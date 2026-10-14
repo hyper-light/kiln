@@ -176,8 +176,10 @@ All generated credentials are also in `~/.local/state/kiln/cluster/credentials.e
 ## Cluster capacity protections
 
 * **Honest node sizes.** Under the docker driver every minikube node reports the whole host. The
-  bootstrap reserves the difference in each kubelet (`kubelet.system-reserved`), so each node
-  advertises its real 8 CPU / 16 GiB and Kubernetes never overcommits builds into OOM kills.
+  bootstrap reserves the difference in each kubelet (`kubelet.system-reserved`). On top of that it
+  holds back 0.5 CPU and 1.5 GiB per node for the kubelet and container runtime. Each node
+  advertises 7.5 CPU / 14.5 GiB, so builds can't be overcommitted into OOM kills and can't starve
+  a node into `NotReady`.
 * **The control plane outranks CI.** The `kiln-control` PriorityClass covers the server and
   `kiln-job` covers job pods. `kiln-job` is low, preemptible and never preempts anything. When the
   cluster is full, the scheduler evicts job pods, and kiln requeues those jobs.
@@ -185,5 +187,7 @@ All generated credentials are also in `~/.local/state/kiln/cluster/credentials.e
   for ArgoCD, Prometheus and Grafana. kiln retries quota-rejected launches every ~15 s.
 * **Pre-pulled toolchains.** The `kiln-prepull` DaemonSet keeps the rust, go, python (uv), node,
   erlang, debian and alpine images on every node, including new ones.
-* **Restart-safe.** If the kiln server restarts, running jobs keep going. Their agents reconnect
-  and reclaim them, and a job is requeued only if its agent never comes back.
+* **Restart-safe.** If the kiln server restarts, running jobs keep going. Their agents (pods included)
+  have a 45 s grace period to reconnect and reclaim them. A job is requeued only if its agent never
+  comes back, or right away if its pod is gone. If a job was requeued but its agent was in fact
+  still working, kiln takes it back instead of discarding the work.
