@@ -81,13 +81,25 @@ const PYTHON: &str = r#"  python:
     steps:
       - name: install
         run: |
-          if [ -f uv.lock ]; then uv sync --all-extras --all-groups --frozen
-          elif [ -f pyproject.toml ]; then uv sync --all-extras --all-groups || { uv venv -q && uv pip install -e .; }
-          elif [ -f setup.py ]; then uv venv -q && uv pip install -e .
-          else uv venv -q && uv pip install -r requirements.txt; fi
-          for f in requirements.txt requirements-dev.txt requirements-test.txt dev-requirements.txt test-requirements.txt; do
-            if [ -f "$f" ]; then uv pip install -q -r "$f"; fi
+          install() {
+            if [ -f uv.lock ]; then uv sync --all-extras --all-groups --frozen || return 1
+            elif [ -f pyproject.toml ]; then uv sync --all-extras --all-groups || { uv venv -q --allow-existing && uv pip install -e .; } || return 1
+            elif [ -f setup.py ]; then uv venv -q --allow-existing && uv pip install -e . || return 1
+            else uv venv -q --allow-existing && uv pip install -r requirements.txt || return 1; fi
+            for f in requirements.txt requirements-dev.txt requirements-test.txt dev-requirements.txt test-requirements.txt; do
+              if [ -f "$f" ]; then uv pip install -q -r "$f" || return 1; fi
+            done
+          }
+          # The project's .python-version wins; otherwise try the image default, then fall back to
+          # an interpreter that pinned dependencies are most likely to have wheels for.
+          if [ -f .python-version ]; then install; exit $?; fi
+          install && exit 0
+          for v in 3.13 3.12; do
+            echo "[kiln] install failed; retrying with Python $v"
+            rm -rf .venv
+            UV_PYTHON=$v install && echo "$v" > .python-version && exit 0
           done
+          exit 1
       - name: test
         run: |
           if [ -d tests ] || [ -d test ]; then uv run --with pytest pytest -q

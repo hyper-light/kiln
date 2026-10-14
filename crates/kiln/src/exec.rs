@@ -63,6 +63,13 @@ enum Outcome {
     TimedOut,
 }
 
+/// The job's private temp directory: a sibling of its workspace on the same volume.
+fn tmp_dir(ws: &Path) -> PathBuf {
+    let mut name = ws.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".tmp");
+    ws.with_file_name(name)
+}
+
 fn have(bin: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
 }
@@ -86,7 +93,12 @@ impl Exec {
         let job = self.assign.job_id.clone();
         self.up.msg(AgentMsg::JobStarted { job: job.clone() }).await;
         let ws = self.work_dir.join("ws").join(format!("{}-{}", slug(&self.assign.repo), job.get(job.len().saturating_sub(12)..).unwrap_or(&job)));
+        let tmp = tmp_dir(&ws);
+        if let Err(e) = tokio::fs::create_dir_all(&tmp).await {
+            tracing::warn!(error = %e, tmp = %tmp.display(), "cannot create job TMPDIR");
+        }
         let result = self.run_inner(&ws).await;
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
         if let Err(e) = tokio::fs::remove_dir_all(&ws).await
             && e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(error = %e, ws = %ws.display(), "workspace cleanup failed");
@@ -135,6 +147,9 @@ impl Exec {
             ("KILN_JOB", a.spec.key.clone()),
             ("KILN_ATTEMPT", a.attempt.to_string()),
             ("KILN_WORKSPACE", ws.to_string_lossy().into_owned()),
+            // Temp space on the work volume, not tmpfs or a container's overlay layer: big
+            // build temporaries fit, and storage-sensitive tests see a real filesystem.
+            ("TMPDIR", tmp_dir(ws).to_string_lossy().into_owned()),
             ("KILN_AGENT", self.agent_name.clone()),
             ("TERM", "xterm-256color".to_owned()),
             ("CARGO_TERM_COLOR", "always".to_owned()),
