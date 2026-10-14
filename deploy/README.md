@@ -172,3 +172,18 @@ sudo deploy/cluster/privileged-setup.sh      # opens 7070/tcp + 7071/udp in ufw/
 
 The UI is at <http://localhost:7070>. Sign in with `kubectl --context kiln -n kiln get secret kiln-admin -o jsonpath='{.data.token}' | base64 -d`.
 All generated credentials are also in `~/.local/state/kiln/cluster/credentials.env` (mode 0600).
+
+## Cluster capacity protections
+
+* **Honest node sizes.** Under the docker driver every minikube node reports the whole host. The
+  bootstrap reserves the difference in each kubelet (`kubelet.system-reserved`), so each node
+  advertises its real 8 CPU / 16 GiB and Kubernetes never overcommits builds into OOM kills.
+* **The control plane outranks CI.** The `kiln-control` PriorityClass covers the server and
+  `kiln-job` covers job pods. `kiln-job` is low, preemptible and never preempts anything. When the
+  cluster is full, the scheduler evicts job pods, and kiln requeues those jobs.
+* **Job quota.** A `ResourceQuota` in `kiln-jobs` caps CI at 18 CPU / 36 GiB, which leaves headroom
+  for ArgoCD, Prometheus and Grafana. kiln retries quota-rejected launches every ~15 s.
+* **Pre-pulled toolchains.** The `kiln-prepull` DaemonSet keeps the rust, go, python (uv), node,
+  erlang, debian and alpine images on every node, including new ones.
+* **Restart-safe.** If the kiln server restarts, running jobs keep going. Their agents reconnect
+  and reclaim them, and a job is requeued only if its agent never comes back.

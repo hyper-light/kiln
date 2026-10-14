@@ -5,6 +5,22 @@ A repository opts in by adding one or more YAML files under `.kiln/` (`.kiln/ci.
 kiln reads the files **at the commit being built**, so pipeline changes are versioned and reviewed
 with the code (GitOps). Check a file locally with `kiln validate .kiln/ci.yaml`.
 
+## No `.kiln/` yet? Auto-detected pipelines
+
+Until a repository adds its own pipeline, kiln reads the files at the root of each commit and
+synthesizes a conservative one (`gitops.auto_pipelines = true`, the default):
+
+| Root file | Job (runs in a pod) |
+| --- | --- |
+| `Cargo.toml` | system deps if missing → `cargo build --workspace --all-targets --locked` → `cargo test --workspace --locked` (honours `rust-toolchain.toml`) |
+| `go.mod` / `go.work` | `go build ./...` → `go vet ./...` → `go test ./...` |
+| `pyproject.toml` / `setup.py` / `requirements.txt` | `uv sync --all-extras --all-groups` (+ any `requirements*.txt`) → `pytest` if `tests/` exists |
+| `package.json` | `npm ci` → `lint` / `typecheck` / `test` / `build` scripts if present |
+| `rebar.config` | `rebar3 compile` → `rebar3 eunit` |
+
+The pipeline is named `auto`. It triggers on pushes to `main`/`master`, on PRs and on manual runs.
+A repository's own `.kiln/*.yaml` always replaces it.
+
 ## Reference
 
 ```yaml
@@ -16,7 +32,7 @@ on:
   schedule: ["0 3 * * *"]                 # cron, UTC, default branch
   manual: true                            # allow "Run" from the UI / API (default true)
 env: { RUST_BACKTRACE: "1" }              # every job
-concurrency:                              # one active run per group
+concurrency:                              # one active run per group (scoped to this repository)
   group: "ci-${{ branch }}"
   cancel-in-progress: true
 jobs:
