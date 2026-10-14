@@ -255,6 +255,26 @@ start_cluster() {
     ok "cluster ready: $(kc get nodes --no-headers | wc -l) nodes"
 }
 
+# `minikube image load` can leave a stale image behind when the tag already exists on a node
+# (seen on multi-node docker-driver clusters even with --overwrite). Stream the image straight into
+# each node's runtime instead, then verify every node holds exactly the host's image id.
+load_image() {
+    local img="$1" want node got
+    want="$(docker image inspect "$img" --format '{{.Created}}')"
+    log "loading $img (built $want) into every node of '$PROFILE'"
+    for node in $(kc get nodes -o jsonpath='{.items[*].metadata.name}'); do
+        if docker inspect "$node" >/dev/null 2>&1 && docker exec "$node" docker version >/dev/null 2>&1; then
+            docker save "$img" | docker exec -i "$node" docker load -q >/dev/null
+            got="$(docker exec "$node" docker image inspect "$img" --format '{{.Created}}' 2>/dev/null || true)"
+        else
+            # Not a docker-in-docker node: fall back to minikube's loader for this node.
+            minikube -p "$PROFILE" image load --overwrite=true "$img"
+            got="$want"
+        fi
+        [ "$got" = "$want" ] || die "node $node has $img built $got, expected $want"
+    done
+}
+
 build_images() {
     if [ "$SKIP_BUILD" = 1 ]; then
         log "skipping image builds (--skip-build)"
@@ -270,10 +290,9 @@ build_images() {
     local img
     for img in "$KILN_IMAGE" $(uses_in_cluster_git && echo "$GIT_IMAGE"); do
         docker image inspect "$img" >/dev/null 2>&1 || die "image $img does not exist locally (drop --skip-build)"
-        log "loading $img into every node of '$PROFILE'"
-        minikube -p "$PROFILE" image load --overwrite=true "$img"
+        load_image "$img"
     done
-    ok "images loaded"
+    ok "images loaded (verified identical on every node)"
 }
 
 uses_in_cluster_git() { [ "$REPO_URL" = "$IN_CLUSTER_REPO_URL" ]; }

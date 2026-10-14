@@ -46,3 +46,9 @@ metrics:
     skipCapabilityCheck: true
   dashboards:
     enabled: true
+
+# This host (adacachy) forwards :7070/tcp and :7071/udp to the kiln NodePorts
+# (deploy/cluster/expose-lan.sh), so agents on the LAN — and the UI join command — use it.
+# Update if the host LAN address changes.
+publicURL: http://192.168.1.77:7070
+quicAdvertise: 192.168.1.77:7071
