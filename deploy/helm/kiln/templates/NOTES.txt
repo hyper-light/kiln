@@ -1,0 +1,19 @@
+kiln {{ .Chart.AppVersion }} is deploying in namespace {{ .Release.Namespace }}; job pods run in {{ include "kiln.jobsNamespace" . }}.
+
+UI / API:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kiln.fullname" . }} {{ .Values.ports.http }}:{{ .Values.ports.http }}
+  open http://localhost:{{ .Values.ports.http }}
+
+Admin token:
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "kiln.adminSecretName" . }} -o jsonpath='{.data.{{ .Values.adminToken.secretKey }}}' | base64 -d; echo
+
+In-cluster address for job pods: {{ include "kiln.serviceHost" . }} (TCP {{ .Values.ports.http }}, UDP {{ .Values.ports.quic }})
+{{- if .Values.externalService.enabled }}
+
+External agents ({{ .Values.externalService.type }}):
+  {{- if eq .Values.externalService.type "NodePort" }}
+  http://<node-ip>:{{ .Values.externalService.nodePorts.http }} (TCP) and <node-ip>:{{ .Values.externalService.nodePorts.quic }} (UDP/QUIC)
+  {{- else }}
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "kiln.fullname" . }}-external
+  {{- end }}
+{{- end }}

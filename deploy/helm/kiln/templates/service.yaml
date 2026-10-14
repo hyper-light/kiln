@@ -1,0 +1,73 @@
+{{- $fullname := include "kiln.fullname" . -}}
+# In-cluster address used by job pods: <fullname>.<namespace>.svc (TCP http + UDP quic).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "kiln.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+    - name: quic
+      port: {{ .Values.ports.quic }}
+      targetPort: quic
+      protocol: UDP
+{{- if .Values.externalService.enabled }}
+---
+# Reachability for agents and users outside the cluster (bare-metal benchmark machines).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-external
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server-external
+  {{- with .Values.externalService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.externalService.type }}
+  externalTrafficPolicy: {{ .Values.externalService.externalTrafficPolicy }}
+  {{- if and (eq .Values.externalService.type "LoadBalancer") .Values.externalService.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.externalService.loadBalancerIP }}
+  {{- end }}
+  {{- if and (eq .Values.externalService.type "LoadBalancer") .Values.externalService.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.externalService.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "kiln.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+      protocol: TCP
+      {{- if .Values.externalService.nodePorts.http }}
+      nodePort: {{ .Values.externalService.nodePorts.http }}
+      {{- end }}
+    - name: quic
+      port: {{ .Values.ports.quic }}
+      targetPort: quic
+      protocol: UDP
+      {{- if .Values.externalService.nodePorts.quic }}
+      nodePort: {{ .Values.externalService.nodePorts.quic }}
+      {{- end }}
+{{- end }}

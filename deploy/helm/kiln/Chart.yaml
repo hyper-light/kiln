@@ -1,0 +1,14 @@
+apiVersion: v2
+name: kiln
+description: >-
+  kiln — self-hosted GitOps CI/CD job server (single Rust binary with embedded UI).
+  Runs jobs as ephemeral agent pods in a separate namespace and exposes Prometheus
+  metrics, alert rules and Grafana dashboards.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/hyper-light/kiln
+sources:
+  - https://github.com/hyper-light/kiln
+keywords: [ci, cd, gitops, build, runner]

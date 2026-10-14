@@ -1,0 +1,201 @@
+# kiln alerting + recording rules (Prometheus rule-file format).
+#
+# Single source of truth for both deployments:
+#   * Kubernetes: rendered into a PrometheusRule by the Helm chart (deploy/helm/kiln/rules -> here)
+#   * bare metal: mounted into Prometheus by deploy/baremetal/docker-compose.yml
+#
+# Both scrape configs give the kiln server job="kiln".
+groups:
+  - name: kiln.recording
+    interval: 30s
+    rules:
+      - record: kiln:jobs_finished:rate5m
+        expr: sum by (status) (rate(kiln_jobs_finished_total{job="kiln"}[5m]))
+      - record: kiln:job_failure_ratio:rate30m
+        expr: |
+          sum(rate(kiln_jobs_finished_total{job="kiln",status=~"failed|timed_out"}[30m]))
+            /
+          clamp_min(sum(rate(kiln_jobs_finished_total{job="kiln",status=~"succeeded|failed|timed_out"}[30m])), 1e-9)
+      - record: kiln:job_duration_seconds:p90_30m
+        expr: histogram_quantile(0.9, sum by (le) (rate(kiln_job_duration_seconds_bucket{job="kiln"}[30m])))
+      - record: kiln:queue_wait_seconds:p90_15m
+        expr: histogram_quantile(0.9, sum by (le) (rate(kiln_queue_wait_seconds_bucket{job="kiln"}[15m])))
+      - record: kiln:agent_slots_utilization
+        expr: sum(kiln_agent_slots_busy{job="kiln"}) / clamp_min(sum(kiln_agent_slots_total{job="kiln"}), 1)
+
+  - name: kiln.alerts
+    rules:
+      - alert: KilnServerDown
+        expr: up{job="kiln"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: kiln server is not answering /metrics
+          description: "Prometheus cannot scrape kiln at {{ $labels.instance }} for 2 minutes."
+      - alert: KilnServerAbsent
+        expr: absent(up{job="kiln"})
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: No kiln scrape target
+          description: Prometheus has had no kiln target for 10 minutes (ServiceMonitor or scrape config missing, or the pod is gone).
+
+      - alert: KilnQueueBacklog
+        expr: sum(kiln_jobs_queued{job="kiln"}) > 25
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: kiln queue backlog
+          description: "{{ $value }} jobs have been queued for more than 15 minutes. Add agents/slots or raise kubernetes.max_pods."
+      - alert: KilnQueueWaitHigh
+        expr: kiln:queue_wait_seconds:p90_15m > 600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Jobs wait long for an executor
+          description: "p90 queue wait is {{ $value | humanizeDuration }} (15m window)."
+      - alert: KilnNoCapacityForQueuedJobs
+        expr: sum(kiln_jobs_queued{job="kiln"}) > 0 and sum(kiln_jobs_running{job="kiln"}) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Jobs are queued but nothing is running
+          description: Jobs have been queued for 10 minutes with zero running jobs. Agents may be disconnected or job pods cannot start.
+
+      - alert: KilnJobFailureRatioHigh
+        expr: |
+          kiln:job_failure_ratio:rate30m > 0.5
+            and
+          sum(increase(kiln_jobs_finished_total{job="kiln"}[30m])) >= 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than half of kiln jobs are failing
+          description: "{{ $value | humanizePercentage }} of jobs failed or timed out over the last 30 minutes."
+      - alert: KilnRepoFailing
+        expr: |
+          sum by (repo) (increase(kiln_jobs_finished_total{job="kiln",status=~"failed|timed_out"}[1h])) >= 5
+            unless on (repo)
+          sum by (repo) (increase(kiln_jobs_finished_total{job="kiln",status="succeeded"}[1h])) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Repository {{ $labels.repo }} has only failing jobs"
+          description: "{{ $value }} failed jobs and no successes in the last hour."
+
+      - alert: KilnAgentDisconnected
+        # Per-agent series that existed during the last hour but are gone now. Ephemeral job-pod
+        # agents are expected to come and go; they are excluded by their pod name kiln-<job>-<attempt>.
+        expr: |
+          count by (agent) (max_over_time(kiln_agent_load1{job="kiln",agent!~"kiln-[0-9a-zA-Z]+-[0-9]+"}[1h]))
+            unless on (agent)
+          count by (agent) (kiln_agent_load1{job="kiln"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "kiln agent {{ $labels.agent }} disconnected"
+          description: "Agent {{ $labels.agent }} reported within the last hour but has stopped reporting for 5 minutes."
+      - alert: KilnAgentsConnectedDropped
+        expr: |
+          max_over_time(kiln_agents_connected{job="kiln"}[30m]) - kiln_agents_connected{job="kiln"} >= 1
+            and
+          sum(kiln_jobs_queued{job="kiln"}) > 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: Fewer agents connected while jobs are queued
+          description: "{{ $value }} fewer agents than the 30-minute peak, and jobs are waiting."
+
+      - alert: KilnSupervisorRestarts
+        expr: increase(kiln_supervisor_restarts_total{job="kiln"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: kiln supervisor restarted the server
+          description: "`kiln supervise` restarted the server {{ $value | printf \"%.0f\" }} time(s) in 15 minutes. See /api/system crash_log."
+      - alert: KilnServerProcessRestarted
+        # Counter reset of the process CPU counter == new server process (covers restarts that
+        # also reset kiln_supervisor_restarts_total, e.g. container restarts).
+        expr: resets(process_cpu_seconds_total{job="kiln"}[15m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: kiln server process restarted
+          description: "The kiln server process on {{ $labels.instance }} restarted in the last 15 minutes."
+      - alert: KilnCrashLooping
+        expr: increase(kiln_supervisor_restarts_total{job="kiln"}[30m]) > 5
+        labels:
+          severity: critical
+        annotations:
+          summary: kiln server is crash-looping
+          description: "More than 5 supervisor restarts in 30 minutes."
+      - alert: KilnPanicsCaught
+        expr: increase(kiln_panics_caught_total{job="kiln"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: kiln caught a panic
+          description: "{{ $value | printf \"%.0f\" }} panic(s) were caught by catch_unwind task boundaries in 15 minutes. This is a bug: check logs."
+
+      - alert: KilnGitopsPollErrors
+        expr: |
+          sum(rate(kiln_gitops_polls_total{job="kiln",result="error"}[15m]))
+            /
+          clamp_min(sum(rate(kiln_gitops_polls_total{job="kiln"}[15m])), 1e-9) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Most GitOps polls are failing
+          description: "{{ $value | humanizePercentage }} of repository polls failed over 15 minutes (network, token or GitHub outage)."
+      - alert: KilnGithubRateLimitLow
+        expr: min(kiln_github_rate_remaining{job="kiln"}) < 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: GitHub API rate limit almost exhausted
+          description: "Only {{ $value }} GitHub API requests remain. Configure a token or raise poll_seconds."
+      - alert: KilnK8sPodErrors
+        expr: sum(increase(kiln_k8s_pods_total{job="kiln",result="error"}[15m])) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: kiln fails to create job pods
+          description: "{{ $value | printf \"%.0f\" }} job pod operations failed in 15 minutes (RBAC, quota, image pulls)."
+
+      - alert: KilnHighMemory
+        expr: process_resident_memory_bytes{job="kiln"} > 1.5e9
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: kiln server memory is high
+          description: "Server RSS is {{ $value | humanize1024 }}B."
+      - alert: KilnFileDescriptorsHigh
+        expr: process_open_fds{job="kiln"} > 50000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: kiln has many open file descriptors
+          description: "{{ $value }} open fds."
+      - alert: KilnAgentDiskFull
+        expr: |
+          kiln_agent_disk_used_bytes{job="kiln"} / clamp_min(kiln_agent_disk_total_bytes{job="kiln"}, 1) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent {{ $labels.agent }} disk is over 90% full"
+          description: "{{ $value | humanizePercentage }} used."

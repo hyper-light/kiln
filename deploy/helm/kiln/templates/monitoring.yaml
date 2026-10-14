@@ -1,0 +1,78 @@
+{{- $sm := .Values.metrics.serviceMonitor -}}
+{{- $pr := .Values.metrics.prometheusRule -}}
+{{- if and $sm.enabled (include "kiln.hasCRD" (list . $sm.skipCapabilityCheck)) }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kiln.fullname" . }}
+  namespace: {{ default .Release.Namespace $sm.namespace }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # job="kiln" regardless of release name, so the shared alert rules and dashboards match
+  jobLabel: app.kubernetes.io/name
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchLabels:
+      {{- include "kiln.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  endpoints:
+    - port: http
+      path: /metrics
+      scheme: http
+      interval: {{ $sm.interval }}
+      scrapeTimeout: {{ $sm.scrapeTimeout }}
+      {{- with $sm.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $sm.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- if and $pr.enabled (include "kiln.hasCRD" (list . $pr.skipCapabilityCheck)) }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "kiln.fullname" . }}
+  namespace: {{ default .Release.Namespace $pr.namespace }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+    {{- with $pr.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- /* rules/ is a symlink to deploy/prometheus, shared with the bare-metal Prometheus */}}
+  {{- $rules := .Files.Get "rules/kiln-rules.yaml" | fromYaml }}
+  {{- $groups := concat (required "rules/kiln-rules.yaml missing from chart" $rules.groups) $pr.additionalGroups }}
+  groups:
+    {{- toYaml $groups | nindent 4 }}
+{{- end }}
+{{- if .Values.metrics.dashboards.enabled }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-dashboard-%s" (include "kiln.fullname" $) (base $path | trimSuffix ".json") | trunc 63 | trimSuffix "-" }}
+  namespace: {{ default $.Release.Namespace $.Values.metrics.dashboards.namespace }}
+  labels:
+    {{- include "kiln.labels" $ | nindent 4 }}
+    {{- with $.Values.metrics.dashboards.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $.Values.metrics.dashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+{{- end }}
+{{- end }}

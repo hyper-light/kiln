@@ -1,0 +1,269 @@
+# Default values for the kiln chart.
+#
+# The kiln server runs in the release namespace (normally `kiln`) and launches one ephemeral
+# agent pod per job in `namespaces.jobs` (normally `kiln-jobs`). Job pods dial back to the
+# server over QUIC (UDP 7071) and HTTP (TCP 7070) through the in-cluster Service.
+
+nameOverride: ""
+# Keep the Service named `kiln` so the in-cluster address is kiln.<namespace>.svc.
+fullnameOverride: ""
+
+image:
+  repository: kiln
+  # Defaults to the chart appVersion when empty. `dev` matches `docker build -t kiln:dev .`
+  tag: dev
+  # Digest pin (sha256:...) takes precedence over tag when set.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- Override the image used for job pods' initContainer that injects /kiln.
+#    Empty = same image as the server.
+jobAgentImage: ""
+
+namespaces:
+  # Namespace where job pods are created.
+  jobs: kiln-jobs
+  # Create the jobs namespace from this chart. Set false when something else (e.g. the ArgoCD
+  # `namespaces` app) owns it. The namespace is kept on `helm uninstall` (it holds the cache PVC).
+  createJobs: true
+  # Pod Security Admission level applied to the jobs namespace when created here.
+  # Builds often need root inside the toolchain image, so `baseline` is the practical default.
+  jobsPodSecurity: baseline
+
+# Container ports; kiln.toml http_addr/quic_addr/public_url/quic_advertise are derived from these.
+ports:
+  http: 7070   # TCP: UI, REST/WebSocket API, /metrics, /healthz, /readyz, agent enrollment
+  quic: 7071   # UDP: QUIC agent transport
+
+# Addresses. Job pods ALWAYS use the in-cluster Service (kubernetes.server_url/server_quic are
+# derived from it). public_url / quic_advertise are what humans and the "join agent" command
+# use — set them to the external address when bare-metal agents outside the cluster join,
+# e.g. publicURL: http://192.168.1.50:7070  quicAdvertise: 192.168.1.50:7071
+# Empty → the in-cluster Service address.
+publicURL: ""
+quicAdvertise: ""
+# Extra DNS names / IPs for the server certificate (QUIC mTLS). The Service names
+# (<fullname>, <fullname>.<ns>, <fullname>.<ns>.svc[.cluster.local]) are always included.
+# Add the external host/IP that bare-metal agents dial.
+tlsNames: []
+
+# Admin token (exported as KILN_ADMIN_TOKEN). Resolution order:
+#   1. existingSecret (recommended for GitOps — ArgoCD renders with `helm template`, where
+#      `lookup` returns nothing and a generated token would change on every sync)
+#   2. value
+#   3. generated once with randAlphaNum and preserved across `helm upgrade` via `lookup`
+adminToken:
+  existingSecret: ""
+  secretKey: token
+  value: ""
+
+# Optional GitHub credentials. The secret is mounted read-only at /etc/kiln/secrets and the
+# corresponding *_file keys are added to [gitops] automatically.
+github:
+  existingSecret: ""
+  tokenKey: token                  # → gitops.github_token_file
+  webhookSecretKey: webhook-secret # → gitops.webhook_secret_file (key may be absent)
+
+# kiln.toml. Rendered section by section into the ConfigMap; values here override the
+# derived defaults (addresses, data_dir, kubernetes.namespace/agent_image/service_account/
+# cache_pvc). Setting a key to null drops a *chart default* (derived keys cannot be dropped,
+# only overridden). Nested maps become [section.sub] tables.
+config:
+  server:
+    metrics_public: true
+  gitops:
+    orgs: ["hyper-light"]
+    poll_seconds: 60
+  local_agent:
+    enabled: false        # in Kubernetes jobs run in pods, not inside the server container
+  kubernetes:
+    enabled: true
+    max_pods: 64
+  terminal:
+    enabled: true
+  retention:
+    days: 30
+
+# -- Raw TOML appended verbatim after the rendered config. kiln parses its config with
+#    deny_unknown_fields: unknown keys stop the server from starting. Prefer `config`; never
+#    repeat a [section] that `config` already renders (duplicate tables are a TOML error).
+#    Example: repositories outside the auto-discovered orgs:
+#      config:
+#        repos:
+#          - { name: hyper-light/kiln, clone_url: "http://kiln-git.kiln-git.svc.cluster.local/kiln.git", branches: [main] }
+extraConfig: ""
+
+# Server data (sqlite, logs, pki, tokens) — mounted at data_dir.
+persistence:
+  enabled: true
+  mountPath: /var/lib/kiln
+  existingClaim: ""
+  # "" = cluster default StorageClass. On multi-node minikube prefer `local-path`
+  # (storage-provisioner-rancher addon) so the volume is pinned to one node.
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  size: 20Gi
+  annotations: {}
+
+# Shared build cache PVC mounted at /cache in job pods (cargo/go/uv/npm caches).
+# Lives in the jobs namespace. ReadWriteMany lets job pods on every node mount it; with
+# ReadWriteOnce all job pods are effectively confined to one node.
+cache:
+  enabled: true
+  name: kiln-cache
+  existingClaim: false   # true = the PVC named `cache.name` already exists; do not create it
+  storageClass: ""
+  accessModes: [ReadWriteMany]
+  size: 100Gi
+  annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""          # default: <fullname>
+  annotations: {}
+
+# ServiceAccount used by job pods. It is granted no RBAC permissions and its token is not mounted.
+jobServiceAccount:
+  create: true
+  name: kiln-job
+  annotations: {}
+
+rbac:
+  create: true
+
+replicaCount: 1   # kiln uses a local sqlite database: run exactly one replica.
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true   # /tmp is an emptyDir and HOME=/tmp
+  capabilities:
+    drop: [ALL]
+
+# Size of the /tmp emptyDir (git scratch, terminal sessions).
+tmpSizeLimit: 2Gi
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 2Gi
+
+env: []            # extra env vars, e.g. [{name: RUST_LOG, value: "info,kiln=debug"}]
+envFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+terminationGracePeriodSeconds: 30
+
+startupProbe:
+  httpGet: { path: /healthz, port: http }
+  periodSeconds: 2
+  failureThreshold: 60
+livenessProbe:
+  httpGet: { path: /healthz, port: http }
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 4
+readinessProbe:
+  httpGet: { path: /readyz, port: http }
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# In-cluster Service (job pods and port-forwards use this). Keep ClusterIP.
+service:
+  type: ClusterIP
+  annotations: {}
+
+# Extra Service for agents/users OUTSIDE the cluster (bare-metal benchmark boxes).
+# NodePort works everywhere (minikube included); LoadBalancer needs MetalLB/cloud LB.
+# Mixed TCP+UDP on one LoadBalancer requires Kubernetes >= 1.26.
+externalService:
+  enabled: false
+  type: NodePort
+  annotations: {}
+  nodePorts:
+    http: 30070   # TCP
+    quic: 30071   # UDP
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  # Local keeps client source IPs and avoids an extra hop for QUIC; requires a server pod on
+  # the node receiving traffic (with NodePort, use that node's IP).
+  externalTrafficPolicy: Cluster
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # nginx example (WebSockets for logs/terminal need long timeouts):
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  hosts:
+    - host: kiln.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# NetworkPolicies (off by default; needs a CNI that enforces them, e.g. Calico/Cilium).
+networkPolicy:
+  enabled: false
+  # Sources allowed to reach the HTTP port (UI/API/metrics). Empty list = from anywhere.
+  httpFrom: []
+  #  - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+  # Sources allowed to reach QUIC. The jobs namespace is always allowed; empty = anywhere.
+  quicFrom: []
+  # Deny all ingress to job pods (they only dial out).
+  isolateJobs: true
+
+metrics:
+  serviceMonitor:
+    enabled: true
+    # Render even when monitoring.coreos.com/v1 is not advertised by the cluster
+    # (e.g. `helm template` in CI, or CRDs installed in the same sync).
+    skipCapabilityCheck: false
+    namespace: ""      # default: release namespace
+    labels:
+      release: kube-prometheus-stack
+    interval: 30s
+    scrapeTimeout: 10s
+    relabelings: []
+    metricRelabelings: []
+  prometheusRule:
+    enabled: true
+    skipCapabilityCheck: false
+    namespace: ""
+    labels:
+      release: kube-prometheus-stack
+    # Rules come from rules/kiln-rules.yaml (shared with the bare-metal Prometheus).
+    # Extra rule groups appended verbatim:
+    additionalGroups: []
+  dashboards:
+    enabled: true
+    # Namespace the Grafana sidecar watches (kube-prometheus-stack watches ALL by default).
+    namespace: ""
+    labels:
+      grafana_dashboard: "1"
+    annotations:
+      grafana_folder: kiln

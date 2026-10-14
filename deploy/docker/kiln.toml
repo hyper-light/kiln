@@ -1,0 +1,26 @@
+# Default config baked into the kiln container image (/etc/kiln/kiln.toml).
+# Suitable for `docker run` on a single host. The Helm chart mounts its own config over this file.
+
+[server]
+http_addr = "0.0.0.0:7070"
+quic_addr = "0.0.0.0:7071"
+public_url = "http://localhost:7070"
+quic_advertise = "localhost:7071"
+data_dir = "/var/lib/kiln"
+metrics_public = true
+
+[gitops]
+orgs = ["hyper-light"]
+poll_seconds = 60
+
+[local_agent]
+enabled = true
+
+[kubernetes]
+enabled = false
+
+[terminal]
+enabled = true
+
+[retention]
+days = 30

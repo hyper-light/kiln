@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kiln.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+data:
+  kiln.toml: |
+    # Rendered by the kiln Helm chart: edit values.yaml (config / extraConfig), not this file.
+    {{- include "kiln.renderToml" (include "kiln.effectiveConfig" . | fromYaml) | nindent 4 }}
+    {{- with .Values.extraConfig }}
+    {{- . | nindent 4 }}
+    {{- end }}

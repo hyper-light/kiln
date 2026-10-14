@@ -1,0 +1,64 @@
+# Prometheus + Grafana for kiln running directly on a host (no Kubernetes).
+#
+#   deploy/baremetal/up.sh          # generates .env (Grafana password) then `docker compose up -d`
+#   docker compose -f deploy/baremetal/docker-compose.yml down
+#
+# Prometheus scrapes the kiln server on the host at host.docker.internal:7070 (/metrics).
+# Bare-metal agents report through the server, so the server is the only target.
+# UIs bind to 127.0.0.1 by default; set KILN_OBS_BIND=0.0.0.0 in .env to expose them.
+name: kiln-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROM_RETENTION:-7d}
+      - --storage.tsdb.retention.size=${PROM_RETENTION_SIZE:-2GB}
+      - --storage.tsdb.wal-compression
+      - --web.enable-lifecycle
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${KILN_OBS_BIND:-127.0.0.1}:${PROM_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/kiln-rules.yaml:/etc/prometheus/rules/kiln-rules.yaml:ro
+      - prometheus-data:/prometheus
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?run deploy/baremetal/up.sh (or set GRAFANA_ADMIN_PASSWORD in .env)}
+      GF_USERS_DEFAULT_THEME: dark
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/kiln/kiln-overview.json
+    ports:
+      - "${KILN_OBS_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards/kiln:ro
+      - grafana-data:/var/lib/grafana
+    mem_limit: 256m
+    cpus: 0.5
+
+volumes:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,48 @@
+# kiln chart overrides for the minikube dev cluster (layered on deploy/helm/kiln/values.yaml).
+
+image:
+  repository: kiln
+  tag: dev                  # loaded into every node by `minikube image load kiln:dev`
+  pullPolicy: IfNotPresent
+
+# Created by deploy/cluster/bootstrap.sh; ArgoCD cannot use the chart's lookup-based generator.
+adminToken:
+  existingSecret: kiln-admin
+  secretKey: token
+
+namespaces:
+  createJobs: false         # owned by the `kiln-namespaces` ArgoCD app
+
+persistence:
+  storageClass: local-path  # pinned to one node; survives pod reschedules
+  size: 20Gi
+
+# minikube's default `standard` hostpath class accepts ReadWriteMany; each node ends up with
+# its own directory, which is exactly what a build cache wants.
+cache:
+  storageClass: standard
+  accessModes: [ReadWriteMany]
+  size: 100Gi
+
+config:
+  kubernetes:
+    max_pods: 64
+
+# Bare-metal agents outside the cluster: <minikube node IP>:30070/TCP and :30071/UDP
+# (deploy/cluster/expose-lan.sh forwards host ports 7070/7071 to these for LAN machines).
+externalService:
+  enabled: true
+  type: NodePort
+  nodePorts:
+    http: 30070
+    quic: 30071
+
+metrics:
+  serviceMonitor:
+    enabled: true
+    skipCapabilityCheck: true   # sync waves guarantee the CRDs exist first
+  prometheusRule:
+    enabled: true
+    skipCapabilityCheck: true
+  dashboards:
+    enabled: true

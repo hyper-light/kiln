@@ -1,0 +1,34 @@
+# Root of the app-of-apps. Applied by deploy/cluster/bootstrap.sh after substituting
+# __REPO_URL__ / __TARGET_REVISION__ (from KILN_REPO_URL / KILN_REPO_REVISION). The same two
+# values are passed down to every child Application, so the git source is defined once.
+#
+# Manual apply example (GitHub):
+#   sed -e 's|__REPO_URL__|https://github.com/hyper-light/kiln|' -e 's|__TARGET_REVISION__|main|' \
+#     deploy/argocd/root.yaml | kubectl apply -f -
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kiln-root
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: __REPO_URL__
+    targetRevision: __TARGET_REVISION__
+    path: deploy/argocd/apps
+    helm:
+      releaseName: kiln-apps
+      parameters:
+        - name: repoURL
+          value: __REPO_URL__
+        - name: targetRevision
+          value: __TARGET_REVISION__
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

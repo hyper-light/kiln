@@ -1,0 +1,21 @@
+# App-of-apps values. `repoURL` and `targetRevision` are injected by the root Application
+# (deploy/argocd/root.yaml, rendered by bootstrap.sh from KILN_REPO_URL / KILN_REPO_REVISION),
+# so switching the git source is ONE change. The defaults below are the in-cluster git server.
+repoURL: http://kiln-git.kiln-git.svc.cluster.local/kiln.git
+targetRevision: main
+
+argocdNamespace: argocd
+project: default
+
+namespaces:
+  enabled: true
+
+kubePrometheusStack:
+  enabled: true
+  namespace: monitoring
+  chartRepo: https://prometheus-community.github.io/helm-charts
+  chartVersion: 92.2.0
+
+kiln:
+  enabled: true
+  namespace: kiln

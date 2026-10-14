@@ -1,0 +1,64 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $jobsNs := include "kiln.jobsNamespace" . -}}
+# Server: allow HTTP and QUIC in (QUIC always from the jobs namespace); egress unrestricted
+# (GitHub, Kubernetes API, git remotes).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kiln.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kiln.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: {{ .Values.ports.http }}
+          protocol: TCP
+      {{- with .Values.networkPolicy.httpFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    - ports:
+        - port: {{ .Values.ports.quic }}
+          protocol: UDP
+        # job pods also enroll over HTTP
+        - port: {{ .Values.ports.http }}
+          protocol: TCP
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $jobsNs }}
+    {{- if .Values.networkPolicy.quicFrom }}
+    - ports:
+        - port: {{ .Values.ports.quic }}
+          protocol: UDP
+      from:
+        {{- toYaml .Values.networkPolicy.quicFrom | nindent 8 }}
+    {{- else }}
+    - ports:
+        - port: {{ .Values.ports.quic }}
+          protocol: UDP
+    {{- end }}
+{{- if .Values.networkPolicy.isolateJobs }}
+---
+# Job pods only dial out (to the kiln server, registries, git remotes); nothing dials in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kiln-jobs-deny-ingress
+  namespace: {{ $jobsNs }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: kiln
+  policyTypes: [Ingress]
+  ingress: []
+{{- end }}
+{{- end }}

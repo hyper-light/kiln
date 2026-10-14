@@ -1,0 +1,15 @@
+{{- if .Values.namespaces.createJobs }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "kiln.jobsNamespace" . }}
+  labels:
+    {{- include "kiln.labels" . | nindent 4 }}
+    {{- with .Values.namespaces.jobsPodSecurity }}
+    pod-security.kubernetes.io/enforce: {{ . }}
+    pod-security.kubernetes.io/warn: {{ . }}
+    {{- end }}
+  annotations:
+    # keep the jobs namespace (and the cache PVC inside it) on uninstall
+    helm.sh/resource-policy: keep
+{{- end }}

@@ -1,0 +1,97 @@
+{{- $sync := dict "prune" true "selfHeal" true -}}
+{{- if .Values.namespaces.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kiln-namespaces
+  namespace: {{ .Values.argocdNamespace }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  project: {{ .Values.project }}
+  source:
+    repoURL: {{ .Values.repoURL }}
+    targetRevision: {{ .Values.targetRevision }}
+    path: deploy/argocd/namespaces
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated:
+      # never prune namespaces: that would delete everything inside them
+      prune: false
+      selfHeal: true
+{{- end }}
+{{- if .Values.kubePrometheusStack.enabled }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: {{ .Values.argocdNamespace }}
+  annotations:
+    # CRDs (ServiceMonitor, PrometheusRule, ...) must exist before the kiln app syncs
+    argocd.argoproj.io/sync-wave: "-1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.project }}
+  sources:
+    - repoURL: {{ .Values.kubePrometheusStack.chartRepo }}
+      chart: kube-prometheus-stack
+      targetRevision: {{ .Values.kubePrometheusStack.chartVersion }}
+      helm:
+        releaseName: kube-prometheus-stack
+        valueFiles:
+          - $values/deploy/argocd/values/kube-prometheus-stack.yaml
+    - repoURL: {{ .Values.repoURL }}
+      targetRevision: {{ .Values.targetRevision }}
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.kubePrometheusStack.namespace }}
+  syncPolicy:
+    automated:
+      {{- toYaml $sync | nindent 6 }}
+    syncOptions:
+      - CreateNamespace=true
+      # the operator CRDs exceed the 256 KiB last-applied-configuration annotation limit
+      - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+{{- end }}
+{{- if .Values.kiln.enabled }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kiln
+  namespace: {{ .Values.argocdNamespace }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ .Values.project }}
+  source:
+    repoURL: {{ .Values.repoURL }}
+    targetRevision: {{ .Values.targetRevision }}
+    path: deploy/helm/kiln
+    helm:
+      releaseName: kiln
+      valueFiles:
+        - values.yaml
+        - ../../argocd/values/kiln.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ .Values.kiln.namespace }}
+  syncPolicy:
+    automated:
+      {{- toYaml $sync | nindent 6 }}
+    syncOptions:
+      - CreateNamespace=true
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+{{- end }}

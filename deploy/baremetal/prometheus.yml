@@ -1,0 +1,23 @@
+# Prometheus config for bare-metal kiln (see docker-compose.yml).
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    deployment: baremetal
+
+rule_files:
+  - /etc/prometheus/rules/*.yaml
+
+scrape_configs:
+  # job="kiln" is what the shared alert rules and the Grafana dashboards select on.
+  - job_name: kiln
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["host.docker.internal:7070"]
+        labels:
+          instance: kiln-server
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]

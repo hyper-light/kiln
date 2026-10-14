@@ -1,0 +1,133 @@
+# kube-prometheus-stack values for the kiln dev cluster (multi-node minikube).
+# Goal: small footprint. One replica of everything, 7d retention, 30s scrapes, no scrapes of
+# control-plane components minikube binds to localhost (etcd/scheduler/controller-manager/proxy).
+#
+# Used by deploy/argocd/apps/templates/kube-prometheus-stack.yaml via `$values/...`.
+
+fullnameOverride: kps
+
+crds:
+  enabled: true
+
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeProxy: false
+    windows: false
+
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+windowsMonitoring:
+  enabled: false
+
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    replicas: 1
+    retention: 72h
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 128Mi }
+
+prometheusOperator:
+  # The admission webhook needs cert-generation hook Jobs that fight with ArgoCD diffs;
+  # not worth it on a dev cluster. tls must be off when the webhook is off.
+  admissionWebhooks:
+    enabled: false
+  tls:
+    enabled: false
+  resources:
+    requests: { cpu: 20m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  prometheusConfigReloader:
+    resources:
+      requests: { cpu: 5m, memory: 16Mi }
+      limits: { memory: 64Mi }
+
+prometheus:
+  prometheusSpec:
+    replicas: 1
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+    retention: 7d
+    retentionSize: 8GB
+    walCompression: true
+    # Pick up ServiceMonitors/PodMonitors/Rules from every namespace, with or without the
+    # `release: kube-prometheus-stack` label.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 2Gi }
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # local-path pins the TSDB to one node (minikube storage-provisioner-rancher addon)
+          storageClassName: local-path
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 10Gi
+
+grafana:
+  enabled: true
+  defaultDashboardsTimezone: browser
+  # Admin credentials come from a Secret created by deploy/cluster/bootstrap.sh (a generated
+  # password would otherwise change on every ArgoCD render).
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  persistence:
+    enabled: false
+  testFramework:
+    enabled: false
+  resources:
+    requests: { cpu: 20m, memory: 128Mi }
+    limits: { memory: 384Mi }
+  grafana.ini:
+    users:
+      default_theme: dark
+    analytics:
+      check_for_updates: false
+      check_for_plugin_updates: false
+      reporting_enabled: false
+    news:
+      news_feed_enabled: false
+  sidecar:
+    resources:
+      requests: { cpu: 5m, memory: 48Mi }
+      limits: { memory: 128Mi }
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+    datasources:
+      enabled: true
+
+kube-state-metrics:
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { memory: 128Mi }
+
+prometheus-node-exporter:
+  resources:
+    requests: { cpu: 10m, memory: 16Mi }
+    limits: { memory: 64Mi }

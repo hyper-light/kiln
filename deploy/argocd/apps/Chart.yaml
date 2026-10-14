@@ -1,0 +1,5 @@
+apiVersion: v2
+name: kiln-apps
+description: App-of-apps for the kiln stack (namespaces, kube-prometheus-stack, kiln). Rendered by the `kiln-root` ArgoCD Application.
+type: application
+version: 0.1.0
