@@ -110,7 +110,20 @@ EOF
     ok "file-descriptor limits set (/etc/security/limits.d/90-kiln.conf, new sessions)"
 fi
 
-# -------------------------------------------------------------- 4. kiln binary (opt.)
+# ------------------------------------------------------------------ 4. host firewall
+# Bare-metal agents on other machines (and containers) reach kiln on 7070/tcp (HTTP: UI, API,
+# enrollment) and 7071/udp (QUIC agent transport). Open them only if a firewall is active.
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 7070/tcp comment 'kiln http' >/dev/null && ufw allow 7071/udp comment 'kiln quic' >/dev/null &&
+        ok "ufw: allowed 7070/tcp and 7071/udp (kiln)"
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port=7070/tcp --add-port=7071/udp >/dev/null && firewall-cmd --reload >/dev/null &&
+        ok "firewalld: allowed 7070/tcp and 7071/udp (kiln)"
+else
+    ok "no active host firewall to configure"
+fi
+
+# -------------------------------------------------------------- 5. kiln binary (opt.)
 install_kiln() {
     local src="$1"
     [ -f "$src" ] || { echo "error: $src not found" >&2; return 1; }
