@@ -1,0 +1,348 @@
+// Fake-but-plausible data for the kiln mock server: repos, pipelines, logs.
+
+export function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function hashStr(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+export const pick = <T>(rnd: () => number, arr: readonly T[]): T => arr[Math.floor(rnd() * arr.length)]!;
+
+export type Toolchain = "rust" | "ts" | "python";
+
+export interface RepoSeed {
+  name: string;
+  branches: string[];
+  toolchain: Toolchain;
+  weight: number;
+}
+
+export const REPOS: RepoSeed[] = [
+  { name: "hyper-light/hyper-raft", branches: ["main", "release/*"], toolchain: "rust", weight: 5 },
+  { name: "hyper-light/slates", branches: ["main"], toolchain: "rust", weight: 3 },
+  { name: "hyper-light/focal", branches: ["main", "next"], toolchain: "rust", weight: 3 },
+  { name: "hyper-light/mantle", branches: ["main"], toolchain: "rust", weight: 2 },
+  { name: "hyper-light/shards", branches: ["main"], toolchain: "rust", weight: 2 },
+  { name: "hyper-light/sylk", branches: ["main"], toolchain: "rust", weight: 2 },
+  { name: "hyper-light/hyperscale", branches: ["main", "dev"], toolchain: "python", weight: 3 },
+  { name: "hyper-light/vorpal", branches: ["main"], toolchain: "rust", weight: 4 },
+  { name: "hyper-light/hyper-tls", branches: ["main"], toolchain: "rust", weight: 1 },
+  { name: "hyper-light/hyperlight-site", branches: ["main"], toolchain: "ts", weight: 3 },
+  { name: "hyper-light/kiln", branches: ["main"], toolchain: "rust", weight: 3 },
+];
+
+export const AUTHORS = ["ada", "mira.k", "jonas", "tsubasa", "lena-p", "dependabot[bot]", "ravi", "ines"];
+
+const SUBJECTS: Record<Toolchain, string[]> = {
+  rust: [
+    "raft: pipeline AppendEntries under backpressure",
+    "transport: coalesce QUIC datagrams on the send path",
+    "fix: off-by-one in snapshot chunk offsets",
+    "perf: avoid clone in hot log-replay loop",
+    "deps: bump tokio to 1.47",
+    "tls: rotate session tickets every 12h",
+    "refactor: split storage engine into segments",
+    "ci: cache sccache across matrix legs",
+    "bench: add criterion group for leader election",
+    "fix: clippy::needless_borrow in codec",
+    "feat: zero-copy decode for framed messages",
+    "docs: explain membership change protocol",
+    "test: property tests for log compaction",
+    "chore: deny unwrap/expect at workspace level",
+  ],
+  ts: [
+    "site: tighten hero tracking on mobile",
+    "blog: post on vorpal benchmarks",
+    "fix: focus ring offset on pill buttons",
+    "perf: lazy-load study gallery artwork",
+    "deps: bump next to 16.3",
+    "a11y: honour prefers-contrast in cards",
+  ],
+  python: [
+    "scheduler: adaptive batch sizing",
+    "fix: race in worker heartbeat",
+    "perf: vectorise histogram merge",
+    "deps: bump numpy to 2.3",
+    "feat: graceful drain on SIGTERM",
+  ],
+};
+
+export function commitMessage(rnd: () => number, tc: Toolchain): string {
+  const s = pick(rnd, SUBJECTS[tc]);
+  return rnd() < 0.3 ? `${s}\n\nSigned-off-by: kiln-bot` : s;
+}
+
+export function sha(rnd: () => number): string {
+  let s = "";
+  for (let i = 0; i < 40; i++) s += "0123456789abcdef"[Math.floor(rnd() * 16)];
+  return s;
+}
+
+/* ---------------------------- pipelines ---------------------------- */
+
+export interface StepTpl {
+  name: string;
+  run: string;
+  dur: [number, number];
+  kind: string;
+}
+export interface JobTpl {
+  key: string;
+  needs: string[];
+  labels: string[];
+  steps: StepTpl[];
+  toolchain: string | null;
+}
+
+const checkout: StepTpl = { name: "checkout", run: "git fetch --depth=1 origin $KILN_SHA && git checkout $KILN_SHA", dur: [2, 5], kind: "checkout" };
+const cache: StepTpl = { name: "restore cache", run: "kiln cache restore cargo-registry target", dur: [2, 8], kind: "cache" };
+
+export function pipelineFor(tc: Toolchain, branch: string): { name: string; jobs: JobTpl[] }[] {
+  if (tc === "rust") {
+    const jobs: JobTpl[] = [
+      { key: "fmt", needs: [], labels: ["k8s"], toolchain: "rust", steps: [checkout, { name: "cargo fmt", run: "cargo fmt --all -- --check", dur: [3, 8], kind: "fmt" }] },
+      { key: "clippy", needs: [], labels: ["k8s"], toolchain: "rust", steps: [checkout, cache, { name: "cargo clippy", run: "cargo clippy --workspace --all-targets -- -D warnings", dur: [30, 90], kind: "clippy" }] },
+      {
+        key: "test (profile=dev)",
+        needs: ["fmt"],
+        labels: ["k8s"],
+        toolchain: "rust",
+        steps: [checkout, cache, { name: "build tests", run: "cargo build --workspace --tests", dur: [40, 120], kind: "compile" }, { name: "cargo test", run: "cargo test --workspace --profile dev", dur: [20, 80], kind: "test" }],
+      },
+      {
+        key: "test (profile=release)",
+        needs: ["fmt"],
+        labels: ["k8s"],
+        toolchain: "rust",
+        steps: [checkout, cache, { name: "build tests", run: "cargo build --workspace --tests --release", dur: [60, 160], kind: "compile" }, { name: "cargo test", run: "cargo test --workspace --profile release", dur: [20, 60], kind: "test" }],
+      },
+      {
+        key: "build",
+        needs: ["clippy", "test (profile=dev)"],
+        labels: ["k8s"],
+        toolchain: "rust",
+        steps: [checkout, cache, { name: "cargo build", run: "cargo build --release --locked", dur: [60, 150], kind: "compile" }, { name: "package", run: "tar czf dist.tgz -C target/release .", dur: [3, 8], kind: "package" }],
+      },
+    ];
+    if (branch === "main" || branch.startsWith("release/"))
+      jobs.push({
+        key: "bench",
+        needs: ["test (profile=release)"],
+        labels: ["baremetal", "bench"],
+        toolchain: "rust",
+        steps: [checkout, { name: "cargo bench", run: "cargo bench -- --save-baseline $KILN_SHA", dur: [60, 180], kind: "bench" }, { name: "upload artifacts", run: "kiln artifacts upload target/criterion/**", dur: [2, 6], kind: "upload" }],
+      });
+    return [{ name: "ci", jobs }];
+  }
+  if (tc === "ts") {
+    const jobs: JobTpl[] = [
+      { key: "install", needs: [], labels: ["k8s"], toolchain: "node", steps: [checkout, { name: "npm ci", run: "npm ci", dur: [10, 30], kind: "npm" }] },
+      { key: "lint", needs: ["install"], labels: ["k8s"], toolchain: "node", steps: [checkout, { name: "eslint", run: "npm run lint", dur: [6, 18], kind: "lint" }] },
+      { key: "typecheck", needs: ["install"], labels: ["k8s"], toolchain: "node", steps: [checkout, { name: "tsc", run: "npm run typecheck", dur: [8, 20], kind: "tsc" }] },
+      { key: "build", needs: ["lint", "typecheck"], labels: ["k8s"], toolchain: "node", steps: [checkout, { name: "next build", run: "npm run build", dur: [25, 60], kind: "vite" }] },
+      { key: "e2e", needs: ["build"], labels: ["baremetal"], toolchain: "node", steps: [checkout, { name: "playwright", run: "npx playwright test", dur: [30, 90], kind: "e2e" }] },
+    ];
+    if (branch === "main") jobs.push({ key: "deploy", needs: ["e2e"], labels: ["k8s"], toolchain: null, steps: [{ name: "argocd sync", run: "argocd app sync hyperlight-site", dur: [6, 20], kind: "deploy" }] });
+    return [{ name: "ci", jobs }];
+  }
+  return [
+    {
+      name: "ci",
+      jobs: [
+        { key: "lint", needs: [], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "ruff", run: "ruff check . && ruff format --check .", dur: [3, 9], kind: "ruff" }] },
+        { key: "test (python=3.12)", needs: ["lint"], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "pytest", run: "uv run pytest -q", dur: [20, 70], kind: "pytest" }] },
+        { key: "test (python=3.13)", needs: ["lint"], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "pytest", run: "uv run pytest -q", dur: [20, 70], kind: "pytest" }] },
+        { key: "wheel", needs: ["test (python=3.12)", "test (python=3.13)"], labels: ["k8s"], toolchain: "python", steps: [checkout, { name: "build wheel", run: "uv build", dur: [8, 20], kind: "wheel" }] },
+      ],
+    },
+  ];
+}
+
+/* ---------------------------- ANSI log lines ---------------------------- */
+
+const E = "\x1b[";
+const dim = (s: string) => `${E}2m${s}${E}0m`;
+const bold = (s: string) => `${E}1m${s}${E}0m`;
+const green = (s: string) => `${E}32m${s}${E}0m`;
+const bgreen = (s: string) => `${E}1;32m${s}${E}0m`;
+const red = (s: string) => `${E}31m${s}${E}0m`;
+const bred = (s: string) => `${E}1;31m${s}${E}0m`;
+const yellow = (s: string) => `${E}33m${s}${E}0m`;
+const byellow = (s: string) => `${E}1;33m${s}${E}0m`;
+const blue = (s: string) => `${E}34m${s}${E}0m`;
+const bblue = (s: string) => `${E}1;34m${s}${E}0m`;
+const cyan = (s: string) => `${E}36m${s}${E}0m`;
+const magenta = (s: string) => `${E}35m${s}${E}0m`;
+
+const CRATES = ["serde", "tokio", "bytes", "quinn", "rustls", "ring", "tracing", "futures-util", "hashbrown", "parking_lot", "smallvec", "crossbeam-channel", "prost", "mio", "socket2", "libc", "memchr", "itoa", "anyhow", "thiserror", "clap", "rand", "criterion", "proptest"];
+const MODS = ["raft::log", "raft::election", "raft::snapshot", "transport::quic", "codec::frame", "storage::segment", "membership", "tls::session", "net::pool", "replica::apply"];
+
+export interface LogPlan {
+  /** lines (may include \r progress updates) */
+  lines: string[];
+  failLines: string[];
+}
+
+export function stepLog(kind: string, run: string, seed: number, ctx: { repo: string; sha: string; branch: string; job: string }): LogPlan {
+  const rnd = mulberry32(seed);
+  const L: string[] = [];
+  const head = `${dim("$")} ${bold(run)}`;
+  L.push(head);
+  const fail: string[] = [];
+  switch (kind) {
+    case "checkout": {
+      L.push(`Initialized empty Git repository in /work/${ctx.repo.split("/")[1]}/.git/`);
+      L.push(`${dim("remote:")} Enumerating objects: ${200 + Math.floor(rnd() * 3000)}, done.`);
+      L.push(`${dim("remote:")} Counting objects: 100% (${Math.floor(rnd() * 900)}/${Math.floor(rnd() * 900) + 900}), done.`);
+      L.push(`Receiving objects: 100% (${Math.floor(rnd() * 3000)}), ${(rnd() * 20 + 1).toFixed(2)} MiB | ${(rnd() * 80 + 20).toFixed(1)} MiB/s, done.`);
+      L.push(`HEAD is now at ${yellow(ctx.sha.slice(0, 7))} on ${cyan(ctx.branch)}`);
+      break;
+    }
+    case "cache": {
+      L.push(`${cyan("kiln")} cache key ${dim(`cargo-${ctx.sha.slice(0, 8)}-linux-x86_64`)}`);
+      const hit = rnd() < 0.8;
+      L.push(hit ? `${green("✓")} restored cargo-registry ${dim(`(${(rnd() * 900 + 100).toFixed(0)} MiB in ${(rnd() * 4 + 1).toFixed(1)}s)`)}` : `${yellow("!")} cache miss for target, falling back to ${dim("cargo-main-linux-x86_64")}`);
+      L.push(`${green("✓")} restored target ${dim(`(${(rnd() * 3 + 0.5).toFixed(1)} GiB)`)}`);
+      break;
+    }
+    case "fmt": {
+      L.push(`${dim("Checking formatting of")} ${Math.floor(rnd() * 200 + 40)} files`);
+      L.push(green("All files formatted correctly."));
+      fail.push(`${bred("Diff in")} /work/src/raft/log.rs at line ${Math.floor(rnd() * 400)}:`);
+      fail.push(`${red("-    let idx = self.entries.len() as u64 ;")}`);
+      fail.push(`${green("+    let idx = self.entries.len() as u64;")}`);
+      break;
+    }
+    case "compile":
+    case "clippy": {
+      const n = 14 + Math.floor(rnd() * 22);
+      for (let i = 0; i < n; i++) {
+        const c = pick(rnd, CRATES);
+        L.push(`${bgreen(kind === "clippy" && i > n - 4 ? "    Checking" : "   Compiling")} ${c} v${Math.floor(rnd() * 2)}.${Math.floor(rnd() * 40)}.${Math.floor(rnd() * 20)}`);
+        if (i % 5 === 4) L.push(`\r${bblue("    Building")} [${"=".repeat(Math.floor((i / n) * 30))}>${" ".repeat(30 - Math.floor((i / n) * 30))}] ${i}/${n}: ${c}`);
+      }
+      if (kind === "clippy" && rnd() < 0.5) {
+        L.push(`${byellow("warning")}${bold(": this expression creates a reference which is immediately dereferenced")}`);
+        L.push(`  ${bblue("-->")} src/codec/frame.rs:${Math.floor(rnd() * 300)}:${Math.floor(rnd() * 40)}`);
+        L.push(`   ${bblue("|")}`);
+        L.push(`${bblue(String(Math.floor(rnd() * 300)).padStart(3))}${bblue(" |")}     let n = decode(&buf[..]);`);
+        L.push(`   ${bblue("|")}                    ${byellow("^^^^^^^^^ help: change this to: `buf`")}`);
+      }
+      L.push(`${bgreen("    Finished")} \`${run.includes("release") ? "release" : "dev"}\` profile [${run.includes("release") ? "optimized" : "unoptimized + debuginfo"}] target(s) in ${(rnd() * 80 + 10).toFixed(2)}s`);
+      fail.push(`${bred("error[E0308]")}${bold(": mismatched types")}`);
+      fail.push(`  ${bblue("-->")} src/raft/snapshot.rs:${Math.floor(rnd() * 400)}:${Math.floor(rnd() * 30)}`);
+      fail.push(`   ${bblue("|")}     ${red("expected `u64`, found `usize`")}`);
+      fail.push(`${bred("error")}: could not compile \`${ctx.repo.split("/")[1]}\` (lib) due to 1 previous error`);
+      break;
+    }
+    case "test": {
+      const n = 18 + Math.floor(rnd() * 30);
+      L.push(`${bgreen("     Running")} unittests src/lib.rs (target/debug/deps/${ctx.repo.split("/")[1]?.replace(/-/g, "_")}-${ctx.sha.slice(0, 16)})`);
+      L.push("");
+      L.push(`running ${n} tests`);
+      for (let i = 0; i < n; i++) {
+        L.push(`test ${pick(rnd, MODS)}::tests::${pick(rnd, ["append", "truncate", "elect_leader", "vote_split", "install_snapshot", "replay", "rejects_stale_term", "roundtrip", "handshake", "pipelining"])}_${i} ... ${green("ok")}`);
+      }
+      L.push("");
+      L.push(`test result: ${green("ok")}. ${n} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in ${(rnd() * 9 + 0.3).toFixed(2)}s`);
+      fail.push(`test raft::election::tests::vote_split_${n} ... ${bred("FAILED")}`);
+      fail.push("");
+      fail.push("failures:");
+      fail.push("");
+      fail.push(`---- raft::election::tests::vote_split_${n} stdout ----`);
+      fail.push(`thread 'raft::election::tests::vote_split_${n}' panicked at src/raft/election.rs:${Math.floor(rnd() * 500)}:9:`);
+      fail.push(`assertion \`left == right\` failed: ${red("leader elected twice in term 7")}`);
+      fail.push(`  left: ${red("Some(NodeId(2))")}`);
+      fail.push(` right: ${green("Some(NodeId(3))")}`);
+      fail.push("");
+      fail.push(`test result: ${bred("FAILED")}. ${n - 1} passed; 1 failed; 0 ignored`);
+      break;
+    }
+    case "bench": {
+      const benches = ["append_entries/batch=64", "append_entries/batch=1024", "election/5-nodes", "snapshot/install/64MiB", "codec/decode/frame"];
+      for (const b of benches) {
+        const t = rnd() * 3 + 0.2;
+        const ch = (rnd() - 0.6) * 8;
+        L.push(`${bold(b.padEnd(34))}time:   [${(t * 0.98).toFixed(4)} ms ${bold(t.toFixed(4) + " ms")} ${(t * 1.02).toFixed(4)} ms]`);
+        L.push(`${" ".repeat(34)}change: [${(ch - 1).toFixed(2)}% ${bold(ch.toFixed(2) + "%")} ${(ch + 1).toFixed(2)}%] (p = 0.0${Math.floor(rnd() * 9)} < 0.05)`);
+        L.push(`${" ".repeat(34)}${ch < 0 ? green("Performance has improved.") : ch > 2 ? red("Performance has regressed.") : "No change in performance detected."}`);
+        if (rnd() < 0.4) L.push(`${yellow(`Found ${Math.floor(rnd() * 8) + 1} outliers among 100 measurements`)}`);
+      }
+      break;
+    }
+    case "upload":
+    case "package": {
+      L.push(`${cyan("kiln")} artifacts: ${Math.floor(rnd() * 40 + 3)} files, ${(rnd() * 120 + 4).toFixed(1)} MiB`);
+      L.push(`${green("✓")} uploaded ${dim(`sha256:${ctx.sha.slice(0, 24)}…`)}`);
+      break;
+    }
+    case "npm": {
+      L.push(`${dim("npm")} ${yellow("warn")} deprecated inflight@1.0.6`);
+      L.push(`\nadded ${Math.floor(rnd() * 600 + 200)} packages, and audited ${Math.floor(rnd() * 600 + 200)} packages in ${Math.floor(rnd() * 20 + 3)}s`);
+      L.push(`${bold(String(Math.floor(rnd() * 200 + 40)))} packages are looking for funding`);
+      L.push(`found ${bold(green("0"))} vulnerabilities`);
+      break;
+    }
+    case "lint":
+    case "tsc":
+    case "ruff": {
+      L.push(`${dim(">")} ${run.replace("npm run ", "")}`);
+      L.push(kind === "ruff" ? `All checks passed!` : `${green("✔")} No problems found in ${Math.floor(rnd() * 120 + 40)} files`);
+      fail.push(`${dim("src/components/header.tsx")}`);
+      fail.push(`  ${dim("42:7")}  ${red("error")}  'pathname' is assigned a value but never used  ${dim("@typescript-eslint/no-unused-vars")}`);
+      fail.push(`\n${bred("✖ 1 problem (1 error, 0 warnings)")}`);
+      break;
+    }
+    case "vite": {
+      L.push(`   ${magenta("▲ Next.js 16.3.4")}`);
+      L.push(`   Creating an optimized production build ...`);
+      L.push(` ${green("✓")} Compiled successfully in ${(rnd() * 20 + 5).toFixed(1)}s`);
+      for (const r of ["/", "/projects", "/projects/[slug]", "/blog", "/blog/[slug]", "/about"]) {
+        L.push(`${dim("├")} ${r.includes("[") ? blue("●") : "○"} ${r.padEnd(22)} ${(rnd() * 9 + 1).toFixed(2)} kB ${dim(`${(rnd() * 60 + 100).toFixed(0)} kB`)}`);
+      }
+      break;
+    }
+    case "e2e": {
+      L.push(`Running ${Math.floor(rnd() * 40 + 20)} tests using 4 workers`);
+      for (let i = 0; i < 12; i++) L.push(`  ${green("✓")}  ${i + 1} [chromium] › ${pick(rnd, ["home.spec.ts", "nav.spec.ts", "blog.spec.ts", "a11y.spec.ts"])}:${Math.floor(rnd() * 90)} › ${pick(rnd, ["renders hero", "motion toggle pauses", "mobile nav opens", "focus visible", "search filters"])} ${dim(`(${Math.floor(rnd() * 900 + 100)}ms)`)}`);
+      L.push(`\n  ${green(`${Math.floor(rnd() * 40 + 20)} passed`)} ${dim(`(${(rnd() * 40 + 10).toFixed(1)}s)`)}`);
+      break;
+    }
+    case "pytest": {
+      L.push(`${bold("============================= test session starts ==============================")}`);
+      L.push(`platform linux -- Python 3.1${Math.floor(rnd() * 2) + 2}.4, pytest-8.4.1`);
+      L.push(`collected ${Math.floor(rnd() * 300 + 50)} items\n`);
+      for (const f of ["tests/test_scheduler.py", "tests/test_worker.py", "tests/test_histogram.py", "tests/test_api.py"]) L.push(`${f} ${green(".".repeat(Math.floor(rnd() * 40 + 10)))} ${dim(`[${Math.floor(rnd() * 100)}%]`)}`);
+      L.push(`${bgreen(`========================= ${Math.floor(rnd() * 300 + 50)} passed in ${(rnd() * 30 + 2).toFixed(2)}s =========================`)}`);
+      break;
+    }
+    case "wheel":
+      L.push(`Building source distribution...`);
+      L.push(`Building wheel from source distribution...`);
+      L.push(`Successfully built ${green(`dist/hyperscale-0.${Math.floor(rnd() * 9)}.0-py3-none-any.whl`)}`);
+      break;
+    case "deploy":
+      L.push(`${cyan("argocd")} syncing application hyperlight-site (revision ${ctx.sha.slice(0, 7)})`);
+      L.push(`Deployment.apps/hyperlight-site  ${green("Synced")}  ${green("Healthy")}`);
+      L.push(`${green("✓")} rollout complete: 3/3 replicas updated`);
+      break;
+    default:
+      L.push("ok");
+  }
+  if (fail.length === 0) fail.push(bred("error: step failed"));
+  return { lines: L, failLines: fail };
+}

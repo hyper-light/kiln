@@ -555,8 +555,12 @@ async fn install_script(State(hub): S) -> Response {
 // ------------------------------------------------------------------ webhooks
 
 async fn github_hook(State(hub): S, headers: HeaderMap, body: axum::body::Bytes) -> R<StatusCode> {
-    if let Some(path) = &hub.cfg.gitops.webhook_secret_file {
-        let secret = tokio::fs::read_to_string(path).await.map_err(anyhow::Error::from)?;
+    // A configured but absent secret file means "no secret" (e.g. an optional mounted Secret).
+    let secret = match &hub.cfg.gitops.webhook_secret_file {
+        Some(path) => tokio::fs::read_to_string(path).await.ok().filter(|s| !s.trim().is_empty()),
+        None => None,
+    };
+    if let Some(secret) = secret {
         let want = format!("sha256={}", crate::util::hmac_hex(secret.trim().as_bytes(), &body));
         let got = headers.get("x-hub-signature-256").and_then(|v| v.to_str().ok()).unwrap_or("");
         if !crate::util::ct_eq(want.as_bytes(), got.as_bytes()) {

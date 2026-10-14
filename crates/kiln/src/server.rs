@@ -79,6 +79,8 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
         server: true,
     })?;
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    // Process restarts by the supervisor count as restarts too (generation 1 = first start).
+    crate::metrics::global().supervisor_restarts.add(hub.generation.saturating_sub(1));
 
     // Transport events. Each message is handled in isolation; the stream itself never ends while
     // the net thread lives (it restarts its endpoint internally).
