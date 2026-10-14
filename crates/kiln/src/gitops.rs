@@ -271,7 +271,9 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
         ctx.set("branch", t.branch.clone());
         ctx.set("event", t.event);
         ctx.set("repo", repo.name.clone());
-        let group = p.concurrency.as_ref().map(|c| ctx.interpolate(&c.group));
+        // Groups are scoped to the repository (as on GitHub): `ci-main` in two repos must not
+        // cancel each other.
+        let group = p.concurrency.as_ref().map(|c| format!("{}:{}", repo.name, ctx.interpolate(&c.group)));
         let planned = match pipeline::plan(&p, &ctx) {
             Ok(j) => j,
             Err(e) => {
