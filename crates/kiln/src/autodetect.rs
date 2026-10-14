@@ -45,6 +45,13 @@ const RUST: &str = r#"  rust:
     toolchain: rust
     resources: { cpu: "4", memory: 8Gi }
     timeout-minutes: 90
+    # CI-friendly profile: line tables instead of full debuginfo cuts linker memory several-fold
+    # (large workspaces otherwise get the linker OOM-killed), no incremental cache to bloat.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "4"
     steps:
       - name: system deps
         run: |
