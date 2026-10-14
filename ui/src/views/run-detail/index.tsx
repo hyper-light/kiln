@@ -340,7 +340,7 @@ function JobPanel({ job, onJobPatch }: { job: Job; onJobPatch: (j: Job) => void 
         />
         {job.needs.length > 0 && (
           <div className="mt-4 flex flex-wrap items-center gap-2 font-mono text-[10px] text-[#93a1b4]">
-            needs {job.needs.map((n) => <span key={n} className="chip">{n}</span>)}
+            needs {collapseNeeds(job.needs).map((n) => <span key={n} className="chip">{n}</span>)}
           </div>
         )}
       </div>
@@ -442,4 +442,15 @@ function StepRow({
       )}
     </div>
   );
+}
+
+/** `pods (a=0, b=1)` … `pods (a=7, b=5)` → `pods × 48`. */
+function collapseNeeds(needs: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const n of needs) {
+    const i = n.indexOf(" (");
+    const id = i > 0 ? n.slice(0, i) : n;
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  return [...counts].map(([id, c]) => (c > 1 ? `${id} × ${c}` : (needs.find((n) => n.startsWith(id)) ?? id)));
 }

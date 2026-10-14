@@ -70,9 +70,67 @@ export function layoutDag(jobs: Job[]) {
   return { placed, width, height };
 }
 
+/** Matrix legs (`id (k=v, …)`) of one job id collapse into a single node. */
+function specId(key: string) {
+  const i = key.indexOf(" (");
+  return i > 0 ? key.slice(0, i) : key;
+}
+
+const STATUS_RANK: Record<string, number> = {
+  running: 0, failed: 1, timed_out: 2, cancelled: 3, queued: 4, pending: 5, succeeded: 6, skipped: 7,
+};
+
+export interface DagGroup {
+  members: Job[];
+  counts: Record<string, number>;
+}
+
+/** Replace each set of matrix legs with one synthetic job keyed by the job id. */
+export function groupMatrix(jobs: Job[]): { nodes: Job[]; groups: Map<string, DagGroup> } {
+  const bySpec = new Map<string, Job[]>();
+  for (const j of jobs) {
+    const id = specId(j.key);
+    (bySpec.get(id) ?? bySpec.set(id, []).get(id)!).push(j);
+  }
+  const keyToNode = new Map<string, string>();
+  for (const [id, members] of bySpec) for (const m of members) keyToNode.set(m.key, members.length > 1 ? id : m.key);
+  const groups = new Map<string, DagGroup>();
+  const nodes: Job[] = [];
+  for (const [id, members] of bySpec) {
+    const needs = [...new Set(members.flatMap((m) => m.needs.map((n) => keyToNode.get(n) ?? n)))];
+    if (members.length === 1 && members[0]) {
+      nodes.push({ ...members[0], needs });
+      continue;
+    }
+    const counts: Record<string, number> = {};
+    for (const m of members) counts[m.status] = (counts[m.status] ?? 0) + 1;
+    const first = members[0]!;
+    const status = members.map((m) => m.status).sort((a, b) => (STATUS_RANK[a] ?? 9) - (STATUS_RANK[b] ?? 9))[0] ?? first.status;
+    const starts = members.map((m) => m.started_at).filter((x): x is number => x != null);
+    const ends = members.map((m) => m.finished_at);
+    const executors = [...new Set(members.map((m) => m.executor).filter(Boolean))];
+    groups.set(id, { members, counts });
+    nodes.push({
+      ...first,
+      id: `group:${id}`,
+      key: id,
+      display: `${id} × ${members.length}`,
+      status,
+      needs,
+      agent: null,
+      attempt: 0,
+      executor: executors.length === 1 ? (executors[0] ?? null) : null,
+      started_at: starts.length ? Math.min(...starts) : null,
+      finished_at: ends.every((e) => e != null) && ends.length ? Math.max(...(ends as number[])) : null,
+    });
+  }
+  return { nodes, groups };
+}
+
 export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: string | null; onSelect: (id: string) => void }) {
   const now = useNow();
-  const { placed, width, height } = React.useMemo(() => layoutDag(jobs), [jobs]);
+  const { nodes, groups } = React.useMemo(() => groupMatrix(jobs), [jobs]);
+  const { placed, width, height } = React.useMemo(() => layoutDag(nodes), [nodes]);
   const pos = new Map(placed.map((p) => [p.job.key, p]));
   const gradId = React.useId().replace(/:/g, "");
 
@@ -117,16 +175,29 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
         </svg>
         {placed.map(({ job, x, y }) => {
           const dur = spanSeconds(job.started_at, job.finished_at, now);
+          const group = groups.get(job.key);
+          const isSelected = group ? group.members.some((m) => m.id === selected) : selected === job.id;
+          // A group selects its most interesting leg: failing or running first.
+          const target = group
+            ? ([...group.members].sort((a, b) => (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9))[0]?.id ?? job.id)
+            : job.id;
+          const summary = group
+            ? Object.entries(group.counts)
+                .sort((a, b) => (STATUS_RANK[a[0]] ?? 9) - (STATUS_RANK[b[0]] ?? 9))
+                .map(([st, n]) => `${n} ${st.replace("_", " ")}`)
+                .join(" · ")
+            : null;
           return (
             <button
               key={job.id}
               type="button"
               className="dag-node"
               data-status={job.status}
-              data-selected={selected === job.id}
+              data-selected={isSelected}
+              data-group={group ? "true" : undefined}
               style={{ left: x, top: y, width: NODE_W, height: NODE_H }}
-              onClick={() => onSelect(job.id)}
-              aria-pressed={selected === job.id}
+              onClick={() => onSelect(target)}
+              aria-pressed={isSelected}
               aria-label={`${job.display}: ${job.status}`}
             >
               <span className="flex min-w-0 items-center gap-2">
@@ -136,7 +207,7 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
               </span>
               <span className="flex min-w-0 items-center gap-2 font-mono text-[10px] text-[#8c8f98]">
                 <span className={job.status === "running" ? "text-[#d8d0f2] tabular-nums" : "tabular-nums"}>{dur === null ? job.status.replace("_", " ") : formatDuration(dur)}</span>
-                {job.agent && <span className="min-w-0 truncate">· {job.agent}</span>}
+                {summary ? <span className="min-w-0 truncate">· {summary}</span> : job.agent && <span className="min-w-0 truncate">· {job.agent}</span>}
                 {job.executor && (
                   <span className="ml-auto shrink-0 rounded-full border border-white/10 px-1.5 text-[8.5px] tracking-[0.06em] text-[#a9acb5] uppercase">
                     {job.executor === "baremetal" ? "metal" : job.executor}
