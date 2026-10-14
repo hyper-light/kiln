@@ -158,13 +158,15 @@ groups:
           summary: Most GitOps polls are failing
           description: "{{ $value | humanizePercentage }} of repository polls failed over 15 minutes (network, token or GitHub outage)."
       - alert: KilnGithubRateLimitLow
-        expr: min(kiln_github_rate_remaining{job="kiln"}) < 200
+        # Ratio, not an absolute: unauthenticated GitHub allows only 60/h, which kiln barely uses
+        # (polling is `git ls-remote`, not the API).
+        expr: min(kiln_github_rate_remaining{job="kiln"} / (kiln_github_rate_limit{job="kiln"} > 0)) < 0.1
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: GitHub API rate limit almost exhausted
-          description: "Only {{ $value }} GitHub API requests remain. Configure a token or raise poll_seconds."
+          description: "Under {{ $value | humanizePercentage }} of the GitHub API quota remains. Configure a token or raise discover_seconds."
       - alert: KilnK8sPodErrors
         expr: sum(increase(kiln_k8s_pods_total{job="kiln",result="error"}[15m])) > 3
         for: 5m

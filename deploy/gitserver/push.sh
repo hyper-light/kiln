@@ -60,7 +60,6 @@ snapshot)
     git -C "$REPO_ROOT" add -A -- . \
         ':(exclude,glob)**/target/**' \
         ':(exclude,glob)**/node_modules/**' \
-        ':(exclude,glob)ui/dist/**' \
         ':(exclude,glob)**/.env' \
         ':(exclude,glob)**/*.token'
     tree="$(git -C "$REPO_ROOT" write-tree)"

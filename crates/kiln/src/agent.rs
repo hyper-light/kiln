@@ -261,7 +261,10 @@ pub async fn run(o: Opts, shutdown: CancellationToken) -> anyhow::Result<()> {
                                 net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                                 redial = Some(tokio::time::Instant::now() + Duration::from_secs(60));
                             }
-                            ServerMsg::Assign(a) => {
+                            ServerMsg::Assign(mut a) => {
+                                // The URL this agent reached the server through is the one that
+                                // works from here (NAT, NodePorts, cluster DNS all differ).
+                                a.server_url = o.server_url.clone();
                                 let id = a.job_id.clone();
                                 let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
                                 if draining || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {

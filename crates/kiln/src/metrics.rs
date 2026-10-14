@@ -141,6 +141,7 @@ pub struct Metrics {
     pub log_bytes: Counter,
     pub gitops_polls: CounterVec,
     pub gitops_rate_remaining: Gauge,
+    pub gitops_rate_limit: Gauge,
     pub terminal_sessions: Gauge,
     pub ws_clients: Gauge,
     pub supervisor_restarts: Counter,
@@ -165,6 +166,7 @@ pub fn global() -> &'static Metrics {
         log_bytes: Counter::default(),
         gitops_polls: CounterVec::new(&["result"]),
         gitops_rate_remaining: Gauge::default(),
+        gitops_rate_limit: Gauge::default(),
         terminal_sessions: Gauge::default(),
         ws_clients: Gauge::default(),
         supervisor_restarts: Counter::default(),
@@ -216,6 +218,7 @@ pub fn render() -> String {
     scalar!("kiln_agent_slots_busy", "gauge", "Job slots in use.", m.agent_slots_busy.get());
     scalar!("kiln_log_bytes_total", "counter", "Bytes of job log ingested.", m.log_bytes.get());
     scalar!("kiln_github_rate_remaining", "gauge", "GitHub API requests remaining.", m.gitops_rate_remaining.get());
+    scalar!("kiln_github_rate_limit", "gauge", "GitHub API request quota per window.", m.gitops_rate_limit.get());
     scalar!("kiln_terminal_sessions", "gauge", "Open PTY sessions.", m.terminal_sessions.get());
     scalar!("kiln_ws_clients", "gauge", "Connected UI websocket clients.", m.ws_clients.get());
     scalar!("kiln_supervisor_restarts_total", "counter", "Supervised subsystem restarts.", m.supervisor_restarts.get());

@@ -762,8 +762,18 @@ impl Store {
                         "avg_seconds": r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
                     }))
                 })?;
+                let mut found = std::collections::HashMap::new();
                 for row in rows {
-                    hourly.push(row?);
+                    let v = row?;
+                    found.insert(v.get("ts").and_then(serde_json::Value::as_i64).unwrap_or(0), v);
+                }
+                // A fixed 24-bucket series (zero-filled) so charts keep a real time axis.
+                let first = (since / 3600 + 1) * 3600;
+                for h in 0..24 {
+                    let ts = first + h * 3600;
+                    hourly.push(found.remove(&ts).unwrap_or_else(|| {
+                        serde_json::json!({ "ts": ts, "succeeded": 0, "failed": 0, "avg_seconds": 0.0 })
+                    }));
                 }
             }
             Ok(serde_json::json!({

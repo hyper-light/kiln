@@ -393,6 +393,9 @@ async fn discover(hub: &Hub, http: &reqwest::Client) -> anyhow::Result<()> {
             if let Some(rem) = resp.headers().get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()) {
                 crate::metrics::global().gitops_rate_remaining.set(rem);
             }
+            if let Some(lim) = resp.headers().get("x-ratelimit-limit").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()) {
+                crate::metrics::global().gitops_rate_limit.set(lim);
+            }
             if !resp.status().is_success() {
                 anyhow::bail!("github org {org}: HTTP {}", resp.status());
             }

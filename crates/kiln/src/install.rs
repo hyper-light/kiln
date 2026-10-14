@@ -41,6 +41,10 @@ pub struct InstallArgs {
     /// Agent: server URL.
     #[arg(long, env = "KILN_SERVER")]
     pub server: Option<String>,
+    /// Agent: QUIC address to dial (overrides what the server advertises, e.g. when the server
+    /// runs in a cluster and is reached through forwarded ports).
+    #[arg(long, env = "KILN_QUIC")]
+    pub quic: Option<String>,
     /// Agent: join token (consumed during install; never stored in the boot command).
     #[arg(long, env = "KILN_JOIN_TOKEN")]
     pub token: Option<String>,
@@ -184,7 +188,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
     let state_dir = crate::config::default_data_dir().join("agent");
     let opts = crate::agent::Opts {
         server_url: server.clone(),
-        quic: None,
+        quic: a.quic.clone(),
         name: name.clone(),
         labels: labels.clone(),
         slots: a.slots.unwrap_or(1),
@@ -208,6 +212,10 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         "--labels".to_owned(),
         labels.join(","),
     ];
+    if let Some(q) = &a.quic {
+        args.push("--quic".to_owned());
+        args.push(q.clone());
+    }
     if let Some(s) = a.slots {
         args.push("--slots".to_owned());
         args.push(s.to_string());
@@ -234,11 +242,14 @@ fn setup_boot(a: &InstallArgs, system: bool, unit: &str, bin: &Path, args: &[Str
         Boot::Systemd => {
             let body = format!(
                 "[Unit]\nDescription=kiln {unit} (self-supervising CI/CD job server)\nAfter=network-online.target\nWants=network-online.target\n\n\
-                 [Service]\nType=simple\nEnvironment=KILN_CONFIG={cfg}\nExecStart={exec}\n\
+                 [Service]\nType=simple\nEnvironment=KILN_CONFIG={cfg}\n\
+                 # The installing user's PATH, so jobs find the same toolchains (nvm, cargo, uv, go).\n\
+                 Environment=\"PATH={path}\"\nExecStart={exec}\n\
                  # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
                  Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\n\
                  [Install]\nWantedBy={target}\n",
                 cfg = config.display(),
+                path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
                 target = if system { "multi-user.target" } else { "default.target" },
             );
             let (path, user_flag): (PathBuf, &[&str]) = if system {
@@ -248,7 +259,9 @@ fn setup_boot(a: &InstallArgs, system: bool, unit: &str, bin: &Path, args: &[Str
             };
             crate::util::write_secret(&path, body.as_bytes(), 0o644)?;
             run(Command::new("systemctl").args(user_flag).arg("daemon-reload"))?;
-            run(Command::new("systemctl").args(user_flag).args(["enable", "--now", unit]))?;
+            run(Command::new("systemctl").args(user_flag).args(["enable", unit]))?;
+            // restart (not just start) so a re-install applies the new unit and binary.
+            run(Command::new("systemctl").args(user_flag).args(["restart", unit]))?;
             say(format!("boot        systemd {} unit {}", if system { "system" } else { "user" }, path.display()));
             if !system {
                 // Start at boot without a login session. Allowed for one's own user by default
