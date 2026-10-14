@@ -171,7 +171,8 @@ extraVolumeMounts: []
 nodeSelector: {}
 tolerations: []
 affinity: {}
-priorityClassName: ""
+# The server outranks CI job pods (see priorityClasses below).
+priorityClassName: kiln-control
 
 terminationGracePeriodSeconds: 30
 
@@ -281,3 +282,18 @@ prepull:
     - docker.io/library/erlang:28
     - docker.io/library/debian:bookworm
     - docker.io/library/alpine:3.24
+
+# Scheduling priority: kiln server above everything CI runs; job pods preemptible and below the
+# rest of the platform. Set create=false if the classes are managed elsewhere.
+priorityClasses:
+  create: true
+  control: kiln-control
+  job: kiln-job
+
+# Total requests CI job pods may hold (leave room for ArgoCD, Prometheus, Grafana, kiln).
+# Default sized for the 3 × (8 CPU, 16 GiB) dev cluster.
+jobQuota:
+  enabled: true
+  cpu: "18"
+  memory: 36Gi
+  pods: "64"

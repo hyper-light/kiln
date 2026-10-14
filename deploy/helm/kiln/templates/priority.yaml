@@ -1,0 +1,38 @@
+{{- if .Values.priorityClasses.create }}
+# The kiln server outranks everything CI runs, and job pods rank below ordinary workloads (ArgoCD,
+# Prometheus, Grafana). When the cluster is full, the scheduler preempts job pods — kiln notices
+# the lost agent and requeues the job — instead of leaving the control plane Pending.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.priorityClasses.control }}
+  labels: {{- include "kiln.labels" . | nindent 4 }}
+value: 100000
+globalDefault: false
+description: kiln server (CI control plane)
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ .Values.priorityClasses.job }}
+  labels: {{- include "kiln.labels" . | nindent 4 }}
+value: -100
+preemptionPolicy: Never
+globalDefault: false
+description: kiln job pods (preemptible, never preempt others)
+{{- end }}
+{{- if .Values.jobQuota.enabled }}
+---
+# Caps what CI may request in the jobs namespace so the platform always keeps headroom.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: kiln-jobs
+  namespace: {{ include "kiln.jobsNamespace" . }}
+  labels: {{- include "kiln.labels" . | nindent 4 }}
+spec:
+  hard:
+    requests.cpu: {{ .Values.jobQuota.cpu | quote }}
+    requests.memory: {{ .Values.jobQuota.memory | quote }}
+    pods: {{ .Values.jobQuota.pods | quote }}
+{{- end }}

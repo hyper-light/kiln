@@ -791,8 +791,18 @@ impl Hub {
                         }
                         Err(e) => {
                             metrics::global().k8s_pods_launched.inc(&["error"]);
-                            tracing::error!(job = %job.id, error = %format!("{e:#}"), "pod launch failed");
-                            self.launching.lock().insert(job.id.clone(), Instant::now());
+                            // Usually the jobs-namespace quota is full: retry in ~15 s rather
+                            // than after the full start timeout.
+                            let msg = format!("{e:#}");
+                            if msg.contains("exceeded quota") {
+                                tracing::debug!(job = %job.id, "job quota full; waiting for capacity");
+                            } else {
+                                tracing::error!(job = %job.id, error = %msg, "pod launch failed");
+                            }
+                            let retry_at = Instant::now()
+                                .checked_sub(timeout.saturating_sub(Duration::from_secs(15)))
+                                .unwrap_or_else(Instant::now);
+                            self.launching.lock().insert(job.id.clone(), retry_at);
                         }
                     }
                 }

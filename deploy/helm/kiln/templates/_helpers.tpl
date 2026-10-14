@@ -90,6 +90,9 @@ Effective kiln.toml as YAML: derived defaults overlaid with .Values.config.
 {{- if .Values.cache.enabled -}}
 {{- $_ := set $k8s "cache_pvc" .Values.cache.name -}}
 {{- end -}}
+{{- if .Values.priorityClasses.create -}}
+{{- $_ := set $k8s "priority_class" .Values.priorityClasses.job -}}
+{{- end -}}
 {{- $gitops := dict -}}
 {{- if .Values.github.existingSecret -}}
 {{- $_ := set $gitops "github_token_file" (printf "/etc/kiln/secrets/%s" .Values.github.tokenKey) -}}

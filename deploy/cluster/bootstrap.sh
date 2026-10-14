@@ -211,6 +211,19 @@ derive_sizes() {
 }
 
 # --------------------------------------------------------------------------- cluster
+# With the docker driver every node *reports* the whole host's CPU and memory, although its
+# container is capped at NODE_CPUS / NODE_MEMORY_MB. Kubernetes then overcommits ~N× and the kernel
+# OOM-kills job pods. Reserve the difference in the kubelet so allocatable == the node's real size.
+kubelet_reservation() {
+    local cpus mem_kib node_kib
+    cpus="$(nproc)"
+    mem_kib="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+    node_kib=$(( ${NODE_MEMORY_MB:-4096} * 1024 ))
+    printf 'kubelet.system-reserved=cpu=%s,memory=%sKi' \
+        "$(( cpus > ${NODE_CPUS:-2} ? cpus - ${NODE_CPUS:-2} : 0 ))" \
+        "$(( mem_kib > node_kib ? mem_kib - node_kib : 0 ))"
+}
+
 start_cluster() {
     local host
     host="$(minikube -p "$PROFILE" status --format '{{.Host}}' 2>/dev/null | head -n1 || true)"
@@ -241,7 +254,30 @@ start_cluster() {
             --disk-size="$NODE_DISK" \
             --kubernetes-version="$K8S_VERSION" \
             --addons=metrics-server,storage-provisioner-rancher \
+            --extra-config="$(kubelet_reservation)" \
             --wait=all
+    fi
+    local alloc_cpu
+    alloc_cpu="$(kc get node "$PROFILE" -o jsonpath='{.status.allocatable.cpu}' 2>/dev/null || true)"
+    if [ -n "$alloc_cpu" ] && [ "$alloc_cpu" = "$(nproc)" ] && [ "$(nproc)" -gt "${NODE_CPUS:-0}" ]; then
+        # The node size minikube was created with (docker's NanoCpus is 0 under the docker driver).
+        local profile_json="${MINIKUBE_HOME:-$HOME/.minikube}/profiles/$PROFILE/config.json"
+        [ -n "$NODE_CPUS" ] || NODE_CPUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["CPUs"])' "$profile_json")"
+        [ -n "$NODE_MEMORY_MB" ] || NODE_MEMORY_MB="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["Memory"])' "$profile_json")"
+        if [ "${NODE_CPUS:-0}" -lt 1 ] || [ "${NODE_MEMORY_MB:-0}" -lt 1024 ]; then
+            die "cannot determine node size from $profile_json; pass --cpus and --memory"
+        fi
+        log "nodes advertise the whole host (${alloc_cpu} CPUs); reserving the rest in the kubelet: $(kubelet_reservation)"
+        minikube start -p "$PROFILE" --extra-config="$(kubelet_reservation)"
+        local n
+        for n in $(kc get nodes -o jsonpath='{.items[*].metadata.name}'); do
+            docker exec "$n" sh -c 'systemctl daemon-reload && systemctl restart kubelet' || warn "could not restart kubelet on $n"
+        done
+        for _ in $(seq 1 60); do
+            [ "$(kc get nodes -o jsonpath='{.items[*].status.allocatable.cpu}' | tr ' ' '\n' | sort -u)" = "$NODE_CPUS" ] && break
+            sleep 2
+        done
+        ok "nodes now advertise $(kc get nodes -o jsonpath='{.items[0].status.allocatable.cpu}') CPUs each"
     fi
     minikube -p "$PROFILE" addons enable metrics-server >/dev/null
     minikube -p "$PROFILE" addons enable storage-provisioner-rancher >/dev/null

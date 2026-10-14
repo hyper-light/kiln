@@ -115,6 +115,7 @@ impl K8s {
             },
             spec: Some(PodSpec {
                 restart_policy: Some("Never".into()),
+                priority_class_name: self.cfg.priority_class.clone(),
                 service_account_name: Some(self.cfg.service_account.clone()),
                 automount_service_account_token: Some(false),
                 active_deadline_seconds: Some(i64::from(spec.timeout_minutes) * 60 + 900),

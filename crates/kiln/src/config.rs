@@ -103,6 +103,8 @@ pub struct Kubernetes {
     /// URL / address pods use to reach the server (defaults to public_url / quic_advertise).
     pub server_url: Option<String>,
     pub server_quic: Option<String>,
+    /// PriorityClass for job pods (low, so CI never starves the control plane).
+    pub priority_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +224,7 @@ impl Default for Kubernetes {
             default_memory: "2Gi".into(),
             server_url: None,
             server_quic: None,
+            priority_class: None,
         }
     }
 }
