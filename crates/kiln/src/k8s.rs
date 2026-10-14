@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, PersistentVolumeClaimVolumeSource, Pod, PodSpec, ResourceRequirements,
+    Affinity, Container, NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm,
+    PreferredSchedulingTerm, EnvVar, PersistentVolumeClaimVolumeSource, Pod, PodSpec, ResourceRequirements,
     Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -116,6 +117,25 @@ impl K8s {
             spec: Some(PodSpec {
                 restart_policy: Some("Never".into()),
                 priority_class_name: self.cfg.priority_class.clone(),
+                // Prefer worker nodes: the control-plane node keeps room for the platform (kiln,
+                // ArgoCD, Prometheus), so restarting those rarely needs to preempt a build.
+                affinity: Some(Affinity {
+                    node_affinity: Some(NodeAffinity {
+                        preferred_during_scheduling_ignored_during_execution: Some(vec![PreferredSchedulingTerm {
+                            weight: 100,
+                            preference: NodeSelectorTerm {
+                                match_expressions: Some(vec![NodeSelectorRequirement {
+                                    key: "node-role.kubernetes.io/control-plane".into(),
+                                    operator: "DoesNotExist".into(),
+                                    values: None,
+                                }]),
+                                ..Default::default()
+                            },
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 service_account_name: Some(self.cfg.service_account.clone()),
                 automount_service_account_token: Some(false),
                 active_deadline_seconds: Some(i64::from(spec.timeout_minutes) * 60 + 900),
