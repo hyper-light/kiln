@@ -430,7 +430,7 @@ impl Hub {
             AgentMsg::Reject { job, reason } => {
                 if self.owns_job(peer, &job) {
                     self.release_slot(&agent, &job);
-                    self.store.requeue_job(job.clone(), format!("rejected by {agent}: {reason}")).await?;
+                    self.store.unclaim_job(job.clone(), format!("declined by {agent}: {reason}")).await?;
                     self.emit_job(&job).await;
                     self.wake.notify_one();
                 }
@@ -760,7 +760,13 @@ impl Hub {
                     if !job.labels.iter().any(|l| l == "k8s") {
                         continue;
                     }
-                    let launched_at = self.launching.lock().get(&job.id).copied();
+                    let mut launched_at = self.launching.lock().get(&job.id).copied();
+                    // After a server restart the launch table is empty, but the job's pod may
+                    // already exist (Pending or about to connect): adopt it instead of duplicating.
+                    if launched_at.is_none() && k.job_pod_alive(&job.id).await {
+                        self.launching.lock().insert(job.id.clone(), Instant::now());
+                        launched_at = Some(Instant::now());
+                    }
                     let timeout = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
                     if let Some(t) = launched_at {
                         if t.elapsed() < timeout {

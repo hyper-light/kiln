@@ -55,7 +55,7 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
     let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
     let requeued = store.recover().await?;
     if requeued > 0 {
-        tracing::warn!(requeued, "recovered jobs that were running at last shutdown");
+        tracing::warn!(jobs = requeued, "jobs were running at last shutdown; waiting for their agents to reclaim them");
     }
     let logs = crate::logs::Logs::new(cfg.data("logs"), cfg.retention.max_job_log_mb.saturating_mul(1 << 20));
     let pki = Arc::new(crate::pki::Pki::open(&cfg.data("pki"))?);

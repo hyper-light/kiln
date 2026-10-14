@@ -76,14 +76,18 @@ const PYTHON: &str = r#"  python:
     name: python install + test
     runs-on: [k8s]
     toolchain: python
-    resources: { cpu: "2", memory: 4Gi }
+    resources: { cpu: "2", memory: 6Gi }
     timeout-minutes: 45
     steps:
       - name: install
         run: |
-          if [ -f uv.lock ]; then uv sync --all-extras --frozen
-          elif [ -f pyproject.toml ] || [ -f setup.py ]; then uv venv -q && uv pip install -e ".[test]" 2>/dev/null || uv pip install -e .
+          if [ -f uv.lock ]; then uv sync --all-extras --all-groups --frozen
+          elif [ -f pyproject.toml ]; then uv sync --all-extras --all-groups || { uv venv -q && uv pip install -e .; }
+          elif [ -f setup.py ]; then uv venv -q && uv pip install -e .
           else uv venv -q && uv pip install -r requirements.txt; fi
+          for f in requirements.txt requirements-dev.txt requirements-test.txt dev-requirements.txt test-requirements.txt; do
+            if [ -f "$f" ]; then uv pip install -q -r "$f"; fi
+          done
       - name: test
         run: |
           if [ -d tests ] || [ -d test ]; then uv run --with pytest pytest -q

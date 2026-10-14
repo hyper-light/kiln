@@ -240,23 +240,36 @@ impl Store {
         .map_err(|e| anyhow::anyhow!("store task failed: {e}"))?
     }
 
-    /// After an unclean stop: anything that was running is requeued (bare-metal jobs whose agent
-    /// is gone) and every agent is marked disconnected until it reconnects.
+    /// After a server restart every agent is marked disconnected until it reconnects. Running jobs
+    /// are left alone: agents keep executing through a server outage and reclaim their jobs in
+    /// `Hello`; whatever is not reclaimed within the grace period is requeued by the scheduler.
+    /// Returns how many jobs are awaiting reclamation.
     pub async fn recover(&self) -> anyhow::Result<usize> {
         self.call(|c| {
+            c.execute("UPDATE agents SET connected = 0", [])?;
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM jobs WHERE status = 'running'", [], |r| r.get(0))?;
+            Ok(usize::try_from(n).unwrap_or(0))
+        })
+        .await
+    }
+
+    /// Put a claimed job back in the queue *without* spending an attempt (the agent declined it
+    /// before doing any work).
+    pub async fn unclaim_job(&self, id: String, note: String) -> anyhow::Result<()> {
+        self.call(move |c| {
             let tx = c.transaction()?;
-            tx.execute("UPDATE agents SET connected = 0", [])?;
-            let n = tx.execute(
-                "UPDATE jobs SET status = 'queued', agent = NULL, attempt = attempt + 1,
-                   error = 'requeued after server restart' WHERE status = 'running'",
-                [],
+            tx.execute(
+                "UPDATE jobs SET status = 'queued', agent = NULL, executor = NULL, started_at = NULL,
+                   error = ?2 WHERE id = ?1 AND status = 'running'",
+                params![id, note],
             )?;
             tx.execute(
-                "UPDATE steps SET status = 'pending', started_at = NULL WHERE status = 'running'",
-                [],
+                "UPDATE steps SET status = 'pending', started_at = NULL, finished_at = NULL,
+                   exit_code = NULL WHERE job_id = ?1",
+                [&id],
             )?;
             tx.commit()?;
-            Ok(n)
+            Ok(())
         })
         .await
     }
@@ -1147,6 +1160,14 @@ mod tests {
         let a = q.first().map(|j| j.id.clone()).unwrap_or_default();
         assert!(s.claim_job(a.clone(), "ag".into(), "baremetal".into()).await?);
         assert!(!s.claim_job(a.clone(), "ag2".into(), "baremetal".into()).await?);
+        // A declined job goes back to the queue without spending an attempt.
+        s.unclaim_job(a.clone(), "declined".into()).await?;
+        let back = s.job(a.clone()).await?.ok_or_else(|| anyhow::anyhow!("job vanished"))?;
+        assert_eq!((back.status, back.attempt), (Status::Queued, 0));
+        // Running jobs survive a server restart untouched, awaiting reclamation by their agent.
+        assert!(s.claim_job(a.clone(), "ag".into(), "baremetal".into()).await?);
+        assert_eq!(s.recover().await?, 1);
+        assert_eq!(s.job(a.clone()).await?.map(|j| j.status), Some(Status::Running));
         let (_, settled) = s.finish_job(a, Status::Failed, Some(1), None, None, None).await?;
         assert_eq!(settled, Some(Status::Failed));
         let jobs = s.jobs("run1".into(), false).await?;
