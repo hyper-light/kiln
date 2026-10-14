@@ -127,6 +127,13 @@ impl K8s {
                     image_pull_policy: Some(self.cfg.image_pull_policy.clone()),
                     command: Some(vec!["cp".into(), "/usr/local/bin/kiln".into(), "/kiln-bin/kiln".into()]),
                     volume_mounts: Some(vec![mount("kiln-bin", "/kiln-bin")]),
+                    // Explicit requests: a namespace ResourceQuota rejects pods with any container
+                    // lacking them (init containers included).
+                    resources: Some(ResourceRequirements {
+                        requests: Some(BTreeMap::from([("cpu".to_owned(), q("50m")), ("memory".to_owned(), q("32Mi"))])),
+                        limits: Some(BTreeMap::from([("memory".to_owned(), q("128Mi"))])),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }]),
                 containers: vec![Container {
