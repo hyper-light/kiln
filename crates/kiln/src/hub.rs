@@ -26,6 +26,8 @@ use crate::store::{AgentRow, Job, Status, Store};
 const AGENT_GRACE: Duration = Duration::from_secs(45);
 /// Host samples kept per agent for the UI charts (1 h at 5 s).
 const HISTORY: usize = 720;
+/// How long an agent that declined a job is not offered that job again.
+const DECLINE_BACKOFF: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentLive {
@@ -87,6 +89,8 @@ pub struct Hub {
     pub shutdown: CancellationToken,
     /// Agents that have been sent Cancel for a job, with when (for the timeout escalation).
     cancel_sent: Mutex<HashMap<String, Instant>>,
+    /// (job, agent) pairs recently declined: not offered again until DECLINE_BACKOFF passes.
+    declined: Mutex<HashMap<(String, String), Instant>>,
 }
 
 impl Hub {
@@ -126,6 +130,7 @@ impl Hub {
             gitops_kick: Notify::new(),
             shutdown,
             cancel_sent: Mutex::new(HashMap::new()),
+            declined: Mutex::new(HashMap::new()),
         })
     }
 
@@ -354,10 +359,18 @@ impl Hub {
         metrics::agent_samples().write().remove(name);
         self.update_slot_gauges();
         self.emit_agent(&snapshot);
-        if snapshot.ephemeral {
-            // A pod agent never comes back; its job is requeued now.
-            self.requeue_agent_jobs(name, "agent pod disconnected").await;
-            self.agents.lock().remove(name);
+        // Connections drop transiently (network blips, server restarts): every agent, pods
+        // included, gets AGENT_GRACE to reconnect and reclaim its jobs. A pod that is really gone
+        // (deleted, evicted, OOM-killed) is requeued right away.
+        if snapshot.ephemeral && !snapshot.running.is_empty() {
+            let gone = match self.k8s.get().and_then(Option::as_ref) {
+                Some(k) => !k.agent_pod_alive(name).await,
+                None => false,
+            };
+            if gone {
+                self.requeue_agent_jobs(name, "agent pod is gone").await;
+                self.agents.lock().remove(name);
+            }
         }
     }
 
@@ -430,6 +443,7 @@ impl Hub {
             AgentMsg::Reject { job, reason } => {
                 if self.owns_job(peer, &job) {
                     self.release_slot(&agent, &job);
+                    self.declined.lock().insert((job.clone(), agent.clone()), Instant::now());
                     self.store.unclaim_job(job.clone(), format!("declined by {agent}: {reason}")).await?;
                     self.emit_job(&job).await;
                     self.wake.notify_one();
@@ -495,8 +509,20 @@ impl Hub {
             }
         }
         for j in &h.running {
-            if !keep.contains(j) {
-                self.send_peer(peer, &ServerMsg::Cancel { job: j.clone(), reason: "unknown to server".into() })
+            if keep.contains(j) {
+                continue;
+            }
+            // The server requeued this job while the agent was away, but the agent kept working:
+            // take it back (claim) rather than throwing the work away. Only a job that has since
+            // been taken by someone else (or settled) is cancelled on this agent.
+            let executor = if h.ephemeral { "k8s" } else { "baremetal" };
+            if self.store.claim_job(j.clone(), name.clone(), executor.into()).await? {
+                tracing::info!(job = %j, agent = %name, "agent reclaimed a requeued job");
+                self.launching.lock().remove(j);
+                keep.push(j.clone());
+                self.emit_job(j).await;
+            } else {
+                self.send_peer(peer, &ServerMsg::Cancel { job: j.clone(), reason: "job was reassigned".into() })
                     .await;
             }
         }
@@ -835,10 +861,17 @@ impl Hub {
     }
 
     fn pick_agent(&self, job: &Job) -> Option<String> {
+        let declined = self.declined.lock().clone();
         let g = self.agents.lock();
         let exclusive = job.spec.as_ref().is_some_and(|s| s.exclusive);
         g.values()
             .filter(|a| a.connected && !a.draining && !a.exclusive)
+            .filter(|a| !a.running.contains(&job.id))
+            .filter(|a| {
+                declined
+                    .get(&(job.id.clone(), a.name.clone()))
+                    .is_none_or(|t| t.elapsed() >= DECLINE_BACKOFF)
+            })
             .filter(|a| match &a.dedicated_job {
                 Some(d) => d == &job.id,
                 None => true,
@@ -904,6 +937,10 @@ impl Hub {
         for name in lost {
             self.requeue_agent_jobs(&name, "agent did not reconnect").await;
         }
+        self.agents.lock().retain(|_, a| {
+            !(a.ephemeral && !a.connected && a.running.is_empty() && a.lost_at.is_some_and(|t| t.elapsed() > AGENT_GRACE))
+        });
+        self.declined.lock().retain(|_, t| t.elapsed() < DECLINE_BACKOFF);
         // Running jobs assigned to agents we have no session for at all (after a server restart).
         if self.started.elapsed() > AGENT_GRACE
             && let Ok(running) = self.store.running_jobs().await {

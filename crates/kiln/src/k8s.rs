@@ -209,6 +209,19 @@ impl K8s {
         })
     }
 
+    /// Is the pod an ephemeral agent runs in still alive (agents are named after their pod)?
+    pub async fn agent_pod_alive(&self, pod: &str) -> bool {
+        match self.pods.get_opt(pod).await {
+            Ok(Some(p)) => {
+                let phase = p.status.and_then(|s| s.phase).unwrap_or_default();
+                p.metadata.deletion_timestamp.is_none() && (phase == "Pending" || phase == "Running")
+            }
+            Ok(None) => false,
+            // Unknown (API hiccup): assume alive and let the grace period decide.
+            Err(_) => true,
+        }
+    }
+
     pub async fn delete_job_pods(&self, job: &str) {
         let lp = ListParams::default().labels(&format!("{MANAGED},{JOB_LABEL}={job}"));
         match self.pods.list(&lp).await {
