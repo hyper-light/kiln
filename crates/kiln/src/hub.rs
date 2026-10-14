@@ -944,8 +944,15 @@ impl Hub {
         // Running jobs assigned to agents we have no session for at all (after a server restart).
         if self.started.elapsed() > AGENT_GRACE
             && let Ok(running) = self.store.running_jobs().await {
-                let known: HashSet<String> =
-                    self.agents.lock().values().filter(|a| a.connected).flat_map(|a| a.running.clone()).collect();
+                // Jobs held by a connected agent, or by one still inside its reconnect grace, are
+                // not orphans.
+                let known: HashSet<String> = self
+                    .agents
+                    .lock()
+                    .values()
+                    .filter(|a| a.connected || a.lost_at.is_some_and(|t| t.elapsed() <= AGENT_GRACE))
+                    .flat_map(|a| a.running.clone())
+                    .collect();
                 for j in running {
                     if !known.contains(&j.id) && j.agent.as_deref() != Some("-")
                         && let Ok(true) = self.store.requeue_job(j.id.clone(), "orphaned after restart".into()).await {

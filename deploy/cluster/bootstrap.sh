@@ -214,14 +214,18 @@ derive_sizes() {
 # With the docker driver every node *reports* the whole host's CPU and memory, although its
 # container is capped at NODE_CPUS / NODE_MEMORY_MB. Kubernetes then overcommits ~N× and the kernel
 # OOM-kills job pods. Reserve the difference in the kubelet so allocatable == the node's real size.
+# Beyond that, keep SYSTEM_HEADROOM inside each node for kubelet, the container runtime and system
+# daemons — otherwise two big builds on one node starve the kubelet and the node goes NotReady.
+SYSTEM_HEADROOM_MILLICPU="${KILN_SYSTEM_HEADROOM_MILLICPU:-500}"
+SYSTEM_HEADROOM_KIB="${KILN_SYSTEM_HEADROOM_KIB:-1572864}" # 1.5 GiB
 kubelet_reservation() {
     local cpus mem_kib node_kib
     cpus="$(nproc)"
     mem_kib="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
     node_kib=$(( ${NODE_MEMORY_MB:-4096} * 1024 ))
-    printf 'kubelet.system-reserved=cpu=%s,memory=%sKi' \
-        "$(( cpus > ${NODE_CPUS:-2} ? cpus - ${NODE_CPUS:-2} : 0 ))" \
-        "$(( mem_kib > node_kib ? mem_kib - node_kib : 0 ))"
+    printf 'kubelet.system-reserved=cpu=%sm,memory=%sKi' \
+        "$(( (cpus > ${NODE_CPUS:-2} ? cpus - ${NODE_CPUS:-2} : 0) * 1000 + SYSTEM_HEADROOM_MILLICPU ))" \
+        "$(( (mem_kib > node_kib ? mem_kib - node_kib : 0) + SYSTEM_HEADROOM_KIB ))"
 }
 
 start_cluster() {
@@ -259,7 +263,12 @@ start_cluster() {
     fi
     local alloc_cpu
     alloc_cpu="$(kc get node "$PROFILE" -o jsonpath='{.status.allocatable.cpu}' 2>/dev/null || true)"
-    if [ -n "$alloc_cpu" ] && [ "$alloc_cpu" = "$(nproc)" ] && [ "$(nproc)" -gt "${NODE_CPUS:-0}" ]; then
+    local want_cpu=""
+    if [ -f "${MINIKUBE_HOME:-$HOME/.minikube}/profiles/$PROFILE/config.json" ]; then
+        want_cpu="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["CPUs"]; print(f"{c*1000-int(sys.argv[2])}m")' \
+            "${MINIKUBE_HOME:-$HOME/.minikube}/profiles/$PROFILE/config.json" "$SYSTEM_HEADROOM_MILLICPU" 2>/dev/null || true)"
+    fi
+    if [ -n "$alloc_cpu" ] && [ -n "$want_cpu" ] && [ "$alloc_cpu" != "$want_cpu" ]; then
         # The node size minikube was created with (docker's NanoCpus is 0 under the docker driver).
         local profile_json="${MINIKUBE_HOME:-$HOME/.minikube}/profiles/$PROFILE/config.json"
         [ -n "$NODE_CPUS" ] || NODE_CPUS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["CPUs"])' "$profile_json")"
@@ -267,14 +276,14 @@ start_cluster() {
         if [ "${NODE_CPUS:-0}" -lt 1 ] || [ "${NODE_MEMORY_MB:-0}" -lt 1024 ]; then
             die "cannot determine node size from $profile_json; pass --cpus and --memory"
         fi
-        log "nodes advertise the whole host (${alloc_cpu} CPUs); reserving the rest in the kubelet: $(kubelet_reservation)"
+        log "nodes advertise ${alloc_cpu} CPUs (want ${want_cpu}); reserving in the kubelet: $(kubelet_reservation)"
         minikube start -p "$PROFILE" --extra-config="$(kubelet_reservation)"
         local n
         for n in $(kc get nodes -o jsonpath='{.items[*].metadata.name}'); do
             docker exec "$n" sh -c 'systemctl daemon-reload && systemctl restart kubelet' || warn "could not restart kubelet on $n"
         done
         for _ in $(seq 1 60); do
-            [ "$(kc get nodes -o jsonpath='{.items[*].status.allocatable.cpu}' | tr ' ' '\n' | sort -u)" = "$NODE_CPUS" ] && break
+            [ "$(kc get nodes -o jsonpath='{.items[*].status.allocatable.cpu}' | tr ' ' '\n' | sort -u)" = "$want_cpu" ] && break
             sleep 2
         done
         ok "nodes now advertise $(kc get nodes -o jsonpath='{.items[0].status.allocatable.cpu}') CPUs each"
