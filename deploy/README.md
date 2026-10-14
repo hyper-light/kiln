@@ -153,3 +153,22 @@ in-repo default, edit `repoURL` in `deploy/argocd/apps/values.yaml` too.
 | bare-metal Prometheus / Grafana | prom/prometheus:v3.15.0 / grafana/grafana:13.2.4 |
 | base images | node:24-alpine, rust:1-alpine, alpine:3.24 |
 | LAN forwarder | alpine/socat:1.8.0.3 |
+
+## This machine (current setup)
+
+| Piece | How it starts at boot | Restarted on failure by |
+| --- | --- | --- |
+| minikube cluster `kiln` | `~/.config/systemd/user/kiln-cluster.service` (`deploy/cluster/autostart.sh enable`) | Kubernetes (pods), Docker (nodes) |
+| kiln server (in-cluster, ArgoCD app `kiln`) | the cluster | `kiln supervise` (PID 1 in the pod), then Kubernetes |
+| bare-metal/bench agent on this host | `~/.config/systemd/user/kiln-agent.service`, user lingering on | `kiln supervise` (restarts, hot-swaps a new `~/.local/bin/kiln`) |
+| LAN forwarders `:7070/tcp`, `:7071/udp` → NodePorts | Docker `--restart unless-stopped` | Docker |
+
+Nothing in this setup needs a password, with one exception. `ufw` is active and blocks *other* machines from
+reaching 7070/7071. Opening those ports takes root once:
+
+```sh
+sudo deploy/cluster/privileged-setup.sh      # opens 7070/tcp + 7071/udp in ufw/firewalld (plus limits, docker on boot)
+```
+
+The UI is at <http://localhost:7070>. Sign in with `kubectl --context kiln -n kiln get secret kiln-admin -o jsonpath='{.data.token}' | base64 -d`.
+All generated credentials are also in `~/.local/state/kiln/cluster/credentials.env` (mode 0600).
