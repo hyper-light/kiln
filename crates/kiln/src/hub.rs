@@ -766,6 +766,12 @@ impl Hub {
                         if t.elapsed() < timeout {
                             continue;
                         }
+                        // Still Pending for capacity (or pulling a large image) is not a failure:
+                        // keep waiting instead of churning pods.
+                        if k.job_pod_alive(&job.id).await {
+                            self.launching.lock().insert(job.id.clone(), Instant::now());
+                            continue;
+                        }
                         tracing::warn!(job = %job.id, "pod agent did not connect in time; relaunching");
                         k.delete_job_pods(&job.id).await;
                     }

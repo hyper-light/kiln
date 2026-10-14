@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod autodetect;
 pub mod config;
 pub mod exec;
 pub mod gitops;

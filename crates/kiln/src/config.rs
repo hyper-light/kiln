@@ -58,6 +58,9 @@ pub struct GitOps {
     pub git_concurrency: usize,
     /// Build pull requests from refs/pull/*/head.
     pub pull_requests: bool,
+    /// Synthesize a build + test pipeline (from Cargo.toml, go.mod, pyproject.toml, package.json,
+    /// rebar.config) for repositories that have no `.kiln/` directory yet.
+    pub auto_pipelines: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +188,7 @@ impl Default for GitOps {
             github_token_file: None,
             git_concurrency: 8,
             pull_requests: true,
+            auto_pipelines: true,
         }
     }
 }

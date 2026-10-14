@@ -152,10 +152,9 @@ pub async fn load_pipelines(
 ) -> anyhow::Result<Vec<(String, Result<Pipeline, String>)>> {
     let path = ensure_commit(hub, repo, sha).await?;
     let p = path.to_string_lossy().to_string();
-    let listing = match run_git(hub, &["-C", &p, "ls-tree", "--name-only", sha, ".kiln/"], LS_REMOTE_TIMEOUT).await {
-        Ok(l) => l,
-        Err(_) => return Ok(vec![]),
-    };
+    let listing = run_git(hub, &["-C", &p, "ls-tree", "--name-only", sha, ".kiln/"], LS_REMOTE_TIMEOUT)
+        .await
+        .unwrap_or_default();
     let mut out = Vec::new();
     for file in String::from_utf8_lossy(&listing).lines() {
         if !(file.ends_with(".yml") || file.ends_with(".yaml")) {
@@ -164,6 +163,13 @@ pub async fn load_pipelines(
         let src = run_git(hub, &["-C", &p, "show", &format!("{sha}:{file}")], LS_REMOTE_TIMEOUT).await?;
         let parsed = pipeline::parse(&String::from_utf8_lossy(&src)).map_err(|e| e.to_string());
         out.push((file.to_owned(), parsed));
+    }
+    if out.is_empty() && hub.cfg.gitops.auto_pipelines {
+        let root = run_git(hub, &["-C", &p, "ls-tree", "--name-only", sha], LS_REMOTE_TIMEOUT).await?;
+        let files: Vec<String> = String::from_utf8_lossy(&root).lines().map(str::to_owned).collect();
+        if let Some(yaml) = crate::autodetect::pipeline_for(&files) {
+            out.push(("auto".to_owned(), pipeline::parse(&yaml).map_err(|e| e.to_string())));
+        }
     }
     Ok(out)
 }

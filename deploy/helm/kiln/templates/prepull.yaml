@@ -1,0 +1,44 @@
+{{- if .Values.prepull.enabled }}
+# Pre-pulls the toolchain images job pods use onto every node, so a job pod starts in seconds
+# instead of waiting on a multi-hundred-MB pull. Each image runs a no-op init container; the
+# DaemonSet then idles on a tiny pause container. New nodes are covered automatically.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "kiln.fullname" . }}-prepull
+  namespace: {{ include "kiln.jobsNamespace" . }}
+  labels:
+    app.kubernetes.io/name: kiln-prepull
+    app.kubernetes.io/part-of: kiln
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kiln-prepull
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kiln-prepull
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 1
+      initContainers:
+        {{- range $i, $img := .Values.prepull.images }}
+        - name: pull-{{ $i }}
+          image: {{ $img }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "true"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+        {{- end }}
+      containers:
+        - name: pause
+          image: {{ .Values.prepull.pauseImage }}
+          resources:
+            requests: { cpu: 1m, memory: 8Mi }
+            limits: { memory: 16Mi }
+{{- end }}

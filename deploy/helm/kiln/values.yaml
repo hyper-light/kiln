@@ -267,3 +267,17 @@ metrics:
       grafana_dashboard: "1"
     annotations:
       grafana_folder: kiln
+
+# Pre-pull the toolchain images job pods use onto every node (a DaemonSet in the jobs namespace),
+# so pods start in seconds. Keep in sync with toolchain presets in crates/kiln/src/pipeline.rs.
+prepull:
+  enabled: true
+  pauseImage: registry.k8s.io/pause:3.10
+  images:
+    - docker.io/library/rust:1-bookworm
+    - docker.io/library/golang:1-bookworm
+    - ghcr.io/astral-sh/uv:python3.14-bookworm
+    - docker.io/library/node:24-bookworm
+    - docker.io/library/erlang:28
+    - docker.io/library/debian:bookworm
+    - docker.io/library/alpine:3.24
