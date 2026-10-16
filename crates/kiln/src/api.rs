@@ -1,6 +1,6 @@
 //! HTTP + WebSocket API for the UI and CLI (see docs/api.md), plus the small set of endpoints
-//! agents use over HTTP: enrollment, source archives and artifact upload. Served by kiln's own
-//! HTTP layer (hyper's protocol code on hyper-rt).
+//! agents use over HTTP: enrollment, join requests (`kiln join`), source archives and artifact
+//! upload. Served by kiln's own HTTP layer (hyper's protocol code on hyper-rt).
 //!
 //! Auth is stateless so it survives restarts: sessions and one-time login links are HMACs of an
 //! expiry under the admin token; job tokens are HMACs of the job id.

@@ -289,7 +289,8 @@ impl Entry {
             hostname: self.hostname.clone(),
             os: self.os.clone(),
             arch: self.arch.clone(),
-            labels: self.labels.clone(),
+            // What the agent got, once approved (an admin may have changed the labels).
+            labels: self.approval.as_ref().map_or_else(|| self.labels.clone(), |a| a.labels.clone()),
             version: self.version.clone(),
             address: self.address.to_string(),
             status: self.status,

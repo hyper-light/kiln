@@ -1,12 +1,15 @@
 # kiln HTTP / WebSocket API (browser + CLI)
 
-Agents do **not** use this API except for `POST /api/agents/enroll`; they speak QUIC (see
-`docs/protocol.md`). All JSON. Timestamps are unix seconds unless the field ends in `_ms`.
+Agents do **not** use this API except for `POST /api/agents/enroll` and the join requests of
+`kiln join`; they speak QUIC (see `docs/protocol.md`). All JSON. Timestamps are unix seconds unless
+the field ends in `_ms`.
 
 ## Auth
 
-Every `/api/*` route except `/api/auth/*`, `/api/agents/enroll`, `/api/hooks/*` requires either the
-`kiln_session` cookie or `Authorization: Bearer <admin token>`. 401 → UI shows the login screen.
+Every `/api/*` route except `/api/auth/*`, `/api/agents/enroll`, `POST /api/join-requests`,
+`GET /api/join-requests/:id` (which takes the join secret instead) and `/api/hooks/*` requires
+either the `kiln_session` cookie or `Authorization: Bearer <admin token>`. 401 → UI shows the login
+screen.
 
 | Method | Path | Body / query | Result |
 | --- | --- | --- | --- |
@@ -36,6 +39,17 @@ interface Agent { name; labels: string[]; slots; hostname; os; arch; version; ep
   draining: boolean; sample: HostSample|null }
 interface Child { name; state: "starting"|"running"|"restarting"|"stopped"|"finished"; restarts;
   last_error: string|null; since_unix }
+// A kiln instance heard on the local network (multicast DNS, see architecture.md).
+interface DiscoveredInstance { id; instance /* DNS-SD name */; name /* host */; role: "server"|"agent";
+  version; os; arch; port /* HTTP, 0: none */; quic /* port, 0: none */; ca: string|null /* 16 hex */;
+  enrolled: string|null /* CA fingerprint of the server an agent is enrolled with */;
+  addresses: string[]; first_seen; last_seen; url: string|null;
+  joined: boolean /* already one of this server's agents */; agent: string|null /* which one */;
+  same_ca: boolean; join_command: string /* "kiln join --server <this server as it can reach us>" */ }
+interface JoinRequest { id; name /* agent name asked for */; hostname; os; arch; labels: string[];
+  version; address /* where it came from */; status: "pending"|"approved"|"denied";
+  code: string|null /* 6 digits; null until the machine confirmed */; created_at; expires_at;
+  agent: string|null /* name given on approval */ }
 ```
 
 ## REST
@@ -57,7 +71,13 @@ interface Child { name; state: "starting"|"running"|"restarting"|"stopped"|"fini
 | GET | `/api/agents` | `Agent[]` |
 | DELETE | `/api/agents/:name` | forget agent |
 | POST | `/api/agents/:name/drain` | `{ draining: bool }` |
-| GET | `/api/agents/join` | `{ token, server, command }` – bare-metal join command |
+| GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
+| GET | `/api/discovery` | `{ enabled, announce, browse, join_requests, self: {id, name, instance, ca, port, quic, version}, instances: DiscoveredInstance[] }` |
+| POST | `/api/join-requests` | **open** · `{ name, hostname, os, arch, labels?, version?, csr /* PEM */, commitment /* sha256 hex of the secret */ }` → 201 `{ id, nonce /* hex */, ca_pem, expires_in, server, version }`; 400 bad CSR/commitment; 429 + `Retry-After` (≤ 20 waiting, 1 per address per 5 s); 404 when `[discovery] join_requests = false` |
+| GET | `/api/join-requests/:id` | **open** with `Authorization: Bearer <secret>` → `{ id, status, code, expires_in, approval: null \| { name, labels, cert_pem, ca_pem, quic, quic_port } }`. The first poll confirms the request (its code becomes visible to admins). 403 wrong secret, 404 unknown or expired. With admin auth: the `JoinRequest` |
+| GET | `/api/join-requests` | `JoinRequest[]` (all live ones, oldest first; requests live 10 minutes) |
+| POST | `/api/join-requests/:id/approve` | optional `{ name?, labels? }` → `{ id, status: "approved", name, labels }`. Signs the CSR with the kiln CA like enrollment. 409 when already decided or not confirmed yet |
+| POST | `/api/join-requests/:id/deny` | → `{ id, status: "denied", name }`; the machine learns it on its next poll |
 | GET | `/api/metrics/history?agent=` | `{ [agent]: HostSample[] }` last hour, 5 s resolution (`agent` optional; server is `"server"`) |
 | GET | `/api/system` | `{ version, uptime_s, generation, children: Child[], crash_log: string[], config: object }` |
 | GET | `/api/audit?limit=` | `{ts, actor, action, detail}[]` |
@@ -69,7 +89,10 @@ interface Child { name; state: "starting"|"running"|"restarting"|"stopped"|"fini
 
 * `GET /api/events` — server → client JSON messages:
   `{type:"run", run: Run}`, `{type:"job", job: Job}`, `{type:"agent", agent: Agent}`,
-  `{type:"sample", agent: string, sample: HostSample}`, `{type:"queue", queued, running}`.
+  `{type:"sample", agent: string, sample: HostSample}`, `{type:"queue", queued, running}`,
+  `{type:"join_requests"}` (a join request arrived, was confirmed or decided: refetch
+  `/api/join-requests`), `{type:"discovery"}` (an instance appeared, changed or left: refetch
+  `/api/discovery`).
 * `GET /api/jobs/:id/logs/ws?step=N` — server sends the backlog then live output as **binary**
   frames (raw bytes, ANSI). Text frames: `{type:"step", idx, status}`, `{type:"end"}`.
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.
