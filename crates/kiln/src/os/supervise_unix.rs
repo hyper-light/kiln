@@ -22,6 +22,12 @@ impl ChildControl {
         Ok((child, Self { pid }))
     }
 
+    /// Take control of a child a previous image of this supervisor started (it re-executed itself
+    /// in place; the child is still ours).
+    pub fn adopt(pid: u32) -> Option<Self> {
+        i32::try_from(pid).ok().map(|p| Self { pid: Some(Pid::from_raw(p)) })
+    }
+
     pub fn pid(&self) -> Option<i32> {
         self.pid.map(Pid::as_raw)
     }

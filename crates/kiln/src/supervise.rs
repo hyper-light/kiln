@@ -47,6 +47,27 @@ fn crash_log(dir: &Path, line: &str) {
     }
 }
 
+/// Wait for a child this supervisor adopted across its own re-exec (no `Child` handle, only a pid).
+fn spawn_pid_waiter(pid: u32) -> oneshot::Receiver<String> {
+    let (tx, rx) = oneshot::channel();
+    crate::rt::spawn(async move {
+        let st = crate::os::proc::wait_pid_exit(pid, || crate::os::try_reap(pid).map(|st| st.map(|(_, d)| d))).await;
+        let _ = tx.send(st.unwrap_or_else(|e| format!("wait error: {e}")));
+    });
+    rx
+}
+
+/// The supervised subcommand (the first argument that is not an option).
+fn subcommand(args: &[String]) -> Option<&str> {
+    args.iter().map(String::as_str).find(|a| !a.starts_with('-'))
+}
+
+/// Children that take up a new binary themselves, in place, keeping their terminals alive: the
+/// supervisor must not restart them for an upgrade.
+fn upgrades_itself(args: &[String]) -> bool {
+    crate::os::IN_PLACE_UPGRADE && subcommand(args) == Some("agent")
+}
+
 /// Wait for the child (in the platform layer: pidfd / poll, plus orphan reaping as PID 1).
 fn spawn_waiter(child: std::process::Child) -> oneshot::Receiver<String> {
     let (tx, rx) = oneshot::channel();
@@ -102,23 +123,41 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     let signals = Signals::new(&[crate::rt::SIGTERM, crate::rt::SIGINT, crate::rt::SIGHUP])?;
     let mut backoff = MIN_BACKOFF;
     let mut generation: u64 = 0;
+    // A previous image of this supervisor re-executed itself into a new binary and left us its
+    // running child ("<pid>:<generation>"): take it over instead of starting another.
+    let mut inherited: Option<(u32, u64)> = std::env::var("KILN_SUPERVISE_CHILD").ok().and_then(|v| {
+        let (pid, generation) = v.split_once(':')?;
+        Some((pid.parse().ok()?, generation.parse().ok()?))
+    });
 
     loop {
         generation += 1;
         let started_mtime = exe_mtime(&exe);
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(&opts.args).env("KILN_SUPERVISED", "1").env("KILN_GENERATION", generation.to_string());
-        let (child, mut control) = match ChildControl::spawn(&mut cmd) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, exe = %exe.display(), "spawn failed");
-                crash_log(&opts.state_dir, &format!("spawn failed: {e}"));
-                crate::rt::sleep(crate::sup::jitter(backoff)).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-                continue;
+        let adopted = inherited
+            .take()
+            .filter(|(pid, _)| crate::os::pid_alive(*pid))
+            .and_then(|(pid, g)| ChildControl::adopt(pid).map(|c| (pid, g, c)));
+        let (mut exited, mut control) = if let Some((pid, g, control)) = adopted {
+            generation = g;
+            tracing::info!(generation, pid, "supervising the child carried over from the previous binary");
+            (spawn_pid_waiter(pid), control)
+        } else {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(&opts.args)
+                .env("KILN_SUPERVISED", "1")
+                .env("KILN_GENERATION", generation.to_string())
+                .env_remove("KILN_SUPERVISE_CHILD");
+            match ChildControl::spawn(&mut cmd) {
+                Ok((child, control)) => (spawn_waiter(child), control),
+                Err(e) => {
+                    tracing::error!(error = %e, exe = %exe.display(), "spawn failed");
+                    crash_log(&opts.state_dir, &format!("spawn failed: {e}"));
+                    crate::rt::sleep(crate::sup::jitter(backoff)).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    continue;
+                }
             }
         };
-        let mut exited = spawn_waiter(child);
         tracing::info!(generation, pid = ?control.pid(), "child started");
         let started = Instant::now();
         let mut upgrade_check = Interval::new(Duration::from_secs(10));
@@ -149,6 +188,16 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 Ev::Signal(_) => break Exit::Shutdown("terminate"),
                 Ev::UpgradeCheck => {
                     if exe_mtime(&exe) != started_mtime && started.elapsed() > Duration::from_secs(5) {
+                        if upgrades_itself(&opts.args)
+                            && let Some(pid) = control.pid()
+                        {
+                            // The child takes up the new binary itself (keeping its terminals);
+                            // this supervisor does the same and keeps supervising it.
+                            tracing::info!(pid, "binary changed on disk; the child upgrades itself in place, re-executing the supervisor");
+                            let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+                            let err = crate::os::reexec(&exe, &args, &[("KILN_SUPERVISE_CHILD", format!("{pid}:{generation}"))]);
+                            tracing::error!(error = %err, "supervisor re-exec failed; restarting the child instead");
+                        }
                         break Exit::Upgrade;
                     }
                 }

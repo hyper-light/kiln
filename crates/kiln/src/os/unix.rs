@@ -84,3 +84,60 @@ pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
 pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     file.write_all_at(buf, offset)
 }
+
+// ------------------------------------------------------------------- in-place re-execution
+
+/// This platform can replace a running kiln with a new binary in place (same pid), handing open
+/// PTY masters to the new image so shells survive the upgrade.
+pub const IN_PLACE_UPGRADE: bool = true;
+
+/// Keep `fd` open across the next exec (clear close-on-exec).
+pub fn keep_across_exec(fd: &std::os::fd::OwnedFd) -> io::Result<()> {
+    rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty()).map_err(io::Error::from)
+}
+
+/// Take ownership of a descriptor this process carried across its own re-exec (its number comes
+/// from the handoff file the previous image wrote). `None` when that number is not open.
+#[allow(unsafe_code)]
+pub fn reclaim_fd(raw: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{BorrowedFd, FromRawFd as _};
+    if raw < 3 {
+        return None;
+    }
+    // SAFETY: the number was written by this same process's previous image just before it
+    // re-executed itself, for a descriptor it had cleared close-on-exec on; the handoff file is
+    // read once at start-up and deleted, and nothing else in the new image has claimed that
+    // number yet. The borrow only lives for the validity check.
+    let open = rustix::io::fcntl_getfd(unsafe { BorrowedFd::borrow_raw(raw) }).is_ok();
+    // SAFETY: as above; the descriptor is open and owned by nobody else in this image.
+    open.then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
+/// Replace this process image with `exe` (same pid, same children). Returns only on failure.
+pub fn reexec(exe: &Path, args: &[std::ffi::OsString], env: &[(&str, String)]) -> io::Error {
+    use std::os::unix::process::CommandExt as _;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.exec()
+}
+
+/// Whether `pid` is still running (and signalable by us).
+pub fn pid_alive(pid: u32) -> bool {
+    i32::try_from(pid).is_ok_and(|p| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok())
+}
+
+/// Reap `pid` if it has exited: `Ok(Some(description))` once it has, `Ok(None)` while it runs.
+pub fn try_reap(pid: u32) -> io::Result<Option<(Option<i32>, String)>> {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    let p = nix::unistd::Pid::from_raw(i32::try_from(pid).map_err(|_| io::Error::other("bad pid"))?);
+    match waitpid(p, Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => Ok(None),
+        Ok(WaitStatus::Exited(_, code)) => Ok(Some((Some(code), format!("exit status: {code}")))),
+        Ok(WaitStatus::Signaled(_, sig, _)) => Ok(Some((None, format!("signal: {sig}")))),
+        Ok(other) => Ok(Some((None, format!("{other:?}")))),
+        Err(e) => Err(io::Error::from(e)),
+    }
+}

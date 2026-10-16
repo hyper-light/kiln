@@ -22,6 +22,11 @@ pub struct ChildControl {
 }
 
 impl ChildControl {
+    /// No in-place re-execution on Windows, so there is never a child to adopt.
+    pub fn adopt(_pid: u32) -> Option<Self> {
+        None
+    }
+
     /// Spawn the supervised child with a stdin pipe the supervisor keeps (its stop request).
     pub fn spawn(cmd: &mut Command) -> std::io::Result<(Child, Self)> {
         let mut child = cmd.stdin(Stdio::piped()).spawn()?;

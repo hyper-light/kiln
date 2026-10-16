@@ -98,3 +98,28 @@ pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<
     }
     Ok(())
 }
+
+// ------------------------------------------------------------------- in-place re-execution
+
+/// Windows has no exec: upgrades restart the process (and its terminals).
+pub const IN_PLACE_UPGRADE: bool = false;
+
+pub fn keep_across_exec(_fd: &()) -> io::Result<()> {
+    Err(io::Error::other("in-place upgrade is not supported on Windows"))
+}
+
+pub fn reclaim_fd(_raw: i32) -> Option<()> {
+    None
+}
+
+pub fn reexec(_exe: &Path, _args: &[std::ffi::OsString], _env: &[(&str, String)]) -> io::Error {
+    io::Error::other("in-place upgrade is not supported on Windows")
+}
+
+pub fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
+pub fn try_reap(_pid: u32) -> io::Result<Option<(Option<i32>, String)>> {
+    Err(io::Error::other("unsupported on Windows"))
+}

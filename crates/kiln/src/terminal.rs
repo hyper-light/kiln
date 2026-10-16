@@ -14,8 +14,19 @@ pub enum PtyOut {
 
 pub struct PtySession {
     input: async_channel::Sender<Vec<u8>>,
+    /// portable-pty's side, for sessions this process started (None once adopted across an exec).
     master: Option<Box<dyn MasterPty + Send>>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    /// The master and shell pid: resizes and hang-ups for adopted sessions, and the handover.
+    handle: Option<crate::os::pty::Handle>,
+}
+
+/// What a re-executed kiln needs to take a session over: the master's descriptor number (kept
+/// open across the exec) and the shell's pid (still our child: exec keeps the pid).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Handover {
+    pub fd: i32,
+    pub pid: u32,
 }
 
 /// The shell for terminals: the configured one, else `$SHELL`, bash or sh on Unix; PowerShell 7,
@@ -84,11 +95,23 @@ pub fn spawn(
     let child = pty.slave.spawn_command(cmd)?;
     drop(pty.slave);
     let killer = child.clone_killer();
+    let handle = child.process_id().map(|pid| io.handle(pid));
     let (tx, rx) = async_channel::bounded::<PtyOut>(256);
     let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
     io.start(child, tx, in_rx);
     crate::metrics::global().terminal_sessions.add(1);
-    Ok((PtySession { input: in_tx, master: Some(pty.master), killer }, rx))
+    Ok((PtySession { input: in_tx, master: Some(pty.master), killer: Some(killer), handle }, rx))
+}
+
+/// Take over a session handed across this process's re-exec ([`PtySession::handover`]). `None`
+/// when its descriptor did not survive (the session is then gone).
+pub fn adopt(h: Handover) -> Option<(PtySession, async_channel::Receiver<PtyOut>)> {
+    let fd = crate::os::reclaim_fd(h.fd)?;
+    let (tx, rx) = async_channel::bounded::<PtyOut>(256);
+    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    let handle = crate::os::pty::adopt(fd, h.pid, tx, in_rx);
+    crate::metrics::global().terminal_sessions.add(1);
+    Some((PtySession { input: in_tx, master: None, killer: None, handle: Some(handle) }, rx))
 }
 
 impl PtySession {
@@ -97,17 +120,35 @@ impl PtySession {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        if let Some(master) = &self.master
-            && let Err(e) = master.resize(size(cols, rows))
-        {
-            tracing::debug!(error = %e, "pty resize failed");
+        if let Some(master) = &self.master {
+            if let Err(e) = master.resize(size(cols, rows)) {
+                tracing::debug!(error = %e, "pty resize failed");
+            }
+        } else if let Some(h) = &self.handle {
+            h.resize(cols, rows);
         }
+    }
+
+    /// Prepare this session to survive an exec of this process: keep its master open and say how
+    /// the new image finds it. `None` where that is impossible (Windows; no shell pid).
+    pub fn handover(&self) -> Option<Handover> {
+        let h = self.handle.as_ref()?;
+        if !crate::os::IN_PLACE_UPGRADE || h.keep_across_exec().is_err() {
+            return None;
+        }
+        Some(Handover { fd: h.raw_fd(), pid: h.pid() })
     }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        let _ = self.killer.kill();
+        match (&mut self.killer, &self.handle) {
+            (Some(k), _) => {
+                let _ = k.kill();
+            }
+            (None, Some(h)) => h.hangup(),
+            (None, None) => {}
+        }
         if let Some(master) = self.master.take() {
             crate::os::pty::close_master(master);
         }

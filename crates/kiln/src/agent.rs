@@ -194,6 +194,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // announced again on every reconnect.
     let mut terms: HashMap<String, (PtySession, Arc<crate::termsess::Session>)> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
+    // In-place upgrades: a new binary on disk is taken up by re-executing this process (same pid)
+    // once no job runs, handing every terminal to the new image so shells survive.
+    let exe = std::env::current_exe().ok();
+    let mut exe_mtime = exe.as_deref().and_then(binary_mtime);
+    let mut upgrade_pending = false;
+    // Only a `kiln agent` process re-executes itself: the server's in-process agent shares its
+    // process with the server, whose upgrades its supervisor handles.
+    let standalone = std::env::args().skip(1).find(|a| !a.starts_with('-')).as_deref() == Some("agent");
+    adopt_handover(&o, &mut terms, &term_tx);
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
@@ -262,6 +271,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Watchdog => {
+                if !o.ephemeral && standalone && crate::os::IN_PLACE_UPGRADE && started.elapsed() > Duration::from_secs(5) {
+                    let now = exe.as_deref().and_then(binary_mtime);
+                    if !upgrade_pending && now.is_some() && now != exe_mtime {
+                        upgrade_pending = true;
+                        tracing::info!(jobs = jobs.len(), terminals = terms.len(), "new kiln binary on disk; upgrading in place once running jobs finish");
+                    }
+                    if upgrade_pending && jobs.is_empty() && let Some(exe) = exe.as_deref() {
+                        let err = upgrade_in_place(&o, exe, &terms);
+                        // Only reached when the exec failed: carry on with this binary.
+                        tracing::error!(error = %err, "in-place upgrade failed; continuing on the running binary");
+                        upgrade_pending = false;
+                        exe_mtime = now;
+                    }
+                }
                 // A dial that never resolves (no Connected / Closed / Unreachable) would leave the
                 // agent waiting forever, e.g. after dialing before the network existed at boot.
                 // Treat it as failed: rebuild the endpoint on a fresh socket and dial again.
@@ -335,8 +358,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
                         let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
-                        if draining || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
-                            let reason = if draining { "draining" } else { "no free slot" };
+                        if draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
+                            let reason = if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
@@ -479,7 +502,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Heartbeat => {
                 if connected {
-                    let free = o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0));
+                    let free = if upgrade_pending { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
                 }
             }
@@ -496,4 +519,109 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
 /// Enroll (or renew) and store credentials without connecting. Used by `kiln install --agent`.
 pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
     credentials(o, &Shutdown::new()).await.map(|_| ())
+}
+
+
+/// The binary's modification time (an upgrade replaces the file).
+fn binary_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// One terminal carried across an in-place upgrade.
+#[derive(Serialize, Deserialize)]
+struct HandedTerm {
+    session: String,
+    command: Option<String>,
+    cols: u16,
+    rows: u16,
+    handover: crate::terminal::Handover,
+    /// Bytes that rebuild the session's screen and scrollback in the new image's emulator.
+    replay: String,
+}
+
+fn handover_path(o: &Opts) -> PathBuf {
+    o.state_dir.join("terminal-handover.json")
+}
+
+/// Re-execute this process from `exe` (same pid), handing every terminal to the new image.
+/// Returns only if the exec failed.
+fn upgrade_in_place(o: &Opts, exe: &std::path::Path, terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>) -> std::io::Error {
+    use base64::Engine as _;
+    let mut handed = Vec::new();
+    for (id, (pty, state)) in terms {
+        let Some(handover) = pty.handover() else {
+            tracing::warn!(session = %id, "terminal cannot be handed over; it ends with this upgrade");
+            continue;
+        };
+        let info = state.info();
+        let a = state.attach();
+        state.detach();
+        handed.push(HandedTerm {
+            session: id.clone(),
+            command: state.command.clone(),
+            cols: info.cols,
+            rows: info.rows,
+            handover,
+            replay: base64::engine::general_purpose::STANDARD.encode(&a.replay),
+        });
+    }
+    let path = handover_path(o);
+    let written = serde_json::to_vec(&handed).map_err(std::io::Error::other).and_then(|json| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        crate::os::with_mode(&mut opts, 0o600);
+        use std::io::Write as _;
+        opts.open(&path)?.write_all(&json)
+    });
+    if let Err(e) = written {
+        return e;
+    }
+    tracing::info!(terminals = handed.len(), exe = %exe.display(), "upgrading in place");
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let err = crate::os::reexec(exe, &args, &[]);
+    let _ = std::fs::remove_file(&path);
+    err
+}
+
+/// Take over the terminals a previous image of this process handed over (see
+/// [`upgrade_in_place`]): reopen each PTY, rebuild its replay state, and keep it for the server,
+/// which re-adopts it from the next TermList.
+fn adopt_handover(o: &Opts, terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>, term_tx: &async_channel::Sender<(String, PtyOut)>) {
+    use base64::Engine as _;
+    let path = handover_path(o);
+    let Ok(raw) = std::fs::read(&path) else { return };
+    let _ = std::fs::remove_file(&path);
+    let handed: Vec<HandedTerm> = match serde_json::from_slice(&raw) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "unreadable terminal handover; its shells are lost");
+            return;
+        }
+    };
+    let mut adopted = 0usize;
+    for h in handed {
+        let Some((pty, rx)) = terminal::adopt(h.handover) else {
+            tracing::warn!(session = %h.session, "terminal did not survive the upgrade");
+            continue;
+        };
+        let tx = term_tx.clone();
+        let s = h.session.clone();
+        crate::rt::spawn(async move {
+            while let Ok(out) = rx.recv().await {
+                let exit = matches!(out, PtyOut::Exit(_));
+                if tx.send((s.clone(), out)).await.is_err() || exit {
+                    break;
+                }
+            }
+        });
+        let state = crate::termsess::Session::detached(h.session.clone(), "agent".into(), h.command.clone(), h.cols, h.rows);
+        if let Ok(replay) = base64::engine::general_purpose::STANDARD.decode(h.replay.as_bytes()) {
+            state.output(&replay);
+        }
+        terms.insert(h.session, (pty, state));
+        adopted += 1;
+    }
+    if adopted > 0 {
+        tracing::info!(terminals = adopted, "terminals carried across the upgrade");
+    }
 }

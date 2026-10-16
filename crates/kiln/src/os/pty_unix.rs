@@ -39,48 +39,109 @@ impl PtyIo {
         Ok(Self { fd: Arc::new(fd) })
     }
 
+    /// What it takes to hand this session to a re-executed kiln: the master and the shell's pid.
+    pub fn handle(&self, pid: u32) -> Handle {
+        Handle { fd: Arc::clone(&self.fd), pid }
+    }
+
     /// Pump PTY output (then the exit status) into `out`, and `input` into the PTY.
     pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) {
-        // PTY → channel. Ends at EOF/EIO (the shell exited, or the master closed).
-        {
-            let fd = Arc::clone(&self.fd);
-            let out = out.clone();
-            crate::rt::spawn(async move {
-                let mut buf = vec![0u8; 32 * 1024];
-                while let Ok(Some(n)) = read_chunk(&fd, &mut buf).await {
-                    if out.send(PtyOut::Data(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default())).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        pump(&self.fd, &out, input);
         // The exit status, after the last output has had a moment to drain.
-        {
-            let pid = child.process_id();
-            crate::rt::spawn(async move {
-                let code = match pid {
-                    Some(pid) => wait_pid_exit(pid, || child.try_wait())
-                        .await
-                        .ok()
-                        .and_then(|st| i32::try_from(st.exit_code()).ok()),
-                    None => None,
-                };
-                crate::rt::sleep(Duration::from_millis(50)).await;
-                let _ = out.send(PtyOut::Exit(code)).await;
-            });
-        }
-        // Channel → PTY.
-        {
-            let fd = Arc::clone(&self.fd);
-            crate::rt::spawn(async move {
-                while let Ok(data) = input.recv().await {
-                    if write_all(&fd, &data).await.is_err() {
-                        break;
-                    }
+        let pid = child.process_id();
+        crate::rt::spawn(async move {
+            let code = match pid {
+                Some(pid) => wait_pid_exit(pid, || child.try_wait())
+                    .await
+                    .ok()
+                    .and_then(|st| i32::try_from(st.exit_code()).ok()),
+                None => None,
+            };
+            crate::rt::sleep(Duration::from_millis(50)).await;
+            let _ = out.send(PtyOut::Exit(code)).await;
+        });
+    }
+}
+
+/// PTY → `out` (until EOF/EIO: the shell exited or the master closed) and `input` → PTY.
+fn pump(fd: &Arc<OwnedFd>, out: &async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) {
+    {
+        let fd = Arc::clone(fd);
+        let out = out.clone();
+        crate::rt::spawn(async move {
+            let mut buf = vec![0u8; 32 * 1024];
+            while let Ok(Some(n)) = read_chunk(&fd, &mut buf).await {
+                if out.send(PtyOut::Data(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default())).await.is_err() {
+                    break;
                 }
-            });
+            }
+        });
+    }
+    {
+        let fd = Arc::clone(fd);
+        crate::rt::spawn(async move {
+            while let Ok(data) = input.recv().await {
+                if write_all(&fd, &data).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+/// A session's master and shell pid: enough to resize it, end it, or hand it across an exec.
+pub struct Handle {
+    fd: Arc<OwnedFd>,
+    pid: u32,
+}
+
+impl Handle {
+    pub fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Keep the master open across this process's next exec.
+    pub fn keep_across_exec(&self) -> std::io::Result<()> {
+        crate::os::keep_across_exec(&self.fd)
+    }
+
+    /// Set the window size (the kernel signals the foreground program, as for any terminal).
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let ws = rustix::termios::Winsize { ws_row: rows.clamp(2, 1000), ws_col: cols.clamp(2, 1000), ws_xpixel: 0, ws_ypixel: 0 };
+        if let Err(e) = rustix::termios::tcsetwinsize(&*self.fd, ws) {
+            tracing::debug!(error = %e, "pty resize failed");
         }
     }
+
+    /// End the session: hang up the shell's process group, as closing a terminal does.
+    pub fn hangup(&self) {
+        if let Ok(p) = i32::try_from(self.pid) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGHUP);
+        }
+    }
+}
+
+/// Take over a session a previous image of this process handed over: its master (already
+/// non-blocking) and its shell, which is still our child. Output and the exit status flow as for
+/// a spawned session.
+pub fn adopt(fd: OwnedFd, pid: u32, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) -> Handle {
+    let fd = Arc::new(fd);
+    pump(&fd, &out, input);
+    crate::rt::spawn(async move {
+        let code = wait_pid_exit(pid, || {
+            crate::os::try_reap(pid).map(|st| st.map(|(code, _)| code))
+        })
+        .await
+        .ok()
+        .flatten();
+        crate::rt::sleep(Duration::from_millis(50)).await;
+        let _ = out.send(PtyOut::Exit(code)).await;
+    });
+    Handle { fd, pid }
 }
 
 /// Close a PTY master (quick on Unix).

@@ -23,6 +23,11 @@ impl PtyIo {
     }
 
     /// Pump PTY output (then the exit status) into `out`, and `input` into the PTY.
+    /// Sessions are never handed over on Windows (no exec).
+    pub fn handle(&self, _pid: u32) -> Handle {
+        Handle
+    }
+
     pub fn start(self, mut child: Box<dyn Child + Send + Sync>, out: async_channel::Sender<PtyOut>, input: async_channel::Receiver<Vec<u8>>) {
         let Self { mut reader, mut writer } = self;
         // PTY → channel. Keeps draining after the consumer is gone: an undrained pseudoconsole
@@ -76,4 +81,30 @@ pub fn close_master(master: Box<dyn MasterPty + Send>) {
     if let Err(e) = std::thread::Builder::new().name("kiln-pty-close".into()).spawn(move || drop(master)) {
         tracing::debug!(error = %e, "closing the PTY inline");
     }
+}
+
+/// Windows has no in-place upgrade, so a session never needs handing over.
+pub struct Handle;
+
+impl Handle {
+    pub fn raw_fd(&self) -> i32 {
+        -1
+    }
+
+    pub fn pid(&self) -> u32 {
+        0
+    }
+
+    pub fn keep_across_exec(&self) -> std::io::Result<()> {
+        Err(std::io::Error::other("in-place upgrade is not supported on Windows"))
+    }
+
+    pub fn resize(&self, _cols: u16, _rows: u16) {}
+
+    pub fn hangup(&self) {}
+}
+
+/// Never reached on Windows ([`crate::os::reclaim_fd`] yields nothing to adopt).
+pub fn adopt(_fd: (), _pid: u32, _out: async_channel::Sender<PtyOut>, _input: async_channel::Receiver<Vec<u8>>) -> Handle {
+    Handle
 }
