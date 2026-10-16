@@ -769,15 +769,7 @@ pub struct Signals {
 impl Signals {
     pub fn new(kinds: &[i32]) -> anyhow::Result<Self> {
         use hyper_rt::signal::Signal;
-        let wanted: Vec<Signal> = kinds
-            .iter()
-            .filter_map(|k| match *k {
-                SIGINT => Some(Signal::Interrupt),
-                SIGTERM => Some(Signal::Terminate),
-                SIGHUP => Some(Signal::Hangup),
-                _ => None,
-            })
-            .collect();
+        let wanted: Vec<Signal> = kinds.iter().flat_map(|k| crate::os::signal_kinds(*k).iter().copied()).collect();
         anyhow::ensure!(!wanted.is_empty(), "no supported signal requested");
         rt()?;
         let stream = hyper_rt::signal::subscribe(&wanted).map_err(|e| anyhow::anyhow!("subscribe to signals: {e}"))?;
@@ -791,13 +783,7 @@ impl Signals {
                     Ok(set) => {
                         failures = 0;
                         for s in set.iter() {
-                            let n = match s {
-                                Signal::Interrupt => SIGINT,
-                                Signal::Terminate => SIGTERM,
-                                Signal::Hangup => SIGHUP,
-                                _ => continue,
-                            };
-                            if tx.send(n).await.is_err() {
+                            if tx.send(crate::os::signal_number(s)).await.is_err() {
                                 return;
                             }
                         }

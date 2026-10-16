@@ -3,7 +3,8 @@
 //!
 //! * restarts the child on any exit that was not requested, with jittered exponential backoff
 //!   (reset once the child has been healthy for a minute),
-//! * forwards SIGTERM / SIGINT / SIGHUP and gives the child a grace period before SIGKILL,
+//! * forwards SIGTERM / SIGINT / SIGHUP and gives the child a grace period before SIGKILL (on
+//!   Windows: closes the child's stdin to ask it to stop, then kills its process tree),
 //! * reaps orphaned zombies so it is safe as PID 1 inside a container,
 //! * re-executes the binary on disk when it changes (in-place upgrades), and
 //! * appends every crash to `<state>/crash.log` for the UI.
@@ -17,11 +18,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::FutureExt as _;
 use futures::channel::oneshot;
-use nix::errno::Errno;
-use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::Pid;
 
+use crate::os::supervise::ChildControl;
 use crate::rt::{Interval, Signals};
 
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
@@ -49,57 +47,13 @@ fn crash_log(dir: &Path, line: &str) {
     }
 }
 
-/// Wait for the child without a thread and report how it ended. Normally that is its pidfd. As
-/// PID 1 (containers) every orphan re-parented to us must be reaped too, so a `waitpid(-1,
-/// WNOHANG)` sweep runs whenever the child's pidfd fires and at least once a second; only our own
-/// child's status is reported. One reaper for everything means no two waits race for a pid.
-fn spawn_waiter(child: std::process::Child, pid1: bool) -> oneshot::Receiver<String> {
+/// Wait for the child (in the platform layer: pidfd / poll, plus orphan reaping as PID 1).
+fn spawn_waiter(child: std::process::Child) -> oneshot::Receiver<String> {
     let (tx, rx) = oneshot::channel();
     crate::rt::spawn(async move {
-        let status = if pid1 { wait_as_pid1(child).await } else { wait_plain(child).await };
-        let _ = tx.send(status);
+        let _ = tx.send(crate::os::supervise::wait_child(child).await);
     });
     rx
-}
-
-async fn wait_plain(mut child: std::process::Child) -> String {
-    let pid = child.id();
-    match crate::proc::wait_pid_exit(pid, || child.try_wait()).await {
-        Ok(status) => status.to_string(),
-        Err(e) => format!("wait error: {e}"),
-    }
-}
-
-async fn wait_as_pid1(child: std::process::Child) -> String {
-    let raw = i32::try_from(child.id()).unwrap_or(0);
-    let pid = Pid::from_raw(raw);
-    let pidfd = rustix::process::Pid::from_raw(raw)
-        .and_then(|p| rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()).ok());
-    loop {
-        loop {
-            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => break,
-                Ok(st) if st.pid() == Some(pid) => return describe(st),
-                Ok(_) | Err(Errno::EINTR) => {}
-                Err(Errno::ECHILD) => return "child vanished".to_owned(),
-                Err(e) => return format!("wait error: {e}"),
-            }
-        }
-        match &pidfd {
-            Some(fd) => {
-                let _ = crate::rt::timeout(Duration::from_secs(1), crate::os::proc::wait_readable(fd)).await;
-            }
-            None => crate::rt::sleep(Duration::from_millis(500)).await,
-        }
-    }
-}
-
-fn describe(st: WaitStatus) -> String {
-    match st {
-        WaitStatus::Exited(_, code) => format!("exit status: {code}"),
-        WaitStatus::Signaled(_, sig, _) => format!("signal: {sig}"),
-        other => format!("{other:?}"),
-    }
 }
 
 fn lock_path(state_dir: &Path, args: &[String]) -> PathBuf {
@@ -132,16 +86,9 @@ pub fn detach(args: &[String], state_dir: &Path) -> anyhow::Result<()> {
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let err = out.try_clone()?;
     let exe = std::env::current_exe()?;
-    use std::os::unix::process::CommandExt as _;
-    std::process::Command::new(exe)
-        .arg("supervise")
-        .arg("--")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(out)
-        .stderr(err)
-        .process_group(0)
-        .spawn()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("supervise").arg("--").args(args).stdin(std::process::Stdio::null()).stdout(out).stderr(err);
+    crate::os::supervise::spawn_detached(&mut cmd)?;
     tracing::info!(log = %log.display(), "supervisor started in the background");
     Ok(())
 }
@@ -153,7 +100,6 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kiln"));
     let signals = Signals::new(&[crate::rt::SIGTERM, crate::rt::SIGINT, crate::rt::SIGHUP])?;
-    let is_pid1 = std::process::id() == 1;
     let mut backoff = MIN_BACKOFF;
     let mut generation: u64 = 0;
 
@@ -162,7 +108,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         let started_mtime = exe_mtime(&exe);
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(&opts.args).env("KILN_SUPERVISED", "1").env("KILN_GENERATION", generation.to_string());
-        let child = match cmd.spawn() {
+        let (child, mut control) = match ChildControl::spawn(&mut cmd) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, exe = %exe.display(), "spawn failed");
@@ -172,15 +118,14 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let pid = i32::try_from(child.id()).ok().map(Pid::from_raw);
-        let mut exited = spawn_waiter(child, is_pid1);
-        tracing::info!(generation, pid = ?pid, "child started");
+        let mut exited = spawn_waiter(child);
+        tracing::info!(generation, pid = ?control.pid(), "child started");
         let started = Instant::now();
         let mut upgrade_check = Interval::new(Duration::from_secs(10));
 
         enum Exit {
             Child(String),
-            Shutdown(Signal),
+            Shutdown(&'static str),
             Upgrade,
         }
         enum Ev {
@@ -198,12 +143,10 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 Ev::Exited(status) => break Exit::Child(status),
                 Ev::Signal(Some(crate::rt::SIGHUP)) => {
                     // HUP = reload: forward to the child, which re-reads its config.
-                    if let Some(p) = pid {
-                        let _ = kill(p, Signal::SIGHUP);
-                    }
+                    control.reload();
                 }
-                Ev::Signal(Some(crate::rt::SIGINT)) => break Exit::Shutdown(Signal::SIGINT),
-                Ev::Signal(_) => break Exit::Shutdown(Signal::SIGTERM),
+                Ev::Signal(Some(crate::rt::SIGINT)) => break Exit::Shutdown("interrupt"),
+                Ev::Signal(_) => break Exit::Shutdown("terminate"),
                 Ev::UpgradeCheck => {
                     if exe_mtime(&exe) != started_mtime && started.elapsed() > Duration::from_secs(5) {
                         break Exit::Upgrade;
@@ -214,13 +157,13 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
 
         match exit {
             Exit::Shutdown(sig) => {
-                tracing::info!(?sig, "shutdown requested; stopping child");
-                stop_child(&mut exited, pid).await;
+                tracing::info!(signal = sig, "shutdown requested; stopping child");
+                stop_child(&mut exited, &mut control).await;
                 return Ok(());
             }
             Exit::Upgrade => {
                 tracing::info!("binary changed on disk; restarting child into new version");
-                stop_child(&mut exited, pid).await;
+                stop_child(&mut exited, &mut control).await;
                 backoff = MIN_BACKOFF;
                 continue;
             }
@@ -252,15 +195,11 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     }
 }
 
-async fn stop_child(exited: &mut oneshot::Receiver<String>, pid: Option<Pid>) {
-    if let Some(p) = pid {
-        let _ = kill(p, Signal::SIGTERM);
-    }
+async fn stop_child(exited: &mut oneshot::Receiver<String>, control: &mut ChildControl) {
+    control.stop();
     if crate::rt::timeout(GRACE, &mut *exited).await.is_err() {
-        tracing::warn!("child ignored SIGTERM for {GRACE:?}; killing");
-        if let Some(p) = pid {
-            let _ = kill(p, Signal::SIGKILL);
-        }
+        tracing::warn!("child ignored the stop request for {GRACE:?}; killing");
+        control.kill().await;
         let _ = crate::rt::timeout(Duration::from_secs(5), exited).await;
     }
 }

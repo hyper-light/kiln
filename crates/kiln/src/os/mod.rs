@@ -31,6 +31,14 @@ pub mod proc;
 #[path = "proc_windows.rs"]
 pub mod proc;
 
+/// `kiln supervise`'s child control.
+#[cfg(unix)]
+#[path = "supervise_unix.rs"]
+pub mod supervise;
+#[cfg(windows)]
+#[path = "supervise_windows.rs"]
+pub mod supervise;
+
 /// PTY session I/O: [`crate::terminal`]'s plumbing.
 #[cfg(unix)]
 #[path = "pty_unix.rs"]
@@ -60,6 +68,46 @@ pub fn which(name: &str) -> Option<PathBuf> {
 /// Whether `name` is an executable on `PATH`.
 pub fn have(name: &str) -> bool {
     which(name).is_some()
+}
+
+/// Open `url` in the desktop's browser (best effort, never waits).
+pub fn open_url(url: &str) {
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+    } else {
+        Command::new("xdg-open")
+    };
+    let _ = cmd.arg(url).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
+/// hyper-rt's signal kinds that stand for kiln's `SIGINT` / `SIGTERM` / `SIGHUP` here. Unix has
+/// them as such; Windows delivers console control events, of which Ctrl-Break, closing the
+/// console and system shutdown mean "terminate", and nothing means "reload".
+pub fn signal_kinds(sig: i32) -> &'static [hyper_rt::signal::Signal] {
+    use hyper_rt::signal::Signal;
+    match sig {
+        crate::rt::SIGINT => &[Signal::Interrupt],
+        crate::rt::SIGTERM if cfg!(windows) => &[Signal::Break, Signal::Close, Signal::Shutdown],
+        crate::rt::SIGTERM => &[Signal::Terminate],
+        crate::rt::SIGHUP if cfg!(windows) => &[],
+        crate::rt::SIGHUP => &[Signal::Hangup],
+        _ => &[],
+    }
+}
+
+/// kiln's signal number for a delivered hyper-rt signal kind.
+pub fn signal_number(kind: hyper_rt::signal::Signal) -> i32 {
+    use hyper_rt::signal::Signal;
+    match kind {
+        Signal::Interrupt => crate::rt::SIGINT,
+        Signal::Hangup => crate::rt::SIGHUP,
+        Signal::Terminate | Signal::Break | Signal::Close | Signal::Logoff | Signal::Shutdown => crate::rt::SIGTERM,
+    }
 }
 
 /// The names `name` may have on disk: itself, plus the executable extensions on Windows.
