@@ -211,7 +211,12 @@ export interface RunDetail {
 export interface JoinInfo {
   token: string;
   server: string;
+  /** Linux: `curl … /install.sh | sh -s -- …`. */
   command: string;
+  /** macOS: the same script, with macOS labels. */
+  macos?: string;
+  /** Windows: the PowerShell installer (`install.ps1`). */
+  windows?: string;
 }
 
 export type MetricsHistory = Record<string, HostSample[]>;

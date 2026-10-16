@@ -4,7 +4,7 @@ import { DropdownMenu, Switch } from "radix-ui";
 import { LayoutGrid, List, MoreHorizontal, Plus, Server, SquareTerminal, Trash2 } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, HostSample, Job } from "@/api/types";
+import type { Agent, HostSample, Job, JoinInfo } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { CopyButton, EmptyState, ErrorState, Facts, Meter, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
@@ -313,9 +313,20 @@ function AgentActions({ agent, onForget, onTerminal }: { agent: Agent; onForget:
   );
 }
 
+type JoinPlatform = "linux" | "macos" | "windows";
+
+const JOIN_BOOT: Record<JoinPlatform, string> = {
+  linux: "starts the agent on boot (systemd, cron @reboot, or XDG autostart)",
+  macos: "starts the agent at login with launchd",
+  windows: "starts the agent at logon with a per-user scheduled task (no admin rights needed)",
+};
+
 function JoinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
-  const [info, setInfo] = React.useState<{ token: string; server: string; command: string } | null>(null);
+  const [info, setInfo] = React.useState<JoinInfo | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
+  const [platform, setPlatform] = useLocalStorage<JoinPlatform>("kiln.agents.join-platform", "linux");
+  const command = !info ? "" : platform === "windows" ? (info.windows ?? info.command) : platform === "macos" ? (info.macos ?? info.command) : info.command;
+  const prompt = platform === "windows" ? "PS> " : "$ ";
   React.useEffect(() => {
     if (!open) return;
     setInfo(null);
@@ -333,7 +344,7 @@ function JoinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: b
       <DialogContent
         title="Add a bare-metal agent"
         eyebrow="Agents / Join"
-        description="Run this on the machine you want to enroll. It installs kiln, enrolls over QUIC + mTLS, and starts the agent on boot (systemd, cron @reboot, or XDG autostart)."
+        description={`Run this on the machine you want to enroll. It installs kiln, enrolls over QUIC + mTLS, and ${JOIN_BOOT[platform]}.`}
         className="!w-[min(680px,calc(100vw-24px))]"
       >
         {err ? (
@@ -342,10 +353,20 @@ function JoinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: b
           <Skeleton className="h-24 w-full" />
         ) : (
           <div className="space-y-4">
+            <Segmented
+              label="Platform"
+              value={platform}
+              onChange={setPlatform}
+              options={[
+                { value: "linux", label: "Linux" },
+                { value: "macos", label: "macOS" },
+                { value: "windows", label: "Windows" },
+              ]}
+            />
             <div className="relative">
               <pre className="overflow-x-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 pr-4 font-mono text-[12px] leading-relaxed whitespace-pre-wrap break-all text-[#cdc4e0]">
-                <span className="text-[#6d7078] select-none">$ </span>
-                {info.command}
+                <span className="text-[#6d7078] select-none">{prompt}</span>
+                {command}
               </pre>
             </div>
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -356,7 +377,7 @@ function JoinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: b
                   { label: "Token", value: `${info.token.slice(0, 6)}…${info.token.slice(-4)}` },
                 ]}
               />
-              <CopyButton text={info.command} label="Copy command" />
+              <CopyButton text={command} label="Copy command" />
             </div>
             <p className="text-[11.5px] leading-relaxed text-[#8f939e]">
               The agent shows up here as soon as it connects. Give it labels like <span className="chip">bench</span> or <span className="chip">gpu</span> to target it with{" "}
