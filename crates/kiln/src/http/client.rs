@@ -230,3 +230,33 @@ impl Response {
         super::server::next_chunk(self.inner.body_mut()).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HTTPS to real public endpoints through hyper-tls on hyper-rt (needs network; run with
+    /// `cargo test -- --ignored https_public`).
+    #[test]
+    #[ignore]
+    fn https_public_endpoints() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let c = github()?;
+            let zen = c.get("https://api.github.com/zen").header("Accept", "application/vnd.github+json").send().await?;
+            assert!(zen.is_success(), "github zen: HTTP {}", zen.status());
+            let text = zen.bytes(4096).await?;
+            assert!(!text.is_empty());
+            let org: serde_json::Value = c.get("https://api.github.com/orgs/hyper-light").send().await?.json(1 << 20).await?;
+            assert_eq!(org.get("login").and_then(|v| v.as_str()), Some("hyper-light"));
+            // A large chunked download, streamed.
+            let mut resp = c.get("https://codeload.github.com/hyper-light/cocoa/tar.gz/refs/heads/main").send().await?;
+            assert!(resp.is_success(), "codeload: HTTP {}", resp.status());
+            let mut n = 0usize;
+            while let Some(chunk) = resp.chunk().await? {
+                n += chunk.len();
+            }
+            assert!(n > 1000, "downloaded {n} bytes");
+            Ok(())
+        })
+    }
+}
