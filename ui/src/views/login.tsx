@@ -136,7 +136,7 @@ export function Login({ error, onRetry }: { error?: string; onRetry: () => void 
                 autoCapitalize="none"
                 autoCorrect="off"
                 spellCheck={false}
-                placeholder={mode === "password" ? "Your password" : "48 hexadecimal characters"}
+                placeholder={mode === "password" ? "Your password" : "kiln_…"}
                 value={secret}
                 onChange={(e) => setSecret(e.target.value)}
                 disabled={loading}
