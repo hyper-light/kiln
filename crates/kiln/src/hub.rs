@@ -29,6 +29,18 @@ const AGENT_GRACE: Duration = Duration::from_secs(45);
 const HISTORY: usize = 720;
 /// How long an agent that declined a job is not offered that job again.
 const DECLINE_BACKOFF: Duration = Duration::from_secs(15);
+/// How soon a refused pod launch is tried again.
+const LAUNCH_RETRY: Duration = Duration::from_secs(15);
+
+/// Where a Kubernetes job's pod stands until its agent connects.
+#[derive(Debug, Clone, Copy)]
+pub enum Launch {
+    /// A pod was created (or adopted after a restart) at this instant.
+    Pod(Instant),
+    /// No pod is on its way: launch again from `at`. `check_pods` when the failed attempt may
+    /// have left a pod behind (an API timeout) or a dead one may hold the name.
+    Retry { at: Instant, check_pods: bool },
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentLive {
@@ -84,7 +96,7 @@ pub struct Hub {
     pub terminals: crate::termsess::Sessions,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
-    pub launching: Mutex<HashMap<String, Instant>>,
+    pub launching: Mutex<HashMap<String, Launch>>,
     pub started: Instant,
     pub generation: u64,
     pub admin_token: String,
@@ -826,29 +838,44 @@ impl Hub {
                     if !job.labels.iter().any(|l| l == "k8s") {
                         continue;
                     }
-                    let mut launched_at = self.launching.lock().get(&job.id).copied();
-                    // After a server restart the launch table is empty, but the job's pod may
-                    // already exist (Pending or about to connect): adopt it instead of duplicating.
-                    if launched_at.is_none() && k.job_pod_alive(&job.id).await {
-                        self.launching.lock().insert(job.id.clone(), Instant::now());
-                        launched_at = Some(Instant::now());
-                    }
                     let timeout = Duration::from_secs(u64::from(self.cfg.kubernetes.start_timeout_seconds));
-                    if let Some(t) = launched_at {
-                        if t.elapsed() < timeout {
-                            continue;
+                    let launch = self.launching.lock().get(&job.id).copied();
+                    match launch {
+                        Some(Launch::Pod(t)) if t.elapsed() < timeout => continue,
+                        Some(Launch::Retry { at, .. }) if Instant::now() < at => continue,
+                        // After a server restart the launch table is empty, but the job's pod may
+                        // already exist (Pending or about to connect): adopt it instead of duplicating.
+                        None => {
+                            if k.job_pod_alive(&job.id).await {
+                                self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
+                                continue;
+                            }
                         }
-                        // Still Pending for capacity (or pulling a large image) is not a failure:
-                        // keep waiting instead of churning pods.
-                        if k.job_pod_alive(&job.id).await {
-                            self.launching.lock().insert(job.id.clone(), Instant::now());
-                            continue;
+                        Some(Launch::Pod(_)) => {
+                            // Still Pending for capacity (or pulling a large image) is not a failure:
+                            // keep waiting instead of churning pods.
+                            if k.job_pod_alive(&job.id).await {
+                                self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
+                                continue;
+                            }
+                            tracing::warn!(job = %job.id, "pod agent did not connect in time; relaunching");
+                            k.delete_job_pods(&job.id).await;
+                            // Not again on the next pass if the launch below has to wait.
+                            self.launching
+                                .lock()
+                                .insert(job.id.clone(), Launch::Retry { at: Instant::now(), check_pods: false });
                         }
-                        tracing::warn!(job = %job.id, "pod agent did not connect in time; relaunching");
-                        k.delete_job_pods(&job.id).await;
+                        Some(Launch::Retry { check_pods: true, .. }) => {
+                            if k.job_pod_alive(&job.id).await {
+                                self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
+                                continue;
+                            }
+                            k.delete_job_pods(&job.id).await;
+                        }
+                        Some(Launch::Retry { check_pods: false, .. }) => {}
                     }
                     if pods_live.is_none() {
-                        pods_live = Some(self.launching.lock().len());
+                        pods_live = Some(self.launching.lock().values().filter(|l| matches!(l, Launch::Pod(_))).count());
                     }
                     let live = pods_live.unwrap_or(0);
                     if u32::try_from(live).unwrap_or(u32::MAX) >= self.cfg.kubernetes.max_pods {
@@ -857,24 +884,26 @@ impl Hub {
                     match k.launch(self, &job, run).await {
                         Ok(pod) => {
                             tracing::info!(job = %job.id, pod, "launched agent pod");
-                            self.launching.lock().insert(job.id.clone(), Instant::now());
+                            self.launching.lock().insert(job.id.clone(), Launch::Pod(Instant::now()));
                             pods_live = Some(live + 1);
                             metrics::global().k8s_pods_launched.inc(&["ok"]);
                         }
                         Err(e) => {
                             metrics::global().k8s_pods_launched.inc(&["error"]);
-                            // Usually the jobs-namespace quota is full: retry in ~15 s rather
-                            // than after the full start timeout.
+                            // Usually the jobs-namespace quota is full: retry soon rather than after
+                            // the full start timeout. Each job retries on its own, since a smaller
+                            // one may still fit where this one did not.
                             let msg = format!("{e:#}");
-                            if msg.contains("exceeded quota") {
+                            let quota = msg.contains("exceeded quota");
+                            if quota {
                                 tracing::debug!(job = %job.id, "job quota full; waiting for capacity");
                             } else {
                                 tracing::error!(job = %job.id, error = %msg, "pod launch failed");
                             }
-                            let retry_at = Instant::now()
-                                .checked_sub(timeout.saturating_sub(Duration::from_secs(15)))
-                                .unwrap_or_else(Instant::now);
-                            self.launching.lock().insert(job.id.clone(), retry_at);
+                            let now = Instant::now();
+                            let at = now.checked_add(LAUNCH_RETRY).unwrap_or(now);
+                            // A quota refusal created nothing, so its retry needs no pod checks.
+                            self.launching.lock().insert(job.id.clone(), Launch::Retry { at, check_pods: !quota });
                         }
                     }
                 }

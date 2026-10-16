@@ -189,7 +189,8 @@ impl K8s {
     }
 
     /// Is a pod for this job still legitimately on its way (Pending waiting for capacity or
-    /// pulling its image, or Running)? Pods stuck on a fatal start error do not count.
+    /// pulling its image, or Running)? Pods stuck on a fatal start error, or already being
+    /// deleted, do not count.
     pub async fn job_pod_alive(&self, job: &str) -> bool {
         let Ok(list) = self.api.list_pods(&format!("{MANAGED},{JOB_LABEL}={job}")).await else { return false };
         list.iter().any(|p| {
@@ -202,7 +203,7 @@ impl K8s {
                 .chain(st.init_container_statuses.iter().flatten())
                 .filter_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.clone())
                 .any(|r| matches!(r.as_str(), "ErrImagePull" | "ImagePullBackOff" | "InvalidImageName" | "CreateContainerConfigError" | "CreateContainerError"));
-            (phase == "Pending" || phase == "Running") && !fatal
+            p.metadata.deletion_timestamp.is_none() && (phase == "Pending" || phase == "Running") && !fatal
         })
     }
 
