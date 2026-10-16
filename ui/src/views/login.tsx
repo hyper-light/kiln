@@ -90,10 +90,6 @@ export function Login({ error, onRetry }: { error?: string; onRetry: () => void 
         </div>
       </header>
       <main id="main" className="container-console grid flex-1 items-center gap-10 py-10 md:grid-cols-[1.05fr_1fr] md:py-16">
-        {/* The rings sit above the form on phones and beside it on wider screens. */}
-        <div className="flex justify-center md:hidden" aria-hidden="true">
-          <Optic size={216} />
-        </div>
         <div data-reveal>
           <div className="eyebrow">
             <span className="spectrum-rule" /> 00 / Sign in
@@ -187,13 +183,10 @@ export function Login({ error, onRetry }: { error?: string; onRetry: () => void 
             <span className="tiny-cross">+</span>Self-hosted. Session cookie only; secrets never leave this origin.
           </div>
         </div>
-        <div className="hidden items-center justify-center md:flex" aria-hidden="true">
-          <div className="relative">
-            <Optic size={380} />
-            <div className="absolute inset-x-0 -bottom-6 text-center font-mono text-[8px] tracking-[0.11em] text-[#7b7e88]">
-              KILN / CONTINUOUS INTEGRATION
-            </div>
-          </div>
+        {/* Beside the form on wide screens; below it on phones, as on hyperlight-site's hero. */}
+        <div className="login-art" aria-hidden="true">
+          <Optic size="var(--optic-size)" />
+          <div className="login-art-caption">KILN / CONTINUOUS INTEGRATION</div>
         </div>
       </main>
       <footer className="site-footer">

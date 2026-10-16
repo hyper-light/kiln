@@ -1051,6 +1051,41 @@
   }
 }
 
+/* Login art: beside the form on wide screens; on phones a full-width frame below the copy
+   (hyperlight-site's mobile hero proportions). */
+.login-art {
+  --optic-size: 380px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+.login-art-caption {
+  position: absolute;
+  inset-inline: 0;
+  bottom: -24px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.11em;
+  color: #7b7e88;
+}
+@media (max-width: 767px) {
+  .login-art {
+    --optic-size: min(86vw, 400px);
+    width: 100%;
+    max-width: 510px;
+    justify-self: center;
+    height: clamp(320px, 96vw, 460px);
+    margin-top: -12px;
+  }
+  .login-art-caption {
+    bottom: 6px;
+    font-size: 7px;
+  }
+}
+
 /* Concentric-ring quiet art (site OG motif), used in empty/login */
 .optic {
   position: relative;
