@@ -108,15 +108,16 @@ fn lock_path(state_dir: &Path, args: &[String]) -> PathBuf {
 }
 
 /// Hold an exclusive lock for this (state dir, args) pair so boot hooks, cron and a manual start
-/// can never run two supervisors for the same service.
-fn single_instance(state_dir: &Path, args: &[String]) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+/// can never run two supervisors for the same service. The lock is the returned file's (`flock`
+/// on Unix, `LockFileEx` on Windows) and lasts until it is dropped.
+fn single_instance(state_dir: &Path, args: &[String]) -> anyhow::Result<Option<std::fs::File>> {
     std::fs::create_dir_all(state_dir)?;
     let path = lock_path(state_dir, args);
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
-    match nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-        Ok(l) => Ok(Some(l)),
-        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
-        Err((_, e)) => Err(anyhow::anyhow!("lock {}: {e}", path.display())),
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::anyhow!("lock {}: {e}", path.display())),
     }
 }
 

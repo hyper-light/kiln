@@ -653,26 +653,20 @@ async fn kill_group(pgid: i32) {
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
 }
 
-/// An advisory lock file (`flock`) so concurrent jobs, even in separate agent processes, update a
-/// shared git mirror one at a time. Released on drop.
-struct FileLock(Option<nix::fcntl::Flock<std::fs::File>>);
+/// A lock file (`flock` on Unix, `LockFileEx` on Windows) so concurrent jobs, even in separate
+/// agent processes, update a shared git mirror one at a time. Released on drop (closing the file
+/// releases the lock).
+struct FileLock(#[allow(dead_code, reason = "held for its lock")] std::fs::File);
 
 impl FileLock {
     async fn acquire(path: &Path) -> anyhow::Result<Self> {
         let path = path.to_path_buf();
         crate::rt::blocking(move || {
             let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
-            nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
-                .map(|l| Self(Some(l)))
-                .map_err(|(_, e)| anyhow::anyhow!("flock {}: {e}", path.display()))
+            f.lock().map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))?;
+            Ok(Self(f))
         })
         .await?
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        drop(self.0.take());
     }
 }
 

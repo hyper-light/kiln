@@ -68,15 +68,10 @@ pub fn load(path: &Path) -> Option<String> {
 
 /// Replace the stored hash atomically (write a 0600 temp file, fsync, rename).
 pub fn store(path: &Path, phc: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
     let dir = path.parent().context("password path has no parent")?;
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
+    let mut f = crate::os::with_mode(std::fs::OpenOptions::new().write(true).create(true).truncate(true), 0o600)
         .open(&tmp)
         .with_context(|| format!("write {}", tmp.display()))?;
     f.write_all(phc.as_bytes())?;
@@ -176,8 +171,11 @@ mod tests {
         assert!(verify("correct horse battery", &loaded));
         assert!(!verify("correct horse batter", &loaded));
         assert!(!verify("", &loaded));
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(std::fs::metadata(&p)?.permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(std::fs::metadata(&p)?.permissions().mode() & 0o777, 0o600);
+        }
         clear(&p)?;
         clear(&p)?;
         assert!(load(&p).is_none());

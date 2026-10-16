@@ -144,7 +144,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 // Bound through std (SO_REUSEADDR: a restart rebinds at once despite TIME_WAIT,
                 // and a second server on the same port fails loudly), then adopted by hyper-rt.
                 let std_listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
-                let listener = hyper_rt::tcp::TcpListener::from_owned(std::os::fd::OwnedFd::from(std_listener), 128)
+                let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128)
                     .map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
                 tracing::info!(%addr, url = %hub.cfg.server.public_url, "HTTP listening (hyper-rt)");
                 let api = Arc::new(crate::api::Api { hub });
