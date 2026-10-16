@@ -149,6 +149,8 @@ fn install_panic_hook() {
 }
 
 fn shutdown_on_signals(token: Shutdown) {
+    // Windows has no SIGTERM: a supervised child is asked to stop through its stdin.
+    kiln::os::supervise::watch_supervisor(token.clone());
     let signals = match kiln::rt::Signals::new(&[kiln::rt::SIGTERM, kiln::rt::SIGINT]) {
         Ok(s) => s,
         Err(e) => {
@@ -265,11 +267,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             }
             out("Tip: choose a password in Settings (or run `kiln passwd`) to sign in from any device without a link.");
             if !print {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
+                kiln::os::open_url(&url);
             }
             Ok(())
         }

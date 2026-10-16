@@ -645,13 +645,12 @@ pub fn file_source(path: impl Into<PathBuf>) -> anyhow::Result<async_channel::Re
     let file = Arc::new(std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?);
     let (tx, rx) = async_channel::bounded::<Bytes>(4);
     spawn(async move {
-        use std::os::unix::fs::FileExt as _;
         let mut offset = 0u64;
         loop {
             let f = Arc::clone(&file);
             let read = blocking(move || {
                 let mut buf = vec![0u8; FILE_CHUNK];
-                let n = f.read_at(&mut buf, offset)?;
+                let n = crate::os::read_at(&f, &mut buf, offset)?;
                 buf.truncate(n);
                 Ok::<_, io::Error>(buf)
             })
@@ -692,7 +691,6 @@ pub fn file_sink(
     let file = Arc::new(std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?);
     let (tx, rx) = async_channel::bounded::<Bytes>(16);
     let writer = spawn(async move {
-        use std::os::unix::fs::FileExt as _;
         let mut total = 0u64;
         while let Ok(first) = rx.recv().await {
             let mut batch = vec![first];
@@ -713,7 +711,7 @@ pub fn file_sink(
             blocking(move || {
                 let mut off = at;
                 for chunk in &batch {
-                    f.write_all_at(chunk, off)?;
+                    crate::os::write_all_at(&f, chunk, off)?;
                     off = off.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
                 }
                 Ok::<_, io::Error>(())
@@ -771,15 +769,7 @@ pub struct Signals {
 impl Signals {
     pub fn new(kinds: &[i32]) -> anyhow::Result<Self> {
         use hyper_rt::signal::Signal;
-        let wanted: Vec<Signal> = kinds
-            .iter()
-            .filter_map(|k| match *k {
-                SIGINT => Some(Signal::Interrupt),
-                SIGTERM => Some(Signal::Terminate),
-                SIGHUP => Some(Signal::Hangup),
-                _ => None,
-            })
-            .collect();
+        let wanted: Vec<Signal> = kinds.iter().flat_map(|k| crate::os::signal_kinds(*k).iter().copied()).collect();
         anyhow::ensure!(!wanted.is_empty(), "no supported signal requested");
         rt()?;
         let stream = hyper_rt::signal::subscribe(&wanted).map_err(|e| anyhow::anyhow!("subscribe to signals: {e}"))?;
@@ -793,13 +783,7 @@ impl Signals {
                     Ok(set) => {
                         failures = 0;
                         for s in set.iter() {
-                            let n = match s {
-                                Signal::Interrupt => SIGINT,
-                                Signal::Terminate => SIGTERM,
-                                Signal::Hangup => SIGHUP,
-                                _ => continue,
-                            };
-                            if tx.send(n).await.is_err() {
+                            if tx.send(crate::os::signal_number(s)).await.is_err() {
                                 return;
                             }
                         }

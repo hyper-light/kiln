@@ -53,7 +53,7 @@ jobs:
     steps:
       - name: build
         run: cargo build --profile ${{ matrix.profile }}
-        shell: bash                       # default: bash -eo pipefail (sh -e if no bash)
+        shell: bash                       # default: bash -eo pipefail (sh -e if no bash); Windows: pwsh, else powershell
         working-directory: crates/core
         env: { CARGO_INCREMENTAL: "0" }
         timeout-minutes: 20

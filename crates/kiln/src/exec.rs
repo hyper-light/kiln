@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
 
 use crate::proto::{AgentMsg, Assignment, JobResult, LOG_CHUNK, LogChunk};
 use crate::rt::{Interval, Shutdown};
@@ -82,7 +80,7 @@ fn tmp_dir(ws: &Path) -> PathBuf {
 }
 
 fn have(bin: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
+    crate::os::have(bin)
 }
 
 fn mask(data: &[u8], secrets: &[(String, String)]) -> Vec<u8> {
@@ -196,6 +194,13 @@ impl Exec {
         ] {
             env.entry(k.to_owned()).or_insert(v);
         }
+        if cfg!(windows) {
+            // Windows tools find their temp dir through TEMP / TMP rather than TMPDIR.
+            let tmp = tmp_dir(ws).to_string_lossy().into_owned();
+            for k in ["TEMP", "TMP"] {
+                env.entry(k.to_owned()).or_insert_with(|| tmp.clone());
+            }
+        }
         for (k, v) in &a.secrets {
             env.insert(k.clone(), v.clone());
         }
@@ -288,7 +293,7 @@ impl Exec {
 
     async fn git(&self, args: &[&str]) -> anyhow::Result<()> {
         let mut cmd = Command::new("git");
-        cmd.args(args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/true");
+        crate::os::git_no_prompts(cmd.args(args));
         let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
         if !out.status.success() {
             anyhow::bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
@@ -364,13 +369,11 @@ impl Exec {
                         }
                     }
                 } else {
-                    args.push("-c".into());
-                    args.push(script.to_owned());
+                    args.extend(crate::os::script_args(&prog, script));
                 }
                 (prog, args)
             }
-            None if have("bash") => ("bash".into(), vec!["--noprofile".into(), "--norc".into(), "-eo".into(), "pipefail".into(), "-c".into(), script.to_owned()]),
-            None => ("sh".into(), vec!["-ec".into(), script.to_owned()]),
+            None => crate::os::default_step_shell(script),
         }
     }
 
@@ -443,7 +446,7 @@ impl Exec {
             }
         }
         // Reap anything the step left behind in its process group.
-        crate::proc::kill_group(pgid);
+        running.kill_group();
         if !pending.is_empty() {
             self.ship(idx, &mut pending).await;
         }
@@ -519,16 +522,16 @@ impl Exec {
                 }
                 Ev::Sample => self.sample(pgid, usage).await,
                 Ev::Cancel => {
-                    kill_group(pgid).await;
+                    crate::proc::terminate_tree(pgid, Duration::from_secs(5)).await;
                     break Outcome::Cancelled;
                 }
                 Ev::Deadline => {
-                    kill_group(pgid).await;
+                    crate::proc::terminate_tree(pgid, Duration::from_secs(5)).await;
                     break Outcome::TimedOut;
                 }
             }
         };
-        drop(pty.master);
+        crate::os::pty::close_master(pty.master);
         while let Ok(Ok(c)) = crate::rt::timeout(Duration::from_millis(300), rx.recv()).await {
             pending.extend(c);
         }
@@ -633,46 +636,27 @@ pub fn reap_orphans(work_dir: &Path) -> usize {
         if pgid <= 0 || job.is_empty() {
             continue;
         }
-        let environ = std::fs::read(format!("/proc/{pgid}/environ")).unwrap_or_default();
-        let marker = format!("KILN_JOB_ID={job}");
-        if environ.split(|b| *b == 0).any(|kv| kv == marker.as_bytes())
-            && killpg(Pid::from_raw(pgid), Signal::SIGKILL).is_ok()
-        {
+        if crate::proc::kill_orphan_group(pgid, &format!("KILN_JOB_ID={job}")) {
             killed += 1;
         }
     }
     killed
 }
 
-async fn kill_group(pgid: i32) {
-    if pgid <= 0 {
-        return;
-    }
-    let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-    crate::rt::sleep(Duration::from_secs(5)).await;
-    let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-}
-
-/// An advisory lock file (`flock`) so concurrent jobs, even in separate agent processes, update a
-/// shared git mirror one at a time. Released on drop.
-struct FileLock(Option<nix::fcntl::Flock<std::fs::File>>);
+/// A lock file (`flock` on Unix, `LockFileEx` on Windows) so concurrent jobs, even in separate
+/// agent processes, update a shared git mirror one at a time. Released on drop (closing the file
+/// releases the lock).
+struct FileLock(#[allow(dead_code, reason = "held for its lock")] std::fs::File);
 
 impl FileLock {
     async fn acquire(path: &Path) -> anyhow::Result<Self> {
         let path = path.to_path_buf();
         crate::rt::blocking(move || {
             let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
-            nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
-                .map(|l| Self(Some(l)))
-                .map_err(|(_, e)| anyhow::anyhow!("flock {}: {e}", path.display()))
+            f.lock().map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))?;
+            Ok(Self(f))
         })
         .await?
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        drop(self.0.take());
     }
 }
 

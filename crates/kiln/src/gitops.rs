@@ -33,9 +33,7 @@ fn github_token(hub: &Hub) -> Option<String> {
 
 fn git(hub: &Hub) -> Command {
     let mut c = Command::new("git");
-    c.env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/bin/true")
-        .env("SSH_ASKPASS", "/bin/true")
+    crate::os::git_no_prompts(&mut c)
         .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
         .stdin(std::process::Stdio::null());
     if let Some(t) = github_token(hub) {

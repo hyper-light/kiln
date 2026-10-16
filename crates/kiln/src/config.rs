@@ -133,35 +133,28 @@ pub struct Telemetry {
 }
 
 fn hostname() -> String {
-    nix::unistd::gethostname()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "localhost".to_owned())
+    crate::os::hostname()
 }
 
+/// `/var/lib/kiln` as root; otherwise per user: `~/.local/share/kiln` (`$XDG_DATA_HOME`) on Unix,
+/// `%LOCALAPPDATA%\kiln` on Windows.
 pub fn default_data_dir() -> PathBuf {
-    if nix::unistd::geteuid().is_root() {
-        return PathBuf::from("/var/lib/kiln");
+    if crate::os::is_root() {
+        return crate::os::system_dirs().0;
     }
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("kiln")
+    crate::os::data_home().join("kiln")
 }
 
+/// `$KILN_CONFIG`; `/etc/kiln/kiln.toml` as root; otherwise per user: `~/.config/kiln/kiln.toml`
+/// (`$XDG_CONFIG_HOME`) on Unix, `%APPDATA%\kiln\kiln.toml` on Windows.
 pub fn default_config_path() -> PathBuf {
     if let Some(p) = std::env::var_os("KILN_CONFIG") {
         return PathBuf::from(p);
     }
-    if nix::unistd::geteuid().is_root() {
-        return PathBuf::from("/etc/kiln/kiln.toml");
+    if crate::os::is_root() {
+        return crate::os::system_dirs().1;
     }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("kiln/kiln.toml")
+    crate::os::config_home().join("kiln").join("kiln.toml")
 }
 
 impl Default for Server {

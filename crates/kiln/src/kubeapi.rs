@@ -149,7 +149,7 @@ impl KubeApi {
     fn from_kubeconfig(namespace: &str) -> anyhow::Result<Self> {
         let path = std::env::var_os("KUBECONFIG")
             .and_then(|v| std::env::split_paths(&v).next())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kube/config")))
+            .or_else(|| Some(crate::os::home_dir().join(".kube").join("config")))
             .ok_or_else(|| anyhow::anyhow!("no in-cluster credentials and no kubeconfig"))?;
         let context = std::env::var("KILN_KUBE_CONTEXT").ok();
         Self::from_kubeconfig_path(&path, context.as_deref(), namespace)

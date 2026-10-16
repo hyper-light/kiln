@@ -16,6 +16,7 @@ pub mod k8s;
 pub mod logs;
 pub mod metrics;
 pub mod net;
+pub mod os;
 pub mod password;
 pub mod pipeline;
 pub mod pki;

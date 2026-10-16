@@ -15,8 +15,8 @@ UI. It runs the same way on bare metal and on Kubernetes.
   log traffic use separate prioritised lanes.
 * **Full machine control:** real PTY terminals in the browser on the server and on every agent.
   Resize, alt-screen and TUIs (k9s, htop, vim) all work.
-* **Observability:** Prometheus `/metrics` (host stats read straight from `/proc`, sampled every
-  5 s), Grafana dashboards, alert rules, live UI charts. No sidecars, nothing paid.
+* **Observability:** Prometheus `/metrics` (host stats read straight from `/proc` on Linux, from
+  the OS on macOS and Windows, sampled every 5 s), Grafana dashboards, alert rules, live UI charts. No sidecars, nothing paid.
 * **Never down for long:** no `unwrap`/`expect`/`panic`/indexing (enforced by clippy).
   Recovery happens at several levels:
   * subsystems restart in-process, Erlang style;
@@ -43,6 +43,32 @@ the UI:
 ```sh
 curl -fsSL http://<server>:7070/install.sh | sh -s -- --token <join-token> --labels baremetal,bench
 ```
+
+## Platforms
+
+kiln builds and runs on Linux, macOS and Windows, on x86_64 and arm64. Every tagged release
+(`.github/workflows/release.yml`) publishes `kiln-<version>-<target>.tar.gz` / `.zip`, the bare
+binaries and `SHA256SUMS` for `x86_64`/`aarch64-unknown-linux-musl` (fully static),
+`x86_64`/`aarch64-apple-darwin` and `x86_64`/`aarch64-pc-windows-msvc`.
+
+| | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| `kiln install` starts on boot with | systemd (else cron `@reboot`, else XDG autostart) | launchd (LaunchAgent; LaunchDaemon as root) | a per-user Scheduled Task at logon (no admin rights) |
+| binary | `~/.local/bin` (`/usr/local/bin` as root) | same | `%LOCALAPPDATA%\Programs\kiln` |
+| config / data | `~/.config/kiln`, `~/.local/share/kiln` (`/etc/kiln`, `/var/lib/kiln` as root) | same | `%APPDATA%\kiln`, `%LOCALAPPDATA%\kiln` |
+| job steps (no `shell:`) | `bash -eo pipefail`, else `sh -e` | same | PowerShell 7 (`pwsh`), else Windows PowerShell |
+| job process trees | process groups | process groups | job objects (they die with the agent) |
+
+A server hands out agents for every platform: `GET /dl/kiln/<target>` serves its own binary when
+it was built for that target and otherwise redirects to the matching release asset of the same
+version. On Windows, add an agent from PowerShell (no elevation needed):
+
+```powershell
+& ([scriptblock]::Create((irm http://<server>:7070/install.ps1))) -Token <join-token> -Labels windows
+```
+
+Give Windows and macOS agents their own labels (`windows`, `macos`) so `runs-on: [baremetal]`
+jobs written for Linux do not land on them.
 
 ## Kubernetes (multi-node, ArgoCD, Prometheus, Grafana)
 

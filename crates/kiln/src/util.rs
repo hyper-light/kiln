@@ -39,20 +39,15 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Write a file atomically with the given mode (temp file + rename).
+/// Write a file atomically with the given mode (temp file + rename; the mode is Unix-only).
 pub fn write_secret(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(mode)
+        let mut f = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(true).write(true), mode)
             .open(&tmp)?;
         f.write_all(contents)?;
         f.sync_all()?;

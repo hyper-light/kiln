@@ -25,12 +25,7 @@ pub struct Target {
 
 /// The cluster bootstrap's credentials file (`deploy/cluster/bootstrap.sh`).
 pub fn cluster_credentials_path() -> PathBuf {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from(".local/state"));
-    state.join("kiln/cluster/credentials.env")
+    crate::os::state_home().join("kiln").join("cluster").join("credentials.env")
 }
 
 /// `KEY=value` lines (shell-style, optional quotes) from an env file.
