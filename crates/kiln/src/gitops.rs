@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use tokio::process::Command;
-use tokio::sync::Semaphore;
+use std::process::Command;
+
+use futures::FutureExt as _;
 
 use crate::hub::Hub;
 use crate::pipeline::{self, Context, Pipeline};
@@ -36,7 +37,6 @@ fn git(hub: &Hub) -> Command {
         .env("GIT_ASKPASS", "/bin/true")
         .env("SSH_ASKPASS", "/bin/true")
         .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
-        .kill_on_drop(true)
         .stdin(std::process::Stdio::null());
     if let Some(t) = github_token(hub) {
         use base64::Engine as _;
@@ -49,10 +49,9 @@ fn git(hub: &Hub) -> Command {
 async fn run_git(hub: &Hub, args: &[&str], timeout: Duration) -> anyhow::Result<Vec<u8>> {
     let mut cmd = git(hub);
     cmd.args(args);
-    let out = tokio::time::timeout(timeout, cmd.output())
+    let out = crate::proc::output(cmd, timeout)
         .await
-        .map_err(|_| anyhow::anyhow!("git {} timed out", args.first().unwrap_or(&"")))?
-        .context("spawn git")?;
+        .with_context(|| format!("git {}", args.first().unwrap_or(&"")))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("git {}: {}", args.first().unwrap_or(&""), crate::util::truncate(err.trim(), 600));
@@ -98,7 +97,7 @@ pub async fn ls_remote(hub: &Hub, url: &str) -> anyhow::Result<BTreeMap<String, 
 
 /// Create or refresh the bare mirror. Concurrent callers for one repo are serialised.
 pub async fn sync_mirror(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
-    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> =
         std::sync::OnceLock::new();
     let lock = LOCKS
         .get_or_init(Default::default)
@@ -115,16 +114,19 @@ pub async fn sync_mirror(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
             .await?;
     } else {
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            let parent = parent.to_path_buf();
+            crate::rt::blocking(move || std::fs::create_dir_all(parent)).await??;
         }
         let tmp = format!("{p}.tmp-{}", std::process::id());
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        let t = tmp.clone();
+        let _ = crate::rt::blocking(move || std::fs::remove_dir_all(t)).await;
         run_git(hub, &["clone", "--bare", "--quiet", &repo.clone_url, &tmp], GIT_TIMEOUT).await?;
         run_git(hub, &["-C", &tmp, "config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"], GIT_TIMEOUT).await?;
         run_git(hub, &["-C", &tmp, "fetch", "--quiet", "origin", "+refs/pull/*/head:refs/pull/*/head"], GIT_TIMEOUT)
             .await
             .ok();
-        tokio::fs::rename(&tmp, &path).await?;
+        let (from, to) = (tmp.clone(), path.clone());
+        crate::rt::blocking(move || std::fs::rename(from, to)).await??;
     }
     Ok(path)
 }
@@ -300,7 +302,7 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
         hub.emit_run(&run.id).await;
         runs.push(run);
     }
-    hub.wake.notify_one();
+    hub.wake.notify();
     Ok(runs)
 }
 
@@ -369,7 +371,7 @@ pub async fn manual(hub: &Hub, repo: &Repo, branch: Option<String>, pipeline: Op
 }
 
 /// Register repositories from config and org discovery.
-async fn discover(hub: &Hub, http: &reqwest::Client) -> anyhow::Result<()> {
+async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Result<()> {
     let poll = hub.cfg.gitops.poll_seconds;
     for r in &hub.cfg.repos {
         hub.store
@@ -390,24 +392,22 @@ async fn discover(hub: &Hub, http: &reqwest::Client) -> anyhow::Result<()> {
     for org in &hub.cfg.gitops.orgs {
         let mut page = 1;
         loop {
-            let mut req = http
-                .get(format!("https://api.github.com/orgs/{org}/repos?per_page=100&page={page}"))
-                .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "kiln");
+            let url = format!("https://api.github.com/orgs/{org}/repos?per_page=100&page={page}");
+            let mut req = http.get(&url).header("Accept", "application/vnd.github+json");
             if let Some(t) = github_token(hub) {
-                req = req.bearer_auth(t);
+                req = req.bearer(&t);
             }
             let resp = req.send().await.context("github org listing")?;
-            if let Some(rem) = resp.headers().get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()) {
+            if let Some(rem) = resp.header("x-ratelimit-remaining").and_then(|v| v.parse().ok()) {
                 crate::metrics::global().gitops_rate_remaining.set(rem);
             }
-            if let Some(lim) = resp.headers().get("x-ratelimit-limit").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()) {
+            if let Some(lim) = resp.header("x-ratelimit-limit").and_then(|v| v.parse().ok()) {
                 crate::metrics::global().gitops_rate_limit.set(lim);
             }
-            if !resp.status().is_success() {
+            if !resp.is_success() {
                 anyhow::bail!("github org {org}: HTTP {}", resp.status());
             }
-            let repos: Vec<serde_json::Value> = resp.json().await?;
+            let repos: Vec<serde_json::Value> = resp.json(32 << 20).await?;
             let n = repos.len();
             for r in repos {
                 let name = r.get("full_name").unwrap_or(&serde_json::Value::Null).as_str().unwrap_or_default().to_owned();
@@ -446,22 +446,21 @@ async fn discover(hub: &Hub, http: &reqwest::Client) -> anyhow::Result<()> {
 }
 
 pub async fn discover_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let http = crate::http::client::github()?;
     loop {
-        if let Err(e) = discover(&hub, &http).await {
+        if let Err(e) = discover(&hub, http).await {
             tracing::warn!(error = %format!("{e:#}"), "repository discovery failed");
         }
-        hub.gitops_kick.notify_one();
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(u64::from(hub.cfg.gitops.discover_seconds.max(60)))) => {}
-            () = hub.shutdown.cancelled() => return Ok(()),
+        hub.gitops_kick.notify();
+        if !hub.shutdown.sleep(Duration::from_secs(u64::from(hub.cfg.gitops.discover_seconds.max(60)))).await {
+            return Ok(());
         }
     }
 }
 
 /// Poll every repository when it is due (or immediately when kicked by a webhook / the UI).
 pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
-    let sem = Arc::new(Semaphore::new(hub.cfg.gitops.git_concurrency.max(1)));
+    let sem = Arc::new(async_lock::Semaphore::new(hub.cfg.gitops.git_concurrency.max(1)));
     let inflight = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
     let mut force = true;
     loop {
@@ -477,7 +476,7 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
             inflight.lock().insert(repo.id.clone());
             let (hub, sem, inflight) = (hub.clone(), sem.clone(), inflight.clone());
             crate::sup::spawn_guarded("poll-repo", async move {
-                let _permit = sem.acquire().await?;
+                let _permit = sem.acquire().await;
                 let r = poll_repo(&hub, &repo).await;
                 let err = r.as_ref().err().map(|e| format!("{e:#}"));
                 let result = match &r {
@@ -495,10 +494,10 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
             });
         }
         force = false;
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(5)) => {}
-            () = hub.gitops_kick.notified() => force = true,
-            () = hub.shutdown.cancelled() => return Ok(()),
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            () = hub.gitops_kick.notified().fuse() => force = true,
+            () = crate::rt::sleep(Duration::from_secs(5)).fuse() => {}
         }
     }
 }
@@ -508,9 +507,8 @@ pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut last_minute = -1i64;
     let mut cache: HashMap<(String, String), Vec<(String, Result<Pipeline, String>)>> = HashMap::new();
     loop {
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(10)) => {}
-            () = hub.shutdown.cancelled() => return Ok(()),
+        if !hub.shutdown.sleep(Duration::from_secs(10)).await {
+            return Ok(());
         }
         let now = time::OffsetDateTime::now_utc();
         let minute = now.unix_timestamp() / 60;
@@ -592,27 +590,31 @@ pub async fn report_status(hub: &Hub, run: &Run, status: Status) {
         "target_url": format!("{}/runs/{}", hub.cfg.server.public_url.trim_end_matches('/'), run.id),
     });
     let url = format!("https://api.github.com/repos/{}/statuses/{}", run.repo_name, run.sha);
-    let client = reqwest::Client::new();
-    let r = client
-        .post(url)
-        .bearer_auth(token)
-        .header("User-Agent", "kiln")
-        .header("Accept", "application/vnd.github+json")
-        .json(&body)
-        .timeout(Duration::from_secs(15))
-        .send()
-        .await;
-    if let Err(e) = r {
-        tracing::debug!(error = %e, "commit status not posted");
+    let r = match crate::http::client::github() {
+        Ok(client) => client
+            .post(&url)
+            .bearer(&token)
+            .header("Accept", "application/vnd.github+json")
+            .json(&body)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map(|resp| resp.status()),
+        Err(e) => Err(e),
+    };
+    match r {
+        Ok(code) if (200..300).contains(&code) => {}
+        Ok(code) => tracing::debug!(code, "commit status not accepted"),
+        Err(e) => tracing::debug!(error = %e, "commit status not posted"),
     }
 }
 
 /// `git archive` of a commit, for pods that build without git. Returns a tar stream.
-pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<tokio::process::Child> {
+pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<async_channel::Receiver<bytes::Bytes>> {
     let path = ensure_commit(hub, repo, sha).await?;
     let mut cmd = git(hub);
-    cmd.arg("-C").arg(path).args(["archive", "--format=tar", sha]).stdout(std::process::Stdio::piped());
-    Ok(cmd.spawn()?)
+    cmd.arg("-C").arg(path).args(["archive", "--format=tar", sha]);
+    crate::proc::stdout_stream(cmd)
 }
 
 #[cfg(test)]

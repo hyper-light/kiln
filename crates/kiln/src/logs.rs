@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use tokio::sync::broadcast;
 
 #[derive(Debug, Clone)]
 pub enum LogEvent {
@@ -19,7 +18,9 @@ pub enum LogEvent {
 }
 
 struct Live {
-    tx: broadcast::Sender<LogEvent>,
+    tx: async_broadcast::Sender<LogEvent>,
+    /// Keeps the channel open while nobody is watching.
+    _idle: async_broadcast::InactiveReceiver<LogEvent>,
     files: HashMap<u32, std::fs::File>,
     bytes: u64,
     truncated: bool,
@@ -53,11 +54,13 @@ impl Logs {
 
     fn with_live<R>(&self, job: &str, f: impl FnOnce(&mut Live) -> R) -> R {
         let mut g = self.live.lock();
-        let live = g.entry(job.to_owned()).or_insert_with(|| Live {
-            tx: broadcast::channel(1024).0,
-            files: HashMap::new(),
-            bytes: 0,
-            truncated: false,
+        let live = g.entry(job.to_owned()).or_insert_with(|| {
+            let (mut tx, rx) = async_broadcast::broadcast(1024);
+            // Slow viewers lose the oldest chunks (and are told so) instead of stalling writers.
+            tx.set_overflow(true);
+            tx.set_await_active(false);
+            let idle = rx.deactivate();
+            Live { tx, _idle: idle, files: HashMap::new(), bytes: 0, truncated: false }
         });
         f(live)
     }
@@ -102,7 +105,7 @@ impl Logs {
                 && let Err(e) = f.write_all(chunk) {
                     tracing::warn!(error = %e, "log write failed");
                 }
-            let _ = live.tx.send(LogEvent::Data { idx, data: Bytes::copy_from_slice(chunk) });
+            let _ = live.tx.try_broadcast(LogEvent::Data { idx, data: Bytes::copy_from_slice(chunk) });
         });
     }
 
@@ -111,21 +114,21 @@ impl Logs {
             if status != "running" {
                 live.files.remove(&idx);
             }
-            let _ = live.tx.send(LogEvent::Step { idx, status });
+            let _ = live.tx.try_broadcast(LogEvent::Step { idx, status });
         });
     }
 
     /// The job is over: close files, tell viewers, drop the channel.
     pub fn finish(&self, job: &str) {
         if let Some(live) = self.live.lock().remove(job) {
-            let _ = live.tx.send(LogEvent::End);
+            let _ = live.tx.try_broadcast(LogEvent::End);
         }
     }
 
     /// Subscribe to a job's live output. Subscribe *before* reading the backlog so nothing falls
     /// in between (viewers may see a few bytes twice at the seam, never miss any).
-    pub fn subscribe(&self, job: &str) -> broadcast::Receiver<LogEvent> {
-        self.with_live(job, |live| live.tx.subscribe())
+    pub fn subscribe(&self, job: &str) -> async_broadcast::Receiver<LogEvent> {
+        self.with_live(job, |live| live.tx.new_receiver())
     }
 
     pub fn is_live(&self, job: &str) -> bool {
@@ -133,21 +136,30 @@ impl Logs {
     }
 
     pub async fn read(&self, job: &str, idx: u32) -> Vec<u8> {
-        tokio::fs::read(self.step_path(job, idx)).await.unwrap_or_default()
+        let p = self.step_path(job, idx);
+        crate::rt::blocking(move || std::fs::read(p).unwrap_or_default()).await.unwrap_or_default()
     }
 
     /// Size of the backlog already on disk (for the UI's "download" affordance).
     pub async fn size(&self, job: &str, idx: u32) -> u64 {
-        tokio::fs::metadata(self.step_path(job, idx)).await.map(|m| m.len()).unwrap_or(0)
+        let p = self.step_path(job, idx);
+        crate::rt::blocking(move || std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).await.unwrap_or(0)
     }
 
     pub async fn remove(&self, jobs: Vec<String>) {
-        for j in jobs {
-            let d = self.job_dir(&j);
-            if let Err(e) = tokio::fs::remove_dir_all(&d).await
-                && e.kind() != std::io::ErrorKind::NotFound {
+        let dirs: Vec<PathBuf> = jobs.iter().map(|j| self.job_dir(j)).collect();
+        let r = crate::rt::blocking(move || {
+            for d in dirs {
+                if let Err(e) = std::fs::remove_dir_all(&d)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
                     tracing::warn!(error = %e, dir = %d.display(), "log prune failed");
                 }
+            }
+        })
+        .await;
+        if let Err(e) = r {
+            tracing::warn!(error = %e, "log prune task failed");
         }
     }
 }
@@ -156,8 +168,9 @@ impl Logs {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn append_tail_and_cap() -> anyhow::Result<()> {
+    #[test]
+    fn append_tail_and_cap() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
         let dir = tempfile::tempdir()?;
         let logs = Logs::new(dir.path().to_path_buf(), 16);
         let mut rx = logs.subscribe("job1");
@@ -178,5 +191,6 @@ mod tests {
         }
         assert_eq!(n, 4);
         Ok(())
+    })
     }
 }

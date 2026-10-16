@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!  supervised children        restart on error/panic with backoff
-//!  ├─ http          axum: UI, API, websockets, /metrics
+//!  ├─ http          hyper on hyper-rt: UI, API, websockets, /metrics
 //!  ├─ net           QUIC events → hub
 //!  ├─ scheduler     queue → agents / pods, timeouts, lost agents
 //!  ├─ gitops-*      discovery, polling, schedules
@@ -18,7 +18,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use tokio_util::sync::CancellationToken;
+use futures::FutureExt as _;
+
+use crate::rt::Shutdown;
 
 use crate::config::Config;
 use crate::hub::Hub;
@@ -48,7 +50,7 @@ pub fn token_path(cfg: &Config) -> PathBuf {
     cfg.server.admin_token_file.clone().unwrap_or_else(|| cfg.data("admin.token"))
 }
 
-pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()> {
+pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
@@ -77,6 +79,7 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
         ca_der: pki.ca_der.clone(),
         leaf,
         server: true,
+        dial_deadline: crate::net::DIAL_DEADLINE,
     })?;
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
     // Process restarts by the supervisor count as restarts too (generation 1 = first start).
@@ -136,13 +139,35 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
             let hub = h.clone();
             let sd = sd.clone();
             async move {
-                let addr = hub.cfg.server.http_addr.clone();
-                let listener = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
-                tracing::info!(%addr, url = %hub.cfg.server.public_url, "HTTP listening");
-                axum::serve(listener, crate::api::router(hub))
-                    .with_graceful_shutdown(async move { sd.cancelled().await })
-                    .await?;
-                Ok(())
+                let addr: SocketAddr = hub.cfg.server.http_addr.parse().with_context(|| format!("http_addr {}", hub.cfg.server.http_addr))?;
+                // Bound through std (SO_REUSEADDR: a restart rebinds at once despite TIME_WAIT,
+                // and a second server on the same port fails loudly), then adopted by hyper-rt.
+                let std_listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+                let listener = hyper_rt::tcp::TcpListener::from_owned(std::os::fd::OwnedFd::from(std_listener), 128)
+                    .map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
+                tracing::info!(%addr, url = %hub.cfg.server.public_url, "HTTP listening (hyper-rt)");
+                let api = Arc::new(crate::api::Api { hub });
+                loop {
+                    let accepted = futures::select_biased! {
+                        () = sd.cancelled().fuse() => return Ok(()),
+                        r = listener.accept().fuse() => r,
+                    };
+                    match accepted {
+                        Ok(stream) => {
+                            // Connections are spread over every shard; a fresh stream has no armed
+                            // waits, so it can move.
+                            let api = api.clone();
+                            crate::rt::spawn_spread(async move {
+                                crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), api).await;
+                            });
+                        }
+                        Err(e) => {
+                            // e.g. EMFILE: back off briefly instead of spinning.
+                            tracing::warn!(error = %format!("{e:#}"), "accept failed");
+                            crate::rt::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
             }
         });
     }
@@ -180,12 +205,12 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
     }
     shutdown.cancelled().await;
     tracing::info!("shutting down");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    crate::rt::sleep(Duration::from_millis(300)).await;
     Ok(())
 }
 
 /// The local agent shares the process shutdown token.
-fn shutdown_child() -> CancellationToken {
+fn shutdown_child() -> Shutdown {
     crate::SHUTDOWN.get().cloned().unwrap_or_default()
 }
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use tokio_util::sync::CancellationToken;
+use kiln::rt::Shutdown;
 
 use kiln::{config, install, supervise};
 
@@ -110,18 +110,23 @@ fn install_panic_hook() {
     }));
 }
 
-fn shutdown_on_signals(token: CancellationToken) {
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
-            tracing::warn!("cannot install signal handlers");
+fn shutdown_on_signals(token: Shutdown) {
+    let signals = match kiln::rt::Signals::new(&[kiln::rt::SIGTERM, kiln::rt::SIGINT]) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "cannot install signal handlers");
             return;
-        };
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
         }
-        token.cancel();
+    };
+    // The subscription is kept for the life of the process: a second SIGTERM during a graceful
+    // shutdown is absorbed instead of restoring the default action and killing us mid-cleanup.
+    kiln::rt::spawn(async move {
+        while let Some(sig) = signals.next().await {
+            if token.is_cancelled() {
+                tracing::info!(signal = sig, "already shutting down");
+            }
+            token.cancel();
+        }
     });
 }
 
@@ -134,14 +139,13 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(&cli.log, cli.json);
     install_panic_hook();
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("kiln").build() {
-        Ok(rt) => rt,
-        Err(e) => {
-            tracing::error!(error = %e, "cannot start runtime");
-            return ExitCode::FAILURE;
-        }
-    };
-    match rt.block_on(real_main(cli)) {
+    // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
+    kiln::rt::configure(match &cli.cmd {
+        Cmd::Server | Cmd::Up => kiln::rt::Profile::server(),
+        Cmd::Agent(_) => kiln::rt::Profile::agent(),
+        _ => kiln::rt::Profile::tool(),
+    });
+    match kiln::rt::block_on(real_main(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e:#}");
@@ -153,7 +157,7 @@ fn main() -> ExitCode {
 async fn real_main(cli: Cli) -> anyhow::Result<()> {
     let config_path = cli.config.clone().unwrap_or_else(config::default_config_path);
     // Make the resolved config path visible to children (supervise → server).
-    let shutdown = CancellationToken::new();
+    let shutdown = Shutdown::new();
     let _ = kiln::SHUTDOWN.set(shutdown.clone());
     match cli.cmd {
         Cmd::Server => {
@@ -266,15 +270,16 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             let token = kiln::server::admin_token(&cfg)?;
             let port = cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p);
             let url = format!("http://127.0.0.1:{port}/api/overview");
-            let v: serde_json::Value = reqwest::Client::new()
-                .get(url)
-                .bearer_auth(token)
+            let resp = kiln::http::client::Client::public()?
+                .get(&url)
+                .bearer(&token)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            if !resp.is_success() {
+                anyhow::bail!("server answered HTTP {}", resp.status());
+            }
+            let v: serde_json::Value = resp.json(8 << 20).await?;
             out(&serde_json::to_string_pretty(&v)?);
             Ok(())
         }

@@ -1,11 +1,16 @@
 //! Pseudo-terminal sessions: a real PTY (so `isatty()` is true, resize sends SIGWINCH, and
 //! full-screen TUIs such as k9s, htop and vim work) bridged to async channels. Shared by the
 //! server's "local" terminal and every agent.
+//!
+//! No threads: the PTY master is non-blocking and read and written as hyper-rt readiness fires;
+//! the shell's exit is awaited through its pidfd.
 
-use std::io::{Read as _, Write as _};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::Context as _;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum PtyOut {
@@ -14,7 +19,7 @@ pub enum PtyOut {
 }
 
 pub struct PtySession {
-    input: std::sync::mpsc::Sender<Vec<u8>>,
+    input: async_channel::Sender<Vec<u8>>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
 }
@@ -38,13 +43,33 @@ fn size(cols: u16, rows: u16) -> PtySize {
     PtySize { rows: rows.clamp(2, 1000), cols: cols.clamp(2, 1000), pixel_width: 0, pixel_height: 0 }
 }
 
+/// A raw descriptor number, so `filedescriptor` can duplicate it into an owned handle (the
+/// duplicate is ours to close; the original stays owned by portable-pty).
+struct RawNumber(RawFd);
+
+impl AsRawFd for RawNumber {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+/// An owned duplicate of the PTY master, non-blocking.
+fn master_fd(master: &dyn MasterPty) -> anyhow::Result<OwnedFd> {
+    let raw = master.as_raw_fd().context("the PTY master has no file descriptor")?;
+    let dup = filedescriptor::FileDescriptor::dup(&RawNumber(raw)).map_err(|e| anyhow::anyhow!("dup PTY master: {e}"))?;
+    let file = dup.as_file().map_err(|e| anyhow::anyhow!("PTY master as file: {e}"))?;
+    let fd = OwnedFd::from(file);
+    crate::proc::nonblocking(&fd).context("non-blocking PTY master")?;
+    Ok(fd)
+}
+
 /// Start `command` (or an interactive login shell) on a new PTY.
 pub fn spawn(
     shell: Option<&str>,
     command: Option<&str>,
     cols: u16,
     rows: u16,
-) -> anyhow::Result<(PtySession, mpsc::Receiver<PtyOut>)> {
+) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
     let pty = native_pty_system().openpty(size(cols, rows))?;
     let shell = default_shell(shell);
     let mut cmd = CommandBuilder::new(&shell);
@@ -66,51 +91,59 @@ pub fn spawn(
     if let Some(home) = std::env::var_os("HOME") {
         cmd.cwd(home);
     }
+    let fd = Arc::new(master_fd(pty.master.as_ref())?);
     let mut child = pty.slave.spawn_command(cmd)?;
     drop(pty.slave);
     let killer = child.clone_killer();
-    let mut reader = pty.master.try_clone_reader()?;
-    let mut writer = pty.master.take_writer()?;
 
-    let (tx, rx) = mpsc::channel::<PtyOut>(256);
-    // Reader thread: PTY → channel. Ends at EOF (child exited, or master closed).
-    let out = tx.clone();
-    std::thread::Builder::new().name("kiln-pty-read".into()).spawn(move || {
-        let mut buf = vec![0u8; 32 * 1024];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let chunk = buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default();
-                    if out.blocking_send(PtyOut::Data(chunk)).is_err() {
-                        break;
-                    }
+    let (tx, rx) = async_channel::bounded::<PtyOut>(256);
+    // PTY → channel. Ends at EOF/EIO (the shell exited, or the master closed).
+    {
+        let fd = Arc::clone(&fd);
+        let out = tx.clone();
+        crate::rt::spawn(async move {
+            let mut buf = vec![0u8; 32 * 1024];
+            while let Ok(Some(n)) = crate::proc::read_chunk(&fd, &mut buf).await {
+                if out.send(PtyOut::Data(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default())).await.is_err() {
+                    break;
                 }
             }
-        }
-    })?;
-    // Waiter thread: reports the exit status after output drains.
-    std::thread::Builder::new().name("kiln-pty-wait".into()).spawn(move || {
-        let code = child.wait().ok().and_then(|s| i32::try_from(s.exit_code()).ok());
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let _ = tx.blocking_send(PtyOut::Exit(code));
-    })?;
-    // Writer thread: channel → PTY. Keeps blocking writes off the async runtime.
-    let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    std::thread::Builder::new().name("kiln-pty-write".into()).spawn(move || {
-        while let Ok(data) = in_rx.recv() {
-            if writer.write_all(&data).and_then(|()| writer.flush()).is_err() {
-                break;
+        });
+    }
+    // The exit status, after the last output has had a moment to drain.
+    {
+        let pid = child.process_id();
+        crate::rt::spawn(async move {
+            let code = match pid {
+                Some(pid) => crate::proc::wait_pid_exit(pid, || child.try_wait())
+                    .await
+                    .ok()
+                    .and_then(|st| i32::try_from(st.exit_code()).ok()),
+                None => None,
+            };
+            crate::rt::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(PtyOut::Exit(code)).await;
+        });
+    }
+    // Channel → PTY.
+    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    {
+        let fd = Arc::clone(&fd);
+        crate::rt::spawn(async move {
+            while let Ok(data) = in_rx.recv().await {
+                if crate::proc::write_all(&fd, &data).await.is_err() {
+                    break;
+                }
             }
-        }
-    })?;
+        });
+    }
     crate::metrics::global().terminal_sessions.add(1);
     Ok((PtySession { input: in_tx, master: pty.master, killer }, rx))
 }
 
 impl PtySession {
     pub fn write(&self, data: Vec<u8>) {
-        let _ = self.input.send(data);
+        let _ = self.input.try_send(data);
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -131,15 +164,16 @@ impl Drop for PtySession {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn pty_is_a_tty_and_resizes() -> anyhow::Result<()> {
-        let (s, mut rx) = spawn(Some("/bin/sh"), Some("stty size; test -t 1 && echo TTY"), 100, 30)?;
+    #[test]
+    fn pty_is_a_tty_and_resizes() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+        let (s, rx) = spawn(Some("/bin/sh"), Some("stty size; test -t 1 && echo TTY"), 100, 30)?;
         let mut out = Vec::new();
         let code = loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await? {
-                Some(PtyOut::Data(d)) => out.extend(d),
-                Some(PtyOut::Exit(c)) => break c,
-                None => break None,
+            match crate::rt::timeout(std::time::Duration::from_secs(10), rx.recv()).await.map_err(|_| anyhow::anyhow!("pty timed out"))? {
+                Ok(PtyOut::Data(d)) => out.extend(d),
+                Ok(PtyOut::Exit(c)) => break c,
+                Err(_) => break None,
             }
         };
         let text = String::from_utf8_lossy(&out);
@@ -148,5 +182,6 @@ mod tests {
         assert_eq!(code, Some(0));
         s.resize(80, 24);
         Ok(())
+    })
     }
 }

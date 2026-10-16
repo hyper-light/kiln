@@ -15,11 +15,14 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::FutureExt as _;
+use futures::channel::oneshot;
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
-use tokio::process::Command;
-use tokio::signal::unix::{SignalKind, signal};
+
+use crate::rt::{Interval, Signals};
 
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -46,18 +49,56 @@ fn crash_log(dir: &Path, line: &str) {
     }
 }
 
-/// Reap any zombie that is not our direct child (we are PID 1 in containers).
-fn reap_orphans(child: Option<Pid>) {
+/// Wait for the child without a thread and report how it ended. Normally that is its pidfd. As
+/// PID 1 (containers) every orphan re-parented to us must be reaped too, so a `waitpid(-1,
+/// WNOHANG)` sweep runs whenever the child's pidfd fires and at least once a second; only our own
+/// child's status is reported. One reaper for everything means no two waits race for a pid.
+fn spawn_waiter(child: std::process::Child, pid1: bool) -> oneshot::Receiver<String> {
+    let (tx, rx) = oneshot::channel();
+    crate::rt::spawn(async move {
+        let status = if pid1 { wait_as_pid1(child).await } else { wait_plain(child).await };
+        let _ = tx.send(status);
+    });
+    rx
+}
+
+async fn wait_plain(mut child: std::process::Child) -> String {
+    let pid = child.id();
+    match crate::proc::wait_pid_exit(pid, || child.try_wait()).await {
+        Ok(status) => status.to_string(),
+        Err(e) => format!("wait error: {e}"),
+    }
+}
+
+async fn wait_as_pid1(child: std::process::Child) -> String {
+    let raw = i32::try_from(child.id()).unwrap_or(0);
+    let pid = Pid::from_raw(raw);
+    let pidfd = rustix::process::Pid::from_raw(raw)
+        .and_then(|p| rustix::process::pidfd_open(p, rustix::process::PidfdFlags::empty()).ok());
     loop {
-        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) | Err(_) => return,
-            Ok(st) => {
-                if st.pid().is_some() && st.pid() == child {
-                    // Our child was reaped here; tokio's waiter will report ECHILD, handled below.
-                    return;
-                }
+        loop {
+            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => break,
+                Ok(st) if st.pid() == Some(pid) => return describe(st),
+                Ok(_) | Err(Errno::EINTR) => {}
+                Err(Errno::ECHILD) => return "child vanished".to_owned(),
+                Err(e) => return format!("wait error: {e}"),
             }
         }
+        match &pidfd {
+            Some(fd) => {
+                let _ = crate::rt::timeout(Duration::from_secs(1), crate::proc::wait_readable(fd)).await;
+            }
+            None => crate::rt::sleep(Duration::from_millis(500)).await,
+        }
+    }
+}
+
+fn describe(st: WaitStatus) -> String {
+    match st {
+        WaitStatus::Exited(_, code) => format!("exit status: {code}"),
+        WaitStatus::Signaled(_, sig, _) => format!("signal: {sig}"),
+        other => format!("{other:?}"),
     }
 }
 
@@ -110,10 +151,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         return Ok(());
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kiln"));
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sighup = signal(SignalKind::hangup())?;
-    let mut sigchld = signal(SignalKind::child())?;
+    let signals = Signals::new(&[crate::rt::SIGTERM, crate::rt::SIGINT, crate::rt::SIGHUP])?;
     let is_pid1 = std::process::id() == 1;
     let mut backoff = MIN_BACKOFF;
     let mut generation: u64 = 0;
@@ -121,48 +159,51 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     loop {
         generation += 1;
         let started_mtime = exe_mtime(&exe);
-        let mut cmd = Command::new(&exe);
-        cmd.args(&opts.args)
-            .env("KILN_SUPERVISED", "1")
-            .env("KILN_GENERATION", generation.to_string())
-            .kill_on_drop(true);
-        let mut child = match cmd.spawn() {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&opts.args).env("KILN_SUPERVISED", "1").env("KILN_GENERATION", generation.to_string());
+        let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, exe = %exe.display(), "spawn failed");
                 crash_log(&opts.state_dir, &format!("spawn failed: {e}"));
-                tokio::time::sleep(crate::sup::jitter(backoff)).await;
+                crate::rt::sleep(crate::sup::jitter(backoff)).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
         };
-        let pid = child.id().and_then(|p| i32::try_from(p).ok()).map(Pid::from_raw);
+        let pid = i32::try_from(child.id()).ok().map(Pid::from_raw);
+        let mut exited = spawn_waiter(child, is_pid1);
         tracing::info!(generation, pid = ?pid, "child started");
         let started = Instant::now();
-        let mut upgrade_check = tokio::time::interval(Duration::from_secs(10));
-        upgrade_check.tick().await;
+        let mut upgrade_check = Interval::new(Duration::from_secs(10));
 
         enum Exit {
             Child(String),
             Shutdown(Signal),
             Upgrade,
         }
+        enum Ev {
+            Exited(String),
+            Signal(Option<i32>),
+            UpgradeCheck,
+        }
         let exit = loop {
-            tokio::select! {
-                st = child.wait() => {
-                    break Exit::Child(match st {
-                        Ok(s) => s.to_string(),
-                        Err(e) => format!("wait error: {e}"),
-                    });
-                }
-                _ = sigterm.recv() => break Exit::Shutdown(Signal::SIGTERM),
-                _ = sigint.recv() => break Exit::Shutdown(Signal::SIGINT),
-                _ = sighup.recv() => {
+            let ev = futures::select_biased! {
+                st = (&mut exited).fuse() => Ev::Exited(st.unwrap_or_else(|_| "waiter lost".to_owned())),
+                sig = signals.next().fuse() => Ev::Signal(sig),
+                () = upgrade_check.tick().fuse() => Ev::UpgradeCheck,
+            };
+            match ev {
+                Ev::Exited(status) => break Exit::Child(status),
+                Ev::Signal(Some(crate::rt::SIGHUP)) => {
                     // HUP = reload: forward to the child, which re-reads its config.
-                    if let Some(p) = pid { let _ = kill(p, Signal::SIGHUP); }
+                    if let Some(p) = pid {
+                        let _ = kill(p, Signal::SIGHUP);
+                    }
                 }
-                _ = sigchld.recv() => if is_pid1 { reap_orphans(pid) },
-                _ = upgrade_check.tick() => {
+                Ev::Signal(Some(crate::rt::SIGINT)) => break Exit::Shutdown(Signal::SIGINT),
+                Ev::Signal(_) => break Exit::Shutdown(Signal::SIGTERM),
+                Ev::UpgradeCheck => {
                     if exe_mtime(&exe) != started_mtime && started.elapsed() > Duration::from_secs(5) {
                         break Exit::Upgrade;
                     }
@@ -173,12 +214,12 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         match exit {
             Exit::Shutdown(sig) => {
                 tracing::info!(?sig, "shutdown requested; stopping child");
-                stop_child(&mut child, pid).await;
+                stop_child(&mut exited, pid).await;
                 return Ok(());
             }
             Exit::Upgrade => {
                 tracing::info!("binary changed on disk; restarting child into new version");
-                stop_child(&mut child, pid).await;
+                stop_child(&mut exited, pid).await;
                 backoff = MIN_BACKOFF;
                 continue;
             }
@@ -193,10 +234,16 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 );
                 tracing::error!("{msg}");
                 crash_log(&opts.state_dir, &msg);
-                tokio::select! {
-                    _ = sigterm.recv() => return Ok(()),
-                    _ = sigint.recv() => return Ok(()),
-                    () = tokio::time::sleep(crate::sup::jitter(backoff)) => {}
+                let pause = crate::rt::sleep(crate::sup::jitter(backoff)).fuse();
+                futures::pin_mut!(pause);
+                loop {
+                    futures::select_biased! {
+                        sig = signals.next().fuse() => match sig {
+                            Some(crate::rt::SIGHUP) => {}
+                            _ => return Ok(()),
+                        },
+                        () = pause => break,
+                    }
                 }
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -204,12 +251,15 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     }
 }
 
-async fn stop_child(child: &mut tokio::process::Child, pid: Option<Pid>) {
+async fn stop_child(exited: &mut oneshot::Receiver<String>, pid: Option<Pid>) {
     if let Some(p) = pid {
         let _ = kill(p, Signal::SIGTERM);
     }
-    if tokio::time::timeout(GRACE, child.wait()).await.is_err() {
+    if crate::rt::timeout(GRACE, &mut *exited).await.is_err() {
         tracing::warn!("child ignored SIGTERM for {GRACE:?}; killing");
-        let _ = child.kill().await;
+        if let Some(p) = pid {
+            let _ = kill(p, Signal::SIGKILL);
+        }
+        let _ = crate::rt::timeout(Duration::from_secs(5), exited).await;
     }
 }

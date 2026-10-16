@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 use futures::FutureExt;
 use parking_lot::Mutex;
 use serde::Serialize;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use crate::rt::{JoinHandle, Shutdown};
 
 pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
@@ -76,7 +75,7 @@ pub fn jitter(d: Duration) -> Duration {
 pub fn spawn<F, Fut>(
     reg: &Registry,
     name: &str,
-    cancel: CancellationToken,
+    cancel: Shutdown,
     mut make: F,
 ) -> JoinHandle<()>
 where
@@ -85,7 +84,7 @@ where
 {
     let reg = reg.clone();
     let name = name.to_owned();
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         let mut backoff = MIN_BACKOFF;
         loop {
             reg.update(&name, |c| {
@@ -94,12 +93,12 @@ where
             });
             let started = Instant::now();
             let fut = AssertUnwindSafe(make()).catch_unwind();
-            let outcome = tokio::select! {
-                () = cancel.cancelled() => {
+            let outcome = futures::select_biased! {
+                () = cancel.cancelled().fuse() => {
                     reg.update(&name, |c| c.state = "stopped");
                     return;
                 }
-                r = fut => r,
+                r = fut.fuse() => r,
             };
             let err = match outcome {
                 Ok(Ok(())) => {
@@ -120,9 +119,9 @@ where
                 c.last_error = Some(err);
             });
             crate::metrics::global().supervisor_restarts.inc();
-            tokio::select! {
-                () = cancel.cancelled() => { reg.update(&name, |c| c.state = "stopped"); return; }
-                () = tokio::time::sleep(jitter(backoff)) => {}
+            if !cancel.sleep(jitter(backoff)).await {
+                reg.update(&name, |c| c.state = "stopped");
+                return;
             }
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
@@ -134,7 +133,7 @@ pub fn spawn_guarded<Fut>(name: &'static str, fut: Fut) -> JoinHandle<()>
 where
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         match AssertUnwindSafe(fut).catch_unwind().await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(task = name, error = %format!("{e:#}"), "task failed"),

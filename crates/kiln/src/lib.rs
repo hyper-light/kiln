@@ -3,6 +3,8 @@
 pub mod agent;
 pub mod api;
 pub mod autodetect;
+pub mod http;
+pub mod kubeapi;
 pub mod config;
 pub mod exec;
 pub mod gitops;
@@ -15,7 +17,9 @@ pub mod metrics;
 pub mod net;
 pub mod pipeline;
 pub mod pki;
+pub mod proc;
 pub mod proto;
+pub mod rt;
 pub mod server;
 pub mod store;
 pub mod sup;
@@ -25,4 +29,4 @@ pub mod ui;
 pub mod util;
 
 /// Process-wide shutdown signal, set once by `main`.
-pub static SHUTDOWN: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
+pub static SHUTDOWN: std::sync::OnceLock<rt::Shutdown> = std::sync::OnceLock::new();

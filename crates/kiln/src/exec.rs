@@ -4,17 +4,16 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use anyhow::Context as _;
+use futures::FutureExt as _;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use tokio::io::AsyncReadExt as _;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::proto::{AgentMsg, Assignment, JobResult, LOG_CHUNK, LogChunk};
+use crate::rt::{Interval, Shutdown};
 use crate::store::Status;
 
 /// What the executor sends upstream; the agent's uplink buffers it across reconnects.
@@ -27,7 +26,7 @@ pub enum Up {
 }
 
 #[derive(Clone)]
-pub struct Uplink(pub mpsc::Sender<Up>);
+pub struct Uplink(pub async_channel::Sender<Up>);
 
 impl Uplink {
     pub async fn msg(&self, m: AgentMsg) {
@@ -48,7 +47,9 @@ pub struct Exec {
     pub work_dir: PathBuf,
     pub agent_name: String,
     pub up: Uplink,
-    pub cancel: CancellationToken,
+    pub cancel: Shutdown,
+    /// HTTP(S) client for the server's source-archive and artifact endpoints.
+    pub http: Arc<crate::http::client::Client>,
 }
 
 #[derive(Default)]
@@ -61,6 +62,16 @@ enum Outcome {
     Exit(Option<i32>),
     Cancelled,
     TimedOut,
+}
+
+/// One turn of a step's event loop (computed inside `select!`, handled after it).
+enum Ev {
+    Chunk(Option<Vec<u8>>),
+    Exit(Option<i32>),
+    Flush,
+    Sample,
+    Cancel,
+    Deadline,
 }
 
 /// The job's private temp directory: a sibling of its workspace on the same volume.
@@ -88,21 +99,48 @@ fn slug(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
 }
 
+/// Pipes deliver LF; xterm wants CRLF.
+fn push_crlf(pending: &mut Vec<u8>, chunk: Vec<u8>) {
+    for b in chunk {
+        if b == b'\n' {
+            pending.push(b'\r');
+        }
+        pending.push(b);
+    }
+}
+
+/// `rx.recv()` while `enabled`, otherwise a future that never completes.
+async fn recv_if(rx: &async_channel::Receiver<Vec<u8>>, enabled: bool) -> Option<Vec<u8>> {
+    if enabled {
+        rx.recv().await.ok()
+    } else {
+        futures::future::pending().await
+    }
+}
+
+async fn fs<R: Send + 'static>(f: impl FnOnce() -> std::io::Result<R> + Send + 'static) -> anyhow::Result<R> {
+    Ok(crate::rt::blocking(f).await??)
+}
+
 impl Exec {
     pub async fn run(self) -> JobResult {
         let job = self.assign.job_id.clone();
         self.up.msg(AgentMsg::JobStarted { job: job.clone() }).await;
         let ws = self.work_dir.join("ws").join(format!("{}-{}", slug(&self.assign.repo), job.get(job.len().saturating_sub(12)..).unwrap_or(&job)));
         let tmp = tmp_dir(&ws);
-        if let Err(e) = tokio::fs::create_dir_all(&tmp).await {
+        let t = tmp.clone();
+        if let Err(e) = fs(move || std::fs::create_dir_all(t)).await {
             tracing::warn!(error = %e, tmp = %tmp.display(), "cannot create job TMPDIR");
         }
         let result = self.run_inner(&ws).await;
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
-        if let Err(e) = tokio::fs::remove_dir_all(&ws).await
-            && e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(error = %e, ws = %ws.display(), "workspace cleanup failed");
-            }
+        let t = tmp.clone();
+        let _ = fs(move || std::fs::remove_dir_all(t)).await;
+        let w = ws.clone();
+        if let Err(e) = crate::rt::blocking(move || std::fs::remove_dir_all(w)).await.map_err(|e| std::io::Error::other(e.to_string())).and_then(|r| r)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, ws = %ws.display(), "workspace cleanup failed");
+        }
         result
     }
 
@@ -123,10 +161,11 @@ impl Exec {
                 a.spec.display, a.attempt + 1, self.agent_name, a.repo, a.sha.get(..12).unwrap_or(&a.sha)
             ))
             .await;
-        if let Err(e) = tokio::select! {
-            r = self.checkout(ws) => r,
-            () = self.cancel.cancelled() => Err(anyhow::anyhow!("cancelled during checkout")),
-        } {
+        let checked_out = futures::select_biased! {
+            () = self.cancel.cancelled().fuse() => Err(anyhow::anyhow!("cancelled during checkout")),
+            r = self.checkout(ws).fuse() => r,
+        };
+        if let Err(e) = checked_out {
             let msg = format!("checkout failed: {e:#}");
             self.up.log(&job, 0, format!("\x1b[31m[kiln] {msg}\x1b[0m\r\n").into_bytes()).await;
             let status = if self.cancel.is_cancelled() { Status::Cancelled } else { Status::Failed };
@@ -161,7 +200,7 @@ impl Exec {
             env.insert(k.clone(), v.clone());
         }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(u64::from(a.spec.timeout_minutes) * 60);
+        let deadline = Instant::now() + Duration::from_secs(u64::from(a.spec.timeout_minutes) * 60);
         let mut usage = Usage::default();
         let mut failed: Option<(Status, Option<i32>, String)> = None;
         for (i, step) in a.spec.steps.iter().enumerate() {
@@ -173,7 +212,7 @@ impl Exec {
             self.up.msg(AgentMsg::StepStarted { job: job.clone(), idx }).await;
             let step_deadline = step
                 .timeout_minutes
-                .map(|m| (tokio::time::Instant::now() + Duration::from_secs(u64::from(m) * 60)).min(deadline))
+                .map(|m| (Instant::now() + Duration::from_secs(u64::from(m) * 60)).min(deadline))
                 .unwrap_or(deadline);
             let mut step_env = env.clone();
             step_env.extend(step.env.clone());
@@ -230,14 +269,17 @@ impl Exec {
     async fn checkout(&self, ws: &Path) -> anyhow::Result<()> {
         let a = &self.assign;
         let job = &a.job_id;
-        tokio::fs::create_dir_all(ws).await?;
+        let w = ws.to_path_buf();
+        fs(move || std::fs::create_dir_all(w)).await?;
         if have("git") && !a.clone_url.is_empty() {
             match self.git_checkout(ws).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     self.up.note(job, 0, &format!("git checkout failed ({e:#}); using server source archive")).await;
-                    let _ = tokio::fs::remove_dir_all(ws).await;
-                    tokio::fs::create_dir_all(ws).await?;
+                    let w = ws.to_path_buf();
+                    let _ = fs(move || std::fs::remove_dir_all(w)).await;
+                    let w = ws.to_path_buf();
+                    fs(move || std::fs::create_dir_all(w)).await?;
                 }
             }
         }
@@ -245,14 +287,9 @@ impl Exec {
     }
 
     async fn git(&self, args: &[&str]) -> anyhow::Result<()> {
-        let out = tokio::process::Command::new("git")
-            .args(args)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ASKPASS", "/bin/true")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output()
-            .await?;
+        let mut cmd = Command::new("git");
+        cmd.args(args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/true");
+        let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
         if !out.status.success() {
             anyhow::bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -265,9 +302,10 @@ impl Exec {
         let mirror = cache.join(format!("{}.git", slug(&a.repo)));
         let m = mirror.to_string_lossy().to_string();
         let lock_path = cache.join(format!("{}.lock", slug(&a.repo)));
-        tokio::fs::create_dir_all(&cache).await?;
+        let c = cache.clone();
+        fs(move || std::fs::create_dir_all(c)).await?;
         // Serialise mirror updates across concurrent jobs (and processes) with a lock file.
-        let _lock = FileLock::acquire(&lock_path).await?;
+        let lock = FileLock::acquire(&lock_path).await?;
         if mirror.join("HEAD").exists() {
             self.git(&["-C", &m, "fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]).await?;
         } else {
@@ -276,7 +314,7 @@ impl Exec {
         if self.git(&["-C", &m, "cat-file", "-e", &format!("{}^{{commit}}", a.sha)]).await.is_err() {
             self.git(&["-C", &m, "fetch", "--quiet", "origin", &a.sha]).await?;
         }
-        drop(_lock);
+        drop(lock);
         let w = ws.to_string_lossy().to_string();
         self.git(&["clone", "--quiet", "--shared", "--no-checkout", &m, &w]).await?;
         self.git(&["-C", &w, "checkout", "--quiet", "--detach", &a.sha]).await?;
@@ -287,25 +325,30 @@ impl Exec {
         Ok(())
     }
 
+    /// Stream the server's `git archive` of the commit to disk, then unpack it.
     async fn tarball(&self, ws: &Path) -> anyhow::Result<()> {
         let a = &self.assign;
         let url = format!("{}/api/jobs/{}/source", a.server_url.trim_end_matches('/'), a.job_id);
-        let resp = reqwest::Client::new()
-            .get(&url)
-            .bearer_auth(&a.job_token)
-            .timeout(Duration::from_secs(600))
-            .send()
-            .await
-            .context("download source")?;
-        if !resp.status().is_success() {
+        let mut resp = self.http.get(&url).bearer(&a.job_token).timeout(Duration::from_secs(120)).send().await?;
+        if !resp.is_success() {
             anyhow::bail!("source archive: HTTP {}", resp.status());
         }
-        let body = resp.bytes().await?;
+        let tar_path = tmp_dir(ws).join("source.tar");
+        let (sink, done) = crate::rt::file_sink(tar_path.clone(), 16 << 30)?;
+        while let Some(chunk) = resp.chunk().await? {
+            if sink.send(chunk).await.is_err() {
+                break;
+            }
+        }
+        drop(sink);
+        done.await?;
         let ws = ws.to_path_buf();
-        tokio::task::spawn_blocking(move || tar::Archive::new(std::io::Cursor::new(body)).unpack(ws))
-            .await
-            .map_err(|e| anyhow::anyhow!("unpack task: {e}"))??;
-        Ok(())
+        fs(move || {
+            let f = std::fs::File::open(&tar_path)?;
+            tar::Archive::new(std::io::BufReader::new(f)).unpack(&ws)?;
+            std::fs::remove_file(&tar_path)
+        })
+        .await
     }
 
     fn command_line(&self, shell: Option<&str>, script: &str) -> (String, Vec<String>) {
@@ -339,83 +382,68 @@ impl Exec {
         shell: Option<&str>,
         cwd: &Path,
         env: &BTreeMap<String, String>,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
         usage: &mut Usage,
     ) -> anyhow::Result<Outcome> {
         let (prog, args) = self.command_line(shell, script);
-        let mut child = tokio::process::Command::new(prog)
-            .args(args)
-            .current_dir(cwd)
-            .envs(env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()?;
-        let pgid = child.id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+        let mut cmd = Command::new(prog);
+        cmd.args(args).current_dir(cwd).envs(env);
+        let mut running = crate::proc::spawn_group(cmd)?;
+        let pgid = running.pgid;
         let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-        if let Some(out) = child.stdout.take() {
-            pump(out, tx.clone());
-        }
-        if let Some(err) = child.stderr.take() {
-            pump(err, tx.clone());
-        }
-        drop(tx);
         let mut pending: Vec<u8> = Vec::with_capacity(LOG_CHUNK);
-        let mut flush = tokio::time::interval(Duration::from_millis(100));
-        let mut sample = tokio::time::interval(Duration::from_secs(2));
+        let mut flush = Interval::new(Duration::from_millis(100));
+        let mut sample = Interval::new(Duration::from_secs(2));
         let mut output_done = false;
         let mut status: Option<Outcome> = None;
         loop {
-            tokio::select! {
-                chunk = rx.recv(), if !output_done => match chunk {
-                    Some(c) => {
-                        // Pipes deliver LF; xterm wants CRLF.
-                        for b in c {
-                            if b == b'\n' { pending.push(b'\r'); }
-                            pending.push(b);
-                        }
-                        if pending.len() >= LOG_CHUNK { self.ship(idx, &mut pending).await; }
-                    }
-                    None => output_done = true,
-                },
-                st = child.wait(), if status.is_none() => {
-                    status = Some(Outcome::Exit(st.ok().and_then(|s| s.code())));
-                }
-                _ = flush.tick() => { if !pending.is_empty() { self.ship(idx, &mut pending).await; } }
-                _ = sample.tick() => self.sample(pgid, usage).await,
-                () = self.cancel.cancelled(), if status.is_none() => {
-                    terminate(pgid, &mut child).await;
-                    status = Some(Outcome::Cancelled);
-                }
-                () = tokio::time::sleep_until(deadline), if status.is_none() => {
-                    terminate(pgid, &mut child).await;
-                    status = Some(Outcome::TimedOut);
-                }
-            }
             if output_done && status.is_some() {
                 break;
             }
             // Children that daemonise keep the pipes open: once the step itself exited, give
             // output a moment to drain, then stop waiting for it.
-            if status.is_some() && !output_done {
-                match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-                    Ok(Some(c)) => {
-                        for b in c {
-                            if b == b'\n' { pending.push(b'\r'); }
-                            pending.push(b);
-                        }
+            if status.is_some() {
+                match crate::rt::timeout(Duration::from_secs(2), running.output.recv()).await {
+                    Ok(Ok(c)) => push_crlf(&mut pending, c),
+                    Ok(Err(_)) | Err(_) => output_done = true,
+                }
+                continue;
+            }
+            let ev = futures::select_biased! {
+                c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
+                code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
+                () = self.cancel.cancelled().fuse() => Ev::Cancel,
+                () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
+                () = flush.tick().fuse() => Ev::Flush,
+                () = sample.tick().fuse() => Ev::Sample,
+            };
+            match ev {
+                Ev::Chunk(Some(c)) => {
+                    push_crlf(&mut pending, c);
+                    if pending.len() >= LOG_CHUNK {
+                        self.ship(idx, &mut pending).await;
                     }
-                    Ok(None) | Err(_) => output_done = true,
+                }
+                Ev::Chunk(None) => output_done = true,
+                Ev::Exit(code) => status = Some(Outcome::Exit(code)),
+                Ev::Flush => {
+                    if !pending.is_empty() {
+                        self.ship(idx, &mut pending).await;
+                    }
+                }
+                Ev::Sample => self.sample(pgid, usage).await,
+                Ev::Cancel => {
+                    crate::proc::terminate_group(&mut running, Duration::from_secs(10)).await;
+                    status = Some(Outcome::Cancelled);
+                }
+                Ev::Deadline => {
+                    crate::proc::terminate_group(&mut running, Duration::from_secs(10)).await;
+                    status = Some(Outcome::TimedOut);
                 }
             }
         }
         // Reap anything the step left behind in its process group.
-        if pgid > 0 {
-            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-        }
+        crate::proc::kill_group(pgid);
         if !pending.is_empty() {
             self.ship(idx, &mut pending).await;
         }
@@ -430,7 +458,7 @@ impl Exec {
         shell: Option<&str>,
         cwd: &Path,
         env: &BTreeMap<String, String>,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
         usage: &mut Usage,
     ) -> anyhow::Result<Outcome> {
         use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -448,38 +476,60 @@ impl Exec {
         let pgid = child.process_id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
         let _guard = PgidRecord::new(&self.work_dir, &self.assign.job_id, pgid);
         let mut reader = pty.master.try_clone_reader()?;
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-        std::thread::spawn(move || {
+        let (tx, rx) = async_channel::bounded::<Vec<u8>>(64);
+        std::thread::Builder::new().name("kiln-pty-step".into()).spawn(move || {
             let mut buf = vec![0u8; 16 * 1024];
             while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.blocking_send(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).is_err() {
+                if n == 0 || tx.send_blocking(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).is_err() {
                     break;
                 }
             }
-        });
-        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
+        })?;
+        let (done_tx, mut done_rx) = futures::channel::oneshot::channel();
+        std::thread::Builder::new().name("kiln-pty-wait".into()).spawn(move || {
             let code = child.wait().ok().and_then(|s| i32::try_from(s.exit_code()).ok());
             let _ = done_tx.send(code);
-        });
+        })?;
         let mut pending = Vec::new();
-        let mut flush = tokio::time::interval(Duration::from_millis(100));
-        let mut sample = tokio::time::interval(Duration::from_secs(2));
+        let mut flush = Interval::new(Duration::from_millis(100));
+        let mut sample = Interval::new(Duration::from_secs(2));
+        let mut output_open = true;
         let outcome = loop {
-            tokio::select! {
-                Some(c) = rx.recv() => {
+            let ev = futures::select_biased! {
+                c = recv_if(&rx, output_open).fuse() => Ev::Chunk(c),
+                code = (&mut done_rx).fuse() => Ev::Exit(code.ok().flatten()),
+                () = self.cancel.cancelled().fuse() => Ev::Cancel,
+                () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
+                () = flush.tick().fuse() => Ev::Flush,
+                () = sample.tick().fuse() => Ev::Sample,
+            };
+            match ev {
+                Ev::Chunk(Some(c)) => {
                     pending.extend(c);
-                    if pending.len() >= LOG_CHUNK { self.ship(idx, &mut pending).await; }
+                    if pending.len() >= LOG_CHUNK {
+                        self.ship(idx, &mut pending).await;
+                    }
                 }
-                code = &mut done_rx => break Outcome::Exit(code.ok().flatten()),
-                _ = flush.tick() => { if !pending.is_empty() { self.ship(idx, &mut pending).await; } }
-                _ = sample.tick() => self.sample(pgid, usage).await,
-                () = self.cancel.cancelled() => { kill_group(pgid).await; break Outcome::Cancelled; }
-                () = tokio::time::sleep_until(deadline) => { kill_group(pgid).await; break Outcome::TimedOut; }
+                Ev::Chunk(None) => output_open = false,
+                Ev::Exit(code) => break Outcome::Exit(code),
+                Ev::Flush => {
+                    if !pending.is_empty() {
+                        self.ship(idx, &mut pending).await;
+                    }
+                }
+                Ev::Sample => self.sample(pgid, usage).await,
+                Ev::Cancel => {
+                    kill_group(pgid).await;
+                    break Outcome::Cancelled;
+                }
+                Ev::Deadline => {
+                    kill_group(pgid).await;
+                    break Outcome::TimedOut;
+                }
             }
         };
         drop(pty.master);
-        while let Ok(Some(c)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+        while let Ok(Ok(c)) = crate::rt::timeout(Duration::from_millis(300), rx.recv()).await {
             pending.extend(c);
         }
         if !pending.is_empty() {
@@ -500,7 +550,7 @@ impl Exec {
         if pgid <= 0 {
             return;
         }
-        let s = tokio::task::spawn_blocking(move || crate::host::process_group(pgid)).await.unwrap_or_default();
+        let s = crate::rt::blocking(move || crate::host::process_group(pgid)).await.unwrap_or_default();
         usage.peak_rss = usage.peak_rss.max(s.rss_bytes);
         usage.cpu_seconds = usage.cpu_seconds.max(s.cpu_seconds);
         self.up
@@ -511,7 +561,7 @@ impl Exec {
     async fn upload_artifacts(&self, ws: &Path) -> anyhow::Result<usize> {
         let patterns = self.assign.spec.artifacts.clone();
         let root = ws.to_path_buf();
-        let (count, bytes) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Vec<u8>)> {
+        let (count, bytes) = crate::rt::blocking(move || -> anyhow::Result<(usize, Vec<u8>)> {
             let mut builder = tar::Builder::new(Vec::new());
             let mut n = 0usize;
             for pat in &patterns {
@@ -529,45 +579,18 @@ impl Exec {
             }
             Ok((n, builder.into_inner()?))
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("artifact task: {e}"))??;
+        .await??;
         if count == 0 {
             return Ok(0);
         }
         let a = &self.assign;
         let url = format!("{}/api/jobs/{}/artifacts/upload", a.server_url.trim_end_matches('/'), a.job_id);
-        let resp = reqwest::Client::new()
-            .put(url)
-            .bearer_auth(&a.job_token)
-            .body(bytes)
-            .timeout(Duration::from_secs(900))
-            .send()
-            .await?;
-        if !resp.status().is_success() {
+        let resp = self.http.put(&url).bearer(&a.job_token).body(bytes).timeout(Duration::from_secs(900)).send().await?;
+        if !resp.is_success() {
             anyhow::bail!("HTTP {}", resp.status());
         }
         Ok(count)
     }
-}
-
-/// Forward everything a pipe produces into `tx` until EOF.
-fn pump<R>(mut r: R, tx: mpsc::Sender<Vec<u8>>)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx.send(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
 }
 
 /// Records a running step's process group on disk so that, if this agent dies without cleaning
@@ -613,9 +636,10 @@ pub fn reap_orphans(work_dir: &Path) -> usize {
         let environ = std::fs::read(format!("/proc/{pgid}/environ")).unwrap_or_default();
         let marker = format!("KILN_JOB_ID={job}");
         if environ.split(|b| *b == 0).any(|kv| kv == marker.as_bytes())
-            && killpg(Pid::from_raw(pgid), Signal::SIGKILL).is_ok() {
-                killed += 1;
-            }
+            && killpg(Pid::from_raw(pgid), Signal::SIGKILL).is_ok()
+        {
+            killed += 1;
+        }
     }
     killed
 }
@@ -625,20 +649,8 @@ async fn kill_group(pgid: i32) {
         return;
     }
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    crate::rt::sleep(Duration::from_secs(5)).await;
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-}
-
-async fn terminate(pgid: i32, child: &mut tokio::process::Child) {
-    if pgid > 0 {
-        let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-    }
-    if tokio::time::timeout(Duration::from_secs(10), child.wait()).await.is_err() {
-        if pgid > 0 {
-            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-        }
-        let _ = child.kill().await;
-    }
 }
 
 /// An advisory lock file (`flock`) so concurrent jobs, even in separate agent processes, update a
@@ -648,14 +660,13 @@ struct FileLock(Option<nix::fcntl::Flock<std::fs::File>>);
 impl FileLock {
     async fn acquire(path: &Path) -> anyhow::Result<Self> {
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
+        crate::rt::blocking(move || {
             let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
             nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
                 .map(|l| Self(Some(l)))
                 .map_err(|(_, e)| anyhow::anyhow!("flock {}: {e}", path.display()))
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("lock task: {e}"))?
+        .await?
     }
 }
 

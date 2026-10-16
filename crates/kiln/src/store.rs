@@ -232,12 +232,11 @@ impl Store {
         R: Send + 'static,
     {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::rt::blocking(move || {
             let mut g = conn.lock();
             f(&mut g)
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("store task failed: {e}"))?
+        .await?
     }
 
     /// After a server restart every agent is marked disconnected until it reconnects. Running jobs
@@ -1111,8 +1110,9 @@ mod tests {
     use super::*;
     use crate::pipeline;
 
-    #[tokio::test]
-    async fn run_lifecycle() -> anyhow::Result<()> {
+    #[test]
+    fn run_lifecycle() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
         let s = Store::in_memory()?;
         let repo = s
             .upsert_repo(Repo {
@@ -1176,5 +1176,6 @@ mod tests {
         s.retry_run("run1".into(), true).await?;
         assert_eq!(s.queued_jobs(10).await?.len(), 1);
         Ok(())
+    })
     }
 }

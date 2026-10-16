@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use hyper_transport::PeerId;
 use parking_lot::Mutex;
 use serde::Serialize;
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio_util::sync::CancellationToken;
+use futures::FutureExt as _;
+
+use crate::rt::{Broadcast, Interval, Notify, Shutdown};
 
 use crate::config::Config;
 use crate::logs::Logs;
@@ -73,8 +74,8 @@ pub struct Hub {
     pub agents: Mutex<HashMap<String, AgentLive>>,
     peers: Mutex<HashMap<PeerId, String>>,
     pending_peers: Mutex<HashMap<PeerId, String>>,
-    pub events: broadcast::Sender<Arc<str>>,
-    pub terms: Mutex<HashMap<String, mpsc::Sender<TermOut>>>,
+    pub events: Broadcast<Arc<str>>,
+    pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
     pub launching: Mutex<HashMap<String, Instant>>,
@@ -84,9 +85,9 @@ pub struct Hub {
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
     pub ephemeral_tokens: Mutex<HashMap<String, (String, Instant)>>,
-    pub k8s: tokio::sync::OnceCell<Option<Arc<crate::k8s::K8s>>>,
+    pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
     pub gitops_kick: Notify,
-    pub shutdown: CancellationToken,
+    pub shutdown: Shutdown,
     /// Agents that have been sent Cancel for a job, with when (for the timeout escalation).
     cancel_sent: Mutex<HashMap<String, Instant>>,
     /// (job, agent) pairs recently declined: not offered again until DECLINE_BACKOFF passes.
@@ -103,7 +104,7 @@ impl Hub {
         pki: Arc<crate::pki::Pki>,
         admin_token: String,
         join_token: String,
-        shutdown: CancellationToken,
+        shutdown: Shutdown,
     ) -> Arc<Self> {
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
@@ -116,7 +117,7 @@ impl Hub {
             agents: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             pending_peers: Mutex::new(HashMap::new()),
-            events: broadcast::channel(4096).0,
+            events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
             history: Mutex::new(HashMap::new()),
             wake: Notify::new(),
@@ -126,7 +127,7 @@ impl Hub {
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
-            k8s: tokio::sync::OnceCell::new(),
+            k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
             shutdown,
             cancel_sent: Mutex::new(HashMap::new()),
@@ -138,7 +139,7 @@ impl Hub {
 
     pub fn emit(&self, v: &serde_json::Value) {
         if self.events.receiver_count() > 0 {
-            let _ = self.events.send(Arc::from(v.to_string()));
+            self.events.send(Arc::from(v.to_string()));
         }
     }
 
@@ -265,7 +266,7 @@ impl Hub {
             a.clone()
         };
         self.emit_agent(&snapshot);
-        self.wake.notify_one();
+        self.wake.notify();
         true
     }
 
@@ -284,8 +285,8 @@ impl Hub {
     // ------------------------------------------------------------ network
 
     /// Consume transport events forever (supervised).
-    pub async fn net_loop(self: Arc<Self>, mut rx: mpsc::Receiver<NetEvent>) -> anyhow::Result<()> {
-        while let Some(ev) = rx.recv().await {
+    pub async fn net_loop(self: Arc<Self>, rx: async_channel::Receiver<NetEvent>) -> anyhow::Result<()> {
+        while let Ok(ev) = rx.recv().await {
             if let Err(e) = self.on_net(ev).await {
                 tracing::warn!(error = %format!("{e:#}"), "agent message handling failed");
             }
@@ -396,7 +397,7 @@ impl Hub {
             self.emit_job(&j).await;
         }
         self.update_slot_gauges();
-        self.wake.notify_one();
+        self.wake.notify();
     }
 
     async fn on_agent_msg(&self, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
@@ -446,7 +447,7 @@ impl Hub {
                     self.declined.lock().insert((job.clone(), agent.clone()), Instant::now());
                     self.store.unclaim_job(job.clone(), format!("declined by {agent}: {reason}")).await?;
                     self.emit_job(&job).await;
-                    self.wake.notify_one();
+                    self.wake.notify();
                 }
             }
             AgentMsg::TermOutput { session, data } => {
@@ -582,7 +583,7 @@ impl Hub {
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
         self.update_slot_gauges();
         self.emit_agent(&live);
-        self.wake.notify_one();
+        self.wake.notify();
         Ok(())
     }
 
@@ -629,7 +630,7 @@ impl Hub {
             crate::gitops::report_status(self, &run, status).await;
         }
         self.update_slot_gauges();
-        self.wake.notify_one();
+        self.wake.notify();
         Ok(())
     }
 
@@ -651,7 +652,7 @@ impl Hub {
         }
         self.emit_run(run_id).await;
         self.update_slot_gauges();
-        self.wake.notify_one();
+        self.wake.notify();
         Ok(())
     }
 
@@ -660,14 +661,13 @@ impl Hub {
     /// Assign queued jobs to agents (or launch pods) until nothing more fits. Runs on every wake
     /// and once a second as a safety net.
     pub async fn scheduler_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tick = Interval::new(Duration::from_secs(1));
         let mut slow = Instant::now();
         loop {
-            tokio::select! {
-                () = self.wake.notified() => {}
-                _ = tick.tick() => {}
-                () = self.shutdown.cancelled() => return Ok(()),
+            futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = self.wake.notified().fuse() => {}
+                () = tick.tick().fuse() => {}
             }
             self.schedule_once().await?;
             if slow.elapsed() >= Duration::from_secs(5) {
@@ -967,11 +967,11 @@ impl Hub {
     /// Sample the server host itself for the UI ("server" series).
     pub async fn sampler_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut sampler = crate::host::Sampler::new(Some(&self.cfg.server.data_dir));
-        let mut tick = tokio::time::interval(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
+        let mut tick = Interval::new(Duration::from_secs(u64::from(self.cfg.telemetry.sample_seconds.max(1))));
         loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                () = self.shutdown.cancelled() => return Ok(()),
+            futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = tick.tick().fuse() => {}
             }
             let s = sampler.sample();
             self.record_sample("server", s);
@@ -980,11 +980,11 @@ impl Hub {
 
     /// Daily retention: delete old runs and their logs.
     pub async fn retention_loop(self: Arc<Self>) -> anyhow::Result<()> {
-        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        let mut tick = Interval::new(Duration::from_secs(3600));
         loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                () = self.shutdown.cancelled() => return Ok(()),
+            futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                () = tick.tick().fuse() => {}
             }
             let jobs = self.store.prune(self.cfg.retention.days).await?;
             if !jobs.is_empty() {

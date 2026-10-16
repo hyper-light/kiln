@@ -19,8 +19,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::Api;
-use kube::api::{DeleteParams, ListParams, PostParams};
+use crate::kubeapi::KubeApi;
 
 use crate::config::Kubernetes as KCfg;
 use crate::hub::Hub;
@@ -30,17 +29,16 @@ pub const MANAGED: &str = "app.kubernetes.io/managed-by=kiln";
 const JOB_LABEL: &str = "kiln.dev/job";
 
 pub struct K8s {
-    pods: Api<Pod>,
+    api: KubeApi,
     cfg: KCfg,
 }
 
 impl K8s {
     pub async fn connect(cfg: &KCfg) -> anyhow::Result<Self> {
-        let client = kube::Client::try_default().await?;
-        let pods: Api<Pod> = Api::namespaced(client, &cfg.namespace);
+        let api = KubeApi::discover(&cfg.namespace)?;
         // Probe permissions now so a broken RBAC setup is reported at startup.
-        pods.list(&ListParams::default().labels(MANAGED).limit(1)).await?;
-        Ok(Self { pods, cfg: cfg.clone() })
+        api.list_pods(MANAGED).await?;
+        Ok(Self { api, cfg: cfg.clone() })
     }
 
     pub async fn launch(&self, hub: &Hub, job: &Job, run: &Run) -> anyhow::Result<String> {
@@ -186,16 +184,15 @@ impl K8s {
             }),
             ..Default::default()
         };
-        self.pods.create(&PostParams::default(), &pod).await?;
+        self.api.create_pod(&pod).await?;
         Ok(name)
     }
 
     /// Is a pod for this job still legitimately on its way (Pending waiting for capacity or
     /// pulling its image, or Running)? Pods stuck on a fatal start error do not count.
     pub async fn job_pod_alive(&self, job: &str) -> bool {
-        let lp = ListParams::default().labels(&format!("{MANAGED},{JOB_LABEL}={job}"));
-        let Ok(list) = self.pods.list(&lp).await else { return false };
-        list.items.iter().any(|p| {
+        let Ok(list) = self.api.list_pods(&format!("{MANAGED},{JOB_LABEL}={job}")).await else { return false };
+        list.iter().any(|p| {
             let st = p.status.clone().unwrap_or_default();
             let phase = st.phase.unwrap_or_default();
             let fatal = st
@@ -211,7 +208,7 @@ impl K8s {
 
     /// Is the pod an ephemeral agent runs in still alive (agents are named after their pod)?
     pub async fn agent_pod_alive(&self, pod: &str) -> bool {
-        match self.pods.get_opt(pod).await {
+        match self.api.get_pod(pod).await {
             Ok(Some(p)) => {
                 let phase = p.status.and_then(|s| s.phase).unwrap_or_default();
                 p.metadata.deletion_timestamp.is_none() && (phase == "Pending" || phase == "Running")
@@ -223,12 +220,11 @@ impl K8s {
     }
 
     pub async fn delete_job_pods(&self, job: &str) {
-        let lp = ListParams::default().labels(&format!("{MANAGED},{JOB_LABEL}={job}"));
-        match self.pods.list(&lp).await {
+        match self.api.list_pods(&format!("{MANAGED},{JOB_LABEL}={job}")).await {
             Ok(list) => {
-                for p in list.items {
+                for p in list {
                     if let Some(n) = p.metadata.name
-                        && let Err(e) = self.pods.delete(&n, &DeleteParams::background()).await {
+                        && let Err(e) = self.api.delete_pod(&n).await {
                             tracing::warn!(pod = %n, error = %e, "pod delete failed");
                         }
                 }
@@ -241,13 +237,12 @@ impl K8s {
     pub async fn reap_loop(self: Arc<Self>, hub: Arc<Hub>) -> anyhow::Result<()> {
         let mut pending_since: std::collections::HashMap<String, Instant> = Default::default();
         loop {
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(15)) => {}
-                () = hub.shutdown.cancelled() => return Ok(()),
+            if !hub.shutdown.sleep(Duration::from_secs(15)).await {
+                return Ok(());
             }
-            let list = self.pods.list(&ListParams::default().labels(MANAGED)).await?;
+            let list = self.api.list_pods(MANAGED).await?;
             let mut seen = std::collections::HashSet::new();
-            for pod in list.items {
+            for pod in list {
                 let Some(name) = pod.metadata.name.clone() else { continue };
                 seen.insert(name.clone());
                 let job_id = pod.metadata.labels.as_ref().and_then(|l| l.get(JOB_LABEL)).cloned().unwrap_or_default();
@@ -258,7 +253,7 @@ impl K8s {
                     None => true,
                 };
                 if phase == "Succeeded" || phase == "Failed" || job_terminal {
-                    if let Err(e) = self.pods.delete(&name, &DeleteParams::background()).await {
+                    if let Err(e) = self.api.delete_pod(&name).await {
                         tracing::debug!(pod = %name, error = %e, "reap delete failed");
                     }
                     continue;
@@ -281,7 +276,7 @@ impl K8s {
                     let since = *pending_since.entry(name.clone()).or_insert_with(Instant::now);
                     if since.elapsed() > Duration::from_secs(120) {
                         tracing::warn!(pod = %name, %reason, "pod cannot start; failing job");
-                        let _ = self.pods.delete(&name, &DeleteParams::background()).await;
+                        let _ = self.api.delete_pod(&name).await;
                         hub.launching.lock().remove(&job_id);
                         if let Ok(Some(j)) = hub.store.job(job_id.clone()).await
                             && j.status == Status::Queued {

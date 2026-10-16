@@ -1,32 +1,27 @@
 //! HTTP + WebSocket API for the UI and CLI (see docs/api.md), plus the small set of endpoints
-//! agents use over HTTP: enrollment, source archives and artifact upload.
+//! agents use over HTTP: enrollment, source archives and artifact upload. Served by kiln's own
+//! HTTP layer (hyper's protocol code on hyper-rt).
 //!
 //! Auth is stateless so it survives restarts: sessions and one-time login links are HMACs of an
 //! expiry under the admin token; job tokens are HMACs of the job id.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post, put};
-use axum::{Json, Router};
-use futures::{SinkExt as _, StreamExt as _};
+use bytes::Bytes;
+use futures::StreamExt as _;
+use http::{HeaderMap, Method, StatusCode, header};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::AsyncWriteExt as _;
 
 use crate::agent::{EnrollRequest, EnrollResponse};
+use crate::http::server::{self as srv, Request, Response};
+use crate::http::ws::{self, Message};
 use crate::hub::{Hub, TermOut};
 use crate::logs::LogEvent;
 use crate::proto::{LANE_TERM, ServerMsg};
 use crate::store::Repo;
-
-type S = State<Arc<Hub>>;
 
 pub struct ApiError(StatusCode, String);
 
@@ -36,12 +31,12 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-impl IntoResponse for ApiError {
+impl ApiError {
     fn into_response(self) -> Response {
         if self.0.is_server_error() {
             tracing::warn!(status = %self.0, error = %self.1, "api error");
         }
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        srv::json(self.0, &json!({ "error": self.1 }))
     }
 }
 
@@ -49,11 +44,12 @@ fn err(code: StatusCode, msg: impl Into<String>) -> ApiError {
     ApiError(code, msg.into())
 }
 
-type R<T> = Result<T, ApiError>;
+type R = Result<Response, ApiError>;
 
 const SESSION_COOKIE: &str = "kiln_session";
 const SESSION_TTL: i64 = 30 * 86_400;
 const OTP_TTL: i64 = 300;
+const JSON_LIMIT: usize = 4 << 20;
 
 // ------------------------------------------------------------------ auth
 
@@ -99,18 +95,11 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
     if let Some(t) = bearer(headers)
-        && crate::util::ct_eq(t.as_bytes(), hub.admin_token.as_bytes()) {
-            return true;
-        }
-    cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", &c))
-}
-
-async fn require_auth(State(hub): S, req: Request, next: Next) -> Response {
-    if authed(&hub, req.headers()) {
-        next.run(req).await
-    } else {
-        err(StatusCode::UNAUTHORIZED, "authentication required").into_response()
+        && crate::util::ct_eq(t.as_bytes(), hub.admin_token.as_bytes())
+    {
+        return true;
     }
+    cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", &c))
 }
 
 fn session_cookie(hub: &Hub) -> String {
@@ -121,66 +110,172 @@ fn session_cookie(hub: &Hub) -> String {
     )
 }
 
+// ------------------------------------------------------------------ router
+
+/// The API as an HTTP handler.
+pub struct Api {
+    pub hub: Arc<Hub>,
+}
+
+impl srv::Handler for Api {
+    async fn handle(self: Arc<Self>, req: Request) -> Response {
+        let hub = self.hub.clone();
+        match route(hub, req).await {
+            Ok(r) => r,
+            Err(e) => e.into_response(),
+        }
+    }
+}
+
+fn segments(path: &str) -> Vec<String> {
+    path.trim_matches('/').split('/').filter(|s| !s.is_empty()).map(srv::decode).collect()
+}
+
+async fn route(hub: Arc<Hub>, req: Request) -> R {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let seg = segments(&path);
+    let s: Vec<&str> = seg.iter().map(String::as_str).collect();
+
+    // Open routes (their own auth, if any).
+    match (&method, s.as_slice()) {
+        (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
+        (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req)),
+        (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
+        (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
+        (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
+        (&Method::GET, ["api", "jobs", id, "source"]) => return job_source(&hub, id, req.headers()).await,
+        (&Method::PUT, ["api", "jobs", id, "artifacts", "upload"]) => {
+            let id = (*id).to_owned();
+            return put_artifacts(&hub, &id, req).await;
+        }
+        (&Method::POST, ["api", "hooks", "github"]) => return github_hook(&hub, req).await,
+        (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
+        (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
+        (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
+        (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
+        (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
+        _ => {}
+    }
+
+    let is_api = s.first() == Some(&"api");
+    if !is_api {
+        return Ok(crate::ui::serve(&req));
+    }
+    if !authed(&hub, req.headers()) {
+        return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
+    }
+    let q = srv::query(&req);
+    match (&method, s.as_slice()) {
+        (&Method::GET, ["api", "overview"]) => overview(&hub).await,
+        (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
+        (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
+        (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
+        (&Method::GET, ["api", "repos"]) => Ok(srv::json(StatusCode::OK, &hub.store.repos().await?)),
+        (&Method::POST, ["api", "repos"]) => add_repo(&hub, req).await,
+        (&Method::DELETE, ["api", "repos", id]) => delete_repo(&hub, id).await,
+        (&Method::POST, ["api", "repos", id, "poll"]) => poll_repo(&hub, id).await,
+        (&Method::POST, ["api", "repos", id, "trigger"]) => {
+            let id = (*id).to_owned();
+            trigger(&hub, &id, req).await
+        }
+        (&Method::GET, ["api", "runs"]) => runs(&hub, &q).await,
+        (&Method::GET, ["api", "runs", id]) => run(&hub, id).await,
+        (&Method::POST, ["api", "runs", id, "cancel"]) => cancel(&hub, id).await,
+        (&Method::POST, ["api", "runs", id, "retry"]) => {
+            let id = (*id).to_owned();
+            retry(&hub, &id, req).await
+        }
+        (&Method::GET, ["api", "jobs", id]) => job(&hub, id).await,
+        (&Method::GET, ["api", "jobs", id, "logs"]) => job_logs(&hub, id, &q).await,
+        (&Method::GET, ["api", "jobs", id, "logs", "ws"]) => {
+            let (id, step) = ((*id).to_owned(), q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0));
+            job_logs_ws(hub.clone(), id, step, req)
+        }
+        (&Method::GET, ["api", "jobs", id, "artifacts"]) => get_artifacts(&hub, id).await,
+        (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &hub.agent_list().await)),
+        (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
+        (&Method::DELETE, ["api", "agents", name]) => forget_agent(&hub, name).await,
+        (&Method::POST, ["api", "agents", name, "drain"]) => {
+            let name = (*name).to_owned();
+            drain_agent(&hub, &name, req).await
+        }
+        (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
+        (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
+        _ => Err(err(StatusCode::NOT_FOUND, "not found")),
+    }
+}
+
+// ------------------------------------------------------------------ auth handlers
+
 #[derive(Deserialize)]
 struct Login {
     token: String,
 }
 
-async fn login(State(hub): S, Json(l): Json<Login>) -> Response {
+async fn login(hub: &Hub, req: Request) -> R {
+    let l: Login = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if crate::util::ct_eq(l.token.trim().as_bytes(), hub.admin_token.as_bytes()) {
         hub.store.audit("admin".into(), "login".into(), "token".into()).await;
-        (StatusCode::NO_CONTENT, [(header::SET_COOKIE, session_cookie(&hub))]).into_response()
+        Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub)))
     } else {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        err(StatusCode::UNAUTHORIZED, "invalid token").into_response()
+        crate::rt::sleep(Duration::from_millis(500)).await;
+        Err(err(StatusCode::UNAUTHORIZED, "invalid token"))
     }
 }
 
-#[derive(Deserialize)]
-struct Otp {
-    code: String,
-}
-
-async fn otp(State(hub): S, Query(q): Query<Otp>) -> Response {
-    if verify_expiring(&hub, "otp", &q.code) {
-        hub.store.audit("admin".into(), "login".into(), "one-time link".into()).await;
-        ([(header::SET_COOKIE, session_cookie(&hub))], Redirect::to("/")).into_response()
+fn otp(hub: &Hub, req: &Request) -> Response {
+    let q = srv::query(req);
+    let code = q.get("code").map(String::as_str).unwrap_or("");
+    if verify_expiring(hub, "otp", code) {
+        let hub_store = hub.store.clone();
+        crate::rt::spawn(async move {
+            hub_store.audit("admin".into(), "login".into(), "one-time link".into()).await;
+        });
+        let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/");
+        srv::with_header(r, header::SET_COOKIE, &session_cookie(hub))
     } else {
-        (StatusCode::UNAUTHORIZED, "login link expired; run `kiln login` again").into_response()
+        srv::text(StatusCode::UNAUTHORIZED, "login link expired; run `kiln login` again")
     }
 }
 
-async fn logout() -> Response {
-    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, format!("{SESSION_COOKIE}=; Path=/; Max-Age=0"))]).into_response()
+fn logout() -> Response {
+    srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &format!("{SESSION_COOKIE}=; Path=/; Max-Age=0"))
 }
 
-async fn me(State(hub): S, headers: HeaderMap) -> Json<serde_json::Value> {
-    Json(json!({
-        "authenticated": authed(&hub, &headers),
-        "version": env!("CARGO_PKG_VERSION"),
-        "hostname": crate::config::Config::hostname(),
-    }))
+fn me(hub: &Hub, headers: &HeaderMap) -> Response {
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "authenticated": authed(hub, headers),
+            "version": env!("CARGO_PKG_VERSION"),
+            "hostname": crate::config::Config::hostname(),
+        }),
+    )
 }
 
 // ------------------------------------------------------------------ overview / system
 
-async fn overview(State(hub): S) -> R<Json<serde_json::Value>> {
+async fn overview(hub: &Hub) -> R {
     let stats = hub.store.stats().await?;
     let agents = hub.agent_list().await;
     let m = crate::metrics::global();
     let sample = hub.history.lock().get("server").and_then(|q| q.back().cloned());
-    Ok(Json(json!({
-        "stats": stats,
-        "queue": { "queued": m.jobs_queued.get(), "running": m.jobs_running.get() },
-        "agents": {
-            "connected": agents.iter().filter(|a| a.connected).count(),
-            "total": agents.len(),
-            "slots": agents.iter().filter(|a| a.connected).map(|a| a.slots).sum::<u32>(),
-            "busy": agents.iter().filter(|a| a.connected).map(|a| a.busy).sum::<u32>(),
-        },
-        "system": system_json(&hub),
-        "sample": sample,
-    })))
+    Ok(srv::json(
+        StatusCode::OK,
+        &json!({
+            "stats": stats,
+            "queue": { "queued": m.jobs_queued.get(), "running": m.jobs_running.get() },
+            "agents": {
+                "connected": agents.iter().filter(|a| a.connected).count(),
+                "total": agents.len(),
+                "slots": agents.iter().filter(|a| a.connected).map(|a| a.slots).sum::<u32>(),
+                "busy": agents.iter().filter(|a| a.connected).map(|a| a.busy).sum::<u32>(),
+            },
+            "system": system_json(hub),
+            "sample": sample,
+        }),
+    ))
 }
 
 fn system_json(hub: &Hub) -> serde_json::Value {
@@ -193,11 +288,13 @@ fn system_json(hub: &Hub) -> serde_json::Value {
         "children": crate::server::registry().snapshot(),
         "sample": sample,
         "kubernetes": hub.k8s.get().is_some_and(Option::is_some),
+        "runtime": "hyper-rt",
     })
 }
 
-async fn system(State(hub): S) -> Json<serde_json::Value> {
-    let crash = tokio::fs::read_to_string(hub.cfg.data("crash.log")).await.unwrap_or_default();
+async fn system(hub: &Hub) -> Response {
+    let path = hub.cfg.data("crash.log");
+    let crash = crate::rt::blocking(move || std::fs::read_to_string(path).unwrap_or_default()).await.unwrap_or_default();
     let lines: Vec<&str> = crash.lines().rev().take(200).collect();
     let mut cfg = serde_json::to_value(&*hub.cfg).unwrap_or_default();
     if let Some(s) = cfg.get_mut("secrets").and_then(|s| s.as_object_mut()) {
@@ -205,44 +302,31 @@ async fn system(State(hub): S) -> Json<serde_json::Value> {
             *v = json!("***");
         }
     }
-    let mut v = system_json(&hub);
+    let mut v = system_json(hub);
     if let Some(o) = v.as_object_mut() {
         o.insert("crash_log".into(), json!(lines));
         o.insert("config".into(), cfg);
     }
-    Json(v)
+    srv::json(StatusCode::OK, &v)
 }
 
-#[derive(Deserialize)]
-struct Limit {
-    limit: Option<u32>,
+async fn audit(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200);
+    Ok(srv::json(StatusCode::OK, &hub.store.audit_log(limit).await?))
 }
 
-async fn audit(State(hub): S, Query(q): Query<Limit>) -> R<Json<Vec<serde_json::Value>>> {
-    Ok(Json(hub.store.audit_log(q.limit.unwrap_or(200)).await?))
-}
-
-#[derive(Deserialize)]
-struct HistoryQ {
-    agent: Option<String>,
-}
-
-async fn history(State(hub): S, Query(q): Query<HistoryQ>) -> Json<serde_json::Value> {
+fn history(hub: &Hub, q: &HashMap<String, String>) -> Response {
     let h = hub.history.lock();
     let mut out = serde_json::Map::new();
     for (k, v) in h.iter() {
-        if q.agent.as_ref().is_none_or(|a| a == k) {
+        if q.get("agent").is_none_or(|a| a == k) {
             out.insert(k.clone(), json!(v));
         }
     }
-    Json(serde_json::Value::Object(out))
+    srv::json(StatusCode::OK, &serde_json::Value::Object(out))
 }
 
 // ------------------------------------------------------------------ repos
-
-async fn repos(State(hub): S) -> R<Json<Vec<Repo>>> {
-    Ok(Json(hub.store.repos().await?))
-}
 
 #[derive(Deserialize)]
 struct NewRepo {
@@ -253,7 +337,8 @@ struct NewRepo {
     poll_seconds: Option<u32>,
 }
 
-async fn add_repo(State(hub): S, Json(r): Json<NewRepo>) -> R<Json<Repo>> {
+async fn add_repo(hub: &Hub, req: Request) -> R {
+    let r: NewRepo = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let name = r.name.trim().trim_start_matches("https://github.com/").trim_end_matches(".git").to_owned();
     if name.split('/').count() != 2 || name.contains(char::is_whitespace) {
         return Err(err(StatusCode::BAD_REQUEST, "name must be owner/repo"));
@@ -273,11 +358,11 @@ async fn add_repo(State(hub): S, Json(r): Json<NewRepo>) -> R<Json<Repo>> {
         })
         .await?;
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
-    hub.gitops_kick.notify_one();
-    Ok(Json(repo))
+    hub.gitops_kick.notify();
+    Ok(srv::json(StatusCode::OK, &repo))
 }
 
-async fn find_repo(hub: &Hub, id: &str) -> R<Repo> {
+async fn find_repo(hub: &Hub, id: &str) -> Result<Repo, ApiError> {
     hub.store
         .repos()
         .await?
@@ -286,19 +371,19 @@ async fn find_repo(hub: &Hub, id: &str) -> R<Repo> {
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "no such repository"))
 }
 
-async fn delete_repo(State(hub): S, Path(id): Path<String>) -> R<StatusCode> {
-    let repo = find_repo(&hub, &id).await?;
+async fn delete_repo(hub: &Hub, id: &str) -> R {
+    let repo = find_repo(hub, id).await?;
     hub.store.delete_repo(repo.id).await?;
     hub.store.audit("admin".into(), "repo.delete".into(), repo.name).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
-async fn poll_repo(State(hub): S, Path(id): Path<String>) -> R<Json<serde_json::Value>> {
-    let repo = find_repo(&hub, &id).await?;
-    let n = crate::gitops::poll_repo(&hub, &repo).await;
+async fn poll_repo(hub: &Hub, id: &str) -> R {
+    let repo = find_repo(hub, id).await?;
+    let n = crate::gitops::poll_repo(hub, &repo).await;
     let e = n.as_ref().err().map(|e| format!("{e:#}"));
     hub.store.repo_polled(repo.id, e.clone()).await?;
-    Ok(Json(json!({ "triggered": n.unwrap_or(0), "error": e })))
+    Ok(srv::json(StatusCode::OK, &json!({ "triggered": n.unwrap_or(0), "error": e })))
 }
 
 #[derive(Deserialize, Default)]
@@ -307,108 +392,114 @@ struct TriggerReq {
     pipeline: Option<String>,
 }
 
-async fn trigger(State(hub): S, Path(id): Path<String>, body: Option<Json<TriggerReq>>) -> R<Json<Vec<crate::store::Run>>> {
-    let repo = find_repo(&hub, &id).await?;
-    let t = body.map(|b| b.0).unwrap_or_default();
-    let runs = crate::gitops::manual(&hub, &repo, t.branch.clone(), t.pipeline)
+async fn trigger(hub: &Hub, id: &str, req: Request) -> R {
+    let repo = find_repo(hub, id).await?;
+    let t: TriggerReq = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    let runs = crate::gitops::manual(hub, &repo, t.branch.clone(), t.pipeline)
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     hub.store.audit("admin".into(), "run.trigger".into(), format!("{} {:?}", repo.name, t.branch)).await;
-    Ok(Json(runs))
+    Ok(srv::json(StatusCode::OK, &runs))
 }
 
 // ------------------------------------------------------------------ runs & jobs
 
+async fn runs(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let before = q.get("before").and_then(|v| v.parse().ok());
+    Ok(srv::json(StatusCode::OK, &hub.store.runs(q.get("repo").cloned(), limit, before).await?))
+}
+
+async fn run(hub: &Hub, id: &str) -> R {
+    let run = hub.store.run(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
+    let jobs = hub.store.jobs(id.to_owned(), false).await?;
+    Ok(srv::json(StatusCode::OK, &json!({ "run": run, "jobs": jobs })))
+}
+
+async fn cancel(hub: &Hub, id: &str) -> R {
+    hub.cancel_run(id, "cancelled by user").await?;
+    hub.store.audit("admin".into(), "run.cancel".into(), id.to_owned()).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 #[derive(Deserialize)]
-struct RunsQ {
-    repo: Option<String>,
-    limit: Option<u32>,
-    before: Option<i64>,
-}
-
-async fn runs(State(hub): S, Query(q): Query<RunsQ>) -> R<Json<Vec<crate::store::Run>>> {
-    Ok(Json(hub.store.runs(q.repo, q.limit.unwrap_or(50), q.before).await?))
-}
-
-async fn run(State(hub): S, Path(id): Path<String>) -> R<Json<serde_json::Value>> {
-    let run = hub.store.run(id.clone()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
-    let jobs = hub.store.jobs(id, false).await?;
-    Ok(Json(json!({ "run": run, "jobs": jobs })))
-}
-
-async fn cancel(State(hub): S, Path(id): Path<String>) -> R<StatusCode> {
-    hub.cancel_run(&id, "cancelled by user").await?;
-    hub.store.audit("admin".into(), "run.cancel".into(), id).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize, Default)]
 struct RetryReq {
-    #[serde(default)]
+    #[serde(default = "yes")]
     only_failed: bool,
 }
 
-async fn retry(State(hub): S, Path(id): Path<String>, body: Option<Json<RetryReq>>) -> R<Json<serde_json::Value>> {
-    let only_failed = body.map(|b| b.0.only_failed).unwrap_or(true);
-    let n = hub.store.retry_run(id.clone(), only_failed).await?;
-    hub.emit_run(&id).await;
-    hub.wake.notify_one();
-    hub.store.audit("admin".into(), "run.retry".into(), id).await;
-    Ok(Json(json!({ "jobs": n })))
+fn yes() -> bool {
+    true
 }
 
-async fn job(State(hub): S, Path(id): Path<String>) -> R<Json<crate::store::Job>> {
-    Ok(Json(hub.store.job(id).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?))
+async fn retry(hub: &Hub, id: &str, req: Request) -> R {
+    let only_failed = srv::body_json::<RetryReq>(req.into_body(), JSON_LIMIT).await.map(|r| r.only_failed).unwrap_or(true);
+    let n = hub.store.retry_run(id.to_owned(), only_failed).await?;
+    hub.emit_run(id).await;
+    hub.wake.notify();
+    hub.store.audit("admin".into(), "run.retry".into(), id.to_owned()).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "jobs": n })))
 }
 
-#[derive(Deserialize)]
-struct StepQ {
-    step: Option<u32>,
+async fn job(hub: &Hub, id: &str) -> R {
+    let j = hub.store.job(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?;
+    Ok(srv::json(StatusCode::OK, &j))
 }
 
-async fn job_logs(State(hub): S, Path(id): Path<String>, Query(q): Query<StepQ>) -> Response {
-    let data = hub.logs.read(&id, q.step.unwrap_or(0)).await;
-    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], data).into_response()
+async fn job_logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+    let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let data = hub.logs.read(id, step).await;
+    Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)))
 }
 
-async fn job_logs_ws(State(hub): S, Path(id): Path<String>, Query(q): Query<StepQ>, ws: WebSocketUpgrade) -> Response {
-    let step = q.step.unwrap_or(0);
-    ws.on_upgrade(move |socket| async move {
-        if let Err(e) = stream_logs(hub, id, step, socket).await {
-            tracing::debug!(error = %e, "log stream ended");
+fn job_logs_ws(hub: Arc<Hub>, job: String, step: u32, req: Request) -> R {
+    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    crate::rt::spawn(async move {
+        match upgrade.await {
+            Ok(socket) => {
+                if let Err(e) = stream_logs(hub, job, step, socket).await {
+                    tracing::debug!(error = %e, "log stream ended");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "log stream upgrade failed"),
         }
-    })
+    });
+    Ok(resp)
 }
 
-async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, mut socket: WebSocket) -> anyhow::Result<()> {
+async fn stream_logs(hub: Arc<Hub>, job: String, step: u32, socket: ws::WebSocket) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    let (mut tx, mut rx_ws) = socket.split();
     let live = hub.logs.is_live(&job);
     let mut rx = live.then(|| hub.logs.subscribe(&job));
     let backlog = hub.logs.read(&job, step).await;
     for chunk in backlog.chunks(64 * 1024) {
-        socket.send(Message::Binary(chunk.to_vec().into())).await?;
+        tx.send(ws::binary(Bytes::copy_from_slice(chunk))).await?;
     }
     let Some(rx) = rx.as_mut() else {
-        socket.send(Message::Text(json!({"type": "end"}).to_string().into())).await?;
+        tx.send(ws::text(json!({"type": "end"}).to_string())).await?;
+        tx.close(None).await.ok();
         return Ok(());
     };
     loop {
-        tokio::select! {
-            ev = rx.recv() => match ev {
-                Ok(LogEvent::Data { idx, data }) if idx == step => socket.send(Message::Binary(data)).await?,
+        futures::select_biased! {
+            ev = rx.recv().fuse() => match ev {
+                Ok(LogEvent::Data { idx, data }) if idx == step => tx.send(ws::binary(data)).await?,
                 Ok(LogEvent::Data { .. }) => {}
                 Ok(LogEvent::Step { idx, status }) => {
-                    socket.send(Message::Text(json!({"type": "step", "idx": idx, "status": status}).to_string().into())).await?;
+                    tx.send(ws::text(json!({"type": "step", "idx": idx, "status": status}).to_string())).await?;
                 }
-                Ok(LogEvent::End) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    socket.send(Message::Text(json!({"type": "end"}).to_string().into())).await?;
+                Ok(LogEvent::End) | Err(async_broadcast::RecvError::Closed) => {
+                    tx.send(ws::text(json!({"type": "end"}).to_string())).await?;
+                    tx.close(None).await.ok();
                     return Ok(());
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                Err(async_broadcast::RecvError::Overflowed(n)) => {
                     let note = format!("\r\n\x1b[33m[kiln] viewer fell behind; {n} chunks skipped (reload for the full log)\x1b[0m\r\n");
-                    socket.send(Message::Binary(note.into_bytes().into())).await?;
+                    tx.send(ws::binary(note.into_bytes())).await?;
                 }
             },
-            msg = socket.recv() => match msg {
+            msg = rx_ws.next().fuse() => match msg {
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
                 _ => {}
             },
@@ -421,20 +512,15 @@ fn job_token_ok(hub: &Hub, headers: &HeaderMap, job: &str) -> bool {
         || authed(hub, headers)
 }
 
-async fn job_source(State(hub): S, Path(id): Path<String>, headers: HeaderMap) -> R<Response> {
-    if !job_token_ok(&hub, &headers, &id) {
+async fn job_source(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
+    if !job_token_ok(hub, headers, id) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
     }
-    let job = hub.store.job(id).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?;
+    let job = hub.store.job(id.to_owned()).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such job"))?;
     let run = hub.store.run(job.run_id).await?.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such run"))?;
-    let repo = find_repo(&hub, &run.repo_id).await?;
-    let mut child = crate::gitops::archive(&hub, &repo, &run.sha).await?;
-    let stdout = child.stdout.take().ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "no archive stream"))?;
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-    let stream = tokio_util::io::ReaderStream::new(stdout);
-    Ok(([(header::CONTENT_TYPE, "application/x-tar")], Body::from_stream(stream)).into_response())
+    let repo = find_repo(hub, &run.repo_id).await?;
+    let stdout = crate::gitops::archive(hub, &repo, &run.sha).await?;
+    Ok(srv::response(StatusCode::OK, "application/x-tar", srv::channel_body(stdout)))
 }
 
 fn artifact_path(hub: &Hub, job: &str) -> std::path::PathBuf {
@@ -442,50 +528,36 @@ fn artifact_path(hub: &Hub, job: &str) -> std::path::PathBuf {
     hub.cfg.data("artifacts").join(format!("{safe}.tar"))
 }
 
-async fn put_artifacts(State(hub): S, Path(id): Path<String>, headers: HeaderMap, body: Body) -> R<StatusCode> {
-    if !job_token_ok(&hub, &headers, &id) {
+async fn put_artifacts(hub: &Hub, id: &str, req: Request) -> R {
+    if !job_token_ok(hub, req.headers(), id) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad job token"));
     }
-    let path = artifact_path(&hub, &id);
-    if let Some(d) = path.parent() {
-        tokio::fs::create_dir_all(d).await.map_err(anyhow::Error::from)?;
+    let path = artifact_path(hub, id);
+    let (sink, done) = crate::rt::file_sink(path, 8 << 30)?;
+    let mut body = req.into_body();
+    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+        if sink.send(chunk).await.is_err() {
+            break; // the writer failed; its error is reported below
+        }
     }
-    let tmp = path.with_extension("part");
-    let mut f = tokio::fs::File::create(&tmp).await.map_err(anyhow::Error::from)?;
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-        f.write_all(&chunk).await.map_err(anyhow::Error::from)?;
-    }
-    f.flush().await.map_err(anyhow::Error::from)?;
-    tokio::fs::rename(&tmp, &path).await.map_err(anyhow::Error::from)?;
-    Ok(StatusCode::NO_CONTENT)
+    drop(sink);
+    done.await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
-async fn get_artifacts(State(hub): S, Path(id): Path<String>) -> R<Response> {
-    let path = artifact_path(&hub, &id);
-    let f = tokio::fs::File::open(&path).await.map_err(|_| err(StatusCode::NOT_FOUND, "no artifacts"))?;
-    let name = format!("attachment; filename=\"artifacts-{id}.tar\"");
-    Ok((
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static("application/x-tar")),
-            (header::CONTENT_DISPOSITION, HeaderValue::from_str(&name).unwrap_or(HeaderValue::from_static("attachment"))),
-        ],
-        Body::from_stream(tokio_util::io::ReaderStream::new(f)),
-    )
-        .into_response())
+async fn get_artifacts(hub: &Hub, id: &str) -> R {
+    let path = artifact_path(hub, id);
+    let body = crate::rt::file_source(path).map_err(|_| err(StatusCode::NOT_FOUND, "no artifacts"))?;
+    let r = srv::response(StatusCode::OK, "application/x-tar", srv::channel_body(body));
+    Ok(srv::with_header(r, header::CONTENT_DISPOSITION, &format!("attachment; filename=\"artifacts-{id}.tar\"")))
 }
 
 // ------------------------------------------------------------------ agents
 
-async fn agents(State(hub): S) -> Json<Vec<crate::hub::AgentLive>> {
-    Json(hub.agent_list().await)
-}
-
-async fn forget_agent(State(hub): S, Path(name): Path<String>) -> R<StatusCode> {
-    hub.forget_agent(&name).await?;
-    hub.store.audit("admin".into(), "agent.forget".into(), name).await;
-    Ok(StatusCode::NO_CONTENT)
+async fn forget_agent(hub: &Hub, name: &str) -> R {
+    hub.forget_agent(name).await?;
+    hub.store.audit("admin".into(), "agent.forget".into(), name.to_owned()).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 #[derive(Deserialize)]
@@ -493,31 +565,36 @@ struct DrainReq {
     draining: bool,
 }
 
-async fn drain_agent(State(hub): S, Path(name): Path<String>, Json(d): Json<DrainReq>) -> R<StatusCode> {
-    if hub.set_draining(&name, d.draining).await {
-        Ok(StatusCode::NO_CONTENT)
+async fn drain_agent(hub: &Hub, name: &str, req: Request) -> R {
+    let d: DrainReq = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if hub.set_draining(name, d.draining).await {
+        Ok(srv::status(StatusCode::NO_CONTENT))
     } else {
         Err(err(StatusCode::NOT_FOUND, "agent not connected"))
     }
 }
 
-async fn join_info(State(hub): S) -> Json<serde_json::Value> {
+fn join_info(hub: &Hub) -> Response {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let token = hub.join_token.clone();
-    Json(json!({
-        "token": token,
-        "server": url,
-        "quic": hub.cfg.server.quic_advertise,
-        "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,bench"),
-        "manual": format!("kiln agent --server {url} --token {token} --labels baremetal,bench"),
-    }))
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "token": token,
+            "server": url,
+            "quic": hub.cfg.server.quic_advertise,
+            "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,bench"),
+            "manual": format!("kiln agent --server {url} --token {token} --labels baremetal,bench"),
+        }),
+    )
 }
 
-async fn enroll(State(hub): S, Json(r): Json<EnrollRequest>) -> R<Json<EnrollResponse>> {
+async fn enroll(hub: &Hub, req: Request) -> R {
+    let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     let ephemeral = !persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some();
     if !persistent && !ephemeral {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        crate::rt::sleep(Duration::from_millis(500)).await;
         return Err(err(StatusCode::UNAUTHORIZED, "invalid join token"));
     }
     let name = crate::pki::sanitize_name(&r.name);
@@ -532,84 +609,85 @@ async fn enroll(State(hub): S, Json(r): Json<EnrollRequest>) -> R<Json<EnrollRes
         hub.store.audit(name.clone(), "agent.enroll".into(), String::new()).await;
         tracing::info!(agent = %name, "agent enrolled");
     }
-    Ok(Json(EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
+    Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
 }
 
 /// The running binary, so new agents can be installed straight from the server.
-async fn download_binary() -> R<Response> {
+async fn download_binary() -> R {
     let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
-    let f = tokio::fs::File::open(exe).await.map_err(anyhow::Error::from)?;
-    Ok((
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        Body::from_stream(tokio_util::io::ReaderStream::new(f)),
-    )
-        .into_response())
+    let body = crate::rt::file_source(exe)?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 
-async fn install_script(State(hub): S) -> Response {
+fn install_script(hub: &Hub) -> Response {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
     let script = include_str!("../assets/install-agent.sh").replace("@@KILN_SERVER@@", &url);
-    ([(header::CONTENT_TYPE, "text/x-shellscript")], script).into_response()
+    srv::response(StatusCode::OK, "text/x-shellscript", srv::full(script))
 }
 
 // ------------------------------------------------------------------ webhooks
 
-async fn github_hook(State(hub): S, headers: HeaderMap, body: axum::body::Bytes) -> R<StatusCode> {
+async fn github_hook(hub: &Hub, req: Request) -> R {
+    let sig = srv::header_str(&req, &header::HeaderName::from_static("x-hub-signature-256")).unwrap_or("").to_owned();
+    let body = srv::body_bytes(req.into_body(), 25 << 20).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     // A configured but absent secret file means "no secret" (e.g. an optional mounted Secret).
     let secret = match &hub.cfg.gitops.webhook_secret_file {
-        Some(path) => tokio::fs::read_to_string(path).await.ok().filter(|s| !s.trim().is_empty()),
+        Some(path) => {
+            let p = path.clone();
+            crate::rt::blocking(move || std::fs::read_to_string(p).ok()).await?.filter(|s| !s.trim().is_empty())
+        }
         None => None,
     };
     if let Some(secret) = secret {
         let want = format!("sha256={}", crate::util::hmac_hex(secret.trim().as_bytes(), &body));
-        let got = headers.get("x-hub-signature-256").and_then(|v| v.to_str().ok()).unwrap_or("");
-        if !crate::util::ct_eq(want.as_bytes(), got.as_bytes()) {
+        if !crate::util::ct_eq(want.as_bytes(), sig.as_bytes()) {
             return Err(err(StatusCode::UNAUTHORIZED, "bad signature"));
         }
     }
     // A webhook only hints; the poll decides what changed (GitOps: state comes from git).
-    hub.gitops_kick.notify_one();
-    Ok(StatusCode::ACCEPTED)
+    hub.gitops_kick.notify();
+    Ok(srv::status(StatusCode::ACCEPTED))
 }
 
 // ------------------------------------------------------------------ events ws
 
-async fn events_ws(State(hub): S, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |mut socket| async move {
+fn events_ws(hub: Arc<Hub>, req: Request) -> R {
+    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    crate::rt::spawn(async move {
+        let Ok(socket) = upgrade.await else { return };
         let m = crate::metrics::global();
         m.ws_clients.add(1);
-        let mut rx = hub.events.subscribe();
-        hub.emit_queue();
-        loop {
-            tokio::select! {
-                ev = rx.recv() => match ev {
-                    Ok(text) => {
-                        if socket.send(Message::Text(text.as_ref().into())).await.is_err() { break; }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        if socket.send(Message::Text(json!({"type": "resync"}).to_string().into())).await.is_err() { break; }
-                    }
-                    Err(_) => break,
-                },
-                msg = socket.recv() => match msg {
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => {}
-                },
-            }
+        if let Err(e) = pump_events(&hub, socket).await {
+            tracing::debug!(error = %e, "events stream ended");
         }
         m.ws_clients.add(-1);
-    })
+    });
+    Ok(resp)
+}
+
+async fn pump_events(hub: &Hub, socket: ws::WebSocket) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    let (mut tx, mut rx_ws) = socket.split();
+    let mut rx = hub.events.subscribe();
+    hub.emit_queue();
+    loop {
+        futures::select_biased! {
+            ev = rx.recv().fuse() => match ev {
+                Ok(text) => tx.send(ws::text(text.as_ref())).await?,
+                Err(async_broadcast::RecvError::Overflowed(_)) => {
+                    tx.send(ws::text(json!({"type": "resync"}).to_string())).await?;
+                }
+                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            },
+            msg = rx_ws.next().fuse() => match msg {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
+                _ => {}
+            },
+        }
+    }
 }
 
 // ------------------------------------------------------------------ terminal ws
-
-#[derive(Deserialize)]
-struct TermQ {
-    target: Option<String>,
-    cols: Option<u16>,
-    rows: Option<u16>,
-    cmd: Option<String>,
-}
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -619,56 +697,58 @@ enum TermCtl {
     Ping,
 }
 
-async fn terminal_ws(State(hub): S, Query(q): Query<TermQ>, ws: WebSocketUpgrade) -> Response {
+async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) -> R {
     if !hub.cfg.terminal.enabled {
-        return err(StatusCode::FORBIDDEN, "terminal disabled in config").into_response();
+        return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
     }
     if crate::metrics::global().terminal_sessions.get() >= i64::try_from(hub.cfg.terminal.max_sessions).unwrap_or(32) {
-        return err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions").into_response();
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
     }
-    ws.on_upgrade(move |socket| async move {
-        let target = q.target.clone().unwrap_or_else(|| "local".into());
+    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let target = q.get("target").cloned().unwrap_or_else(|| "local".into());
+    let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
+    let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
+    let cmd = q.get("cmd").cloned();
+    crate::rt::spawn(async move {
+        let Ok(socket) = upgrade.await else { return };
         hub.store.audit("admin".into(), "terminal.open".into(), target.clone()).await;
         let r = match target.strip_prefix("agent:") {
-            Some(agent) => agent_terminal(hub.clone(), agent.to_owned(), q, socket).await,
-            None => local_terminal(hub.clone(), q, socket).await,
+            Some(agent) => agent_terminal(hub.clone(), agent.to_owned(), cols, rows, cmd, socket).await,
+            None => local_terminal(&hub, cols, rows, cmd, socket).await,
         };
         if let Err(e) = r {
             tracing::debug!(error = %e, "terminal session ended");
         }
-    })
+    });
+    Ok(resp)
 }
 
-async fn local_terminal(hub: Arc<Hub>, q: TermQ, socket: WebSocket) -> anyhow::Result<()> {
+async fn local_terminal(hub: &Hub, cols: u16, rows: u16, cmd: Option<String>, socket: ws::WebSocket) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
-    let (pty, mut out) = match crate::terminal::spawn(
-        hub.cfg.terminal.shell.as_deref(),
-        q.cmd.as_deref(),
-        q.cols.unwrap_or(120),
-        q.rows.unwrap_or(40),
-    ) {
+    let (pty, out) = match crate::terminal::spawn(hub.cfg.terminal.shell.as_deref(), cmd.as_deref(), cols, rows) {
         Ok(p) => p,
         Err(e) => {
-            tx.send(Message::Text(json!({"type": "error", "message": format!("{e:#}")}).to_string().into())).await?;
+            tx.send(ws::text(json!({"type": "error", "message": format!("{e:#}")}).to_string())).await?;
             return Ok(());
         }
     };
     loop {
-        tokio::select! {
-            o = out.recv() => match o {
-                Some(crate::terminal::PtyOut::Data(d)) => tx.send(Message::Binary(d.into())).await?,
-                Some(crate::terminal::PtyOut::Exit(code)) => {
-                    tx.send(Message::Text(json!({"type": "exit", "code": code}).to_string().into())).await.ok();
+        futures::select_biased! {
+            o = out.recv().fuse() => match o {
+                Ok(crate::terminal::PtyOut::Data(d)) => tx.send(ws::binary(d)).await?,
+                Ok(crate::terminal::PtyOut::Exit(code)) => {
+                    tx.send(ws::text(json!({"type": "exit", "code": code}).to_string())).await.ok();
                     return Ok(());
                 }
-                None => {
-                    tx.send(Message::Text(json!({"type": "exit", "code": null}).to_string().into())).await.ok();
+                Err(_) => {
+                    tx.send(ws::text(json!({"type": "exit", "code": null}).to_string())).await.ok();
                     return Ok(());
                 }
             },
-            m = rx.next() => match m {
+            m = rx.next().fuse() => match m {
                 Some(Ok(Message::Binary(b))) => pty.write(b.to_vec()),
-                Some(Ok(Message::Text(t))) => match serde_json::from_str::<TermCtl>(&t) {
+                Some(Ok(Message::Text(t))) => match serde_json::from_str::<TermCtl>(t.as_str()) {
                     Ok(TermCtl::Resize { cols, rows }) => pty.resize(cols, rows),
                     Ok(TermCtl::Input { data }) => pty.write(data.into_bytes()),
                     Ok(TermCtl::Ping) | Err(_) => {}
@@ -680,45 +760,49 @@ async fn local_terminal(hub: Arc<Hub>, q: TermQ, socket: WebSocket) -> anyhow::R
     }
 }
 
-async fn agent_terminal(hub: Arc<Hub>, agent: String, q: TermQ, socket: WebSocket) -> anyhow::Result<()> {
+async fn agent_terminal(
+    hub: Arc<Hub>,
+    agent: String,
+    cols: u16,
+    rows: u16,
+    cmd: Option<String>,
+    socket: ws::WebSocket,
+) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
     let session = crate::util::new_id();
     let key = format!("{agent}/{session}");
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<TermOut>(512);
+    let (out_tx, out_rx) = async_channel::bounded::<TermOut>(512);
     hub.terms.lock().insert(key.clone(), out_tx);
     let opened = hub
-        .send_to_agent(
-            &agent,
-            LANE_TERM,
-            &ServerMsg::TermOpen { session: session.clone(), cols: q.cols.unwrap_or(120), rows: q.rows.unwrap_or(40), command: q.cmd.clone() },
-        )
+        .send_to_agent(&agent, LANE_TERM, &ServerMsg::TermOpen { session: session.clone(), cols, rows, command: cmd })
         .await;
     if !opened {
         hub.terms.lock().remove(&key);
-        tx.send(Message::Text(json!({"type": "error", "message": format!("agent {agent} is not connected")}).to_string().into())).await?;
+        tx.send(ws::text(json!({"type": "error", "message": format!("agent {agent} is not connected")}).to_string())).await?;
         return Ok(());
     }
     crate::metrics::global().terminal_sessions.add(1);
     let result: anyhow::Result<()> = async {
         loop {
-            tokio::select! {
-                o = out_rx.recv() => match o {
-                    Some(TermOut::Data(d)) => tx.send(Message::Binary(d.into())).await?,
-                    Some(TermOut::Exit { code, error }) => {
+            futures::select_biased! {
+                o = out_rx.recv().fuse() => match o {
+                    Ok(TermOut::Data(d)) => tx.send(ws::binary(d)).await?,
+                    Ok(TermOut::Exit { code, error }) => {
                         let msg = match error {
                             Some(e) => json!({"type": "error", "message": e}),
                             None => json!({"type": "exit", "code": code}),
                         };
-                        tx.send(Message::Text(msg.to_string().into())).await.ok();
+                        tx.send(ws::text(msg.to_string())).await.ok();
                         return Ok(());
                     }
-                    None => return Ok(()),
+                    Err(_) => return Ok(()),
                 },
-                m = rx.next() => match m {
+                m = rx.next().fuse() => match m {
                     Some(Ok(Message::Binary(b))) => {
                         hub.send_to_agent(&agent, LANE_TERM, &ServerMsg::TermInput { session: session.clone(), data: b.to_vec() }).await;
                     }
-                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<TermCtl>(&t) {
+                    Some(Ok(Message::Text(t))) => match serde_json::from_str::<TermCtl>(t.as_str()) {
                         Ok(TermCtl::Resize { cols, rows }) => {
                             hub.send_to_agent(&agent, LANE_TERM, &ServerMsg::TermResize { session: session.clone(), cols, rows }).await;
                         }
@@ -740,74 +824,18 @@ async fn agent_terminal(hub: Arc<Hub>, agent: String, q: TermQ, socket: WebSocke
     result
 }
 
-// ------------------------------------------------------------------ router
+// ------------------------------------------------------------------ misc
 
-async fn metrics_handler(State(hub): S, headers: HeaderMap) -> Response {
-    if !hub.cfg.server.metrics_public && !authed(&hub, &headers) {
+fn metrics_handler(hub: &Hub, headers: &HeaderMap) -> Response {
+    if !hub.cfg.server.metrics_public && !authed(hub, headers) {
         return err(StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], crate::metrics::render()).into_response()
+    srv::response(StatusCode::OK, "text/plain; version=0.0.4", srv::full(crate::metrics::render()))
 }
 
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-async fn readyz(State(hub): S) -> Response {
+async fn readyz(hub: &Hub) -> Response {
     match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
-        Ok(_) => (StatusCode::OK, "ready").into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, format!("store: {e:#}")).into_response(),
+        Ok(_) => srv::text(StatusCode::OK, "ready"),
+        Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
     }
-}
-
-pub fn router(hub: Arc<Hub>) -> Router {
-    let protected = Router::new()
-        .route("/api/overview", get(overview))
-        .route("/api/system", get(system))
-        .route("/api/audit", get(audit))
-        .route("/api/metrics/history", get(history))
-        .route("/api/repos", get(repos).post(add_repo))
-        .route("/api/repos/{id}", axum::routing::delete(delete_repo))
-        .route("/api/repos/{id}/poll", post(poll_repo))
-        .route("/api/repos/{id}/trigger", post(trigger))
-        .route("/api/runs", get(runs))
-        .route("/api/runs/{id}", get(run))
-        .route("/api/runs/{id}/cancel", post(cancel))
-        .route("/api/runs/{id}/retry", post(retry))
-        .route("/api/jobs/{id}", get(job))
-        .route("/api/jobs/{id}/logs", get(job_logs))
-        .route("/api/jobs/{id}/logs/ws", get(job_logs_ws))
-        .route("/api/jobs/{id}/artifacts", get(get_artifacts))
-        .route("/api/agents", get(agents))
-        .route("/api/agents/join", get(join_info))
-        .route("/api/agents/{name}", axum::routing::delete(forget_agent))
-        .route("/api/agents/{name}/drain", post(drain_agent))
-        .route("/api/events", get(events_ws))
-        .route("/api/terminal/ws", get(terminal_ws))
-        .layer(middleware::from_fn_with_state(hub.clone(), require_auth));
-
-    let open = Router::new()
-        .route("/api/auth/login", post(login))
-        .route("/api/auth/otp", get(otp))
-        .route("/api/auth/logout", post(logout))
-        .route("/api/me", get(me))
-        .route("/api/agents/enroll", post(enroll))
-        .route("/api/jobs/{id}/source", get(job_source))
-        .route(
-            "/api/jobs/{id}/artifacts/upload",
-            put(put_artifacts).layer(DefaultBodyLimit::max(8 << 30)),
-        )
-        .route("/api/hooks/github", post(github_hook))
-        .route("/metrics", get(metrics_handler))
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/dl/kiln", get(download_binary))
-        .route("/install.sh", get(install_script));
-
-    Router::new()
-        .merge(protected)
-        .merge(open)
-        .fallback(crate::ui::serve)
-        .layer(tower_http::compression::CompressionLayer::new().gzip(true).br(true).zstd(true))
-        .with_state(hub)
 }
