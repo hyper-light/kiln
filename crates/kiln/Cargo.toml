@@ -18,7 +18,7 @@ futures = "0.3.34"
 glob = "0.3.4"
 hex = "0.4.3"
 mime_guess = "2.0.5"
-nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net"] }
 parking_lot = "0.12.5"
 portable-pty = "0.9.0"
 rand = "0.10.3"
@@ -55,6 +55,7 @@ rustix = { version = "1.1", features = ["process"] }
 filedescriptor = "0.8"
 argon2 = "0.6"
 rpassword = "7"
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [lints]
 workspace = true
