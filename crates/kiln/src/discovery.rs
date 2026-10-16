@@ -322,15 +322,35 @@ pub struct Instance {
     pub quic: u16,
     pub ca: Option<String>,
     pub enrolled: Option<String>,
-    /// The address its packets came from first, then its A/AAAA records.
+    /// Its addresses in the order first heard: the IPv4 address its packets came from, then its
+    /// A/AAAA records. Addresses heard over several packets (interfaces) are merged, and each one
+    /// lapses with the TTL it was last announced with.
     pub addresses: Vec<IpAddr>,
     pub first_seen: i64,
     pub last_seen: i64,
     #[serde(skip)]
     pub expires: Instant,
+    /// When each address lapses.
+    #[serde(skip)]
+    address_expiry: Vec<(IpAddr, Instant)>,
 }
 
 impl Instance {
+    /// Fold an earlier sighting's addresses into this one: known addresses keep their place,
+    /// lapsed ones go.
+    fn merge_addresses(&mut self, earlier: &Instance, now: Instant) {
+        let mut merged: Vec<(IpAddr, Instant)> = earlier.address_expiry.iter().copied().filter(|(_, t)| *t > now).collect();
+        for (ip, t) in &self.address_expiry {
+            match merged.iter_mut().find(|(have, _)| have == ip) {
+                Some(slot) => slot.1 = slot.1.max(*t),
+                None => merged.push((*ip, *t)),
+            }
+        }
+        merged.truncate(16);
+        self.addresses = merged.iter().map(|(ip, _)| *ip).collect();
+        self.address_expiry = merged;
+    }
+
     /// The address to reach it at: the first IPv4 one, else the first.
     pub fn address(&self) -> Option<IpAddr> {
         self.addresses.iter().find(|a| a.is_ipv4()).or_else(|| self.addresses.first()).copied()
@@ -407,9 +427,14 @@ fn heard(msg: &Message, from: SocketAddr, now: Instant) -> (Vec<Instance>, Vec<S
         if id.is_empty() {
             continue;
         }
+        let ttl = srv_ttl.min(txt_ttl).clamp(1, 4500);
+        let expires = now + Duration::from_secs(u64::from(ttl));
+        // The source address, when it can be dialed as is (an IPv6 link-local source carries no
+        // usable scope here), then the address records.
         let mut addresses: Vec<IpAddr> = Vec::new();
-        if !from.ip().is_unspecified() {
-            addresses.push(from.ip());
+        let source = from.ip();
+        if !source.is_unspecified() && !matches!(source, IpAddr::V6(v6) if v6.is_unicast_link_local()) {
+            addresses.push(source);
         }
         for r in msg.records().filter(|r| r.name == target && r.ttl > 0) {
             let ip = match r.data {
@@ -421,7 +446,6 @@ fn heard(msg: &Message, from: SocketAddr, now: Instant) -> (Vec<Instance>, Vec<S
                 addresses.push(ip);
             }
         }
-        let ttl = srv_ttl.min(txt_ttl).clamp(1, 4500);
         seen.push(Instance {
             id,
             instance: clean(Some(&label), 63),
@@ -434,10 +458,11 @@ fn heard(msg: &Message, from: SocketAddr, now: Instant) -> (Vec<Instance>, Vec<S
             quic: get("quic").and_then(|q| q.parse().ok()).unwrap_or(0),
             ca: get("ca").and_then(hex16),
             enrolled: get("enrolled").and_then(hex16),
+            address_expiry: addresses.iter().map(|ip| (*ip, expires)).collect(),
             addresses,
             first_seen: unix,
             last_seen: unix,
-            expires: now + Duration::from_secs(u64::from(ttl)),
+            expires,
         });
     }
     (seen, gone)
@@ -466,9 +491,10 @@ impl Table {
     }
 
     /// Record a sighting; true when the instance is new or something about it changed.
-    fn upsert(&self, mut seen: Instance) -> bool {
+    fn upsert(&self, mut seen: Instance, now: Instant) -> bool {
         let mut g = self.inner.lock();
         if let Some(have) = g.get_mut(&seen.id) {
+            seen.merge_addresses(have, now);
             let changed = !have.same(&seen);
             seen.first_seen = have.first_seen;
             *have = seen;
@@ -872,7 +898,7 @@ impl Engine {
             let mut changed = false;
             for i in seen {
                 if me.as_deref() != Some(i.id.as_str()) {
-                    changed |= self.table.upsert(i);
+                    changed |= self.table.upsert(i, now);
                 }
             }
             for label in gone {
@@ -1341,6 +1367,7 @@ mod tests {
             first_seen: 1,
             last_seen: 1,
             expires: now + Duration::from_secs(ttl),
+            address_expiry: vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 80)), now + Duration::from_secs(ttl))],
         }
     }
 
@@ -1348,19 +1375,19 @@ mod tests {
     fn the_table_tracks_changes_and_expiry() {
         let t = Table::default();
         let now = Instant::now();
-        assert!(t.upsert(instance("a", "A", now, 120)));
+        assert!(t.upsert(instance("a", "A", now, 120), now));
         // A refresh is not a change; a new version is.
         let mut again = instance("a", "A", now, 120);
         again.last_seen = 99;
-        assert!(!t.upsert(again));
+        assert!(!t.upsert(again, now));
         let mut newer = instance("a", "A", now, 120);
         newer.version = "0.2.0".into();
-        assert!(t.upsert(newer));
+        assert!(t.upsert(newer, now));
         assert_eq!(t.snapshot().first().map(|i| i.first_seen), Some(1));
         // The same instance name under a new id replaces the old entry.
-        assert!(t.upsert(instance("b", "A", now, 120)));
+        assert!(t.upsert(instance("b", "A", now, 120), now));
         assert_eq!(t.len(), 1);
-        assert!(t.upsert(instance("c", "C", now, 10)));
+        assert!(t.upsert(instance("c", "C", now, 10), now));
         assert!(!t.sweep(now + Duration::from_secs(5)));
         assert!(t.sweep(now + Duration::from_secs(11)));
         assert_eq!(t.snapshot().iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec!["b"]);
@@ -1368,10 +1395,35 @@ mod tests {
         assert!(t.is_empty());
         // Bounded: the entry closest to expiring makes room.
         for n in 0..MAX_INSTANCES + 5 {
-            t.upsert(instance(&format!("i{n}"), &format!("I{n}"), now, 100 + u64::try_from(n).unwrap_or(0)));
+            t.upsert(instance(&format!("i{n}"), &format!("I{n}"), now, 100 + u64::try_from(n).unwrap_or(0)), now);
         }
         assert_eq!(t.len(), MAX_INSTANCES);
         assert!(t.snapshot().iter().all(|i| i.id != "i0"));
+    }
+
+    #[test]
+    fn addresses_merge_across_packets_and_lapse() {
+        let t = Table::default();
+        let now = Instant::now();
+        let at = |ip: [u8; 4], when: Instant, ttl: u64| {
+            let mut i = instance("m", "M", when, ttl);
+            i.addresses = vec![IpAddr::from(ip)];
+            i.address_expiry = vec![(IpAddr::from(ip), when + Duration::from_secs(ttl))];
+            i
+        };
+        // A machine on two links of ours announces on both: one entry, both addresses, in the
+        // order first heard, and hearing them again in either order is no change.
+        assert!(t.upsert(at([192, 168, 1, 80], now, 120), now));
+        assert!(t.upsert(at([10, 0, 0, 80], now, 120), now));
+        assert!(!t.upsert(at([192, 168, 1, 80], now, 120), now));
+        assert!(!t.upsert(at([10, 0, 0, 80], now, 120), now));
+        let addrs = t.snapshot().first().map(|i| i.addresses.clone()).unwrap_or_default();
+        assert_eq!(addrs, vec![IpAddr::from([192, 168, 1, 80]), IpAddr::from([10, 0, 0, 80])]);
+        // One link goes away: its address lapses once its TTL ran out.
+        let later = now + Duration::from_secs(130);
+        assert!(t.upsert(at([10, 0, 0, 80], later, 120), later));
+        let addrs = t.snapshot().first().map(|i| i.addresses.clone()).unwrap_or_default();
+        assert_eq!(addrs, vec![IpAddr::from([10, 0, 0, 80])]);
     }
 
     #[test]

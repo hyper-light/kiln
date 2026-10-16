@@ -6,8 +6,9 @@
 //! expiry under the admin token; job tokens are HMACs of the job id.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -146,6 +147,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
         (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
         (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
+        (&Method::POST, ["api", "join-requests"]) => return create_join(&hub, req).await,
+        (&Method::GET, ["api", "join-requests", id]) => {
+            let id = (*id).to_owned();
+            return poll_join(&hub, &id, req.headers()).await;
+        }
         (&Method::GET, ["api", "jobs", id, "source"]) => return job_source(&hub, id, req.headers()).await,
         (&Method::PUT, ["api", "jobs", id, "artifacts", "upload"]) => {
             let id = (*id).to_owned();
@@ -197,6 +203,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => get_artifacts(&hub, id).await,
         (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &hub.agent_list().await)),
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
+        (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
+        (&Method::GET, ["api", "join-requests"]) => Ok(srv::json(StatusCode::OK, &hub.joins.list(Instant::now(), &hub.pki.ca_der))),
+        (&Method::POST, ["api", "join-requests", id, "approve"]) => {
+            let id = (*id).to_owned();
+            approve_join(&hub, &id, req).await
+        }
+        (&Method::POST, ["api", "join-requests", id, "deny"]) => deny_join(&hub, id).await,
         (&Method::DELETE, ["api", "agents", name]) => forget_agent(&hub, name).await,
         (&Method::POST, ["api", "agents", name, "drain"]) => {
             let name = (*name).to_owned();
@@ -675,6 +688,9 @@ fn join_info(hub: &Hub) -> Response {
             "quic": hub.cfg.server.quic_advertise,
             "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,bench"),
             "manual": format!("kiln agent --server {url} --token {token} --labels baremetal,bench"),
+            // No token: the machine asks to join and an admin approves it (verification code).
+            "join": format!("curl -fsSL {url}/install.sh | sh -s -- --join"),
+            "join_manual": format!("kiln join --server {url}"),
         }),
     )
 }
@@ -700,6 +716,216 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         tracing::info!(agent = %name, "agent enrolled");
     }
     Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
+}
+
+// ------------------------------------------------------------------ discovery & joining
+
+/// The kiln instances heard on the network, each marked with whether it already is one of this
+/// server's agents and the command that would make it one.
+async fn discovery(hub: &Hub) -> Response {
+    let d = &hub.discovery;
+    let agents = hub.agent_list().await;
+    let ours = crate::discovery::ca_fingerprint(&hub.pki.ca_der);
+    let me = d.advert.lock().clone();
+    let instances: Vec<serde_json::Value> = d
+        .table
+        .snapshot()
+        .into_iter()
+        .map(|i| {
+            let agent = joined_as(&agents, &i, &ours);
+            let url = our_url_for(hub, &i);
+            let mut v = serde_json::to_value(&i).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("url".into(), json!(i.url()));
+                o.insert("joined".into(), json!(agent.is_some()));
+                o.insert("agent".into(), json!(agent));
+                o.insert("same_ca".into(), json!(i.ca.as_deref() == Some(ours.as_str())));
+                o.insert("join_command".into(), json!(format!("kiln join --server {url}")));
+            }
+            v
+        })
+        .collect();
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "enabled": d.settings.enabled,
+            "announce": d.settings.enabled && d.settings.announce,
+            "browse": d.settings.enabled && d.settings.browse,
+            "join_requests": d.settings.join_requests,
+            "self": {
+                "id": me.id,
+                "name": me.name,
+                "instance": me.instance_label(),
+                "ca": me.ca,
+                "port": me.port,
+                "quic": me.quic,
+                "version": me.version,
+            },
+            "instances": instances,
+        }),
+    )
+}
+
+/// The agent a discovered instance already is (or runs) for this server: an agent enrolled with our
+/// CA, or a machine with one of our (persistent) agents on it.
+fn joined_as(agents: &[crate::hub::AgentLive], i: &crate::discovery::Instance, ours: &str) -> Option<String> {
+    let by_host = agents
+        .iter()
+        .filter(|a| !a.ephemeral)
+        .find(|a| a.hostname.eq_ignore_ascii_case(&i.name) || a.name == crate::pki::sanitize_name(&i.name))
+        .map(|a| a.name.clone());
+    if i.role == "agent" && i.enrolled.as_deref() == Some(ours) {
+        return Some(by_host.unwrap_or_else(|| crate::pki::sanitize_name(&i.name)));
+    }
+    by_host
+}
+
+/// This server's URL as `i` can reach it: the configured public URL when one was set, else our
+/// address on the route to it.
+fn our_url_for(hub: &Hub, i: &crate::discovery::Instance) -> String {
+    let public = hub.cfg.server.public_url.trim_end_matches('/');
+    let default = crate::config::Server::default().public_url;
+    if public != default.trim_end_matches('/') && !crate::access::is_loopback(public) {
+        return public.to_owned();
+    }
+    let port = hub.discovery.advert.lock().port;
+    match i.address().and_then(crate::discovery::local_address_for) {
+        Some(IpAddr::V4(ip)) => format!("http://{ip}:{port}"),
+        Some(IpAddr::V6(ip)) => format!("http://[{ip}]:{port}"),
+        None => public.to_owned(),
+    }
+}
+
+fn refused(r: &crate::join::Refusal) -> Response {
+    let code = StatusCode::from_u16(r.status()).unwrap_or(StatusCode::BAD_REQUEST);
+    let resp = srv::json(code, &json!({ "error": r.message() }));
+    match r {
+        crate::join::Refusal::TooMany { retry_after, .. } => {
+            srv::with_header(resp, header::RETRY_AFTER, &retry_after.as_secs().max(1).to_string())
+        }
+        _ => resp,
+    }
+}
+
+/// `POST /api/join-requests` (open): a machine asks to join; an admin decides.
+async fn create_join(hub: &Hub, req: Request) -> R {
+    if !hub.cfg.discovery.join_requests {
+        return Err(err(StatusCode::NOT_FOUND, "this server does not accept join requests"));
+    }
+    let from = srv::remote_ip(&req).unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let body: crate::join::NewRequest =
+        srv::body_json(req.into_body(), 64 << 10).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let (id, nonce) = match hub.joins.create(body, from, Instant::now()) {
+        Ok(v) => v,
+        Err(r) => return Ok(refused(&r)),
+    };
+    let name = hub.joins.get(&id, Instant::now(), &hub.pki.ca_der).map(|l| l.name).unwrap_or_default();
+    tracing::info!(%id, agent = %name, %from, "join request received; waiting for an admin");
+    hub.emit(&json!({ "type": "join_requests" }));
+    Ok(srv::json(
+        StatusCode::CREATED,
+        &crate::join::Created {
+            id,
+            nonce: hex::encode(nonce),
+            ca_pem: hub.pki.ca_pem.clone(),
+            expires_in: crate::join::REQUEST_TTL.as_secs(),
+            server: crate::config::Config::hostname(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+    ))
+}
+
+/// `GET /api/join-requests/:id`: the machine polls with its secret (`Authorization: Bearer`); an
+/// admin sees the request as listed.
+async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
+    let now = Instant::now();
+    if authed(hub, headers) {
+        return Ok(match hub.joins.get(id, now, &hub.pki.ca_der) {
+            Ok(l) => srv::json(StatusCode::OK, &l),
+            Err(r) => refused(&r),
+        });
+    }
+    let Some(secret) = bearer(headers) else {
+        return Err(err(StatusCode::UNAUTHORIZED, "the join secret is required (Authorization: Bearer <secret>)"));
+    };
+    match hub.joins.poll(id, secret.trim(), now, &hub.pki.ca_der) {
+        Ok((polled, confirmed)) => {
+            if confirmed {
+                tracing::info!(%id, "join request confirmed by its machine");
+                hub.emit(&json!({ "type": "join_requests" }));
+            }
+            Ok(srv::json(StatusCode::OK, &polled))
+        }
+        Err(r) => {
+            if r == crate::join::Refusal::WrongSecret {
+                crate::rt::sleep(Duration::from_millis(300)).await;
+            }
+            Ok(refused(&r))
+        }
+    }
+}
+
+/// A name for an approved machine: the one it asked for, unless another machine's agent (or the
+/// server's own local agent) has it, then `<name>-2`, `<name>-3`, …
+async fn free_agent_name(hub: &Hub, wanted: &str, hostname: &str) -> String {
+    let agents = hub.agent_list().await;
+    let local = hub.cfg.local_agent.enabled.then(|| crate::pki::sanitize_name(&hub.cfg.local_agent_name()));
+    let taken = |n: &str| {
+        local.as_deref() == Some(n) || agents.iter().any(|a| a.name == n && !a.hostname.eq_ignore_ascii_case(hostname))
+    };
+    let mut name = wanted.to_owned();
+    let mut n = 2u32;
+    while taken(&name) && n < 1000 {
+        let suffix = format!("-{n}");
+        name = format!("{}{suffix}", crate::util::truncate(wanted, 63 - suffix.len()));
+        n += 1;
+    }
+    name
+}
+
+/// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
+async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
+    let decision: crate::join::Decision = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    let c = match hub.joins.candidate(id, Instant::now()) {
+        Ok(c) => c,
+        Err(r) => return Ok(refused(&r)),
+    };
+    let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
+    let name = free_agent_name(hub, &wanted, &c.hostname).await;
+    let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
+    let cert = hub.pki.sign_csr(&c.csr, &name, 365).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let quic = hub.cfg.server.quic_advertise.clone();
+    let quic_port = hub.discovery.advert.lock().quic;
+    let approval = crate::join::Approval {
+        name: name.clone(),
+        labels: labels.clone(),
+        cert_pem: cert,
+        ca_pem: hub.pki.ca_pem.clone(),
+        quic,
+        quic_port,
+    };
+    if let Err(r) = hub.joins.approve(id, approval, Instant::now()) {
+        return Ok(refused(&r));
+    }
+    // A name forgotten earlier in this server's life is welcome again.
+    hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
+    hub.store.audit("admin".into(), "agent.join.approve".into(), format!("{name} ({})", c.hostname)).await;
+    tracing::info!(agent = %name, host = %c.hostname, "join request approved");
+    hub.emit(&json!({ "type": "join_requests" }));
+    Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "approved", "name": name, "labels": labels })))
+}
+
+/// `POST /api/join-requests/:id/deny`.
+async fn deny_join(hub: &Hub, id: &str) -> R {
+    match hub.joins.deny(id, Instant::now()) {
+        Ok(name) => {
+            hub.store.audit("admin".into(), "agent.join.deny".into(), name.clone()).await;
+            tracing::info!(agent = %name, "join request denied");
+            hub.emit(&json!({ "type": "join_requests" }));
+            Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "denied", "name": name })))
+        }
+        Err(r) => Ok(refused(&r)),
+    }
 }
 
 /// The running binary, so new agents can be installed straight from the server.

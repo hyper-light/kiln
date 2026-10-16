@@ -157,6 +157,8 @@ pub enum Out {
     Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8> },
     Disconnect { peer: PeerId },
     Revoke { name: String },
+    /// Accept that agent name again (an admin approved a new machine under it).
+    Unrevoke { name: String },
     /// Agent side: dial the server.
     Connect { addr: SocketAddr },
     /// Drop the endpoint and build a new one (fresh socket and runtime); an agent re-dials.
@@ -514,6 +516,11 @@ async fn run_loop(
                                 for p in peers {
                                     d.endpoint().disconnect(now, p);
                                 }
+                            }
+                        }
+                        Out::Unrevoke { name } => {
+                            if let AnyDriver::Server(d) = &mut driver {
+                                d.endpoint().directory_mut().revoked.remove(&name);
                             }
                         }
                         Out::Connect { addr } => {

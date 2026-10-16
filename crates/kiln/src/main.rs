@@ -43,6 +43,9 @@ enum Cmd {
     Up,
     /// Install (binary, config, start on boot) — server by default, `--agent` for an agent.
     Install(install::InstallArgs),
+    /// Ask a kiln server on this network to take this machine as an agent (an admin approves it
+    /// after comparing a verification code), then install the agent to start on boot.
+    Join(kiln::join::JoinArgs),
     /// Remove boot integration (keeps data and config).
     Uninstall {
         #[arg(long)]
@@ -103,8 +106,9 @@ impl ServerArgs {
 
 #[derive(clap::Args, Clone)]
 struct AgentArgs {
-    #[arg(long, env = "KILN_SERVER", default_value = "http://localhost:7070")]
-    server: String,
+    /// The server's URL (default: the one `kiln join` stored, else http://localhost:7070).
+    #[arg(long, env = "KILN_SERVER")]
+    server: Option<String>,
     /// QUIC address (host:port); defaults to what the server advertised at enrollment.
     #[arg(long, env = "KILN_QUIC")]
     quic: Option<String>,
@@ -112,8 +116,13 @@ struct AgentArgs {
     token: Option<String>,
     #[arg(long, env = "KILN_AGENT_NAME")]
     name: Option<String>,
-    #[arg(long, value_delimiter = ',', env = "KILN_LABELS", default_value = "baremetal")]
+    /// Labels jobs target with `runs-on` (default: the ones `kiln join` stored, else baremetal).
+    #[arg(long, value_delimiter = ',', env = "KILN_LABELS")]
     labels: Vec<String>,
+    /// Announce this agent on the local network; when it is not enrolled yet, find a kiln server
+    /// there and ask to join it (an admin approves it with a verification code).
+    #[arg(long)]
+    discover: bool,
     #[arg(long, env = "KILN_SLOTS")]
     slots: Option<u32>,
     #[arg(long, env = "KILN_WORK_DIR")]
@@ -168,6 +177,18 @@ fn shutdown_on_signals(token: Shutdown) {
     });
 }
 
+/// Run an agent until shutdown. Persistent agents supervise their own main loop.
+async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Result<()> {
+    if opts.ephemeral {
+        return kiln::agent::run(opts, shutdown).await;
+    }
+    let reg = kiln::sup::Registry::default();
+    let sd = shutdown.clone();
+    let h = kiln::sup::spawn(&reg, "agent", shutdown, move || kiln::agent::run(opts.clone(), sd.clone()));
+    let _ = h.await;
+    Ok(())
+}
+
 fn out(s: &str) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stdout(), "{s}");
@@ -180,7 +201,7 @@ fn main() -> ExitCode {
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
     kiln::rt::configure(match &cli.cmd {
         Cmd::Server | Cmd::Up => kiln::rt::Profile::server(),
-        Cmd::Agent(_) => kiln::rt::Profile::agent(),
+        Cmd::Agent(_) | Cmd::Join(_) => kiln::rt::Profile::agent(),
         _ => kiln::rt::Profile::tool(),
     });
     match kiln::rt::block_on(real_main(cli)) {
@@ -206,13 +227,50 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Agent(a) => {
             shutdown_on_signals(shutdown.clone());
             let base = config::default_data_dir().join("agent");
-            let state_dir = a.state_dir.unwrap_or_else(|| base.clone());
+            let state_dir = a.state_dir.clone().unwrap_or_else(|| base.clone());
             let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            // What `kiln join` stored stands in for flags that were not given.
+            let mut server = a.server.clone().or_else(|| kiln::join::stored(&state_dir, "server"));
+            let mut quic = a.quic.clone();
+            let mut name = a.name.clone();
+            let mut labels = if a.labels.is_empty() {
+                kiln::join::stored(&state_dir, "labels")
+                    .map(|l| l.split(',').map(str::to_owned).collect())
+                    .unwrap_or_else(|| vec!["baremetal".to_owned()])
+            } else {
+                a.labels.clone()
+            };
+            let announcer = (a.discover && !a.ephemeral).then(|| {
+                let ca = std::fs::read_to_string(state_dir.join("ca.pem")).ok().and_then(|p| kiln::join::pem_der(&p).ok());
+                let cfg = config::Config::load(&config_path).unwrap_or_default();
+                kiln::discovery::AgentAnnouncer::start(&state_dir, ca.as_deref(), cfg.discovery.interfaces, shutdown.clone())
+            });
+            if let Some(ann) = &announcer
+                && a.token.is_none()
+                && !kiln::join::enrolled(&state_dir)
+            {
+                let url = match server.clone() {
+                    Some(s) => s,
+                    None => {
+                        tracing::info!("not enrolled yet: looking for kiln servers on this network");
+                        let found = kiln::join::servers_in(&ann.table, std::time::Duration::from_secs(5)).await;
+                        kiln::join::choose(found, true, kiln::join::interactive(), &shutdown).await?
+                    }
+                };
+                let me = kiln::join::Machine::this(name.clone(), &a.labels);
+                let say = |m: &str| tracing::info!("{m}");
+                let joined = kiln::join::request(&url, &me, &state_dir, &say, &shutdown).await?;
+                ann.enrolled(&joined.ca_der);
+                server = Some(joined.server);
+                quic = Some(joined.quic);
+                name = Some(joined.name);
+                labels = joined.labels;
+            }
             let opts = kiln::agent::Opts {
-                server_url: a.server,
-                quic: a.quic,
-                name: a.name.unwrap_or_else(config::Config::hostname),
-                labels: a.labels,
+                server_url: server.unwrap_or_else(|| "http://localhost:7070".to_owned()),
+                quic,
+                name: name.unwrap_or_else(config::Config::hostname),
+                labels,
                 slots: a.slots.unwrap_or_else(|| u32::try_from((cpus / 4).max(1)).unwrap_or(1)),
                 work_dir: a.work_dir.unwrap_or_else(|| state_dir.join("work")),
                 state_dir,
@@ -223,15 +281,18 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 shell: a.shell,
                 credentials: None,
             };
-            if opts.ephemeral {
-                return kiln::agent::run(opts, shutdown).await;
+            let result = run_agent(opts, shutdown).await;
+            if let Some(ann) = announcer {
+                ann.finish().await;
             }
-            // Persistent agents supervise their own main loop too.
-            let reg = kiln::sup::Registry::default();
-            let sd = shutdown.clone();
-            let h = kiln::sup::spawn(&reg, "agent", shutdown.clone(), move || kiln::agent::run(opts.clone(), sd.clone()));
-            let _ = h.await;
-            Ok(())
+            result
+        }
+        Cmd::Join(j) => {
+            shutdown_on_signals(shutdown.clone());
+            match kiln::join::cli(j, shutdown.clone()).await? {
+                Some(opts) => run_agent(opts, shutdown).await,
+                None => Ok(()),
+            }
         }
         Cmd::Supervise { detach, args } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
@@ -251,6 +312,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Up => {
             let cfg = config::Config::load(&config_path)?;
+            // A machine that never ran a server may rather join the one already on the network.
+            if kiln::join::offer_instead_of_server(&config_path, &cfg).await? {
+                return Ok(());
+            }
             supervise::run(supervise::Options { args: vec!["server".into()], state_dir: cfg.server.data_dir }).await
         }
         Cmd::Install(a) => install::install(a).await,

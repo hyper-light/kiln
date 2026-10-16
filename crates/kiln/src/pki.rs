@@ -68,6 +68,11 @@ pub fn cert_dns_name(der: &[u8]) -> Option<String> {
     })
 }
 
+/// The name a leaf certificate carries (its first DNS SAN).
+pub fn leaf_name(leaf: &Leaf) -> Option<String> {
+    cert_dns_name(&pem_to_der(&leaf.cert_pem).ok()?)
+}
+
 fn leaf_params(names: Vec<String>, days: i64) -> anyhow::Result<CertificateParams> {
     let mut p = CertificateParams::new(names.clone()).context("leaf names")?;
     let now = OffsetDateTime::now_utc();

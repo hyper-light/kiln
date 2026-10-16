@@ -23,15 +23,27 @@ pub trait Handler: Send + Sync + 'static {
     fn handle(self: Arc<Self>, req: Request) -> impl Future<Output = Response> + Send;
 }
 
+/// The client's address, attached to every request of a connection (request extension).
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteAddr(pub std::net::SocketAddr);
+
+/// The address a request came from, when the listener knew it.
+pub fn remote_ip(req: &Request) -> Option<std::net::IpAddr> {
+    req.extensions().get::<RemoteAddr>().map(|r| r.0.ip())
+}
+
 /// Serve one accepted connection until the client goes away. Errors are logged at debug level:
 /// clients disappearing mid-request are normal.
-pub async fn serve_connection<I, H>(io: I, handler: Arc<H>)
+pub async fn serve_connection<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     H: Handler,
 {
-    let service = service_fn(move |req: Request| {
+    let service = service_fn(move |mut req: Request| {
         let h = handler.clone();
+        if let Some(r) = remote {
+            req.extensions_mut().insert(RemoteAddr(r));
+        }
         async move { Ok::<_, Infallible>(h.handle(req).await) }
     });
     let conn = http1::Builder::new()

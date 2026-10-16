@@ -14,6 +14,7 @@ pub mod gitops;
 pub mod host;
 pub mod hub;
 pub mod install;
+pub mod join;
 pub mod k8s;
 pub mod logs;
 pub mod metrics;
