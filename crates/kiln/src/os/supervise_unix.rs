@@ -102,3 +102,9 @@ pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<Child> {
 
 /// A supervised child on Unix is stopped by signals, which `main` already handles.
 pub fn watch_supervisor(_shutdown: crate::rt::Shutdown) {}
+
+/// `kiln uninstall` on Unix leaves running supervisors to the boot manager that started them
+/// (`systemctl disable --now`, `launchctl bootout`); nothing to find here.
+pub fn stop_supervisors(_subcommand: &str) -> usize {
+    0
+}

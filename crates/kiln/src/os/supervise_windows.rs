@@ -74,6 +74,29 @@ pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<Child> {
     }
 }
 
+/// Kill every running `kiln supervise … -- <subcommand> …` of this user (with its child and the
+/// child's jobs): a detached supervisor outlives the Scheduled Task that launched it, so
+/// `kiln uninstall` stops it here. Returns how many were stopped.
+pub fn stop_supervisors(subcommand: &str) -> usize {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let me = std::process::id();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always));
+    let mut stopped = 0;
+    for (pid, p) in sys.processes() {
+        let args: Vec<String> = p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let is_kiln = args.first().is_some_and(|a| crate::os::program_stem(a) == "kiln");
+        let ours = is_kiln
+            && args.iter().any(|a| a == "supervise")
+            && args.iter().any(|a| a == subcommand)
+            && (subcommand == "agent" || !args.iter().any(|a| a == "agent"));
+        if ours && pid.as_u32() != me && crate::os::proc::taskkill_tree(pid.as_u32()) {
+            stopped += 1;
+        }
+    }
+    stopped
+}
+
 /// In a supervised child, treat EOF on stdin (the supervisor closed it, or died) as a shutdown
 /// request.
 pub fn watch_supervisor(shutdown: crate::rt::Shutdown) {

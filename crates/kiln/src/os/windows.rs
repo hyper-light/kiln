@@ -12,6 +12,20 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Windows identifies users by SID, not a numeric id; nothing on Windows asks for one.
+pub fn uid() -> u32 {
+    0
+}
+
+/// `DOMAIN\user` of the current user (a Scheduled Task's principal).
+pub fn user_principal() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => format!("{domain}\\{user}"),
+        _ => user,
+    }
+}
+
 pub fn hostname() -> String {
     sysinfo::System::host_name()
         .or_else(|| std::env::var("COMPUTERNAME").ok())

@@ -12,6 +12,16 @@ pub fn is_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
+/// The real user id (launchd's per-user domains are `gui/<uid>` and `user/<uid>`).
+pub fn uid() -> u32 {
+    nix::unistd::getuid().as_raw()
+}
+
+/// The current user's login name.
+pub fn user_principal() -> String {
+    std::env::var("USER").unwrap_or_default()
+}
+
 pub fn hostname() -> String {
     nix::unistd::gethostname()
         .ok()
