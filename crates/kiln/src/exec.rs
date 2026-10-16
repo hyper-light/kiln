@@ -194,6 +194,13 @@ impl Exec {
         ] {
             env.entry(k.to_owned()).or_insert(v);
         }
+        if cfg!(windows) {
+            // Windows tools find their temp dir through TEMP / TMP rather than TMPDIR.
+            let tmp = tmp_dir(ws).to_string_lossy().into_owned();
+            for k in ["TEMP", "TMP"] {
+                env.entry(k.to_owned()).or_insert_with(|| tmp.clone());
+            }
+        }
         for (k, v) in &a.secrets {
             env.insert(k.clone(), v.clone());
         }
@@ -286,7 +293,7 @@ impl Exec {
 
     async fn git(&self, args: &[&str]) -> anyhow::Result<()> {
         let mut cmd = Command::new("git");
-        cmd.args(args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/true");
+        crate::os::git_no_prompts(cmd.args(args));
         let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
         if !out.status.success() {
             anyhow::bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
@@ -362,13 +369,11 @@ impl Exec {
                         }
                     }
                 } else {
-                    args.push("-c".into());
-                    args.push(script.to_owned());
+                    args.extend(crate::os::script_args(&prog, script));
                 }
                 (prog, args)
             }
-            None if have("bash") => ("bash".into(), vec!["--noprofile".into(), "--norc".into(), "-eo".into(), "pipefail".into(), "-c".into(), script.to_owned()]),
-            None => ("sh".into(), vec!["-ec".into(), script.to_owned()]),
+            None => crate::os::default_step_shell(script),
         }
     }
 

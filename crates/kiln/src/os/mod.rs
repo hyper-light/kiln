@@ -70,6 +70,47 @@ pub fn have(name: &str) -> bool {
     which(name).is_some()
 }
 
+/// Keep git from ever prompting (terminal, askpass helper, or Git Credential Manager's window):
+/// a missing credential fails fast instead of hanging a job. On Windows there is no
+/// `/bin/true` to answer askpass, and git without one simply fails the credential.
+pub fn git_no_prompts(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "never");
+    if cfg!(unix) {
+        cmd.env("GIT_ASKPASS", "/bin/true").env("SSH_ASKPASS", "/bin/true");
+    }
+    cmd
+}
+
+/// How a job step runs `script` by default: `bash -eo pipefail` (else `sh -e`) on Unix;
+/// PowerShell 7 (else Windows PowerShell) on Windows, as GitHub Actions does there.
+pub fn default_step_shell(script: &str) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let ps = if have("pwsh") { "pwsh" } else { "powershell" };
+        return (ps.to_owned(), script_args(ps, script));
+    }
+    if have("bash") {
+        let args = ["--noprofile", "--norc", "-eo", "pipefail", "-c", script];
+        return ("bash".to_owned(), args.map(str::to_owned).to_vec());
+    }
+    ("sh".to_owned(), vec!["-ec".to_owned(), script.to_owned()])
+}
+
+/// The arguments that make shell `program` run `script`: `-c` for Unix shells, `/D /S /C` for
+/// cmd, and for PowerShell `-Command` with errors made fatal and the last native exit code
+/// passed on (GitHub Actions' wrapper).
+pub fn script_args(program: &str, script: &str) -> Vec<String> {
+    match program_stem(program).as_str() {
+        "cmd" => ["/D", "/S", "/C", script].map(str::to_owned).to_vec(),
+        "pwsh" | "powershell" => {
+            let wrapped = format!(
+                "$ErrorActionPreference = 'Stop'\n{script}\nif ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) {{ exit $LASTEXITCODE }}"
+            );
+            vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), wrapped]
+        }
+        _ => vec!["-c".into(), script.to_owned()],
+    }
+}
+
 /// Open `url` in the desktop's browser (best effort, never waits).
 pub fn open_url(url: &str) {
     use std::process::{Command, Stdio};
@@ -143,6 +184,22 @@ mod tests {
         assert_eq!(program_stem("/usr/bin/bash"), "bash");
         assert_eq!(program_stem(r"C:\Program Files\PowerShell\7\pwsh.exe"), "pwsh");
         assert_eq!(program_stem("CMD.EXE"), "cmd");
+    }
+
+    #[test]
+    fn shells_get_the_right_flags() {
+        assert_eq!(script_args("/bin/bash", "echo hi"), ["-c", "echo hi"]);
+        assert_eq!(script_args(r"C:\Windows\System32\cmd.exe", "dir"), ["/D", "/S", "/C", "dir"]);
+        let ps = script_args("pwsh", "Write-Output hi");
+        assert_eq!(ps.get(..4), Some(&["-NoLogo".to_owned(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into()][..]));
+        assert!(ps.last().is_some_and(|s| s.contains("Write-Output hi") && s.contains("exit $LASTEXITCODE")));
+        let (prog, args) = default_step_shell("true");
+        if cfg!(windows) {
+            assert!(prog == "pwsh" || prog == "powershell");
+        } else {
+            assert!(prog == "bash" || prog == "sh");
+            assert_eq!(args.last().map(String::as_str), Some("true"));
+        }
     }
 
     #[test]
