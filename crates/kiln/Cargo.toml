@@ -53,6 +53,8 @@ tungstenite = { version = "0.30.0", default-features = false, features = ["hands
 async-lock = "3.4.2"
 rustix = { version = "1.1", features = ["process"] }
 filedescriptor = "0.8"
+argon2 = "0.6"
+rpassword = "7"
 
 [lints]
 workspace = true

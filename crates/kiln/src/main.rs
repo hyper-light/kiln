@@ -48,19 +48,57 @@ enum Cmd {
         #[arg(long)]
         agent: bool,
     },
-    /// Print a one-time login link for the UI (no password typing) and try to open it.
+    /// Print one-time sign-in links for the UI (this machine and the LAN) and open the local one.
     Login {
+        /// Only print the links; do not open a browser.
         #[arg(long)]
         print: bool,
+        #[command(flatten)]
+        server: ServerArgs,
     },
-    /// Print the admin token.
-    Token,
+    /// Print the admin token of the server this machine can reach.
+    Token {
+        #[command(flatten)]
+        server: ServerArgs,
+    },
+    /// Set the sign-in password (any device can then sign in with it), or remove it.
+    Passwd {
+        /// Read the new password from stdin instead of prompting.
+        #[arg(long)]
+        stdin: bool,
+        /// Remove the password (only the admin token and sign-in links will work).
+        #[arg(long, conflicts_with = "stdin")]
+        clear: bool,
+        #[command(flatten)]
+        server: ServerArgs,
+    },
     /// Validate a pipeline file and show the planned jobs.
     Validate { file: PathBuf },
     /// Print the default configuration.
     DefaultConfig,
     /// Show server health and queue state.
-    Status,
+    Status {
+        #[command(flatten)]
+        server: ServerArgs,
+    },
+}
+
+/// Which server a CLI command talks to. By default kiln finds it: the cluster bootstrap's
+/// credentials, then the local server; every admin token is checked against the server first.
+#[derive(clap::Args, Clone, Default)]
+struct ServerArgs {
+    /// The server's URL, e.g. http://localhost:7070.
+    #[arg(long, env = "KILN_URL")]
+    url: Option<String>,
+    /// The server's admin token.
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+}
+
+impl ServerArgs {
+    async fn resolve(&self, cfg: &config::Config) -> anyhow::Result<kiln::access::Target> {
+        kiln::access::resolve(cfg, self.url.as_deref(), self.token.as_deref()).await
+    }
 }
 
 #[derive(clap::Args, Clone)]
@@ -217,17 +255,15 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Install(a) => install::install(a).await,
         Cmd::Uninstall { agent } => install::uninstall(agent),
-        Cmd::Login { print } => {
-            let cfg = config::Config::load(&config_path)?;
-            let token = kiln::server::admin_token(&cfg)?;
-            let port = cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p);
-            let base = if cfg.server.http_addr.starts_with("0.0.0.0") || cfg.server.http_addr.starts_with("127.") {
-                format!("http://localhost:{port}")
-            } else {
-                cfg.server.public_url.clone()
-            };
-            let url = kiln::api::otp_url(&token, &base);
-            out(&url);
+        Cmd::Login { print, server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let t = server.resolve(&cfg).await?;
+            let url = kiln::api::otp_url(&t.token, &t.url);
+            out(&format!("Sign in on this machine (valid 5 minutes):\n  {url}"));
+            if let Some(public) = t.public_url.as_deref().filter(|p| !kiln::access::is_loopback(p) && p.trim_end_matches('/') != t.url) {
+                out(&format!("Sign in from another device on the network (valid 5 minutes):\n  {}", kiln::api::otp_url(&t.token, public)));
+            }
+            out("Tip: choose a password in Settings (or run `kiln passwd`) to sign in from any device without a link.");
             if !print {
                 let _ = std::process::Command::new("xdg-open")
                     .arg(&url)
@@ -237,9 +273,41 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Token => {
-            let cfg = config::Config::load(&config_path)?;
-            out(&kiln::server::admin_token(&cfg)?);
+        Cmd::Token { server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            out(&server.resolve(&cfg).await?.token);
+            Ok(())
+        }
+        Cmd::Passwd { stdin, clear, server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let t = server.resolve(&cfg).await?;
+            let client = kiln::http::client::Client::public()?;
+            let endpoint = format!("{}/api/settings/password", t.url);
+            if clear {
+                let resp = client.request(kiln::http::client::Method::Delete, &endpoint).bearer(&t.token).send().await?;
+                anyhow::ensure!(resp.is_success(), "the server answered HTTP {}", resp.status());
+                out("Password sign-in removed. Use the admin token or `kiln login` links to sign in.");
+                return Ok(());
+            }
+            let pw = if stdin {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line.trim_end_matches(['\r', '\n']).to_owned()
+            } else {
+                let a = rpassword::prompt_password("New sign-in password: ")?;
+                let b = rpassword::prompt_password("Repeat it: ")?;
+                anyhow::ensure!(a == b, "the two passwords differ; nothing changed");
+                a
+            };
+            if let Err(why) = kiln::password::validate(&pw) {
+                anyhow::bail!("password not accepted: {why}");
+            }
+            let resp = client.put(&endpoint).bearer(&t.token).json(&serde_json::json!({ "password": pw })).send().await?;
+            if !resp.is_success() {
+                let body = resp.bytes(64 << 10).await.unwrap_or_default();
+                anyhow::bail!("the server refused the password: {}", String::from_utf8_lossy(&body));
+            }
+            out(&format!("Password set. Sign in at {} from any device.", t.public_url.as_deref().unwrap_or(&t.url)));
             Ok(())
         }
         Cmd::Validate { file } => {
@@ -265,14 +333,12 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             out(&config::Config::render_default());
             Ok(())
         }
-        Cmd::Status => {
-            let cfg = config::Config::load(&config_path)?;
-            let token = kiln::server::admin_token(&cfg)?;
-            let port = cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p);
-            let url = format!("http://127.0.0.1:{port}/api/overview");
+        Cmd::Status { server } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let t = server.resolve(&cfg).await?;
             let resp = kiln::http::client::Client::public()?
-                .get(&url)
-                .bearer(&token)
+                .get(&format!("{}/api/overview", t.url))
+                .bearer(&t.token)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .await?;

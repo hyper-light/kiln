@@ -141,6 +141,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     match (&method, s.as_slice()) {
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req)),
+        (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
+        (&Method::POST, ["api", "auth", "password"]) => return login_password(&hub, req).await,
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
         (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
         (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
@@ -200,6 +202,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let name = (*name).to_owned();
             drain_agent(&hub, &name, req).await
         }
+        (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
+        (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
         (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
@@ -235,8 +239,93 @@ fn otp(hub: &Hub, req: &Request) -> Response {
         let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/");
         srv::with_header(r, header::SET_COOKIE, &session_cookie(hub))
     } else {
-        srv::text(StatusCode::UNAUTHORIZED, "login link expired; run `kiln login` again")
+        // Back to the login page, which explains what went wrong and offers the other methods.
+        srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &format!("/?signin={}", otp_problem(hub, code)))
     }
+}
+
+/// Why a one-time link was refused: `expired` (ours, too old) or `foreign` (signed with another
+/// server's admin token, e.g. `kiln login` run against a different installation).
+fn otp_problem(hub: &Hub, code: &str) -> &'static str {
+    let ours = code
+        .split_once('.')
+        .is_some_and(|(exp, sig)| crate::util::ct_eq(sig.as_bytes(), sign(hub, "otp", exp).as_bytes()));
+    if ours { "expired" } else { "foreign" }
+}
+
+static PASSWORD_THROTTLE: std::sync::LazyLock<crate::password::Throttle> = std::sync::LazyLock::new(Default::default);
+/// One password check at a time, so the throttle cannot be outrun by parallel guesses.
+static PASSWORD_GATE: async_lock::Mutex<()> = async_lock::Mutex::new(());
+
+/// Which sign-in methods the login page should offer (public).
+async fn auth_methods(hub: &Hub) -> Response {
+    let path = crate::password::path(&hub.cfg);
+    let password = crate::rt::blocking(move || crate::password::load(&path).is_some()).await.unwrap_or(false);
+    srv::json(StatusCode::OK, &json!({ "password": password, "token": true }))
+}
+
+#[derive(Deserialize)]
+struct PasswordLogin {
+    password: String,
+}
+
+async fn login_password(hub: &Hub, req: Request) -> R {
+    let l: PasswordLogin =
+        srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let gate = PASSWORD_GATE.lock().await;
+    if let Err(wait) = PASSWORD_THROTTLE.check() {
+        let secs = wait.as_secs().max(1);
+        let r = srv::json(
+            StatusCode::TOO_MANY_REQUESTS,
+            &json!({ "error": format!("Too many wrong passwords. Try again in {secs}s.") }),
+        );
+        return Ok(srv::with_header(r, header::RETRY_AFTER, &secs.to_string()));
+    }
+    let path = crate::password::path(&hub.cfg);
+    let outcome = crate::rt::blocking(move || crate::password::load(&path).map(|phc| crate::password::verify(&l.password, &phc)))
+        .await
+        .unwrap_or(Some(false));
+    match outcome {
+        Some(true) => {
+            PASSWORD_THROTTLE.succeeded();
+            drop(gate);
+            hub.store.audit("admin".into(), "login".into(), "password".into()).await;
+            Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub)))
+        }
+        Some(false) => {
+            PASSWORD_THROTTLE.failed();
+            drop(gate);
+            crate::rt::sleep(Duration::from_millis(300)).await;
+            Err(err(StatusCode::UNAUTHORIZED, "Wrong password."))
+        }
+        None => Err(err(
+            StatusCode::CONFLICT,
+            "Password sign-in is not set up yet. Sign in with the admin token once, then choose a password in Settings.",
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPassword {
+    password: String,
+}
+
+async fn set_password(hub: &Hub, req: Request) -> R {
+    let p: SetPassword =
+        srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    crate::password::validate(&p.password).map_err(|why| err(StatusCode::BAD_REQUEST, format!("Password not accepted: {why}.")))?;
+    let path = crate::password::path(&hub.cfg);
+    crate::rt::blocking(move || crate::password::hash(&p.password).and_then(|h| crate::password::store(&path, &h))).await??;
+    PASSWORD_THROTTLE.succeeded();
+    hub.store.audit("admin".into(), "password".into(), "set".into()).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+async fn clear_password(hub: &Hub) -> R {
+    let path = crate::password::path(&hub.cfg);
+    crate::rt::blocking(move || crate::password::clear(&path)).await??;
+    hub.store.audit("admin".into(), "password".into(), "cleared".into()).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 fn logout() -> Response {
@@ -248,6 +337,7 @@ fn me(hub: &Hub, headers: &HeaderMap) -> Response {
         StatusCode::OK,
         &json!({
             "authenticated": authed(hub, headers),
+            "public_url": hub.cfg.server.public_url,
             "version": env!("CARGO_PKG_VERSION"),
             "hostname": crate::config::Config::hostname(),
         }),
