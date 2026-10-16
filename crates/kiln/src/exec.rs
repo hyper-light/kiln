@@ -72,6 +72,14 @@ enum Ev {
     Deadline,
 }
 
+/// The job's workspace: `<work>/w/<8 hex>`. Kept short on purpose: Unix socket paths are limited
+/// to 107 bytes, and test suites bind sockets several directories deep inside their workspace
+/// (`target/tmp/...`), so every byte of prefix counts.
+fn workspace(work_dir: &Path, job: &str) -> PathBuf {
+    let digest = crate::util::sha256_hex(job.as_bytes());
+    work_dir.join("w").join(digest.get(..8).unwrap_or("job"))
+}
+
 /// The job's private temp directory: a sibling of its workspace on the same volume.
 fn tmp_dir(ws: &Path) -> PathBuf {
     let mut name = ws.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
@@ -124,7 +132,7 @@ impl Exec {
     pub async fn run(self) -> JobResult {
         let job = self.assign.job_id.clone();
         self.up.msg(AgentMsg::JobStarted { job: job.clone() }).await;
-        let ws = self.work_dir.join("ws").join(format!("{}-{}", slug(&self.assign.repo), job.get(job.len().saturating_sub(12)..).unwrap_or(&job)));
+        let ws = workspace(&self.work_dir, &job);
         let tmp = tmp_dir(&ws);
         let t = tmp.clone();
         if let Err(e) = fs(move || std::fs::create_dir_all(t)).await {
@@ -663,6 +671,17 @@ impl FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspaces_are_short_and_distinct() {
+        let base = Path::new("/home/someone/.local/share/kiln/agent/work");
+        let a = workspace(base, "01a146e7d7e972949d3537141e355b07");
+        let b = workspace(base, "01a146e7d7e972949d3537141e355b08");
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(base.join("w").as_path()));
+        // Leaves room for a socket several directories deep (e.g. cargo's target/tmp/...).
+        assert!(a.as_os_str().len() + "/target/tmp/slates-ipc-1623558/original/socket".len() <= 107);
+    }
 
     #[test]
     fn masks_secrets() {
