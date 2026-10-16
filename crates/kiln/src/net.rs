@@ -212,8 +212,8 @@ pub fn limits(server: bool) -> Limits {
         max_head: 64 << 10,
         window_ceiling: window,
         serve_period: Duration::from_secs(2),
-        idle_timeout: Duration::from_secs(30),
-        keep_alive: Some(Duration::from_secs(5)),
+        idle_timeout: Duration::from_secs(10),
+        keep_alive: Some(Duration::from_secs(2)),
         max_responses: 64,
         receive_chunks: usize::try_from(window).unwrap_or(usize::MAX) / RECEIVE_CHUNK + 1,
     }

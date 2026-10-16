@@ -207,6 +207,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     shutdown.cancelled().await;
     tracing::info!("shutting down");
+    hub.disconnect_all().await;
+    // Lets the close frames go out and in-flight responses finish.
     crate::rt::sleep(Duration::from_millis(300)).await;
     Ok(())
 }

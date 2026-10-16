@@ -144,6 +144,15 @@ impl Hub {
 
     // ------------------------------------------------------------ UI events
 
+    /// Close every runner's connection (server shutdown): runners see the close at once and
+    /// reconnect to the next server process, instead of waiting out the QUIC idle timeout.
+    pub async fn disconnect_all(&self) {
+        let peers: Vec<PeerId> = self.peers.lock().keys().chain(self.pending_peers.lock().keys()).copied().collect();
+        for peer in peers {
+            let _ = self.net.command(crate::net::Out::Disconnect { peer }).await;
+        }
+    }
+
     /// Tell every UI that the session list changed.
     pub fn emit_terminals(&self) {
         self.emit(&serde_json::json!({ "type": "terminals" }));
