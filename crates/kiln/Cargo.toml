@@ -55,6 +55,7 @@ rustix = { version = "1.1", features = ["process"] }
 filedescriptor = "0.8"
 argon2 = "0.6"
 rpassword = "7"
+vt100 = "0.16.2"
 
 [lints]
 workspace = true

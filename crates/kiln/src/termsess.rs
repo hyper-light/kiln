@@ -1,0 +1,487 @@
+//! Terminal sessions owned by the server, so a shell outlives any one browser: on the server
+//! (`local`) or on a machine's agent (`agent:<name>`). Any number of browsers, on any device, can
+//! attach to a session at once; output fans out to all of them and input from any of them reaches
+//! the shell. Attaching replays recent output, and while a full-screen program (htop, vim, k9s, an
+//! AI coding agent) owns the screen, a snapshot of that screen rendered by a server-side terminal
+//! emulator, so a new device picks up exactly where the session is. A session ends when its shell
+//! exits, when it is closed, or after it has sat with nobody attached for the idle limit.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use futures::FutureExt as _;
+use parking_lot::Mutex;
+use serde::Serialize;
+
+use crate::hub::{Hub, TermOut};
+use crate::proto::{LANE_TERM, ServerMsg};
+use crate::rt::{Broadcast, Shutdown};
+
+/// Raw output kept per session for replay on attach.
+const BACKLOG_BYTES: usize = 256 * 1024;
+/// An exited session stays listed this long, so attached devices can show how it ended.
+const EXITED_LINGER: Duration = Duration::from_secs(60);
+/// Live frames buffered per attached client before a slow one starts losing the oldest.
+const FANOUT: usize = 1024;
+
+/// What attached clients receive.
+#[derive(Clone, Debug)]
+pub enum Frame {
+    Data(Bytes),
+    Exit { code: Option<i32>, error: Option<String> },
+}
+
+/// What attached clients send.
+#[derive(Debug)]
+pub enum Input {
+    Data(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
+/// A session as the API lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Info {
+    pub id: String,
+    pub target: String,
+    pub command: Option<String>,
+    /// The window title the program set (OSC 0/2), if any.
+    pub title: String,
+    pub created_at: i64,
+    pub attached: usize,
+    pub cols: u16,
+    pub rows: u16,
+    pub idle_seconds: u64,
+    pub exited: bool,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+}
+
+/// Captures the window title programs set, for the session list.
+#[derive(Default)]
+struct Titles {
+    title: String,
+}
+
+impl vt100::Callbacks for Titles {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = String::from_utf8_lossy(title).chars().filter(|c| !c.is_control()).take(120).collect();
+    }
+}
+
+struct Exit {
+    code: Option<i32>,
+    error: Option<String>,
+    at: Instant,
+}
+
+struct State {
+    backlog: VecDeque<u8>,
+    /// The backlog has dropped its oldest bytes at least once (replay then starts at a line).
+    trimmed: bool,
+    screen: vt100::Parser<Titles>,
+    attached: usize,
+    last_activity: Instant,
+    exit: Option<Exit>,
+    cols: u16,
+    rows: u16,
+}
+
+pub struct Session {
+    pub id: String,
+    pub target: String,
+    pub command: Option<String>,
+    pub created_at: i64,
+    state: Mutex<State>,
+    out: Broadcast<Frame>,
+    input: async_channel::Sender<Input>,
+    close: Shutdown,
+}
+
+/// What a client gets when it attaches.
+pub struct Attachment {
+    /// Bytes that bring a fresh terminal to the session's current state.
+    pub replay: Vec<u8>,
+    /// Everything after the replay.
+    pub live: async_broadcast::Receiver<Frame>,
+    /// Set when the session had already ended.
+    pub ended: Option<(Option<i32>, Option<String>)>,
+}
+
+impl Session {
+    fn new(target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, async_channel::Receiver<Input>) {
+        let (input, input_rx) = async_channel::bounded(1024);
+        let cols = cols.clamp(2, 1000);
+        let rows = rows.clamp(2, 1000);
+        let session = Arc::new(Self {
+            id: crate::util::new_id(),
+            target,
+            command,
+            created_at: crate::util::now_unix(),
+            state: Mutex::new(State {
+                backlog: VecDeque::with_capacity(16 * 1024),
+                trimmed: false,
+                screen: vt100::Parser::new_with_callbacks(rows, cols, 0, Titles::default()),
+                attached: 0,
+                last_activity: Instant::now(),
+                exit: None,
+                cols,
+                rows,
+            }),
+            out: Broadcast::new(FANOUT),
+            input,
+            close: Shutdown::new(),
+        });
+        (session, input_rx)
+    }
+
+    pub fn info(&self) -> Info {
+        let st = self.state.lock();
+        Info {
+            id: self.id.clone(),
+            target: self.target.clone(),
+            command: self.command.clone(),
+            title: st.screen.callbacks().title.clone(),
+            created_at: self.created_at,
+            attached: st.attached,
+            cols: st.cols,
+            rows: st.rows,
+            idle_seconds: st.last_activity.elapsed().as_secs(),
+            exited: st.exit.is_some(),
+            exit_code: st.exit.as_ref().and_then(|e| e.code),
+            error: st.exit.as_ref().and_then(|e| e.error.clone()),
+        }
+    }
+
+    pub fn is_exited(&self) -> bool {
+        self.state.lock().exit.is_some()
+    }
+
+    /// Program output: into the emulator and the backlog, then to every attached client, all under
+    /// one lock so an attaching client sees each byte exactly once (in its replay or live).
+    fn output(&self, data: &[u8]) {
+        let mut st = self.state.lock();
+        st.screen.process(data);
+        st.backlog.extend(data.iter().copied());
+        let excess = st.backlog.len().saturating_sub(BACKLOG_BYTES);
+        if excess > 0 {
+            st.backlog.drain(..excess);
+            st.trimmed = true;
+        }
+        st.last_activity = Instant::now();
+        self.out.send(Frame::Data(Bytes::copy_from_slice(data)));
+    }
+
+    fn finish(&self, code: Option<i32>, error: Option<String>) {
+        let mut st = self.state.lock();
+        if st.exit.is_some() {
+            return;
+        }
+        st.exit = Some(Exit { code, error: error.clone(), at: Instant::now() });
+        st.last_activity = Instant::now();
+        self.out.send(Frame::Exit { code, error });
+    }
+
+    /// Join the session: the replay that reproduces its current state, then live output.
+    pub fn attach(&self) -> Attachment {
+        let mut st = self.state.lock();
+        st.attached = st.attached.saturating_add(1);
+        st.last_activity = Instant::now();
+        let screen = st.screen.screen();
+        let mut replay = b"\x1b[0m".to_vec();
+        if screen.alternate_screen() {
+            // A full-screen program owns the display: repaint it from the emulator.
+            replay.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
+            replay.extend(screen.state_formatted());
+            replay.extend(screen.cursor_state_formatted());
+        } else {
+            // The shell's recent output ends in exactly the live state; once trimmed, start it
+            // at a line boundary so the replay never opens mid escape sequence.
+            let mut bytes: Vec<u8> = st.backlog.iter().copied().collect();
+            if st.trimmed
+                && let Some(nl) = bytes.iter().take(8192).position(|b| *b == b'\n')
+            {
+                bytes.drain(..=nl);
+            }
+            replay.extend(bytes);
+            replay.extend(screen.input_mode_formatted());
+        }
+        let ended = st.exit.as_ref().map(|e| (e.code, e.error.clone()));
+        let live = self.out.subscribe();
+        Attachment { replay, live, ended }
+    }
+
+    pub fn detach(&self) {
+        let mut st = self.state.lock();
+        st.attached = st.attached.saturating_sub(1);
+        st.last_activity = Instant::now();
+    }
+
+    /// Keystrokes or a resize from an attached client.
+    pub fn send(&self, input: Input) {
+        {
+            let mut st = self.state.lock();
+            st.last_activity = Instant::now();
+            if let Input::Resize { cols, rows } = input {
+                let (cols, rows) = (cols.clamp(2, 1000), rows.clamp(2, 1000));
+                st.cols = cols;
+                st.rows = rows;
+                st.screen.screen_mut().set_size(rows, cols);
+            }
+        }
+        if self.input.try_send(input).is_err() {
+            tracing::debug!(session = %self.id, "terminal input dropped (session busy or ended)");
+        }
+    }
+
+    /// End the session: the shell is killed.
+    pub fn close(&self) {
+        self.close.cancel();
+    }
+}
+
+/// Every terminal session on this server.
+pub struct Sessions {
+    map: Mutex<HashMap<String, Arc<Session>>>,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sessions {
+    pub fn new() -> Self {
+        Self { map: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn get(&self, id: &str) -> Option<Arc<Session>> {
+        self.map.lock().get(id).cloned()
+    }
+
+    pub fn list(&self) -> Vec<Info> {
+        let mut v: Vec<Info> = self.map.lock().values().map(|s| s.info()).collect();
+        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v
+    }
+
+    /// Sessions whose shell is still running.
+    pub fn live(&self) -> usize {
+        self.map.lock().values().filter(|s| !s.is_exited()).count()
+    }
+
+    fn insert(&self, s: &Arc<Session>) {
+        self.map.lock().insert(s.id.clone(), Arc::clone(s));
+    }
+
+    /// Close sessions nobody has attached to for `idle`, and forget exited ones nobody watches.
+    /// Returns whether anything changed.
+    pub fn sweep(&self, idle: Duration) -> bool {
+        let mut changed = false;
+        let sessions: Vec<Arc<Session>> = self.map.lock().values().cloned().collect();
+        for s in sessions {
+            let (attached, idle_for, exited_for) = {
+                let st = s.state.lock();
+                (st.attached, st.last_activity.elapsed(), st.exit.as_ref().map(|e| e.at.elapsed()))
+            };
+            match exited_for {
+                Some(gone) if attached == 0 || gone > EXITED_LINGER * 10 => {
+                    if gone > EXITED_LINGER || attached == 0 {
+                        self.map.lock().remove(&s.id);
+                        changed = true;
+                    }
+                }
+                Some(_) => {}
+                None if attached == 0 && idle_for > idle => {
+                    tracing::info!(session = %s.id, target = %s.target, "closing terminal session left idle");
+                    s.close();
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+        changed
+    }
+}
+
+/// Open a shell on this server.
+pub fn open_local(hub: &Arc<Hub>, command: Option<String>, cols: u16, rows: u16) -> anyhow::Result<Arc<Session>> {
+    let (pty, pty_out) = crate::terminal::spawn(hub.cfg.terminal.shell.as_deref(), command.as_deref(), cols, rows)?;
+    let (session, input) = Session::new("local".to_owned(), command, cols, rows);
+    hub.terminals.insert(&session);
+    let s = Arc::clone(&session);
+    let h = Arc::clone(hub);
+    crate::rt::spawn(async move {
+        let mut pty = Some(pty);
+        enum Ev {
+            Out(Option<crate::terminal::PtyOut>),
+            In(Option<Input>),
+            Close,
+        }
+        loop {
+            let ev = futures::select_biased! {
+                () = s.close.cancelled().fuse() => Ev::Close,
+                o = pty_out.recv().fuse() => Ev::Out(o.ok()),
+                i = input.recv().fuse() => Ev::In(i.ok()),
+            };
+            match ev {
+                Ev::Out(Some(crate::terminal::PtyOut::Data(d))) => s.output(&d),
+                Ev::Out(Some(crate::terminal::PtyOut::Exit(code))) => {
+                    s.finish(code, None);
+                    break;
+                }
+                Ev::Out(None) => {
+                    s.finish(None, None);
+                    break;
+                }
+                Ev::In(Some(Input::Data(d))) => {
+                    if let Some(p) = &pty {
+                        p.write(d);
+                    }
+                }
+                Ev::In(Some(Input::Resize { cols, rows })) => {
+                    if let Some(p) = &pty {
+                        p.resize(cols, rows);
+                    }
+                }
+                Ev::In(None) | Ev::Close => {
+                    // Dropping the PTY session kills the shell.
+                    drop(pty.take());
+                    s.finish(None, Some("session closed".to_owned()));
+                    break;
+                }
+            }
+        }
+        h.emit_terminals();
+    });
+    hub.emit_terminals();
+    Ok(session)
+}
+
+/// Open a shell on a machine through its agent.
+pub fn open_agent(hub: &Arc<Hub>, machine: String, command: Option<String>, cols: u16, rows: u16) -> Arc<Session> {
+    let (session, input) = Session::new(format!("agent:{machine}"), command.clone(), cols, rows);
+    hub.terminals.insert(&session);
+    let s = Arc::clone(&session);
+    let h = Arc::clone(hub);
+    crate::rt::spawn(async move {
+        let key = format!("{machine}/{}", s.id);
+        let (out_tx, out_rx) = async_channel::bounded::<TermOut>(512);
+        h.terms.lock().insert(key.clone(), out_tx);
+        let opened = h
+            .send_to_agent(&machine, LANE_TERM, &ServerMsg::TermOpen { session: s.id.clone(), cols, rows, command })
+            .await;
+        if !opened {
+            h.terms.lock().remove(&key);
+            s.finish(None, Some(format!("machine {machine} is not connected")));
+            h.emit_terminals();
+            return;
+        }
+        crate::metrics::global().terminal_sessions.add(1);
+        enum Ev {
+            Out(Option<TermOut>),
+            In(Option<Input>),
+            Close,
+        }
+        loop {
+            let ev = futures::select_biased! {
+                () = s.close.cancelled().fuse() => Ev::Close,
+                o = out_rx.recv().fuse() => Ev::Out(o.ok()),
+                i = input.recv().fuse() => Ev::In(i.ok()),
+            };
+            match ev {
+                Ev::Out(Some(TermOut::Data(d))) => s.output(&d),
+                Ev::Out(Some(TermOut::Exit { code, error })) => {
+                    s.finish(code, error);
+                    break;
+                }
+                Ev::Out(None) => {
+                    s.finish(None, Some("connection to the machine lost".to_owned()));
+                    break;
+                }
+                Ev::In(Some(Input::Data(data))) => {
+                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermInput { session: s.id.clone(), data }).await;
+                }
+                Ev::In(Some(Input::Resize { cols, rows })) => {
+                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermResize { session: s.id.clone(), cols, rows }).await;
+                }
+                Ev::In(None) | Ev::Close => {
+                    h.send_to_agent(&machine, LANE_TERM, &ServerMsg::TermClose { session: s.id.clone() }).await;
+                    s.finish(None, Some("session closed".to_owned()));
+                    break;
+                }
+            }
+        }
+        h.terms.lock().remove(&key);
+        crate::metrics::global().terminal_sessions.add(-1);
+        h.emit_terminals();
+    });
+    hub.emit_terminals();
+    session
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(s: &Session, b: &[u8]) {
+        s.output(b);
+    }
+
+    #[test]
+    fn replay_is_exact_for_shells_and_snapshots_full_screen_programs() {
+        let (s, _input) = Session::new("local".into(), None, 80, 24);
+        feed(&s, b"$ echo hi\r\nhi\r\n$ ");
+        let a = s.attach();
+        assert!(a.replay.ends_with(b"$ echo hi\r\nhi\r\n$ ") || a.replay.windows(5).any(|w| w == b"hi\r\n$"));
+        assert!(a.ended.is_none());
+
+        // A full-screen program: the replay repaints its screen instead of replaying history.
+        feed(&s, b"\x1b[?1049h\x1b[H\x1b[2JTOP 1\r\nload 0.5");
+        let b = s.attach();
+        assert!(b.replay.starts_with(b"\x1b[0m\x1b[?1049h"));
+        let text = String::from_utf8_lossy(&b.replay);
+        assert!(text.contains("TOP 1") && text.contains("load 0.5"), "{text}");
+        assert!(!text.contains("echo hi"), "{text}");
+        assert_eq!(s.info().attached, 2);
+        s.detach();
+        assert_eq!(s.info().attached, 1);
+    }
+
+    #[test]
+    fn backlog_is_bounded_and_replay_starts_at_a_line() {
+        let (s, _input) = Session::new("local".into(), None, 80, 24);
+        let line = b"0123456789abcdefghijklmnopqrstuvwxyz\r\n";
+        for _ in 0..(BACKLOG_BYTES / line.len() + 500) {
+            feed(&s, line);
+        }
+        let a = s.attach();
+        assert!(a.replay.len() <= BACKLOG_BYTES + 64);
+        // After the reset prefix the replay begins with a whole line.
+        assert!(a.replay.get(4..).is_some_and(|r| r.starts_with(b"0123")));
+    }
+
+    #[test]
+    fn titles_exits_and_sweeping() {
+        let sessions = Sessions::new();
+        let (s, _input) = Session::new("local".into(), None, 80, 24);
+        sessions.insert(&s);
+        feed(&s, b"\x1b]0;claude: fixing tests\x07ready");
+        assert_eq!(s.info().title, "claude: fixing tests");
+        // Attached and live: never swept.
+        let _a = s.attach();
+        assert!(!sessions.sweep(Duration::ZERO));
+        // Detached for longer than the idle limit: closed.
+        s.detach();
+        assert!(sessions.sweep(Duration::ZERO));
+        assert!(s.close.is_cancelled());
+        // Exited with nobody attached: forgotten.
+        s.finish(Some(0), None);
+        assert!(sessions.sweep(Duration::from_secs(3600)));
+        assert!(sessions.get(&s.id).is_none());
+        let late = s.attach();
+        assert_eq!(late.ended, Some((Some(0), None)));
+    }
+}
