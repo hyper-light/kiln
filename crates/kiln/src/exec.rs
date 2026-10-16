@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt as _;
-use nix::sys::signal::{Signal, killpg};
-use nix::unistd::Pid;
 
 use crate::proto::{AgentMsg, Assignment, JobResult, LOG_CHUNK, LogChunk};
 use crate::rt::{Interval, Shutdown};
@@ -82,7 +80,7 @@ fn tmp_dir(ws: &Path) -> PathBuf {
 }
 
 fn have(bin: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
+    crate::os::have(bin)
 }
 
 fn mask(data: &[u8], secrets: &[(String, String)]) -> Vec<u8> {
@@ -443,7 +441,7 @@ impl Exec {
             }
         }
         // Reap anything the step left behind in its process group.
-        crate::proc::kill_group(pgid);
+        running.kill_group();
         if !pending.is_empty() {
             self.ship(idx, &mut pending).await;
         }
@@ -519,16 +517,16 @@ impl Exec {
                 }
                 Ev::Sample => self.sample(pgid, usage).await,
                 Ev::Cancel => {
-                    kill_group(pgid).await;
+                    crate::proc::terminate_tree(pgid, Duration::from_secs(5)).await;
                     break Outcome::Cancelled;
                 }
                 Ev::Deadline => {
-                    kill_group(pgid).await;
+                    crate::proc::terminate_tree(pgid, Duration::from_secs(5)).await;
                     break Outcome::TimedOut;
                 }
             }
         };
-        drop(pty.master);
+        crate::os::pty::close_master(pty.master);
         while let Ok(Ok(c)) = crate::rt::timeout(Duration::from_millis(300), rx.recv()).await {
             pending.extend(c);
         }
@@ -633,24 +631,11 @@ pub fn reap_orphans(work_dir: &Path) -> usize {
         if pgid <= 0 || job.is_empty() {
             continue;
         }
-        let environ = std::fs::read(format!("/proc/{pgid}/environ")).unwrap_or_default();
-        let marker = format!("KILN_JOB_ID={job}");
-        if environ.split(|b| *b == 0).any(|kv| kv == marker.as_bytes())
-            && killpg(Pid::from_raw(pgid), Signal::SIGKILL).is_ok()
-        {
+        if crate::proc::kill_orphan_group(pgid, &format!("KILN_JOB_ID={job}")) {
             killed += 1;
         }
     }
     killed
-}
-
-async fn kill_group(pgid: i32) {
-    if pgid <= 0 {
-        return;
-    }
-    let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
-    crate::rt::sleep(Duration::from_secs(5)).await;
-    let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
 }
 
 /// A lock file (`flock` on Unix, `LockFileEx` on Windows) so concurrent jobs, even in separate

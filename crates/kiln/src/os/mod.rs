@@ -23,6 +23,30 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// Child processes: [`crate::proc`]'s implementation.
+#[cfg(unix)]
+#[path = "proc_unix.rs"]
+pub mod proc;
+#[cfg(windows)]
+#[path = "proc_windows.rs"]
+pub mod proc;
+
+/// PTY session I/O: [`crate::terminal`]'s plumbing.
+#[cfg(unix)]
+#[path = "pty_unix.rs"]
+pub mod pty;
+#[cfg(windows)]
+#[path = "pty_windows.rs"]
+pub mod pty;
+
+/// Host and process metrics: [`crate::host`]'s implementation (procfs on Linux, sysinfo elsewhere).
+#[cfg(target_os = "linux")]
+#[path = "metrics_procfs.rs"]
+pub mod metrics;
+#[cfg(not(target_os = "linux"))]
+#[path = "metrics_sysinfo.rs"]
+pub mod metrics;
+
 /// The first executable called `name` on `PATH` (on Windows also `name` + each `PATHEXT`).
 pub fn which(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
@@ -51,10 +75,12 @@ fn exe_names(name: &str) -> Vec<String> {
 /// The file name of a program, without directory or extension, lowercased: what to compare when
 /// choosing how to talk to a shell (`C:\Program Files\PowerShell\7\pwsh.exe` → `pwsh`).
 pub fn program_stem(program: &str) -> String {
-    Path::new(program)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default()
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let stem = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ["exe", "com", "bat", "cmd"].contains(&ext.to_ascii_lowercase().as_str()) => stem,
+        _ => name,
+    };
+    stem.to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -67,7 +93,8 @@ mod tests {
         assert!(have(sh), "{sh} not on PATH");
         assert!(!have("kiln-surely-not-a-real-program"));
         assert_eq!(program_stem("/usr/bin/bash"), "bash");
-        assert_eq!(program_stem(r"C:\Program Files\PowerShell\7\pwsh.exe").rsplit(['\\', '/']).next(), Some("pwsh"));
+        assert_eq!(program_stem(r"C:\Program Files\PowerShell\7\pwsh.exe"), "pwsh");
+        assert_eq!(program_stem("CMD.EXE"), "cmd");
     }
 
     #[test]

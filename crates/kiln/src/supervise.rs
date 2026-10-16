@@ -87,7 +87,7 @@ async fn wait_as_pid1(child: std::process::Child) -> String {
         }
         match &pidfd {
             Some(fd) => {
-                let _ = crate::rt::timeout(Duration::from_secs(1), crate::proc::wait_readable(fd)).await;
+                let _ = crate::rt::timeout(Duration::from_secs(1), crate::os::proc::wait_readable(fd)).await;
             }
             None => crate::rt::sleep(Duration::from_millis(500)).await,
         }
