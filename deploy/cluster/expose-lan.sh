@@ -23,9 +23,11 @@ case "$cmd" in
 up)
     ip="$(minikube -p "$PROFILE" ip)"
     for c in kiln-lan-http kiln-lan-quic; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    # nodelay on both legs: without it Nagle holds every small write behind the client's delayed
+    # ACK, adding ~40 ms to each terminal echo (keystrokes, prompts) through the forwarder.
     docker run -d --name kiln-lan-http --restart unless-stopped --network host \
         --memory 32m --cpus 0.5 "$SOCAT_IMAGE" \
-        "TCP-LISTEN:${HTTP_PORT},fork,reuseaddr" "TCP:${ip}:${NODE_HTTP_PORT}" >/dev/null
+        "TCP-LISTEN:${HTTP_PORT},fork,reuseaddr,nodelay" "TCP:${ip}:${NODE_HTTP_PORT},nodelay" >/dev/null
     # UDP: one forked child per agent (QUIC keeps a stable 4-tuple); idle children exit after 10 min
     docker run -d --name kiln-lan-quic --restart unless-stopped --network host \
         --memory 32m --cpus 0.5 "$SOCAT_IMAGE" -T 600 \
