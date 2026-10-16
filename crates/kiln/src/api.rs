@@ -156,7 +156,9 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
         (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
+        (&Method::GET, ["dl", "kiln", target]) => return download_for(target).await,
         (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
+        (&Method::GET, ["install.ps1"]) => return Ok(install_powershell(&hub)),
         _ => {}
     }
 
@@ -674,6 +676,8 @@ fn join_info(hub: &Hub) -> Response {
             "server": url,
             "quic": hub.cfg.server.quic_advertise,
             "command": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,bench"),
+            "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels macos"),
+            "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'windows'"),
             "manual": format!("kiln agent --server {url} --token {token} --labels baremetal,bench"),
         }),
     )
@@ -702,6 +706,30 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
 }
 
+/// The target triple this binary was built for (`build.rs`).
+pub const TARGET: &str = env!("KILN_TARGET");
+
+/// Where the release workflow (`.github/workflows/release.yml`) publishes binaries: the asset
+/// `kiln-<version>-<target>` (`.exe` on Windows) of release `v<version>`.
+pub const RELEASES: &str = "https://github.com/hyper-light/kiln/releases/download";
+
+/// The targets the release workflow builds.
+pub const RELEASE_TARGETS: [&str; 6] = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+];
+
+/// The URL of this version's release binary for `target`.
+pub fn release_url(target: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let exe = if target.contains("-windows-") { ".exe" } else { "" };
+    format!("{RELEASES}/v{version}/kiln-{version}-{target}{exe}")
+}
+
 /// The running binary, so new agents can be installed straight from the server.
 async fn download_binary() -> R {
     let exe = std::env::current_exe().map_err(anyhow::Error::from)?;
@@ -709,10 +737,38 @@ async fn download_binary() -> R {
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 
-fn install_script(hub: &Hub) -> Response {
+/// The binary for `target`: this server's own when it was built for that target, otherwise a
+/// redirect to the release build of the same version on GitHub.
+async fn download_for(target: &str) -> R {
+    if target == TARGET {
+        return download_binary().await;
+    }
+    if !RELEASE_TARGETS.contains(&target) {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            format!("no kiln build for {target}; available: {}, {TARGET}", RELEASE_TARGETS.join(", ")),
+        ));
+    }
+    let r = srv::with_header(srv::status(StatusCode::FOUND), header::LOCATION, &release_url(target));
+    Ok(srv::with_header(r, header::CACHE_CONTROL, "no-store"))
+}
+
+/// An install script with this server's URL and build target filled in.
+fn render_script(hub: &Hub, template: &str) -> String {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let script = include_str!("../assets/install-agent.sh").replace("@@KILN_SERVER@@", &url);
+    template.replace("@@KILN_SERVER@@", &url).replace("@@KILN_TARGET@@", TARGET)
+}
+
+/// Linux and macOS agents: `curl -fsSL <server>/install.sh | sh -s -- --token ...`.
+fn install_script(hub: &Hub) -> Response {
+    let script = render_script(hub, include_str!("../assets/install-agent.sh"));
     srv::response(StatusCode::OK, "text/x-shellscript", srv::full(script))
+}
+
+/// Windows agents: `& ([scriptblock]::Create((irm <server>/install.ps1))) -Token ...`.
+fn install_powershell(hub: &Hub) -> Response {
+    let script = render_script(hub, include_str!("../assets/install-agent.ps1"));
+    srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(script))
 }
 
 // ------------------------------------------------------------------ webhooks
@@ -927,5 +983,25 @@ async fn readyz(hub: &Hub) -> Response {
     match hub.store.call(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await {
         Ok(_) => srv::text(StatusCode::OK, "ready"),
         Err(e) => srv::text(StatusCode::SERVICE_UNAVAILABLE, &format!("store: {e:#}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_downloads() {
+        assert!(!TARGET.is_empty());
+        let v = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            release_url("x86_64-pc-windows-msvc"),
+            format!("https://github.com/hyper-light/kiln/releases/download/v{v}/kiln-{v}-x86_64-pc-windows-msvc.exe")
+        );
+        assert!(release_url("aarch64-apple-darwin").ends_with(&format!("kiln-{v}-aarch64-apple-darwin")));
+        for script in [include_str!("../assets/install-agent.sh"), include_str!("../assets/install-agent.ps1")] {
+            assert!(script.contains("@@KILN_SERVER@@"));
+            assert!(script.contains("/dl/kiln/"));
+        }
     }
 }
