@@ -146,8 +146,97 @@ async fn otp(State(hub): S, Query(q): Query<Otp>) -> Response {
         hub.store.audit("admin".into(), "login".into(), "one-time link".into()).await;
         ([(header::SET_COOKIE, session_cookie(&hub))], Redirect::to("/")).into_response()
     } else {
-        (StatusCode::UNAUTHORIZED, "login link expired; run `kiln login` again").into_response()
+        // Back to the login page, which explains what went wrong and offers the other methods.
+        Redirect::to(&format!("/?signin={}", otp_problem(&hub, &q.code))).into_response()
     }
+}
+
+/// Why a one-time link was refused: `expired` (ours, too old) or `foreign` (signed with another
+/// server's admin token, e.g. `kiln login` run against a different installation).
+fn otp_problem(hub: &Hub, code: &str) -> &'static str {
+    let ours = code
+        .split_once('.')
+        .is_some_and(|(exp, sig)| crate::util::ct_eq(sig.as_bytes(), sign(hub, "otp", exp).as_bytes()));
+    if ours { "expired" } else { "foreign" }
+}
+
+static PASSWORD_THROTTLE: std::sync::LazyLock<crate::password::Throttle> = std::sync::LazyLock::new(Default::default);
+/// One password check at a time, so the throttle cannot be outrun by parallel guesses.
+static PASSWORD_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Which sign-in methods the login page should offer (public).
+async fn auth_methods(State(hub): S) -> Json<serde_json::Value> {
+    let path = crate::password::path(&hub.cfg);
+    let password = tokio::task::spawn_blocking(move || crate::password::load(&path).is_some()).await.unwrap_or(false);
+    Json(json!({ "password": password, "token": true }))
+}
+
+#[derive(Deserialize)]
+struct PasswordLogin {
+    password: String,
+}
+
+async fn login_password(State(hub): S, Json(l): Json<PasswordLogin>) -> Response {
+    let gate = PASSWORD_GATE.lock().await;
+    if let Err(wait) = PASSWORD_THROTTLE.check() {
+        let secs = wait.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, secs.to_string())],
+            Json(json!({ "error": format!("Too many wrong passwords. Try again in {secs}s.") })),
+        )
+            .into_response();
+    }
+    let path = crate::password::path(&hub.cfg);
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::password::load(&path).map(|phc| crate::password::verify(&l.password, &phc))
+    })
+    .await
+    .unwrap_or(Some(false));
+    match outcome {
+        Some(true) => {
+            PASSWORD_THROTTLE.succeeded();
+            drop(gate);
+            hub.store.audit("admin".into(), "login".into(), "password".into()).await;
+            (StatusCode::NO_CONTENT, [(header::SET_COOKIE, session_cookie(&hub))]).into_response()
+        }
+        Some(false) => {
+            PASSWORD_THROTTLE.failed();
+            drop(gate);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            err(StatusCode::UNAUTHORIZED, "Wrong password.").into_response()
+        }
+        None => err(
+            StatusCode::CONFLICT,
+            "Password sign-in is not set up yet. Sign in with the admin token once, then choose a password in Settings.",
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetPassword {
+    password: String,
+}
+
+async fn set_password(State(hub): S, Json(p): Json<SetPassword>) -> R<StatusCode> {
+    crate::password::validate(&p.password).map_err(|why| err(StatusCode::BAD_REQUEST, format!("Password not accepted: {why}.")))?;
+    let path = crate::password::path(&hub.cfg);
+    tokio::task::spawn_blocking(move || crate::password::hash(&p.password).and_then(|h| crate::password::store(&path, &h)))
+        .await
+        .map_err(|e| anyhow::anyhow!("password task: {e}"))??;
+    PASSWORD_THROTTLE.succeeded();
+    hub.store.audit("admin".into(), "password".into(), "set".into()).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn clear_password(State(hub): S) -> R<StatusCode> {
+    let path = crate::password::path(&hub.cfg);
+    tokio::task::spawn_blocking(move || crate::password::clear(&path))
+        .await
+        .map_err(|e| anyhow::anyhow!("password task: {e}"))??;
+    hub.store.audit("admin".into(), "password".into(), "cleared".into()).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn logout() -> Response {
@@ -157,6 +246,7 @@ async fn logout() -> Response {
 async fn me(State(hub): S, headers: HeaderMap) -> Json<serde_json::Value> {
     Json(json!({
         "authenticated": authed(&hub, &headers),
+        "public_url": hub.cfg.server.public_url,
         "version": env!("CARGO_PKG_VERSION"),
         "hostname": crate::config::Config::hostname(),
     }))
@@ -782,6 +872,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/api/agents/join", get(join_info))
         .route("/api/agents/{name}", axum::routing::delete(forget_agent))
         .route("/api/agents/{name}/drain", post(drain_agent))
+        .route("/api/settings/password", put(set_password).delete(clear_password))
         .route("/api/events", get(events_ws))
         .route("/api/terminal/ws", get(terminal_ws))
         .layer(middleware::from_fn_with_state(hub.clone(), require_auth));
@@ -789,6 +880,8 @@ pub fn router(hub: Arc<Hub>) -> Router {
     let open = Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/auth/otp", get(otp))
+        .route("/api/auth/methods", get(auth_methods))
+        .route("/api/auth/password", post(login_password))
         .route("/api/auth/logout", post(logout))
         .route("/api/me", get(me))
         .route("/api/agents/enroll", post(enroll))

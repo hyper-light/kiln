@@ -106,6 +106,14 @@ export const api = {
     await post<void>("/api/auth/login", { token });
     setAuthed(true);
   },
+  /** Which sign-in methods this server offers (public). */
+  authMethods: (signal?: AbortSignal) => get<{ password: boolean; token: boolean }>("/api/auth/methods", signal),
+  loginPassword: async (password: string) => {
+    await post<void>("/api/auth/password", { password });
+    setAuthed(true);
+  },
+  setPassword: (password: string) => request<void>("PUT", "/api/settings/password", { password }),
+  clearPassword: () => del<void>("/api/settings/password"),
   logout: async () => {
     try {
       await post<void>("/api/auth/logout");

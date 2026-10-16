@@ -46,6 +46,8 @@ k8s-openapi = { version = "0.28.0", features = ["latest"] }
 x509-parser = "0.18.1"
 tar = "0.4.46"
 hmac = "0.13.0"
+argon2 = "0.6"
+rpassword = "7"
 
 [lints]
 workspace = true

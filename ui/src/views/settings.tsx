@@ -1,5 +1,6 @@
 import * as React from "react";
 import { LogOut } from "lucide-react";
+import { ApiError } from "@/api/client";
 import { api } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Facts, PageIntro, Panel, TextField } from "@/components/ui/misc";
@@ -44,6 +45,7 @@ export default function Settings() {
         <Panel eyebrow="Accessibility" title="Motion" description="Ambient prism animation and status pulses. Your operating system's reduced-motion setting always wins.">
           <MotionToggle />
         </Panel>
+        <PasswordPanel />
         <Panel eyebrow="Session" title="Signed in" actions={<Button variant="ghost" size="sm" onClick={() => void api.logout()}><LogOut /> Sign out</Button>}>
           <Facts
             items={[
@@ -55,5 +57,94 @@ export default function Settings() {
         </Panel>
       </div>
     </div>
+  );
+}
+
+/** The sign-in password: set it once here, then sign in from any device with it. */
+function PasswordPanel() {
+  const methods = useResource((sig) => api.authMethods(sig), []);
+  const [pw, setPw] = React.useState("");
+  const [again, setAgain] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [problem, setProblem] = React.useState<string | null>(null);
+  const isSet = methods.data?.password ?? false;
+  const tooShort = pw.length > 0 && pw.length < 8;
+  const mismatch = again.length > 0 && pw !== again;
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (pw.length < 8 || pw !== again) return;
+    setBusy(true);
+    setProblem(null);
+    try {
+      await api.setPassword(pw);
+      setPw("");
+      setAgain("");
+      toast({ title: isSet ? "Password changed" : "Password set", description: "Sign in from any device with it.", tone: "info" });
+      methods.reload();
+    } catch (err) {
+      setProblem(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async () => {
+    if (!window.confirm("Remove the sign-in password? Devices will need the admin token or a `kiln login` link to sign in.")) return;
+    setBusy(true);
+    try {
+      await api.clearPassword();
+      toast({ title: "Password removed", tone: "info" });
+      methods.reload();
+    } catch (err) {
+      setProblem(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Panel
+      eyebrow="Sign-in"
+      title="Password"
+      description={
+        isSet
+          ? "On. Any device that can reach this server can sign in with it; the admin token keeps working too."
+          : "Off. Choose a password so your phone or another computer can sign in without the admin token."
+      }
+      actions={
+        isSet ? (
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => void remove()}>
+            Remove
+          </Button>
+        ) : undefined
+      }
+    >
+      <form className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end" onSubmit={save} autoComplete="on">
+        <input type="text" name="username" autoComplete="username" value="admin" readOnly tabIndex={-1} aria-hidden="true" className="sr-only" />
+        <TextField
+          label={isSet ? "New password" : "Password"}
+          type="password"
+          name="new-password"
+          autoComplete="new-password"
+          value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          hint={tooShort ? "At least 8 characters" : undefined}
+        />
+        <TextField
+          label="Repeat it"
+          type="password"
+          name="new-password-repeat"
+          autoComplete="new-password"
+          value={again}
+          onChange={(e) => setAgain(e.target.value)}
+          hint={mismatch ? "The two passwords differ" : undefined}
+        />
+        <Button type="submit" variant="secondary" disabled={busy || pw.length < 8 || pw !== again}>
+          {isSet ? "Change password" : "Set password"}
+        </Button>
+      </form>
+      {problem && <p className="mt-3 text-[12.5px] text-[#d8c8b0]">{problem}</p>}
+    </Panel>
   );
 }

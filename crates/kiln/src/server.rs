@@ -52,6 +52,7 @@ pub async fn run(cfg: Config, shutdown: CancellationToken) -> anyhow::Result<()>
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
+    crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
     let requeued = store.recover().await?;
     if requeued > 0 {

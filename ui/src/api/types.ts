@@ -28,6 +28,8 @@ export interface Me {
   authenticated: boolean;
   version: string;
   hostname: string;
+  /** Where the server says it is reachable from other devices. */
+  public_url?: string;
 }
 
 export interface Repo {
