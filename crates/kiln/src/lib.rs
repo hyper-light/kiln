@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod agent;
+pub mod aisessions;
 pub mod api;
 pub mod autodetect;
 pub mod http;

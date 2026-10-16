@@ -19,6 +19,8 @@ pub struct PtySession {
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     /// The master and shell pid: resizes and hang-ups for adopted sessions, and the handover.
     handle: Option<crate::os::pty::Handle>,
+    /// The shell's pid, to tell which programs run inside this terminal.
+    pid: Option<u32>,
 }
 
 /// What a re-executed kiln needs to take a session over: the master's descriptor number (kept
@@ -95,12 +97,13 @@ pub fn spawn(
     let child = pty.slave.spawn_command(cmd)?;
     drop(pty.slave);
     let killer = child.clone_killer();
-    let handle = child.process_id().map(|pid| io.handle(pid));
+    let pid = child.process_id();
+    let handle = pid.map(|pid| io.handle(pid));
     let (tx, rx) = async_channel::bounded::<PtyOut>(256);
     let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
     io.start(child, tx, in_rx);
     crate::metrics::global().terminal_sessions.add(1);
-    Ok((PtySession { input: in_tx, master: Some(pty.master), killer: Some(killer), handle }, rx))
+    Ok((PtySession { input: in_tx, master: Some(pty.master), killer: Some(killer), handle, pid }, rx))
 }
 
 /// Take over a session handed across this process's re-exec ([`PtySession::handover`]). `None`
@@ -111,10 +114,14 @@ pub fn adopt(h: Handover) -> Option<(PtySession, async_channel::Receiver<PtyOut>
     let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
     let handle = crate::os::pty::adopt(fd, h.pid, tx, in_rx);
     crate::metrics::global().terminal_sessions.add(1);
-    Some((PtySession { input: in_tx, master: None, killer: None, handle: Some(handle) }, rx))
+    Some((PtySession { input: in_tx, master: None, killer: None, handle: Some(handle), pid: Some(h.pid) }, rx))
 }
 
 impl PtySession {
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
     pub fn write(&self, data: Vec<u8>) {
         let _ = self.input.try_send(data);
     }

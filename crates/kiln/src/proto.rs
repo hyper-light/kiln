@@ -43,6 +43,13 @@ pub enum AgentMsg {
     TermList { sessions: Vec<TermInfo> },
     /// Bytes that bring a fresh terminal to the session's current state (answer to TermAttach).
     TermReplay { session: String, data: Vec<u8> },
+    /// The AI coding sessions running on this machine, as a JSON array of
+    /// [`crate::aisessions::AiSession`] (JSON, so either side can add fields). Sent when they
+    /// change. Appended last: postcard encodes variants by index.
+    AiSessions { json: String },
+    /// Answer to [`ServerMsg::AiTranscript`]: the messages as JSON, `None` when that session has
+    /// no transcript (any more).
+    AiTranscript { req: u64, json: Option<String> },
 }
 
 /// A terminal session kept by an agent.
@@ -96,6 +103,9 @@ pub enum ServerMsg {
     TermClose { session: String },
     /// Send the session's replay (TermReplay); live output keeps flowing as TermOutput.
     TermAttach { session: String },
+    /// Send the recent messages of the AI session running as `pid` (answered by AiTranscript).
+    /// Appended last: postcard encodes variants by index.
+    AiTranscript { req: u64, pid: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

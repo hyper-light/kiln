@@ -203,6 +203,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // process with the server, whose upgrades its supervisor handles.
     let standalone = std::env::args().skip(1).find(|a| !a.starts_with('-')).as_deref() == Some("agent");
     adopt_handover(&o, &mut terms, &term_tx);
+    // AI coding sessions running on this machine (job pods have none), reported as they change.
+    let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()));
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
@@ -341,6 +343,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             })
                             .collect();
                         uplink.0.send(Up::Term(AgentMsg::TermList { sessions })).await.ok();
+                        if let Some(ai) = &ai {
+                            ai.reset();
+                        }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                     }
                     ServerMsg::Refused { reason } => {
@@ -454,6 +459,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::TermClose { session } => {
                         terms.remove(&session);
                     }
+                    ServerMsg::AiTranscript { req, pid } => match &ai {
+                        Some(ai) => ai.transcript(req, pid, uplink.0.clone()),
+                        None => {
+                            uplink.0.send(Up::Term(AgentMsg::AiTranscript { req, json: None })).await.ok();
+                        }
+                    },
                 }
             }
             Ev::Term(session, out) => {
@@ -510,6 +521,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
+                    if let Some(ai) = &ai {
+                        let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
+                        ai.scan(shells, uplink.0.clone());
+                    }
                 }
             }
         }

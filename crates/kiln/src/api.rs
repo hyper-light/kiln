@@ -219,7 +219,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
+        (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
+        (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
+        (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
             if let Some(s) = hub.terminals.get(id) {
                 s.close();
@@ -229,6 +232,41 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
+    }
+}
+
+// ------------------------------------------------------------------ AI sessions
+
+/// The AI coding sessions running on every connected machine, most recently active first.
+fn ai_sessions(hub: &Hub) -> Response {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for (machine, sessions) in hub.ai_sessions.lock().iter() {
+        for s in sessions {
+            let mut v = serde_json::to_value(s).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("machine".into(), json!(machine));
+                // Attachable only while kiln holds that terminal.
+                if s.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_none()) {
+                    o.insert("terminal".into(), serde_json::Value::Null);
+                }
+            }
+            out.push(v);
+        }
+    }
+    out.sort_by_key(|v| std::cmp::Reverse(v.get("last_activity").and_then(serde_json::Value::as_i64).unwrap_or(0)));
+    srv::json(StatusCode::OK, &out)
+}
+
+/// The recent messages of one session, read from its machine.
+async fn ai_transcript(hub: &Hub, machine: &str, pid: &str) -> R {
+    let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
+    match hub.ai_transcript(machine, pid).await {
+        Ok(Some(json)) => {
+            let entries: serde_json::Value = serde_json::from_str(&json).map_err(|e| err(StatusCode::BAD_GATEWAY, format!("unreadable transcript: {e}")))?;
+            Ok(srv::json(StatusCode::OK, &entries))
+        }
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "that session has no transcript")),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
 }
 
@@ -1074,6 +1112,46 @@ enum TermCtl {
     Resize { cols: u16, rows: u16 },
     Input { data: String },
     Ping,
+}
+
+#[derive(Deserialize)]
+struct NewTerminal {
+    /// "local" or "agent:<machine>".
+    target: String,
+    #[serde(default)]
+    cmd: Option<String>,
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+}
+
+/// Start a terminal session without attaching to it (an AI agent launched from the Agents page);
+/// any device then attaches by its id.
+async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
+    if !hub.cfg.terminal.enabled {
+        return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
+    }
+    let t: NewTerminal = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if hub.terminals.live() >= hub.cfg.terminal.max_sessions {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
+    }
+    let (cols, rows) = (t.cols.unwrap_or(120), t.rows.unwrap_or(40));
+    let session = match t.target.strip_prefix("agent:") {
+        Some(machine) => {
+            if !hub.agents.lock().get(machine).is_some_and(|a| a.connected) {
+                return Err(err(StatusCode::CONFLICT, format!("{machine} is not connected")));
+            }
+            hub.store.audit("admin".into(), "terminal.open".into(), t.target.clone()).await;
+            crate::termsess::open_agent(hub, machine.to_owned(), t.cmd, cols, rows)
+        }
+        None if t.target == "local" => {
+            hub.store.audit("admin".into(), "terminal.open".into(), t.target.clone()).await;
+            crate::termsess::open_local(hub, t.cmd, cols, rows).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        }
+        None => return Err(err(StatusCode::BAD_REQUEST, "target is \"local\" or \"agent:<machine>\"")),
+    };
+    Ok(srv::json(StatusCode::CREATED, &session.info()))
 }
 
 async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) -> R {
