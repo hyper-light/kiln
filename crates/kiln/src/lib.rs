@@ -27,6 +27,7 @@ pub mod store;
 pub mod sup;
 pub mod supervise;
 pub mod terminal;
+pub mod termsess;
 pub mod ui;
 pub mod util;
 

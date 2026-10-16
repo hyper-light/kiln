@@ -184,7 +184,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut jobs: HashMap<String, Running> = HashMap::new();
     let mut exclusive = false;
     let mut draining = false;
-    let mut terms: HashMap<String, PtySession> = HashMap::new();
+    // Terminals outlive the server connection: kept (with their replay state) across disconnects and
+    // announced again on every reconnect.
+    let mut terms: HashMap<String, (PtySession, Arc<crate::termsess::Session>)> = HashMap::new();
     let (term_tx, term_rx) = async_channel::bounded::<(String, PtyOut)>(1024);
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
@@ -288,7 +290,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 connected = false;
                 dialing_since = None;
-                terms.clear();
                 redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
@@ -303,6 +304,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 match msg {
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
+                        let sessions: Vec<proto::TermInfo> = terms
+                            .iter()
+                            .map(|(id, (_, s))| {
+                                let i = s.info();
+                                proto::TermInfo { session: id.clone(), cols: i.cols, rows: i.rows, command: s.command.clone() }
+                            })
+                            .collect();
+                        uplink.0.send(Up::Term(AgentMsg::TermList { sessions })).await.ok();
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                     }
                     ServerMsg::Refused { reason } => {
@@ -368,6 +377,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal disabled on this agent".into()) })).await.ok();
                             continue;
                         }
+                        if terms.contains_key(&session) {
+                            continue;
+                        }
                         match terminal::spawn(o.shell.as_deref(), command.as_deref(), cols, rows) {
                             Ok((pty, rx)) => {
                                 let tx = term_tx.clone();
@@ -380,7 +392,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                         }
                                     }
                                 });
-                                terms.insert(session, pty);
+                                let state = crate::termsess::Session::detached(session.clone(), "agent".into(), command.clone(), cols, rows);
+                                terms.insert(session, (pty, state));
                             }
                             Err(e) => {
                                 uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some(format!("{e:#}")) })).await.ok();
@@ -388,14 +401,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::TermInput { session, data } => {
-                        if let Some(t) = terms.get(&session) {
-                            t.write(data);
+                        if let Some((pty, _)) = terms.get(&session) {
+                            pty.write(data);
                         }
                     }
                     ServerMsg::TermResize { session, cols, rows } => {
-                        if let Some(t) = terms.get(&session) {
-                            t.resize(cols, rows);
+                        if let Some((pty, state)) = terms.get(&session) {
+                            pty.resize(cols, rows);
+                            state.send(crate::termsess::Input::Resize { cols, rows });
                         }
+                    }
+                    ServerMsg::TermAttach { session } => {
+                        let msg = match terms.get(&session) {
+                            Some((_, state)) => {
+                                let a = state.attach();
+                                state.detach();
+                                AgentMsg::TermReplay { session, data: a.replay }
+                            }
+                            None => AgentMsg::TermExit { session, code: None, error: Some("session no longer exists".into()) },
+                        };
+                        uplink.0.send(Up::Term(msg)).await.ok();
                     }
                     ServerMsg::TermClose { session } => {
                         terms.remove(&session);
@@ -404,7 +429,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Term(session, out) => {
                 let msg = match out {
-                    PtyOut::Data(data) => AgentMsg::TermOutput { session, data },
+                    PtyOut::Data(data) => {
+                        if let Some((_, state)) = terms.get(&session) {
+                            state.output(&data);
+                        }
+                        AgentMsg::TermOutput { session, data }
+                    }
                     PtyOut::Exit(code) => {
                         terms.remove(&session);
                         AgentMsg::TermExit { session, code, error: None }

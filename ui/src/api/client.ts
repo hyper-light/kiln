@@ -11,6 +11,7 @@ import type {
   Run,
   RunDetail,
   SystemInfo,
+  TerminalSessionInfo,
 } from "./types";
 
 export class ApiError extends Error {
@@ -156,6 +157,9 @@ export const api = {
     get<MetricsHistory>(`/api/metrics/history${qs({ agent })}`, signal),
 
   system: (signal?: AbortSignal) => get<SystemInfo>("/api/system", signal),
+  terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
+  /** End a session: its shell stops on every device. */
+  closeTerminalSession: (id: string) => del<void>(`/api/terminal/sessions/${enc(id)}`),
   audit: (limit = 200, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit })}`, signal),
 };
 

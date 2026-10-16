@@ -104,16 +104,18 @@ export function createTerminal(host: HTMLElement, opts: ITerminalOptions = {}, u
   term.unicode.activeVersion = "11";
   term.open(host);
 
-  // WebGL first (unless disabled); on failure or context loss fall back to the DOM renderer.
+  // The DOM renderer by default: the WebGL one draws nothing at all on some phones and GPUs, which
+  // reads as a dead terminal. WebGL is opt-in (localStorage kiln.term.renderer = "webgl") and still
+  // falls back to the DOM renderer on failure or context loss.
   let renderer: "webgl" | "dom" = "dom";
   let webgl: WebglAddon | null = null;
-  let forceDom = false;
+  let wantWebgl = false;
   try {
-    forceDom = localStorage.getItem("kiln.term.renderer") === '"dom"';
+    wantWebgl = localStorage.getItem("kiln.term.renderer") === '"webgl"';
   } catch {
     /* storage unavailable */
   }
-  if (useWebgl && !forceDom) {
+  if (useWebgl && wantWebgl) {
     try {
       const addon = new WebglAddon();
       addon.onContextLoss(() => {

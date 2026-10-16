@@ -38,6 +38,20 @@ pub enum AgentMsg {
     Reject { job: String, reason: String },
     TermOutput { session: String, data: Vec<u8> },
     TermExit { session: String, code: Option<i32>, error: Option<String> },
+    /// The terminals still running on this machine (sent on every (re)connect, so a restarted
+    /// server learns about sessions that outlived it).
+    TermList { sessions: Vec<TermInfo> },
+    /// Bytes that bring a fresh terminal to the session's current state (answer to TermAttach).
+    TermReplay { session: String, data: Vec<u8> },
+}
+
+/// A terminal session kept by an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TermInfo {
+    pub session: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,6 +94,8 @@ pub enum ServerMsg {
     TermInput { session: String, data: Vec<u8> },
     TermResize { session: String, cols: u16, rows: u16 },
     TermClose { session: String },
+    /// Send the session's replay (TermReplay); live output keeps flowing as TermOutput.
+    TermAttach { session: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

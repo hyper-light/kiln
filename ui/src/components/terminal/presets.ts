@@ -11,12 +11,13 @@ export interface Shortcut {
 export interface Preset {
   id: string;
   name: string;
-  /** Process/title fragments that select this preset automatically. */
+  /** Session command / window-title fragments that select this preset automatically. */
   match: RegExp;
   shortcuts: Shortcut[];
 }
 
 const ctrl = (c: string): Stroke => ({ text: c, mods: { ctrl: true } });
+const esc: Stroke = { key: "Escape" };
 
 /** zsh / bash line editing (emacs keymap, the default in both). */
 export const SHELL: Preset = {
@@ -41,11 +42,72 @@ export const SHELL: Preset = {
   ],
 };
 
-/** Presets for AI coding harnesses are filled from their documented bindings. */
-export const PRESETS: Preset[] = [SHELL];
+/** Claude Code's interactive-mode bindings. */
+export const CLAUDE: Preset = {
+  id: "claude",
+  name: "Claude Code",
+  match: /claude/i,
+  shortcuts: [
+    { label: "Esc", hint: "Interrupt Claude", strokes: [esc] },
+    { label: "Esc Esc", hint: "Rewind / edit a previous message", strokes: [esc, esc] },
+    { label: "⇧Tab", hint: "Cycle permission mode (auto-accept / plan)", strokes: [{ key: "Tab", mods: { shift: true } }] },
+    { label: "^C", hint: "Cancel input or generation (twice: exit)", strokes: [ctrl("c")] },
+    { label: "⏎ newline", hint: "New line in the prompt (Ctrl+J)", strokes: [ctrl("j")] },
+    { label: "/", hint: "Slash command", strokes: [{ text: "/" }] },
+    { label: "@", hint: "Mention a file", strokes: [{ text: "@" }] },
+    { label: "!", hint: "Bash mode", strokes: [{ text: "!" }] },
+    { label: "#", hint: "Add to memory", strokes: [{ text: "#" }] },
+    { label: "^O", hint: "Verbose output / transcript", strokes: [ctrl("o")] },
+    { label: "^T", hint: "Task list", strokes: [ctrl("t")] },
+    { label: "^B", hint: "Run the current command in the background", strokes: [ctrl("b")] },
+    { label: "^R", hint: "Search history", strokes: [ctrl("r")] },
+    { label: "^G", hint: "Edit the prompt in $EDITOR", strokes: [ctrl("g")] },
+    { label: "^L", hint: "Clear the screen", strokes: [ctrl("l")] },
+    { label: "^D", hint: "Exit", strokes: [ctrl("d")] },
+  ],
+};
 
-/** The preset for a session, from what its program reports (window title) or the user's choice. */
-export function presetFor(title: string, chosen?: string | null): Preset {
+/** OpenAI Codex CLI bindings. */
+export const CODEX: Preset = {
+  id: "codex",
+  name: "Codex",
+  match: /codex/i,
+  shortcuts: [
+    { label: "Esc", hint: "Interrupt", strokes: [esc] },
+    { label: "Esc Esc", hint: "Edit a previous message", strokes: [esc, esc] },
+    { label: "^C", hint: "Cancel (twice: quit)", strokes: [ctrl("c")] },
+    { label: "⏎ newline", hint: "New line in the prompt (Ctrl+J)", strokes: [ctrl("j")] },
+    { label: "/", hint: "Slash command", strokes: [{ text: "/" }] },
+    { label: "@", hint: "Search for a file", strokes: [{ text: "@" }] },
+    { label: "^T", hint: "Transcript", strokes: [ctrl("t")] },
+    { label: "^D", hint: "Exit", strokes: [ctrl("d")] },
+  ],
+};
+
+/** Google Gemini CLI bindings. */
+export const GEMINI: Preset = {
+  id: "gemini",
+  name: "Gemini CLI",
+  match: /gemini/i,
+  shortcuts: [
+    { label: "Esc", hint: "Cancel the request", strokes: [esc] },
+    { label: "⇧Tab", hint: "Toggle auto-accept edits", strokes: [{ key: "Tab", mods: { shift: true } }] },
+    { label: "^X", hint: "Edit the prompt in an external editor", strokes: [ctrl("x")] },
+    { label: "^Y", hint: "Toggle YOLO mode", strokes: [ctrl("y")] },
+    { label: "^T", hint: "Tool descriptions", strokes: [ctrl("t")] },
+    { label: "/", hint: "Slash command", strokes: [{ text: "/" }] },
+    { label: "@", hint: "Add a file", strokes: [{ text: "@" }] },
+    { label: "^C", hint: "Quit", strokes: [ctrl("c")] },
+  ],
+};
+
+export const PRESETS: Preset[] = [SHELL, CLAUDE, CODEX, GEMINI];
+
+/**
+ * The preset for a session: the user's choice for it, else the first AI harness whose name appears
+ * in what the session runs (its command, or the window title its program set), else the shell.
+ */
+export function presetFor(hints: string, chosen?: string | null): Preset {
   if (chosen) return PRESETS.find((p) => p.id === chosen) ?? SHELL;
-  return PRESETS.find((p) => p !== SHELL && p.match.test(title)) ?? SHELL;
+  return PRESETS.find((p) => p !== SHELL && p.match.test(hints)) ?? SHELL;
 }

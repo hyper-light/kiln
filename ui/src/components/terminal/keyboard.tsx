@@ -14,8 +14,11 @@ interface Props {
   send: (bytes: string) => void;
   /** The terminal's application-cursor mode, read at key time. */
   appCursor: () => boolean;
-  /** The session's window title, used to pick the shortcut preset. */
-  title: string;
+  /** What the session runs (its command and window title), used to pick the shortcut preset. */
+  hints: string;
+  /** The user's preset for this session (null: automatic). */
+  presetId: string | null;
+  onPreset: (id: string | null) => void;
   mode: KeyboardMode;
   onMode: (m: KeyboardMode) => void;
   onHide: () => void;
@@ -69,15 +72,14 @@ const buzz = () => {
   }
 };
 
-export function TerminalKeyboard({ send, appCursor, title, mode, onMode, onHide }: Props) {
+export function TerminalKeyboard({ send, appCursor, hints, presetId, onPreset, mode, onMode, onHide }: Props) {
   const [ctrl, setCtrl] = React.useState<Latch>("off");
   const [alt, setAlt] = React.useState<Latch>("off");
   const [shift, setShift] = React.useState<Latch>("off");
   const [layer, setLayer] = React.useState<Layer>("abc");
-  const [presetId, setPresetId] = React.useState<string | null>(null);
   const [presetOpen, setPresetOpen] = React.useState(false);
   const { start, stop } = useRepeat();
-  const preset = presetFor(title, presetId);
+  const preset = presetFor(hints, presetId);
 
   const mods = (): Mods => ({ ctrl: ctrl !== "off", alt: alt !== "off", shift: shift !== "off" });
   const consume = () => {
@@ -125,25 +127,23 @@ export function TerminalKeyboard({ send, appCursor, title, mode, onMode, onHide 
 
   return (
     <div className="vk" role="group" aria-label="Terminal keyboard" data-mode={mode}>
+      {presetOpen && (
+        <div className="vk-menu" role="listbox" aria-label="Shortcut set">
+          <button type="button" role="option" aria-selected={presetId === null} className="vk-menu-item" {...press(() => { onPreset(null); setPresetOpen(false); })}>
+            Auto ({presetFor(hints).name})
+          </button>
+          {PRESETS.map((p) => (
+            <button key={p.id} type="button" role="option" aria-selected={presetId === p.id} className="vk-menu-item" {...press(() => { onPreset(p.id); setPresetOpen(false); })}>
+              {p.name}
+            </button>
+          ))}
+        </div>
+      )}
       {/* Shortcuts for the program in this session. */}
       <div className="vk-row vk-scroll">
-        <div className="vk-preset">
-          <button type="button" className="vk-key vk-chip" aria-haspopup="listbox" aria-expanded={presetOpen} {...press(() => setPresetOpen((o) => !o))}>
-            {preset.name} <ChevronDown size={12} />
-          </button>
-          {presetOpen && (
-            <div className="vk-menu" role="listbox">
-              <button type="button" role="option" aria-selected={presetId === null} className="vk-menu-item" {...press(() => { setPresetId(null); setPresetOpen(false); })}>
-                Auto ({presetFor(title).name})
-              </button>
-              {PRESETS.map((p) => (
-                <button key={p.id} type="button" role="option" aria-selected={presetId === p.id} className="vk-menu-item" {...press(() => { setPresetId(p.id); setPresetOpen(false); })}>
-                  {p.name}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        <button type="button" className="vk-key vk-chip vk-preset" aria-haspopup="listbox" aria-expanded={presetOpen} {...press(() => setPresetOpen((o) => !o))}>
+          {preset.name} <ChevronDown size={12} />
+        </button>
         {preset.shortcuts.map((s) => (
           <button key={s.label} type="button" className="vk-key vk-chip" title={s.hint} aria-label={`${s.label}: ${s.hint}`} {...press(() => send(s.strokes.map((st) => strokeBytes(st, appCursor())).join("")))}>
             {s.label}

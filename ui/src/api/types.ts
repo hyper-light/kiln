@@ -246,10 +246,35 @@ export type ServerEvent =
   | { type: "job"; job: Job }
   | { type: "agent"; agent: Agent }
   | { type: "sample"; agent: string; sample: HostSample }
-  | { type: "queue"; queued: number; running: number };
+  | { type: "queue"; queued: number; running: number }
+  | { type: "terminals" };
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
 
+/** A terminal session kept by the server (any device can attach to it). */
+export interface TerminalSessionInfo {
+  id: string;
+  /** "local" (the server) or "agent:<machine>" */
+  target: string;
+  command: string | null;
+  /** Window title the program set (OSC 0/2). */
+  title: string;
+  created_at: number;
+  attached: number;
+  cols: number;
+  rows: number;
+  idle_seconds: number;
+  exited: boolean;
+  exit_code: number | null;
+  error: string | null;
+}
+
 export type TerminalControlFrame =
   | { type: "exit"; code: number | null }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  /** First frame on every attach: which session this socket is on. */
+  | { type: "session"; session: TerminalSessionInfo }
+  /** The session isn't known (yet): e.g. its machine is reconnecting. Retry by id. */
+  | { type: "missing"; session: string }
+  /** The session's machine dropped; it keeps running there. Reattach by id. */
+  | { type: "reconnect" };

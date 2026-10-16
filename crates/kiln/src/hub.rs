@@ -62,7 +62,11 @@ pub struct AgentLive {
 #[derive(Debug)]
 pub enum TermOut {
     Data(Vec<u8>),
+    /// The agent's replay for an adopted session.
+    Replay(Vec<u8>),
     Exit { code: Option<i32>, error: Option<String> },
+    /// The machine disconnected; its shells keep running there.
+    Gone,
 }
 
 pub struct Hub {
@@ -76,6 +80,8 @@ pub struct Hub {
     pending_peers: Mutex<HashMap<PeerId, String>>,
     pub events: Broadcast<Arc<str>>,
     pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
+    /// Every terminal session, local and on machines.
+    pub terminals: crate::termsess::Sessions,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
     pub launching: Mutex<HashMap<String, Instant>>,
@@ -119,6 +125,7 @@ impl Hub {
             pending_peers: Mutex::new(HashMap::new()),
             events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
+            terminals: crate::termsess::Sessions::new(),
             history: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             launching: Mutex::new(HashMap::new()),
@@ -136,6 +143,11 @@ impl Hub {
     }
 
     // ------------------------------------------------------------ UI events
+
+    /// Tell every UI that the session list changed.
+    pub fn emit_terminals(&self) {
+        self.emit(&serde_json::json!({ "type": "terminals" }));
+    }
 
     pub fn emit(&self, v: &serde_json::Value) {
         if self.events.receiver_count() > 0 {
@@ -294,7 +306,7 @@ impl Hub {
         anyhow::bail!("transport event stream ended")
     }
 
-    async fn on_net(&self, ev: NetEvent) -> anyhow::Result<()> {
+    async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
         match ev {
             NetEvent::Connected { peer, name } => {
                 if let Some(n) = name {
@@ -344,7 +356,7 @@ impl Hub {
         if let Err(e) = self.store.agent_disconnected(name.to_owned()).await {
             tracing::warn!(error = %e, "agent_disconnected");
         }
-        // Remote terminals on that agent are gone.
+        // That machine's terminals keep running there; park them until it reconnects.
         let sessions: Vec<String> = self
             .terms
             .lock()
@@ -354,7 +366,7 @@ impl Hub {
             .collect();
         for s in sessions {
             if let Some(tx) = self.terms.lock().remove(&s) {
-                let _ = tx.try_send(TermOut::Exit { code: None, error: Some("agent disconnected".into()) });
+                let _ = tx.try_send(TermOut::Gone);
             }
         }
         metrics::agent_samples().write().remove(name);
@@ -400,7 +412,7 @@ impl Hub {
         self.wake.notify();
     }
 
-    async fn on_agent_msg(&self, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
+    async fn on_agent_msg(self: &Arc<Self>, peer: PeerId, msg: AgentMsg) -> anyhow::Result<()> {
         if let AgentMsg::Hello(h) = msg {
             return self.on_hello(peer, h).await;
         }
@@ -455,6 +467,18 @@ impl Hub {
                 let tx = self.terms.lock().get(&key).cloned();
                 if let Some(tx) = tx {
                     let _ = tx.send(TermOut::Data(data)).await;
+                }
+            }
+            AgentMsg::TermList { sessions } => {
+                for info in &sessions {
+                    crate::termsess::adopt_agent(self, &agent, info);
+                }
+            }
+            AgentMsg::TermReplay { session, data } => {
+                let key = format!("{agent}/{session}");
+                let tx = self.terms.lock().get(&key).cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(TermOut::Replay(data)).await;
                 }
             }
             AgentMsg::TermExit { session, code, error } => {
@@ -979,6 +1003,19 @@ impl Hub {
     }
 
     /// Daily retention: delete old runs and their logs.
+    /// Close terminal sessions left idle with nobody attached; forget ended ones.
+    pub async fn terminal_loop(self: Arc<Self>) -> anyhow::Result<()> {
+        let idle = Duration::from_secs(self.cfg.terminal.idle_minutes.max(1).saturating_mul(60));
+        loop {
+            if !self.shutdown.sleep(Duration::from_secs(30)).await {
+                return Ok(());
+            }
+            if self.terminals.sweep(idle) {
+                self.emit_terminals();
+            }
+        }
+    }
+
     pub async fn retention_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let mut tick = Interval::new(Duration::from_secs(3600));
         loop {

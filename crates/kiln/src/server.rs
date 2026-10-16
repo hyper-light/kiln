@@ -106,6 +106,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     child!("scheduler", h => h.scheduler_loop());
     child!("sampler", h => h.sampler_loop());
     child!("retention", h => h.retention_loop());
+    child!("terminals", h => h.terminal_loop());
     child!("gitops-discover", h => crate::gitops::discover_loop(h));
     child!("gitops-poll", h => crate::gitops::poll_loop(h));
     child!("gitops-schedule", h => crate::gitops::schedule_loop(h));

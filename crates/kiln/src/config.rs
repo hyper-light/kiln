@@ -113,6 +113,8 @@ pub struct Terminal {
     pub enabled: bool,
     pub shell: Option<String>,
     pub max_sessions: usize,
+    /// Close a terminal session after this long with nobody attached.
+    pub idle_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,7 +233,7 @@ impl Default for Kubernetes {
 
 impl Default for Terminal {
     fn default() -> Self {
-        Self { enabled: true, shell: None, max_sessions: 32 }
+        Self { enabled: true, shell: None, max_sessions: 32, idle_minutes: 720 }
     }
 }
 

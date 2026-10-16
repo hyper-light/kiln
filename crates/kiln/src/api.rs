@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::agent::{EnrollRequest, EnrollResponse};
 use crate::http::server::{self as srv, Request, Response};
 use crate::http::ws::{self, Message};
-use crate::hub::{Hub, TermOut};
+use crate::hub::Hub;
 use crate::logs::LogEvent;
 use crate::proto::{LANE_TERM, ServerMsg};
 use crate::store::Repo;
@@ -205,6 +205,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
+        (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
+        (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
+            if let Some(s) = hub.terminals.get(id) {
+                s.close();
+                hub.store.audit("admin".into(), "terminal.close".into(), s.target.clone()).await;
+            }
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
         (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
@@ -791,7 +799,8 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     if !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
     }
-    if crate::metrics::global().terminal_sessions.get() >= i64::try_from(hub.cfg.terminal.max_sessions).unwrap_or(32) {
+    let existing = q.get("session").cloned();
+    if existing.is_none() && hub.terminals.live() >= hub.cfg.terminal.max_sessions {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
     }
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
@@ -801,84 +810,74 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     let cmd = q.get("cmd").cloned();
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        hub.store.audit("admin".into(), "terminal.open".into(), target.clone()).await;
-        let r = match target.strip_prefix("agent:") {
-            Some(agent) => agent_terminal(hub.clone(), agent.to_owned(), cols, rows, cmd, socket).await,
-            None => local_terminal(&hub, cols, rows, cmd, socket).await,
-        };
-        if let Err(e) = r {
-            tracing::debug!(error = %e, "terminal session ended");
+        if let Err(e) = terminal_attach(hub, existing, target, cols, rows, cmd, socket).await {
+            tracing::debug!(error = %format!("{e:#}"), "terminal websocket ended");
         }
     });
     Ok(resp)
 }
 
-async fn local_terminal(hub: &Hub, cols: u16, rows: u16, cmd: Option<String>, socket: ws::WebSocket) -> anyhow::Result<()> {
-    use futures::FutureExt as _;
-    let (mut tx, mut rx) = socket.split();
-    let (pty, out) = match crate::terminal::spawn(hub.cfg.terminal.shell.as_deref(), cmd.as_deref(), cols, rows) {
-        Ok(p) => p,
-        Err(e) => {
-            tx.send(ws::text(json!({"type": "error", "message": format!("{e:#}")}).to_string())).await?;
-            return Ok(());
-        }
-    };
-    loop {
-        futures::select_biased! {
-            o = out.recv().fuse() => match o {
-                Ok(crate::terminal::PtyOut::Data(d)) => tx.send(ws::binary(d)).await?,
-                Ok(crate::terminal::PtyOut::Exit(code)) => {
-                    tx.send(ws::text(json!({"type": "exit", "code": code}).to_string())).await.ok();
-                    return Ok(());
-                }
-                Err(_) => {
-                    tx.send(ws::text(json!({"type": "exit", "code": null}).to_string())).await.ok();
-                    return Ok(());
-                }
-            },
-            m = rx.next().fuse() => match m {
-                Some(Ok(Message::Binary(b))) => pty.write(b.to_vec()),
-                Some(Ok(Message::Text(t))) => match serde_json::from_str::<TermCtl>(t.as_str()) {
-                    Ok(TermCtl::Resize { cols, rows }) => pty.resize(cols, rows),
-                    Ok(TermCtl::Input { data }) => pty.write(data.into_bytes()),
-                    Ok(TermCtl::Ping) | Err(_) => {}
-                },
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
-                _ => {}
-            },
-        }
-    }
-}
-
-async fn agent_terminal(
+/// One browser on one session: identity, replay, then live output; input both ways. Closing the
+/// socket only detaches — the shell keeps running for the next attach.
+async fn terminal_attach(
     hub: Arc<Hub>,
-    agent: String,
+    existing: Option<String>,
+    target: String,
     cols: u16,
     rows: u16,
     cmd: Option<String>,
     socket: ws::WebSocket,
 ) -> anyhow::Result<()> {
+    use crate::termsess::{Frame, Input};
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
-    let session = crate::util::new_id();
-    let key = format!("{agent}/{session}");
-    let (out_tx, out_rx) = async_channel::bounded::<TermOut>(512);
-    hub.terms.lock().insert(key.clone(), out_tx);
-    let opened = hub
-        .send_to_agent(&agent, LANE_TERM, &ServerMsg::TermOpen { session: session.clone(), cols, rows, command: cmd })
-        .await;
-    if !opened {
-        hub.terms.lock().remove(&key);
-        tx.send(ws::text(json!({"type": "error", "message": format!("agent {agent} is not connected")}).to_string())).await?;
-        return Ok(());
-    }
-    crate::metrics::global().terminal_sessions.add(1);
+    let session = match existing {
+        Some(id) => match hub.terminals.get(&id) {
+            Some(s) => s,
+            None => {
+                // Not (yet) known: e.g. its machine is reconnecting. The client retries.
+                tx.send(ws::text(json!({"type": "missing", "session": id}).to_string())).await?;
+                return Ok(());
+            }
+        },
+        None => {
+            hub.store.audit("admin".into(), "terminal.open".into(), target.clone()).await;
+            match target.strip_prefix("agent:") {
+                Some(machine) => crate::termsess::open_agent(&hub, machine.to_owned(), cmd, cols, rows),
+                None => match crate::termsess::open_local(&hub, cmd, cols, rows) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tx.send(ws::text(json!({"type": "error", "message": format!("{e:#}")}).to_string())).await?;
+                        return Ok(());
+                    }
+                },
+            }
+        }
+    };
+    tx.send(ws::text(json!({"type": "session", "session": session.info()}).to_string())).await?;
+    let attachment = session.attach();
+    let mut live = attachment.live;
     let result: anyhow::Result<()> = async {
+        if !attachment.replay.is_empty() {
+            tx.send(ws::binary(attachment.replay)).await?;
+        }
+        if let Some((code, error)) = attachment.ended {
+            let msg = match error {
+                Some(e) => json!({"type": "error", "message": e}),
+                None => json!({"type": "exit", "code": code}),
+            };
+            tx.send(ws::text(msg.to_string())).await.ok();
+            return Ok(());
+        }
         loop {
             futures::select_biased! {
-                o = out_rx.recv().fuse() => match o {
-                    Ok(TermOut::Data(d)) => tx.send(ws::binary(d)).await?,
-                    Ok(TermOut::Exit { code, error }) => {
+                f = live.recv().fuse() => match f {
+                    Ok(Frame::Data(d)) => tx.send(ws::binary(d)).await?,
+                    Ok(Frame::Exit { error: Some(e), .. }) if e == "__reconnect__" => {
+                        tx.send(ws::text(json!({"type": "reconnect"}).to_string())).await.ok();
+                        return Ok(());
+                    }
+                    Ok(Frame::Exit { code, error }) => {
                         let msg = match error {
                             Some(e) => json!({"type": "error", "message": e}),
                             None => json!({"type": "exit", "code": code}),
@@ -886,19 +885,19 @@ async fn agent_terminal(
                         tx.send(ws::text(msg.to_string())).await.ok();
                         return Ok(());
                     }
-                    Err(_) => return Ok(()),
+                    Err(async_broadcast::RecvError::Overflowed(_)) => {
+                        // This viewer fell behind; repaint it from the session's state.
+                        let a = session.attach();
+                        session.detach();
+                        tx.send(ws::binary(a.replay)).await?;
+                    }
+                    Err(async_broadcast::RecvError::Closed) => return Ok(()),
                 },
                 m = rx.next().fuse() => match m {
-                    Some(Ok(Message::Binary(b))) => {
-                        hub.send_to_agent(&agent, LANE_TERM, &ServerMsg::TermInput { session: session.clone(), data: b.to_vec() }).await;
-                    }
+                    Some(Ok(Message::Binary(b))) => session.send(Input::Data(b.to_vec())),
                     Some(Ok(Message::Text(t))) => match serde_json::from_str::<TermCtl>(t.as_str()) {
-                        Ok(TermCtl::Resize { cols, rows }) => {
-                            hub.send_to_agent(&agent, LANE_TERM, &ServerMsg::TermResize { session: session.clone(), cols, rows }).await;
-                        }
-                        Ok(TermCtl::Input { data }) => {
-                            hub.send_to_agent(&agent, LANE_TERM, &ServerMsg::TermInput { session: session.clone(), data: data.into_bytes() }).await;
-                        }
+                        Ok(TermCtl::Resize { cols, rows }) => session.send(Input::Resize { cols, rows }),
+                        Ok(TermCtl::Input { data }) => session.send(Input::Data(data.into_bytes())),
                         Ok(TermCtl::Ping) | Err(_) => {}
                     },
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
@@ -908,9 +907,8 @@ async fn agent_terminal(
         }
     }
     .await;
-    hub.terms.lock().remove(&key);
-    hub.send_to_agent(&agent, LANE_TERM, &ServerMsg::TermClose { session }).await;
-    crate::metrics::global().terminal_sessions.add(-1);
+    session.detach();
+    hub.emit_terminals();
     result
 }
 

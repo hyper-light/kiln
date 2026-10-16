@@ -110,12 +110,21 @@ pub struct Attachment {
 }
 
 impl Session {
+    /// Replay state only, for a terminal whose PTY someone else drives (an agent's sessions).
+    pub fn detached(id: String, target: String, command: Option<String>, cols: u16, rows: u16) -> Arc<Self> {
+        Self::with_id(id, target, command, cols, rows).0
+    }
+
     fn new(target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, async_channel::Receiver<Input>) {
+        Self::with_id(crate::util::new_id(), target, command, cols, rows)
+    }
+
+    fn with_id(id: String, target: String, command: Option<String>, cols: u16, rows: u16) -> (Arc<Self>, async_channel::Receiver<Input>) {
         let (input, input_rx) = async_channel::bounded(1024);
         let cols = cols.clamp(2, 1000);
         let rows = rows.clamp(2, 1000);
         let session = Arc::new(Self {
-            id: crate::util::new_id(),
+            id,
             target,
             command,
             created_at: crate::util::now_unix(),
@@ -154,13 +163,18 @@ impl Session {
         }
     }
 
+    /// Nothing has been output yet.
+    pub fn is_empty(&self) -> bool {
+        self.state.lock().backlog.is_empty()
+    }
+
     pub fn is_exited(&self) -> bool {
         self.state.lock().exit.is_some()
     }
 
     /// Program output: into the emulator and the backlog, then to every attached client, all under
     /// one lock so an attaching client sees each byte exactly once (in its replay or live).
-    fn output(&self, data: &[u8]) {
+    pub(crate) fn output(&self, data: &[u8]) {
         let mut st = self.state.lock();
         st.screen.process(data);
         st.backlog.extend(data.iter().copied());
@@ -272,6 +286,10 @@ impl Sessions {
         self.map.lock().values().filter(|s| !s.is_exited()).count()
     }
 
+    pub fn remove(&self, id: &str) {
+        self.map.lock().remove(id);
+    }
+
     fn insert(&self, s: &Arc<Session>) {
         self.map.lock().insert(s.id.clone(), Arc::clone(s));
     }
@@ -363,17 +381,30 @@ pub fn open_local(hub: &Arc<Hub>, command: Option<String>, cols: u16, rows: u16)
 /// Open a shell on a machine through its agent.
 pub fn open_agent(hub: &Arc<Hub>, machine: String, command: Option<String>, cols: u16, rows: u16) -> Arc<Session> {
     let (session, input) = Session::new(format!("agent:{machine}"), command.clone(), cols, rows);
-    hub.terminals.insert(&session);
-    let s = Arc::clone(&session);
+    run_agent(hub, machine, session.clone(), input, Some(ServerMsg::TermOpen { session: session.id.clone(), cols, rows, command }));
+    session
+}
+
+/// Take back a session an agent reports after a reconnect (it outlived the connection or this
+/// server): register it and fetch its replay. A no-op when the session is already known.
+pub fn adopt_agent(hub: &Arc<Hub>, machine: &str, info: &crate::proto::TermInfo) {
+    if hub.terminals.get(&info.session).is_some() {
+        return;
+    }
+    let (session, input) = Session::with_id(info.session.clone(), format!("agent:{machine}"), info.command.clone(), info.cols, info.rows);
+    run_agent(hub, machine.to_owned(), session, input, Some(ServerMsg::TermAttach { session: info.session.clone() }));
+}
+
+fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_channel::Receiver<Input>, first: Option<ServerMsg>) {
+    hub.terminals.insert(&s);
     let h = Arc::clone(hub);
     crate::rt::spawn(async move {
         let key = format!("{machine}/{}", s.id);
-        let (out_tx, out_rx) = async_channel::bounded::<TermOut>(512);
+        let (out_tx, out_rx) = async_channel::bounded::<TermOut>(4096);
         h.terms.lock().insert(key.clone(), out_tx);
-        let opened = h
-            .send_to_agent(&machine, LANE_TERM, &ServerMsg::TermOpen { session: s.id.clone(), cols, rows, command })
-            .await;
-        if !opened {
+        if let Some(msg) = first
+            && !h.send_to_agent(&machine, LANE_TERM, &msg).await
+        {
             h.terms.lock().remove(&key);
             s.finish(None, Some(format!("machine {machine} is not connected")));
             h.emit_terminals();
@@ -393,12 +424,21 @@ pub fn open_agent(hub: &Arc<Hub>, machine: String, command: Option<String>, cols
             };
             match ev {
                 Ev::Out(Some(TermOut::Data(d))) => s.output(&d),
+                Ev::Out(Some(TermOut::Replay(d))) => {
+                    // An adopted session starts from the agent's picture of it.
+                    if s.is_empty() {
+                        s.output(&d);
+                    }
+                }
                 Ev::Out(Some(TermOut::Exit { code, error })) => {
                     s.finish(code, error);
                     break;
                 }
-                Ev::Out(None) => {
-                    s.finish(None, Some("connection to the machine lost".to_owned()));
+                Ev::Out(Some(TermOut::Gone) | None) => {
+                    // The machine went away; the shell keeps running there and is adopted again
+                    // when it reconnects. Attached browsers reconnect by session id.
+                    h.terminals.remove(&s.id);
+                    s.out.send(Frame::Exit { code: None, error: Some("__reconnect__".to_owned()) });
                     break;
                 }
                 Ev::In(Some(Input::Data(data))) => {
@@ -419,7 +459,6 @@ pub fn open_agent(hub: &Arc<Hub>, machine: String, command: Option<String>, cols
         h.emit_terminals();
     });
     hub.emit_terminals();
-    session
 }
 
 #[cfg(test)]
