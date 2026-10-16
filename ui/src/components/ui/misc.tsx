@@ -322,14 +322,15 @@ export function Kbd({ children }: { children: React.ReactNode }) {
   return <kbd className="kbd">{children}</kbd>;
 }
 
-/** Concentric optical rings (hyperlight OG motif). */
-export function Optic({ size = 220, className }: { size?: number; className?: string }) {
+/** Concentric optical rings (hyperlight OG motif). `size` is pixels or any CSS length. */
+export function Optic({ size = 220, className }: { size?: number | string; className?: string }) {
   const colors = ["#939da7", "#aeb1bb", "#b0a4c4", "#c1a8b5", "#a6b5ca", "#bbc7bf"];
+  const scale = (f: number) => (typeof size === "number" ? size * f : `calc(${size} * ${f.toFixed(3)})`);
   return (
     <div className={cn("optic", className)} style={{ width: size, height: size }} aria-hidden="true">
       {Array.from({ length: 12 }, (_, i) => {
-        const w = size * (0.42 + i * 0.05);
-        const h = size * (0.24 + i * 0.035);
+        const w = scale(0.42 + i * 0.05);
+        const h = scale(0.24 + i * 0.035);
         return (
           <span
             key={i}
