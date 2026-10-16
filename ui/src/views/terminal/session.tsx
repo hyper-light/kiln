@@ -6,7 +6,7 @@ import { createTerminal, ensureFont, safeFit, type KilnTerminal } from "@/compon
 export type SessionState =
   | { kind: "connecting" }
   | { kind: "open" }
-  /** Lost the connection; the shell keeps running and this view reattaches on its own. */
+  /** The socket dropped (server restart, network, sleep); the shell keeps running and we reattach. */
   | { kind: "reconnecting"; attempt: number }
   | { kind: "exited"; code: number | null }
   | { kind: "error"; message: string };
@@ -17,14 +17,14 @@ export interface SessionHandle {
   clear: () => void;
   copySelection: () => Promise<void>;
   setFontSize: (px: number) => void;
-  /** Bytes from the on-screen keyboard, delivered exactly as if typed. */
+  /** Send bytes to the shell as if typed (on-screen keyboard). */
   send: (bytes: string) => void;
-  /** Application-cursor mode (DECCKM), which changes how arrows are encoded. */
+  /** The program's application-cursor mode (arrows encode differently in vim, less, TUIs). */
   appCursor: () => boolean;
 }
 
 interface Props {
-  /** Attach to this server-side session; null opens a new one on `target`. */
+  /** Server session to attach to; null opens a new session on `target`. */
   sessionId: string | null;
   target: string;
   active: boolean;
@@ -32,27 +32,27 @@ interface Props {
   visible: boolean;
   fontSize: number;
   copyOnSelect: boolean;
-  /** The on-screen keyboard is in use: keep the device keyboard closed on tap. */
-  suppressDeviceKeyboard: boolean;
+  /** Whether tapping the terminal may open the device keyboard (false while the full kiln keyboard is in use). */
+  deviceKeyboard: boolean;
   onState: (s: SessionState) => void;
   onTitle: (title: string) => void;
-  /** The server assigned or confirmed this view's session. */
+  /** The server confirmed which session this view is on (first frame of every attach). */
   onSession: (info: TerminalSessionInfo) => void;
   onRenderer?: (r: "webgl" | "dom") => void;
 }
 
 const encoder = new TextEncoder();
-/** Reattach backoff: quick first tries (a server restart takes a few seconds), then every 5 s. */
-const backoff = (attempt: number) => Math.min(5000, 300 * 2 ** Math.min(attempt, 5));
+/** Reattach delays: quick at first (server restarts take ~1-2 s), then patient. */
+const BACKOFF_MS = [250, 500, 1000, 1500, 2500, 4000];
 
 /**
- * One view of a server-side terminal session: xterm.js bound to /api/terminal/ws. The shell lives
- * on the server or a machine, not in this tab: closing the socket only detaches, and a dropped
- * connection reattaches by session id, the server replaying the screen so nothing is lost.
- * Binary frames carry keystrokes/output; text frames carry identity, resize, exit and errors.
+ * One terminal view: xterm.js attached to a server-side session over /api/terminal/ws. The shell
+ * lives on the server or a machine, not in this page: when the socket drops the view keeps
+ * reattaching by session id and repaints from the server's replay, so a restart or a flaky network
+ * costs a moment of "reconnecting", never the shell.
  */
 export const TerminalSession = React.forwardRef<SessionHandle, Props>(function TerminalSession(
-  { sessionId, target, active, visible, fontSize, copyOnSelect, suppressDeviceKeyboard, onState, onTitle, onSession, onRenderer },
+  { sessionId, target, active, visible, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onRenderer },
   ref,
 ) {
   const hostRef = React.useRef<HTMLDivElement>(null);
@@ -60,12 +60,13 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
   const wsRef = React.useRef<WebSocket | null>(null);
   const sessionRef = React.useRef<string | null>(sessionId);
   const [gen, setGen] = React.useState(0);
-  const cbs = React.useRef({ onState, onTitle, onSession, onRenderer, copyOnSelect, active });
-  cbs.current = { onState, onTitle, onSession, onRenderer, copyOnSelect, active };
+  const cbs = React.useRef({ onState, onTitle, onSession, onRenderer, copyOnSelect });
+  cbs.current = { onState, onTitle, onSession, onRenderer, copyOnSelect };
 
-  const sendBytes = React.useCallback((data: string | Uint8Array) => {
+  const sendBytes = React.useCallback((data: string | Uint8Array<ArrayBuffer>) => {
     const ws = wsRef.current;
-    if (ws?.readyState === WebSocket.OPEN) ws.send(typeof data === "string" ? encoder.encode(data) : data);
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    ws.send(typeof data === "string" ? encoder.encode(data) : data);
   }, []);
 
   /* ---- terminal instance: created once per component ---- */
@@ -130,35 +131,36 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
     });
     ro.observe(host);
 
-    // Touch scrolling: a vertical swipe becomes wheel input for xterm, which does the right thing
-    // in every mode (scrollback in a shell, wheel reports to mouse-aware programs, arrow keys in a
-    // full-screen program's alternate screen). A tap stays a tap (focus / click).
-    let touchY: number | null = null;
+    // Touch: a one-finger drag scrolls. It is replayed as wheel events on xterm, which then does
+    // what a wheel does there: scrollback in a shell, wheel reports to programs that track the
+    // mouse, arrow keys in full-screen programs that don't. Short touches stay taps.
+    let lastY: number | null = null;
     let moved = 0;
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) return;
-      touchY = e.touches[0]?.clientY ?? null;
+      lastY = e.touches[0]?.clientY ?? null;
       moved = 0;
     };
     const onTouchMove = (e: TouchEvent) => {
       const t = e.touches[0];
-      if (touchY === null || !t || e.touches.length !== 1) return;
-      const dy = touchY - t.clientY;
+      if (lastY === null || !t || e.touches.length !== 1) return;
+      const dy = lastY - t.clientY;
       moved += Math.abs(dy);
       if (moved < 8) return;
-      touchY = t.clientY;
+      lastY = t.clientY;
       e.preventDefault();
-      const target = host.querySelector(".xterm-screen") ?? host;
-      target.dispatchEvent(
+      const screen = host.querySelector(".xterm-screen");
+      screen?.dispatchEvent(
         new WheelEvent("wheel", { deltaY: dy * 2, deltaMode: 0, clientX: t.clientX, clientY: t.clientY, bubbles: true, cancelable: true }),
       );
     };
     const onTouchEnd = () => {
-      touchY = null;
+      lastY = null;
     };
     host.addEventListener("touchstart", onTouchStart, { passive: true });
     host.addEventListener("touchmove", onTouchMove, { passive: false });
     host.addEventListener("touchend", onTouchEnd, { passive: true });
+    host.addEventListener("touchcancel", onTouchEnd, { passive: true });
 
     return () => {
       disposed = true;
@@ -167,6 +169,7 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
       host.removeEventListener("touchstart", onTouchStart);
       host.removeEventListener("touchmove", onTouchMove);
       host.removeEventListener("touchend", onTouchEnd);
+      host.removeEventListener("touchcancel", onTouchEnd);
       subs.forEach((s) => s.dispose());
       wsRef.current?.close();
       wsRef.current = null;
@@ -176,115 +179,126 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ---- device keyboard: closed while the kiln keyboard is in use ---- */
+  /* ---- device keyboard: suppressed while the kiln keyboard is in use ---- */
   React.useEffect(() => {
     const ta = kRef.current?.term.textarea;
     if (!ta) return;
-    ta.setAttribute("inputmode", suppressDeviceKeyboard ? "none" : "text");
-    ta.setAttribute("autocapitalize", "off");
-    ta.setAttribute("autocorrect", "off");
-    ta.setAttribute("spellcheck", "false");
-  }, [suppressDeviceKeyboard, gen]);
+    if (deviceKeyboard) ta.removeAttribute("inputmode");
+    else ta.setAttribute("inputmode", "none");
+  }, [deviceKeyboard, gen]);
 
-  /* ---- websocket: attach (or open), and reattach whenever the connection drops ---- */
+  /* ---- websocket: attach, and reattach whenever it drops ---- */
   React.useEffect(() => {
-    const kt = kRef.current;
-    const hostEl = hostRef.current;
-    if (!kt || !hostEl || gen === 0) return;
-    const term = kt.term;
-    let ws: WebSocket | null = null;
+    const k = kRef.current;
+    const host = hostRef.current;
+    if (!k || !host || gen === 0) return;
+    const term = k.term;
     let stopped = false;
     let ended = false;
     let attempt = 0;
     let timer = 0;
+    let ws: WebSocket | null = null;
 
-    const schedule = () => {
+    const schedule = (fast = false) => {
       if (stopped || ended) return;
       window.clearTimeout(timer);
-      cbs.current.onState({ kind: "reconnecting", attempt });
-      timer = window.setTimeout(connect, backoff(attempt));
+      const delay = fast ? 150 : (BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)] ?? 4000);
       attempt += 1;
+      cbs.current.onState({ kind: "reconnecting", attempt });
+      timer = window.setTimeout(connect, delay);
     };
 
     function connect() {
       if (stopped || ended) return;
-      window.clearTimeout(timer);
-      safeFit(kt, hostEl);
-      const cols = Math.max(2, term.cols);
-      const rows = Math.max(1, term.rows);
-      const id = sessionRef.current;
-      const params = id ? new URLSearchParams({ session: id }) : new URLSearchParams({ target, cols: String(cols), rows: String(rows) });
+      safeFit(k!, host!);
+      const params = new URLSearchParams();
+      const reattach = sessionRef.current !== null;
+      if (sessionRef.current) params.set("session", sessionRef.current);
+      else {
+        params.set("target", target);
+        params.set("cols", String(Math.max(2, term.cols)));
+        params.set("rows", String(Math.max(1, term.rows)));
+      }
       const sock = new WebSocket(wsUrl(`/api/terminal/ws?${params}`));
       sock.binaryType = "arraybuffer";
       ws = sock;
       wsRef.current = sock;
-      if (attempt === 0) cbs.current.onState({ kind: "connecting" });
+      if (!reattach) cbs.current.onState({ kind: "connecting" });
 
-      sock.onopen = () => {
-        sock.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-      };
       sock.onmessage = (ev) => {
-        if (typeof ev.data !== "string") {
-          term.write(new Uint8Array(ev.data as ArrayBuffer));
-          return;
-        }
-        let msg: TerminalControlFrame;
-        try {
-          msg = JSON.parse(ev.data) as TerminalControlFrame;
-        } catch {
-          term.write(ev.data);
-          return;
-        }
-        switch (msg.type) {
-          case "session": {
-            // The replay that follows rebuilds the screen from scratch.
-            if (sessionRef.current) term.reset();
-            sessionRef.current = msg.session.id;
-            attempt = 0;
-            cbs.current.onSession(msg.session);
-            cbs.current.onState({ kind: "open" });
-            if (cbs.current.active) term.focus();
-            break;
+        if (typeof ev.data === "string") {
+          let msg: TerminalControlFrame;
+          try {
+            msg = JSON.parse(ev.data) as TerminalControlFrame;
+          } catch {
+            term.write(ev.data);
+            return;
           }
-          case "missing":
-          case "reconnect":
-            // Its machine is reconnecting (or the server just restarted): try again shortly.
-            sock.close();
-            break;
-          case "exit":
-            ended = true;
-            cbs.current.onState({ kind: "exited", code: msg.code ?? null });
-            term.write(`\r\n\x1b[2m\x1b[38;2;151;153;159m[process exited${msg.code !== null && msg.code !== undefined ? ` with code ${msg.code}` : ""}]\x1b[0m\r\n`);
-            break;
-          case "error":
-            ended = true;
-            cbs.current.onState({ kind: "error", message: msg.message });
-            term.write(`\r\n\x1b[38;2;209;170;173m[error] ${msg.message}\x1b[0m\r\n`);
-            break;
+          switch (msg.type) {
+            case "session": {
+              sessionRef.current = msg.session.id;
+              cbs.current.onSession(msg.session);
+              if (msg.session.title) cbs.current.onTitle(msg.session.title);
+              // The replay that follows repaints the whole session: start from a clean terminal.
+              if (reattach) term.reset();
+              attempt = 0;
+              cbs.current.onState({ kind: "open" });
+              // Our size wins on attach (the replay was rendered for the session's last size).
+              sock.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+              if (active) term.focus();
+              return;
+            }
+            case "missing":
+              // Its machine is reconnecting (or the server just restarted): keep trying.
+              schedule();
+              sock.close();
+              return;
+            case "reconnect":
+              schedule(true);
+              sock.close();
+              return;
+            case "exit":
+              ended = true;
+              cbs.current.onState({ kind: "exited", code: msg.code ?? null });
+              term.write(`\r\n\x1b[2m\x1b[38;2;151;153;159m[process exited${msg.code !== null && msg.code !== undefined ? ` with code ${msg.code}` : ""}]\x1b[0m\r\n`);
+              return;
+            case "error":
+              ended = true;
+              cbs.current.onState({ kind: "error", message: msg.message });
+              term.write(`\r\n\x1b[38;2;209;170;173m[error] ${msg.message}\x1b[0m\r\n`);
+              return;
+          }
+          return;
         }
+        term.write(new Uint8Array(ev.data as ArrayBuffer));
       };
       sock.onclose = () => {
         if (wsRef.current === sock) wsRef.current = null;
-        if (!stopped && !ended) schedule();
+        if (stopped || ended) return;
+        schedule();
       };
     }
 
-    // Back from the background / back online: retry at once instead of waiting out the backoff.
-    const retryNow = () => {
-      if (document.visibilityState === "visible" && !ended && !stopped && (!ws || ws.readyState === WebSocket.CLOSED)) {
+    // Coming back to the page or the network: retry at once instead of waiting out the backoff.
+    const kick = () => {
+      if (!stopped && !ended && (!ws || ws.readyState === WebSocket.CLOSED)) {
+        window.clearTimeout(timer);
         attempt = 0;
         connect();
       }
     };
-    document.addEventListener("visibilitychange", retryNow);
-    window.addEventListener("online", retryNow);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") kick();
+    };
+    window.addEventListener("online", kick);
+    document.addEventListener("visibilitychange", onVisible);
 
     connect();
     return () => {
       stopped = true;
       window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", retryNow);
-      window.removeEventListener("online", retryNow);
+      window.removeEventListener("online", kick);
+      document.removeEventListener("visibilitychange", onVisible);
       if (wsRef.current === ws) wsRef.current = null;
       ws?.close();
     };
@@ -299,10 +313,10 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
     if (!k || !host) return;
     const id = requestAnimationFrame(() => {
       safeFit(k, host);
-      if (!suppressDeviceKeyboard) k.term.focus();
+      k.term.focus();
     });
     return () => cancelAnimationFrame(id);
-  }, [active, visible, gen, suppressDeviceKeyboard]);
+  }, [active, visible, gen]);
 
   React.useEffect(() => {
     const k = kRef.current;
@@ -316,7 +330,7 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
     ref,
     () => ({
       reconnect: () => {
-        // After an exit or error: a fresh session on the same target.
+        // A fresh session on the same target (the old one ended).
         const k = kRef.current;
         if (k) {
           k.term.reset();
@@ -337,9 +351,7 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
         if (kRef.current) kRef.current.term.options.fontSize = px;
       },
       send: (bytes: string) => {
-        const term = kRef.current?.term;
-        if (!term) return;
-        term.scrollToBottom();
+        kRef.current?.term.scrollToBottom();
         sendBytes(bytes);
       },
       appCursor: () => kRef.current?.term.modes.applicationCursorKeysMode ?? false,

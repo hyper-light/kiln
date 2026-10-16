@@ -20,7 +20,6 @@ use crate::http::server::{self as srv, Request, Response};
 use crate::http::ws::{self, Message};
 use crate::hub::Hub;
 use crate::logs::LogEvent;
-use crate::proto::{LANE_TERM, ServerMsg};
 use crate::store::Repo;
 
 pub struct ApiError(StatusCode, String);
