@@ -16,13 +16,22 @@ for name in $KILN_GIT_REPOS; do
     git -C "$repo" config http.receivepack false
 done
 
-fcgiwrap -c "${FCGI_CHILDREN:-4}" -s unix:/tmp/fcgiwrap.sock &
+SOCK=/tmp/fcgiwrap.sock
+# /tmp is an emptyDir, which outlives container restarts: a socket left by the previous run would
+# make fcgiwrap fail to bind (and look like a live socket below), so every restart would 502.
+rm -f "$SOCK"
+fcgiwrap -c "${FCGI_CHILDREN:-4}" -s "unix:$SOCK" &
+FCGI_PID=$!
 
 # wait for the socket so the first request does not 502
 i=0
-while [ ! -S /tmp/fcgiwrap.sock ] && [ "$i" -lt 50 ]; do
+while [ ! -S "$SOCK" ] && [ "$i" -lt 50 ]; do
     i=$((i + 1))
     sleep 0.1
 done
+if ! kill -0 "$FCGI_PID" 2>/dev/null || [ ! -S "$SOCK" ]; then
+    echo "kiln-git: fcgiwrap did not start" >&2
+    exit 1
+fi
 
 exec nginx -e /dev/stderr -c /etc/nginx/kiln-git.conf -g 'daemon off;'
