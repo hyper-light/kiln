@@ -4,13 +4,21 @@
 # on boot via `kiln install --agent --unattended`.
 #
 #   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --token <join-token> [--labels baremetal,bench] [--name box1] [--slots 4]
+#
+# Without a token, `--join` asks the server to take this machine instead (`kiln join`): it prints a
+# verification code, an admin approves the machine in the UI (Agents -> Waiting to join), and the
+# agent is installed the same way.
+#
+#   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --join [--labels baremetal,bench] [--name box1]
 set -eu
 
 SERVER="@@KILN_SERVER@@"
+JOIN=0
 ARGS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="$2"; shift 2 ;;
+    --join) JOIN=1; shift ;;
     *) ARGS="$ARGS $1"; shift ;;
   esac
 done
@@ -28,5 +36,9 @@ chmod 0755 "$TMP"
 mv -f "$TMP" "$BIN_DIR/kiln"
 trap - EXIT
 echo "kiln installed to $BIN_DIR/kiln"
+if [ "$JOIN" = 1 ]; then
+  # shellcheck disable=SC2086
+  exec "$BIN_DIR/kiln" join --server "$SERVER" $ARGS
+fi
 # shellcheck disable=SC2086
 exec "$BIN_DIR/kiln" install --agent --unattended --server "$SERVER" $ARGS

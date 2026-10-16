@@ -212,6 +212,65 @@ export interface JoinInfo {
   token: string;
   server: string;
   command: string;
+  /** Token-free install that asks to join (an admin approves it with a verification code). */
+  join?: string;
+  join_manual?: string;
+}
+
+export type JoinRequestStatus = "pending" | "approved" | "denied";
+
+/** A machine asking to join as an agent (`kiln join`), GET /api/join-requests. */
+export interface JoinRequest {
+  id: string;
+  name: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  labels: string[];
+  version: string;
+  /** Where the request came from. */
+  address: string;
+  status: JoinRequestStatus;
+  /** Six digits; null until the machine has confirmed the request. */
+  code: string | null;
+  created_at: number;
+  expires_at: number;
+  /** The agent name the approval gave. */
+  agent: string | null;
+}
+
+/** A kiln instance heard on the local network (multicast DNS). */
+export interface DiscoveredInstance {
+  id: string;
+  instance: string;
+  /** Host name. */
+  name: string;
+  role: "server" | "agent" | string;
+  version: string;
+  os: string;
+  arch: string;
+  port: number;
+  quic: number;
+  ca: string | null;
+  enrolled: string | null;
+  addresses: string[];
+  first_seen: number;
+  last_seen: number;
+  url: string | null;
+  /** Already one of this server's agents (or runs one). */
+  joined: boolean;
+  agent: string | null;
+  same_ca: boolean;
+  join_command: string;
+}
+
+export interface DiscoveryInfo {
+  enabled: boolean;
+  announce: boolean;
+  browse: boolean;
+  join_requests: boolean;
+  self: { id: string; name: string; instance: string; ca: string | null; port: number; quic: number; version: string };
+  instances: DiscoveredInstance[];
 }
 
 export type MetricsHistory = Record<string, HostSample[]>;
@@ -246,7 +305,11 @@ export type ServerEvent =
   | { type: "job"; job: Job }
   | { type: "agent"; agent: Agent }
   | { type: "sample"; agent: string; sample: HostSample }
-  | { type: "queue"; queued: number; running: number };
+  | { type: "queue"; queued: number; running: number }
+  /** Join requests changed: refetch GET /api/join-requests. */
+  | { type: "join_requests" }
+  /** The discovery table changed: refetch GET /api/discovery. */
+  | { type: "discovery" };
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
 
