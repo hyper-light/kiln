@@ -163,6 +163,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");
     }
     let (ca, leaf, enrolled_quic) = credentials(&o, &shutdown).await?;
+    // The certificate names this agent (the server checks Hello against it); an approved join may
+    // have given a variant of the requested name.
+    let name = crate::pki::leaf_name(&leaf).unwrap_or_else(|| o.name.clone());
+    if name != crate::pki::sanitize_name(&o.name) {
+        tracing::info!(certificate = %name, requested = %o.name, "using the agent name from this agent's certificate");
+    }
     let quic_addr = o
         .quic
         .clone()
@@ -197,7 +203,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
 
     let hello = |running: Vec<String>| Hello {
         protocol: proto::VERSION,
-        name: o.name.clone(),
+        name: name.clone(),
         labels: o.labels.clone(),
         slots: o.slots.max(1),
         hostname: crate::config::Config::hostname(),
@@ -344,7 +350,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let exec = Exec {
                             assign: *a,
                             work_dir: o.work_dir.clone(),
-                            agent_name: o.name.clone(),
+                            agent_name: name.clone(),
                             up: uplink.clone(),
                             cancel,
                             http: http.clone(),

@@ -1,8 +1,10 @@
 import type {
   Agent,
   AuditEntry,
+  DiscoveryInfo,
   Job,
   JoinInfo,
+  JoinRequest,
   Me,
   MetricsHistory,
   NewRepo,
@@ -152,6 +154,11 @@ export const api = {
   forgetAgent: (name: string) => del<void>(`/api/agents/${enc(name)}`),
   drainAgent: (name: string, draining: boolean) => post<void>(`/api/agents/${enc(name)}/drain`, { draining }),
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),
+  joinRequests: (signal?: AbortSignal) => get<JoinRequest[]>("/api/join-requests", signal),
+  approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) =>
+    post<{ id: string; status: string; name: string; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
+  denyJoin: (id: string) => post<{ id: string; status: string; name: string }>(`/api/join-requests/${enc(id)}/deny`),
+  discovery: (signal?: AbortSignal) => get<DiscoveryInfo>("/api/discovery", signal),
 
   metricsHistory: (agent?: string, signal?: AbortSignal) =>
     get<MetricsHistory>(`/api/metrics/history${qs({ agent })}`, signal),

@@ -98,6 +98,10 @@ pub struct Hub {
     cancel_sent: Mutex<HashMap<String, Instant>>,
     /// (job, agent) pairs recently declined: not offered again until DECLINE_BACKOFF passes.
     declined: Mutex<HashMap<(String, String), Instant>>,
+    /// Multicast DNS discovery: what this server announces and the kiln instances it heard.
+    pub discovery: Arc<crate::discovery::Discovery>,
+    /// Machines asking to join as agents (`kiln join`), waiting for an admin.
+    pub joins: crate::join::Requests,
 }
 
 impl Hub {
@@ -114,6 +118,7 @@ impl Hub {
     ) -> Arc<Self> {
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
+        let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         Arc::new(Self {
             cfg,
             store,
@@ -139,6 +144,8 @@ impl Hub {
             shutdown,
             cancel_sent: Mutex::new(HashMap::new()),
             declined: Mutex::new(HashMap::new()),
+            discovery,
+            joins: crate::join::Requests::default(),
         })
     }
 

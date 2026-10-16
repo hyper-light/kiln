@@ -16,6 +16,7 @@ import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage, useDocumentTitle, useLocalStorage, useResource } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { HostCharts } from "./host-charts";
+import { OnThisNetwork, WaitingToJoin, useJoinData } from "./agents-join";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct, upsert } from "./shared";
 
 type Filter = "all" | "connected" | "baremetal" | "k8s" | "draining";
@@ -39,6 +40,7 @@ export default function Agents() {
   const [joinOpen, setJoinOpen] = React.useState(params.get("join") === "1");
   const [forget, setForget] = React.useState<Agent | null>(null);
   const selected = params.get("agent");
+  const { requests: joinRequests, discovery } = useJoinData();
 
   React.useEffect(() => {
     if (params.get("join") === "1") {
@@ -125,6 +127,8 @@ export default function Agents() {
           </Button>
         }
       />
+
+      <WaitingToJoin requests={joinRequests.data ?? []} onDecided={joinRequests.reload} />
 
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <Segmented
@@ -243,6 +247,8 @@ export default function Agents() {
           </table>
         </div>
       )}
+
+      <OnThisNetwork discovery={discovery.data} error={discovery.error} onRetry={discovery.reload} />
 
       <JoinDialog open={joinOpen} onOpenChange={setJoinOpen} />
       <AgentDrawer agent={selAgent} onClose={() => openAgent(null)} onDrain={drain} onForget={(a) => setForget(a)} />
@@ -383,6 +389,22 @@ function JoinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: b
               The agent shows up here as soon as it connects. Give it labels like <span className="chip">bench</span> or <span className="chip">gpu</span> to target it with{" "}
               <code className="font-mono text-[#cdc4e0]">runs-on</code>.
             </p>
+            {info.join && (
+              <div className="space-y-2 border-t border-[#222428] pt-4">
+                <div className="label">Without a token: ask to join</div>
+                <pre className="overflow-x-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[12px] leading-relaxed whitespace-pre-wrap break-all text-[#cdc4e0]">
+                  <span className="text-[#6d7078] select-none">$ </span>
+                  {info.join}
+                </pre>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-[#8f939e]">
+                    The machine shows a verification code and appears under Waiting to join; approve it when the codes match. With kiln already
+                    installed, run <code className="font-mono text-[#cdc4e0]">kiln join</code> instead.
+                  </p>
+                  <CopyButton text={info.join} label="Copy command" />
+                </div>
+              </div>
+            )}
           </div>
         )}
       </DialogContent>

@@ -9,6 +9,7 @@
 //!  ├─ k8s-reaper    pod lifecycle (Kubernetes mode)
 //!  ├─ sampler       server host metrics
 //!  ├─ retention     prune old runs + logs
+//!  ├─ discovery     multicast DNS: announce `_kiln._tcp.local.`, browse for other kiln instances
 //!  └─ local-agent   in-process agent over loopback QUIC (bare-metal mode)
 //! ```
 
@@ -110,6 +111,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     child!("gitops-discover", h => crate::gitops::discover_loop(h));
     child!("gitops-poll", h => crate::gitops::poll_loop(h));
     child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
+    // Home-network discovery (multicast DNS): announce this server, list the kiln instances nearby.
+    if cfg.discovery.enabled && (cfg.discovery.announce || cfg.discovery.browse) {
+        child!("discovery", h => crate::discovery::Discovery::serve(h));
+    }
 
     // Kubernetes executor: connect in the background so a slow API server never delays startup.
     if cfg.kubernetes.enabled {
@@ -159,8 +164,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             // Connections are spread over every shard; a fresh stream has no armed
                             // waits, so it can move.
                             let api = api.clone();
+                            let remote = stream.peer_addr().ok();
                             crate::rt::spawn_spread(async move {
-                                crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), api).await;
+                                crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), api, remote).await;
                             });
                         }
                         Err(e) => {

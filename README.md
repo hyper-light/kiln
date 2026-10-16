@@ -37,8 +37,8 @@ kiln login                         # opens the UI with a one-time link; no passw
 sudo; add `--unattended` to use `sudo -n` only). The server runs a local agent by default, so
 `runs-on: [baremetal]` jobs work immediately.
 
-To add another machine, such as a benchmark box, copy the command from **Agents → Add agent** in
-the UI:
+To add another machine with a join token, such as a benchmark box, copy the command from
+**Agents → Add agent** in the UI:
 
 ```sh
 curl -fsSL http://<server>:7070/install.sh | sh -s -- --token <join-token> --labels baremetal,bench
@@ -70,6 +70,28 @@ version. On Windows, add an agent from PowerShell (no elevation needed):
 Give Windows and macOS agents their own labels (`windows`, `macos`) so `runs-on: [baremetal]`
 jobs written for Linux do not land on them.
 
+## Add another computer
+
+On a home network kiln servers announce themselves (multicast DNS, `_kiln._tcp.local.`), so the
+other computers need no token and no address. With the kiln binary on the new computer:
+
+```sh
+kiln join          # finds the server, asks to join, prints a verification code, waits
+```
+
+The request shows up in the UI under **Agents → Waiting to join**. Approve it there if the UI shows
+the same verification code as the terminal. The computer then installs its agent, which starts on
+boot, and appears in the fleet with its terminal, metrics and jobs. `kiln join --server
+http://<server>:7070` skips the search. `--labels`, `--name` and `--slots` work as for
+`kiln install --agent`. A computer without kiln can fetch it from the server and join in one step:
+`curl -fsSL http://<server>:7070/install.sh | sh -s -- --join`. **Agents → On this network** lists
+the kiln machines the server hears that have not joined yet, with the command to run on each.
+
+Firewalls: discovery needs UDP 5353 open to the LAN on both machines, for example
+`sudo ufw allow from 192.168.1.0/24 to any port 5353 proto udp`. Joining also needs the server's
+HTTP port (TCP 7070) and QUIC port (UDP 7071) reachable from the new computer. Discovery can be
+turned off with `[discovery] enabled = false`; see [docs/architecture.md](docs/architecture.md#home-network-discovery-and-joining).
+
 ## Kubernetes (multi-node, ArgoCD, Prometheus, Grafana)
 
 ```sh
@@ -84,7 +106,7 @@ the `kiln-external` service (UDP 7071 + TCP 7070).
 
 | Path | What |
 | --- | --- |
-| `crates/kiln` | The binary: `server`, `agent`, `supervise`, `install`, `login`, `validate`, … |
+| `crates/kiln` | The binary: `server`, `agent`, `supervise`, `install`, `join`, `login`, `validate`, … |
 | `ui/` | React + Tailwind dashboard in the hyperlight-site design language, embedded at build time |
 | `deploy/` | Dockerfile support, Helm chart, ArgoCD apps, Grafana dashboards, alert rules, cluster scripts |
 | `docs/` | [architecture](docs/architecture.md), [API](docs/api.md), [pipelines](docs/pipelines.md) |

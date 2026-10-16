@@ -19,6 +19,7 @@ pub struct Config {
     pub terminal: Terminal,
     pub retention: Retention,
     pub telemetry: Telemetry,
+    pub discovery: Discovery,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
@@ -132,6 +133,24 @@ pub struct Telemetry {
     pub log_format: String,
 }
 
+/// Finding other kiln instances on the local network (multicast DNS, `_kiln._tcp.local.`) and
+/// letting machines ask to join this server as agents. Joining always needs an admin's approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Discovery {
+    /// Master switch for announcing and browsing.
+    pub enabled: bool,
+    /// Advertise this server on the local network (UDP 5353 must be open to the LAN).
+    pub announce: bool,
+    /// Keep a table of other kiln instances seen on the network (`GET /api/discovery`).
+    pub browse: bool,
+    /// Accept join requests (`POST /api/join-requests`) from machines running `kiln join`.
+    pub join_requests: bool,
+    /// Network interfaces to use (e.g. `["enp5s0"]`). Empty: every multicast-capable LAN
+    /// interface except loopback, point-to-point links and container bridges.
+    pub interfaces: Vec<String>,
+}
+
 fn hostname() -> String {
     crate::os::hostname()
 }
@@ -221,6 +240,12 @@ impl Default for Kubernetes {
             server_quic: None,
             priority_class: None,
         }
+    }
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self { enabled: true, announce: true, browse: true, join_requests: true, interfaces: Vec::new() }
     }
 }
 
