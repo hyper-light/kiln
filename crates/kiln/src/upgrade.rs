@@ -294,8 +294,38 @@ pub fn parse_unit(body: &str, unit: &str, system: bool) -> Option<Existing> {
     })
 }
 
+/// Read a launchd job kiln wrote (`kiln install --agent` on macOS): the binary, and what follows
+/// `supervise --` in its `ProgramArguments`. Its environment stays with it (an upgrade there
+/// replaces the binary in place).
+pub fn parse_plist(body: &str, unit: &str, system: bool) -> Option<Existing> {
+    let array = body.split("<key>ProgramArguments</key>").nth(1)?.split("</array>").next()?;
+    let words: Vec<String> = array.split("<string>").skip(1).filter_map(|s| s.split("</string>").next()).map(xml_unescape).collect();
+    let (bin, rest) = words.split_first()?;
+    let sep = rest.iter().position(|w| w == "--")?;
+    let args = rest.get(sep + 1..)?.to_vec();
+    (rest.first().map(String::as_str) == Some("supervise") && args.first().map(String::as_str) == Some("agent")).then(|| Existing {
+        boot: "launchd".to_owned(),
+        system,
+        unit: unit.to_owned(),
+        bin: PathBuf::from(bin),
+        args,
+        env: Vec::new(),
+    })
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
 /// The installed agent service (`kiln install --agent`), if any.
 pub fn find_existing(unit: &str) -> Option<Existing> {
+    if cfg!(target_os = "macos") {
+        for system in [false, true] {
+            if let Ok(body) = std::fs::read_to_string(crate::install::launchd_plist(system, unit)) {
+                return parse_plist(&body, unit, system);
+            }
+        }
+    }
     if cfg!(target_os = "linux") {
         let user = crate::os::config_home().join(format!("systemd/user/{unit}.service"));
         if let Ok(body) = std::fs::read_to_string(&user) {
@@ -363,6 +393,14 @@ pub async fn install_alongside(unit: &str, say: &(dyn Fn(String) + Sync)) -> any
     let existing = find_existing(unit).ok_or_else(|| {
         anyhow::anyhow!("no installed kiln agent service ({unit}) found to upgrade beside; install one with `kiln install --agent` first")
     })?;
+    // launchd (macOS) runs a runner that takes a new binary in place: the binary its job runs is
+    // replaced, and the runner (its supervisor first) re-executes itself from it once its jobs are
+    // done, keeping its terminals.
+    if existing.boot == "launchd" {
+        copy_atomic(&std::env::current_exe()?, &existing.bin).with_context(|| format!("install {}", existing.bin.display()))?;
+        say(format!("runner      {} (taken up in place once its jobs are done; it keeps its terminals)", existing.bin.display()));
+        return Ok(());
+    }
     let state_dir = arg_value(&existing.args, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);
     let (machine_cert, key) = machine_credentials(&state_dir)?;
     let server = arg_value(&existing.args, "--server").or_else(|| crate::join::stored(&state_dir, "server")).ok_or_else(|| {
