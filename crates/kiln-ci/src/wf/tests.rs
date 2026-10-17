@@ -1,0 +1,179 @@
+//! W02's unit tests: the scenarios (W02-S01 to S05), v1 forms (R06), overlays (AC05), file
+//! kinds and precedence (R01, R02, AC08), schemas (R09). The corpora run in `tests/wf_corpus.rs`.
+
+use super::*;
+use crate::expr::Dialect;
+
+fn gha(src: &str) -> (Option<Workflow>, Vec<Diag>) {
+    parse_workflow(".github/workflows/ci.yml", src, Dialect::Gha)
+}
+
+fn kiln(src: &str) -> (Option<Workflow>, Vec<Diag>) {
+    parse_workflow(".kiln/ci.yaml", src, Dialect::Kiln)
+}
+
+fn codes(d: &[Diag]) -> Vec<&'static str> {
+    d.iter().map(|x| x.code).collect()
+}
+
+fn errors(d: &[Diag]) -> Vec<String> {
+    d.iter().filter(|x| x.is_error()).map(|x| format!("{} {}:{} {}", x.code, x.range.start.line, x.range.start.col, x.message)).collect()
+}
+
+#[test]
+fn w02_s01_a_plain_github_workflow() {
+    let (wf, d) = gha("on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo hi\n");
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    assert!(codes(&d).contains(&"KCI6002"), "tag, not SHA: info");
+    let wf = wf.unwrap_or_default();
+    assert_eq!(wf.jobs.len(), 1);
+    assert_eq!(wf.on.first().map(|t| t.event.as_str()), Some("push"));
+    assert!(!wf.checkout, "GHA workflows never check out implicitly");
+}
+
+#[test]
+fn w02_s02_run_and_uses_together() {
+    let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo\n        uses: actions/checkout@v4\n");
+    let e = d.iter().find(|x| x.code == "KCI1012");
+    assert_eq!(e.map(|x| x.range.start.line), Some(6), "{d:?}");
+}
+
+#[test]
+fn w02_s03_secrets_not_available_in_job_if() {
+    let (_, d) = gha("on: push\njobs:\n  a:\n    if: ${{ secrets.X == '' }}\n    runs-on: x\n    steps: [{run: echo}]\n");
+    let e = d.iter().find(|x| x.code == "KCI3001");
+    assert!(e.is_some(), "{d:?}");
+    assert_eq!(e.map(|x| (x.range.start.line, x.range.start.col)), Some((4, 13)), "points at `secrets`");
+}
+
+#[test]
+fn w02_s05_untrusted_input_in_run() {
+    let (_, d) = gha("on: pull_request\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo \"${{ github.event.pull_request.title }}\"\n");
+    assert!(codes(&d).contains(&"KCI6004"), "{d:?}");
+    assert!(d.iter().find(|x| x.code == "KCI6004").and_then(|x| x.fix.as_ref()).is_some());
+}
+
+#[test]
+fn github_rules_are_strict() {
+    let (_, d) = gha("on: push\njobs:\n  a:\n    run-on: x\n    steps: [{run: echo}]\n");
+    let e = d.iter().find(|x| x.code == "KCI1010").map(|x| x.message.clone()).unwrap_or_default();
+    assert!(e.contains("did you mean `runs-on`"), "{e}");
+    assert!(codes(&d).contains(&"KCI1014"), "runs-on missing");
+    let (_, d) = gha("on: pushh\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(codes(&d).contains(&"KCI1018"));
+    let (_, d) = gha("on:\n  pull_request:\n    types: [opend]\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(d.iter().any(|x| x.code == "KCI1015" && x.message.contains("opened")), "{d:?}");
+    let (_, d) = gha("on: push\npermissions:\n  content: read\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(d.iter().any(|x| x.code == "KCI1015" && x.message.contains("contents")));
+    let (_, d) = gha("on: push\njobs:\n  a:\n    needs: [b]\n    runs-on: x\n    steps: [{run: echo}]\n  b:\n    needs: a\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(codes(&d).contains(&"KCI4002"), "cycle");
+    let (_, d) = gha("on: push\njobs:\n  a:\n    needs: [bild]\n    runs-on: x\n    steps: [{run: echo}]\n  build:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(d.iter().any(|x| x.code == "KCI4001" && x.message.contains("build")));
+    let (_, d) = gha("on: push\njobs:\n  call:\n    uses: ./.github/workflows/r.yml\n    runs-on: x\n");
+    assert!(codes(&d).contains(&"KCI1016"), "a reusable call can't have runs-on");
+    let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    strategy:\n      matrix:\n        os: []\n    steps: [{run: echo}]\n");
+    assert!(codes(&d).contains(&"KCI1017"));
+}
+
+#[test]
+fn kiln_keys_are_refused_in_github_workflows() {
+    let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    retry: {max: 2}\n    steps: [{run: echo}]\n");
+    let e = d.iter().find(|x| x.code == "KCI5002").map(|x| x.message.clone()).unwrap_or_default();
+    assert!(e.contains("overlay"), "{e}");
+    let (_, d) = gha("on:\n  diff: {}\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(codes(&d).contains(&"KCI5002"));
+    let (_, d) = gha("on: push\njobs:\n  a:\n    if: changed('x')\n    runs-on: x\n    steps: [{run: echo}]\n");
+    assert!(codes(&d).contains(&"KCI5001"), "{d:?}");
+}
+
+#[test]
+fn w02_r06_v1_forms() {
+    let src = "name: ci\non:\n  push: { branches: [main] }\n  tag: { branches: ['v*'] }\n  schedule: ['0 6 * * *']\njobs:\n  test:\n    toolchain: rust\n    matrix: { profile: [dev, release] }\n    retries: 2\n    artifacts: ['target/**']\n    cache: ['.cargo/registry']\n    exclusive: true\n    if: branch == 'main'\n    steps:\n      - run: cargo test --profile ${{ matrix.profile }}\n        tty: true\n";
+    let (wf, d) = kiln(src);
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let wf = wf.unwrap_or_default();
+    assert!(wf.checkout, "kiln checks out implicitly");
+    assert!(wf.trigger("workflow_dispatch").is_some(), "v1 allows manual runs by default");
+    assert!(wf.on.iter().any(|t| t.event == "push" && t.tags.as_deref() == Some(&["v*".to_owned()][..])), "on.tag became push tags");
+    assert_eq!(wf.trigger("schedule").map(|t| t.schedules.len()), Some(1));
+    let j = wf.job("test").cloned().unwrap_or_default();
+    assert!(matches!(j.strategy.as_ref().and_then(|s| s.matrix.as_ref()), Some(ir::Matrix::Spec(m)) if m.axes.len() == 1));
+    assert_eq!(j.kiln.toolchain.as_deref(), Some("rust"));
+    assert!(j.kiln.exclusive);
+    assert_eq!(j.kiln.artifacts, vec!["target/**".to_owned()]);
+    assert!(j.kiln.retry.is_some());
+    assert!(j.runs_on.is_none(), "the server's default applies");
+    let (wf, _) = kiln("name: x\non:\n  manual: false\n  push: {}\njobs:\n  a: { steps: [{run: x}] }\n");
+    assert!(wf.unwrap_or_default().trigger("workflow_dispatch").is_none());
+}
+
+#[test]
+fn w02_ac05_overlays() {
+    let base = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [linux, macos]\n    steps:\n      - id: test\n        run: make test\n";
+    let (wf, d) = gha(base);
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let mut wf = wf.unwrap_or_default();
+    let before = def_hash(&wf);
+    let ov_src = "jobs:\n  build:\n    runs-on: [linux, x64]\n    retry: { max: 2, on: [infra] }\n    prefer: [{ fact: disk.free, higher: true }]\n    strategy:\n      matrix:\n        where: matrix.os != 'macos'\n    steps:\n      test:\n        retry: { max: 1 }\n      missing:\n        retry: { max: 1 }\n  nojob:\n    retry: { max: 1 }\n";
+    let (ov, d) = parse_overlay(ov_src);
+    assert!(errors(&d).is_empty(), "{:?}", errors(&d));
+    let ov = ov.unwrap_or_default();
+    let d = apply_overlay(&mut wf, &ov);
+    assert_eq!(d.iter().filter(|x| x.code == "KCI4010").count(), 2, "{d:?}");
+    let j = wf.job("build").cloned().unwrap_or_default();
+    assert!(j.kiln.retry.is_some() && !j.kiln.prefer.is_empty());
+    assert!(matches!(&j.runs_on, Some(ir::RunsOn::Labels(l)) if l.len() == 2));
+    assert!(matches!(j.strategy.as_ref().and_then(|s| s.matrix.as_ref()), Some(ir::Matrix::Spec(m)) if m.filter.is_some()));
+    assert!(j.steps.first().is_some_and(|s| s.kiln.retry.is_some()));
+    assert_ne!(def_hash(&wf), before);
+    let (_, d) = parse_overlay("jobs:\n  build:\n    steps: []\n    env: { A: b }\n");
+    assert!(d.iter().any(|x| x.code == "KCI1010"), "overlays can't change GitHub keys: {d:?}");
+}
+
+#[test]
+fn file_kinds_and_precedence() {
+    assert_eq!(file_kind(".github/workflows/ci.yml"), Some(FileKind::GhaWorkflow));
+    assert_eq!(file_kind(".github/workflows/sub/ci.yml"), None, "not subdirectories");
+    assert_eq!(file_kind(".kiln/ci.yaml"), Some(FileKind::KilnWorkflow));
+    assert_eq!(file_kind(".kiln/review.yaml"), Some(FileKind::Policy));
+    assert_eq!(file_kind(".kiln/overlays/ci.yaml"), Some(FileKind::Overlay { stem: "ci".into() }));
+    assert_eq!(file_kind(".github/actions/setup/action.yml"), Some(FileKind::Action));
+    assert_eq!(file_kind("README.md"), None);
+    assert!(!github_workflows_run(GithubWorkflows::Auto, true).0);
+    assert!(github_workflows_run(GithubWorkflows::Auto, false).0);
+    assert!(github_workflows_run(GithubWorkflows::On, true).0);
+    assert!(!github_workflows_run(GithubWorkflows::Off, false).0);
+}
+
+#[test]
+fn actions() {
+    let (a, d) = parse_action("name: x\ninputs:\n  token:\n    required: 'true'\n    default: ${{ github.token }}\nruns:\n  using: composite\n  steps:\n    - run: echo hi\n    - run: echo\n      shell: bash\nbranding: {icon: x}\nweird: 1\n");
+    let a = a.unwrap_or_default();
+    assert_eq!(a.runs.steps.len(), 2);
+    assert!(a.inputs.first().is_some_and(|i| i.required));
+    assert!(codes(&d).contains(&"KCI1020"), "composite run needs shell");
+    assert!(d.iter().any(|x| x.code == "KCI1010" && x.severity == Severity::Warning), "unknown keys only warn");
+    let (_, d) = parse_action("runs:\n  using: node20\n");
+    assert!(codes(&d).contains(&"KCI1014"));
+}
+
+#[test]
+fn schemas_are_generated() {
+    for k in [SchemaKind::Gha, SchemaKind::Kiln, SchemaKind::Overlay, SchemaKind::Action] {
+        let s = schema(k);
+        assert_eq!(s.get("type").and_then(|t| t.as_str()), Some("object"));
+    }
+    let g = schema(SchemaKind::Gha);
+    let job = g.pointer("/properties/jobs/patternProperties/^[A-Za-z_][A-Za-z0-9_-]*$/properties");
+    assert!(job.is_some_and(|p| p.get("runs-on").is_some() && p.get("retry").is_none()), "GHA jobs have no kiln keys");
+    let k = schema(SchemaKind::Kiln);
+    let job = k.pointer("/properties/jobs/patternProperties/^[A-Za-z_][A-Za-z0-9_-]*$/properties");
+    assert!(job.is_some_and(|p| p.get("retry").is_some()));
+}
+
+#[test]
+fn diagnostics_point_into_block_scalars() {
+    let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: |\n          echo one\n          echo ${{ secrets }}\n          echo ${{ bad( }}\n");
+    let e = d.iter().find(|x| x.is_error()).map(|x| (x.range.start.line, x.range.start.col));
+    assert_eq!(e, Some((9, 23)), "the `(` of `bad(`: {d:?}");
+}

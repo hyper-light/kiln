@@ -379,6 +379,23 @@ impl Template {
     }
 }
 
+/// Where each `${{ … }}` body is in a template: (start, end) byte offsets of the text between
+/// `${{` and `}}`. For mapping errors inside a template back to their place in a file.
+pub fn template_spans(src: &str, dialect: Dialect) -> Result<Vec<(usize, usize)>, ExprError> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(start) = src.get(from..).and_then(|r| r.find("${{")) {
+        let body_start = from + start + 3;
+        let body = src.get(body_start..).unwrap_or_default();
+        let Some(end) = find_close(body, dialect) else {
+            return Err(ExprError::new("KCI2002", "`${{` is not closed by `}}`", Some(u32::try_from(from + start + 1).unwrap_or(u32::MAX))));
+        };
+        out.push((body_start, body_start + end));
+        from = body_start + end + 2;
+    }
+    Ok(out)
+}
+
 /// The byte offset of the `}}` that closes an expression body, skipping string literals.
 fn find_close(body: &str, dialect: Dialect) -> Option<usize> {
     let bytes = body.as_bytes();

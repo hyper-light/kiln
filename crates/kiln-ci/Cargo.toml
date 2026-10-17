@@ -12,6 +12,7 @@ thiserror = "2.0.21"
 regex = "1"
 serde_yaml = "0.9.34"
 sha2 = "0.11.1"
+yaml-rust2 = "0.13"
 
 [dev-dependencies]
 proptest = "1"
