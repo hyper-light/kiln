@@ -822,12 +822,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let base = o.server_url.trim_end_matches('/').to_owned();
                         let rt = &mut a.runtime;
                         for u in [&mut rt.results_url, &mut rt.cache_url, &mut rt.facade_url, &mut rt.api_url, &mut rt.graphql_url] {
-                            if u == "/" {
-                                // The server itself (`GITHUB_SERVER_URL` has no trailing slash).
-                                u.clone_from(&base);
-                            } else if u.starts_with('/') {
+                            if u.starts_with('/') {
                                 *u = format!("{base}{u}");
                             }
+                        }
+                        // `GITHUB_SERVER_URL` has no trailing slash; `ACTIONS_CACHE_URL` and
+                        // `ACTIONS_RESULTS_URL` keep theirs, as the toolkit appends paths to them.
+                        if rt.facade_url.ends_with('/') {
+                            rt.facade_url.pop();
                         }
                         if let Some(u) = rt.id_token_url.as_mut().filter(|u| u.starts_with('/')) {
                             *u = format!("{base}{u}");

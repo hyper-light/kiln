@@ -9,6 +9,7 @@ pub mod events;
 pub mod facade;
 pub mod load;
 pub mod runs;
+pub mod services;
 pub mod token;
 pub mod workflows;
 

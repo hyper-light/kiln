@@ -177,6 +177,7 @@ pub fn spawn(hub: Arc<Hub>) {
     }
     let Some(rx) = hub.ci.rx.lock().take() else { return };
     hub.ci.on.store(true, Ordering::Relaxed);
+    super::services::spawn_maintenance(Arc::clone(&hub));
     crate::rt::spawn(async move {
         let mut rules = vec![routing::native_rule()];
         if hub.cfg.ci.github_labels {
@@ -523,7 +524,9 @@ impl Dispatch {
         let spec = &l.spec;
         let wf = &spec.workflow;
         let job = spec.def();
-        let token = super::token::leg_token(&self.hub, leg);
+        let (cache_mode, cache) = cache_access(spec, r);
+        let ttl = (i64::from(spec.timeout_minutes) + 60) * 60;
+        let token = super::token::mint(&self.hub, &super::token::Leg { leg, run: &l.run, repo: &r.repo.id, cache, cache_mode: cache_mode.as_str(), ttl });
         let mut secrets: Vec<wire::Secret> = Vec::new();
         if r.trusted {
             secrets.extend(self.hub.ci_secrets().into_iter().map(|(name, value)| wire::Secret { name, value }));
@@ -558,9 +561,11 @@ impl Dispatch {
             timeout_minutes: spec.timeout_minutes,
             continue_on_error: spec.continue_on_error,
             runtime: wire::Runtime {
-                results_url: "/_kiln/results/".into(),
+                // The results service (Twirp at the origin's root) and the cache as GHES serves
+                // it (`_apis/artifactcache/` under the root), W08.
+                results_url: "/".into(),
                 runtime_token: token.clone(),
-                cache_url: "/_kiln/cache/".into(),
+                cache_url: "/".into(),
                 id_token_url: None,
                 id_token_request_token: None,
                 // The code host: kiln's mirror, which the leg's token reads (W14), at the
@@ -569,6 +574,7 @@ impl Dispatch {
                 api_url: "/_kiln/api".into(),
                 graphql_url: "/_kiln/api/graphql".into(),
                 github_token: token,
+                cache_mode: Some(cache_mode.as_str().into()),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
             actions: r.actions.clone(),
@@ -864,4 +870,26 @@ fn report_from_json(s: &str) -> LegReport {
         run_env: serde_json::from_value(get("run_env")).unwrap_or_default(),
         secret_outputs: serde_json::from_value(get("secret_outputs")).unwrap_or_default(),
     }
+}
+
+/// A leg's cache mode and the cache scopes its token allows, in lookup order (W08-R06,
+/// W08-R14): restores from its own ref, a pull request's base and the default branch, and saves
+/// to its own ref.
+fn cache_access(spec: &kiln_ci::plan::LegSpec, r: &RunSt) -> (kiln_ci::store::cache::Mode, Vec<super::token::Access>) {
+    use kiln_ci::store::cache::{self, Mode};
+    let default_branch = r.github.pointer("/event/repository/default_branch").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).unwrap_or("main").to_owned();
+    let git_ref = r.event.git_ref.clone();
+    let on_default = git_ref == format!("refs/heads/{default_branch}");
+    let job_mode = spec.def().and_then(|j| j.cache_mode.as_deref()).and_then(Mode::parse);
+    let wf_mode = spec.workflow.cache_mode.as_deref().and_then(Mode::parse);
+    let mode = cache::effective(job_mode, wf_mode, &r.event.name, on_default);
+    let mut access = Vec::new();
+    for (i, scope) in cache::scopes(&git_ref, r.event.base_ref.as_deref(), &default_branch).into_iter().enumerate() {
+        let read = if mode.restores() { super::token::READ } else { 0 };
+        let write = if i == 0 && mode.saves() { super::token::WRITE } else { 0 };
+        if read | write != 0 {
+            access.push(super::token::Access { scope, permission: read | write });
+        }
+    }
+    (mode, access)
 }
