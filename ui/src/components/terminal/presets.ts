@@ -46,7 +46,8 @@ export const SHELL: Preset = {
 export const CLAUDE: Preset = {
   id: "claude",
   name: "Claude Code",
-  match: /claude/i,
+  // Its name, or its window titles: a status glyph and the conversation's topic ("◐ Fix the tests").
+  match: /claude|^\s*[◐◓◑◒✳✶✻✽✢]\s/iu,
   shortcuts: [
     { label: "Esc", hint: "Interrupt Claude", strokes: [esc] },
     { label: "Esc Esc", hint: "Rewind / edit a previous message", strokes: [esc, esc] },

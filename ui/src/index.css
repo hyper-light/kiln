@@ -1465,6 +1465,9 @@
   background: #0b0c0e;
   user-select: none;
   -webkit-user-select: none;
+  /* No iOS long-press callout or tap flash: a held key must not start a system gesture. */
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
   /* Every finger's press reaches the keys: no pinch or double-tap gestures over the keyboard
      (with them the browser swallows overlapping presses, which drops letters when typing fast). */
   touch-action: none;
