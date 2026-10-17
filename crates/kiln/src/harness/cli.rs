@@ -2,7 +2,9 @@
 //! They run in this shell's directory and environment, as kiln-native sessions of the machine's
 //! kiln, and show up under this shell in kiln's UI on every device.
 
-use std::io::{BufRead as _, Write as _};
+#[cfg(unix)]
+use std::io::BufRead as _;
+use std::io::Write as _;
 
 use serde_json::Value;
 
@@ -57,6 +59,7 @@ pub enum AgentsCmd {
     },
 }
 
+#[cfg(unix)]
 fn socket() -> anyhow::Result<std::path::PathBuf> {
     std::env::var_os("KILN_HARNESS_SOCK")
         .map(std::path::PathBuf::from)

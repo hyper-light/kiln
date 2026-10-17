@@ -322,6 +322,51 @@ export interface SlashCommand {
     | { kind: "unsupported"; reason: string };
 }
 
+/** Which agents a broadcast picks: `ids` exactly; else `all`, or filters that must all match (none: nothing). */
+export interface BroadcastTo {
+  all?: boolean;
+  ids?: string[];
+  machines?: string[];
+  kinds?: string[];
+  status?: string[];
+}
+
+export interface BroadcastBody {
+  to: BroadcastTo;
+  text?: string;
+  mode?: SendMode;
+  command?: Command;
+  approvals?: "allow" | "deny";
+}
+
+export interface BroadcastOutcome {
+  id: string;
+  name: string;
+  machine: string;
+  kind: string;
+  result: "sent" | "skipped" | "failed";
+  reason?: string;
+}
+
+export interface BroadcastReport {
+  id: string;
+  sent: number;
+  skipped: number;
+  failed: number;
+  results: BroadcastOutcome[];
+}
+
+type Counted<T> = T & { count: number };
+
+export interface BroadcastPreview {
+  agents: { id: string; name: string; machine: string; kind: string; status: Status }[];
+  machines: string[];
+  commands: Counted<SlashCommand>[];
+  modes: Counted<ModeOption>[];
+  models: Counted<ModelOption>[];
+  efforts: Counted<ControlOption>[];
+}
+
 export interface ControlOption {
   id: string;
   label: string;
@@ -438,6 +483,19 @@ export interface KindInfo {
 }
 
 /** What to start. */
+/** A conversation that ended on a machine, to continue with `spec.resume`. */
+export interface PastSession {
+  kind: string;
+  id: string;
+  title: string;
+  cwd: string;
+  branch?: string;
+  model?: string;
+  /** Unix seconds. */
+  last_activity: number;
+  last_prompt?: string;
+}
+
 export interface Spec {
   kind: string;
   cwd?: string;
@@ -465,7 +523,17 @@ export type Command =
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }
   | { type: "queue_send_now"; id: string }
-  | { type: "approve"; id: string; decision: Decision; message?: string; always?: number; answers?: Record<string, string> }
+  | {
+      type: "approve";
+      id: string;
+      decision: Decision;
+      message?: string;
+      always?: number;
+      /** The older form: one string per question (runners from before `choices`). */
+      answers?: Record<string, string>;
+      /** Each question's answer as picked: labels, your own words, a note. Wins over `answers`. */
+      choices?: { question: string; id?: string; selected: string[]; other?: string; note?: string }[];
+    }
   | { type: "interrupt" }
   | { type: "set_mode"; mode: string }
   | { type: "set_model"; model: string }
@@ -517,11 +585,18 @@ export const harnessApi = {
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  /** A machine's recent ended conversations (newest first), for one harness or all. */
+  history: (target: string, kind?: string, limit = 40) =>
+    call<PastSession[]>("GET", `/api/harness/history?target=${encodeURIComponent(target)}${kind ? `&kind=${encodeURIComponent(kind)}` : ""}&limit=${limit}`),
   /** A task's output: its tail, or what came after byte `since`. */
   taskOutput: (id: string, task: string, since?: number) =>
     call<TaskOutput>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(task)}/output${since !== undefined ? `?since=${since}` : ""}`),
   /** End the terminal a found session runs in and continue its conversation as an agent here. */
-  takeover: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`),
+  /** `stop`: it runs outside kiln, so it is stopped on its machine first. */
+  takeover: (machine: string, pid: number, opts?: { stop?: boolean }) =>
+    call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`, opts?.stop ? { stop: true } : undefined),
+  /** Continue a copy of a found session's conversation as an agent; the session keeps running. */
+  fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** A command without opening the session's socket (inbox answers). */
@@ -541,6 +616,10 @@ export const harnessApi = {
   },
   /** One command to many agents (each send gets its own message id). */
   broadcast: (ids: string[], c: Command) => call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }),
+  /** One thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits. */
+  broadcastTo: (body: BroadcastBody) => call<BroadcastReport>("POST", "/api/harness/broadcast", body),
+  /** Who a broadcast to `to` would reach, and their catalogs merged (each entry with how many have it). */
+  broadcastPreview: (to: BroadcastTo) => call<BroadcastPreview>("POST", "/api/harness/broadcast/preview", { to }),
 };
 
 let seq = 0;
@@ -743,3 +822,67 @@ export function useAgentSession(id: string): [Snapshot, SessionStore] {
   const snap = React.useSyncExternalStore(store.subscribe, store.get, store.get);
   return [snap, store];
 }
+
+/* ------------------------------------------------------------------ accounts */
+
+/** A way to sign a harness in. `asks`: what it will want given back (the code the page shows, or an API key). */
+export interface AccountMethod {
+  id: string;
+  label: string;
+  asks?: "code" | "api_key";
+}
+
+/** Which account a harness runs as on one machine, as its own CLI reports it. */
+export interface Account {
+  /** "claude", "codex" … */
+  kind: string;
+  /** "Claude Code", "Codex" … */
+  name: string;
+  /** null: kiln couldn't tell (`error` says why). */
+  signed_in: boolean | null;
+  /** How it is signed in: "Claude subscription", "ChatGPT", "API key" … */
+  method?: string;
+  email?: string;
+  org?: string;
+  /** "max", "pro", "plus" … */
+  plan?: string;
+  /** The ways it can be signed in. */
+  methods: AccountMethod[];
+  error?: string;
+}
+
+/** A sign-in or sign-out, run by the harness's own CLI in a hidden terminal on its machine. */
+export interface AccountFlow {
+  id: string;
+  target: string;
+  kind: string;
+  action: "login" | "logout";
+  method?: string;
+  state: "running" | "done" | "failed" | "cancelled";
+  /** The sign-in page to open (on any device). */
+  url?: string;
+  /** A one-time code to enter on that page (device sign-in). */
+  code?: string;
+  /** Waiting to be given something: the code the page shows after signing in, or an API key. */
+  asks?: "code" | "api_key";
+  /** The CLI's own output, as plain text. */
+  lines: string[];
+  /** Once it ended: the account as it is now. */
+  account?: Account;
+  error?: string;
+  /** Unix seconds. */
+  started_at: number;
+  ended_at?: number;
+}
+
+export const accountsApi = {
+  /** Every harness's account on a machine ("local" or "agent:<machine>"). */
+  list: (target: string) => call<Account[]>("GET", `/api/accounts?target=${encodeURIComponent(target)}`),
+  login: (target: string, kind: string, method: string) => call<AccountFlow>("POST", "/api/accounts/login", { target, kind, method }),
+  flow: (id: string) => call<AccountFlow>("GET", `/api/accounts/flows/${encodeURIComponent(id)}`),
+  /** What a flow asks for (the page's code, or an API key): in the body only, never in a URL. */
+  input: (id: string, text: string) => call<void>("POST", `/api/accounts/flows/${encodeURIComponent(id)}/input`, { text }),
+  cancel: (id: string) => call<void>("DELETE", `/api/accounts/flows/${encodeURIComponent(id)}`),
+  /** Signs out at once: the flow comes back finished, with the account as it is now. */
+  logout: (target: string, kind: string) => call<AccountFlow>("POST", "/api/accounts/logout", { target, kind }),
+};

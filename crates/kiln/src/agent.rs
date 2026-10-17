@@ -8,7 +8,6 @@
 //! * Serves PTY terminals so the UI can drive this machine.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -173,10 +172,6 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
     }
 }
 
-async fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
-    crate::rt::resolve(addr).await.with_context(|| format!("resolve {addr}"))
-}
-
 /// A dial that produced no transport event in this long is treated as lost (see `run`).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -237,6 +232,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTP(S) to the server (source archives, artifacts): public roots plus kiln's own CA.
     let http = Arc::new(Client::new(Roots::WebPkiPlusDer(ca.clone()), None)?);
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
+    // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
+    let mut paths = crate::tunnel::Paths::new(&o.server_url, &quic_addr);
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
     let uplink = Uplink(up_tx);
@@ -342,7 +339,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Redial => {
                 redial = None;
-                match resolve(&quic_addr).await {
+                match paths.target(&http, Instant::now()).await {
                     Ok(addr) => {
                         dialing_since = Some(Instant::now());
                         net.command(Out::Connect { addr }).await;
@@ -386,13 +383,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     tracing::warn!(server = %quic_addr, after = ?DIAL_TIMEOUT, "no answer from server; rebuilding transport and redialing");
                     dialing_since = None;
                     net.command(Out::Rebuild).await;
-                    redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
+                    let now = Instant::now();
+                    redial = Some(if paths.dial_failed(now) { now } else { now + crate::sup::jitter(dial_backoff) });
                     dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                }
+                // Direct dials unanswered for too long: through the tunnel now. Tunnelled and UDP
+                // answers again: drop this connection (what is sent meanwhile waits in the buffer)
+                // and dial directly; the tunnel stays open until that connection is up.
+                if paths.tick(connected, Instant::now()) {
+                    connected = false;
+                    dialing_since = None;
+                    redial = Some(Instant::now());
                 }
             }
             Ev::Net(None) => anyhow::bail!("transport stopped"),
-            Ev::Net(Some(NetEvent::Connected { .. })) => {
-                tracing::info!(server = %quic_addr, "connected to server");
+            Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
+                tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+                paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
                 // Which process of this machine this is, then Hello (an older server skips the first).
@@ -418,14 +425,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
+                let now = Instant::now();
+                let mut at_once = false;
                 if connected {
                     tracing::warn!(%reason, "disconnected from server");
+                    paths.disconnected();
                 } else {
-                    tracing::info!(%reason, retry_in = ?dial_backoff, "dial failed");
+                    tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
+                    // The path changed (to the tunnel, or back): dial that way now.
+                    at_once = paths.dial_failed(now);
                 }
                 connected = false;
                 dialing_since = None;
-                redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
+                redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) => {
@@ -464,7 +476,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             for info in h.list() {
                                 let Some(s) = h.get(&info.id) else { continue };
                                 for u in s.snapshot() {
-                                    if let Ok(json) = serde_json::to_string(&u) {
+                                    for json in harness_frames(&info.id, &u) {
                                         uplink.0.send(Up::Term(AgentMsg::Harness { session: info.id.clone(), json })).await.ok();
                                     }
                                 }
@@ -694,6 +706,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             up.msg(AgentMsg::UpgradeDone { job, ok: error.is_none(), error }).await;
                         });
                     }
+                    ServerMsg::HarnessHistory { req, kind, limit } => match &ai {
+                        Some(ai) => {
+                            // Kiln's own sessions here are running, not past.
+                            let running = harness.as_ref().map(|h| h.list().into_iter().filter_map(|i| i.harness_session).collect()).unwrap_or_default();
+                            ai.history(req, kind, usize::try_from(limit).unwrap_or(usize::MAX), running, uplink.0.clone());
+                        }
+                        None => {
+                            uplink.0.send(Up::Term(AgentMsg::HarnessHistory { req, json: None })).await.ok();
+                        }
+                    },
                     ServerMsg::HarnessTaskOutput { req, session, task, since } => {
                         let s = harness.as_ref().and_then(|h| h.get(&session));
                         let up = uplink.0.clone();
@@ -703,6 +725,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 None => None,
                             };
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
+                        });
+                    }
+                    ServerMsg::DirList { req, path } => {
+                        // The console's folder picker: this machine's folders, read off this loop.
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let json = crate::dirs::answer(path).await;
+                            let _ = up.send(Up::Term(AgentMsg::DirList { req, json })).await;
                         });
                     }
                 }
@@ -745,8 +775,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Harness(session, u) => {
                 // Not kept across a disconnect: the reconnect sends every session whole.
-                if connected && let Ok(json) = serde_json::to_string(&u) {
-                    uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
+                if connected {
+                    for json in harness_frames(&session, &u) {
+                        uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                    }
                 }
             }
             Ev::Done(r) => {
@@ -795,6 +827,97 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
     credentials(o, &Shutdown::new()).await.map(|_| ())
 }
 
+
+/// Most of one agent-session update a frame carries. They go on the interactive lane, which
+/// refuses frames past 1 MiB ([`net::Kiln`]); a resumed session's history can be several.
+const HARNESS_FRAME: usize = 512 * 1024;
+
+/// An agent-session update as frames that fit: a long run of events goes in parts (events are
+/// upserts by id, so the parts mean what the whole did), and an event too large on its own has
+/// its longest texts cut, saying so. Anything else too large is dropped, and logged.
+fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
+    use crate::harness::core::Update;
+    let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
+    if json.len() <= HARNESS_FRAME {
+        return vec![json];
+    }
+    let Update::Events { events } = u else {
+        tracing::warn!(session, bytes = json.len(), "agent session update too large to send; dropped");
+        return Vec::new();
+    };
+    let one = HARNESS_FRAME - 1024;
+    let mut frames = Vec::new();
+    let mut part = Vec::new();
+    let mut size = 0;
+    for e in events {
+        let mut e = e.clone();
+        if json_len(&e) > one {
+            e = cut(e, one);
+        }
+        let n = json_len(&e).saturating_add(1);
+        if n > one {
+            tracing::warn!(session, event = %e.id, bytes = n, "agent session event too large to send, even cut; dropped");
+            continue;
+        }
+        if size + n > one && !part.is_empty() {
+            frames.extend(serde_json::to_string(&Update::Events { events: std::mem::take(&mut part) }));
+            size = 0;
+        }
+        size += n;
+        part.push(e);
+    }
+    if !part.is_empty() {
+        frames.extend(serde_json::to_string(&Update::Events { events: part }));
+    }
+    frames
+}
+
+fn json_len<T: Serialize>(v: &T) -> usize {
+    serde_json::to_vec(v).map_or(usize::MAX, |b| b.len())
+}
+
+/// An event cut to about `budget` bytes of JSON: its longest texts shortened, each saying so.
+fn cut(e: crate::harness::model::Event, budget: usize) -> crate::harness::model::Event {
+    let Ok(mut v) = serde_json::to_value(&e) else { return e };
+    for _ in 0..64 {
+        let len = json_len(&v);
+        if len <= budget {
+            break;
+        }
+        let mut best = (0, String::new());
+        longest(&v, String::new(), &mut best);
+        let Some(serde_json::Value::String(s)) = v.pointer_mut(&best.1) else { break };
+        if s.len() < 256 {
+            break;
+        }
+        let mut at = s.len().saturating_sub(len - budget + 64);
+        while !s.is_char_boundary(at) {
+            at -= 1;
+        }
+        let dropped = s.len() - at;
+        s.truncate(at);
+        s.push_str(&format!("\n… [{dropped} bytes cut by kiln to fit]"));
+    }
+    serde_json::from_value(v).unwrap_or(e)
+}
+
+/// The JSON pointer of the longest string in `v`.
+fn longest(v: &serde_json::Value, at: String, best: &mut (usize, String)) {
+    match v {
+        serde_json::Value::String(s) if s.len() > best.0 => *best = (s.len(), at),
+        serde_json::Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                longest(x, format!("{at}/{i}"), best);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for (k, x) in o {
+                longest(x, format!("{at}/{}", k.replace('~', "~0").replace('/', "~1")), best);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// The binary's modification time (an upgrade replaces the file).
 fn binary_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -897,5 +1020,51 @@ fn adopt_handover(o: &Opts, terms: &mut HashMap<String, (PtySession, Arc<crate::
     }
     if adopted > 0 {
         tracing::info!(terminals = adopted, "terminals carried across the upgrade");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::core::Update;
+    use crate::harness::model::{Body, Event};
+
+    fn said(id: usize, text: String) -> Event {
+        Event { id: format!("e{id}"), seq: id as u64, at: 0, parent: None, body: Body::Assistant { text, streaming: false } }
+    }
+
+    fn events(frame: &str) -> Vec<Event> {
+        match serde_json::from_str::<Update>(frame) {
+            Ok(Update::Events { events }) => events,
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_long_history_goes_in_parts_that_fit() {
+        // A resumed session's history: 900 events, about 1.8 MB.
+        let all: Vec<Event> = (0..900).map(|i| said(i, "x".repeat(2000))).collect();
+        let frames = harness_frames("s", &Update::Events { events: all.clone() });
+        assert!(frames.len() >= 4, "{} frames", frames.len());
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let sent: Vec<Event> = frames.iter().flat_map(|f| events(f)).collect();
+        assert_eq!(sent, all, "every event, whole and in order");
+        // Small ones go as they are.
+        let small = Update::Events { events: all.get(..3).unwrap_or_default().to_vec() };
+        assert_eq!(harness_frames("s", &small), vec![serde_json::to_string(&small).unwrap_or_default()]);
+    }
+
+    #[test]
+    fn an_event_too_large_alone_is_cut_and_says_so() {
+        let huge = said(7, format!("start {}", "é".repeat(1_500_000)));
+        let frames = harness_frames("s", &Update::Events { events: vec![said(1, "hi".into()), huge] });
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let sent: Vec<Event> = frames.iter().flat_map(|f| events(f)).collect();
+        assert_eq!(sent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["e1", "e7"]);
+        let text = match sent.last().map(|e| &e.body) {
+            Some(Body::Assistant { text, .. }) => text.as_str(),
+            _ => "",
+        };
+        assert!(text.starts_with("start ") && text.ends_with("bytes cut by kiln to fit]"), "{}", text.get(..40).unwrap_or(text));
     }
 }

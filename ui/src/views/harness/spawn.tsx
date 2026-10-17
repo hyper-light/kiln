@@ -8,12 +8,15 @@ import "./harness.css";
 import { Dialog as D, DropdownMenu, Popover } from "radix-ui";
 import { Check, ChevronDown, Folder, Rocket, Server, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
-import { harnessApi, type AgentInfo, type KindInfo, type Spec } from "@/api/harness";
+import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec } from "@/api/harness";
 import type { Agent, TerminalSessionInfo } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { errorMessage, useLocalStorage } from "@/lib/hooks";
+import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
+import { relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { HarnessMark } from "./parts";
+import { tildify } from "./derive";
+import { InlinePath } from "./inline-path";
 
 interface ModeChoice {
   id: string;
@@ -158,6 +161,61 @@ function FolderChip({ value, onChange, recent, shellLabel }: { value: string; on
   );
 }
 
+/** Below the prompt: the machine's past conversations with this harness, to pick one up again. */
+function PastSessions({ target, kind, kindName, onPick, busy }: { target: string; kind: string; kindName: string; onPick: (p: PastSession) => void; busy: boolean }) {
+  const [open, setOpen] = React.useState(false);
+  const [list, setList] = React.useState<PastSession[] | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const now = useNow();
+  React.useEffect(() => {
+    if (!open || !target) return;
+    let live = true;
+    setList(null);
+    setError(null);
+    harnessApi.history(target, kind).then(
+      (l) => live && setList(l),
+      (e: unknown) => live && setError(e instanceof Error ? e.message : String(e)),
+    );
+    return () => {
+      live = false;
+    };
+  }, [open, target, kind]);
+  if (!target) return null;
+  return (
+    <div className="ps">
+      <button type="button" className="ps-line" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span>Continue a past {kindName} session</span>
+        <ChevronDown size={12} className="ps-chev" aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="ps-body">
+          {error ? (
+            <p className="ps-none">{/(502|404|not found)/i.test(error) ? "This machine's runner can't list its past sessions yet — upgrade it in Settings → Updates." : error}</p>
+          ) : !list ? (
+            <p className="ps-none">Looking…</p>
+          ) : list.length === 0 ? (
+            <p className="ps-none">No past {kindName} sessions on this machine.</p>
+          ) : (
+            <ul className="ps-list">
+              {list.map((p) => (
+                <li key={p.id}>
+                  <button type="button" className="ps-row" disabled={busy} onClick={() => onPick(p)}>
+                    <span className="ps-title">{p.title || p.last_prompt || p.id}</span>
+                    <span className="ps-meta">
+                      {tildify(p.cwd)}
+                      {p.branch ? ` · ${p.branch}` : ""} · {relativeTime(p.last_activity, now)}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function SpawnDialog({
   open,
   onOpenChange,
@@ -243,6 +301,21 @@ export function SpawnDialog({
   const modeInfo = modes.find((m) => m.id === mode);
   const shellInfo = shell ? shells.find((s) => s.id === shell) : undefined;
   const targetShells = shells.filter((s) => s.target === target && !s.exited);
+
+  /** Pick up a past conversation where it ended: same harness, folder and history. */
+  const resume = async (p: PastSession) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const started = await harnessApi.start(target, { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: mode || undefined, name: (p.title || "").slice(0, 80) || undefined }, 1);
+      setDirs({ ...dirs, [target]: [p.cwd, ...recent.filter((d) => d !== p.cwd)].slice(0, 8) });
+      onStarted(started);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const start = async () => {
     if (!target) return;
@@ -358,7 +431,7 @@ export function SpawnDialog({
                   }}
                   options={where.map((t) => ({ value: t, label: machineName(t) }))}
                 />
-                <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : shell ? "this shell" : undefined} />
+                {shell && <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : "this shell"} />}
                 <Chip title="How many" label={`×${count}`} value={count} onPick={(n) => setCount(n)} options={COUNTS.map((n) => ({ value: n, label: n === 1 ? "1 agent" : `${n} agents` }))} />
                 {modes.length > 0 && (
                   <Chip
@@ -402,9 +475,11 @@ export function SpawnDialog({
               </div>
             )}
 
+            {!shell && target && <InlinePath target={target} value={cwd} onChange={setCwd} recent={recent} className="sp-path" />}
             {!noHarness && upgradeHint}
             {modeInfo && <div className="sp-hint">{modeInfo.hint}.</div>}
             {error && <div className="sp-error">{error}</div>}
+            <PastSessions target={target} kind={kind} kindName={kindInfo?.name ?? kind} onPick={(p) => void resume(p)} busy={busy} />
 
             <footer className="sp-foot">
               <span className="sp-foot-note">{target ? `${kindInfo?.name ?? kind} on ${machineName(target)}` : ""}</span>

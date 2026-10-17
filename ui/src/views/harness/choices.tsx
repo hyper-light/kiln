@@ -106,7 +106,7 @@ export interface ChoicesProps {
   busy?: boolean;
   canDecline?: boolean;
   /** Unset: a sheet on phones, a dialog elsewhere. */
-  layout?: "sheet" | "dialog" | "inline";
+  layout?: "sheet" | "dialog" | "inline" | "flow";
   onSubmit: (answers: ChoiceAnswer[]) => void;
   onDecline?: () => void;
   onMinimize?: () => void;
@@ -693,7 +693,7 @@ function Ask({
     }
   };
 
-  const modal = frame !== "inline";
+  const modal = frame !== "inline" && frame !== "flow";
   const title = agentName ?? kind ?? "The agent";
   const titleInner = (
     <>
@@ -846,7 +846,7 @@ function Ask({
       <section
         ref={setRoot}
         className={cn("ch", className)}
-        data-layout="inline"
+        data-layout={frame}
         data-wide={hasPreviews(questions) || undefined}
         aria-labelledby={`${uid}-t`}
         aria-describedby={describedBy}

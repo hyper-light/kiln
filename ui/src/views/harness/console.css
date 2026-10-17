@@ -134,68 +134,6 @@
   width: 40px;
   height: 40px;
 }
-.ag-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 14px;
-}
-.ag-chip {
-  position: relative;
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  gap: 8px;
-  height: 30px;
-  padding: 0 11px;
-  border: 1px solid #303239;
-  border-radius: 5px;
-  background: #0b0c0e;
-  color: #ededee;
-  font-size: 12.5px;
-  cursor: pointer;
-  transition: border-color 0.2s;
-}
-.ag-chip:hover {
-  border-color: #47464f;
-}
-.ag-chip:focus-within {
-  border-color: #bab0e3;
-}
-.ag-chip > svg {
-  color: #8f929b;
-}
-.ag-chip-label {
-  color: #8f929b;
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-.ag-chip-value {
-  white-space: nowrap;
-}
-.ag-chip-n {
-  color: #7b7e88;
-  font-family: var(--font-mono);
-  font-size: 10px;
-}
-.ag-chip select {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  font-size: 16px;
-  cursor: pointer;
-}
-.ag-chip-off {
-  cursor: default;
-  opacity: 0.5;
-}
-.ag-chip-off select {
-  cursor: default;
-}
 @container (max-width: 640px) {
   .ag-head {
     padding: 12px 14px 10px;
@@ -217,8 +155,6 @@
   .ag-cwd {
     max-width: 100%;
   }
-  /* Phones: how it runs is one tappable line (the sheet holds the rest). */
-  .ag-controls,
   .ag-wide-only {
     display: none;
   }
@@ -509,7 +445,6 @@
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .ag-chip,
   .cp-stop,
   .cp-send {
     transition: none;
@@ -589,159 +524,6 @@
 .hx-turn .hx-note,
 .hx-turn .hx-outcome {
   color: #d9dade;
-}
-
-/* ---------------------------------------------------------------- how it runs: a line on phones, a sheet behind it */
-.ag-summary {
-  display: none;
-  max-width: 100%;
-  min-width: 0;
-  align-items: center;
-  gap: 6px;
-  height: 24px;
-  margin-top: 4px;
-  color: #c9cbd1;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-.ag-summary > svg {
-  flex: none;
-  color: #8f929b;
-}
-.ag-summary-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-@container (max-width: 640px) {
-  .ag-summary {
-    display: flex;
-  }
-}
-.rs {
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-  padding: 4px 0 8px;
-}
-.rs-head {
-  margin: 0 0 8px;
-  color: #a1a3ab;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 400;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-}
-.rs-opts {
-  display: flex;
-  flex-direction: column;
-  border-top: 1px solid #25272c;
-}
-.rs-opt {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 12px 4px 12px 14px;
-  border-bottom: 1px solid #25272c;
-  text-align: left;
-}
-.rs-opt[aria-checked="true"] {
-  box-shadow: inset 2px 0 0 #bab0e3;
-}
-.rs-opt-label {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: #ededee;
-  font-size: 14px;
-}
-.rs-opt-desc {
-  color: #97999f;
-  font-size: 12px;
-  line-height: 1.5;
-}
-.rs-danger {
-  color: #d1aaad;
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-.rs-rows {
-  display: flex;
-  flex-direction: column;
-  border-top: 1px solid #25272c;
-}
-.rs-row {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 48px;
-  padding: 0 4px 0 14px;
-  border-bottom: 1px solid #25272c;
-  color: #ededee;
-  font-size: 14px;
-  cursor: pointer;
-}
-.rs-link {
-  border-top: 1px solid #25272c;
-  text-align: left;
-}
-.rs-label {
-  flex: 1;
-}
-.rs-value {
-  color: #a1a4ad;
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-.rs-row > svg {
-  color: #8f929b;
-}
-.rs-row select {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
-  font-size: 16px;
-  cursor: pointer;
-}
-.rs-row-off {
-  opacity: 0.5;
-}
-/* On a phone the sheet rises from the bottom edge. */
-@media (max-width: 640px) {
-  .dialog.ag-sheet {
-    top: auto;
-    bottom: 0;
-    left: 0;
-    width: 100%;
-    max-height: 86dvh;
-    padding-bottom: env(safe-area-inset-bottom);
-    transform: none;
-    border-right: 0;
-    border-bottom: 0;
-    border-left: 0;
-    border-radius: 12px 12px 0 0;
-    animation: ag-sheet-in 0.3s var(--ease);
-  }
-}
-@keyframes ag-sheet-in {
-  from {
-    transform: translateY(24px);
-    opacity: 0;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .dialog.ag-sheet {
-    animation: none;
-  }
 }
 
 /* ---------------------------------------------------------------- what it left running */
@@ -986,6 +768,14 @@
 .pl-hint {
   color: #7b7e88;
 }
+/* How many of the agents written to have it, when not all do. */
+.pl-note {
+  margin-left: 8px;
+  color: #c6b08e;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
 .pl-desc {
   min-width: 0;
   overflow: hidden;
@@ -1066,5 +856,290 @@
   .pl-item {
     flex-direction: column;
     gap: 2px;
+  }
+}
+
+/* The run tuner sits under the head's top row, full width. */
+.ag-head .ag-run {
+  margin-top: 10px;
+}
+
+/* ---------------------------------------------------------------- queued messages: a line that opens in place */
+.qd {
+  min-width: 0;
+}
+.qd-line {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 4px;
+  color: #a1a4ad;
+  text-align: left;
+}
+.qd-label {
+  flex: none;
+  color: #cdc6ea;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.qd-first,
+.qd-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: #8f929b;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qd-chev {
+  flex: none;
+  margin-left: auto;
+  color: #8f929b;
+  transition: transform 0.15s;
+}
+.qd[data-open] .qd-chev {
+  transform: rotate(180deg);
+}
+.qd-list {
+  margin: 4px 0 2px;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid #25272c;
+}
+.qd-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid #25272c;
+}
+.qd-n {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+.qd-text {
+  min-width: 0;
+  overflow: hidden;
+  color: #d9dade;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qd-text.qd-whole {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.qd-edit {
+  font-size: max(13px, 1em);
+}
+.qd-acts {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-left: -6px;
+}
+.qd-acts .qd-remove:hover {
+  color: #ecc9cc;
+}
+@media (pointer: coarse) {
+  .qd-acts .hx-icon {
+    width: 36px;
+    height: 36px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .qd-chev {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------- what's running besides it: one line, open in place */
+.al-line {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  padding: 4px max(16px, env(safe-area-inset-right)) 4px 4px;
+  color: #cdc6ea;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-align: left;
+  text-transform: uppercase;
+}
+.al-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.al-chev {
+  flex: none;
+  margin-left: auto;
+  color: #8f929b;
+  transition: transform 0.15s;
+}
+.al-list {
+  max-height: 40dvh;
+  margin: 4px 0 2px;
+  overflow-y: auto;
+  padding: 0;
+  border-top: 1px solid #25272c;
+  list-style: none;
+}
+.al-item {
+  border-bottom: 1px solid #25272c;
+}
+.al-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "glyph what time";
+  align-items: center;
+  gap: 2px 10px;
+  width: 100%;
+  padding: 8px max(16px, env(safe-area-inset-right)) 8px 4px;
+  text-align: left;
+}
+.al-row > .sg-optic,
+.al-row > .kg {
+  grid-area: glyph;
+}
+.al-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  /* Centred, not on the baseline: a segment that starts with its glyph would otherwise sit on
+     the glyph's bottom edge, higher than one that starts with the separator. */
+  vertical-align: middle;
+}
+.al-sep {
+  margin: 0 8px;
+  color: #6d7078;
+}
+.al-what {
+  grid-area: what;
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+}
+.al-kind {
+  flex: none;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.al-desc {
+  min-width: 0;
+  overflow: hidden;
+  color: #ededee;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.al-time {
+  grid-area: time;
+  display: inline-flex;
+  gap: 10px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.al-last {
+  max-width: 12ch;
+  overflow: hidden;
+  color: #8f929b;
+  text-overflow: ellipsis;
+}
+.al-item .bg-out {
+  padding: 0 4px 10px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .al-chev {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------- new agents: continue a past session */
+.ps {
+  border-top: 1px solid #25272c;
+}
+.ps-line {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 8px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  text-align: left;
+}
+.ps-line:hover {
+  color: #ededee;
+}
+.ps-chev {
+  transition: transform 0.15s;
+}
+.ps-line[aria-expanded="true"] .ps-chev {
+  transform: rotate(180deg);
+}
+.ps-body {
+  max-height: 34dvh;
+  overflow-y: auto;
+}
+.ps-none {
+  margin: 0 0 10px;
+  color: #8f929b;
+  font-size: 12px;
+}
+.ps-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ps-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 0;
+  border-top: 1px solid #1f2125;
+  text-align: left;
+}
+.ps-row:hover:not(:disabled) .ps-title {
+  color: #ffffff;
+}
+.ps-title {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 13.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ps-meta {
+  overflow: hidden;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ps-chev {
+    transition: none;
   }
 }

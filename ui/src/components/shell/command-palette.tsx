@@ -128,7 +128,7 @@ export function CommandPalette() {
     const actions: Item[] = [
       { id: "a-term-local", group: "Actions", label: "Open terminal on server", hint: "local", icon: <SquareTerminal size={15} />, run: () => go("/terminal?open=local") },
       { id: "a-new-agent", group: "Actions", label: "New agent", hint: "Claude Code, Codex, Gemini", icon: <Bot size={15} />, run: () => go("/agents?new=1") },
-      { id: "a-add-runner", group: "Actions", label: "Add runner", icon: <Server size={15} />, run: () => go("/runners?join=1") },
+      { id: "a-add-machines", group: "Actions", label: "Add machines", hint: "runners", icon: <Server size={15} />, run: () => go("/runners/add") },
       { id: "a-add-repo", group: "Actions", label: "Add repository", icon: <GitBranch size={15} />, run: () => go("/repos?add=1") },
       {
         id: "a-logout",

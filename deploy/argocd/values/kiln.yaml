@@ -28,6 +28,14 @@ config:
   kubernetes:
     max_pods: 64
 
+# kiln's own repository is on GitHub: its CI follows it there, like every hyper-light repository's
+# (Argo CD still deploys from the in-cluster git server). Registered here because the repository
+# was first added pointing at the in-cluster server, and discovery leaves names it already has.
+extraConfig: |
+  [[repos]]
+  name = "hyper-light/kiln"
+  clone_url = "https://github.com/hyper-light/kiln.git"
+
 # Bare-metal agents outside the cluster: <minikube node IP>:30070/TCP and :30071/UDP
 # (deploy/cluster/expose-lan.sh forwards host ports 7070/7071 to these for LAN machines).
 externalService:

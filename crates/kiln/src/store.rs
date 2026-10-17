@@ -275,8 +275,20 @@ impl Store {
 
     // ---------------------------------------------------------------- repos
 
+    /// Add a repository, or update it by name. One that moved to another remote forgets the
+    /// branches and tags it saw at the old one: its next poll adopts the new remote's as they are,
+    /// rather than building every ref that differs between the two.
     pub async fn upsert_repo(&self, r: Repo) -> anyhow::Result<Repo> {
         self.call(move |c| {
+            let before: Option<(String, String)> = c
+                .query_row("SELECT id, clone_url FROM repos WHERE name = ?1", [&r.name], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if let Some((id, url)) = &before
+                && url != &r.clone_url
+            {
+                c.execute("DELETE FROM refs WHERE repo_id = ?1", [id])?;
+                tracing::info!(repo = %r.name, from = %url, to = %r.clone_url, "repository moved: adopting its new remote's branches and tags as they are");
+            }
             c.execute(
                 "INSERT INTO repos (id, name, clone_url, branches, poll_seconds, enabled, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1109,6 +1121,34 @@ fn advance_run(tx: &rusqlite::Transaction<'_>, run_id: &str, now: i64) -> anyhow
 mod tests {
     use super::*;
     use crate::pipeline;
+
+    #[test]
+    fn a_repository_that_moves_adopts_its_new_remote() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            let at = |url: &str| Repo {
+                id: crate::util::new_id(),
+                name: "hyper-light/kiln".into(),
+                clone_url: url.into(),
+                branches: vec![],
+                poll_seconds: 60,
+                enabled: true,
+                created_at: 0,
+                last_polled_at: None,
+                last_error: None,
+            };
+            let repo = s.upsert_repo(at("http://kiln-git/kiln.git")).await?;
+            s.set_ref(repo.id.clone(), "refs/heads/main".into(), "a1".into()).await?;
+            // Re-read from the same remote (every discovery does): what it saw stays.
+            let same = s.upsert_repo(at("http://kiln-git/kiln.git")).await?;
+            anyhow::ensure!(same.id == repo.id && s.refs(repo.id.clone()).await?.len() == 1, "refs lost on a plain re-read");
+            // Moved to GitHub: same repository, nothing seen yet there (its next poll adopts it).
+            let moved = s.upsert_repo(at("https://github.com/hyper-light/kiln.git")).await?;
+            anyhow::ensure!(moved.id == repo.id, "a moved repository keeps its id (and its runs)");
+            anyhow::ensure!(s.refs(repo.id.clone()).await?.is_empty(), "refs from the old remote survived the move");
+            anyhow::Ok(())
+        })
+    }
 
     #[test]
     fn run_lifecycle() -> anyhow::Result<()> {

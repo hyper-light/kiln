@@ -716,7 +716,7 @@ pub async fn request(server: &str, me: &Machine, state_dir: &Path, say: &(dyn Fn
         let code = verification_code(&public_key, &ca_der, secret.as_bytes(), &nonce);
         say(&format!(
             "Asked {} ({server}, kiln {}) to let this machine join as \"{}\" ({}/{}, labels {}).\n\n    Verification code:  {}\n\n\
-             Approve it in the kiln UI under Agents → Waiting to join, after checking that the UI shows the same code.\n\
+             Approve it at {server}/runners/add (Runners → Add machines) once it shows the same code.\n\
              Waiting for a decision (the request expires in {} minutes)…",
             created.server,
             created.version,

@@ -72,6 +72,39 @@ scheduler assigns the oldest matching job. A lost agent (missed heartbeats) requ
 3. **Job**: retries, agent-loss requeue, timeouts, cancellation that kills the whole process group.
 4. **State**: SQLite in WAL mode with `synchronous=NORMAL`; recovery on start marks orphaned runs.
 
+## Agent transport
+
+Agents keep one QUIC connection to the server (hyper-transport, mutual TLS: the agent checks the
+server's certificate under the fixed name `kiln-server`, the server the agent's, both against the
+kiln CA). **No ports beyond the HTTP one are required; UDP is used when reachable.** An agent dials
+the QUIC address over UDP first. When two direct dials in a row get no answer (or direct dials go
+unanswered for 20 s) it opens the HTTP tunnel instead: a WebSocket to `GET /api/agents/tunnel` on
+the server's HTTP port (`ws://`, or `wss://` when the server URL is `https://`), with a UDP socket
+on loopback at its end that its QUIC endpoint dials. Each binary message is one datagram; the server
+relays them to and from its own QUIC listener from a loopback socket per tunnel (a wildcard
+`quic_addr` such as `0.0.0.0:7071` is reached at `127.0.0.1:7071`, `[::]` at `[::1]`, a specific
+address as itself).
+
+```text
+  agent QUIC ─UDP─▶ relay 127.0.0.1:<any> ═WS /api/agents/tunnel═▶ server relay ─UDP─▶ QUIC listener
+```
+
+QUIC runs end to end through the tunnel unchanged, so the tunnel adds no trust: the route is open at
+the HTTP level, and bounded instead (256 tunnels at once, 60 new ones a minute per source address,
+messages of at most one 1500-byte datagram, closed after 10 idle minutes). While tunnelled, the
+agent checks every 5 minutes whether UDP answers again (a 1200-byte datagram of a reserved QUIC
+version, which the listener answers with Version Negotiation, no handshake) and switches back when
+it does, closing the tunnel once the direct connection is up. It logs `connected directly` or
+`connected through the HTTP tunnel (UDP <addr> unreachable)` each time the transport changes.
+The agent names the TLS exporter value of the connection the tunnel carries in a text message
+(`bind <hex>`), which only the two ends of that connection can know; the server matches it against
+its own connections' to show the transport of each agent (`transport` in `GET /api/agents`).
+
+The tunnel costs throughput, not correctness: datagrams ride one TCP connection, so a lost segment
+holds up every QUIC stream behind it (head-of-line blocking) and QUIC's congestion control sees TCP's
+delays rather than the path's; terminals and job traffic are small enough not to notice. Datagrams a
+full socket cannot take are dropped, as a congested link would, and QUIC recovers them.
+
 ## Home network: discovery and joining
 
 kiln instances on one LAN find each other, and any computer can become an agent of a server with
@@ -84,7 +117,7 @@ with its terminal, metrics and jobs: one pane of glass across the computers in t
  POST /api/join-requests ────────────────▶  keeps the request (memory, 10 min)
    {name, os, arch, labels, CSR, H(secret)}
                      ◀──────────────────── {id, nonce, CA}
- shows the verification code                Agents → Waiting to join: code ──────▶ same code?
+ shows the verification code                Runners → Add machines: code ─────▶ same code?
  GET /api/join-requests/<id>, every 2 s ─▶                                   ◀──── Approve
                      ◀──────────────────── {approved, cert, CA, QUIC}
                                             (the CSR signed by the kiln CA, as in enrollment)
@@ -153,7 +186,7 @@ Joining is never automatic: a machine asks, an admin decides.
    its CA certificate. At most 20 requests wait at once and each source address may send one every
    5 seconds (HTTP 429 with `Retry-After` otherwise).
 3. The machine polls `GET /api/join-requests/<id>` every 2 s with the secret as a bearer token. The
-   first poll confirms the request: from then on admins see it under **Agents → Waiting to join**,
+   first poll confirms the request: from then on admins see it under **Runners → Add machines**,
    with its address and verification code, and can approve or deny it.
 4. **The verification code** is six digits taken from SHA-256 over the CSR's public key, the
    server's CA certificate, the machine's secret and the server's nonce; both sides compute it.
@@ -179,4 +212,6 @@ the binary from the server and runs `kiln join --server <server>`.
 
 **Firewalls.** Discovery needs UDP 5353 open to the LAN on every machine involved, e.g.
 `sudo ufw allow from 192.168.1.0/24 to any port 5353 proto udp`. Joining and running as an agent
-also need the server's HTTP port (TCP 7070) and QUIC port (UDP 7071) reachable from the machine.
+need only the server's HTTP port (TCP 7070) reachable from the machine; its QUIC port (UDP 7071) is
+used when it is reachable too, and agents tunnel QUIC through the HTTP port when it is not (see
+[Agent transport](#agent-transport)).

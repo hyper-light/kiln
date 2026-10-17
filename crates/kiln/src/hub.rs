@@ -75,6 +75,9 @@ pub struct AgentLive {
     /// restart: the old one keeps its terminals until they end). See `crate::instances`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub instances: Vec<crate::instances::InstanceView>,
+    /// How its connection reaches the server, while connected (`GET /api/agents`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<crate::tunnel::Transport>,
 }
 
 /// Output from a remote (agent) terminal session, routed to its websocket.
@@ -97,6 +100,8 @@ pub struct Hub {
     pub agents: Mutex<HashMap<String, AgentLive>>,
     peers: Mutex<HashMap<PeerId, String>>,
     pending_peers: Mutex<HashMap<PeerId, String>>,
+    /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
+    pub tunnels: Arc<crate::tunnel::Registry>,
     pub events: Broadcast<Arc<str>>,
     pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
     /// Every terminal session, local and on machines.
@@ -162,6 +167,7 @@ impl Hub {
             agents: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             pending_peers: Mutex::new(HashMap::new()),
+            tunnels: Arc::default(),
             events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
             terminals: crate::termsess::Sessions::new(),
@@ -283,6 +289,7 @@ impl Hub {
                     exclusive: false,
                     lost_at: None,
                     instances: vec![],
+                    transport: None,
                 },
             })
             .collect();
@@ -293,6 +300,9 @@ impl Hub {
             if !out.iter().any(|a| &a.name == name) {
                 out.push(l.clone());
             }
+        }
+        for a in &mut out {
+            a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
         }
         out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
         out
@@ -327,6 +337,38 @@ impl Hub {
     pub async fn harness_task_output(&self, machine: &str, session: &str, task: &str, since: Option<u64>) -> anyhow::Result<Option<String>> {
         let (session, task) = (session.to_owned(), task.to_owned());
         self.ai_ask(machine, move |req| ServerMsg::HarnessTaskOutput { req, session, task, since }).await
+    }
+
+    /// The folders at `path` on a machine, as JSON [`crate::dirs::Listing`], read by its newest
+    /// runner process. Only one that announced [`proto::CAP_DIRS`] is sent [`ServerMsg::DirList`]:
+    /// `Ok(None)` when it is too old to list folders.
+    pub async fn dir_list(&self, machine: &str, path: &str) -> anyhow::Result<Option<String>> {
+        let peer = {
+            let inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            inst.newest_with(machine, proto::CAP_DIRS)
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = proto::encode(&ServerMsg::DirList { req, path: path.to_owned() })?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(crate::dirs::WAIT, rx).await.ok() } else { None };
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(Some(json))) => Ok(Some(json)),
+            Some(_) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
+    /// A machine's past sessions (JSON `[PastSession]`).
+    pub async fn harness_history(&self, machine: &str, kind: Option<String>, limit: u32) -> anyhow::Result<Option<String>> {
+        self.ai_ask(machine, move |req| ServerMsg::HarnessHistory { req, kind, limit }).await
     }
 
     async fn ai_ask(&self, machine: &str, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<String>> {
@@ -422,12 +464,14 @@ impl Hub {
 
     async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
         match ev {
-            NetEvent::Connected { peer, name } => {
+            NetEvent::Connected { peer, name, binding } => {
+                self.tunnels.connected(peer, binding);
                 if let Some(n) = name {
                     self.pending_peers.lock().insert(peer, n);
                 }
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
+                self.tunnels.closed(peer);
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
                 let lost = self.instances.lock().lost(peer);
@@ -625,9 +669,14 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
-            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } => {
+            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
+                }
+            }
+            AgentMsg::DirList { req, json } => {
+                if let Some(tx) = self.ai_requests.lock().remove(&req) {
+                    let _ = tx.send(Some(json));
                 }
             }
             AgentMsg::Build { build, caps } => {
@@ -791,6 +840,7 @@ impl Hub {
             exclusive: false,
             lost_at: None,
             instances: Vec::new(),
+            transport: None,
         };
         let prev = self.agents.lock().get(&name).cloned();
         let draining = prev.as_ref().is_some_and(|a| a.draining);

@@ -18,7 +18,9 @@ const Deployments = React.lazy(() => import("@/views/deployments/index"));
 const DeploymentApp = React.lazy(() => import("@/views/deployments/app"));
 const Repos = React.lazy(() => import("@/views/repos"));
 const Runners = React.lazy(() => import("@/views/runners"));
-const Agents = React.lazy(() => import("@/views/agents"));
+const AddMachines = React.lazy(() => import("@/views/add-machines"));
+// Found sessions live in Mission control now; their old page sends you there.
+const FoundRedirect = React.lazy(() => import("@/views/harness/found"));
 const Mission = React.lazy(() => import("@/views/harness/mission"));
 const AgentPage = React.lazy(() => import("@/views/harness/agent"));
 const Metrics = React.lazy(() => import("@/views/metrics"));
@@ -80,8 +82,9 @@ export function App() {
                   <Route path="deployments/apps/:project/:name" element={<DeploymentApp />} />
                   <Route path="repos" element={<Repos />} />
                   <Route path="runners" element={<Runners />} />
+                  <Route path="runners/add" element={<AddMachines />} />
                   <Route path="agents" element={<Mission />} />
-                  <Route path="agents/sessions" element={<Agents />} />
+                  <Route path="agents/sessions" element={<FoundRedirect />} />
                   <Route path="agents/:id" element={<AgentPage />} />
                   <Route path="terminal" element={null} />
                   <Route path="telemetry" element={<Metrics />} />

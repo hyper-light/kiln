@@ -1,6 +1,7 @@
 //! kiln: a self-hosted GitOps CI/CD job server for the hyper-light stack.
 
 pub mod access;
+pub mod accounts;
 pub mod agent;
 pub mod aisessions;
 pub mod api;
@@ -9,6 +10,7 @@ pub mod cd;
 pub mod http;
 pub mod kubeapi;
 pub mod config;
+pub mod dirs;
 pub mod discovery;
 pub mod dns;
 pub mod exec;
@@ -37,6 +39,7 @@ pub mod sup;
 pub mod supervise;
 pub mod terminal;
 pub mod termsess;
+pub mod tunnel;
 pub mod ui;
 pub mod updates;
 pub mod upgrade;

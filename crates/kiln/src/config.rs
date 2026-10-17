@@ -135,8 +135,9 @@ pub struct Telemetry {
     pub log_format: String,
 }
 
-/// Finding other kiln instances on the local network (multicast DNS, `_kiln._tcp.local.`) and
-/// letting machines ask to join this server as agents. Joining always needs an admin's approval.
+/// Finding other kiln instances (multicast DNS `_kiln._tcp.local.` or the OS's own service
+/// discovery, unicast DNS-SD, probes of addresses, Tailscale peers) and letting machines ask to join
+/// this server as agents. Joining always needs an admin's approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Discovery {
@@ -151,6 +152,41 @@ pub struct Discovery {
     /// Network interfaces to use (e.g. `["enp5s0"]`). Empty: every multicast-capable LAN
     /// interface except loopback, point-to-point links and container bridges.
     pub interfaces: Vec<String>,
+    /// Use the system's service discovery where there is one (Bonjour on macOS, DNS-SD on
+    /// Windows 10 1809+) instead of kiln's own multicast DNS. Linux always uses kiln's own.
+    pub native: bool,
+    /// Unicast DNS-SD domains to browse for `_kiln._tcp.<domain>`, besides the system's search
+    /// domains and the browse domains they list (`b._dns-sd._udp.<domain>`).
+    pub domains: Vec<String>,
+    /// Name servers for unicast DNS-SD (`"192.168.1.1"`, `"[fd00::1]:53"`). Empty: those of
+    /// `/etc/resolv.conf`, or of the network adapters on Windows.
+    pub dns_servers: Vec<String>,
+    /// Who may query this instance's multicast DNS responder by unicast from outside its own
+    /// subnets (scans and probes from other networks): `"private"` (RFC 1918, 100.64.0.0/10,
+    /// fc00::/7, link-local), `"any"`, or addresses and CIDRs. Empty: the local subnets only.
+    pub answer_from: Vec<String>,
+    /// Probe the peers `tailscale status` lists, every few minutes.
+    pub tailscale: bool,
+    /// Addresses or host names (optionally `:<http port>`) probed every minute.
+    pub seeds: Vec<String>,
+    /// Publish this instance in a unicast DNS zone with DNS UPDATE signed with TSIG.
+    pub publish: Option<Publish>,
+}
+
+/// `[discovery.publish]`: the zone kiln adds its DNS-SD records to (RFC 2136 + RFC 8945).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Publish {
+    /// The primary name server of the zone, `host[:port]`.
+    pub server: String,
+    /// The zone, e.g. `home.example.com`.
+    pub zone: String,
+    /// The TSIG key's name.
+    pub key_name: String,
+    /// A file holding the key's base64 secret (alone, or as `tsig-keygen` writes it).
+    pub key_secret_file: PathBuf,
+    /// `hmac-sha256` (default), `hmac-sha384` or `hmac-sha512`.
+    pub algorithm: String,
 }
 
 fn hostname() -> String {
@@ -290,7 +326,20 @@ impl Default for Kubernetes {
 
 impl Default for Discovery {
     fn default() -> Self {
-        Self { enabled: true, announce: true, browse: true, join_requests: true, interfaces: Vec::new() }
+        Self {
+            enabled: true,
+            announce: true,
+            browse: true,
+            join_requests: true,
+            interfaces: Vec::new(),
+            native: true,
+            domains: Vec::new(),
+            dns_servers: Vec::new(),
+            answer_from: vec!["private".into()],
+            tailscale: true,
+            seeds: Vec::new(),
+            publish: None,
+        }
     }
 }
 

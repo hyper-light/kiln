@@ -266,7 +266,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             let announcer = (a.discover && !a.ephemeral).then(|| {
                 let ca = std::fs::read_to_string(state_dir.join("ca.pem")).ok().and_then(|p| kiln::join::pem_der(&p).ok());
                 let cfg = config::Config::load(&config_path).unwrap_or_default();
-                kiln::discovery::AgentAnnouncer::start(&state_dir, ca.as_deref(), cfg.discovery.interfaces, shutdown.clone())
+                kiln::discovery::AgentAnnouncer::start(&state_dir, ca.as_deref(), cfg.discovery, shutdown.clone())
             });
             if let Some(ann) = &announcer
                 && a.token.is_none()
@@ -277,7 +277,15 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                     None => {
                         tracing::info!("not enrolled yet: looking for kiln servers on this network");
                         let found = kiln::join::servers_in(&ann.table, std::time::Duration::from_secs(5)).await;
-                        kiln::join::choose(found, true, kiln::join::interactive(), &shutdown).await?
+                        let interactive = kiln::join::interactive();
+                        if found.len() == 1 || (found.len() > 1 && interactive) {
+                            kiln::join::choose(found, true, interactive, &shutdown).await?
+                        } else {
+                            // No server yet, or several and nobody to ask: wait until one invites
+                            // this machine (or, never having heard more than one, the only one).
+                            let say = |m: &str| tracing::info!("{m}");
+                            kiln::discovery::invite::wait_for_invitation(&ann.table, &ann.id(), true, &shutdown, &say).await?
+                        }
                     }
                 };
                 let me = kiln::join::Machine::this(name.clone(), &a.labels);
@@ -311,9 +319,22 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             }
             result
         }
-        Cmd::Join(j) => {
+        Cmd::Join(mut j) => {
             shutdown_on_signals(shutdown.clone());
-            match kiln::join::cli(j, shutdown.clone()).await? {
+            // Without --server: find one; several and no terminal wait for an invitation.
+            let mut waiting = None;
+            if j.server.is_none() {
+                let cfg = config::Config::load(&config_path).unwrap_or_default();
+                if let Some((url, w)) = kiln::discovery::invite::server_for_join(&j, &cfg.discovery, &shutdown).await? {
+                    j.server = Some(url);
+                    waiting = w;
+                }
+            }
+            let joined = kiln::join::cli(j, shutdown.clone()).await;
+            if let Some(w) = waiting {
+                w.end().await;
+            }
+            match joined? {
                 Some(opts) => run_agent(opts, shutdown).await,
                 None => Ok(()),
             }

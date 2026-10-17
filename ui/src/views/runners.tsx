@@ -4,10 +4,10 @@ import { DropdownMenu, Switch } from "radix-ui";
 import { LayoutGrid, List, MoreHorizontal, Plus, Server, SquareTerminal, Trash2 } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, HostSample, Job, JoinInfo, RunnerInstance } from "@/api/types";
+import type { Agent, HostSample, Job, RunnerInstance } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
-import { CopyButton, EmptyState, ErrorState, Facts, Meter, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
+import { EmptyState, ErrorState, Facts, Meter, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
@@ -16,7 +16,8 @@ import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage, useDocumentTitle, useLocalStorage, useResource } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { HostCharts } from "./host-charts";
-import { OnThisNetwork, WaitingToJoin, useJoinData } from "./agents-join";
+import { useJoinData } from "./add-machines/data";
+import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct, upsert } from "./shared";
 
 type Filter = "all" | "connected" | "draining";
@@ -38,19 +39,14 @@ export default function Runners() {
   const [view, setView] = useLocalStorage<"table" | "cards">("kiln.agents.view", "table");
   const [filter, setFilter] = React.useState<Filter>("all");
   const [q, setQ] = React.useState("");
-  const [joinOpen, setJoinOpen] = React.useState(params.get("join") === "1");
   const [forget, setForget] = React.useState<Agent | null>(null);
   const selected = params.get("agent");
   const { requests: joinRequests, discovery } = useJoinData();
 
+  // Old links (`?join=1`) opened a dialog; adding machines has its own page now.
   React.useEffect(() => {
-    if (params.get("join") === "1") {
-      setJoinOpen(true);
-      const n = new URLSearchParams(params);
-      n.delete("join");
-      setParams(n, { replace: true });
-    }
-  }, [params, setParams]);
+    if (params.get("join") === "1") navigate("/runners/add", { replace: true });
+  }, [params, navigate]);
 
   React.useEffect(() => {
     const ctl = new AbortController();
@@ -119,13 +115,15 @@ export default function Runners() {
           )
         }
         actions={
-          <Button onClick={() => setJoinOpen(true)}>
-            <Plus /> Add runner
+          <Button asChild>
+            <Link to="/runners/add">
+              <Plus /> Add machines
+            </Link>
           </Button>
         }
       />
 
-      <WaitingToJoin requests={joinRequests.data ?? []} onDecided={joinRequests.reload} />
+      <JoinNotice requests={joinRequests.data} discovery={discovery.data} />
 
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <Segmented
@@ -161,8 +159,10 @@ export default function Runners() {
           icon={<Server size={24} />}
           title="No runners have enrolled."
           action={
-            <Button variant="secondary" onClick={() => setJoinOpen(true)}>
-              <Plus /> Add runner
+            <Button asChild variant="secondary">
+              <Link to="/runners/add">
+                <Plus /> Add machines
+              </Link>
             </Button>
           }
         >
@@ -240,9 +240,6 @@ export default function Runners() {
         </div>
       )}
 
-      <OnThisNetwork discovery={discovery.data} error={discovery.error} onRetry={discovery.reload} />
-
-      <JoinDialog open={joinOpen} onOpenChange={setJoinOpen} />
       <AgentDrawer agent={selAgent} onClose={() => openAgent(null)} onDrain={drain} onForget={(a) => setForget(a)} />
       {forget && (
         <ConfirmDialog
@@ -356,99 +353,6 @@ function AgentActions({ agent, onForget, onTerminal }: { agent: Agent; onForget:
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
     </div>
-  );
-}
-
-type JoinPlatform = "linux" | "macos" | "windows";
-
-const JOIN_BOOT: Record<JoinPlatform, string> = {
-  linux: "starts the runner on boot (systemd, cron @reboot, or XDG autostart)",
-  macos: "starts the runner at login with launchd",
-  windows: "starts the runner at logon with a per-user scheduled task (no admin rights needed)",
-};
-
-function JoinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
-  const [info, setInfo] = React.useState<JoinInfo | null>(null);
-  const [err, setErr] = React.useState<string | null>(null);
-  const [platform, setPlatform] = useLocalStorage<JoinPlatform>("kiln.agents.join-platform", "linux");
-  const command = !info ? "" : platform === "windows" ? (info.windows ?? info.command) : platform === "macos" ? (info.macos ?? info.command) : info.command;
-  const prompt = platform === "windows" ? "PS> " : "$ ";
-  React.useEffect(() => {
-    if (!open) return;
-    setInfo(null);
-    setErr(null);
-    const ctl = new AbortController();
-    api
-      .join(ctl.signal)
-      .then(setInfo)
-      .catch((e) => !ctl.signal.aborted && setErr(errorMessage(e)));
-    return () => ctl.abort();
-  }, [open]);
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        title="Add a runner"
-        eyebrow="Runners / Join"
-        description={`Run this on the machine you want to enroll. It installs kiln, enrolls over QUIC + mTLS, and ${JOIN_BOOT[platform]}.`}
-        className="!w-[min(680px,calc(100vw-24px))]"
-      >
-        {err ? (
-          <ErrorState error={err} />
-        ) : !info ? (
-          <Skeleton className="h-24 w-full" />
-        ) : (
-          <div className="space-y-4">
-            <Segmented
-              label="Platform"
-              value={platform}
-              onChange={setPlatform}
-              options={[
-                { value: "linux", label: "Linux" },
-                { value: "macos", label: "macOS" },
-                { value: "windows", label: "Windows" },
-              ]}
-            />
-            <div className="relative">
-              <pre className="overflow-x-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 pr-4 font-mono text-[12px] leading-relaxed whitespace-pre-wrap break-all text-[#cdc4e0]">
-                <span className="text-[#6d7078] select-none">{prompt}</span>
-                {command}
-              </pre>
-            </div>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <Facts
-                className="min-w-0 flex-1"
-                items={[
-                  { label: "Server", value: info.server },
-                  { label: "Token", value: `${info.token.slice(0, 6)}…${info.token.slice(-4)}` },
-                ]}
-              />
-              <CopyButton text={command} label="Copy command" />
-            </div>
-            <p className="text-[11.5px] leading-relaxed text-[#8f939e]">
-              The runner shows up here as soon as it connects. Give it labels like <span className="chip">bench</span> or <span className="chip">gpu</span> to target it with{" "}
-              <code className="font-mono text-[#cdc4e0]">runs-on</code>.
-            </p>
-            {info.join && (
-              <div className="space-y-2 border-t border-[#222428] pt-4">
-                <div className="label">Without a token: ask to join</div>
-                <pre className="overflow-x-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[12px] leading-relaxed whitespace-pre-wrap break-all text-[#cdc4e0]">
-                  <span className="text-[#6d7078] select-none">$ </span>
-                  {info.join}
-                </pre>
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-[#8f939e]">
-                    The machine shows a verification code and appears under Waiting to join; approve it when the codes match. With kiln already
-                    installed, run <code className="font-mono text-[#cdc4e0]">kiln join</code> instead.
-                  </p>
-                  <CopyButton text={info.join} label="Copy command" />
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
   );
 }
 

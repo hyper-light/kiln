@@ -217,6 +217,8 @@ impl Acp {
                     self.send(core, item, SendMode::Now);
                 }
             }
+            // ACP cannot steer a turn: it stays queued.
+            Command::QueueSteer { .. } => {}
             Command::Approve { id, decision, message, always, .. } => self.answer(core, &id, decision, message, always),
             Command::Interrupt => self.cancel(core),
             Command::SetMode { mode } => {
@@ -937,7 +939,7 @@ mod tests {
         assert_eq!(ap.diffs.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()), Some(vec!["-fn a() {}".to_owned(), "+fn b() {}".to_owned()]));
         assert_eq!(core.state.status, Status::Waiting);
         // Always: the allow_always option.
-        a.command(&mut core, Command::Approve { id: "7".into(), decision: Decision::Always, message: None, always: Some(0), answers: None });
+        a.command(&mut core, Command::Approve { id: "7".into(), decision: Decision::Always, message: None, always: Some(0), answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/outcome/optionId")).and_then(Value::as_str), Some("ever"));
         // A second message waits (no steering in ACP).

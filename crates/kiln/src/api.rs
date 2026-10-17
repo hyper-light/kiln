@@ -154,11 +154,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
         (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
         (&Method::POST, ["api", "agents", "instance"]) => return enroll_instance(&hub, req).await,
+        (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return create_join(&hub, req).await,
         (&Method::GET, ["api", "join-requests", id]) => {
             let id = (*id).to_owned();
             return poll_join(&hub, &id, req.headers()).await;
         }
+        (&Method::GET, ["api", "join", "invited"]) => return Ok(join_invited(&hub, &req)),
         (&Method::GET, ["api", "jobs", id, "source"]) => return job_source(&hub, id, req.headers()).await,
         (&Method::PUT, ["api", "jobs", id, "artifacts", "upload"]) => {
             let id = (*id).to_owned();
@@ -225,6 +227,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &hub.agent_list().await)),
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
+        (&Method::POST, ["api", "discovery", "scan"]) => discovery_scan(&hub, req).await,
+        (&Method::POST, ["api", "discovery", "probe"]) => discovery_probe(&hub, req).await,
+        (&Method::POST, ["api", "discovery", "invite"]) => discovery_invite(&hub, req).await,
+        (&Method::DELETE, ["api", "discovery", "invite", id]) => Ok(discovery_uninvite(&hub, id).await),
         (&Method::GET, ["api", "join-requests"]) => Ok(srv::json(StatusCode::OK, &hub.joins.list(Instant::now(), &hub.pki.ca_der))),
         (&Method::POST, ["api", "join-requests", id, "approve"]) => {
             let id = (*id).to_owned();
@@ -243,7 +249,19 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
-        (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid).await,
+        (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid, &q, req).await,
+        (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => ai_fork(&hub, machine, pid).await,
+        (&Method::GET, ["api", "accounts"]) => accounts_status(&hub, &q).await,
+        (&Method::POST, ["api", "accounts", "login"]) => accounts_login(&hub, req).await,
+        (&Method::POST, ["api", "accounts", "logout"]) => accounts_logout(&hub, req).await,
+        (&Method::GET, ["api", "accounts", "flows", id]) => {
+            crate::accounts::get(id).map(|f| srv::json(StatusCode::OK, &f)).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such sign-in"))
+        }
+        (&Method::POST, ["api", "accounts", "flows", id, "input"]) => accounts_input(id, req).await,
+        (&Method::DELETE, ["api", "accounts", "flows", id]) => {
+            crate::accounts::cancel(id).map(|()| srv::status(StatusCode::NO_CONTENT)).map_err(|e| err(StatusCode::NOT_FOUND, format!("{e:#}")))
+        }
+        (&Method::GET, ["api", "machines", target, "dirs"]) => machine_dirs(&hub, target, &q).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.visible())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
@@ -270,13 +288,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 Err(err(StatusCode::NOT_FOUND, "no such agent session"))
             }
         }
+        (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
+        (&Method::POST, ["api", "harness", "broadcast", "preview"]) => harness_broadcast_preview(&hub, req).await,
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();
             harness_command(&hub, &id, req).await
         }
-        (&Method::POST, ["api", "harness", "command"]) => harness_broadcast(&hub, req).await,
+        (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -293,6 +314,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
 /// The AI coding sessions running on every connected machine, most recently active first.
 fn ai_sessions(hub: &Hub) -> Response {
+    // Conversations kiln already runs as agent sessions (taken over, or resumed by hand there too).
+    let managed: HashMap<String, String> = hub.harness.list().into_iter().filter_map(|i| Some((i.harness_session?, i.id))).collect();
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (machine, sessions) in hub.ai_sessions.lock().iter() {
         for s in sessions {
@@ -305,6 +328,10 @@ fn ai_sessions(hub: &Hub) -> Response {
                     o.insert("terminal".into(), serde_json::Value::Null);
                 }
                 o.insert("takeover".into(), json!(takeover_on(hub, machine, s.takeover(held))));
+                o.insert("fork".into(), json!(s.forkable() && forks_on(hub, machine)));
+                if let Some(agent) = managed.get(&s.id).filter(|_| !s.id.is_empty()) {
+                    o.insert("managed_by".into(), json!(agent));
+                }
             }
             out.push(v);
         }
@@ -313,10 +340,22 @@ fn ai_sessions(hub: &Hub) -> Response {
     srv::json(StatusCode::OK, &out)
 }
 
-/// Take-over needs the machine's runner to wait for the old process; an older one would race it.
+/// Take-over needs the machine's runner to wait for the old process (and to end one running
+/// outside kiln); an older one would race it or refuse.
 fn takeover_on(hub: &Hub, machine: &str, t: crate::aisessions::TakeOver) -> crate::aisessions::TakeOver {
     use crate::aisessions::TakeOver;
-    if t == TakeOver::Ready && hub.runner_caps(machine) & crate::proto::CAP_TAKEOVER == 0 { TakeOver::Upgrade } else { t }
+    let needs = match t {
+        TakeOver::Ready => crate::proto::CAP_TAKEOVER,
+        TakeOver::Stop => crate::proto::CAP_TAKEOVER_STOP,
+        _ => return t,
+    };
+    if hub.runner_caps(machine) & needs == 0 { TakeOver::Upgrade } else { t }
+}
+
+/// A runner that lists folders ([`crate::proto::CAP_DIRS`]) is newer than `Spec::fork`: an older
+/// one would resume the session itself, beside the one still running.
+fn forks_on(hub: &Hub, machine: &str) -> bool {
+    hub.runner_caps(machine) & crate::proto::CAP_DIRS != 0
 }
 
 /// Connected runners that have never reported AI sessions (an older kiln): what they run can't
@@ -334,13 +373,29 @@ fn ai_silent(hub: &Hub) -> Response {
     srv::json(StatusCode::OK, &json!({ "machines": machines }))
 }
 
+/// `POST /api/ai-sessions/:machine/:pid/takeover`.
+#[derive(Deserialize, Default)]
+struct TakeoverOpts {
+    /// It runs outside kiln (`takeover: "stop"`): end it there. Asked for, never assumed.
+    #[serde(default)]
+    stop: bool,
+}
+
 /// Continue a session found running on a machine as a kiln agent session: the kiln terminal it
-/// runs in is ended, and the harness resumes it there, in the same folder, once its process is
-/// gone (the machine waits for it). One running outside kiln is refused: quit it there first, or
-/// resume an ended one with `POST /api/harness/sessions` and `spec.resume`.
-async fn ai_takeover(hub: &Hub, machine: &str, pid: &str) -> R {
+/// runs in is ended (or, asked with `{"stop": true}`, its process when it runs outside kiln), and
+/// the harness resumes it there, in the same folder, once its process is gone (the machine waits
+/// for it). An ended one is resumed with `POST /api/harness/sessions` and `spec.resume`; one left
+/// running is branched with `.../fork`.
+async fn ai_takeover(hub: &Hub, machine: &str, pid: &str, q: &HashMap<String, String>, req: Request) -> R {
     use crate::aisessions::TakeOver;
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
+    let body = srv::body_bytes(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let opts: TakeoverOpts = if body.iter().all(u8::is_ascii_whitespace) {
+        TakeoverOpts::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?
+    };
+    let stop = opts.stop || q.get("stop").is_some_and(|v| v == "1" || v == "true");
     let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
     let Some(found) = found else {
         return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
@@ -348,10 +403,16 @@ async fn ai_takeover(hub: &Hub, machine: &str, pid: &str) -> R {
     let held = found.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_some());
     let spec = match (takeover_on(hub, machine, found.takeover(held)), found.takeover_spec(held)) {
         (TakeOver::Ready, Some(spec)) => spec,
-        (TakeOver::Upgrade, _) => {
-            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than take-over and wouldn't wait for the session to end: upgrade it in Settings → Updates first")));
+        (TakeOver::Stop, Some(spec)) if stop => spec,
+        (TakeOver::Stop, _) => {
+            return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): taking it over ends it there, so ask with {{\"stop\": true}}")));
         }
-        (TakeOver::Outside, _) => return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): quit it there first, then continue it"))),
+        (TakeOver::Upgrade, _) => {
+            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than this take-over: upgrade it in Settings → Updates first")));
+        }
+        (TakeOver::Outside, _) => {
+            return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}), as a harness kiln might not resume: quit it there first, then continue it")));
+        }
         (TakeOver::NoId, _) => return Err(err(StatusCode::CONFLICT, "it has no conversation to continue yet")),
         _ => return Err(err(StatusCode::BAD_REQUEST, format!("kiln cannot run {} as an agent session", found.tool))),
     };
@@ -359,9 +420,80 @@ async fn ai_takeover(hub: &Hub, machine: &str, pid: &str) -> R {
         t.close();
         hub.store.audit("admin".into(), "terminal.close".into(), t.target.clone()).await;
     }
-    hub.store.audit("admin".into(), "agent.takeover".into(), format!("{} (process {pid}) on {machine}", found.tool)).await;
+    let how = if spec.takeover_stop { ", ended there" } else { "" };
+    hub.store.audit("admin".into(), "agent.takeover".into(), format!("{} (process {pid}) on {machine}{how}", found.tool)).await;
     let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::OK, &infos))
+}
+
+/// Continue a copy of a session found running on a machine as a new kiln agent session (a branch
+/// of its conversation, in the same folder), leaving the original running as it is.
+async fn ai_fork(hub: &Hub, machine: &str, pid: &str) -> R {
+    let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
+    let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
+    let Some(found) = found else {
+        return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
+    };
+    if !forks_on(hub, machine) {
+        return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in Settings → Updates first")));
+    }
+    let Some(spec) = found.fork_spec() else {
+        return Err(if !found.started() {
+            err(StatusCode::CONFLICT, "it has no conversation to continue yet")
+        } else {
+            err(StatusCode::BAD_REQUEST, format!("kiln cannot branch a {} session", found.tool))
+        });
+    };
+    hub.store.audit("admin".into(), "agent.fork".into(), format!("{} (process {pid}) on {machine}", found.tool)).await;
+    let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &infos))
+}
+
+// ------------------------------------------------------------------ harness accounts
+
+/// `POST /api/accounts/login` and `/api/accounts/logout`.
+#[derive(Deserialize)]
+struct AccountAsk {
+    target: String,
+    kind: String,
+    #[serde(default)]
+    method: Option<String>,
+}
+
+/// The harnesses' accounts on a machine (`?target=local|agent:<name>`), as their CLIs report.
+async fn accounts_status(hub: &Arc<Hub>, q: &HashMap<String, String>) -> R {
+    let target = q.get("target").map_or("local", String::as_str);
+    let accounts = crate::accounts::status(hub, target).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &accounts))
+}
+
+/// Start signing a harness in on a machine; follow it at `/api/accounts/flows/:id`.
+async fn accounts_login(hub: &Arc<Hub>, req: Request) -> R {
+    let a: AccountAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let flow = crate::accounts::login(hub, &a.target, &a.kind, a.method.as_deref()).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "account.login".into(), format!("{} on {} ({})", a.kind, a.target, flow.method.as_deref().unwrap_or("-"))).await;
+    Ok(srv::json(StatusCode::OK, &flow))
+}
+
+/// Sign a harness out on a machine: the finished flow, with the account as it is now.
+async fn accounts_logout(hub: &Arc<Hub>, req: Request) -> R {
+    let a: AccountAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "account.logout".into(), format!("{} on {}", a.kind, a.target)).await;
+    let flow = crate::accounts::logout(hub, &a.target, &a.kind).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &flow))
+}
+
+#[derive(Deserialize)]
+struct AccountInput {
+    text: String,
+}
+
+/// Give a waiting sign-in what it asks for (the code its page showed, an API key): never logged,
+/// nor shown again.
+async fn accounts_input(id: &str, req: Request) -> R {
+    let a: AccountInput = srv::body_json(req.into_body(), 16 * 1024).await.map_err(|_| err(StatusCode::BAD_REQUEST, "expected {\"text\": \"…\"}"))?;
+    crate::accounts::input(id, &a.text).map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// The recent messages of one session, read from its machine.
@@ -510,6 +642,15 @@ fn logout() -> Response {
 }
 
 fn me(hub: &Hub, headers: &HeaderMap) -> Response {
+    // What discovery announces anyway (when it does), so a probe can tell which instance answers.
+    let d = &hub.discovery;
+    let announced = d.announcing().then(|| {
+        let a = d.advert.lock();
+        json!({
+            "id": a.id, "instance": a.instance_label(), "name": a.name, "role": a.role, "version": a.version,
+            "port": a.port, "quic": a.quic, "ca": a.ca, "os": a.os, "arch": a.arch,
+        })
+    });
     srv::json(
         StatusCode::OK,
         &json!({
@@ -517,6 +658,7 @@ fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "public_url": hub.cfg.server.public_url,
             "version": env!("CARGO_PKG_VERSION"),
             "hostname": crate::config::Config::hostname(),
+            "discovery": announced,
         }),
     )
 }
@@ -857,6 +999,17 @@ fn join_info(hub: &Hub) -> Response {
             // No token: the machine asks to join and an admin approves it (verification code).
             "join": format!("curl -fsSL {url}/install.sh | sh -s -- --join"),
             "join_manual": format!("kiln join --server {url}"),
+            // Windows: install.ps1 without a token asks to join the same way.
+            "join_windows": format!("irm '{url}/install.ps1' | iex"),
+            // One line per OS that downloads kiln from this server and installs the agent with the
+            // join token (`install.sh` passes `--token`/`--labels` to `kiln install --agent`).
+            "install": {
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,linux"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,macos"),
+                "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'baremetal,windows'"),
+            },
+            // The join token is kept in <data>/join.token and does not expire.
+            "expires_at": serde_json::Value::Null,
         }),
     )
 }
@@ -937,31 +1090,57 @@ pub fn release_url(target: &str) -> String {
 
 // ------------------------------------------------------------------ discovery & joining
 
-/// The kiln instances heard on the network, each marked with whether it already is one of this
-/// server's agents and the command that would make it one.
-async fn discovery(hub: &Hub) -> Response {
+/// Instances as the API lists them: each marked with whether it already is one of this server's
+/// agents, the command that would make it one, whether this server invited it and its pending join
+/// request.
+async fn render_instances(hub: &Hub, list: &[crate::discovery::Instance]) -> Vec<serde_json::Value> {
     let d = &hub.discovery;
     let agents = hub.agent_list().await;
     let ours = crate::discovery::ca_fingerprint(&hub.pki.ca_der);
-    let me = d.advert.lock().clone();
-    let instances: Vec<serde_json::Value> = d
-        .table
-        .snapshot()
-        .into_iter()
+    let now = Instant::now();
+    let all = d.table.snapshot();
+    let requests = hub.joins.list(now, &hub.pki.ca_der);
+    list.iter()
         .map(|i| {
-            let agent = joined_as(&agents, &i, &ours);
-            let url = our_url_for(hub, &i);
-            let mut v = serde_json::to_value(&i).unwrap_or_default();
+            let agent = joined_as(&agents, i, &ours);
+            let url = our_url_for(hub, i);
+            let mut v = serde_json::to_value(i).unwrap_or_default();
             if let Some(o) = v.as_object_mut() {
                 o.insert("url".into(), json!(i.url()));
                 o.insert("joined".into(), json!(agent.is_some()));
                 o.insert("agent".into(), json!(agent));
                 o.insert("same_ca".into(), json!(i.ca.as_deref() == Some(ours.as_str())));
                 o.insert("join_command".into(), json!(format!("kiln join --server {url}")));
+                o.insert("invited".into(), json!(d.invites.invited(&i.id, now)));
+                o.insert("request".into(), json!(crate::discovery::invite::request_for(i, &all, &requests)));
             }
             v
         })
-        .collect();
+        .collect()
+}
+
+/// The kiln instances found, how each way of finding them is doing, what is wrong, the latest
+/// scan, and unicast DNS-SD's domains, publishing and zone-file lines.
+async fn discovery(hub: &Hub) -> Response {
+    let d = &hub.discovery;
+    let me = d.advert.lock().clone();
+    let instances = render_instances(hub, &d.table.snapshot()).await;
+    let health = d.health.lock().clone();
+    // Until the first browse ran: what it is going to browse.
+    let domains = if health.dns_sd.ran {
+        health.dns_sd.domains.clone()
+    } else {
+        let search = crate::discovery::unicast::system_resolver().1;
+        let mut v: Vec<String> = Vec::new();
+        for s in d.settings.domains.iter().chain(&search) {
+            if let Some(n) = crate::discovery::unicast::browsable(s).map(|n| n.to_zone(false))
+                && !v.contains(&n)
+            {
+                v.push(n);
+            }
+        }
+        v
+    };
     srv::json(
         StatusCode::OK,
         &json!({
@@ -979,7 +1158,109 @@ async fn discovery(hub: &Hub) -> Response {
                 "version": me.version,
             },
             "instances": instances,
+            "methods": d.methods(),
+            "problems": d.problems(),
+            "subnets": crate::discovery::subnets(&d.settings.interfaces),
+            "scan": d.probes.scan(),
+            "dns_sd": {
+                "domains": domains,
+                "publish": health.publish,
+                "records": crate::discovery::publish::manual_records(d),
+            },
         }),
+    )
+}
+
+/// Tells UI clients that discovery changed (scans run on after their request).
+fn discovery_events(hub: &Arc<Hub>) -> Arc<dyn Fn() + Send + Sync> {
+    let weak = Arc::downgrade(hub);
+    Arc::new(move || {
+        if let Some(h) = weak.upgrade() {
+            h.emit(&json!({ "type": "discovery" }));
+        }
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct ScanRequest {
+    #[serde(default)]
+    cidrs: Option<Vec<String>>,
+}
+
+/// `POST /api/discovery/scan`: probe every address of the given ranges (default: the LAN subnets,
+/// each at most a /22) in the background; 202 with the scan's state, progress as events.
+async fn discovery_scan(hub: &Arc<Hub>, req: Request) -> R {
+    let body: ScanRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    let state = crate::discovery::probe::start_scan(&hub.discovery, body.cidrs, discovery_events(hub)).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    hub.store.audit("admin".into(), "discovery.scan".into(), state.cidrs.join(", ")).await;
+    hub.emit(&json!({ "type": "discovery" }));
+    Ok(srv::json(StatusCode::ACCEPTED, &state))
+}
+
+#[derive(Deserialize)]
+struct ProbeRequest {
+    address: String,
+}
+
+/// `POST /api/discovery/probe`: one address or host name (optionally `:port`), by unicast multicast
+/// DNS and `GET /api/me`.
+async fn discovery_probe(hub: &Arc<Hub>, req: Request) -> R {
+    let body: ProbeRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let events = discovery_events(hub);
+    let found = crate::discovery::probe::probe(&hub.discovery, &body.address, &*events).await.map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    Ok(srv::json(StatusCode::OK, &json!({ "found": render_instances(hub, &found).await })))
+}
+
+#[derive(Deserialize)]
+struct InviteRequest {
+    instance: String,
+}
+
+/// `POST /api/discovery/invite`: let a machine found on the network know it may ask to join (for 30
+/// minutes); it still needs approving.
+async fn discovery_invite(hub: &Hub, req: Request) -> R {
+    if !hub.cfg.discovery.join_requests {
+        return Err(err(StatusCode::CONFLICT, "this server does not accept join requests ([discovery] join_requests = false)"));
+    }
+    let body: InviteRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !hub.discovery.invites.invite(&body.instance, Instant::now()) {
+        return Err(err(StatusCode::BAD_REQUEST, "not an instance id"));
+    }
+    let who = hub.discovery.table.get(&body.instance).map(|i| i.instance).unwrap_or_else(|| body.instance.clone());
+    hub.store.audit("admin".into(), "discovery.invite".into(), who).await;
+    hub.emit(&json!({ "type": "discovery" }));
+    Ok(srv::json(StatusCode::OK, &json!({ "invited": true })))
+}
+
+/// `DELETE /api/discovery/invite/:instance`.
+async fn discovery_uninvite(hub: &Hub, id: &str) -> Response {
+    if hub.discovery.invites.revoke(id) {
+        hub.store.audit("admin".into(), "discovery.uninvite".into(), id.to_owned()).await;
+        hub.emit(&json!({ "type": "discovery" }));
+    }
+    srv::status(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/join/invited?instance=<id>` (open, rate-limited): whether this server invited that
+/// machine, and its CA fingerprint (what it announces), for a machine waiting to be invited.
+fn join_invited(hub: &Hub, req: &Request) -> Response {
+    if !hub.cfg.discovery.join_requests {
+        return srv::json(StatusCode::NOT_FOUND, &json!({ "error": "this server does not accept join requests" }));
+    }
+    let from = srv::remote_ip(req).unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let now = Instant::now();
+    if let Err(wait) = hub.discovery.invites.allow(from, now) {
+        let r = srv::json(StatusCode::TOO_MANY_REQUESTS, &json!({ "error": "too many questions; ask again later" }));
+        return srv::with_header(r, header::RETRY_AFTER, &wait.as_secs().max(1).to_string());
+    }
+    let q = srv::query(req);
+    let id = q.get("instance").map(String::as_str).unwrap_or_default();
+    if !crate::discovery::invite::valid_id(id) {
+        return srv::json(StatusCode::BAD_REQUEST, &json!({ "error": "instance must be an instance id" }));
+    }
+    srv::json(
+        StatusCode::OK,
+        &json!({ "invited": hub.discovery.invites.invited(id, now), "ca": crate::discovery::ca_fingerprint(&hub.pki.ca_der) }),
     )
 }
 
@@ -1039,6 +1320,8 @@ async fn create_join(hub: &Hub, req: Request) -> R {
     let name = hub.joins.get(&id, Instant::now(), &hub.pki.ca_der).map(|l| l.name).unwrap_or_default();
     tracing::info!(%id, agent = %name, %from, "join request received; waiting for an admin");
     hub.emit(&json!({ "type": "join_requests" }));
+    // The machine's entry under discovery now has a pending request.
+    hub.emit(&json!({ "type": "discovery" }));
     Ok(srv::json(
         StatusCode::CREATED,
         &crate::join::Created {
@@ -1070,6 +1353,7 @@ async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
             if confirmed {
                 tracing::info!(%id, "join request confirmed by its machine");
                 hub.emit(&json!({ "type": "join_requests" }));
+                hub.emit(&json!({ "type": "discovery" }));
             }
             Ok(srv::json(StatusCode::OK, &polled))
         }
@@ -1107,6 +1391,11 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
         Ok(c) => c,
         Err(r) => return Ok(refused(&r)),
     };
+    // The discovered machine that asked, if it is listed (its invitation is used up).
+    let asked = hub.joins.get(id, Instant::now(), &hub.pki.ca_der).ok().and_then(|listed| {
+        let all = hub.discovery.table.snapshot();
+        all.iter().find(|i| crate::discovery::invite::request_for(i, &all, std::slice::from_ref(&listed)).is_some()).map(|i| i.id.clone())
+    });
     let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
     let name = free_agent_name(hub, &wanted, &c.hostname).await;
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
@@ -1128,7 +1417,11 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
     hub.store.audit("admin".into(), "agent.join.approve".into(), format!("{name} ({})", c.hostname)).await;
     tracing::info!(agent = %name, host = %c.hostname, "join request approved");
+    if let Some(instance) = asked {
+        hub.discovery.invites.revoke(&instance);
+    }
     hub.emit(&json!({ "type": "join_requests" }));
+    hub.emit(&json!({ "type": "discovery" }));
     Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "approved", "name": name, "labels": labels })))
 }
 
@@ -1139,6 +1432,7 @@ async fn deny_join(hub: &Hub, id: &str) -> R {
             hub.store.audit("admin".into(), "agent.join.deny".into(), name.clone()).await;
             tracing::info!(agent = %name, "join request denied");
             hub.emit(&json!({ "type": "join_requests" }));
+            hub.emit(&json!({ "type": "discovery" }));
             Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "denied", "name": name })))
         }
         Err(r) => Ok(refused(&r)),
@@ -1300,6 +1594,21 @@ async fn github_hook(hub: &Hub, req: Request) -> R {
     // A webhook only hints; the poll decides what changed (GitOps: state comes from git).
     hub.gitops_kick.notify();
     Ok(srv::status(StatusCode::ACCEPTED))
+}
+
+// ------------------------------------------------------------------ agent tunnel
+
+/// `GET /api/agents/tunnel`: a runner's QUIC datagrams through a WebSocket, for runners whose
+/// UDP to the QUIC port is dropped (see `crate::tunnel`). Open: the QUIC mutual TLS inside it
+/// authenticates both ends.
+fn agent_tunnel(hub: &Arc<Hub>, req: Request) -> R {
+    let bind: std::net::SocketAddr = hub
+        .cfg
+        .server
+        .quic_addr
+        .parse()
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the QUIC listener address is not an address"))?;
+    crate::tunnel::serve(&hub.tunnels, crate::tunnel::listener_for(bind), req).map_err(|(status, why)| err(status, why))
 }
 
 // ------------------------------------------------------------------ events ws
@@ -1520,6 +1829,25 @@ fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
     }
 }
 
+/// A machine's past conversations to continue (`?target=local|agent:<name>`, `kind=claude|codex`,
+/// `limit=`): newest first; resume one with `spec.resume = id`.
+async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let target = q.get("target").map_or("local", String::as_str);
+    if target != "local" && target.strip_prefix("agent:").is_none_or(str::is_empty) {
+        return Err(err(StatusCode::BAD_REQUEST, "target is \"local\" or \"agent:<name>\""));
+    }
+    let kind = q.get("kind").filter(|k| !k.is_empty()).cloned();
+    if kind.as_deref().is_some_and(|k| k != "claude" && k != "codex") {
+        return Err(err(StatusCode::BAD_REQUEST, "kind is \"claude\" or \"codex\""));
+    }
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(50);
+    match hub.harness.history(hub, target, kind, limit).await {
+        Ok(Some(v)) => Ok(srv::json(StatusCode::OK, &v)),
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    }
+}
+
 #[derive(Deserialize)]
 struct HarnessOpen {
     target: String,
@@ -1529,7 +1857,9 @@ struct HarnessOpen {
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
-    let body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Ending a process found running is asked for with a take-over, never with a spec.
+    body.spec.takeover_stop = false;
     // Agents run programs as the machine's user, like terminals: the same switch governs both.
     if body.target == "local" && !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
@@ -1544,6 +1874,67 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::OK, &infos))
+}
+
+/// One thing to many agents at once: a prompt or slash command, a command, or answers to every
+/// tool call waiting on you (see `crate::harness::broadcast`). Each agent's outcome comes back.
+async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
+    let b: crate::harness::broadcast::Broadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let report = crate::harness::broadcast::run(hub, &b).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
+    hub.store.audit("admin".into(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed)).await;
+    Ok(srv::json(StatusCode::OK, &report))
+}
+
+/// Who a broadcast to `to` would reach (the same picking as the broadcast itself), the machines
+/// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts)
+/// merged, each entry with `count`, how many of them have it.
+async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        to: crate::harness::broadcast::To,
+    }
+    let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let picked = crate::harness::broadcast::pick(&hub.harness.list(), &b.to);
+    let mut machines: Vec<String> = Vec::new();
+    // (field in each agent's meta, the key naming an entry, the entries seen with their counts)
+    let mut merged: [(&str, &str, Vec<(serde_json::Value, usize)>); 4] =
+        [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new())];
+    for info in &picked {
+        let machine = info.target.strip_prefix("agent:").unwrap_or(&info.target).to_owned();
+        if !machines.contains(&machine) {
+            machines.push(machine);
+        }
+        let Some(meta) = hub.harness.meta(&info.id) else { continue };
+        for (field, key, seen) in &mut merged {
+            for entry in meta.get(*field).and_then(serde_json::Value::as_array).into_iter().flatten() {
+                let Some(name) = entry.get(*key).and_then(serde_json::Value::as_str) else { continue };
+                match seen.iter_mut().find(|(v, _)| v.get(*key).and_then(serde_json::Value::as_str) == Some(name)) {
+                    Some((_, n)) => *n += 1,
+                    None => seen.push((entry.clone(), 1)),
+                }
+            }
+        }
+    }
+    let counted = |seen: Vec<(serde_json::Value, usize)>| -> Vec<serde_json::Value> {
+        seen.into_iter()
+            .map(|(mut v, n)| {
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("count".into(), json!(n));
+                }
+                v
+            })
+            .collect()
+    };
+    let [(_, _, commands), (_, _, modes), (_, _, models), (_, _, efforts)] = merged;
+    let agents: Vec<serde_json::Value> = picked
+        .iter()
+        .map(|i| json!({"id": i.id, "name": i.name, "machine": i.target.strip_prefix("agent:").unwrap_or(&i.target), "kind": i.kind, "status": i.status}))
+        .collect();
+    Ok(srv::json(
+        StatusCode::OK,
+        &json!({"agents": agents, "machines": machines, "commands": counted(commands), "modes": counted(modes), "models": counted(models), "efforts": counted(efforts)}),
+    ))
 }
 
 async fn harness_command(hub: &Hub, id: &str, req: Request) -> R {
@@ -1576,28 +1967,19 @@ struct HarnessBroadcast {
     command: crate::harness::model::Command,
 }
 
-/// One command for several sessions (a message to a selection, interrupt all, ...). Each send
-/// gets its own message id.
-async fn harness_broadcast(hub: &Hub, req: Request) -> R {
-    use crate::harness::model::Command;
+/// `POST /api/harness/command`: one command for the sessions listed, through the same sending as
+/// `/api/harness/broadcast` (each send its own message id); `sent` lists those it reached, and the
+/// rest of the report says why the others weren't.
+async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
+    use crate::harness::broadcast::{Broadcast, To};
     let b: HarnessBroadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let mut done = Vec::new();
-    for id in b.ids.iter().take(256) {
-        let c = match &b.command {
-            Command::Send { text, mode, attachments, overrides, .. } => Command::Send {
-                id: crate::util::new_id(),
-                text: text.clone(),
-                mode: *mode,
-                attachments: attachments.clone(),
-                overrides: overrides.clone(),
-            },
-            other => other.clone(),
-        };
-        if hub.harness.command(hub, id, c).await == crate::harness::registry::Sent::Ok {
-            done.push(id.clone());
-        }
-    }
-    Ok(srv::json(StatusCode::OK, &json!({ "sent": done })))
+    let command = serde_json::to_value(&b.command).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let to = To { ids: b.ids, ..To::default() };
+    let report = crate::harness::broadcast::run(hub, &Broadcast { to, text: None, mode: None, command: Some(command), approvals: None })
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let sent: Vec<&str> = report.results.iter().filter(|o| o.result == "sent").map(|o| o.id.as_str()).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "report": report })))
 }
 
 fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
@@ -1652,6 +2034,38 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> any
             },
         }
     }
+}
+
+// ------------------------------------------------------------------ folders
+
+/// The folders in a folder on a machine, for the console's folder picker: `target` is `local`
+/// (this server) or a machine (`<name>` or `agent:<name>`), `?path=` as typed. What can't be listed
+/// (no such folder, permission denied) is said in a 200 answer; see `crate::dirs`. Folders are
+/// offered where agents may run: where terminals are on.
+async fn machine_dirs(hub: &Hub, target: &str, q: &HashMap<String, String>) -> R {
+    let path = q.get("path").cloned().unwrap_or_default();
+    if target == "local" {
+        if !hub.cfg.terminal.enabled {
+            return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
+        }
+        return Ok(srv::json(StatusCode::OK, &crate::dirs::here(path).await));
+    }
+    let machine = target.strip_prefix("agent:").unwrap_or(target);
+    let (connected, agents) = hub.agents.lock().get(machine).map_or((false, false), |a| (a.connected, a.terminal && !a.ephemeral));
+    if !connected {
+        return Err(err(StatusCode::CONFLICT, format!("{machine} is not connected")));
+    }
+    if !agents {
+        return Err(err(StatusCode::FORBIDDEN, format!("{machine} has terminals (and so agents) turned off")));
+    }
+    let json = match hub.dir_list(machine, &path).await {
+        Ok(Some(json)) => json,
+        Ok(None) => return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is too old to list folders: upgrade it"))),
+        Err(e) => return Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    };
+    let listing: crate::dirs::Listing =
+        serde_json::from_str(&json).map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{machine} sent an unreadable folder list: {e}")))?;
+    Ok(srv::json(StatusCode::OK, &listing))
 }
 
 // ------------------------------------------------------------------ misc

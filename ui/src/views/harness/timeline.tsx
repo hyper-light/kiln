@@ -5,10 +5,12 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
+import { ArrowDown, ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
 import type { Command, Delivery, HEvent, Meta, State, Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { AccountCard, saysSignedOut } from "./account-card";
 import { changesetOf, diffStats, duration, relPath, stepStatus, stepSummary, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
+import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
 import { Output, Prose, ToolIcon } from "./parts";
@@ -16,6 +18,17 @@ import { Beam, PrismLabel, ThinkingBody, ThinkingHead, type BeamStatus } from ".
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
+
+/** The notice saying the harness isn't signed in (the latest, unless it has worked since), and where to sign it in. */
+const SignIn = React.createContext<{ notice: string; target: string; kind: string } | null>(null);
+
+function Contexts({ asking, signIn, children }: { asking: ReadonlySet<string>; signIn: React.ContextType<typeof SignIn>; children: React.ReactNode }) {
+  return (
+    <Asking.Provider value={asking}>
+      <SignIn.Provider value={signIn}>{children}</SignIn.Provider>
+    </Asking.Provider>
+  );
+}
 
 const STEP_ICON: Record<Step["group"], Parameters<typeof ToolIcon>[0]["kind"]> = {
   explore: "read",
@@ -305,11 +318,19 @@ function Thought({ e, more = [] }: { e: Extract<HEvent, { kind: "thinking" }>; m
 }
 
 function Notice({ e }: { e: Extract<HEvent, { kind: "notice" }> }) {
+  const signIn = React.useContext(SignIn);
   const I = e.level === "error" ? CircleAlert : e.level === "warn" ? TriangleAlert : Info;
   return (
-    <div className="hx-notice" data-level={e.level}>
-      <I size={12} /> <span>{e.text}</span>
-    </div>
+    <>
+      <div className="hx-notice" data-level={e.level}>
+        <I size={12} /> <span>{e.text}</span>
+      </div>
+      {signIn?.notice === e.id && (
+        <div className="ac-under">
+          <AccountCard compact intent="login" target={signIn.target} kind={signIn.kind} />
+        </div>
+      )}
+    </>
   );
 }
 
@@ -427,8 +448,22 @@ export function Timeline({
   onCommand,
   footer,
   agentLabel,
+  agentName,
+  onDecide,
+  target,
+  kind,
+  accountOpen,
 }: {
   agentLabel?: string;
+  /** The agent's own name, for what it asks. */
+  agentName?: string;
+  /** Answers what waits on you (shown at the end of the conversation, where it was asked). */
+  onDecide?: Decide;
+  /** Where the agent runs and its harness: a notice that it isn't signed in gets its sign-in under it. */
+  target?: string;
+  kind?: string;
+  /** The account is open already: the notice doesn't offer it twice. */
+  accountOpen?: boolean;
   events: HEvent[];
   state: State | null;
   meta?: Meta | null;
@@ -456,8 +491,34 @@ export function Timeline({
   const tasks = state?.tasks ?? [];
   const approvals = state?.approvals;
   const asking = React.useMemo(() => new Set((approvals ?? []).map((a) => a.tool_id).filter((t): t is string => Boolean(t))), [approvals]);
+  // What waits on you sits where it was asked: the latest thing the agent did, the conversation's
+  // end. Scrolled away from it, a pill floating over the bottom edge says so (nothing moves).
+  const pending = onDecide ? (approvals ?? []) : [];
+  const hasAsks = pending.length > 0;
+  const asksRef = React.useRef<HTMLDivElement>(null);
+  const [asksSeen, setAsksSeen] = React.useState(true);
+  React.useEffect(() => {
+    const el = asksRef.current;
+    const root = ref.current;
+    if (!hasAsks || !el || !root) return;
+    const io = new IntersectionObserver(([e]) => setAsksSeen(Boolean(e?.isIntersecting)), { root, threshold: 0.05 });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [hasAsks]);
+  const signedOut = React.useMemo(() => {
+    if (parent || !kind || accountOpen) return null;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (!e || e.parent) continue;
+      // It has worked since: nothing to sign in.
+      if (e.kind === "assistant" || e.kind === "tool" || e.kind === "thinking") return null;
+      if (e.kind === "notice" && e.level !== "info" && saysSignedOut(kind, e.text)) return e.id;
+    }
+    return null;
+  }, [events, parent, kind, accountOpen]);
+  const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Asking.Provider value={asking}>
+    <Contexts asking={asking} signIn={signIn}>
       <div ref={ref} className="hx-timeline" onScroll={onScroll}>
         {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
         {turns.length === 0 &&
@@ -484,8 +545,24 @@ export function Timeline({
             agentLabel={agentLabel}
           />
         ))}
+        {hasAsks && onDecide && (
+          <div ref={asksRef} className="hx-asks">
+            {pending.map((a) => (
+              <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} />
+            ))}
+          </div>
+        )}
         {footer}
+        <div className="hx-waiting-anchor">
+          {hasAsks && !asksSeen && (
+            <button type="button" className="hx-waiting" onClick={() => asksRef.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+              <i aria-hidden="true" />
+              {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+              <ArrowDown size={12} aria-hidden="true" />
+            </button>
+          )}
+        </div>
       </div>
-    </Asking.Provider>
+    </Contexts>
   );
 }

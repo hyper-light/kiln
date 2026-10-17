@@ -36,7 +36,9 @@ jobs:
   release-binary:
     name: release build (bare metal)
     needs: [rust, ui]
-    runs-on: [baremetal]
+    # The server's own Linux machine (as release.yaml): other runners, a Mac among them, are bare
+    # metal too.
+    runs-on: [baremetal, local]
     if: "branch == 'main'"
     steps:
       - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build

@@ -41,6 +41,16 @@ const MAX_SESSIONS: usize = 32;
 const MAX_DEPTH: usize = 16;
 /// A transcript untouched this long while mid-turn counts as waiting rather than working.
 const STALLED: Duration = Duration::from_secs(120);
+/// Most past sessions one listing returns.
+const HISTORY_MAX: usize = 200;
+/// Bytes read from the start and the end of a past session's transcript.
+const HISTORY_HEAD: u64 = 32 * 1024;
+const HISTORY_TAIL: u64 = 64 * 1024;
+/// Past sessions remembered between listings (by transcript, with its length and mtime).
+const HISTORY_CACHE: usize = 4096;
+/// How far back from the end the last reply (and so the model) is looked for, when the tail
+/// holds none (attachments can be large).
+const HISTORY_MODEL_TAIL: u64 = 2 * 1024 * 1024;
 /// Codex subcommands that are not an interactive session.
 const CODEX_BATCH: &[&str] = &[
     "exec", "e", "app-server", "mcp", "mcp-server", "login", "logout", "completion", "debug", "apply", "a", "proto", "cloud",
@@ -62,6 +72,30 @@ impl Tool {
             Tool::Gemini => "gemini",
         }
     }
+}
+
+/// A conversation on a machine that is not running: one to continue (`Spec::resume = id`; the
+/// harness keeps its model). Every field has a default, as for [`AiSession`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PastSession {
+    /// "claude" or "codex".
+    pub kind: String,
+    /// The harness's own id: Claude Code's session, Codex's thread.
+    pub id: String,
+    /// Its name (Claude Code's custom or generated title, Codex's thread name), else its last
+    /// prompt's first line.
+    pub title: String,
+    pub cwd: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub branch: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Unix seconds of the last write to its transcript.
+    pub last_activity: i64,
+    /// The last prompt (clipped).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_prompt: String,
 }
 
 /// One live session, as runners report it and the API lists it. Every field has a default so
@@ -96,50 +130,95 @@ pub struct AiSession {
 }
 
 /// Whether a found session can be taken over: continued as a kiln agent session (its kiln
-/// terminal is ended, the harness resumes it in the same folder).
+/// terminal is ended, or its process when it runs outside kiln, and the harness resumes it in the
+/// same folder).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TakeOver {
     Ready,
-    /// It runs outside kiln: quit it there first (an ended session is resumed with `spec.resume`).
+    /// It runs outside kiln: taking it over ends it there first (kiln quits its process).
+    Stop,
+    /// It runs outside kiln, as a harness kiln can't be sure to resume (an ACP agent may only start
+    /// anew): quit it there first (an ended session is resumed with `spec.resume`).
     Outside,
     /// It has no session id to continue yet (still starting).
     NoId,
     /// kiln cannot run that harness as an agent session.
     Unsupported,
-    /// The machine's runner predates take-over (it would not wait for the session to end):
-    /// upgrade it first.
+    /// The machine's runner predates this take-over (it would not wait for the session to end, or
+    /// could not end one running outside kiln): upgrade it first.
     Upgrade,
 }
 
 impl AiSession {
     /// Whether it can be taken over; `held`: kiln holds the terminal it runs in.
     pub fn takeover(&self, held: bool) -> TakeOver {
-        let structured = crate::harness::kinds::Kind::get(&self.tool).is_some_and(crate::harness::kinds::Kind::structured);
-        if !structured {
-            TakeOver::Unsupported
-        } else if self.id.trim().is_empty() || self.cwd.trim().is_empty() {
+        let Some(kind) = crate::harness::kinds::Kind::get(&self.tool).filter(|k| k.structured()) else {
+            return TakeOver::Unsupported;
+        };
+        if !self.started() {
             TakeOver::NoId
-        } else if !held || self.terminal.is_none() {
-            TakeOver::Outside
-        } else {
+        } else if held && self.terminal.is_some() {
             TakeOver::Ready
+        } else if native(kind) {
+            TakeOver::Stop
+        } else {
+            TakeOver::Outside
         }
     }
 
     /// The agent session that continues it: the same harness, folder, conversation and model,
-    /// started once its process (ended with its terminal) is gone. `None` unless it is `Ready`.
+    /// started once its process (ended with its terminal, or by kiln when it runs outside kiln) is
+    /// gone. `None` unless it is `Ready` or `Stop`.
     pub fn takeover_spec(&self, held: bool) -> Option<crate::harness::session::Spec> {
-        (self.takeover(held) == TakeOver::Ready).then(|| crate::harness::session::Spec {
+        let t = self.takeover(held);
+        matches!(t, TakeOver::Ready | TakeOver::Stop).then(|| crate::harness::session::Spec {
+            takeover_pid: Some(self.pid),
+            takeover_stop: t == TakeOver::Stop,
+            ..self.continued()
+        })
+    }
+
+    /// It has a conversation to continue: an id, a folder, and a transcript with a first message.
+    /// A brand-new session reports its id before its transcript holds anything to resume (taking it
+    /// over or branching it then would wait on a transcript that isn't there).
+    pub fn started(&self) -> bool {
+        !self.id.trim().is_empty() && !self.cwd.trim().is_empty() && self.transcript && !(self.last_prompt.trim().is_empty() && self.last_reply.trim().is_empty())
+    }
+
+    /// Whether a copy of it can be continued as an agent session, leaving it running as it is.
+    pub fn forkable(&self) -> bool {
+        crate::harness::kinds::Kind::get(&self.tool).is_some_and(native) && self.started()
+    }
+
+    /// The agent session that continues a copy of it (a branch of its conversation), leaving it
+    /// running as it is. `None` unless it is `forkable`.
+    pub fn fork_spec(&self) -> Option<crate::harness::session::Spec> {
+        self.forkable().then(|| {
+            let s = self.continued();
+            let name = format!("{} (branch)", s.name.as_deref().unwrap_or(&self.tool));
+            crate::harness::session::Spec { fork: true, name: Some(name), ..s }
+        })
+    }
+
+    /// Its harness, folder, conversation, model and name, as an agent session's spec.
+    fn continued(&self) -> crate::harness::session::Spec {
+        crate::harness::session::Spec {
             kind: self.tool.clone(),
             cwd: Some(self.cwd.clone()),
             resume: Some(self.id.clone()),
             model: Some(self.model.clone()).filter(|m| !m.is_empty()),
             name: [&self.name, &self.title].into_iter().find(|n| !n.trim().is_empty()).map(|n| n.chars().take(80).collect()),
-            takeover_pid: Some(self.pid),
             ..crate::harness::session::Spec::default()
-        })
+        }
     }
+}
+
+/// A harness that resumes and branches a session itself (Claude Code, Codex); an ACP agent may only
+/// be able to start a new one.
+fn native(kind: &crate::harness::kinds::Kind) -> bool {
+    use crate::harness::kinds::Protocol;
+    matches!(kind.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer)
 }
 
 /// One message of an opened transcript.
@@ -241,6 +320,17 @@ impl Reporter {
         });
     }
 
+    /// Answer the server's request for this machine's past sessions (`running`: the harness ids
+    /// of kiln's own sessions here).
+    pub fn history(&self, req: u64, kind: Option<String>, limit: usize, running: HashSet<String>, up: async_channel::Sender<crate::exec::Up>) {
+        let scanner = Arc::clone(&self.scanner);
+        crate::rt::spawn(async move {
+            let past = crate::rt::blocking(move || scanner.lock().history(kind.as_deref(), limit, &running)).await.ok();
+            let json = past.and_then(|p| serde_json::to_string(&p).ok());
+            let _ = up.send(crate::exec::Up::Term(crate::proto::AgentMsg::HarnessHistory { req, json })).await;
+        });
+    }
+
     /// Answer the server's request for a session's recent messages.
     pub fn transcript(&self, req: u64, pid: u32, up: async_channel::Sender<crate::exec::Up>) {
         let scanner = Arc::clone(&self.scanner);
@@ -272,6 +362,15 @@ impl Proc {
     }
 }
 
+/// A Codex rollout's `session_meta`: its folder, when its thread began (unix seconds) and what
+/// started it ("codex-tui", "kiln", ...).
+#[derive(Clone, Default)]
+struct CodexHead {
+    cwd: String,
+    began: i64,
+    originator: String,
+}
+
 /// Finds the sessions. Keeps the process table and parsed transcripts between scans, so a scan
 /// only rereads transcripts that changed.
 pub struct Scanner {
@@ -286,10 +385,13 @@ pub struct Scanner {
     claude_files: HashMap<String, PathBuf>,
     /// Codex transcripts by process (pid, start time), once found.
     codex_files: HashMap<(u32, u64), PathBuf>,
-    /// The `session_meta` (id, cwd) of Codex transcripts, read once per file.
-    codex_meta: HashMap<PathBuf, (String, String)>,
+    /// The `session_meta` of Codex transcripts, read once per file.
+    codex_meta: HashMap<PathBuf, CodexHead>,
     /// Each reported session's transcript by pid, for [`Scanner::transcript`].
     open: HashMap<u32, (Tool, PathBuf)>,
+    /// Past sessions by transcript, with the length and mtime they were read at (`None`: not a
+    /// conversation, e.g. nothing was ever asked).
+    past: HashMap<PathBuf, (u64, SystemTime, Option<PastSession>)>,
 }
 
 impl Scanner {
@@ -304,6 +406,7 @@ impl Scanner {
             codex_files: HashMap::new(),
             codex_meta: HashMap::new(),
             open: HashMap::new(),
+            past: HashMap::new(),
         }
     }
 
@@ -493,6 +596,85 @@ impl Scanner {
         Some(s)
     }
 
+    /// This machine's conversations that are not running, most recently active first, at most
+    /// `limit`: Claude Code's (`projects/*/*.jsonl`) and Codex's (`sessions/**/rollout-*.jsonl`),
+    /// or one `kind`'s. Running: those found in terminals (a scan), Claude Code's with a live
+    /// session record (of any kind), and `running` (the harness ids of kiln's own sessions).
+    /// Only the head and the tail of each transcript are read, once per change.
+    pub fn history(&mut self, kind: Option<&str>, limit: usize, running: &HashSet<String>) -> Vec<PastSession> {
+        let found = self.scan(&HashMap::new());
+        let open: HashSet<PathBuf> = self.open.values().map(|(_, f)| f.clone()).collect();
+        let mut skip: HashSet<String> = running.clone();
+        skip.extend(found.into_iter().map(|s| s.id).filter(|id| !id.is_empty()));
+        for r in claude_records(&self.claude.join("sessions")) {
+            if self.sys.process(Pid::from_u32(r.pid)).is_some_and(|p| tool_of(p) == Some(Tool::Claude)) {
+                skip.insert(r.session_id);
+            }
+        }
+        let want = |k: &str| kind.is_none_or(|w| w == k);
+        let mut files: Vec<(SystemTime, Tool, PathBuf)> = Vec::new();
+        let mut stat = |tool: Tool, paths: Vec<PathBuf>| {
+            for f in paths {
+                if let Ok(m) = std::fs::metadata(&f).and_then(|m| m.modified()) {
+                    files.push((m, tool, f));
+                }
+            }
+        };
+        if want("claude") {
+            let mut paths = Vec::new();
+            for d in std::fs::read_dir(self.claude.join("projects")).into_iter().flatten().flatten() {
+                // Sessions only: subagents' transcripts live below them, or as agent-*.jsonl.
+                walk_jsonl(&d.path(), 0, &mut |f| !f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("agent-")), &mut paths);
+            }
+            stat(Tool::Claude, paths);
+        }
+        if want("codex") {
+            let mut paths = Vec::new();
+            walk_jsonl(&self.codex.join("sessions"), 3, &mut |_| true, &mut paths);
+            stat(Tool::Codex, paths);
+        }
+        files.sort_by_key(|(m, _, _)| std::cmp::Reverse(*m));
+        let names = if want("codex") { codex_names(&self.codex) } else { HashMap::new() };
+        let limit = limit.clamp(1, HISTORY_MAX);
+        let mut out: Vec<PastSession> = Vec::new();
+        let mut seen = HashSet::new();
+        for (modified, tool, f) in files {
+            if out.len() >= limit {
+                break;
+            }
+            if open.contains(&f) {
+                continue;
+            }
+            let Some(mut p) = self.past_session(tool, &f, modified) else { continue };
+            // A thread's forks and later parts share its id: the newest stands for it.
+            if skip.contains(&p.id) || !seen.insert(p.id.clone()) {
+                continue;
+            }
+            if let Some(n) = names.get(&p.id) {
+                p.title.clone_from(n);
+            }
+            out.push(p);
+        }
+        if self.past.len() > HISTORY_CACHE {
+            self.past.clear();
+        }
+        out
+    }
+
+    /// A transcript as a past session, reread only when it changed.
+    fn past_session(&mut self, tool: Tool, f: &Path, modified: SystemTime) -> Option<PastSession> {
+        let len = std::fs::metadata(f).ok()?.len();
+        if let Some((l, m, p)) = self.past.get(f)
+            && *l == len
+            && *m == modified
+        {
+            return p.clone();
+        }
+        let p = read_past(tool, f, len, modified);
+        self.past.insert(f.to_owned(), (len, modified, p.clone()));
+        p
+    }
+
     /// A Claude Code session's transcript: `projects/<dir>/<id>.jsonl`, where `<dir>` is the
     /// working directory with every other character than letters and digits turned into `-`
     /// (looked for in every project when the directory was shortened or moved).
@@ -533,8 +715,10 @@ impl Scanner {
             .map(|(_, f)| f)
     }
 
-    /// A Codex process's rollout: `codex resume <id>` names it; otherwise the newest rollout of
-    /// the same directory written since the process started.
+    /// A Codex process's rollout: the one `codex resume <id>` names, or the newest of its
+    /// directory whose thread began after the process started (a new session's own; Codex writes
+    /// it from the first turn on). A session resumed from Codex's menu writes to an older rollout
+    /// that could as well be another session's: none is claimed for it.
     fn codex_file(&mut self, p: &Proc, taken: &HashSet<PathBuf>) -> Option<PathBuf> {
         let key = (p.pid, p.start);
         if let Some(f) = self.codex_files.get(&key) {
@@ -542,12 +726,13 @@ impl Scanner {
         }
         let root = self.codex.join("sessions");
         let resume = p.args.iter().position(|a| a == "resume").and_then(|i| p.args.get(i + 1)).filter(|a| !a.starts_with('-'));
+        // (A second of slack for the start time's rounding.)
+        let since = p.start.saturating_sub(1);
         let mut files = Vec::new();
         match resume {
             // Resumed sessions keep writing their original rollout, from whatever day it began.
             Some(id) => walk_jsonl(&root, 3, &mut |f| f.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&format!("{id}.jsonl"))), &mut files),
             None => {
-                let since = p.start.saturating_sub(60);
                 for day in recent_days(&root, since) {
                     walk_jsonl(&day, 0, &mut |f| modified_since(f, since), &mut files);
                 }
@@ -559,8 +744,10 @@ impl Scanner {
                 continue;
             }
             if resume.is_none() {
-                let (_, file_cwd) = self.codex_session_meta(&f);
-                if file_cwd != p.cwd {
+                let head = self.codex_session_meta(&f);
+                // A terminal's thread: not one kiln's agent sessions (or an editor) started.
+                let tui = head.originator.is_empty() || head.originator.contains("tui") || head.originator.contains("cli");
+                if head.cwd != p.cwd || u64::try_from(head.began).unwrap_or(0) < since || !tui {
                     continue;
                 }
             }
@@ -574,15 +761,22 @@ impl Scanner {
         Some(f)
     }
 
-    fn codex_session_meta(&mut self, f: &Path) -> (String, String) {
+    fn codex_session_meta(&mut self, f: &Path) -> CodexHead {
         if let Some(m) = self.codex_meta.get(f) {
             return m.clone();
         }
         let first = head_line(f).unwrap_or_default();
         let (meta, _) = parse_codex(std::slice::from_ref(&first));
-        let m = (meta.id, meta.cwd);
+        let v = serde_json::from_str::<Value>(&first).unwrap_or(Value::Null);
+        let began = v
+            .pointer("/payload/timestamp")
+            .and_then(Value::as_str)
+            .and_then(|t| time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok())
+            .map_or(0, time::OffsetDateTime::unix_timestamp);
+        let originator = v.pointer("/payload/originator").and_then(Value::as_str).unwrap_or("").to_owned();
+        let m = CodexHead { cwd: meta.cwd, began, originator };
         // Only remember a complete header: a brand-new file may not have one yet.
-        if !m.1.is_empty() {
+        if !m.cwd.is_empty() {
             self.codex_meta.insert(f.to_owned(), m.clone());
         }
         m
@@ -600,6 +794,81 @@ fn claude_records(dir: &Path) -> Vec<ClaudeRecord> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| serde_json::from_slice::<ClaudeRecord>(&std::fs::read(e.path()).ok()?).ok())
         .collect()
+}
+
+/// A transcript's head and tail (the whole of a small one) as one past session.
+fn read_past(tool: Tool, f: &Path, len: u64, modified: SystemTime) -> Option<PastSession> {
+    let mut lines = Vec::new();
+    if len > HISTORY_HEAD + HISTORY_TAIL {
+        let file = std::fs::File::open(f).ok()?;
+        let mut buf = Vec::new();
+        file.take(HISTORY_HEAD).read_to_end(&mut buf).ok()?;
+        let head = String::from_utf8_lossy(&buf);
+        // (Its last line is cut short.)
+        let mut head_lines: Vec<&str> = head.lines().collect();
+        head_lines.pop();
+        lines.extend(head_lines.into_iter().filter(|l| !l.trim().is_empty()).map(str::to_owned));
+        lines.extend(tail_lines(f, HISTORY_TAIL)?);
+    } else {
+        lines = tail_lines(f, len.max(1))?;
+    }
+    let (mut meta, entries) = parse(tool, &lines);
+    if meta.model.is_empty() && len > HISTORY_HEAD + HISTORY_TAIL {
+        let (more, _) = parse(tool, &tail_lines(f, HISTORY_MODEL_TAIL.min(len)).unwrap_or_default());
+        meta.model = more.model;
+    }
+    let summary = summarize(meta, &entries);
+    let meta = &summary.meta;
+    let id = match tool {
+        // The file's name is the session's (the thread's, for Codex: a fork's or later part's
+        // first id).
+        Tool::Claude => f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        _ => codex_thread_of(f).unwrap_or_else(|| meta.id.clone()),
+    };
+    if id.is_empty() || (summary.last_prompt.trim().is_empty() && meta.title.is_empty()) {
+        return None;
+    }
+    // Codex's header (the first line) can outgrow the head read: its folder and branch.
+    let (cwd, branch) = if tool == Tool::Codex && (meta.cwd.is_empty() || meta.branch.is_empty()) {
+        let (head, _) = parse_codex(&head_line(f).into_iter().collect::<Vec<_>>());
+        (if meta.cwd.is_empty() { head.cwd } else { meta.cwd.clone() }, if meta.branch.is_empty() { head.branch } else { meta.branch.clone() })
+    } else {
+        (meta.cwd.clone(), meta.branch.clone())
+    };
+    Some(PastSession {
+        kind: tool.name().to_owned(),
+        id,
+        title: if meta.title.is_empty() { first_line(&summary.last_prompt, 80) } else { meta.title.clone() },
+        cwd,
+        branch,
+        model: meta.model.clone(),
+        last_activity: unix_secs(modified),
+        last_prompt: clip(&summary.last_prompt, SNIPPET),
+    })
+}
+
+/// The thread a Codex rollout belongs to, from its name: `rollout-<time>-<thread>[_<part>].jsonl`.
+fn codex_thread_of(f: &Path) -> Option<String> {
+    let name = f.file_name()?.to_str()?.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    // The time is "YYYY-MM-DDThh-mm-ss", then "-".
+    let rest = name.get(20..)?;
+    let thread = rest.split('_').next()?;
+    (thread.len() >= 32).then(|| thread.to_owned())
+}
+
+/// Codex's thread names (`session_index.jsonl`; the latest per thread).
+fn codex_names(home: &Path) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Some(lines) = tail_lines(&home.join("session_index.jsonl"), 1024 * 1024) else { return names };
+    for l in lines {
+        let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
+        if let (Some(id), Some(n)) = (str_at(&v, "id"), str_at(&v, "thread_name"))
+            && !n.trim().is_empty()
+        {
+            names.insert(id.to_owned(), n.to_owned());
+        }
+    }
+    names
 }
 
 fn args_of(p: &Process) -> Vec<String> {
@@ -635,6 +904,51 @@ fn tool_of(p: &Process) -> Option<Tool> {
         return by_name(&crate::os::program_stem(&script));
     }
     None
+}
+
+/// Whether `pid` runs the harness `kind` (`"claude"`, `"codex"` or `"gemini"`), as a scan would
+/// find it.
+pub fn runs(pid: u32, kind: &str) -> bool {
+    let p = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[p]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).with_exe(UpdateKind::Always).without_tasks(),
+    );
+    sys.process(p).and_then(tool_of).is_some_and(|t| t.name() == kind)
+}
+
+/// Ends a session running outside kiln, for a take-over: asks its process to quit (SIGTERM;
+/// Windows has no such ask, so there it is `false`), or with `force` kills it and everything it
+/// started, never kiln itself. Whether that was done.
+pub fn end(pid: u32, force: bool) -> bool {
+    let root = Pid::from_u32(pid);
+    let ours = Pid::from_u32(std::process::id());
+    if pid <= 1 || root == ours {
+        return false;
+    }
+    let mut sys = System::new();
+    if !force {
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[root]), true, ProcessRefreshKind::nothing().without_tasks());
+        return sys.process(root).and_then(|p| p.kill_with(sysinfo::Signal::Term)).unwrap_or(false);
+    }
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+    // Its tree, parents first, leaving out kiln's own (were kiln started from inside it).
+    let mut tree = vec![root];
+    let mut i = 0;
+    while let Some(&parent) = tree.get(i) {
+        let kids: Vec<Pid> = sys.processes().iter().filter(|(c, p)| p.parent() == Some(parent) && **c != ours && !tree.contains(*c)).map(|(c, _)| *c).collect();
+        tree.extend(kids);
+        i += 1;
+    }
+    let ended = sys.process(root).is_some_and(Process::kill);
+    for c in tree.iter().skip(1) {
+        if let Some(p) = sys.process(*c) {
+            p.kill();
+        }
+    }
+    ended
 }
 
 /// An interactive session rather than a one-shot or helper run of the tool.
@@ -821,13 +1135,24 @@ fn entry(role: &str, text: &str, at: &str) -> Entry {
 fn parse_claude(lines: &[String]) -> (Meta, Vec<Entry>) {
     let mut meta = Meta::default();
     let mut entries = Vec::new();
+    let mut custom = false;
     for line in lines {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         let kind = str_at(&v, "type").unwrap_or("");
         match kind {
             "ai-title" => {
-                if let Some(t) = str_at(&v, "aiTitle") {
+                if let Some(t) = str_at(&v, "aiTitle")
+                    && !custom
+                {
                     meta.title = t.to_owned();
+                }
+                continue;
+            }
+            // Named by the user (/rename): over any generated title.
+            "custom-title" => {
+                if let Some(t) = str_at(&v, "customTitle").filter(|t| !t.trim().is_empty()) {
+                    meta.title = t.to_owned();
+                    custom = true;
                 }
                 continue;
             }
@@ -1075,7 +1400,103 @@ mod tests {
     }
 
     #[test]
-    fn found_sessions_are_taken_over_only_from_a_kiln_terminal() {
+    fn a_codex_process_gets_its_own_rollout() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let day = dir.path().join("sessions").join(time::OffsetDateTime::now_utc().format(&time::macros::format_description!("[year]/[month]/[day]"))?);
+        std::fs::create_dir_all(&day)?;
+        let now = time::OffsetDateTime::now_utc();
+        let rfc = |t: time::OffsetDateTime| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+        let rollout = |id: &str, cwd: &str, began: time::OffsetDateTime| -> anyhow::Result<PathBuf> {
+            let f = day.join(format!("rollout-x-{id}.jsonl"));
+            let originator = if id.starts_with("kiln") { "kiln" } else { "codex-tui" };
+            let head = serde_json::json!({"timestamp": rfc(now), "type": "session_meta", "payload": {"id": id, "cwd": cwd, "timestamp": rfc(began), "originator": originator}});
+            std::fs::write(&f, format!("{head}\n"))?;
+            Ok(f)
+        };
+        let mut sc = Scanner::new(dir.path().to_owned());
+        sc.codex = dir.path().to_owned();
+        let start = u64::try_from(now.unix_timestamp()).unwrap_or(0).saturating_sub(5);
+        let p = Proc { pid: 4242, start, cwd: "/work".into(), args: vec!["codex".into()] };
+        // A thread that began before the process did, still written to (another session in the
+        // same folder, ending): not its.
+        rollout("other-1", "/work", now - time::Duration::minutes(3))?;
+        assert_eq!(sc.codex_file(&p, &HashSet::new()), None);
+        // Another folder's, or a thread one of kiln's agent sessions began meanwhile: not its
+        // either. Its own, once written: its for good.
+        rollout("elsewhere-1", "/other", now)?;
+        rollout("kiln-1", "/work", now)?;
+        assert_eq!(sc.codex_file(&p, &HashSet::new()), None);
+        let own = rollout("own-1", "/work", now - time::Duration::seconds(2))?;
+        assert_eq!(sc.codex_file(&p, &HashSet::new()).as_ref(), Some(&own));
+        assert_eq!(sc.codex_files.get(&(4242, start)), Some(&own));
+        // Resumed from Codex's menu: an older thread, nobody's for sure.
+        let q = Proc { pid: 4343, start, cwd: "/work".into(), args: vec!["codex".into(), "resume".into()] };
+        assert_eq!(sc.codex_file(&q, &HashSet::from([own.clone()])), None);
+        // Resumed by id: that one.
+        let r = Proc { pid: 4444, start, cwd: "/work".into(), args: vec!["codex".into(), "resume".into(), "other-1".into()] };
+        assert!(sc.codex_file(&r, &HashSet::new()).is_some_and(|f| f.to_string_lossy().ends_with("other-1.jsonl")));
+        Ok(())
+    }
+
+    #[test]
+    fn past_sessions_newest_first_without_the_running_ones() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (claude, codex) = (dir.path().join("claude"), dir.path().join("codex"));
+        let write = |f: &Path, lines: &[serde_json::Value], age: u64| -> anyhow::Result<()> {
+            if let Some(p) = f.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::write(f, lines.iter().map(|l| format!("{l}\n")).collect::<String>())?;
+            std::fs::File::options().write(true).open(f)?.set_modified(SystemTime::now() - Duration::from_secs(age))?;
+            Ok(())
+        };
+        let user = |id: &str, said: &str| serde_json::json!({"type": "user", "sessionId": id, "cwd": "/work/a", "gitBranch": "main", "timestamp": "t", "message": {"role": "user", "content": said}});
+        let reply = |id: &str| serde_json::json!({"type": "assistant", "sessionId": id, "cwd": "/work/a", "timestamp": "t", "message": {"role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}]}});
+        let proj = claude.join("projects").join("-work-a");
+        // Named with /rename; then one with no name; then one kiln runs now; an empty one; a
+        // subagent's.
+        write(&proj.join("c-named.jsonl"), &[user("c-named", "fix the build"), reply("c-named"), serde_json::json!({"type": "custom-title", "customTitle": "Build fix", "sessionId": "c-named"})], 300)?;
+        write(&proj.join("c-plain.jsonl"), &[user("c-plain", "write the docs\nall of them"), reply("c-plain")], 200)?;
+        write(&proj.join("c-running.jsonl"), &[user("c-running", "busy"), reply("c-running")], 10)?;
+        write(&proj.join("c-empty.jsonl"), &[serde_json::json!({"type": "queue-operation", "operation": "enqueue"})], 5)?;
+        write(&proj.join("agent-sub.jsonl"), &[user("agent-sub", "sub task")], 1)?;
+        // Codex: a thread (its session_meta, a turn's context, a prompt) and a later part of it;
+        // its name from the index.
+        let day = codex.join("sessions/2026/10/16");
+        let thread = "01a14829-db2b-7e00-a770-67aa7bf6d977";
+        let meta = serde_json::json!({"timestamp": "t", "type": "session_meta", "payload": {"id": thread, "cwd": "/work/b", "originator": "codex-tui", "git": {"branch": "dev"}}});
+        let ctx = serde_json::json!({"timestamp": "t", "type": "turn_context", "payload": {"cwd": "/work/b", "model": "gpt-5.5"}});
+        let said = serde_json::json!({"timestamp": "t", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ship it"}]}});
+        write(&day.join(format!("rollout-2026-10-16T21-41-05-{thread}.jsonl")), &[meta.clone(), ctx.clone(), said.clone()], 100)?;
+        write(&day.join(format!("rollout-2026-10-16T21-41-07-{thread}_01a14829-e32a-79c2-8581-3ab5a4b9d221.jsonl")), &[meta, ctx, said], 50)?;
+        std::fs::write(codex.join("session_index.jsonl"), format!("{}\n", serde_json::json!({"id": thread, "thread_name": "Ship", "updated_at": "t"})))?;
+        let mut sc = Scanner::new(dir.path().to_owned());
+        sc.claude = claude;
+        sc.codex = codex;
+        let running: HashSet<String> = HashSet::from(["c-running".to_owned()]);
+        let past = sc.history(None, 50, &running);
+        let got: Vec<(&str, &str, &str, &str, &str, &str)> = past.iter().map(|p| (p.kind.as_str(), p.id.as_str(), p.title.as_str(), p.cwd.as_str(), p.branch.as_str(), p.model.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("codex", thread, "Ship", "/work/b", "dev", "gpt-5.5"),
+                ("claude", "c-plain", "write the docs", "/work/a", "main", "claude-opus-5-5"),
+                ("claude", "c-named", "Build fix", "/work/a", "main", "claude-opus-5-5"),
+            ]
+        );
+        assert!(past.windows(2).all(|w| w.first().map(|p| p.last_activity) >= w.get(1).map(|p| p.last_activity)));
+        assert_eq!(past.get(1).map(|p| p.last_prompt.as_str()), Some("write the docs\nall of them"));
+        // One kind, a limit.
+        assert_eq!(sc.history(Some("claude"), 1, &running).iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["c-plain"]);
+        assert!(sc.history(Some("codex"), 50, &running).iter().all(|p| p.kind == "codex"));
+        // Written to since: read again.
+        write(&proj.join("c-plain.jsonl"), &[user("c-plain", "write the docs"), reply("c-plain"), user("c-plain", "and the changelog")], 1)?;
+        assert_eq!(sc.history(Some("claude"), 1, &running).first().map(|p| p.last_prompt.as_str()), Some("and the changelog"));
+        Ok(())
+    }
+
+    #[test]
+    fn found_sessions_are_taken_over_or_branched() {
         let s = AiSession {
             tool: "claude".into(),
             id: "8b2c".into(),
@@ -1084,19 +1505,55 @@ mod tests {
             cwd: "/work".into(),
             model: "claude-opus-5-5".into(),
             terminal: Some("term1".into()),
+            transcript: true,
+            last_prompt: "fix the build".into(),
             ..AiSession::default()
         };
         assert_eq!(s.takeover(true), TakeOver::Ready);
         let spec = s.takeover_spec(true).unwrap_or_default();
         assert_eq!((spec.kind.as_str(), spec.cwd.as_deref(), spec.resume.as_deref(), spec.takeover_pid), ("claude", Some("/work"), Some("8b2c"), Some(4242)));
         assert_eq!((spec.model.as_deref(), spec.name.as_deref()), (Some("claude-opus-5-5"), Some("fix the build")));
-        // kiln does not hold its terminal (any more), or it runs outside kiln: quit it first.
-        assert_eq!(s.takeover(false), TakeOver::Outside);
-        assert_eq!(AiSession { terminal: None, ..s.clone() }.takeover(true), TakeOver::Outside);
-        assert!(s.takeover_spec(false).is_none());
+        assert!(!spec.takeover_stop && !spec.fork);
+        // kiln does not hold its terminal (any more), or it runs outside kiln: kiln ends it first.
+        assert_eq!(s.takeover(false), TakeOver::Stop);
+        assert_eq!(AiSession { terminal: None, ..s.clone() }.takeover(true), TakeOver::Stop);
+        let stop = s.takeover_spec(false).unwrap_or_default();
+        assert_eq!((stop.takeover_pid, stop.takeover_stop, stop.resume.as_deref()), (Some(4242), true, Some("8b2c")));
+        // An ACP agent might start anew rather than resume it: never ended to find out.
+        let acp = AiSession { tool: "gemini".into(), terminal: None, ..s.clone() };
+        assert_eq!(acp.takeover(true), TakeOver::Outside);
+        assert!(acp.takeover_spec(true).is_none());
+        // A copy leaves it running: a branch of its conversation, with no process to wait for.
+        let fork = s.fork_spec().unwrap_or_default();
+        assert_eq!((fork.fork, fork.takeover_pid, fork.resume.as_deref(), fork.name.as_deref()), (true, None, Some("8b2c"), Some("fix the build (branch)")));
+        assert!(acp.fork_spec().is_none() && AiSession { id: String::new(), ..s.clone() }.fork_spec().is_none());
+        // Brand new: its id is known before its transcript holds a first message.
+        for fresh in [AiSession { transcript: false, ..s.clone() }, AiSession { last_prompt: String::new(), ..s.clone() }] {
+            assert_eq!((fresh.takeover(true), fresh.takeover(false), fresh.forkable()), (TakeOver::NoId, TakeOver::NoId, false));
+        }
         // Nothing to continue yet; a harness kiln cannot run as an agent session.
         assert_eq!(AiSession { id: String::new(), ..s.clone() }.takeover(true), TakeOver::NoId);
         assert_eq!(AiSession { tool: "antigravity".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
         assert_eq!(serde_json::to_value(TakeOver::NoId).ok(), Some(serde_json::json!("no_id")));
+        assert_eq!(serde_json::to_value(TakeOver::Stop).ok(), Some(serde_json::json!("stop")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_taken_over_from_outside_is_asked_to_quit_then_killed() -> anyhow::Result<()> {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut asked = std::process::Command::new("sleep").arg("30").spawn()?;
+        // Not a harness, whatever it was found as: a take-over leaves it alone.
+        assert!(!runs(asked.id(), "claude"));
+        assert!(end(asked.id(), false));
+        assert_eq!(asked.wait()?.signal(), Some(15));
+        // Killed, with what it started.
+        let mut killed = std::process::Command::new("sh").args(["-c", "sleep 30; true"]).spawn()?;
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(end(killed.id(), true));
+        assert_eq!(killed.wait()?.signal(), Some(9));
+        // Never kiln itself.
+        assert!(!end(std::process::id(), true) && !end(1, false));
+        Ok(())
     }
 }

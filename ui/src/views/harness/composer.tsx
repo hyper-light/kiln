@@ -11,6 +11,8 @@ import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { Attachments } from "./controls";
 import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, type Reply } from "./palette";
+import { SendWith } from "./run-settings";
+import { modelLabel } from "./derive";
 
 const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -20,16 +22,18 @@ const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] =
 
 const fine = () => typeof window !== "undefined" && window.matchMedia?.("(pointer: fine)").matches;
 
+/** One queued message: its words (tap to read them whole), and what can be done with it. */
 function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: string; text: string; index: number; count: number; store: SessionStore; canNow: boolean; canSteer: boolean }) {
   const [editing, setEditing] = React.useState(false);
+  const [whole, setWhole] = React.useState(false);
   const [draft, setDraft] = React.useState(text);
   React.useEffect(() => setDraft(text), [text]);
   return (
-    <li className="hx-queue-row">
-      <span className="hx-queue-n">{index + 1}</span>
+    <li className="qd-row">
+      <span className="qd-n">{index + 1}</span>
       {editing ? (
         <textarea
-          className="hx-input hx-queue-edit"
+          className="hx-input qd-edit"
           autoFocus
           rows={Math.min(6, draft.split("\n").length + 1)}
           value={draft}
@@ -47,39 +51,98 @@ function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: str
           }}
         />
       ) : (
-        <button type="button" className="hx-queue-text" onClick={() => setEditing(true)} title="Edit">
+        <button type="button" className={cn("qd-text", whole && "qd-whole")} onClick={() => setWhole(!whole)} aria-expanded={whole}>
           {text}
         </button>
       )}
-      <span className="hx-queue-actions">
-        <button type="button" className="hx-icon" aria-label="Edit" onClick={() => setEditing(true)}>
-          <Pencil size={12} />
-        </button>
-        <button type="button" className="hx-icon" aria-label="Move up" disabled={index === 0} onClick={() => store.send({ type: "queue_move", id, index: index - 1 })}>
-          <ArrowUp size={12} />
-        </button>
-        <button type="button" className="hx-icon" aria-label="Move down" disabled={index === count - 1} onClick={() => store.send({ type: "queue_move", id, index: index + 1 })}>
-          <ArrowDown size={12} />
-        </button>
+      <span className="qd-acts">
+        <Tip content="Edit">
+          <button type="button" className="hx-icon" aria-label="Edit" onClick={() => setEditing(true)}>
+            <Pencil size={13} />
+          </button>
+        </Tip>
         {canSteer && (
-          <Tip content="Steer it into the running turn now — no interrupt">
+          <Tip content="Steer it into the running turn now, without interrupting">
             <button type="button" className="hx-icon" aria-label="Steer now" onClick={() => store.send({ type: "queue_steer", id })}>
-              <Navigation size={12} />
+              <Navigation size={13} />
             </button>
           </Tip>
         )}
         {canNow && (
           <Tip content="Stop the current turn and send this now">
             <button type="button" className="hx-icon" aria-label="Send now" onClick={() => store.send({ type: "queue_send_now", id })}>
-              <Zap size={12} />
+              <Zap size={13} />
             </button>
           </Tip>
         )}
-        <button type="button" className="hx-icon" aria-label="Remove" onClick={() => store.send({ type: "queue_remove", id })}>
-          <X size={12} />
-        </button>
+        <Tip content="Move up">
+          <button type="button" className="hx-icon" aria-label="Move up" disabled={index === 0} onClick={() => store.send({ type: "queue_move", id, index: index - 1 })}>
+            <ArrowUp size={13} />
+          </button>
+        </Tip>
+        <Tip content="Move down">
+          <button type="button" className="hx-icon" aria-label="Move down" disabled={index === count - 1} onClick={() => store.send({ type: "queue_move", id, index: index + 1 })}>
+            <ArrowDown size={13} />
+          </button>
+        </Tip>
+        <Tip content="Remove">
+          <button type="button" className="hx-icon qd-remove" aria-label="Remove" onClick={() => store.send({ type: "queue_remove", id })}>
+            <X size={13} />
+          </button>
+        </Tip>
       </span>
     </li>
+  );
+}
+
+/** What's queued: one line until opened; it folds again a few seconds after you leave it. */
+function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text: string }[]; store: SessionStore; canNow: boolean; canSteer: boolean }) {
+  const [open, setOpen] = React.useState(false);
+  const timer = React.useRef(0);
+  const root = React.useRef<HTMLDivElement>(null);
+  const hovered = React.useRef(false);
+  // It folds a few seconds after the last touch, unless one is being edited or a mouse rests on it.
+  const fold = React.useCallback(() => {
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      const editing = root.current?.contains(document.activeElement) && document.activeElement?.tagName === "TEXTAREA";
+      if (editing || hovered.current) fold();
+      else setOpen(false);
+    }, 4000);
+  }, []);
+  React.useEffect(() => () => window.clearTimeout(timer.current), []);
+  React.useEffect(() => {
+    if (open) fold();
+  }, [open, queue.length, fold]);
+  const first = queue[0]?.text ?? "";
+  return (
+    <div
+      ref={root}
+      className="qd"
+      data-open={open || undefined}
+      onPointerEnter={(e) => {
+        if (e.pointerType === "mouse") hovered.current = true;
+      }}
+      onPointerLeave={() => {
+        hovered.current = false;
+      }}
+      onPointerDown={() => open && fold()}
+      onKeyDown={() => open && fold()}
+    >
+      <button type="button" className="qd-line" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span className="qd-label">Queued · {queue.length}</span>
+        {!open && <span className="qd-first">{first}</span>}
+        {open && <span className="qd-hint">sent in order when it finishes</span>}
+        <ChevronDown size={12} className="qd-chev" aria-hidden="true" />
+      </button>
+      {open && (
+        <ol className="qd-list">
+          {queue.map((q, i) => (
+            <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={canNow} canSteer={canSteer} />
+          ))}
+        </ol>
+      )}
+    </div>
   );
 }
 
@@ -115,6 +178,10 @@ export function Composer({
   const { files, add, clear, chips, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
+  /** "Send with": a model or effort for the next message only (long-press or right-click Send). */
+  const [withOpen, setWithOpen] = React.useState(false);
+  const pressTimer = React.useRef(0);
+  const longPressed = React.useRef(false);
   const approvals = state?.approvals.length ?? 0;
   const sendLabel = running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
 
@@ -138,7 +205,8 @@ export function Composer({
   React.useEffect(() => {
     setPalIndex(0);
     setPalClosed(false);
-    setNote(null);
+    // A new command name replaces an old note; clearing the field after one keeps it in view.
+    if (slash?.name) setNote(null);
   }, [slash?.name]);
   const typed = slash && !slash.typingName ? findCommand(commands, slash.name) : undefined;
 
@@ -231,6 +299,7 @@ export function Composer({
       setSuggest(null);
       clear();
       setOverride({});
+      setWithOpen(false);
       // "Now" and "Steer" are for one message: the next one queues again unless chosen.
       setMode("queue");
     }
@@ -291,19 +360,7 @@ export function Composer({
 
   return (
     <div className="hx-composer cp">
-      {queue.length > 0 && (
-        <div className="hx-queue">
-          <div className="hx-queue-head">
-            <span className="hx-eyebrow">Queued · {queue.length}</span>
-            <span className="hx-dim">sent in order when it finishes</span>
-          </div>
-          <ol>
-            {queue.map((q, i) => (
-              <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={features.includes("send_now")} canSteer={features.includes("queue_steer")} />
-            ))}
-          </ol>
-        </div>
-      )}
+      {queue.length > 0 && <Queued queue={queue} store={store} canNow={features.includes("send_now")} canSteer={features.includes("queue_steer")} />}
 
       {reply && <ReplyPanel reply={reply} onClose={() => setReply(null)} />}
       {palItems.length > 0 && <CommandList items={palItems} index={palIndex} onPick={pick} onHover={setPalIndex} />}
@@ -355,6 +412,18 @@ export function Composer({
         }}
       >
         {chips}
+        {canOverride && (withOpen || override.model || override.effort) && (
+          <SendWith
+            className="cp-with"
+            models={meta?.models ?? []}
+            model={state?.model ?? ""}
+            modelLabel={modelLabel}
+            efforts={meta?.efforts ?? []}
+            effort={state?.effort ?? ""}
+            value={override}
+            onChange={setOverride}
+          />
+        )}
         <textarea
           onPaste={(e) => {
             if (canAttach && e.clipboardData.files.length) {
@@ -438,30 +507,6 @@ export function Composer({
               </label>
             </>
           )}
-          {canOverride && (meta?.models.length || meta?.efforts?.length) ? (
-            <span className="cp-override">
-              {meta?.models.length ? (
-                <select aria-label="Model for this message" value={override.model ?? ""} onChange={(e) => setOverride({ ...override, model: e.target.value || undefined })}>
-                  <option value="">model</option>
-                  {meta.models.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-              ) : null}
-              {meta?.efforts?.length ? (
-                <select aria-label="Effort for this message" value={override.effort ?? ""} onChange={(e) => setOverride({ ...override, effort: e.target.value || undefined })}>
-                  <option value="">effort</option>
-                  {meta.efforts.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-              ) : null}
-            </span>
-          ) : null}
           <span className="cp-gap" />
           {running && features.includes("interrupt") && (
             <Tip content="Stop the current turn (Esc)">
@@ -475,7 +520,28 @@ export function Composer({
             type="button"
             className="cp-send"
             data-mode={running ? mode : "send"}
-            onClick={submit}
+            onClick={() => {
+              if (longPressed.current) {
+                longPressed.current = false;
+                return;
+              }
+              submit();
+            }}
+            onContextMenu={(e) => {
+              if (!canOverride) return;
+              e.preventDefault();
+              setWithOpen((o) => !o);
+            }}
+            onPointerDown={() => {
+              if (!canOverride) return;
+              window.clearTimeout(pressTimer.current);
+              pressTimer.current = window.setTimeout(() => {
+                longPressed.current = true;
+                setWithOpen(true);
+              }, 450);
+            }}
+            onPointerUp={() => window.clearTimeout(pressTimer.current)}
+            onPointerLeave={() => window.clearTimeout(pressTimer.current)}
             disabled={(!text.trim() && files.length === 0) || disabled || pending > 0}
             aria-label={sendLabel}
           >

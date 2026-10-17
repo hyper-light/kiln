@@ -15,7 +15,26 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
-import { AUTHORS, REPOS, commitMessage, hashStr, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
+import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
+import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
+import { handleAccounts, handleDemoSession } from "./accounts.ts";
+import {
+  AUTOJOIN,
+  DNS_SD_DOMAINS,
+  INSTANCE_SEEDS,
+  PROBE_FIND,
+  SCAN_FIND,
+  SERVER_ADDR,
+  SERVER_CA,
+  SERVER_INSTANCE_ID,
+  SERVER_URL,
+  SILENT_NETWORK_FIXES,
+  SUBNETS,
+  dnsSdRecords,
+  mdnsInterfaces,
+  type InstanceSeed,
+  type MockOs,
+} from "./data.ts";
 
 const PORT = Number(process.env.PORT ?? 7070);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -739,6 +758,314 @@ setInterval(() => {
 }, 10_000);
 
 /* ------------------------------------------------------------------ */
+/* Discovery and joining (Runners → Add machines)                      */
+/*                                                                     */
+/*   MOCK_SERVER_OS=macos|linux|windows  the server's OS (default macos: */
+/*                                       Bonjour is a discovery method)  */
+/*   MOCK_NETWORK=empty                  nothing else on the network     */
+/*   MOCK_AUTOJOIN=0                     no machine runs the one-liner   */
+/*   MOCK_AUTOJOIN_SECONDS=30            how long after the page asked   */
+/* ------------------------------------------------------------------ */
+
+const SERVER_OS: MockOs = process.env.MOCK_SERVER_OS === "linux" || process.env.MOCK_SERVER_OS === "windows" ? process.env.MOCK_SERVER_OS : "macos";
+const SERVER_ARCH = SERVER_OS === "macos" ? "aarch64" : "x86_64";
+/** The OS's own DNS-SD (Bonjour, Windows DNS-SD); Linux has none kiln uses. */
+const NATIVE = SERVER_OS !== "linux";
+const EMPTY_NETWORK = process.env.MOCK_NETWORK === "empty";
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+interface MockInstance {
+  id: string;
+  instance: string;
+  name: string;
+  role: string;
+  version: string;
+  os: string;
+  arch: string;
+  port: number;
+  quic: number;
+  ca: string | null;
+  enrolled: string | null;
+  addresses: string[];
+  first_seen: number;
+  last_seen: number;
+  via: DiscoveryVia[];
+  invited: boolean;
+  request: string | null;
+}
+
+const instances = new Map<string, MockInstance>();
+const joinRequests = new Map<string, JoinRequest>();
+
+function seedInstance(s: InstanceSeed, at = now()): MockInstance {
+  return {
+    id: s.id,
+    instance: `kiln ${s.role} on ${s.name} (${s.id.slice(0, 8)})`,
+    name: s.name,
+    role: s.role,
+    version: s.version || VERSION,
+    os: s.os,
+    arch: s.arch,
+    port: s.port,
+    quic: s.quic,
+    ca: s.ca,
+    enrolled: s.enrolled,
+    addresses: [...s.addresses],
+    first_seen: at - s.firstAgo,
+    last_seen: at - s.lastAgo,
+    via: NATIVE ? [...s.via] : s.via.filter((v) => v !== "native"),
+    invited: s.invited ?? false,
+    request: null,
+  };
+}
+
+// This server shows up too: through its own DNS-SD zone and the last scan.
+instances.set(
+  SERVER_INSTANCE_ID,
+  seedInstance({ id: SERVER_INSTANCE_ID, name: HOSTNAME, role: "server", version: "", os: SERVER_OS, arch: SERVER_ARCH, port: 7070, quic: 7071, ca: SERVER_CA, enrolled: null, addresses: [SERVER_ADDR], via: ["dns-sd", "scan"], firstAgo: 86_000, lastAgo: 4 }),
+);
+if (!EMPTY_NETWORK) for (const s of INSTANCE_SEEDS) instances.set(s.id, seedInstance(s));
+
+/** The agent an instance already is here: one of our runners on that host, or a runner enrolled with our CA. */
+function joinedAs(i: MockInstance): string | null {
+  const host = [...agents.values()].find((a) => !a.ephemeral && a.hostname.toLowerCase() === i.name.toLowerCase());
+  if (host) return host.name;
+  return i.role === "agent" && i.enrolled === SERVER_CA ? i.name.replace(/\.lan$/, "") : null;
+}
+
+function addressOf(i: MockInstance) {
+  return i.addresses.find((a) => !a.includes(":")) ?? i.addresses[0] ?? null;
+}
+
+function presentInstance(i: MockInstance): DiscoveredInstance {
+  const agent = joinedAs(i);
+  const addr = addressOf(i);
+  return {
+    ...i,
+    url: i.port && addr ? `http://${addr.includes(":") ? `[${addr}]` : addr}:${i.port}` : null,
+    joined: agent !== null,
+    agent,
+    same_ca: i.ca === SERVER_CA,
+    join_command: `kiln join --server ${SERVER_URL}`,
+  };
+}
+
+const sixDigits = () => String(Math.floor(rnd() * 1e6)).padStart(6, "0");
+
+/** A machine asking to join (`kiln join`). `code: false`: it has not confirmed yet (it does after `confirmMs`). */
+function addJoinRequest(
+  r: Pick<JoinRequest, "name" | "hostname" | "os" | "arch" | "labels" | "version" | "address">,
+  opts: { code?: string | false; ago?: number; instance?: string; confirmMs?: number } = {},
+): JoinRequest {
+  const at = now() - (opts.ago ?? 0);
+  const jr: JoinRequest = { ...r, id: rid("jr_"), status: "pending", code: opts.code === false ? null : (opts.code ?? sixDigits()), created_at: at, expires_at: at + 600, agent: null };
+  joinRequests.set(jr.id, jr);
+  const inst = opts.instance ? instances.get(opts.instance) : undefined;
+  if (inst) inst.request = jr.id;
+  if (jr.code === null) {
+    setTimeout(() => {
+      if (jr.status !== "pending" || jr.code) return;
+      jr.code = sixDigits();
+      emit({ type: "join_requests" });
+    }, opts.confirmMs ?? 3000);
+  }
+  return jr;
+}
+
+function requestFrom(i: MockInstance): Pick<JoinRequest, "name" | "hostname" | "os" | "arch" | "labels" | "version" | "address"> {
+  const name = i.name.replace(/\.lan$/, "");
+  return { name, hostname: i.name, os: i.os, arch: i.arch, labels: ["baremetal", i.os, i.arch], version: i.version, address: addressOf(i) ?? "" };
+}
+
+if (!EMPTY_NETWORK) {
+  const studio = INSTANCE_SEEDS.find((s) => s.name === "studio-mbp.lan")!;
+  addJoinRequest(requestFrom(instances.get(studio.id)!), { code: "482913", ago: 95, instance: studio.id });
+  // Two machines that are not on this network: one over the internet, one over Tailscale.
+  addJoinRequest({ name: "ci-win-02", hostname: "CI-WIN-02", os: "windows", arch: "x86_64", labels: ["baremetal", "windows", "x86_64"], version: VERSION, address: "203.0.113.24" }, { code: "731064", ago: 40 });
+  addJoinRequest({ name: "gpu-box", hostname: "gpu-box", os: "linux", arch: "x86_64", labels: ["baremetal", "gpu", "linux", "x86_64"], version: "0.0.9", address: "100.70.3.9" }, { code: false, ago: 3, confirmMs: 9000 });
+}
+
+// Requests live 10 minutes; a machine still waiting asks again, with a new code. Decided ones go.
+setInterval(() => {
+  const t = now();
+  let changed = false;
+  for (const jr of [...joinRequests.values()]) {
+    if (jr.expires_at > t) continue;
+    joinRequests.delete(jr.id);
+    changed = true;
+    if (jr.status !== "pending") continue;
+    const inst = [...instances.values()].find((i) => i.request === jr.id);
+    if (inst) inst.request = null;
+    addJoinRequest({ name: jr.name, hostname: jr.hostname, os: jr.os, arch: jr.arch, labels: jr.labels, version: jr.version, address: jr.address }, { code: false, instance: inst?.id, confirmMs: 2000 });
+  }
+  if (changed) {
+    emit({ type: "join_requests" });
+    emit({ type: "discovery" });
+  }
+}, 5000);
+
+// What announces itself is heard again every 30 s or so; what a scan or a probe found is not.
+setInterval(() => {
+  const t = now();
+  for (const i of instances.values()) if (i.via.some((v) => v === "mdns" || v === "native" || v === "tailscale" || v === "dns-sd")) i.last_seen = t - Math.floor(rnd() * 8);
+}, 30_000);
+
+/* ---- scans ---- */
+
+let scan: ScanState | null = { running: false, cidrs: [SUBNETS[0]!], started_at: now() - 760, finished_at: now() - 731, probed: 254, total: 254, found: 2 };
+
+function ipv4(s: string): number | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (!m) return null;
+  const o = m.slice(1, 5).map(Number);
+  return o.some((x) => x > 255) ? null : ((o[0]! << 24) | (o[1]! << 16) | (o[2]! << 8) | o[3]!) >>> 0;
+}
+
+/** Addresses in a CIDR, or why it can't be scanned. */
+function cidrSize(c: string): number | string {
+  const [addr = "", bits = ""] = c.split("/");
+  const n = Number(bits);
+  if (ipv4(addr) === null || !/^\d{1,2}$/.test(bits) || n > 32) return `${c} is not an IPv4 subnet like 192.168.1.0/24`;
+  if (n < 22) return `${c} is too big to scan: at most a /22 (1022 addresses) at a time`;
+  return n >= 31 ? 2 ** (32 - n) : 2 ** (32 - n) - 2;
+}
+
+function inCidr(addr: string, c: string): boolean {
+  const [base = "", bits = "32"] = c.split("/");
+  const a = ipv4(addr);
+  const b = ipv4(base);
+  if (a === null || b === null) return false;
+  const mask = Number(bits) === 0 ? 0 : (~0 << (32 - Number(bits))) >>> 0;
+  return ((a & mask) >>> 0) === ((b & mask) >>> 0);
+}
+
+function startScan(cidrs: string[], total: number): ScanState {
+  const s: ScanState = { running: true, cidrs, started_at: now(), finished_at: null, probed: 0, total, found: 0 };
+  scan = s;
+  const step = Math.max(1, Math.ceil(total / 40));
+  let emitted = 0;
+  const timer = setInterval(() => {
+    s.probed = Math.min(total, s.probed + step);
+    const find = SCAN_FIND.addresses[0]!;
+    if (s.probed >= total * 0.6 && !instances.has(SCAN_FIND.id) && cidrs.some((c) => inCidr(find, c))) {
+      instances.set(SCAN_FIND.id, seedInstance(SCAN_FIND));
+      s.found++;
+    }
+    if (s.probed >= total) {
+      clearInterval(timer);
+      s.running = false;
+      s.finished_at = now();
+      for (const i of instances.values()) {
+        if (i.role === "agent" && i.id !== AUTOJOIN.id && i.addresses.some((a) => cidrs.some((c) => inCidr(a, c))) && !i.via.includes("scan")) i.via.push("scan");
+      }
+      emit({ type: "discovery" });
+      return;
+    }
+    // Progress events at most twice a second, as the server sends them.
+    if (Date.now() - emitted >= 500) {
+      emitted = Date.now();
+      emit({ type: "discovery" });
+    }
+  }, 250);
+  return s;
+}
+
+/* ---- the join token, and a machine running the one-liner ---- */
+
+let joinToken = { token: `kj_${randomBytes(18).toString("base64url")}`, expires_at: now() + 86_400 };
+let autojoinPlanned = process.env.MOCK_AUTOJOIN === "0";
+
+function joinInfo(): JoinInfo & { quic: string; manual: string } {
+  if (joinToken.expires_at <= now()) joinToken = { token: `kj_${randomBytes(18).toString("base64url")}`, expires_at: now() + 86_400 };
+  const { token, expires_at } = joinToken;
+  const install = {
+    linux: `curl -fsSL ${SERVER_URL}/install.sh | sh -s -- --token ${token} --labels baremetal,linux`,
+    macos: `curl -fsSL ${SERVER_URL}/install.sh | sh -s -- --token ${token} --labels baremetal,macos`,
+    windows: `& ([scriptblock]::Create((irm '${SERVER_URL}/install.ps1'))) -Token '${token}' -Labels 'baremetal,windows'`,
+  };
+  return {
+    token,
+    server: SERVER_URL,
+    quic: `${SERVER_ADDR}:7071`,
+    command: install.linux,
+    macos: install.macos,
+    windows: install.windows,
+    manual: `kiln agent --server ${SERVER_URL} --token ${token} --labels baremetal`,
+    join: `curl -fsSL ${SERVER_URL}/install.sh | sh -s -- --join`,
+    join_manual: `kiln join --server ${SERVER_URL}`,
+    install,
+    expires_at,
+  };
+}
+
+/** Once per mock run: a while after someone asked for the one-liner, a machine runs it and connects. */
+function planAutojoin() {
+  if (autojoinPlanned) return;
+  autojoinPlanned = true;
+  setTimeout(() => {
+    if (agents.has(AUTOJOIN.name)) return;
+    const a = addAgent({ name: AUTOJOIN.name, labels: ["baremetal", "linux", "aarch64"], slots: 1, hostname: AUTOJOIN.hostname, os: AUTOJOIN.os, arch: AUTOJOIN.arch, version: VERSION, ephemeral: false, connected: true, last_seen: now(), enrolled_at: now() }, newHost(4, 8, 250));
+    instances.set(AUTOJOIN.id, seedInstance({ id: AUTOJOIN.id, name: AUTOJOIN.hostname, role: "agent", version: "", os: AUTOJOIN.os, arch: AUTOJOIN.arch, port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: [AUTOJOIN.address], via: ["mdns"], firstAgo: 0, lastAgo: 0 }));
+    addAudit(AUTOJOIN.name, "agent.enroll", "");
+    emit({ type: "agent", agent: a });
+    emit({ type: "discovery" });
+  }, Number(process.env.MOCK_AUTOJOIN_SECONDS ?? 30) * 1000);
+}
+
+function discoveryInfo(): DiscoveryInfo {
+  const list = [...instances.values()];
+  const by = (v: DiscoveryVia) => list.filter((i) => i.id !== SERVER_INSTANCE_ID && i.via.includes(v));
+  const last = (xs: MockInstance[]) => (xs.length ? Math.max(...xs.map((i) => i.last_seen)) : null);
+  const method = (id: DiscoveryMethod["id"], label: string, state: DiscoveryMethod["state"], detail: string, v?: DiscoveryVia): DiscoveryMethod => {
+    const xs = v && state === "active" ? by(v) : [];
+    return { id, label, state, detail, heard: xs.length, last_heard: last(xs) };
+  };
+  const publish = { configured: true, zone: DNS_SD_DOMAINS[0]!, ok: false, error: "update refused by 192.168.1.1 (REFUSED)", at: Math.floor(STARTED / 1000) + 12 };
+  const methods: DiscoveryMethod[] = [
+    method("mdns", "Multicast DNS", "active", `${mdnsInterfaces(SERVER_OS)} · announcing kiln server on ${HOSTNAME}`, "mdns"),
+    NATIVE
+      ? method("native", SERVER_OS === "macos" ? "Bonjour (macOS)" : "Windows DNS-SD", "active", SERVER_OS === "macos" ? "mDNSResponder · browsing _kiln._tcp in local." : "DnsServiceBrowse · browsing _kiln._tcp.local", "native")
+      : method("native", "Bonjour (macOS)", "unavailable", "only on macOS and Windows; multicast DNS covers Linux"),
+    method("dns-sd", `DNS-SD (${DNS_SD_DOMAINS[0]})`, "active", `browsing _kiln._tcp.${DNS_SD_DOMAINS[0]} through 192.168.1.1`, "dns-sd"),
+    method("dns-sd", `DNS-SD (${DNS_SD_DOMAINS[1]})`, "error", `SERVFAIL from 10.10.0.2 for _kiln._tcp.${DNS_SD_DOMAINS[1]}`),
+    method("scan", "Network scan", "active", scan?.running ? `scanning ${scan.cidrs.join(", ")}` : scan ? `on demand · last ${scan.cidrs.join(", ")}` : "on demand · not run yet", "scan"),
+    method("tailscale", "Tailscale", "active", "tailnet tail4a2c.ts.net · 6 peers online, asked every 60 s", "tailscale"),
+    method("seeds", "Seed addresses", "off", "none configured"),
+  ];
+  const problems: DiscoveryProblem[] = [];
+  const silent = list.filter((i) => i.id !== SERVER_INSTANCE_ID && !i.via.some((v) => v === "mdns" || v === "native") && i.addresses.some((a) => inCidr(a, SUBNETS[0]!)));
+  if (silent.length) {
+    const names = silent.map((i) => i.name).join(", ");
+    const one = silent.length === 1;
+    problems.push({
+      id: "silent-network",
+      text: `${names} ${one ? "answers" : "answer"} a scan of ${SUBNETS[0]} but ${one ? "has" : "have"} never been heard over multicast DNS. Something between ${one ? "it" : "them"} and this server drops multicast: a firewall, or Wi-Fi client isolation.`,
+      fixes: SILENT_NETWORK_FIXES,
+    });
+  }
+  if (publish.ok === false) {
+    problems.push({
+      id: "dns-sd-publish",
+      text: `Publishing this server to ${publish.zone} failed: ${publish.error}. Machines on other networks can't find it there until it is published.`,
+      fixes: [{ text: `Allow dynamic updates (RFC 2136) from ${SERVER_ADDR} for ${publish.zone}, or add the records under DNS-SD below to the zone by hand.` }],
+    });
+  }
+  return {
+    enabled: true,
+    announce: true,
+    browse: true,
+    join_requests: true,
+    self: { id: SERVER_INSTANCE_ID, name: HOSTNAME, instance: `kiln server on ${HOSTNAME} (${SERVER_INSTANCE_ID.slice(0, 8)})`, ca: SERVER_CA, port: 7070, quic: 7071, version: VERSION },
+    instances: list.map(presentInstance),
+    methods,
+    problems,
+    subnets: SUBNETS,
+    scan,
+    dns_sd: { domains: DNS_SD_DOMAINS, publish, records: dnsSdRecords(HOSTNAME, VERSION, SERVER_OS, SERVER_ARCH, publish.zone) },
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTP                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -902,9 +1229,16 @@ const server = http.createServer(async (req, res) => {
       res.setHeader("set-cookie", "kiln_session=; Path=/; Max-Age=0");
       return noContent(res);
     }
+    // Open (rate-limited on the server): what an invited machine polls before it asks to join.
+    if (p === "/api/join/invited" && m === "GET") {
+      const i = instances.get(url.searchParams.get("instance") ?? "");
+      return json(res, 200, { invited: Boolean(i?.invited), ca: SERVER_CA });
+    }
     if (!authed(req)) return err(res, 401, "unauthorized");
 
     if (p === "/api/me") return json(res, 200, { authenticated: true, version: VERSION, hostname: HOSTNAME });
+    // ---- harness accounts (and the demo agents to see them from) ----
+    if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
     // ---- repos ----
@@ -1052,9 +1386,106 @@ const server = http.createServer(async (req, res) => {
     // ---- agents ----
     if (p === "/api/agents" && m === "GET") return json(res, 200, [...agents.values()]);
     if (p === "/api/agents/join" && m === "GET") {
-      const token = `kj_${randomBytes(16).toString("base64url")}`;
-      const srv = "kiln.lan:7443";
-      return json(res, 200, { token, server: srv, command: `curl -fsSL https://kiln.lan/install.sh | sh -s -- agent join --server ${srv} --token ${token} --labels baremetal` });
+      planAutojoin();
+      return json(res, 200, joinInfo());
+    }
+
+    // ---- joining and discovery ----
+    if (p === "/api/join-requests" && m === "GET") {
+      return json(res, 200, [...joinRequests.values()].sort((a, b) => a.created_at - b.created_at));
+    }
+    if ((mm = p.match(/^\/api\/join-requests\/([^/]+)\/(approve|deny)$/)) && m === "POST") {
+      const jr = joinRequests.get(decodeURIComponent(mm[1]!));
+      if (!jr || jr.expires_at <= now()) return err(res, 404, "no such join request (it may have expired)");
+      if (jr.status !== "pending") return err(res, 409, `that request was already ${jr.status}`);
+      const inst = [...instances.values()].find((i) => i.request === jr.id);
+      if (mm[2] === "deny") {
+        jr.status = "denied";
+        if (inst) Object.assign(inst, { request: null, invited: false });
+        addAudit("admin", "join.deny", `${jr.name} from ${jr.address}`);
+        emit({ type: "join_requests" });
+        emit({ type: "discovery" });
+        return json(res, 200, { id: jr.id, status: "denied", name: jr.name });
+      }
+      if (!jr.code) return err(res, 409, "the machine has not confirmed its request yet");
+      const b = await body<{ name?: string; labels?: string[] }>(req);
+      const base = (b.name || jr.name).toLowerCase().replace(/[^a-z0-9-]/g, "-");
+      let name = base;
+      for (let n = 2; agents.has(name); n++) name = `${base}-${n}`;
+      const labels = b.labels?.length ? b.labels : jr.labels;
+      jr.status = "approved";
+      jr.agent = name;
+      if (inst) Object.assign(inst, { request: null, invited: false, enrolled: SERVER_CA });
+      addAudit("admin", "join.approve", `${name} from ${jr.address}`);
+      emit({ type: "join_requests" });
+      emit({ type: "discovery" });
+      // The machine picks up its certificate on its next poll, installs its runner and connects.
+      setTimeout(() => {
+        const a = addAgent({ name, labels, slots: 2, hostname: jr.hostname, os: jr.os, arch: jr.arch, version: jr.version || VERSION, ephemeral: false, connected: true, last_seen: now(), enrolled_at: now() }, newHost(8, 32, 1000));
+        emit({ type: "agent", agent: a });
+        emit({ type: "discovery" });
+      }, 2500);
+      return json(res, 200, { id: jr.id, status: "approved", name, labels });
+    }
+    if (p === "/api/discovery" && m === "GET") return json(res, 200, discoveryInfo());
+    if (p === "/api/discovery/scan" && m === "POST") {
+      if (scan?.running) return err(res, 409, `a scan of ${scan.cidrs.join(", ")} is running`);
+      const b = await body<{ cidrs?: string[] }>(req);
+      const cidrs = b.cidrs?.length ? b.cidrs.map((c) => c.trim()).filter(Boolean) : SUBNETS;
+      let total = 0;
+      for (const c of cidrs) {
+        const n = cidrSize(c);
+        if (typeof n === "string") return err(res, 400, n);
+        total += n;
+      }
+      addAudit("admin", "discovery.scan", cidrs.join(", "));
+      const s = startScan(cidrs, total);
+      emit({ type: "discovery" });
+      return json(res, 202, s);
+    }
+    if (p === "/api/discovery/probe" && m === "POST") {
+      const b = await body<{ address?: string }>(req);
+      const address = (b.address ?? "").trim();
+      if (!address) return err(res, 400, "address is required");
+      const host = address.replace(/^\[(.*)\](:\d+)?$/, "$1").replace(/:\d+$/, "").toLowerCase();
+      if (host.endsWith(".invalid")) return err(res, 400, `cannot resolve ${host}`);
+      await sleep(600 + rnd() * 900);
+      let found = [...instances.values()].filter((i) => i.addresses.includes(host) || [i.name, i.name.replace(/\.lan$/, "")].includes(host));
+      if (!found.length && (PROBE_FIND.addresses.includes(host) || host === PROBE_FIND.name)) {
+        const i = seedInstance(PROBE_FIND);
+        instances.set(i.id, i);
+        found = [i];
+      }
+      for (const i of found) {
+        if (!i.via.includes("probe")) i.via.push("probe");
+        i.last_seen = now();
+      }
+      if (found.length) emit({ type: "discovery" });
+      return json(res, 200, { found: found.map(presentInstance) });
+    }
+    if (p === "/api/discovery/invite" && m === "POST") {
+      const b = await body<{ instance?: string }>(req);
+      const inst = instances.get(b.instance ?? "");
+      if (!inst) return err(res, 404, "no such instance");
+      if (inst.role !== "agent" || inst.enrolled) return err(res, 409, `${inst.name} is already set up`);
+      inst.invited = true;
+      addAudit("admin", "discovery.invite", inst.name);
+      emit({ type: "discovery" });
+      // It polls GET /api/join/invited, sees the invitation and asks to join like `kiln join`.
+      setTimeout(() => {
+        if (!inst.invited || inst.request || inst.enrolled) return;
+        addJoinRequest(requestFrom(inst), { code: false, instance: inst.id, confirmMs: 2500 });
+        emit({ type: "join_requests" });
+        emit({ type: "discovery" });
+      }, 6000);
+      return json(res, 200, { invited: true });
+    }
+    if ((mm = p.match(/^\/api\/discovery\/invite\/([^/]+)$/)) && m === "DELETE") {
+      const inst = instances.get(decodeURIComponent(mm[1]!));
+      if (!inst) return err(res, 404, "no such instance");
+      inst.invited = false;
+      emit({ type: "discovery" });
+      return noContent(res);
     }
     if ((mm = p.match(/^\/api\/agents\/([^/]+)$/)) && m === "DELETE") {
       const name = decodeURIComponent(mm[1]!);
@@ -1070,6 +1501,27 @@ const server = http.createServer(async (req, res) => {
       emit({ type: "agent", agent: a });
       addAudit("admin", a.draining ? "agent.drain" : "agent.undrain", a.name);
       return noContent(res);
+    }
+
+    // ---- folders on machines (the folder picker) ----
+    if ((mm = p.match(/^\/api\/machines\/([^/]+)\/dirs$/)) && m === "GET") {
+      const target = decodeURIComponent(mm[1]!);
+      const path = url.searchParams.get("path") ?? "";
+      let os: "linux" | "macos" = "linux";
+      let wait = between(20, 60);
+      if (target !== "local") {
+        const name = target.replace(/^agent:/, "");
+        const a = agents.get(name);
+        if (!a || !a.connected) return err(res, 409, `${name} is not connected`);
+        if (a.ephemeral) return err(res, 403, `${name} has terminals (and so agents) turned off`);
+        // Runners older than this server never announced that they list folders.
+        if (a.version !== VERSION) return err(res, 409, `${name}'s runner is too old to list folders: upgrade it`);
+        if (a.os === "macos") os = "macos";
+        // A machine answers over its QUIC session; its network mount answers slowly.
+        wait = /^\/mnt\/nfs(\/|$)/.test(path.trim()) ? 2500 : between(90, 280);
+      }
+      await new Promise((r) => setTimeout(r, wait));
+      return json(res, 200, mockDirList(os, path));
     }
 
     // ---- metrics / system ----
@@ -1139,6 +1591,8 @@ server.on("upgrade", (req, socket, head) => {
     const lm = p.match(/^\/api\/jobs\/([^/]+)\/logs\/ws$/);
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
+    const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
+    if (hm && handleDemoSession(ws, decodeURIComponent(hm[1]!))) return;
     ws.close(1008, "no such socket");
   });
 });

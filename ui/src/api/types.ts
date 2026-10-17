@@ -244,6 +244,8 @@ export interface JoinInfo {
   /** Token-free install that asks to join (an admin approves it with a verification code). */
   join?: string;
   join_manual?: string;
+  /** Windows: `irm <server>/install.ps1 | iex` (no token: asks to join with a verification code). */
+  join_windows?: string;
 }
 
 export type JoinRequestStatus = "pending" | "approved" | "denied";
@@ -471,8 +473,12 @@ export interface AiSession {
   last_reply: string;
   /** The kiln terminal session it runs in: attach to drive it. Null when started outside kiln. */
   terminal: string | null;
-  /** Whether kiln can take it over as an agent: ready (it runs in a kiln terminal), outside (quit it there first), no_id (still starting), upgrade (its machine's runner is too old to do it safely), unsupported. Older servers omit it. */
-  takeover?: "ready" | "outside" | "no_id" | "unsupported" | "upgrade";
+  /** Whether kiln can take it over as an agent: ready (it runs in a kiln terminal), stop (it runs outside kiln: taking over stops it there first), outside (an older server: quit it there first), no_id (still starting), upgrade (its machine's runner is too old to do it safely), unsupported. Older servers omit it. */
+  takeover?: "ready" | "stop" | "outside" | "no_id" | "unsupported" | "upgrade";
+  /** The kiln agent that runs this session, when kiln started it itself. */
+  managed_by?: string;
+  /** A copy of its conversation can be continued as an agent, leaving it running. Older servers omit it. */
+  fork?: boolean;
   /** Its transcript can be opened. */
   transcript: boolean;
 }
@@ -671,4 +677,116 @@ export interface CdSummary {
   health: Record<string, number>;
   /** Connected clusters. */
   clusters: number;
+}
+
+/* ---------------------------- discovery v2 + Add machines ---------------------------- */
+// The fields and types of .claude/contracts/discovery.md. The interfaces named like ones above are
+// merged into them (declaration merging), so this block adds to them without touching them.
+// Every field is optional: servers from before discovery v2 leave them out.
+
+/** How an instance was heard: multicast DNS, the OS's own DNS-SD (Bonjour on macOS, DNS-SD on
+ * Windows), unicast DNS-SD, a network scan, a probe of one address, Tailscale, a seed address. */
+export type DiscoveryVia = "mdns" | "native" | "dns-sd" | "scan" | "probe" | "tailscale" | "seed";
+
+export interface DiscoveredInstance {
+  via?: DiscoveryVia[];
+  /** This server invited it (POST /api/discovery/invite). */
+  invited?: boolean;
+  /** The id of its pending join request, if any. */
+  request?: string | null;
+}
+
+export interface DiscoveryInfo {
+  methods?: DiscoveryMethod[];
+  problems?: DiscoveryProblem[];
+  /** Detected LAN IPv4 subnets, e.g. "192.168.1.0/24": what a scan covers by default. */
+  subnets?: string[];
+  /** The latest on-demand scan. */
+  scan?: ScanState | null;
+  dns_sd?: DnsSdInfo;
+}
+
+/** One way of finding kiln machines, and how it is doing. */
+export interface DiscoveryMethod {
+  id: "mdns" | "native" | "dns-sd" | "scan" | "tailscale" | "seeds";
+  /** "Multicast DNS", "Bonjour (macOS)", "Windows DNS-SD", "DNS-SD (example.com)", "Network scan", "Tailscale", "Seed addresses". */
+  label: string;
+  state: "active" | "off" | "unavailable" | "error";
+  /** One line: interfaces, domain, why it is unavailable, the error. */
+  detail: string;
+  /** Instances currently known through it. */
+  heard: number;
+  last_heard: number | null;
+}
+
+/** Something keeping machines from finding each other, with what fixes it. */
+export interface DiscoveryProblem {
+  /** Stable, e.g. "mdns-port", "no-multicast-iface", "silent-network", "dns-sd-publish". */
+  id: string;
+  /** What is wrong, in one or two sentences. */
+  text: string;
+  fixes: DiscoveryFix[];
+}
+
+export interface DiscoveryFix {
+  /** The system it is for; none: any. */
+  os?: InstallOs;
+  text?: string;
+  command?: string;
+}
+
+export interface ScanState {
+  running: boolean;
+  cidrs: string[];
+  started_at: number;
+  finished_at: number | null;
+  /** Addresses probed so far, of `total`. */
+  probed: number;
+  total: number;
+  /** New instances this scan found. */
+  found: number;
+}
+
+/** Unicast DNS-SD: the domains browsed and publishing this server into a zone. */
+export interface DnsSdInfo {
+  /** Config, search domains and discovered browse domains. */
+  domains: string[];
+  publish: { configured: boolean; zone: string | null; ok: boolean | null; error: string | null; at: number | null };
+  /** Zone-file lines an admin can add by hand to publish this server. */
+  records: string[];
+}
+
+export type InstallOs = "linux" | "macos" | "windows";
+
+export interface JoinInfo {
+  /** One-liners with an embedded join token: download kiln from this server, install it as a service, join. */
+  install?: Record<InstallOs, string>;
+  /** When that token stops working, if it expires. */
+  expires_at?: number | null;
+}
+
+/* ---------------------------- folders on a machine (GET /api/machines/:target/dirs) ---------------------------- */
+
+/** One folder inside another. */
+export interface DirEntry {
+  name: string;
+  /** Last modified, unix seconds (0: unknown). */
+  modified: number;
+}
+
+/** The folders in one folder on a machine, most recently modified first (at most 200). */
+export interface DirListing {
+  /** The folder, normalized: `~` form under the home of the user kiln runs as. */
+  path: string;
+  /** The same folder, absolute. */
+  abs: string;
+  /** The folder above it (`~` form under home); null at the root. */
+  parent: string | null;
+  /** A folder is there. False when nothing is (or not a folder); true when one is but can't be read. */
+  exists: boolean;
+  dirs: DirEntry[];
+  /** It has more folders than were sent. */
+  truncated: boolean;
+  /** Why it can't be listed: "no such folder", "not a folder", "permission denied", ... */
+  error?: string;
 }

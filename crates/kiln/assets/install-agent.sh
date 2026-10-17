@@ -7,7 +7,7 @@
 #   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --token <join-token> [--labels baremetal,bench] [--name box1] [--slots 4]
 #
 # Without a token, `--join` asks the server to take this machine instead (`kiln join`): it prints a
-# verification code, an admin approves the machine in the UI (Agents -> Waiting to join), and the
+# verification code, an admin approves the machine in the UI (Runners -> Add machines), and the
 # agent is installed the same way.
 #
 #   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --join [--labels baremetal,bench] [--name box1]

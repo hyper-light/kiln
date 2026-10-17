@@ -448,7 +448,7 @@ fn launchd_label(unit: &str) -> String {
 }
 
 /// Where a unit's plist lives: a LaunchDaemon as root, else the user's LaunchAgent.
-fn launchd_plist(system: bool, unit: &str) -> PathBuf {
+pub(crate) fn launchd_plist(system: bool, unit: &str) -> PathBuf {
     let file = format!("{}.plist", launchd_label(unit));
     if system { PathBuf::from("/Library/LaunchDaemons").join(file) } else { home().join("Library/LaunchAgents").join(file) }
 }
@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_definitions() {
+    fn boot_definitions() -> anyhow::Result<()> {
         let args = vec!["supervise".to_owned(), "--".to_owned(), "agent".to_owned(), "--name".to_owned(), "box <1> & co".to_owned()];
         let i = Install {
             system: false,
@@ -755,8 +755,13 @@ mod tests {
         assert!(plist.contains("<string>io.github.hyper-light.kiln-agent</string>"));
         assert!(plist.contains("<string>supervise</string>\n    <string>--</string>\n    <string>agent</string>"));
         assert!(plist.contains("box &lt;1&gt; &amp; co"));
+        // `install --agent --upgrade` reads it back on macOS.
+        let e = crate::upgrade::parse_plist(&plist, "kiln-agent", false).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
+        assert_eq!((e.boot.as_str(), e.bin.as_path()), ("launchd", Path::new("/Users/me/.local/bin/kiln")));
+        assert_eq!(e.args, ["agent", "--name", "box <1> & co"]);
         let xml = task_xml(&i);
         assert!(xml.contains("<Arguments>supervise --detach -- agent --name &quot;box &lt;1&gt; &amp; co&quot;</Arguments>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        Ok(())
     }
 }

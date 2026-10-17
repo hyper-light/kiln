@@ -10,9 +10,14 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { duration, tildify } from "./derive";
+import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
 
 const BACKGROUND = new Set(["shell", "monitor", "mcp"]);
-export const isBackground = (t: Task) => (t.class ? BACKGROUND.has(t.class) : false);
+/** What a task is; machines from before `class` only say the harness's own task type. */
+export const classOf = (t: Task): string =>
+  t.class ??
+  (t.kind?.startsWith("monitor") ? "monitor" : t.kind === "local_bash" ? "shell" : t.kind === "local_workflow" ? "workflow" : t.kind?.includes("mcp") ? "mcp" : "agent");
+export const isBackground = (t: Task) => BACKGROUND.has(classOf(t));
 const isLive = (t: Task) => t.status === "running" || t.status === "pending" || t.status === "paused";
 const WORD: Record<string, string> = { shell: "Shell", monitor: "Monitor", mcp: "MCP call" };
 
@@ -21,7 +26,7 @@ export function backgroundOf(state: State | null): Task[] {
 }
 
 /** The task's output, tailed while it runs. */
-function Output({ agent, task }: { agent: string; task: Task }) {
+export function Output({ agent, task }: { agent: string; task: Task }) {
   const [text, setText] = React.useState("");
   const [note, setNote] = React.useState<string | null>(null);
   const offset = React.useRef<number | undefined>(undefined);
@@ -70,19 +75,19 @@ function Row({ t, agent, send }: { t: Task; agent: string; send: (c: Command) =>
   const what = t.command || t.description || t.id;
   const facts = [
     live ? (t.status === "paused" ? "paused" : `running ${duration(now - t.started)}`) : t.exit_code !== undefined ? `ended · exit ${t.exit_code}` : `ended ${t.status !== "completed" ? `· ${t.status}` : ""}`.trim(),
-    t.class === "monitor" && t.events ? `${t.events} event${t.events === 1 ? "" : "s"}` : "",
-    t.class === "monitor" && t.wakes ? (t.wakes === "agent" ? "wakes the agent" : "wakes its subagent") : "",
+    classOf(t) === "monitor" && t.events ? `${t.events} event${t.events === 1 ? "" : "s"}` : "",
+    classOf(t) === "monitor" && t.wakes ? (t.wakes === "agent" ? "wakes the agent" : "wakes its subagent") : "",
     t.cwd ? tildify(t.cwd) : "",
   ].filter(Boolean);
   return (
     <li className="bg-row" data-live={live || undefined}>
       <div className="bg-main">
-        <span className="bg-class">{WORD[t.class ?? ""] ?? t.class}</span>
+        <span className="bg-class">{WORD[classOf(t)] ?? classOf(t)}</span>
         <span className="bg-what" title={what}>
           {what}
         </span>
         <span className="bg-facts">{facts.join(" · ")}</span>
-        {t.class === "monitor" && t.last_event && <span className="bg-last">Latest: {t.last_event}</span>}
+        {classOf(t) === "monitor" && t.last_event && <span className="bg-last">Latest: {t.last_event}</span>}
       </div>
       <div className="bg-actions">
         <button type="button" className="bg-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -149,5 +154,80 @@ export function BackgroundStrip({ state, onView }: { state: State | null; onView
       <span className="bg-strip-what">{names.join(" · ")}</span>
       <ChevronRight size={13} aria-hidden="true" />
     </button>
+  );
+}
+
+/**
+ * By the composer: what's running besides the agent itself — its subagents, and the shells and
+ * monitors it started — as one line that opens in place. A subagent opens its thread; a shell or
+ * monitor shows its output right there.
+ */
+export function ActivityLine({ state, agent, onOpenTask }: { state: State | null; agent: string; onOpenTask: (toolId: string) => void }) {
+  const [open, setOpen] = React.useState(false);
+  const [shown, setShown] = React.useState<string | null>(null);
+  const now = useNow();
+  const tasks = state?.tasks ?? [];
+  const subs = tasks.filter((t) => !isBackground(t) && isLive(t));
+  const bg = tasks.filter((t) => isBackground(t) && isLive(t));
+  if (subs.length + bg.length === 0) return null;
+  const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
+  const shells = bg.filter((t) => classOf(t) === "shell").length;
+  const monitors = bg.filter((t) => classOf(t) === "monitor").length;
+  const other = bg.length - shells - monitors;
+  // One glyph per kind, so the line says what is running at a glance.
+  const segments: { kind: GlyphKind; text: string; live: boolean }[] = [
+    { kind: "agent" as const, text: count(subs.length, "subagent"), live: subs.some((t) => t.status === "running") },
+    { kind: "shell" as const, text: count(shells, "shell"), live: true },
+    { kind: "monitor" as const, text: count(monitors, "monitor"), live: true },
+    { kind: "mcp" as const, text: count(other, "background call"), live: true },
+  ].filter((s) => s.text);
+  return (
+    <div className="al" data-open={open || undefined}>
+      <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <span className="al-summary">
+          {segments.map((s, i) => (
+            <span key={s.kind} className="al-seg">
+              {i > 0 && <span className="al-sep">·</span>}
+              <KindGlyph kind={s.kind} live={s.live} />
+              {s.text}
+            </span>
+          ))}
+        </span>
+        <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
+      </button>
+      {open && (
+        <ul className="al-list">
+          {[...subs, ...bg].map((t) => {
+            const isSub = !isBackground(t);
+            const last = isSub ? t.last_tool : classOf(t) === "monitor" ? t.last_event : undefined;
+            // The header already says what they are; a row names its kind only in a mixed list.
+            const mixed = subs.length > 0 && bg.length > 0;
+            return (
+              <li key={t.id} className="al-item">
+                <button
+                  type="button"
+                  className="al-row"
+                  onClick={() => {
+                    if (isSub && t.tool_id) onOpenTask(t.tool_id);
+                    else setShown(shown === t.id ? null : t.id);
+                  }}
+                >
+                  <KindGlyph kind={isSub ? "agent" : glyphKind(classOf(t))} live={t.status === "running"} pending={t.status === "pending"} />
+                  <span className="al-what">
+                    {mixed && <span className="al-kind">{isSub ? "Subagent" : (WORD[classOf(t)] ?? classOf(t))}</span>}
+                    <span className="al-desc">{t.description || t.command || t.id}</span>
+                  </span>
+                  <span className="al-time">
+                    {last && <span className="al-last">{last}</span>}
+                    {duration(now - t.started)}
+                  </span>
+                </button>
+                {shown === t.id && <Output agent={agent} task={t} />}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
   );
 }

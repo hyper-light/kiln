@@ -299,21 +299,61 @@ pub struct AlwaysOption {
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Question {
+    /// The harness's own id for it (Codex), when it has one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default)]
     pub question: String,
     #[serde(default)]
     pub header: String,
     #[serde(default)]
     pub multi: bool,
+    /// A free-text answer ("Other") is accepted.
+    #[serde(default)]
+    pub other: bool,
+    /// The answer is a secret: masked as it is typed.
+    #[serde(default)]
+    pub secret: bool,
+    #[serde(default)]
     pub options: Vec<QuestionOption>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct QuestionOption {
+    #[serde(default)]
     pub label: String,
     #[serde(default)]
     pub description: String,
+    /// What to show while it is focused (Claude Code: a mockup, code, a comparison).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
+}
+
+/// An approval's answers, one per question: `choices`, or the older map (question → its answer as
+/// one string) read as one choice each.
+pub fn choices_of(answers: Option<std::collections::BTreeMap<String, String>>, choices: Option<Vec<ChoiceAnswer>>) -> Option<Vec<ChoiceAnswer>> {
+    choices.or_else(|| answers.map(|m| m.into_iter().map(|(question, a)| ChoiceAnswer { question, selected: vec![a], ..ChoiceAnswer::default() }).collect()))
+}
+
+/// The answer to one question (`Command::Approve::choices`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ChoiceAnswer {
+    /// The question's text; `id` its id when it has one.
+    #[serde(default)]
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The labels of the options chosen.
+    #[serde(default)]
+    pub selected: Vec<String>,
+    /// A free-text answer ("Other").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other: Option<String>,
+    /// A note with the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A message kiln holds until the agent's current turn ends.
@@ -1015,6 +1055,11 @@ pub enum Command {
     QueueSendNow {
         id: String,
     },
+    /// Deliver this queued message into the running turn as steering (no interrupt); with no
+    /// turn running it is sent as the next one. (Feature "queue_steer".)
+    QueueSteer {
+        id: String,
+    },
     Approve {
         /// The approval's id.
         id: String,
@@ -1028,6 +1073,10 @@ pub enum Command {
         /// Answers to questions: question text → chosen label(s) (multi-select comma-separated).
         #[serde(default)]
         answers: Option<std::collections::BTreeMap<String, String>>,
+        /// Answers to questions, one per question (over `answers`): labels with commas, free
+        /// text and notes come through as they are.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        choices: Option<Vec<ChoiceAnswer>>,
     },
     Interrupt,
     SetMode {

@@ -200,7 +200,7 @@ export default function Overview() {
             ))}
           </div>
         ) : runners.length === 0 ? (
-          <EmptyState icon={<Server size={24} />} title="No runners yet." action={<Link to="/runners?join=1" className="text-link">Add a runner <ArrowUpRight size={15} /></Link>}>
+          <EmptyState icon={<Server size={24} />} title="No runners yet." action={<Link to="/runners/add" className="text-link">Add a machine <ArrowUpRight size={15} /></Link>}>
             Jobs run on runners. Join a machine, or let kiln launch pods on Kubernetes.
           </EmptyState>
         ) : (

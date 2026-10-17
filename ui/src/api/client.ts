@@ -3,6 +3,7 @@ import type {
   AiSession,
   AiTranscriptEntry,
   AuditEntry,
+  DirListing,
   DiscoveryInfo,
   Job,
   JoinInfo,
@@ -194,8 +195,37 @@ export const api = {
   deleteBinary: (target: string) => del<void>(`/api/updates/binaries/${enc(target)}`),
 };
 
+/* ---------------------------- folders on a machine ---------------------------- */
+
+/**
+ * The folders in a folder on a machine, for the folder picker. `target` is "local" (the kiln
+ * server), "agent:<name>" or a machine's name; `path` as typed (`~` is home; "" is home too).
+ * What can't be listed (no such folder, permission denied) comes back in `error` with a 200; a
+ * runner too old to list folders is a 409.
+ */
+export const machineDirs = (target: string, path: string, signal?: AbortSignal) =>
+  get<DirListing>(`/api/machines/${enc(target)}/dirs${qs({ path })}`, signal);
+
 /** Build a ws:// or wss:// URL for a same-origin path. */
 export function wsUrl(path: string): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}${path}`;
 }
+
+/* ---------------------------- discovery v2 + Add machines ---------------------------- */
+// The routes of .claude/contracts/discovery.md, kept apart from `api` above. Join requests are
+// decided with `api.approveJoin` / `api.denyJoin`.
+
+import type { DiscoveredInstance, ScanState } from "./types";
+
+export const discoveryApi = {
+  /** Scan subnets for kiln (each at most a /22; none: the detected `subnets`). 202; progress arrives as `discovery` events. */
+  scan: (cidrs?: string[]) => post<ScanState>("/api/discovery/scan", cidrs?.length ? { cidrs } : {}),
+  /** Ask one address (IP or host name, optional `:port`) whether kiln runs there; answers within ~3 s. */
+  probe: (address: string) => post<{ found: DiscoveredInstance[] }>("/api/discovery/probe", { address }),
+  /** Invite a machine that is not set up yet: it asks to join, and its request waits for approval as usual. */
+  invite: (instance: string) => post<{ invited: true }>("/api/discovery/invite", { instance }),
+  uninvite: (instance: string) => del<void>(`/api/discovery/invite/${enc(instance)}`),
+  /** Open (rate-limited): what an invited machine polls. */
+  invited: (instance: string, signal?: AbortSignal) => get<{ invited: boolean; ca: string }>(`/api/join/invited${qs({ instance })}`, signal),
+};
