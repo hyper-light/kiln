@@ -45,7 +45,8 @@ const VERSION = "0.1.0";
 const STARTED = Date.now();
 const HOSTNAME = "kiln-01";
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DIST = join(__dirname, "..", "dist");
+// MOCK_DIST: serve another build (a scratch one, so builds in progress elsewhere don't clash).
+const DIST = process.env.MOCK_DIST ?? join(__dirname, "..", "dist");
 
 const now = () => Math.floor(Date.now() / 1000);
 const rid = (p: string) => `${p}${randomBytes(6).toString("hex")}`;
