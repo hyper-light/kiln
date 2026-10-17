@@ -68,7 +68,7 @@ export default function AgentPage() {
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [risky, setRisky] = React.useState<string | null>(null);
   const [settings, setSettings] = React.useState(false);
-  const attachments = useAttachments((meta?.features ?? []).includes("attachments"));
+  const attachments = useAttachments((meta?.features ?? []).includes("attachments") ? "any" : (meta?.features ?? []).includes("images") ? "images" : "none");
   const [dragging, setDragging] = React.useState(false);
   const addFiles = attachments.add;
   // Screenshots pasted anywhere on the page attach to the next message (text pastes are left alone).

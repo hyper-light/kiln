@@ -226,6 +226,8 @@ export interface Control {
   /** "turn": an action on one turn (rewind to it, branch from it). */
   scope?: "session" | "turn";
   requires?: string;
+  /** For an action that takes free text (compaction instructions …): the field's placeholder. */
+  input?: string;
 }
 
 export interface Attachment {

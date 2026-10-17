@@ -87,10 +87,25 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
             <span />
           </button>
         )}
-        {c.kind === "action" && (
+        {c.kind === "action" && !c.input && (
           <Button size="xs" variant={c.dangerous ? "danger" : "secondary"} onClick={() => set(null)}>
             {c.label}
           </Button>
+        )}
+        {c.kind === "action" && c.input && (
+          <form
+            className="flex gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              set(text);
+              setText("");
+            }}
+          >
+            <input className="hx-input" value={text} placeholder={c.input} onChange={(e) => setText(e.target.value)} aria-label={c.label} />
+            <Button size="xs" variant={c.dangerous ? "danger" : "secondary"} type="submit">
+              {c.label}
+            </Button>
+          </form>
         )}
         {c.kind === "text" && (
           <form
@@ -234,16 +249,18 @@ async function prepareImage(f: File): Promise<Blob> {
 const stamp = () => new Date().toTimeString().slice(0, 8).replace(/:/g, "");
 
 /** Files and screenshots to send with a message: pasted, dropped anywhere on the page, or picked (Photos, Camera or Files on a phone). */
-export function useAttachments(enabled: boolean) {
+export function useAttachments(accepts: "any" | "images" | "none") {
+  const enabled = accepts !== "none";
   const [files, setFiles] = React.useState<Attached[]>([]);
   const [busy, setBusy] = React.useState(false);
   const add = React.useCallback(
     async (list: FileList | File[]) => {
-      if (!enabled) return;
+      if (accepts === "none") return;
       setBusy(true);
       try {
         const added: Attached[] = [];
         for (const f of [...list]) {
+          if (accepts === "images" && !f.type.startsWith("image/")) continue;
           const blob = f.type.startsWith("image/") ? await prepareImage(f) : f;
           if (blob.size > FILE_MAX_BYTES) continue;
           const ext = blob.type === "image/jpeg" ? "jpg" : (blob.type.split("/")[1] ?? "bin");
@@ -256,7 +273,7 @@ export function useAttachments(enabled: boolean) {
         setBusy(false);
       }
     },
-    [enabled],
+    [accepts],
   );
   const remove = (i: number) => setFiles((cur) => cur.filter((_, j) => j !== i));
   const clear = React.useCallback(() => setFiles([]), []);
@@ -275,7 +292,7 @@ export function useAttachments(enabled: boolean) {
         {busy && <span className="hx-attach-chip hx-dim">Preparing…</span>}
       </div>
     ) : null;
-  return { enabled, files, add, clear, chips };
+  return { enabled, accepts, files, add, clear, chips };
 }
 
 export type Attachments = ReturnType<typeof useAttachments>;

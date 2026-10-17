@@ -86,7 +86,7 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
   const modes = MODES.filter((m) => !m.feature || features.includes(m.feature));
   const queue = state?.queue ?? [];
   const canAttach = attachments.enabled;
-  const canOverride = features.includes("turn_overrides");
+  const canOverride = features.includes("overrides");
   const { files, add, clear, chips } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
@@ -280,6 +280,7 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
                 type="file"
                 multiple
                 hidden
+                accept={attachments.accepts === "images" ? "image/*" : undefined}
                 onChange={(e) => {
                   if (e.target.files) void add(e.target.files);
                   e.target.value = "";
