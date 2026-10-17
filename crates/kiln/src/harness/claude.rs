@@ -2437,8 +2437,8 @@ fn claude_catalog() -> Vec<SlashCommand> {
         no("exit", "Quit", "Session", "close the agent in kiln").aka(&["quit"]),
         no("stop", "Stop this background session", "Session", "close the agent in kiln"),
         no("background", "Send this session to the background", "Session", "an agent in kiln runs on its own: closing the console leaves it running").aka(&["bg"]),
-        no("login", "Sign in", "Session", "signing in or out changes the account: do it in a terminal"),
-        no("logout", "Sign out", "Session", "signing in or out changes the account: do it in a terminal"),
+        v("login", "Sign Claude Code in on this machine", "Session", "login"),
+        v("logout", "Sign Claude Code out on this machine", "Session", "logout"),
         no("feedback", "Send feedback or report a bug", "Session", "it sends the conversation to Anthropic: use the CLI for that").aka(&["bug"]),
         no("copy", "Copy the last response", "Session", "copy from the console"),
         no("cd", "Move this session to another folder", "Session", "an agent's folder is set when it starts"),
@@ -3742,7 +3742,8 @@ mod tests {
         // Bound to the CLI's terminal, or not runnable from kiln: why.
         assert!(matches!(get("doctor").route, Route::Unsupported { reason } if reason.contains("terminal")));
         assert!(matches!(get("color").route, Route::Unsupported { .. }));
-        assert!(matches!(get("login").route, Route::Unsupported { reason } if reason.contains("account")));
+        assert!(matches!(get("login").route, Route::View { view } if view == "login"));
+        assert!(matches!(get("logout").route, Route::View { view } if view == "logout"));
         // kiln's own requests: the CLI does not list them.
         assert_eq!((control("btw"), get("btw").args.as_str()), ("side_question".to_owned(), "required"));
         assert_eq!((control("permissions"), control("plan"), control("memory"), control("git-diff"), control("export")), ("permission_rules".into(), "plan".into(), "memory".into(), "workspace_diff".into(), "export".into()));

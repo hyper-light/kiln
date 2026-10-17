@@ -243,6 +243,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid, &q, req).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => ai_fork(&hub, machine, pid).await,
+        (&Method::GET, ["api", "accounts"]) => accounts_status(&hub, &q).await,
+        (&Method::POST, ["api", "accounts", "login"]) => accounts_login(&hub, req).await,
+        (&Method::POST, ["api", "accounts", "logout"]) => accounts_logout(&hub, req).await,
+        (&Method::GET, ["api", "accounts", "flows", id]) => {
+            crate::accounts::get(id).map(|f| srv::json(StatusCode::OK, &f)).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such sign-in"))
+        }
+        (&Method::POST, ["api", "accounts", "flows", id, "input"]) => accounts_input(id, req).await,
+        (&Method::DELETE, ["api", "accounts", "flows", id]) => {
+            crate::accounts::cancel(id).map(|()| srv::status(StatusCode::NO_CONTENT)).map_err(|e| err(StatusCode::NOT_FOUND, format!("{e:#}")))
+        }
         (&Method::GET, ["api", "machines", target, "dirs"]) => machine_dirs(&hub, target, &q).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.visible())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
@@ -427,6 +437,53 @@ async fn ai_fork(hub: &Hub, machine: &str, pid: &str) -> R {
     hub.store.audit("admin".into(), "agent.fork".into(), format!("{} (process {pid}) on {machine}", found.tool)).await;
     let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(srv::json(StatusCode::OK, &infos))
+}
+
+// ------------------------------------------------------------------ harness accounts
+
+/// `POST /api/accounts/login` and `/api/accounts/logout`.
+#[derive(Deserialize)]
+struct AccountAsk {
+    target: String,
+    kind: String,
+    #[serde(default)]
+    method: Option<String>,
+}
+
+/// The harnesses' accounts on a machine (`?target=local|agent:<name>`), as their CLIs report.
+async fn accounts_status(hub: &Arc<Hub>, q: &HashMap<String, String>) -> R {
+    let target = q.get("target").map_or("local", String::as_str);
+    let accounts = crate::accounts::status(hub, target).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &accounts))
+}
+
+/// Start signing a harness in on a machine; follow it at `/api/accounts/flows/:id`.
+async fn accounts_login(hub: &Arc<Hub>, req: Request) -> R {
+    let a: AccountAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let flow = crate::accounts::login(hub, &a.target, &a.kind, a.method.as_deref()).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "account.login".into(), format!("{} on {} ({})", a.kind, a.target, flow.method.as_deref().unwrap_or("-"))).await;
+    Ok(srv::json(StatusCode::OK, &flow))
+}
+
+/// Sign a harness out on a machine: the finished flow, with the account as it is now.
+async fn accounts_logout(hub: &Arc<Hub>, req: Request) -> R {
+    let a: AccountAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "account.logout".into(), format!("{} on {}", a.kind, a.target)).await;
+    let flow = crate::accounts::logout(hub, &a.target, &a.kind).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &flow))
+}
+
+#[derive(Deserialize)]
+struct AccountInput {
+    text: String,
+}
+
+/// Give a waiting sign-in what it asks for (the code its page showed, an API key): never logged,
+/// nor shown again.
+async fn accounts_input(id: &str, req: Request) -> R {
+    let a: AccountInput = srv::body_json(req.into_body(), 16 * 1024).await.map_err(|_| err(StatusCode::BAD_REQUEST, "expected {\"text\": \"…\"}"))?;
+    crate::accounts::input(id, &a.text).map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// The recent messages of one session, read from its machine.

@@ -399,10 +399,10 @@ pub fn open_local(hub: &Arc<Hub>, command: Option<String>, cols: u16, rows: u16)
     Ok(session)
 }
 
-/// A terminal kiln opened for itself, such as upgrading an older runner
-/// ([`crate::updates::HIDDEN_MARK`]): never listed as anyone's terminal.
+/// A terminal kiln opened for itself, upgrading an older runner ([`crate::updates::HIDDEN_MARK`])
+/// or signing a harness in or out ([`crate::accounts::MARK`]): never listed as anyone's terminal.
 pub fn hidden(command: Option<&str>) -> bool {
-    command.is_some_and(|c| c.contains(crate::updates::HIDDEN_MARK))
+    command.is_some_and(|c| c.contains(crate::updates::HIDDEN_MARK) || c.contains(crate::accounts::MARK))
 }
 
 /// Open a shell on a machine through its agent.

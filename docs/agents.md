@@ -70,6 +70,31 @@ that continues a copy of the conversation (Claude Code's `--fork-session`, Codex
 `thread/fork`), named `<name> (branch)`, leaving the found session running as it is. Errors: 404,
 409 (no conversation yet, or a runner too old to branch), 400 (a harness that can't branch).
 
+### Signing harnesses in and out
+
+`/login` and `/logout` open kiln's account card (the views `login` and `logout`). kiln runs the
+harness's own CLI on the agent's machine, in a terminal it opens for the purpose (never listed),
+and shows what a sign-in asks for:
+
+- Claude Code (`claude auth login --claudeai|--console|--sso`): a page to open on any device, then
+  the code that page shows, pasted back (a browser on the same machine may finish without one).
+- Codex (`codex login --device-auth`): a page and a one-time code to enter there; it finishes by
+  itself. Or an OpenAI API key (`--with-api-key`), never echoed.
+
+Not on Windows machines yet. What is typed in goes to the CLI only: never logged, kept once the
+sign-in ends, or shown in its output.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/accounts?target=local\|agent:<name>` | `Account[]`, for the harnesses installed there: `kind`, `name`, `signed_in` (`null`: couldn't tell, see `error`), `method?`, `email?`, `org?`, `plan?`, `methods` (`{id, label, asks?}`) |
+| POST | `/api/accounts/login` | `{target, kind, method?}` → `Flow` (running) |
+| GET | `/api/accounts/flows/:id` | `Flow`: `state` (`running`, `done`, `failed`, `cancelled`), `url?` (the page to open), `code?` (to enter there), `asks?` (`code` or `api_key`: waiting for it), `lines` (its output, never what was typed), `account?` (once ended), `error?` |
+| POST | `/api/accounts/flows/:id/input` | `{text}`: the code or the key it asks for → 204 |
+| DELETE | `/api/accounts/flows/:id` | cancel it → 204 |
+| POST | `/api/accounts/logout` | `{target, kind}` → the finished `Flow`, with `account` |
+
+Each change is also an `account_flow` event (`{type, flow}`) on `/api/events`.
+
 ### Continuing a past session
 
 `GET /api/harness/history?target=local|agent:<name>&kind=claude|codex&limit=50` lists the

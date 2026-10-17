@@ -2389,7 +2389,8 @@ fn codex_catalog() -> Vec<SlashCommand> {
         no("worktree", "Continue in a new worktree", "Session", "start an agent in the worktree's folder"),
         no("archive", "Archive this session", "Session", "manage saved conversations with the Codex CLI"),
         no("delete", "Delete this session", "Session", "manage saved conversations with the Codex CLI"),
-        no("logout", "Sign out", "Session", "signing out changes the account: use the Codex CLI"),
+        v("login", "Sign Codex in on this machine", "Session", "login"),
+        v("logout", "Sign Codex out on this machine", "Session", "logout"),
         no("feedback", "Send logs to the maintainers", "Session", "it sends logs to OpenAI: use the Codex CLI"),
         no("quit", "Exit Codex", "Session", "close the agent in kiln"),
         no("exit", "Exit Codex", "Session", "close the agent in kiln"),
@@ -3143,7 +3144,8 @@ mod tests {
         assert!(matches!(route("model"), Some(Route::View { view }) if view == "model"));
         assert!(matches!(route("ps"), Some(Route::View { view }) if view == "tasks"));
         assert!(matches!(route("init"), Some(Route::Prompt { text: Some(t), .. }) if t.contains("AGENTS.md")));
-        assert!(matches!(route("logout"), Some(Route::Unsupported { reason }) if !reason.is_empty()));
+        assert!(matches!(route("logout"), Some(Route::View { view }) if view == "logout"));
+        assert!(matches!(route("login"), Some(Route::View { view }) if view == "login"));
         assert!(matches!(route("goal"), Some(Route::Control { command }) if command.pointer("/value/client") == Some(&json!("{client}"))));
         let mut names: Vec<&str> = cat.iter().map(|e| e.name.as_str()).collect();
         names.dedup();
