@@ -438,6 +438,19 @@ export interface KindInfo {
 }
 
 /** What to start. */
+/** A conversation that ended on a machine, to continue with `spec.resume`. */
+export interface PastSession {
+  kind: string;
+  id: string;
+  title: string;
+  cwd: string;
+  branch?: string;
+  model?: string;
+  /** Unix seconds. */
+  last_activity: number;
+  last_prompt?: string;
+}
+
 export interface Spec {
   kind: string;
   cwd?: string;
@@ -527,6 +540,9 @@ export const harnessApi = {
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  /** A machine's recent ended conversations (newest first), for one harness or all. */
+  history: (target: string, kind?: string, limit = 40) =>
+    call<PastSession[]>("GET", `/api/harness/history?target=${encodeURIComponent(target)}${kind ? `&kind=${encodeURIComponent(kind)}` : ""}&limit=${limit}`),
   /** A task's output: its tail, or what came after byte `since`. */
   taskOutput: (id: string, task: string, since?: number) =>
     call<TaskOutput>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(task)}/output${since !== undefined ? `?since=${since}` : ""}`),
