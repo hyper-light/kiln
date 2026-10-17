@@ -2945,3 +2945,40 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   text-underline-offset: 3px;
 }
 
+/* A name edited where it shows (components/ui/name-field): the font of where it sits. */
+.name-field {
+  width: 100%;
+  min-width: 0;
+  padding: 1px 8px;
+  border: 1px solid #3a3d45;
+  border-radius: 8px;
+  background: #0d0e11;
+  color: var(--color-foreground);
+  font: inherit;
+  outline: none;
+}
+.name-field:focus {
+  border-color: rgb(186 176 227 / 55%);
+  box-shadow: 0 0 0 3px rgb(186 176 227 / 12%);
+}
+.name-field::placeholder {
+  color: #6d7078;
+}
+/* In a terminal tab, and in the phone's session bar. */
+.term-name {
+  display: flex;
+  min-width: 0;
+  max-width: 200px;
+}
+.name-field.term-name-field {
+  padding: 0 6px;
+  font-size: 12px;
+  line-height: 22px;
+}
+.sw-renaming {
+  cursor: default;
+}
+.name-field.sw-name-field {
+  font-size: 14px;
+  line-height: 28px;
+}

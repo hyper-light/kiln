@@ -182,6 +182,8 @@ export const api = {
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
   /** End a session: its shell stops on every device. */
   closeTerminalSession: (id: string) => del<void>(`/api/terminal/sessions/${enc(id)}`),
+  /** Names a terminal session ("" takes its name away). */
+  renameTerminalSession: (id: string, name: string) => request<void>("PUT", `/api/terminal/sessions/${enc(id)}/name`, { name }),
   /** Start a session without attaching (any device attaches by its id). */
   createTerminalSession: (body: { target: string; cmd?: string; cols?: number; rows?: number }) =>
     post<TerminalSessionInfo>("/api/terminal/sessions", body),
