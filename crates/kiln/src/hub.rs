@@ -761,6 +761,9 @@ impl Hub {
             }
             AgentMsg::Sync { json, raft } => self.sync.from_runner(&agent, &json, raft),
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
+            // CI (docs/ci.md §2.5): handled by the dispatcher (W05/W06) and facts (W13) when they land.
+            AgentMsg::JobEvent { job, .. } => tracing::debug!(agent = %agent, job = %job, "CI job event before the CI dispatcher exists"),
+            AgentMsg::Facts { .. } => tracing::debug!(agent = %agent, "runner facts before CI facts are stored"),
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {

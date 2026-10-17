@@ -94,6 +94,16 @@ pub enum AgentMsg {
     /// the kiln CA. Sent on every (re)connect and whenever it changes. Appended last: postcard
     /// encodes variants by index.
     FrontDoorStatus { json: String },
+    /// CI (docs/ci.md §2.5): one event of a leg this runner runs from an [`ServerMsg::AssignV2`]
+    /// (JSON `JobEventV2`: steps starting and finishing, annotations, groups, summaries, outputs,
+    /// failure classes). Only from runners announcing [`CAP_CI2`]. Appended last: postcard encodes
+    /// variants by index.
+    JobEvent { job: String, json: String },
+    /// CI: what this runner is (JSON `RunnerFacts`, docs/ci.md W13-R01): OS, architecture, CPUs,
+    /// memory, disk, GPUs, executors, tools, declared facts. Sent on connect, every 10 minutes and
+    /// when asked ([`ServerMsg::ProbeFacts`]); only from runners announcing [`CAP_FACTS`].
+    /// Appended last: postcard encodes variants by index.
+    Facts { json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -113,6 +123,23 @@ pub const CAP_SYNC: u32 = 64;
 /// a domain, HTTPS in front of the server, a `.local` name) and reports it with
 /// [`AgentMsg::FrontDoorStatus`].
 pub const CAP_FRONT_DOOR: u32 = 16;
+
+// CI's capability bits (docs/ci.md §2.5) start at 1 << 10, clear of the rest of kiln's.
+/// The runner takes [`ServerMsg::AssignV2`], sends [`AgentMsg::JobEvent`], runs the GitHub-exact
+/// step runtime (docs/ci.md W06).
+pub const CAP_CI2: u32 = 1 << 10;
+/// The runner runs `uses:` actions (docs/ci.md W07).
+pub const CAP_ACTIONS: u32 = 1 << 11;
+/// The runner has a working Docker or Podman (job containers, services, Docker actions).
+pub const CAP_DOCKER: u32 = 1 << 12;
+/// The runner can boot Firecracker microVMs.
+pub const CAP_FIRECRACKER: u32 = 1 << 13;
+/// The runner can run shards microVMs.
+pub const CAP_SHARDS: u32 = 1 << 14;
+/// The runner sends [`AgentMsg::Facts`] (docs/ci.md W13).
+pub const CAP_FACTS: u32 = 1 << 15;
+/// The runner opens terminals into legs ([`ServerMsg::JobTerminalOpen`], docs/ci.md W17).
+pub const CAP_JOB_TTY: u32 = 1 << 16;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,6 +248,23 @@ pub enum ServerMsg {
     /// whenever that changes; only to runners that announced [`CAP_FRONT_DOOR`]. Appended last:
     /// postcard encodes variants by index.
     FrontDoor { json: String },
+    /// CI (docs/ci.md §2.5): run this leg (JSON `AssignmentV2`). Only to runners announcing
+    /// [`CAP_CI2`]; others keep getting [`ServerMsg::Assign`]. Appended last: postcard encodes
+    /// variants by index.
+    AssignV2 { json: String },
+    /// CI: secrets that became available to a running leg (an environment's, once approved; JSON
+    /// `[{name, value}]`). Appended last: postcard encodes variants by index.
+    SecretsFor { job: String, json: String },
+    /// CI: open a terminal inside a running or kept leg's environment (docs/ci.md W17); output
+    /// flows as terminal output for `session`. Only to runners announcing [`CAP_JOB_TTY`].
+    /// Appended last: postcard encodes variants by index.
+    JobTerminalOpen { job: String, session: String, cols: u16, rows: u16 },
+    /// CI: a leg kept after failing (docs/ci.md W17-R02) may be cleaned up now. Appended last:
+    /// postcard encodes variants by index.
+    KeepRelease { job: String },
+    /// CI: send [`AgentMsg::Facts`] now. Only to runners announcing [`CAP_FACTS`]. Appended last:
+    /// postcard encodes variants by index.
+    ProbeFacts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -348,6 +392,36 @@ mod tests {
             "CAP_FRONT_DOOR is a bit of its own"
         );
         assert_eq!(CAP_FRONT_DOOR, 16);
+        Ok(())
+    }
+
+    #[test]
+    fn ci_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let server = [
+            (ServerMsg::AssignV2 { json: "{}".into() }, 23u8),
+            (ServerMsg::SecretsFor { job: "j".into(), json: "[]".into() }, 24),
+            (ServerMsg::JobTerminalOpen { job: "j".into(), session: "s".into(), cols: 80, rows: 24 }, 25),
+            (ServerMsg::KeepRelease { job: "j".into() }, 26),
+            (ServerMsg::ProbeFacts, 27),
+        ];
+        for (m, idx) in server {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is ServerMsg variant {idx} on the wire");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
+        let agent = [(AgentMsg::JobEvent { job: "j".into(), json: "{}".into() }, 27u8), (AgentMsg::Facts { json: "{}".into() }, 28)];
+        for (m, idx) in agent {
+            let b = encode(&m)?;
+            assert_eq!(b.first(), Some(&idx), "{m:?} is AgentMsg variant {idx} on the wire");
+            assert_eq!(decode::<AgentMsg>(&b)?, m);
+        }
+        let ci = [CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY];
+        let others = CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP | CAP_SYNC | CAP_FRONT_DOOR;
+        let mut seen = 0u32;
+        for c in ci {
+            assert!(c.is_power_of_two() && c & others == 0 && c & seen == 0, "{c} is a bit of its own");
+            seen |= c;
+        }
         Ok(())
     }
 }

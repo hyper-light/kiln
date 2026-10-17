@@ -800,6 +800,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             fd.push(json);
                         }
                     }
+                    // CI (docs/ci.md §2.5). This runner announces none of the CI capabilities yet, so
+                    // a server never sends these; W06, W13 and W17 handle them when they land.
+                    ServerMsg::AssignV2 { .. }
+                    | ServerMsg::SecretsFor { .. }
+                    | ServerMsg::JobTerminalOpen { .. }
+                    | ServerMsg::KeepRelease { .. }
+                    | ServerMsg::ProbeFacts => {
+                        tracing::debug!("ignoring a CI message this runner does not take yet");
+                    }
                 }
             }
             Ev::FrontDoor => {
