@@ -88,29 +88,34 @@ function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text:
   const [open, setOpen] = React.useState(false);
   const timer = React.useRef(0);
   const root = React.useRef<HTMLDivElement>(null);
-  const hold = () => window.clearTimeout(timer.current);
-  const fold = () => {
+  const hovered = React.useRef(false);
+  // It folds a few seconds after the last touch, unless one is being edited or a mouse rests on it.
+  const fold = React.useCallback(() => {
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => {
-      if (!root.current?.contains(document.activeElement)) setOpen(false);
+      const editing = root.current?.contains(document.activeElement) && document.activeElement?.tagName === "TEXTAREA";
+      if (editing || hovered.current) fold();
+      else setOpen(false);
     }, 4000);
-  };
+  }, []);
   React.useEffect(() => () => window.clearTimeout(timer.current), []);
   React.useEffect(() => {
     if (open) fold();
-  }, [open, queue.length]);
+  }, [open, queue.length, fold]);
   const first = queue[0]?.text ?? "";
   return (
     <div
       ref={root}
       className="qd"
       data-open={open || undefined}
-      onPointerEnter={hold}
-      onPointerLeave={() => open && fold()}
-      onFocus={hold}
-      onBlur={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) fold();
+      onPointerEnter={(e) => {
+        if (e.pointerType === "mouse") hovered.current = true;
       }}
+      onPointerLeave={() => {
+        hovered.current = false;
+      }}
+      onPointerDown={() => open && fold()}
+      onKeyDown={() => open && fold()}
     >
       <button type="button" className="qd-line" aria-expanded={open} onClick={() => setOpen(!open)}>
         <span className="qd-label">Queued · {queue.length}</span>
