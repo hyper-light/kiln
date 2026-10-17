@@ -59,7 +59,7 @@ fn auto(id: &str) -> AppConfig {
 fn deploy(h: &mut Harness, git: &Git, app: &str, rev: &str, objects: Vec<Value>) {
     git.borrow_mut().insert(rev.to_owned(), objects);
     let key = obj::hash_bytes(rev.as_bytes());
-    h.input(Input::Inputs { app: app.into(), revision: rev.into(), key });
+    h.input(Input::Inputs { app: app.into(), revision: rev.into(), key, content: key });
 }
 
 fn status<'a>(h: &'a Harness, app: &str) -> Option<&'a crate::engine::Summary> {
@@ -191,7 +191,7 @@ fn a_restart_remembers_the_last_sync_and_leaves_drift_without_self_heal() {
     deploy(&mut h, &git, "web", "r1", objects.clone());
     assert!(h.run_until(60_000, |h| settled(h, "web")));
     let last = h.records.iter().rev().find_map(|r| match r {
-        Record::Finished { key: Some(k), succeeded, .. } => Some((*k, *succeeded)),
+        Record::Finished { content: Some(c), succeeded, .. } => Some((*c, *succeeded)),
         _ => None,
     });
     assert!(last.is_some());
@@ -203,8 +203,8 @@ fn a_restart_remembers_the_last_sync_and_leaves_drift_without_self_heal() {
     });
     let (mut h2, git2) = restart(&mut h);
     h2.input(Input::UpsertApp(no_heal()));
-    if let Some((key, succeeded)) = last {
-        h2.input(Input::Remember { app: "web".into(), key, succeeded });
+    if let Some((content, succeeded)) = last {
+        h2.input(Input::Remember { app: "web".into(), content, succeeded });
     }
     deploy(&mut h2, &git2, "web", "r1", objects);
     h2.run_for(30_000);
@@ -224,6 +224,74 @@ fn a_custom_resource_takes_its_scope_from_a_crd_in_the_same_render() {
     h.run_for(1_000);
     let keys: Vec<ResKey> = h.engine.resources("web").into_iter().map(|r| r.key).collect();
     assert!(keys.contains(&ResKey::new("example.com", "ClusterIssuer", "", "letsencrypt")), "{keys:?}");
+}
+
+#[test]
+fn a_sync_asked_for_while_a_render_is_in_flight_deploys_that_render() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(AppConfig::new("web", "dev", "web")));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    h.run_for(1_000);
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    // A new commit, and a sync asked for before its render is back.
+    deploy(&mut h, &git, "web", "r2", vec![deployment("web", "web:2", json!({}))]);
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
+    h.run_for(30_000);
+    let key = ResKey::new("apps", "Deployment", "web", "web");
+    let image = h.clusters.get("dev").and_then(|c| c.get(&key)).and_then(|v| v.pointer("/spec/template/spec/containers/0/image").cloned());
+    assert_eq!(image, Some(json!("web:2")));
+    assert_eq!(status(&h, "web").map(|s| s.sync), Some(Sync::Synced));
+}
+
+#[test]
+fn a_render_key_that_moves_only_with_the_cluster_syncs_nothing_again() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.sync.self_heal = false;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    let key = ResKey::new("apps", "Deployment", "web", "web");
+    h.edit("dev", &key, |v| {
+        if let Some(s) = v.pointer_mut("/spec").and_then(Value::as_object_mut) {
+            s.insert("replicas".into(), json!(1));
+        }
+    });
+    h.run_for(5_000);
+    let started = |h: &Harness| h.records.iter().filter(|r| matches!(r, Record::Started { .. })).count();
+    let before = started(&h);
+    // The cluster's API versions moved (a CRD installed somewhere): a new key, the same content.
+    let content = obj::hash_bytes(b"r1");
+    h.input(Input::Inputs { app: "web".into(), revision: "r1".into(), key: content ^ 0xC1, content });
+    h.run_for(30_000);
+    assert_eq!(started(&h), before, "{:?}", h.records);
+    assert_eq!(status(&h, "web").map(|s| s.sync), Some(Sync::OutOfSync));
+    // A new commit still syncs.
+    deploy(&mut h, &git, "web", "r2", vec![deployment("web", "web:2", json!({}))]);
+    assert!(h.run_until(60_000, |h| started(h) > before));
+}
+
+#[test]
+fn a_rollback_syncs_as_one_step_and_automation_cannot_cut_in() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.sync.self_heal = false;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    deploy(&mut h, &git, "web", "r2", vec![deployment("web", "web:2", json!({}))]);
+    assert!(h.run_until(60_000, |h| h.records.iter().filter(|r| matches!(r, Record::Finished { succeeded: true, .. })).count() == 2));
+    // Back to r1, in one step: its render was kept, so the sync starts at once, as a rollback.
+    let key = obj::hash_bytes(b"r1");
+    let request = SyncRequest { trigger: Some(crate::engine::Trigger::Rollback), ..SyncRequest::default() };
+    h.input(Input::SyncTo { app: "web".into(), revision: "r1".into(), key, content: key, request });
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    let triggers: Vec<crate::engine::Trigger> = h.records.iter().filter_map(|r| match r { Record::Started { trigger, .. } => Some(*trigger), _ => None }).collect();
+    assert_eq!(triggers.last(), Some(&crate::engine::Trigger::Rollback), "{triggers:?}");
+    let dep = ResKey::new("apps", "Deployment", "web", "web");
+    let image = h.clusters.get("dev").and_then(|c| c.get(&dep)).and_then(|v| v.pointer("/spec/template/spec/containers/0/image").cloned());
+    assert_eq!(image, Some(json!("web:1")));
 }
 
 #[test]
@@ -337,7 +405,7 @@ fn apps_with_the_same_inputs_share_one_render() {
         let mut app = AppConfig::new(&format!("web-{c}"), c, "web");
         app.sync.auto = true;
         h.input(Input::UpsertApp(app));
-        h.input(Input::Inputs { app: format!("web-{c}").into(), revision: "r1".into(), key: 7 });
+        h.input(Input::Inputs { app: format!("web-{c}").into(), revision: "r1".into(), key: 7, content: 7 });
     }
     assert!(h.run_until(60_000, Harness::all_settled));
     assert_eq!(*renders.borrow(), 1);

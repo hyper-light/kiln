@@ -559,8 +559,19 @@ export interface CdApp extends CdStatus {
   origin: { kind: "deploy"; repo: string } | { kind: "argo"; parent: string | null } | { kind: "api" };
   /** Adopted from Argo CD and not taken over: kiln compares it and never writes. */
   shadow: boolean;
+  /** Held at an earlier deployment by a rollback, until git changes the app. */
+  pinned?: CdPin | null;
   /** Why its sources can't be read. */
   source_error?: string;
+}
+
+/** A rollback's hold on an app. */
+export interface CdPin {
+  /** The deployment it went back to. */
+  to: number;
+  revision: string | null;
+  by: string | null;
+  at_ms: number;
 }
 
 /** One of an app's sources. */
@@ -627,6 +638,10 @@ export interface CdDiff {
 /** One deployment of an app. */
 export interface CdDeployment {
   app: string;
+  /** Its number in the app's history. */
+  id: number;
+  /** Each source's commit. */
+  commits?: (string | null)[];
   op: number;
   revision: string | null;
   trigger: string;

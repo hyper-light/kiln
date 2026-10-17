@@ -85,6 +85,21 @@ enum CdCmd {
     },
     /// Stop shadowing an app adopted from Argo CD: kiln syncs it from now on.
     TakeOver { id: String },
+    /// Roll an app back to an earlier deployment (`kiln cd app <app> --history` lists them; by
+    /// default the one before what runs now). It holds there until git changes the app.
+    Rollback {
+        id: String,
+        /// The deployment's id.
+        to: Option<u64>,
+        /// Delete what that deployment didn't have.
+        #[arg(long)]
+        prune: bool,
+        /// Wait until it finishes and the app is healthy.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Let a rolled-back app follow git again.
+    Follow { id: String },
     /// Import Argo CD manifests (Applications) from files.
     Import { files: Vec<std::path::PathBuf> },
     /// Clusters.
@@ -288,12 +303,23 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
         }
         CdCmd::Sync { id, prune, dry_run, options, wait } => {
             let path = app_path(&id);
+            let before = op_id(&api, &path).await;
             let v = api.call(Method::Post, &format!("{path}/sync"), Some(json!({"prune": prune, "dry_run": dry_run, "options": options}))).await?;
             if wait {
-                return wait_for(&api, &path, args.json).await;
+                return wait_for(&api, &path, args.json, before).await;
             }
             v
         }
+        CdCmd::Rollback { id, to, prune, wait } => {
+            let path = app_path(&id);
+            let before = op_id(&api, &path).await;
+            let v = api.call(Method::Post, &format!("{path}/rollback"), Some(json!({"to": to, "prune": prune}))).await?;
+            if wait {
+                return wait_for(&api, &path, args.json, before).await;
+            }
+            v
+        }
+        CdCmd::Follow { id } => api.call(Method::Post, &format!("{}/follow", app_path(&id)), None).await?,
         CdCmd::Refresh { id, hard } => api.call(Method::Post, &format!("{}/refresh?hard={hard}", app_path(&id)), None).await?,
         CdCmd::Delete { id, cascade } => {
             let q = cascade.map(|c| format!("?cascade={c}")).unwrap_or_default();
@@ -335,11 +361,19 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
 }
 
 /// Follows an app until its sync finishes and it is healthy (or the sync fails).
-async fn wait_for(api: &Api, path: &str, json_out: bool) -> Result<()> {
+/// The id of an app's current (or last) sync, if it has one.
+async fn op_id(api: &Api, path: &str) -> Option<u64> {
+    api.call(Method::Get, path, None).await.ok()?.pointer("/operation/id").and_then(Value::as_u64)
+}
+
+/// Waits for the sync after `before` to finish with the app healthy.
+async fn wait_for(api: &Api, path: &str, json_out: bool, before: Option<u64>) -> Result<()> {
     let mut last = String::new();
     for _ in 0..1200 {
         let v = api.call(Method::Get, path, None).await?;
-        let phase = v.pointer("/operation/phase").and_then(Value::as_str).unwrap_or("");
+        // Until the new sync shows, the last one's outcome says nothing.
+        let fresh = v.pointer("/operation/id").and_then(Value::as_u64) != before;
+        let phase = if fresh { v.pointer("/operation/phase").and_then(Value::as_str).unwrap_or("") } else { "" };
         let line = format!("{} · {} · {} {}", s(&v, "sync"), s(&v, "health"), phase, v.pointer("/operation/message").and_then(Value::as_str).unwrap_or(""));
         if line != last && !json_out {
             println!("{line}");

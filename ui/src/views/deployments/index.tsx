@@ -264,6 +264,7 @@ const AppRow = React.memo(function AppRow({ app, pos, size }: { app: CdApp; pos:
           <span className="cd-row-meta">
             {[app.project, placeOf(app), shortRev(app.revision)].filter(Boolean).join(" · ")}
             {app.shadow ? " · shadow" : ""}
+            {app.pinned ? " · rolled back" : ""}
           </span>
         </span>
         <span className="cd-row-states">

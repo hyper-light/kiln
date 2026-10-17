@@ -90,6 +90,14 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<S
         (&Method::POST, ["apps", p, n, "refresh"]) => ("cd.apps.refresh".into(), with(app(p, n), "hard", json!(q.get("hard").is_some_and(|v| v == "true" || v == "1")))),
         (&Method::POST, ["apps", p, n, "terminate"]) => ("cd.apps.terminate".into(), app(p, n)),
         (&Method::POST, ["apps", p, n, "take-over"]) => ("cd.apps.take_over".into(), app(p, n)),
+        (&Method::POST, ["apps", p, n, "rollback"]) => {
+            let mut b = json_body(body).await?;
+            if let Some(m) = b.as_object_mut() {
+                m.insert("app".into(), json!(format!("{p}/{n}")));
+            }
+            ("cd.apps.rollback".into(), b)
+        }
+        (&Method::POST, ["apps", p, n, "follow"]) => ("cd.apps.follow".into(), app(p, n)),
         (&Method::GET, ["clusters"]) => ("cd.clusters.list".into(), json!({})),
         (&Method::POST, ["clusters"]) => ("cd.clusters.add".into(), json_body(body).await?),
         (&Method::DELETE, ["clusters", name]) => ("cd.clusters.remove".into(), json!({"name": name})),

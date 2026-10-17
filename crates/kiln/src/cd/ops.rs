@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use kiln_cd::apps::{self, AppDef, Origin};
-use kiln_cd::engine::{Input, SyncRequest, Summary};
+use kiln_cd::engine::{Input, OpPhase, Summary, SyncRequest, Trigger};
 use kiln_cd::model::{Health, Sync, SyncOptions};
 use kiln_cd::obj::{self, ResKey};
-use kiln_cd::state::{ClusterAuth, ClusterDef, Command, RepoDef, RepoKind};
+use kiln_cd::state::{self, ClusterAuth, ClusterDef, Command, RepoDef, RepoKind};
 use serde_json::{Value, json};
 
 use super::{AppEntry, Cd};
@@ -145,6 +145,14 @@ pub fn ops() -> &'static [Op] {
             op!("cd.apps.terminate", "Stop an app's running sync.", ro: false, destructive: false, input: app_only, run: terminate),
             op!("cd.apps.take_over", "Stop shadowing an app adopted from Argo CD: kiln syncs it from now on.", ro: false, destructive: false,
                 input: app_only, run: take_over),
+            op!("cd.apps.rollback", "Roll an app back to an earlier deployment (`to`, its history id; by default the one before what runs now). kiln renders that deployment's commits again and syncs them; the app holds there until git changes it, then follows git again.", ro: false, destructive: true,
+                input: || obj_schema(json!({
+                    "app": {"type": "string", "description": APP},
+                    "to": {"type": "integer", "minimum": 1, "description": "The deployment's id (cd.apps.history)."},
+                    "prune": {"type": "boolean", "description": "Also delete what that deployment didn't have."}
+                }), &["app"]), run: rollback),
+            op!("cd.apps.follow", "Let a rolled-back app follow git again (an automatic app then deploys what git says).", ro: false, destructive: false,
+                input: app_only, run: follow),
             op!("cd.apps.create", "Create or replace an app kept in kiln (an AppDef).", ro: false, destructive: true,
                 input: || obj_schema(json!({"definition": {"type": "object", "description": "The app: name, project, sources, destination, sync, ignore, tracking."}}), &["definition"]),
                 run: create),
@@ -235,6 +243,7 @@ fn selected(cd: &Cd, sel: &Value, max: usize) -> Vec<String> {
 }
 
 async fn list(cx: Cx, q: Value) -> Out {
+    let pins = cx.cd.store.read(|d| d.pins.clone());
     let limit = q.get("limit").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
     let apps = cx.cd.apps.read();
     let statuses = cx.cd.statuses.read();
@@ -249,13 +258,13 @@ async fn list(cx: Cx, q: Value) -> Out {
             next = Some(id.clone());
             break;
         }
-        items.push(app_row(e, statuses.get(id.as_str())));
+        items.push(app_row(e, statuses.get(id.as_str()), pins.get(id.as_str())));
     }
     Ok(json!({"apps": items, "next": next}))
 }
 
 /// An app as lists show it.
-pub fn app_row(e: &AppEntry, s: Option<&Summary>) -> Value {
+pub fn app_row(e: &AppEntry, s: Option<&Summary>, pin: Option<&state::Pin>) -> Value {
     let unknown = || json!({"sync": Sync::Unknown.as_str(), "health": Health::Unknown.as_str()});
     let mut row = s.map(super::summary_json).unwrap_or_else(unknown);
     if let Some(m) = row.as_object_mut() {
@@ -269,6 +278,7 @@ pub fn app_row(e: &AppEntry, s: Option<&Summary>) -> Value {
         m.insert("labels".into(), json!(e.def.labels));
         m.insert("origin".into(), origin(&e.def.origin));
         m.insert("shadow".into(), json!(super::is_shadow(&e.def)));
+        m.insert("pinned".into(), pin.map_or(Value::Null, |p| json!({"to": p.to, "revision": p.revision, "by": p.by, "at_ms": p.at_ms})));
         if let Some(err) = &e.error {
             m.insert("source_error".into(), json!(err));
         }
@@ -288,7 +298,8 @@ async fn get(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     let entry = cx.cd.apps.read().get(&id).cloned().ok_or_else(|| missing(format!("no app {id}")))?;
     let status = cx.cd.statuses.read().get(&id).cloned();
-    let mut out = app_row(&entry, status.as_ref());
+    let pin = cx.cd.store.read(|d| d.pins.get(&id).cloned());
+    let mut out = app_row(&entry, status.as_ref(), pin.as_ref());
     if let Some(m) = out.as_object_mut() {
         m.insert("definition".into(), serde_json::to_value(&entry.def).unwrap_or(Value::Null));
         m.insert("commits".into(), json!(entry.commits));
@@ -451,9 +462,23 @@ fn sync_request(v: &Value, by: &str) -> Result<SyncRequest, Fail> {
     })
 }
 
+/// Whether an app can start a sync now: none is running, and its render didn't fail.
+fn ready_to_sync(cd: &Cd, id: &str) -> Result<(), Fail> {
+    let statuses = cd.statuses.read();
+    let Some(s) = statuses.get(id) else { return Ok(()) };
+    if s.operation.as_ref().is_some_and(|o| matches!(o.phase, OpPhase::DryRun | OpPhase::Running | OpPhase::Failing | OpPhase::Terminating)) {
+        return Err((StatusCode::CONFLICT, format!("{id} is already syncing; stop that sync first")));
+    }
+    if let Some(m) = s.message.as_deref().filter(|m| m.starts_with("render failed")) {
+        return Err(bad(format!("{id} can't sync: its {m}")));
+    }
+    Ok(())
+}
+
 async fn sync(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
+    ready_to_sync(&cx.cd, &id)?;
     let request = sync_request(&v, &cx.actor)?;
     cx.cd.input(Input::Sync { app: id.as_str().into(), request });
     audit(&cx, "cd.sync", id.clone()).await;
@@ -506,6 +531,71 @@ async fn take_over(cx: Cx, v: Value) -> Out {
     propose(&cx.cd, Command::PutApp(Box::new(def))).await?;
     audit(&cx, "cd.take_over", id.clone()).await;
     Ok(json!({"taken_over": id}))
+}
+
+async fn rollback(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
+    if super::is_shadow(&def) {
+        return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
+    }
+    ready_to_sync(&cx.cd, &id)?;
+    let history = cx.cd.store.read(|d| d.history.get(&id).cloned().unwrap_or_default());
+    let current = history.iter().rev().find(|d| d.succeeded).and_then(|d| d.key);
+    let target = match v.get("to").and_then(Value::as_u64) {
+        Some(n) => history.iter().find(|d| d.id == n).ok_or_else(|| missing(format!("{id} has no deployment {n}")))?,
+        None => history
+            .iter()
+            .rev()
+            .find(|d| d.succeeded && d.key != current)
+            .ok_or_else(|| bad(format!("{id} has no earlier deployment to roll back to")))?,
+    };
+    if !target.succeeded {
+        return Err(bad(format!("deployment {} of {id} failed; roll back to one that succeeded", target.id)));
+    }
+    // Each source's commit; entries kept before kiln recorded them carry the revision only.
+    let commits = if !target.commits.is_empty() {
+        target.commits.clone()
+    } else if def.sources.len() == 1 && target.revision.is_some() {
+        vec![target.revision.clone()]
+    } else {
+        return Err(bad(format!("deployment {} of {id} was kept without its sources' commits, so it can't be rendered again", target.id)));
+    };
+    let Some(cluster) = cx.cd.clusters.read().get(&def.destination.cluster).cloned() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, format!("cluster {} is not connected", def.destination.cluster)));
+    };
+    let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
+    let (cd, d2, at) = (cx.cd.clone(), def.clone(), commits.clone());
+    let (head, back) = crate::rt::blocking(move || -> anyhow::Result<_> {
+        let head = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
+        let back = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
+        Ok((head, back))
+    })
+    .await
+    .and_then(|r| r)
+    .map_err(|e| bad(format!("{e:#}")))?;
+    let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(cx.actor.clone()), at_ms: super::now_ms() };
+    propose(&cx.cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
+    // The held inputs and their sync as one step: nothing syncs the app in between.
+    let request = SyncRequest { prune: v.get("prune").and_then(Value::as_bool), by: Some(cx.actor.clone()), trigger: Some(Trigger::Rollback), ..SyncRequest::default() };
+    {
+        let _gate = cx.cd.inputs_gate.lock();
+        cx.cd.keep_inputs(&id, &back);
+        cx.cd.input(Input::SyncTo { app: id.as_str().into(), revision: back.revision.as_str().into(), key: back.key, content: back.content, request });
+    }
+    audit(&cx, "cd.rollback", format!("{id} to deployment {}", target.id)).await;
+    Ok(json!({"rolling_back": id, "to": target.id, "revision": target.revision}))
+}
+
+async fn follow(cx: Cx, v: Value) -> Out {
+    let id = app_id(&v)?;
+    exists(&cx.cd, &id)?;
+    if cx.cd.store.read(|d| d.pins.contains_key(&id)) {
+        propose(&cx.cd, Command::Pin { app: id.clone(), pin: None }).await?;
+        cx.cd.kick();
+        audit(&cx, "cd.follow", id.clone()).await;
+    }
+    Ok(json!({"following": id}))
 }
 
 async fn create(cx: Cx, v: Value) -> Out {

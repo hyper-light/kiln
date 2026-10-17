@@ -15,7 +15,7 @@ pub mod cli;
 pub mod kube;
 pub mod ops;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -69,6 +69,25 @@ pub struct AppEntry {
     pub error: Option<String>,
     /// Apps it renders (app of apps), by id.
     pub children: BTreeSet<String>,
+    /// Its latest resolutions, so a render (or a history entry) reads the commits its key
+    /// stands for even after git moved.
+    pub resolved: VecDeque<Resolved>,
+}
+
+/// One resolution of an app's sources: what a render key stands for.
+#[derive(Clone, Debug, Default)]
+pub struct Resolved {
+    /// The first source's commit: the app's revision.
+    pub revision: String,
+    /// The render key: the content address of everything a render reads, the cluster's version
+    /// and API versions included.
+    pub key: u64,
+    /// The same without the cluster's part: what git holds for the app.
+    pub content: u64,
+    /// Each source's commit.
+    pub commits: Vec<Option<String>>,
+    /// What each source's render reads.
+    pub deps: Vec<Vec<Dep>>,
 }
 
 /// The deployments service.
@@ -86,6 +105,9 @@ pub struct Cd {
     dirty: Mutex<BTreeSet<String>>,
     watched: Mutex<BTreeSet<(String, GroupKind)>>,
     connecting: Mutex<BTreeSet<String>>,
+    /// Held while an app's inputs are checked against its pin and sent, so the source poll and a
+    /// rollback never interleave.
+    inputs_gate: Mutex<()>,
     dir: PathBuf,
     tools: Tools,
     poll: Duration,
@@ -156,18 +178,20 @@ impl Cd {
                 key: None,
                 error: None,
                 children: BTreeSet::new(),
+                resolved: VecDeque::new(),
             });
             if entry.def != def {
                 entry.def = def;
                 entry.key = None;
                 entry.commits.clear();
+                entry.resolved.clear();
             }
         }
         self.input(Input::UpsertApp(cfg));
         // The last sync from before a restart: automation goes on from it, not from scratch.
-        let last = self.store.read(|d| d.history.get(&id).and_then(|h| h.back()).and_then(|h| Some((h.key?, h.succeeded))));
-        if let Some((key, succeeded)) = last {
-            self.input(Input::Remember { app: id.as_str().into(), key, succeeded });
+        let last = self.store.read(|d| d.history.get(&id).and_then(|h| h.back()).and_then(|h| Some((h.content?, h.succeeded))));
+        if let Some((content, succeeded)) = last {
+            self.input(Input::Remember { app: id.as_str().into(), content, succeeded });
         }
         self.kick();
     }
@@ -235,25 +259,35 @@ impl Cd {
             // after, and could be applied first.
             let Some(cluster) = self.clusters.read().get(&def.destination.cluster).cloned() else { continue };
             let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
-            let result = crate::rt::blocking(move || this.inputs_of(&def, kube_version.as_deref(), &api_versions)).await.and_then(|r| r);
+            let pin = self.store.read(|d| d.pins.get(&id).cloned());
+            let mut seen = pin.clone();
+            let result = crate::rt::blocking(move || -> Result<(Resolved, Option<Resolved>)> {
+                let head = this.inputs_of(&def, kube_version.as_deref(), &api_versions, None)?;
+                // A rolled-back app holds its deployment's commits until git changes what it
+                // renders; then it follows git again.
+                let held = match &pin {
+                    Some(p) if p.head == head.content => Some(this.inputs_of(&def, kube_version.as_deref(), &api_versions, Some(&p.commits))?),
+                    _ => None,
+                };
+                Ok((head, held))
+            })
+            .await
+            .and_then(|r| r);
             match result {
-                Ok((revision, key, commits, deps)) => {
-                    let moved = {
-                        let mut apps = self.apps.write();
-                        match apps.get_mut(&id) {
-                            Some(e) => {
-                                let moved = e.key != Some(key) || e.commits != commits;
-                                e.key = Some(key);
-                                e.commits = commits;
-                                e.deps = deps;
-                                e.error = None;
-                                moved
-                            }
-                            None => false,
+                Ok((head, held)) => {
+                    if seen.is_some() && held.is_none() {
+                        tracing::info!(app = %id, "deployments: git changed a rolled-back app; it follows git again");
+                        match self.store.submit(Command::Pin { app: id.clone(), pin: None }).await {
+                            Ok(Ok(())) => seen = None,
+                            Ok(Err(e)) => tracing::warn!(app = %id, error = %e, "deployments: letting go of a rollback failed"),
+                            Err(_) => tracing::warn!(app = %id, "deployments: the store stopped"),
                         }
-                    };
-                    if moved {
-                        self.input(Input::Inputs { app: id.as_str().into(), revision: revision.into(), key });
+                    }
+                    // A rollback may have pinned the app (or let go of it) meanwhile: then its
+                    // inputs stand, and the next poll starts from them.
+                    let _gate = self.inputs_gate.lock();
+                    if self.store.read(|d| d.pins.get(&id).cloned()) == seen {
+                        self.use_inputs(&id, held.unwrap_or(head));
                     }
                 }
                 Err(e) => self.set_source_error(&id, Some(format!("{e:#}"))),
@@ -270,24 +304,59 @@ impl Cd {
         }
     }
 
-    /// An app's revision, render key, each source's commit and what each source reads.
-    fn inputs_of(&self, def: &AppDef, kube_version: Option<&str>, api_versions: &[String]) -> Result<(String, u64, Vec<Option<String>>, Vec<Vec<Dep>>)> {
+    /// Makes `r` an app's inputs, telling the engine when they moved.
+    fn use_inputs(&self, id: &str, r: Resolved) {
+        if self.keep_inputs(id, &r) {
+            self.input(Input::Inputs { app: id.into(), revision: r.revision.into(), key: r.key, content: r.content });
+        }
+    }
+
+    /// Records `r` as an app's inputs (renders read their commits from here); whether they moved.
+    fn keep_inputs(&self, id: &str, r: &Resolved) -> bool {
+        let mut apps = self.apps.write();
+        let Some(e) = apps.get_mut(id) else { return false };
+        let moved = e.key != Some(r.key) || e.commits != r.commits;
+        e.key = Some(r.key);
+        e.commits = r.commits.clone();
+        e.deps = r.deps.clone();
+        e.error = None;
+        if !e.resolved.iter().any(|x| x.key == r.key) {
+            e.resolved.push_back(r.clone());
+            while e.resolved.len() > 8 {
+                e.resolved.pop_front();
+            }
+        }
+        moved
+    }
+
+    /// Resolves an app's sources: its revision, render key, each source's commit and what each
+    /// source reads. `at` holds sources at given commits (a rollback); the others resolve their
+    /// revisions.
+    fn inputs_of(&self, def: &AppDef, kube_version: Option<&str>, api_versions: &[String], at: Option<&[Option<String>]>) -> Result<Resolved> {
         let mut key = blake(&[serde_json::to_vec(&def.sources)?.as_slice(), def.destination.namespace.as_bytes(), def.name.as_bytes()]);
-        key ^= blake(&[kube_version.unwrap_or("").as_bytes(), api_versions.join(",").as_bytes()]).rotate_left(7);
+        // Only Helm and plugins read the cluster's version and API versions. Other renders come out
+        // alike anywhere, so a CRD installed on the cluster moves none of their keys.
+        let cluster = blake(&[kube_version.unwrap_or("").as_bytes(), api_versions.join(",").as_bytes()]).rotate_left(7);
+        let mut reads_cluster = false;
+        let held = |i: usize| at.and_then(|c| c.get(i).cloned().flatten());
         let mut commits = Vec::new();
         let mut all_deps = Vec::new();
         let mut revision = String::new();
         // Commits of ref sources first: other sources' value files read them.
         let mut ref_commits: HashMap<String, (Mirror, String)> = HashMap::new();
-        for s in &def.sources {
+        for (i, s) in def.sources.iter().enumerate() {
             if let (Some(name), None) = (&s.as_ref, &s.chart) {
                 let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
-                let commit = m.resolve(&s.revision)?;
+                let commit = match held(i) {
+                    Some(c) => c,
+                    None => m.resolve(&s.revision)?,
+                };
                 ref_commits.insert(name.clone(), (m, commit));
             }
         }
         for (i, s) in def.sources.iter().enumerate() {
             if s.chart.is_some() {
+                reads_cluster = true;
                 commits.push(None);
                 // A chart from a Helm repository: its version is its content (ref value files below).
                 let deps = render::deps(s, Kind::Helm, &|_| None);
@@ -296,7 +365,10 @@ impl Cd {
                 continue;
             }
             let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
-            let commit = m.resolve(&s.revision)?;
+            let commit = match held(i) {
+                Some(c) => c,
+                None => m.resolve(&s.revision)?,
+            };
             if revision.is_empty() && s.as_ref.is_none() {
                 revision = commit.clone();
             }
@@ -307,6 +379,12 @@ impl Cd {
             }
             let read = |p: &str| m.read(&commit, p).ok().flatten().map(|b| String::from_utf8_lossy(&b).into_owned());
             let kind = render::kind_of(s, &|p| m.hashes(&commit, &[p]).ok().and_then(|h| h.into_iter().next().flatten()).is_some());
+            reads_cluster |= matches!(kind, Kind::Helm | Kind::Plugin);
+            // A plugin, or parameters naming the revision, can write the commit itself into the
+            // objects: then it is part of what the render reads.
+            if kind == Kind::Plugin || serde_json::to_string(&s.engine).is_ok_and(|e| e.contains("ARGOCD_APP_REVISION") || e.contains("KILN_SHA")) {
+                key ^= blake(&[b"commit", commit.as_bytes()]).rotate_left(((i + 17) % 61) as u32);
+            }
             let deps = render::deps(s, kind, &read);
             let own: Vec<String> = deps.iter().filter(|d| d.source.is_none()).map(|d| d.path.clone()).collect();
             let own = m.with_links(&commit, &own)?;
@@ -327,7 +405,11 @@ impl Cd {
         if revision.is_empty() {
             revision = def.sources.first().map(|s| s.revision.clone()).unwrap_or_default();
         }
-        Ok((revision, key, commits, all_deps))
+        let content = key;
+        if reads_cluster {
+            key ^= cluster;
+        }
+        Ok(Resolved { revision, key, content, commits, deps: all_deps })
     }
 
     fn ref_dep_hashes(&self, deps: &[Dep], refs: &HashMap<String, (Mirror, String)>) -> Result<u64> {
@@ -354,9 +436,16 @@ impl Cd {
             Some(c) => (c.version.read().clone(), c.discovery.read().api_versions.clone()),
             None => (None, Vec::new()),
         };
+        // The commits this key stands for, even if git moved since it was resolved.
+        let inputs = entry.resolved.iter().find(|r| r.key == key).cloned().unwrap_or_else(|| Resolved {
+            key,
+            commits: entry.commits.clone(),
+            deps: entry.deps.clone(),
+            ..Resolved::default()
+        });
         let this = self.clone();
-        let e2 = entry.clone();
-        let result = crate::rt::blocking(move || this.render_app(&e2, key, kube_version.as_deref(), &api_versions)).await.and_then(|r| r);
+        let def = entry.def.clone();
+        let result = crate::rt::blocking(move || this.render_app(&def, &inputs, key, kube_version.as_deref(), &api_versions)).await.and_then(|r| r);
         match result {
             Ok((objects, children)) => {
                 self.adopt_children(&app, children);
@@ -371,16 +460,15 @@ impl Cd {
 
     /// Renders every source of an app into one list; Argo CD Applications among the objects are
     /// its children (app of apps), returned apart.
-    fn render_app(&self, e: &AppEntry, key: u64, kube_version: Option<&str>, api_versions: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
-        let def = &e.def;
+    fn render_app(&self, def: &AppDef, inputs: &Resolved, key: u64, kube_version: Option<&str>, api_versions: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
         let views = self.dir.join("views").join(format!("{key:016x}"));
         let _ = std::fs::remove_dir_all(&views);
         // Ref sources' files, by name.
         let mut refs: BTreeMap<String, PathBuf> = BTreeMap::new();
         for (i, s) in def.sources.iter().enumerate() {
             let Some(name) = &s.as_ref else { continue };
-            let commit = e.commits.get(i).cloned().flatten().context("a ref source's commit is unknown")?;
-            let wanted: Vec<String> = e.deps.iter().flatten().filter(|d| d.source.as_deref() == Some(name)).map(|d| d.path.clone()).collect();
+            let commit = inputs.commits.get(i).cloned().flatten().context("a ref source's commit is unknown")?;
+            let wanted: Vec<String> = inputs.deps.iter().flatten().filter(|d| d.source.as_deref() == Some(name)).map(|d| d.path.clone()).collect();
             let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
             let root = views.join(format!("ref-{name}"));
             let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
@@ -393,10 +481,10 @@ impl Cd {
                 continue;
             }
             let root = views.join(format!("src-{i}"));
-            let commit = e.commits.get(i).cloned().flatten().unwrap_or_else(|| s.revision.clone());
+            let commit = inputs.commits.get(i).cloned().flatten().unwrap_or_else(|| s.revision.clone());
             if s.chart.is_none() {
                 let m = Mirror::open(&self.mirror_dir(&s.repo), &s.repo, self.git_auth(&s.repo))?;
-                let own: Vec<&str> = e.deps.get(i).into_iter().flatten().filter(|d| d.source.is_none()).map(|d| d.path.as_str()).collect();
+                let own: Vec<&str> = inputs.deps.get(i).into_iter().flatten().filter(|d| d.source.is_none()).map(|d| d.path.as_str()).collect();
                 m.extract(&commit, &own, &root)?;
             }
             std::fs::create_dir_all(&root)?;
@@ -721,11 +809,16 @@ impl Cd {
     }
 
     fn record(&self, r: Record) {
-        let Record::Finished { app, op, revision, key, trigger, by, succeeded, message, applied, pruned, at_ms } = r else { return };
+        let Record::Finished { app, op, revision, key, content, trigger, by, succeeded, message, applied, pruned, at_ms } = r else { return };
         if !succeeded {
             tracing::info!(app = %app, op, message = %message, "deployments: a sync failed");
         }
-        let limit = self.apps.read().get(app.as_ref()).map(|e| e.def.history_limit).unwrap_or(10);
+        let (limit, commits) = {
+            let apps = self.apps.read();
+            let e = apps.get(app.as_ref());
+            let commits = key.and_then(|k| e.and_then(|e| e.resolved.iter().find(|r| r.key == k)).map(|r| r.commits.clone())).unwrap_or_default();
+            (e.map(|e| e.def.history_limit).unwrap_or(10), commits)
+        };
         let d = Deployment {
             app: app.to_string(),
             op,
@@ -738,6 +831,9 @@ impl Cd {
             applied,
             pruned,
             at_ms,
+            id: 0,
+            commits,
+            content,
         };
         let rx = self.store.submit(Command::Deployed { deployment: Box::new(d), limit });
         crate::rt::spawn(async move {
@@ -872,6 +968,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         dirty: Mutex::new(BTreeSet::new()),
         watched: Mutex::new(BTreeSet::new()),
         connecting: Mutex::new(BTreeSet::new()),
+        inputs_gate: Mutex::new(()),
         dir,
         tools,
         poll: Duration::from_secs(cfg.poll_seconds.max(5)),
@@ -913,6 +1010,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                     kiln_cd::state::Change::ClusterDeleted(name) => {
                         c2.clusters.write().remove(&name);
                     }
+                    kiln_cd::state::Change::Pinned(_) => c2.kick(),
                     _ => {}
                 }
             }

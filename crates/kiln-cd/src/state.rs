@@ -192,6 +192,33 @@ pub struct Deployment {
     pub pruned: u32,
     /// When it finished (ms since the epoch).
     pub at_ms: u64,
+    /// Its number in the app's history (1, 2, ...), given when it is recorded.
+    #[serde(default)]
+    pub id: u64,
+    /// Each source's commit: what a rollback renders again.
+    #[serde(default)]
+    pub commits: Vec<Option<String>>,
+    /// What git held for the app: its inputs' content address, the cluster's part left out.
+    #[serde(default)]
+    pub content: Option<u64>,
+}
+
+/// An app held at an earlier deployment (a rollback) until git changes what it renders.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct Pin {
+    /// The deployment it went back to (its history id).
+    pub to: u64,
+    /// That deployment's revision.
+    pub revision: Option<String>,
+    /// Each source's commit it holds.
+    pub commits: Vec<Option<String>>,
+    /// What git held for the app when it was pinned: the content address of its inputs, the
+    /// cluster's part left out. When that moves, the app follows git again.
+    pub head: u64,
+    /// Who rolled it back.
+    pub by: Option<String>,
+    /// When (ms since the epoch).
+    pub at_ms: u64,
 }
 
 /// A change to what is kept.
@@ -222,6 +249,13 @@ pub enum Command {
     },
     /// Set a setting.
     PutSetting(String, Value),
+    /// Hold an app at an earlier deployment (a rollback), or let it follow git again.
+    Pin {
+        /// The app.
+        app: String,
+        /// The hold; none to follow git.
+        pin: Option<Box<Pin>>,
+    },
 }
 
 /// Something that changed, for whoever follows the store.
@@ -243,6 +277,8 @@ pub enum Change {
     Deployed(String),
     /// A setting changed.
     Setting(String),
+    /// An app was held at an earlier deployment, or let go.
+    Pinned(String),
 }
 
 /// What is kept.
@@ -260,6 +296,9 @@ pub struct Data {
     pub history: BTreeMap<String, VecDeque<Deployment>>,
     /// Settings by key.
     pub settings: BTreeMap<String, Value>,
+    /// Apps held at an earlier deployment, by id.
+    #[serde(default)]
+    pub pins: BTreeMap<String, Pin>,
 }
 
 impl Data {
@@ -279,6 +318,7 @@ impl Data {
                     return Err(format!("no app {id}"));
                 }
                 self.history.remove(&id);
+                self.pins.remove(&id);
                 changes.push(Change::AppDeleted(id));
             }
             Command::PutCluster(c) => {
@@ -322,7 +362,15 @@ impl Data {
             Command::Deployed { deployment, limit } => {
                 let app = deployment.app.clone();
                 let h = self.history.entry(app.clone()).or_default();
-                h.push_back(*deployment);
+                // Entries are numbered in order; ones kept before numbering get theirs first.
+                if h.iter().any(|d| d.id == 0) {
+                    for (n, d) in h.iter_mut().enumerate() {
+                        d.id = n as u64 + 1;
+                    }
+                }
+                let mut deployment = *deployment;
+                deployment.id = h.back().map_or(0, |d| d.id) + 1;
+                h.push_back(deployment);
                 // Failures go first, so a run of failed syncs never pushes out the deployments a
                 // rollback needs; the newest entry always stays (automation goes on from it).
                 while h.len() > limit.max(1) as usize {
@@ -341,6 +389,17 @@ impl Data {
             Command::PutSetting(key, value) => {
                 self.settings.insert(key.clone(), value);
                 changes.push(Change::Setting(key));
+            }
+            Command::Pin { app, pin } => {
+                match pin {
+                    Some(p) => {
+                        self.pins.insert(app.clone(), *p);
+                    }
+                    None => {
+                        self.pins.remove(&app);
+                    }
+                }
+                changes.push(Change::Pinned(app));
             }
         }
         Ok(())
@@ -586,6 +645,31 @@ mod tests {
             cascade: true,
             managed_namespace: None,
         }
+    }
+
+    #[test]
+    fn deployments_are_numbered_and_pins_come_and_go() {
+        let mut d = Data::default();
+        let mut ch = Vec::new();
+        assert!(d.apply(Command::PutCluster(Box::new(ClusterDef { name: "in-cluster".into(), ..ClusterDef::default() })), &mut ch).is_ok());
+        assert!(d.apply(Command::PutApp(Box::new(app("web"))), &mut ch).is_ok());
+        // One kept before numbering: numbered when the next comes.
+        d.history.entry("default/web".into()).or_default().push_back(Deployment { app: "default/web".into(), succeeded: true, ..Deployment::default() });
+        for op in 1..3 {
+            let dep = Deployment { app: "default/web".into(), op, succeeded: true, ..Deployment::default() };
+            assert!(d.apply(Command::Deployed { deployment: Box::new(dep), limit: 10 }, &mut ch).is_ok());
+        }
+        let ids: Vec<u64> = d.history.get("default/web").map(|h| h.iter().map(|x| x.id).collect()).unwrap_or_default();
+        assert_eq!(ids, [1, 2, 3]);
+        let pin = Pin { to: 1, ..Pin::default() };
+        assert!(d.apply(Command::Pin { app: "default/web".into(), pin: Some(Box::new(pin)) }, &mut ch).is_ok());
+        assert_eq!(d.pins.get("default/web").map(|p| p.to), Some(1));
+        assert!(d.apply(Command::Pin { app: "default/web".into(), pin: None }, &mut ch).is_ok());
+        assert!(d.pins.is_empty());
+        assert!(d.apply(Command::Pin { app: "default/web".into(), pin: Some(Box::new(Pin::default())) }, &mut ch).is_ok());
+        assert!(d.apply(Command::DeleteApp("default/web".into()), &mut ch).is_ok());
+        assert!(d.pins.is_empty());
+        assert_eq!(ch.last(), Some(&Change::AppDeleted("default/web".into())));
     }
 
     #[test]

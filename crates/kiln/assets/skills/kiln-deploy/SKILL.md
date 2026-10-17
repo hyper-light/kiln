@@ -34,6 +34,17 @@ return { sync: a.sync, health: a.health, op: a.operation };
 
 Fleets: `kiln.cd.apps.sync_many({ project, health, ... })` starts every matching app in one call.
 
+## Rolling back
+
+Undo a bad deploy from its history, not by hand:
+
+1. `kiln.cd.apps.history({ app })` lists deployments, newest first, each with an `id`.
+2. `kiln.cd.apps.rollback({ app })` goes back to the one before what runs now (`to: <id>` picks
+   one; `prune: true` also deletes what it didn't have). It waits for that render, then syncs.
+3. The app holds there: automation won't redeploy the bad commit. When git changes the app (the
+   fix lands), it follows git again by itself; `kiln.cd.apps.follow({ app })` lets go sooner.
+   `kiln.cd.apps.get({ app }).pinned` says whether it is held, and since when.
+
 ## Rules
 
 - Waves: objects annotated `argocd.argoproj.io/sync-wave` apply in order; a wave waits until

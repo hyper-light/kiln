@@ -475,7 +475,7 @@
 }
 .cd-history-row {
   display: grid;
-  grid-template-columns: 110px 84px minmax(0, 1fr) auto;
+  grid-template-columns: 110px 128px minmax(0, 1fr) auto auto;
   align-items: baseline;
   gap: 4px 18px;
   padding: 13px 10px;
@@ -486,6 +486,9 @@
   color: #c8cad0;
   font-size: 12.5px;
   overflow-wrap: anywhere;
+}
+.cd-history-act {
+  justify-self: end;
 }
 .cd-history-msg {
   grid-column: 1 / -1;
@@ -505,6 +508,9 @@
   .cd-history-at {
     order: 1;
     margin-left: auto;
+  }
+  .cd-history-act {
+    order: 1;
   }
   .cd-history-what {
     order: 2;

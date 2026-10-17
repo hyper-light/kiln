@@ -177,7 +177,8 @@ fn run_shard(b: &Bench, shard: usize, shards: usize, mut progress: impl FnMut(&P
             a.sync = SyncPolicy { auto: true, prune: true, self_heal: true, ..SyncPolicy::default() };
             h.input(Input::UpsertApp(a));
             let shared = (i % b.distinct.max(1)) as u64;
-            h.input(Input::Inputs { app: app_id(i).into(), revision: "v1".into(), key: obj::hash_bytes(&[shared.to_le_bytes(), 1u64.to_le_bytes()].concat()) });
+            let key = obj::hash_bytes(&[shared.to_le_bytes(), 1u64.to_le_bytes()].concat());
+            h.input(Input::Inputs { app: app_id(i).into(), revision: "v1".into(), key, content: key });
         }
     });
     progress(&p);
@@ -217,7 +218,8 @@ fn run_shard(b: &Bench, shard: usize, shards: usize, mut progress: impl FnMut(&P
     let records0 = h.records.len();
     for &i in my_apps.iter().take(changed) {
         let shared = (i % b.distinct.max(1)) as u64;
-        h.input(Input::Inputs { app: app_id(i).into(), revision: "v2".into(), key: obj::hash_bytes(&[shared.to_le_bytes(), 2u64.to_le_bytes()].concat()) });
+        let key = obj::hash_bytes(&[shared.to_le_bytes(), 2u64.to_le_bytes()].concat());
+        h.input(Input::Inputs { app: app_id(i).into(), revision: "v2".into(), key, content: key });
     }
     let target = changed.min(my_apps.len());
     let done = h.run_until(3_600_000, |h| {

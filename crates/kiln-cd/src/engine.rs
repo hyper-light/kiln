@@ -193,8 +193,13 @@ pub enum Input {
         app: Str,
         /// The revision (commit) the inputs are from.
         revision: Str,
-        /// The content address of the inputs.
+        /// The content address of the inputs: the render key.
         key: u64,
+        /// What git holds for the app: the same without the cluster's part. Automation counts
+        /// a sync as attempted per content, so a key that moves only with the cluster (a CRD
+        /// installed anywhere changes its API versions) syncs nothing again, as Argo CD syncs
+        /// only new revisions.
+        content: u64,
     },
     /// A render finished.
     Rendered {
@@ -231,6 +236,20 @@ pub enum Input {
         /// How.
         request: SyncRequest,
     },
+    /// An app's inputs move to `key` and a sync of them starts once they are rendered, in one
+    /// step, so nothing else syncs the app in between (a rollback).
+    SyncTo {
+        /// The app.
+        app: Str,
+        /// The revision (commit) the inputs are from.
+        revision: Str,
+        /// The render key.
+        key: u64,
+        /// What git holds for the app (see [`Input::Inputs`]).
+        content: u64,
+        /// How to sync.
+        request: SyncRequest,
+    },
     /// Stop the running sync.
     Terminate {
         /// The app.
@@ -241,8 +260,8 @@ pub enum Input {
     Remember {
         /// The app.
         app: Str,
-        /// The render key it synced.
-        key: u64,
+        /// What git held for it (see [`Input::Inputs`]).
+        content: u64,
         /// Whether it succeeded.
         succeeded: bool,
     },
@@ -385,6 +404,8 @@ pub enum Record {
         revision: Option<Str>,
         /// The render key synced (enough to roll back to it).
         key: Option<u64>,
+        /// What git held for the app (see [`Input::Inputs`]).
+        content: Option<u64>,
         /// Why it ran.
         trigger: Trigger,
         /// Who asked, if a person or agent did.
@@ -518,6 +539,8 @@ struct Op {
     trigger: Trigger,
     by: Option<String>,
     revision: Option<Str>,
+    /// What git held for the app when it started.
+    content: Option<u64>,
     render: Option<Arc<Render>>,
     tasks: Vec<sync::Task>,
     res: Vec<Option<ResIx>>,
@@ -544,7 +567,7 @@ struct Op {
 
 #[derive(Default)]
 struct Auto {
-    /// The render key of the last automatic sync, and whether it succeeded.
+    /// What git held for the app's last sync (its content), and whether it succeeded.
     attempted: Option<(u64, bool)>,
     heal_backoff_ms: u64,
     heal_after_ms: u64,
@@ -561,6 +584,8 @@ struct App {
     /// The revision of the inputs it was last given (rendering, if `key` moved).
     wanted_revision: Option<Str>,
     key: Option<u64>,
+    /// What git holds for it (see [`Input::Inputs`]).
+    content: Option<u64>,
     render: Option<Arc<Render>>,
     render_error: Option<String>,
     /// Resources whose desired form or tracking is this app's.
@@ -573,6 +598,8 @@ struct App {
     auto: Auto,
     /// A failed sync waiting to run again.
     retry: Option<PendingRetry>,
+    /// A sync asked for while the newest render was in flight: it runs when that render lands.
+    queued: Option<SyncRequest>,
     dirty: bool,
 }
 
@@ -851,7 +878,7 @@ impl Engine {
                     cl.scopes.set(kind, namespaced);
                 }
             }
-            Input::Inputs { app, revision, key } => self.set_inputs(&app, revision, key, false),
+            Input::Inputs { app, revision, key, content } => self.set_inputs(&app, revision, key, Some(content), false),
             Input::Rendered { key, result } => self.rendered(key, result),
             Input::Live { cluster, change } => {
                 let c = self.cluster_ix(&cluster);
@@ -867,30 +894,29 @@ impl Engine {
                         };
                         if let (Some(rev), Some(key)) = (rev, key) {
                             self.renders.remove(&key);
-                            self.set_inputs(&app, rev, key, true);
+                            self.set_inputs(&app, rev, key, None, true);
                         }
                     } else {
                         self.recompare_app(a);
                     }
                 }
             }
-            Input::Sync { app, request } => {
-                if let Some(&a) = self.app_by_id.get(&*app) {
-                    let trigger = request.trigger.unwrap_or(Trigger::Manual);
-                    self.start_op(a, trigger, request);
-                }
+            Input::Sync { app, request } => self.request_sync(&app, request),
+            Input::SyncTo { app, revision, key, content, request } => {
+                self.set_inputs(&app, revision, key, Some(content), false);
+                self.request_sync(&app, request);
             }
             Input::Terminate { app } => {
                 if let Some(&a) = self.app_by_id.get(&*app) {
                     self.terminate(a);
                 }
             }
-            Input::Remember { app, key, succeeded } => {
+            Input::Remember { app, content, succeeded } => {
                 if let Some(&a) = self.app_by_id.get(&*app)
                     && let Some(app) = self.app_mut(a)
                     && app.auto.attempted.is_none()
                 {
-                    app.auto.attempted = Some((key, succeeded));
+                    app.auto.attempted = Some((content, succeeded));
                 }
             }
         }
@@ -987,6 +1013,7 @@ impl Engine {
             revision: None,
             wanted_revision: None,
             key: None,
+            content: None,
             render: None,
             render_error: None,
             resources: FxHashSet::default(),
@@ -997,6 +1024,7 @@ impl Engine {
             last_op: None,
             auto: Auto::default(),
             retry: None,
+            queued: None,
             dirty: false,
         };
         let id = app.cfg.id.clone();
@@ -1063,12 +1091,30 @@ impl Engine {
         self.pump(c);
     }
 
-    fn set_inputs(&mut self, id: &str, revision: Str, key: u64, force: bool) {
+    /// Starts a sync, or queues it while the app's newest inputs are still rendering: a sync
+    /// deploys what git (or a rollback) says now, not before.
+    fn request_sync(&mut self, id: &str, request: SyncRequest) {
+        let Some(&a) = self.app_by_id.get(id) else { return };
+        let pending = self.app(a).is_some_and(|x| x.key.is_some() && x.render.as_ref().map(|r| r.key) != x.key && x.render_error.is_none());
+        if pending {
+            if let Some(x) = self.app_mut(a) {
+                x.queued = Some(request);
+            }
+        } else {
+            let trigger = request.trigger.unwrap_or(Trigger::Manual);
+            self.start_op(a, trigger, request);
+        }
+    }
+
+    fn set_inputs(&mut self, id: &str, revision: Str, key: u64, content: Option<u64>, force: bool) {
         let Some(&a) = self.app_by_id.get(id) else { return };
         let same = self.app(a).is_some_and(|app| app.key == Some(key));
         let rendered = self.app(a).is_some_and(|app| app.render.as_ref().is_some_and(|r| r.key == key));
         if let Some(app) = self.app_mut(a) {
             app.wanted_revision = Some(revision.clone());
+            if content.is_some() {
+                app.content = content;
+            }
             // Same content at a new revision: what was compared is what this revision holds.
             if same && rendered {
                 app.revision = Some(revision.clone());
@@ -1124,6 +1170,7 @@ impl Engine {
                 for a in waiters {
                     if let Some(app) = self.app_mut(a).filter(|app| app.key == Some(key)) {
                         app.render_error = Some(e.clone());
+                        app.queued = None;
                     }
                     self.mark(a);
                 }
@@ -1292,6 +1339,12 @@ impl Engine {
         }
         for gk in kinds {
             self.watch(c, gk);
+        }
+        // A sync asked for while this render was in flight runs now.
+        let ready = self.app(a).is_some_and(|x| x.render.as_ref().map(|r| r.key) == x.key);
+        if ready && let Some(request) = self.app_mut(a).and_then(|x| x.queued.take()) {
+            let trigger = request.trigger.unwrap_or(Trigger::Manual);
+            self.start_op(a, trigger, request);
         }
         self.mark(a);
     }
@@ -1841,8 +1894,9 @@ impl Engine {
         if only_prune && !app.cfg.sync.prune {
             return;
         }
+        let content = app.content.unwrap_or(key);
         let trigger = match app.auto.attempted {
-            Some((k, _)) if k != key => Trigger::Auto,
+            Some((c, _)) if c != content => Trigger::Auto,
             None => Trigger::Auto,
             Some((_, true)) => {
                 if !app.cfg.sync.self_heal {
@@ -1888,6 +1942,10 @@ impl Engine {
         // Shadow mode compares and reports; it may dry-run, never write.
         let request = if app.cfg.read_only { SyncRequest { dry_run: true, ..request } } else { request };
         let Some(render) = app.render.clone() else { return };
+        // Never a render older than the app's inputs (a sync waits for the newest: Input::Sync).
+        if app.key.is_some_and(|k| k != render.key) {
+            return;
+        }
         let options = request.options.or(app.cfg.sync.options);
         let prune = request.prune.unwrap_or(false);
         let selected: Option<FxHashSet<ResKey>> = request.resources.as_ref().map(|r| r.iter().cloned().collect());
@@ -1944,11 +2002,13 @@ impl Engine {
         let fail_n = plan.on_fail.len();
         let revision = app.revision.clone();
         let app_id = app.cfg.id.clone();
+        let op_content = app.content;
         let mut op = Op {
             id,
             trigger,
             by: request.by.clone(),
             revision: revision.clone(),
+            content: op_content,
             render: Some(render),
             tasks: plan.tasks,
             res,
@@ -2477,11 +2537,12 @@ impl Engine {
         let Some(app) = self.app_mut(a) else { return };
         let Some(op) = app.op.take() else { return };
         let key = op.render.as_ref().map(|r| r.key);
+        let content = op.content.or(key);
         // Like Argo CD, the last sync of a revision decides what automation does with it, whoever
         // started it: after a success, only self-heal syncs it again; after a failure, nothing does
         // until the revision moves.
-        if let Some(k) = key {
-            app.auto.attempted = Some((k, succeeded));
+        if let Some(c) = content {
+            app.auto.attempted = Some((c, succeeded));
         }
         app.retry = None;
         if op.trigger == Trigger::SelfHeal {
@@ -2508,6 +2569,7 @@ impl Engine {
             op: op.id,
             revision: op.revision.clone(),
             key,
+            content,
             trigger: op.trigger,
             by: op.by.clone(),
             succeeded,

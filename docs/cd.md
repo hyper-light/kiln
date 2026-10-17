@@ -203,9 +203,14 @@ Syncs queue by priority (people, then rollbacks, then promotions, then automatic
 self-heal), oldest first within a priority, and one app can never hold more than its share. When
 a sync waits, it says why: the cluster's budget, a window, an approval, a concurrency limit.
 
-**Rollback.** "Roll back to deployment N" syncs that deployment's revision and parameters and
-turns off automatic sync until someone turns it on, as Argo CD does. In a repository kiln hosts,
-it also opens the revert as a diff, so trunk catches up with what runs.
+**Rollback.** "Roll back to deployment N" renders that deployment's commits again and syncs them.
+The app then holds there (a pin): automation keeps it at that deployment, self-heal included,
+until git changes what the app renders. Then it follows git again by itself, so nobody has to
+remember to turn automation back on, as Argo CD makes you. A commit elsewhere in the repository
+doesn't count, nor does a cluster upgrade; `follow` lets go sooner. A sync asked for while a
+render is in flight waits for it, so a rollback never deploys the render it replaced. In a
+repository kiln hosts, rollback will also open the revert as a diff, so trunk catches up with
+what runs (not yet).
 
 ## Environments and promotion
 
@@ -338,7 +343,7 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | GET | `/api/cd/apps/:app/tree` | resources, with health and sync state |
 | GET | `/api/cd/apps/:app/diff` | rendered against live, per resource |
 | GET | `/api/cd/apps/:app/manifests?revision=` | rendered manifests |
-| POST | `/api/cd/apps/:app/{refresh,sync,rollback,terminate}` | |
+| POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | |
 | GET | `/api/cd/apps/:app/history` | deployments |
 | GET / POST / DELETE | `/api/cd/apps/:app/resources/:key[/actions/:action\|/logs\|/events]` | one resource |
 | POST | `/api/cd/bulk` | `{ selector, action }` over many apps |
@@ -350,7 +355,7 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 `GET /api/cd/apps/:app/ws` streams one app's resource tree.
 
 CLI: `kiln cd apps`, `kiln cd app <app> [--tree|--diff|--history]`, `kiln cd sync <app>…
-[--selector] [--prune] [--dry-run] [--wait]`, `kiln cd rollback <app> <n>`, `kiln cd plan
+[--selector] [--prune] [--dry-run] [--wait]`, `kiln cd rollback <app> [n]`, `kiln cd follow <app>`, `kiln cd plan
 [D123|--pr n]`, `kiln cd cluster add|list|rm`, `kiln cd import`, `kiln cd bench`.
 
 UI: **Deployments**: the fleet as one list (sync and health per app, filtered by environment,
@@ -370,8 +375,11 @@ status into every Application object; kiln writes only what it can't recompute.
 **Restarts.** A restarted server judges nothing before it has read the cluster: an object of a
 kind not yet listed is *unread*, not missing, and automation waits. An app's render waits for its
 cluster too, since Helm's `.Capabilities` come from it. Automation resumes from the replicated
-history, so the last sync of a render counts as attempted: a restart syncs nothing again, and
-drift stays where self-heal is off. Failed syncs are kept in the history too, but never push out
+history, so the last sync of what git holds counts as attempted: a restart syncs nothing again,
+and drift stays where self-heal is off. "What git holds" leaves the cluster out: only Helm and
+plugin renders read its version and API versions, and a render whose key moved only with the
+cluster (a CRD installed somewhere) is re-rendered but not synced again, as Argo CD syncs only
+new revisions. Failed syncs are kept in the history too, but never push out
 successful ones.
 
 **Where work happens.** Apps are split into shards by destination cluster, so one server holds
@@ -449,8 +457,9 @@ and the network come on top, and are measured separately as they are built.
 | `.kiln/deploy.yaml` and environments | parsed and tested; read from kiln repositories: not yet |
 | `/api/cd`, `kiln cd` | built |
 | MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; Claude Code sessions kiln starts get it | built |
-| UI: the fleet list (windowed, filtered on the server, live) and an app's page (resources, diff, history; sync, refresh, take over, stop, delete) | built; environments board, previews, fleets, rollback: not yet |
-| Notifications, windows, projects and RBAC, plans and previews for diffs, rollback | not yet |
+| Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI) | built |
+| UI: the fleet list (windowed, filtered on the server, live) and an app's page (resources, diff, history; sync, rollback, refresh, take over, stop, delete) | built; environments board, previews, fleets: not yet |
+| Notifications, windows, projects and RBAC, plans and previews for diffs | not yet |
 
 Checked against a live cluster: in shadow mode, kiln agrees with Argo CD on kiln's own app of
 apps (four apps, the same sync, health and resource counts). On a cluster of its own, a kiln app

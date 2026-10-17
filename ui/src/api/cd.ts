@@ -41,6 +41,9 @@ export const cdApi = {
   refresh: (id: string, hard: boolean) => request<unknown>("POST", `${appPath(id)}/refresh${qs({ hard })}`, {}),
   terminate: (id: string) => request<unknown>("POST", `${appPath(id)}/terminate`, {}),
   takeOver: (id: string) => request<unknown>("POST", `${appPath(id)}/take-over`, {}),
+  rollback: (id: string, body: { to?: number; prune?: boolean }) =>
+    request<{ to: number; revision: string | null }>("POST", `${appPath(id)}/rollback`, body),
+  follow: (id: string) => request<unknown>("POST", `${appPath(id)}/follow`, {}),
   remove: (id: string, cascade: "foreground" | "orphan") => request<unknown>("DELETE", `${appPath(id)}${qs({ cascade })}`),
   clusters: (signal?: AbortSignal) => request<{ clusters: CdCluster[] }>("GET", "/api/cd/clusters", undefined, { signal }),
 };
