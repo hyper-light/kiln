@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use super::core::{Core, Effect, PreviewJob};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Hunk, Known, Level, Limit, McpServer, McpStatus,
-    McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall, ToolKind, ToolStatus,
+    McpTool, ModeOption, ModelOption, Objective, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall, ToolKind, ToolStatus,
     ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog,
 };
 
@@ -61,7 +61,7 @@ pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String
     if let Some(m) = mode.filter(|m| !m.is_empty()) {
         a.extend(["--permission-mode".to_owned(), m.to_owned()]);
     }
-    if allow_bypass {
+    if allow_bypass && bypass_possible() {
         a.push("--allow-dangerously-skip-permissions".to_owned());
     }
     if let Some(e) = spec.effort.as_deref().filter(|e| !e.is_empty()) {
@@ -125,6 +125,8 @@ enum Pending {
 enum Run {
     McpAdd { name: String, client: Option<String> },
     McpRemove { name: String, client: Option<String> },
+    /// The transcript's end, read for how the goal the turn pursued came out.
+    GoalVerdict,
 }
 
 /// How often plan usage and status are asked for while a session runs (also after each turn,
@@ -168,6 +170,8 @@ pub struct Claude {
     denied: BTreeSet<String>,
     notice_seq: u64,
     allow_bypass: bool,
+    /// Bypass was chosen, which it was not started able to use: it starts again able to.
+    bypass_next: bool,
     /// Every conversation entry, in order: its uuid, and the prompt's event id when it is one
     /// (rewinds and branches name an entry).
     entries: Vec<(String, Option<String>)>,
@@ -205,6 +209,9 @@ pub struct Claude {
     mcp_at: i64,
     /// CLI runs under way, by job.
     runs: HashMap<String, Run>,
+    /// This turn ended because Claude Code's cap on a Stop hook blocking it was reached (a goal
+    /// it kept not meeting).
+    goal_capped: bool,
     next_run: u64,
     /// The MCP configuration changed (what changed): Claude Code reads it when it starts, so it
     /// starts again, continuing the conversation, as soon as it is not in the middle of a turn.
@@ -229,6 +236,7 @@ impl Claude {
             denied: BTreeSet::new(),
             notice_seq: 0,
             allow_bypass,
+            bypass_next: false,
             entries: Vec::new(),
             efforts: HashMap::new(),
             output_styles: Vec::new(),
@@ -247,6 +255,7 @@ impl Claude {
             usage_at: 0,
             mcp_at: 0,
             runs: HashMap::new(),
+            goal_capped: false,
             next_run: 0,
             reload: None,
             reload_waits: false,
@@ -597,7 +606,18 @@ impl Claude {
                 }
             }
             Command::SetMode { mode } => {
-                self.request(core, Pending::SetMode(mode.clone()), json!({"subtype": "set_permission_mode", "mode": mode}));
+                if mode == "bypassPermissions" && !self.allow_bypass {
+                    // Claude Code refuses it unless started able to: it starts again, in it,
+                    // continuing the conversation (once the turn under way ends).
+                    self.bypass_next = true;
+                    self.reload = Some("Bypass".to_owned());
+                    if self.busy(core) {
+                        self.notice(core, Level::Info, "Bypass comes on when this turn ends: Claude Code starts again with every permission check off (the conversation continues)".to_owned(), None);
+                    }
+                    self.reload_when_idle(core);
+                } else {
+                    self.request(core, Pending::SetMode(mode.clone()), json!({"subtype": "set_permission_mode", "mode": mode}));
+                }
             }
             Command::SetModel { model } => {
                 self.request(core, Pending::SetModel(model.clone()), json!({"subtype": "set_model", "model": model}));
@@ -700,6 +720,12 @@ impl Claude {
         let (name, client, added) = match run {
             Run::McpAdd { name, client } => (name, client, true),
             Run::McpRemove { name, client } => (name, client, false),
+            Run::GoalVerdict => {
+                if code == Some(0) {
+                    self.goal_verdict(core, output);
+                }
+                return;
+            }
         };
         let out = strip_ansi(output).trim().to_owned();
         if code == Some(0) {
@@ -714,6 +740,52 @@ impl Claude {
             }
             answer(core, client, json!({"ok": false, "error": err}));
         }
+    }
+
+    /// /goal as Claude Code ran it, by what it said: "Goal set: …" (it works until a Stop hook
+    /// finds the condition met) or "Goal cleared: …". Anything else (a bare /goal's answer, a
+    /// refusal) changes nothing.
+    fn goal_command(&mut self, core: &mut Core, args: &str, said: &str) {
+        let said = strip_ansi(said);
+        let said = said.trim();
+        let next = if said.starts_with("Goal set") && !args.trim().is_empty() {
+            self.goal_capped = false;
+            Objective::new(args, "active", None)
+        } else if let Some(rest) = said.strip_prefix("Goal cleared") {
+            let text = rest.trim_start_matches(':').trim();
+            let text = if text.is_empty() { core.state.objective.as_ref().map(|o| o.text.clone()).unwrap_or_default() } else { text.to_owned() };
+            Objective::new(&text, "cleared", None)
+        } else {
+            return;
+        };
+        core.state.objective = Some(next);
+        core.touch_state();
+    }
+
+    /// How the goal the turn pursued came out, from the verdicts Claude Code writes to its
+    /// transcript (`goal_status`): met, can't be met, cleared; or still set (it gave up for now).
+    fn goal_verdict(&mut self, core: &mut Core, tail: &str) {
+        let Some(o) = core.state.objective.clone().filter(|o| o.status == "active") else { return };
+        let last = tail.lines().rev().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find_map(|r| {
+            let a = r.get("attachment").filter(|a| str_of(a, "type") == Some("goal_status"))?;
+            (str_of(a, "condition").map(str::trim) == Some(o.text.as_str())).then(|| a.clone())
+        });
+        let flag = |a: &Value, k: &str| a.get(k).and_then(Value::as_bool) == Some(true);
+        let reason = |a: &Value| str_of(a, "reason").map(str::to_owned);
+        let next = match last {
+            Some(a) if flag(&a, "met") && flag(&a, "sentinel") => Objective::new(&o.text, "cleared", None),
+            Some(a) if flag(&a, "met") => Objective::new(&o.text, "met", reason(&a)),
+            Some(a) if flag(&a, "failed") => Objective::new(&o.text, "unmet", Some(reason(&a).unwrap_or_else(|| "Claude Code found it can't be met.".to_owned()))),
+            Some(a) if self.goal_capped => {
+                let why = reason(&a).map(|r| format!(" The last check: {r}")).unwrap_or_default();
+                Objective::new(&o.text, "unmet", Some(format!("Claude Code stopped after its checks kept finding it unmet; the goal is still set.{why}")))
+            }
+            // Set and not yet decided: the turn was cut short; it carries on with the next.
+            _ => return,
+        };
+        self.goal_capped = false;
+        core.state.objective = Some(next);
+        core.touch_state();
     }
 
     /// Start again with the changed MCP configuration (resuming the conversation), unless a turn
@@ -734,11 +806,19 @@ impl Claude {
         }
         self.reload_waits = false;
         let Some(what) = self.reload.take() else { return };
+        // Bypass: from the next start it may skip checks, and starts in that mode.
+        let bypass = std::mem::take(&mut self.bypass_next);
+        if bypass {
+            core.effects.push(Effect::AllowBypass);
+            core.state.mode = "bypassPermissions".to_owned();
+            core.touch_state();
+        }
         // Not running, or nothing to resume: its next start reads the configuration anyway.
-        if core.state.status == Status::Exited || core.state.harness_session.is_none() {
+        if core.state.status == Status::Exited || (core.state.harness_session.is_none() && !bypass) {
             return;
         }
-        self.notice(core, Level::Info, format!("{what}: Claude Code starts again to load it (the conversation continues)"), None);
+        let why = if bypass { "Bypass: Claude Code starts again with every permission check off (the conversation continues)".to_owned() } else { format!("{what}: Claude Code starts again to load it (the conversation continues)") };
+        self.notice(core, Level::Info, why, None);
         core.effects.push(Effect::Restart { resume_at: None });
     }
 
@@ -1781,6 +1861,9 @@ impl Claude {
                 self.notice(core, Level::Warn, strip_ansi(text), parent);
             }
             "informational" | "notification" | "local_command_output" => {
+                if str_of(v, "key") == Some("stop-hook-block-cap") {
+                    self.goal_capped = true;
+                }
                 let text = str_of(v, "content").or_else(|| str_of(v, "text")).or_else(|| str_of(v, "output")).unwrap_or("");
                 if !text.trim().is_empty() {
                     self.notice(core, Level::Info, strip_ansi(text), parent);
@@ -1978,6 +2061,13 @@ impl Claude {
 
     fn assistant(&mut self, core: &mut Core, v: &Value, parent: Option<String>) {
         self.begin(core);
+        if parent.is_none()
+            && let Some(run) = v.get("local_command_run")
+            && str_of(run, "command") == Some("goal")
+        {
+            let said = v.pointer("/message/content/0/text").and_then(Value::as_str).unwrap_or("");
+            self.goal_command(core, str_of(run, "args").unwrap_or(""), said);
+        }
         let Some(msg) = v.get("message") else { return };
         if parent.is_none() {
             self.entry(str_of(v, "uuid").unwrap_or(""), None);
@@ -2346,6 +2436,14 @@ impl Claude {
                 self.notice(core, Level::Error, msg, None);
             }
         }
+        // A goal it pursued: how it came out is in the transcript.
+        if core.state.objective.as_ref().is_some_and(|o| o.status == "active")
+            && let Some(session) = core.state.harness_session.clone()
+        {
+            let job = format!("goal-verdict-{}", Core::now());
+            self.runs.insert(job.clone(), Run::GoalVerdict);
+            core.effects.push(Effect::TranscriptTail { job, config: self.config_dir.clone(), session, bytes: 512 * 1024 });
+        }
         core.touch_state();
         self.settle(core);
         self.request(core, Pending::ContextUsage, json!({"subtype": "get_context_usage"}));
@@ -2505,6 +2603,7 @@ fn claude_catalog() -> Vec<SlashCommand> {
         c("restart", "Start Claude Code again, continuing the conversation", "", "Kiln", json!({"type": "restart"})),
         v("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
         v("screen", "Claude Code's own screen, in this agent's folder", "Kiln", "screen"),
+        v("goals", "Goals one after another: each a /goal, the next once it's met", "Kiln", "goals"),
     ]
 }
 
@@ -3041,19 +3140,26 @@ pub fn rel(path: &str, cwd: &str) -> String {
     path.to_owned()
 }
 
-/// The permission modes Claude Code offers.
+/// The permission modes Claude Code offers. Bypass is always one: a session not started able to
+/// use it starts again in it (the conversation continues).
 pub fn modes(allow_bypass: bool) -> Vec<ModeOption> {
-    let mut m = vec![
+    let bypass = if allow_bypass { "Skip every permission check" } else { "Skip every permission check (Claude Code starts again to turn it on; the conversation continues)" };
+    vec![
         ModeOption { id: "default".into(), label: "Ask".into(), description: "Ask before edits and commands".into(), dangerous: false },
         ModeOption { id: "acceptEdits".into(), label: "Accept edits".into(), description: "Edit files without asking; ask before commands".into(), dangerous: false },
         ModeOption { id: "plan".into(), label: "Plan".into(), description: "Read and plan only; change nothing".into(), dangerous: false },
         ModeOption { id: "auto".into(), label: "Auto".into(), description: "A classifier approves safe actions; risky ones still ask".into(), dangerous: false },
-        ModeOption { id: "dontAsk".into(), label: "Don't ask".into(), description: "Deny anything not already allowed".into(), dangerous: false },
-    ];
-    if allow_bypass {
-        m.push(ModeOption { id: "bypassPermissions".into(), label: "Bypass".into(), description: "Skip every permission check".into(), dangerous: true });
-    }
-    m
+        // Claude Code's dontAsk never asks and refuses whatever isn't already allowed: it is not
+        // "go ahead without asking", which is Bypass.
+        ModeOption { id: "dontAsk".into(), label: "Allowed only".into(), description: "Never asks: refuses anything not already allowed".into(), dangerous: false },
+        ModeOption { id: "bypassPermissions".into(), label: "Bypass".into(), description: bypass.into(), dangerous: true },
+    ]
+}
+
+/// Whether Claude Code would let this process skip its checks: as root it refuses to, unless
+/// told it runs in a sandbox (`IS_SANDBOX`).
+fn bypass_possible() -> bool {
+    !crate::os::is_root() || std::env::var_os("IS_SANDBOX").is_some()
 }
 
 /// Kind, one-line title and detail for a tool call.
@@ -3366,6 +3472,62 @@ mod tests {
     }
 
     #[test]
+    fn a_goal_is_followed_to_the_verdict_in_the_transcript() {
+        let mut c = Claude::new(false).with_config_dir("/cfg".into());
+        let mut core = Core::new();
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s1", "model": "m", "permissionMode": "default"}).to_string());
+        let run = |c: &mut Claude, core: &mut Core, args: &str, said: &str| {
+            c.line(core, &json!({"type": "assistant", "uuid": "u", "local_command_run": {"command": "goal", "args": args}, "message": {"id": "lc", "role": "assistant", "content": [{"type": "text", "text": said}]}}).to_string());
+        };
+        let set = |c: &mut Claude, core: &mut Core, cond: &str| run(c, core, cond, &format!("Goal set: {cond}"));
+        let end = |c: &mut Claude, core: &mut Core| -> Option<String> {
+            c.line(core, &json!({"type": "result", "subtype": "success"}).to_string());
+            core.effects.drain(..).find_map(|e| match e {
+                Effect::TranscriptTail { job, config, session, .. } => (config == "/cfg" && session == "s1").then_some(job),
+                _ => None,
+            })
+        };
+        let rec = |a: Value| json!({"type": "attachment", "attachment": a}).to_string();
+        let status = |core: &Core| core.state.objective.as_ref().map(|o| (o.status.clone(), o.reason.clone()));
+
+        // Met after two checks.
+        set(&mut c, &mut core, "tests pass");
+        assert_eq!(status(&core), Some(("active".into(), None)));
+        let job = end(&mut c, &mut core).unwrap_or_default();
+        let tail = [rec(json!({"type": "goal_status", "met": false, "sentinel": true, "condition": "tests pass"})), rec(json!({"type": "goal_status", "met": false, "condition": "tests pass", "reason": "Not yet"})), rec(json!({"type": "goal_status", "met": true, "condition": "tests pass", "reason": "They pass", "iterations": 2}))].join("\n");
+        c.run_done(&mut core, &job, Some(0), &tail);
+        assert_eq!(status(&core), Some(("met".into(), Some("They pass".into()))));
+
+        // Can't be met.
+        set(&mut c, &mut core, "fly");
+        let job = end(&mut c, &mut core).unwrap_or_default();
+        c.run_done(&mut core, &job, Some(0), &rec(json!({"type": "goal_status", "met": false, "failed": true, "condition": "fly", "reason": "No wings"})));
+        assert_eq!(status(&core), Some(("unmet".into(), Some("No wings".into()))));
+
+        // It gave up after its checks: still set, unmet.
+        set(&mut c, &mut core, "never");
+        c.line(&mut core, &json!({"type": "system", "subtype": "notification", "key": "stop-hook-block-cap", "text": "A hook blocked the turn from ending 9 consecutive times"}).to_string());
+        let job = end(&mut c, &mut core).unwrap_or_default();
+        c.run_done(&mut core, &job, Some(0), &rec(json!({"type": "goal_status", "met": false, "condition": "never", "reason": "Not yet (9)"})));
+        assert!(matches!(status(&core), Some((s, Some(r))) if s == "unmet" && r.contains("Not yet (9)")));
+
+        // Cut short (no verdict yet): still active; cleared by /goal clear.
+        set(&mut c, &mut core, "later");
+        let job = end(&mut c, &mut core).unwrap_or_default();
+        c.run_done(&mut core, &job, Some(0), &rec(json!({"type": "goal_status", "met": false, "sentinel": true, "condition": "later"})));
+        assert_eq!(status(&core), Some(("active".into(), None)));
+        run(&mut c, &mut core, "clear", "Goal cleared: later");
+        assert_eq!(status(&core), Some(("cleared".into(), None)));
+        // One it gave up on, still set, cleared too; a bare /goal only asks.
+        set(&mut c, &mut core, "again");
+        run(&mut c, &mut core, "", "No goal set. Usage: `/goal <condition>`");
+        assert_eq!(status(&core), Some(("active".into(), None)));
+        core.state.objective = Some(Objective::new("again", "unmet", Some("still set".into())));
+        run(&mut c, &mut core, "clear", "Goal cleared: again");
+        assert_eq!(status(&core), Some(("cleared".into(), None)));
+    }
+
+    #[test]
     fn a_turn_with_an_approval_from_send_to_result() -> anyhow::Result<()> {
         let mut c = Claude::new(false);
         let mut core = Core::new();
@@ -3612,6 +3774,7 @@ mod tests {
             resume_at: Some("u9".into()),
             fork: true,
             effort: Some("high".into()),
+            allow_bypass: false,
             ..Default::default()
         };
         let a = args(&spec, None);
@@ -3619,6 +3782,10 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--resume-session-at", "u9"]) && a.iter().any(|x| x == "--fork-session"));
         assert!(a.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(!a.iter().any(|x| x == "--allow-dangerously-skip-permissions"));
+        // Every session starts able to skip checks unless it says otherwise; none starts skipping them.
+        let a = args(&super::super::session::Spec { kind: "claude".into(), ..Default::default() }, None);
+        assert_eq!(a.iter().any(|x| x == "--allow-dangerously-skip-permissions"), bypass_possible());
+        assert!(!a.iter().any(|x| x == "--dangerously-skip-permissions") && !a.iter().any(|x| x == "--permission-mode"));
     }
 
     /// The control requests kiln wrote since the last call: (request id, subtype, request).
@@ -4140,12 +4307,41 @@ mod tests {
     }
 
     #[test]
+    fn bypass_without_its_flag_starts_claude_code_again_in_it() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        assert!(core.meta.modes.iter().any(|m| m.id == "bypassPermissions" && m.dangerous));
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": []}));
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s1", "model": "m", "permissionMode": "default"}).to_string());
+        c.line(&mut core, r#"{"type":"system","subtype":"session_state_changed","state":"idle","uuid":"u","session_id":"s1"}"#);
+        let _ = requests(&mut core);
+        core.effects.clear();
+        c.command(&mut core, Command::SetMode { mode: "bypassPermissions".into() });
+        // Not asked of the CLI (it would refuse): it starts again able to, continuing the conversation.
+        assert!(!requests(&mut core).iter().any(|r| r.1 == "set_permission_mode"));
+        assert_eq!(core.effects, vec![Effect::AllowBypass, Effect::Restart { resume_at: None }]);
+        assert_eq!(core.state.mode, "bypassPermissions");
+        // Started able to, it switches in place.
+        let mut c = Claude::new(true);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let _ = requests(&mut core);
+        c.command(&mut core, Command::SetMode { mode: "bypassPermissions".into() });
+        assert!(requests(&mut core).iter().any(|r| r.1 == "set_permission_mode" && r.2.get("mode") == Some(&json!("bypassPermissions"))));
+        assert!(!core.effects.contains(&Effect::AllowBypass));
+    }
+
+    #[test]
     fn a_mode_change_mid_session() {
         let mut c = Claude::new(false);
         let mut core = Core::new();
         c.start(&mut core);
         let ids: Vec<&str> = core.meta.modes.iter().map(|m| m.id.as_str()).collect();
-        assert!(ids.contains(&"default") && ids.contains(&"plan") && ids.contains(&"acceptEdits") && !ids.contains(&"bypassPermissions"), "{ids:?}");
+        assert!(ids.contains(&"default") && ids.contains(&"plan") && ids.contains(&"acceptEdits") && ids.contains(&"bypassPermissions"), "{ids:?}");
+        // dontAsk refuses what isn't allowed: it never reads as going ahead without asking.
+        assert!(core.meta.modes.iter().any(|m| m.id == "dontAsk" && m.label == "Allowed only" && !m.dangerous));
         let _ = requests(&mut core);
         c.command(&mut core, Command::SetMode { mode: "plan".into() });
         let reqs = requests(&mut core);

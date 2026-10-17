@@ -102,7 +102,11 @@ pub async fn wait_pid_exit<S>(pid: u32, mut try_wait: impl FnMut() -> io::Result
             return Ok(status);
         }
         match &pidfd {
-            Some(fd) => ready(fd, false).await,
+            // At least once a second whatever the readiness says: a wake-up missed must cost a
+            // second, not leave the exited child unreaped (a zombie) for good.
+            Some(fd) => {
+                let _ = crate::rt::timeout(Duration::from_secs(1), ready(fd, false)).await;
+            }
             None => crate::rt::sleep(Duration::from_millis(50)).await,
         }
     }

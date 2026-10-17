@@ -31,6 +31,7 @@ fn acp_extras() -> Vec<SlashCommand> {
         SlashCommand::view("new", "Start another agent", "Kiln", "new_agent"),
         SlashCommand::view("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
         SlashCommand::view("screen", "The agent's own terminal interface, in its folder", "Kiln", "screen"),
+        SlashCommand::view("goals", "Goals one after another: each sent once the one before is done", "Kiln", "goals"),
     ]
 }
 
@@ -96,6 +97,21 @@ pub struct Acp {
     notice_seq: u64,
     /// The files each tool call changes, with their text before it (from its diff content).
     befores: HashMap<String, Vec<(String, Option<String>)>>,
+    /// kiln's Bypass: every request to go ahead is answered yes by kiln, at once.
+    bypass: bool,
+}
+
+/// kiln's own permission modes, for agents whose own all keep their checks: kiln asks you, or
+/// kiln answers every request to go ahead itself.
+pub const KILN_ASK: &str = "kiln-ask";
+pub const KILN_BYPASS: &str = "kiln-bypass";
+
+fn kiln_ask() -> ModeOption {
+    ModeOption { id: KILN_ASK.into(), label: "Ask".into(), description: "Ask before anything the agent asks to do".into(), dangerous: false }
+}
+
+fn kiln_bypass() -> ModeOption {
+    ModeOption { id: KILN_BYPASS.into(), label: "Bypass".into(), description: "kiln approves everything the agent asks to do".into(), dangerous: true }
 }
 
 impl Acp {
@@ -116,7 +132,14 @@ impl Acp {
             seq: 0,
             notice_seq: 0,
             befores: HashMap::new(),
+            bypass: false,
         }
+    }
+
+    /// Starts in this mode: kiln's Bypass goes on at once (the agent's own modes it is told of).
+    pub fn with_mode(mut self, mode: Option<&str>) -> Self {
+        self.bypass = mode == Some(KILN_BYPASS);
+        self
     }
 
     fn request(&mut self, core: &mut Core, kind: Pending, method: &str, params: Value) {
@@ -224,7 +247,20 @@ impl Acp {
             Command::Approve { id, decision, message, always, .. } => self.answer(core, &id, decision, message, always),
             Command::Interrupt => self.cancel(core),
             Command::SetMode { mode } => {
-                if let Some(s) = self.session.clone() {
+                if mode == KILN_BYPASS || mode == KILN_ASK {
+                    // kiln's own: the agent's mode stays as it is.
+                    self.bypass = mode == KILN_BYPASS;
+                    core.state.mode = mode;
+                    core.touch_state();
+                    if self.bypass {
+                        // What waits for you now goes ahead too.
+                        let waiting: Vec<String> = self.asks.keys().cloned().collect();
+                        for id in waiting {
+                            self.answer(core, &id, Decision::Allow, None, None);
+                        }
+                    }
+                } else if let Some(s) = self.session.clone() {
+                    self.bypass = false;
                     self.request(core, Pending::SetMode(mode.clone()), "session/set_mode", json!({"sessionId": s, "modeId": mode}));
                 }
             }
@@ -488,7 +524,20 @@ impl Acp {
                     if let Some(c) = modes.get("currentModeId").and_then(Value::as_str) {
                         core.state.mode = c.to_owned();
                     }
+                    // Its modes all keep its checks: kiln's own Bypass joins them.
+                    if !core.meta.modes.iter().any(|m| m.dangerous) {
+                        core.meta.modes.push(kiln_bypass());
+                    }
                     core.touch_meta();
+                } else {
+                    // No modes of its own: kiln asks you, or approves everything itself.
+                    core.meta.modes = vec![kiln_ask(), kiln_bypass()];
+                    core.state.mode = KILN_ASK.to_owned();
+                    core.touch_meta();
+                }
+                if self.bypass {
+                    core.state.mode = KILN_BYPASS.to_owned();
+                    core.touch_state();
                 }
                 if let Some(models) = result.get("models") {
                     core.meta.models = models
@@ -577,6 +626,19 @@ impl Acp {
             .and_then(Value::as_array)
             .map(|o| o.iter().filter_map(|x| Some((x.get("optionId")?.as_str()?.to_owned(), x.get("kind")?.as_str()?.to_owned()))).collect())
             .unwrap_or_default();
+        // kiln's Bypass: yes, at once (once, so the agent's own rules stay as they are).
+        if self.bypass {
+            let pick = |kind: &str| options.iter().find(|(_, k)| k == kind).map(|(o, _)| o.clone());
+            if let Some(o) = pick("allow_once").or_else(|| pick("allow_always")) {
+                core.write(&json!({"jsonrpc": "2.0", "id": rpc, "result": {"outcome": {"outcome": "selected", "optionId": o}}}));
+                if let Some(t) = &tool_id {
+                    let mut running = call;
+                    running.status = ToolStatus::Running;
+                    core.upsert(t, None, Body::Tool(Box::new(running)));
+                }
+                return;
+            }
+        }
         let always: Vec<AlwaysOption> = p
             .get("options")
             .and_then(Value::as_array)
@@ -903,6 +965,50 @@ mod tests {
             _ => None,
         });
         assert!(matches!(reply, Some((c, v)) if c == "k1" && v.get("format") == Some(&json!("markdown"))));
+        Ok(())
+    }
+
+    #[test]
+    fn kiln_bypass_answers_every_request_itself() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut a = Acp::new(None);
+        a.start(&mut core);
+        let _ = written(&mut core);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
+        let _ = written(&mut core);
+        // Its modes all keep their checks: kiln's own Bypass joins them.
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1", "modes": {"currentModeId": "build", "availableModes": [{"id": "build", "name": "Build"}, {"id": "plan", "name": "Plan"}]}}})]);
+        assert!(core.meta.modes.iter().any(|m| m.id == KILN_BYPASS && m.dangerous));
+        // Asked while it asks you: it waits for you. Turning Bypass on lets it go ahead.
+        let ask = |id: u64, tool: &str| json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": {"sessionId": "s1", "toolCall": {"toolCallId": tool, "kind": "execute", "title": "Run", "rawInput": {"command": "ls"}}, "options": [{"optionId": "y", "name": "Allow", "kind": "allow_once"}, {"optionId": "n", "name": "Reject", "kind": "reject_once"}]}});
+        feed(&mut a, &mut core, &[ask(7, "t1")]);
+        assert_eq!(core.state.approvals.len(), 1);
+        let _ = written(&mut core);
+        a.command(&mut core, Command::SetMode { mode: KILN_BYPASS.into() });
+        assert_eq!(core.state.mode, KILN_BYPASS);
+        let w = written(&mut core);
+        assert!(!w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("session/set_mode")));
+        assert_eq!(w.first().and_then(|v| v.pointer("/result/outcome/optionId")).and_then(Value::as_str), Some("y"));
+        assert!(core.state.approvals.is_empty());
+        // From then on kiln answers at once.
+        feed(&mut a, &mut core, &[ask(8, "t2")]);
+        assert!(core.state.approvals.is_empty());
+        assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/result/outcome/optionId")).and_then(Value::as_str), Some("y"));
+        // One of the agent's own modes: it asks again.
+        a.command(&mut core, Command::SetMode { mode: "build".into() });
+        assert!(written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("session/set_mode")));
+        feed(&mut a, &mut core, &[ask(9, "t3")]);
+        assert_eq!(core.state.approvals.len(), 1);
+        // An agent with no modes of its own: Ask, or kiln's Bypass.
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut a = Acp::new(None).with_mode(Some(KILN_BYPASS));
+        a.start(&mut core);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s2"}})]);
+        assert_eq!(core.meta.modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), [KILN_ASK, KILN_BYPASS]);
+        assert_eq!(core.state.mode, KILN_BYPASS);
         Ok(())
     }
 

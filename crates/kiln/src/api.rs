@@ -361,6 +361,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::DELETE, ["api", "harness", "sessions", id]) => {
             let id = (*id).to_owned();
             if hub.harness.close(&hub, &id).await {
+                let _ = crate::goals::forget(&hub, &id).await;
                 hub.store.audit("admin".into(), "agent.close".into(), id).await;
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
@@ -376,6 +377,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
+        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => goals_control(&hub, id, action).await,
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -818,7 +823,7 @@ async fn shared_plan(hub: &Hub, token: &str) -> R {
         return Err(err(StatusCode::NOT_FOUND, "no such plan"));
     }
     let p = crate::plans::shared(hub, token).await.map_err(plan_err)?;
-    Ok(srv::json(StatusCode::OK, &json!({ "title": p.title, "body": p.body, "steps": p.steps, "version": p.version, "updated_at": p.updated_at })))
+    Ok(srv::json(StatusCode::OK, &json!({ "title": p.title, "body": p.body, "items": p.items, "steps": p.steps, "version": p.version, "updated_at": p.updated_at })))
 }
 
 // ------------------------------------------------------------------ voice
@@ -1418,6 +1423,10 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
 /// The target triple this binary was built for (`build.rs`).
 pub const TARGET: &str = env!("KILN_TARGET");
 
+/// The commit this binary was built from (`build.rs`); empty when it was built without knowing
+/// one (a tree with changes, or a Docker build without `--build-arg KILN_COMMIT=...`).
+pub const COMMIT: &str = env!("KILN_COMMIT");
+
 /// Where the release workflow (`.github/workflows/release.yml`) publishes binaries: the asset
 /// `kiln-<version>-<target>` (`.exe` on Windows) of release `v<version>`.
 pub const RELEASES: &str = "https://github.com/hyper-light/kiln/releases/download";
@@ -1851,7 +1860,17 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
         return json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "error": format!("kiln doesn't build {} (no repository of that name)", u.release_repo) });
     };
     let last = hub.store.runs(Some(repo.id.clone()), 100, None).await.unwrap_or_default().into_iter().find(|r| r.pipeline == u.release_pipeline);
-    json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "branch": u.release_branch, "last": last })
+    let s = crate::updates::in_step(hub, COMMIT);
+    json!({
+        "repo": u.release_repo,
+        "pipeline": u.release_pipeline,
+        "branch": u.release_branch,
+        "last": last,
+        "commit": s.commit,
+        "in_step": s.in_step,
+        "behind": s.behind,
+        "keeps_in_step": u.in_step,
+    })
 }
 
 /// `POST /api/updates/build`: run the pipeline that builds kiln for every platform; when it
@@ -1859,10 +1878,15 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
 async fn build_every_platform(hub: &Hub) -> R {
     let u = &hub.cfg.updates;
     let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln doesn't build {}", u.release_repo)))?;
-    let runs = crate::gitops::manual(hub, &repo, Some(u.release_branch.clone()), Some(u.release_pipeline.clone()))
-        .await
-        .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
-    let run = runs.into_iter().next().ok_or_else(|| err(StatusCode::CONFLICT, format!("{} has no pipeline called {}", u.release_repo, u.release_pipeline)))?;
+    // The commit this server runs, when it knows it: only that build is what runners take.
+    let run = if COMMIT.is_empty() {
+        let runs = crate::gitops::manual(hub, &repo, Some(u.release_branch.clone()), Some(u.release_pipeline.clone()))
+            .await
+            .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+        runs.into_iter().next().ok_or_else(|| err(StatusCode::CONFLICT, format!("{} has no pipeline called {}", u.release_repo, u.release_pipeline)))?
+    } else {
+        crate::updates::build_commit(hub, &repo, COMMIT).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?
+    };
     hub.store.audit("admin".into(), "upgrade.build".into(), format!("{} {} #{}", u.release_repo, u.release_pipeline, run.number)).await;
     Ok(srv::json(StatusCode::ACCEPTED, &run))
 }
@@ -2222,6 +2246,50 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
+}
+
+fn goals_err(e: crate::goals::Error) -> ApiError {
+    match e {
+        crate::goals::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
+        crate::goals::Error::NoAgent => err(StatusCode::NOT_FOUND, "no such agent"),
+        crate::goals::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct GoalsSet {
+    goals: Vec<crate::goals::Given>,
+}
+
+/// An agent's goals not yet started, as they should be (`crate::goals::set`).
+async fn goals_set(hub: &Hub, id: &str, req: Request) -> R {
+    let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
+    hub.store.audit("admin".into(), "goals.set".into(), id.to_owned()).await;
+    Ok(srv::json(StatusCode::OK, &s))
+}
+
+#[derive(Deserialize)]
+struct GoalsAdd {
+    goals: Vec<String>,
+    #[serde(default)]
+    start: bool,
+}
+
+/// Goals lined up after the agent's others (`crate::goals::add`).
+async fn goals_add(hub: &Hub, id: &str, req: Request) -> R {
+    let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
+    hub.store.audit("admin".into(), "goals.add".into(), id.to_owned()).await;
+    Ok(srv::json(StatusCode::OK, &s))
+}
+
+/// Start, pause, skip or clear an agent's goal stack.
+async fn goals_control(hub: &Hub, id: &str, action: &str) -> R {
+    let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
+    let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
+    hub.store.audit("admin".into(), "goals.control".into(), format!("{id}: {action}")).await;
+    Ok(srv::json(StatusCode::OK, &s))
 }
 
 /// A terminal beside an agent: a shell in its folder, or its harness's own screen

@@ -1216,3 +1216,18 @@
     transition: none;
   }
 }
+
+/* "Stop all", asked in place; finished background tasks folded under one line. */
+.bg-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 0 0 10px;
+  color: #c9cbd1;
+  font-size: 12px;
+}
+.bg-ended {
+  padding: 8px 0 2px;
+  list-style: none;
+}

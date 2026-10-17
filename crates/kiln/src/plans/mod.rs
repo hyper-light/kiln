@@ -22,6 +22,9 @@ const TAGS: usize = 20;
 const TAG: usize = 40;
 /// Steps one run sends at the most.
 const STEPS: usize = 100;
+/// Items a plan has at the most, and each field's bytes.
+const ITEMS: usize = 100;
+const FIELD: usize = 16 << 10;
 
 /// A plan, as kept.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,10 +41,61 @@ pub struct Plan {
     pub version: i64,
     pub created_at: i64,
     pub updated_at: i64,
-    /// Its steps (from the body).
+    /// Its items: the work, piece by piece, each with what makes it done.
+    pub items: Vec<Item>,
+    /// Its steps: its items, else its body's top-level list items.
     pub steps: Vec<String>,
     /// How many times it was run.
     pub runs: i64,
+}
+
+/// One item of a plan: a piece of the work, with what it's like and what makes it done.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Item {
+    /// What it is, short.
+    pub title: String,
+    /// What to do (markdown).
+    pub description: String,
+    /// Examples of what's meant.
+    pub examples: String,
+    /// When it's done.
+    pub acceptance: String,
+    /// How it's tested: examples, scenarios, criteria.
+    pub testing: String,
+}
+
+impl Item {
+    /// The item as markdown: its title, then each part it has under its name.
+    pub fn text(&self) -> String {
+        let mut out = self.title.trim().to_owned();
+        for (name, v) in [("", &self.description), ("Examples", &self.examples), ("Acceptance criteria", &self.acceptance), ("Testing", &self.testing)] {
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            out.push_str("\n\n");
+            if !name.is_empty() {
+                out.push_str(&format!("{name}:\n"));
+            }
+            out.push_str(v);
+        }
+        out
+    }
+
+    /// The item as a goal: one line, what it is and what makes it done (its harness's /goal
+    /// checks the condition, and takes it as what to work toward).
+    pub fn goal(&self) -> String {
+        let parts = [
+            self.title.trim().to_owned(),
+            self.description.trim().to_owned(),
+            if self.examples.trim().is_empty() { String::new() } else { format!("Examples: {}", self.examples.trim()) },
+            if self.acceptance.trim().is_empty() { String::new() } else { format!("Done when: {}", self.acceptance.trim()) },
+            if self.testing.trim().is_empty() { String::new() } else { format!("Tested by: {}", self.testing.trim()) },
+        ];
+        let line = parts.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" — ").split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.chars().count() > 1990 { format!("{}…", line.chars().take(1990).collect::<String>()) } else { line }
+    }
 }
 
 /// The session a plan was captured from.
@@ -61,6 +115,7 @@ pub struct Version {
     pub version: i64,
     pub title: String,
     pub body: String,
+    pub items: Vec<Item>,
     pub at: i64,
     /// `admin`, or `agent:<who>`.
     pub by: String,
@@ -83,6 +138,7 @@ pub struct Run {
 pub struct New {
     pub title: String,
     pub body: String,
+    pub items: Vec<Item>,
     pub tags: Vec<String>,
     pub source: Option<Source>,
 }
@@ -93,6 +149,7 @@ pub struct New {
 pub struct Patch {
     pub title: Option<String>,
     pub body: Option<String>,
+    pub items: Option<Vec<Item>>,
     pub tags: Option<Vec<String>>,
 }
 
@@ -115,6 +172,9 @@ pub enum Mode {
     Message,
     /// Each step its own message, each sent once the turn before it ends.
     Steps,
+    /// Each step a goal in the agent's goal stack (`crate::goals`): the next goes once the one
+    /// before is met (its harness's own /goal where it has one).
+    Goals,
 }
 
 impl Mode {
@@ -122,6 +182,7 @@ impl Mode {
         match self {
             Self::Message => "message",
             Self::Steps => "steps",
+            Self::Goals => "goals",
         }
     }
 }
@@ -209,9 +270,28 @@ pub fn title_of(body: &str) -> String {
     if t.is_empty() { "Plan".to_owned() } else { t }
 }
 
+/// The whole plan as markdown: its text, then its items, each under its own heading.
+pub fn markdown(p: &Plan) -> String {
+    let mut out = p.body.trim().to_owned();
+    for (i, it) in p.items.iter().enumerate() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("## {}. {}", i + 1, it.title.trim()));
+        for (name, v) in [("", &it.description), ("Examples", &it.examples), ("Acceptance criteria", &it.acceptance), ("Testing", &it.testing)] {
+            let v = v.trim();
+            if !v.is_empty() {
+                out.push_str(&if name.is_empty() { format!("\n\n{v}") } else { format!("\n\n**{name}**\n\n{v}") });
+            }
+        }
+    }
+    out
+}
+
 /// The message that hands an agent the whole plan, under its title (unless it opens with it).
 pub fn message(p: &Plan) -> String {
-    let body = p.body.trim();
+    let all = markdown(p);
+    let body = all.trim();
     let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
     if first.starts_with('#') && title_of(first) == p.title {
         format!("Carry out this plan, step by step, and say when it is done.\n\n{body}")
@@ -243,32 +323,58 @@ fn clean_tags(tags: Vec<String>) -> R<Vec<String>> {
     Ok(out)
 }
 
-fn check(title: &str, body: &str) -> R<()> {
+fn check(title: &str, body: &str, items: &[Item]) -> R<()> {
     if title.trim().is_empty() {
         return Err(Error::Bad("a plan needs a title".into()));
     }
     if title.chars().count() > TITLE {
         return Err(Error::Bad(format!("a title is {TITLE} characters at the most")));
     }
-    if body.trim().is_empty() {
-        return Err(Error::Bad("a plan needs something in it".into()));
+    if body.trim().is_empty() && items.is_empty() {
+        return Err(Error::Bad("a plan needs something in it: text, or a step".into()));
     }
     if body.len() > BODY {
         return Err(Error::Bad(format!("a plan is {} KiB at the most", BODY >> 10)));
     }
+    if items.len() > ITEMS {
+        return Err(Error::Bad(format!("a plan has {ITEMS} steps at the most")));
+    }
+    for (i, it) in items.iter().enumerate() {
+        if it.title.trim().is_empty() {
+            return Err(Error::Bad(format!("step {} needs a title", i + 1)));
+        }
+        if it.title.chars().count() > TITLE {
+            return Err(Error::Bad(format!("step {}'s title is {TITLE} characters at the most", i + 1)));
+        }
+        if [&it.description, &it.examples, &it.acceptance, &it.testing].iter().any(|f| f.len() > FIELD) {
+            return Err(Error::Bad(format!("each part of step {} is {} KiB at the most", i + 1, FIELD >> 10)));
+        }
+    }
     Ok(())
 }
 
-const COLUMNS: &str = "p.id, p.title, p.body, p.tags, p.source, p.share, p.version, p.created_at, p.updated_at, (SELECT COUNT(*) FROM plan_runs r WHERE r.plan_id = p.id)";
+/// What a plan's title is when none is given: its text's heading or first line, else its first
+/// item's title.
+fn title_for(body: &str, items: &[Item]) -> String {
+    if body.trim().is_empty() {
+        items.first().map(|i| i.title.trim().chars().take(80).collect()).filter(|t: &String| !t.is_empty()).unwrap_or_else(|| "Plan".to_owned())
+    } else {
+        title_of(body)
+    }
+}
+
+const COLUMNS: &str = "p.id, p.title, p.body, p.tags, p.source, p.share, p.version, p.created_at, p.updated_at, (SELECT COUNT(*) FROM plan_runs r WHERE r.plan_id = p.id), p.items";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
     let tags: String = r.get(3)?;
     let source: Option<String> = r.get(4)?;
     let body: String = r.get(2)?;
+    let items: Vec<Item> = serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default();
     Ok(Plan {
         id: r.get(0)?,
         title: r.get(1)?,
-        steps: steps(&body),
+        steps: if items.is_empty() { steps(&body) } else { items.iter().map(Item::text).collect() },
+        items,
         body,
         tags: serde_json::from_str(&tags).unwrap_or_default(),
         source: source.and_then(|s| serde_json::from_str(&s).ok()),
@@ -298,7 +404,7 @@ pub async fn list(hub: &Hub, q: Option<String>, tag: Option<String>) -> R<Vec<Pl
     Ok(all
         .into_iter()
         .filter(|p| tag.as_ref().is_none_or(|t| p.tags.contains(t)))
-        .filter(|p| q.as_ref().is_none_or(|q| p.title.to_lowercase().contains(q) || p.body.to_lowercase().contains(q) || p.tags.iter().any(|t| t.to_lowercase().contains(q))))
+        .filter(|p| q.as_ref().is_none_or(|q| p.title.to_lowercase().contains(q) || p.body.to_lowercase().contains(q) || p.tags.iter().any(|t| t.to_lowercase().contains(q)) || p.steps.iter().any(|s| s.to_lowercase().contains(q))))
         .collect())
 }
 
@@ -317,8 +423,9 @@ pub async fn shared(hub: &Hub, token: &str) -> R<Plan> {
 }
 
 pub async fn create(hub: &Hub, n: New, by: &str) -> R<Plan> {
-    let title = if n.title.trim().is_empty() { title_of(&n.body) } else { n.title.trim().to_owned() };
-    check(&title, &n.body)?;
+    let title = if n.title.trim().is_empty() { title_for(&n.body, &n.items) } else { n.title.trim().to_owned() };
+    check(&title, &n.body, &n.items)?;
+    let items = serde_json::to_string(&n.items).map_err(anyhow::Error::from)?;
     let tags = serde_json::to_string(&clean_tags(n.tags)?).map_err(anyhow::Error::from)?;
     let source = n.source.map(|s| serde_json::to_string(&fill_source(hub, s))).transpose().map_err(anyhow::Error::from)?;
     let (id, now, by) = (crate::util::new_id(), crate::util::now_unix(), by.to_owned());
@@ -328,10 +435,10 @@ pub async fn create(hub: &Hub, n: New, by: &str) -> R<Plan> {
         .call(move |c| {
             let tx = c.transaction()?;
             tx.execute(
-                "INSERT INTO plans (id, title, body, tags, source, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
-                params![id, title, body, tags, source, now],
+                "INSERT INTO plans (id, title, body, items, tags, source, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                params![id, title, body, items, tags, source, now],
             )?;
-            tx.execute("INSERT INTO plan_versions (plan_id, version, title, body, at, by) VALUES (?1, 1, ?2, ?3, ?4, ?5)", params![id, title, body, now, by])?;
+            tx.execute("INSERT INTO plan_versions (plan_id, version, title, body, items, at, by) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)", params![id, title, body, items, now, by])?;
             let p = get_in(&tx, &id)?;
             tx.commit()?;
             Ok(p)
@@ -359,22 +466,24 @@ pub async fn update(hub: &Hub, id: &str, patch: Patch, by: &str) -> R<Plan> {
     let old = get(hub, id).await?;
     let title = patch.title.map(|t| t.trim().to_owned()).unwrap_or_else(|| old.title.clone());
     let body = patch.body.unwrap_or_else(|| old.body.clone());
-    check(&title, &body)?;
+    let items = patch.items.unwrap_or_else(|| old.items.clone());
+    check(&title, &body, &items)?;
     let tags = match patch.tags {
         Some(t) => clean_tags(t)?,
         None => old.tags.clone(),
     };
-    let new_version = title != old.title || body != old.body;
+    let new_version = title != old.title || body != old.body || items != old.items;
     let tags = serde_json::to_string(&tags).map_err(anyhow::Error::from)?;
+    let items = serde_json::to_string(&items).map_err(anyhow::Error::from)?;
     let (id, now, by) = (id.to_owned(), crate::util::now_unix(), by.to_owned());
     let plan = hub
         .store
         .call(move |c| {
             let tx = c.transaction()?;
             let version = if new_version { old.version.saturating_add(1) } else { old.version };
-            tx.execute("UPDATE plans SET title = ?2, body = ?3, tags = ?4, version = ?5, updated_at = ?6 WHERE id = ?1", params![id, title, body, tags, version, now])?;
+            tx.execute("UPDATE plans SET title = ?2, body = ?3, items = ?4, tags = ?5, version = ?6, updated_at = ?7 WHERE id = ?1", params![id, title, body, items, tags, version, now])?;
             if new_version {
-                tx.execute("INSERT INTO plan_versions (plan_id, version, title, body, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![id, version, title, body, now, by])?;
+                tx.execute("INSERT INTO plan_versions (plan_id, version, title, body, items, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![id, version, title, body, items, now, by])?;
             }
             let p = get_in(&tx, &id)?;
             tx.commit()?;
@@ -387,7 +496,7 @@ pub async fn update(hub: &Hub, id: &str, patch: Patch, by: &str) -> R<Plan> {
 /// A version of the plan made current again (as a new version, so nothing is lost).
 pub async fn restore(hub: &Hub, id: &str, version: i64, by: &str) -> R<Plan> {
     let old = versions(hub, id).await?.into_iter().find(|v| v.version == version).ok_or_else(|| Error::Bad(format!("the plan has no version {version}")))?;
-    update(hub, id, Patch { title: Some(old.title), body: Some(old.body), tags: None }, by).await
+    update(hub, id, Patch { title: Some(old.title), body: Some(old.body), items: Some(old.items), tags: None }, by).await
 }
 
 pub async fn delete(hub: &Hub, id: &str) -> R<()> {
@@ -413,8 +522,13 @@ pub async fn versions(hub: &Hub, id: &str) -> R<Vec<Version>> {
     Ok(hub
         .store
         .call(move |c| {
-            let mut st = c.prepare("SELECT version, title, body, at, by FROM plan_versions WHERE plan_id = ?1 ORDER BY version DESC")?;
-            let rows = st.query_map(params![id], |r| Ok(Version { version: r.get(0)?, title: r.get(1)?, body: r.get(2)?, at: r.get(3)?, by: r.get(4)? }))?.collect::<Result<Vec<_>, _>>()?;
+            let mut st = c.prepare("SELECT version, title, body, at, by, items FROM plan_versions WHERE plan_id = ?1 ORDER BY version DESC")?;
+            let rows = st
+                .query_map(params![id], |r| {
+                    let items: String = r.get(5)?;
+                    Ok(Version { version: r.get(0)?, title: r.get(1)?, body: r.get(2)?, items: serde_json::from_str(&items).unwrap_or_default(), at: r.get(3)?, by: r.get(4)? })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .await?)
@@ -451,8 +565,11 @@ pub async fn share(hub: &Hub, id: &str, on: bool) -> R<Plan> {
 /// Runs a plan on an agent: an existing one, or a new one started with it.
 pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R<Ran> {
     let p = get(hub, id).await?;
+    if mode == Mode::Goals {
+        return run_goals(hub, &p, target, by).await;
+    }
     let messages: Vec<String> = match mode {
-        Mode::Message => vec![message(&p)],
+        Mode::Message | Mode::Goals => vec![message(&p)],
         Mode::Steps => {
             let steps: Vec<&String> = p.steps.iter().take(STEPS).collect();
             if steps.is_empty() {
@@ -495,6 +612,41 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R
     Ok(Ran { session, sent, run })
 }
 
+/// A plan's steps as goals, after the agent's others (a new agent is started for them), and the
+/// stack running.
+async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &str) -> R<Ran> {
+    let goals: Vec<String> = if p.items.is_empty() { p.steps.iter().take(STEPS).cloned().collect() } else { p.items.iter().take(STEPS).map(Item::goal).collect() };
+    if goals.is_empty() {
+        return Err(Error::Bad("this plan has no steps (no list in it) to make goals of".into()));
+    }
+    let session = match target {
+        Target::Session(s) => s,
+        Target::New { target, kind, cwd } => {
+            let spec = Spec { kind, cwd: cwd.filter(|c| !c.trim().is_empty()), name: Some(p.title.clone()), ..Spec::default() };
+            let infos = hub.harness.open(hub, &target, spec, 1).await?;
+            infos.into_iter().next().ok_or_else(|| Error::Bad("the agent did not start".into()))?.id
+        }
+    };
+    let sent = goals.len();
+    crate::goals::add(hub, &session, goals, true).await.map_err(|e| match e {
+        crate::goals::Error::NoAgent => Error::Bad("no such agent".into()),
+        crate::goals::Error::Bad(m) => Error::Bad(m),
+        crate::goals::Error::Other(e) => Error::Other(e),
+    })?;
+    let (run, now, by_s, version, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.to_owned(), p.version, p.id.clone(), session.clone());
+    let run_c = run.clone();
+    hub.store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, 'goals', ?5, ?6)",
+                params![run_c, plan_id, version, session_c, now, by_s],
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(Ran { session, sent, run })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,10 +675,28 @@ mod tests {
 
     #[test]
     fn messages_hand_over_the_plan_or_one_step() {
-        let p = Plan { id: "p".into(), title: "T".into(), body: "- a\n- b".into(), tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps: vec!["a".into(), "b".into()], runs: 0 };
+        let p = Plan { id: "p".into(), title: "T".into(), body: "- a\n- b".into(), items: vec![], tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps: vec!["a".into(), "b".into()], runs: 0 };
         assert!(message(&p).contains("# T\n\n- a\n- b"));
         let headed = Plan { body: "# T\n\n- a\n- b".into(), ..p.clone() };
         assert_eq!(message(&headed).matches("# T").count(), 1);
         assert!(step_message(&p, 1, 2, "b").starts_with("Step 2 of 2 of the plan \"T\": b"));
     }
+
+    #[test]
+    fn items_read_as_markdown_as_steps_and_as_goals() {
+        let it = Item { title: "Split the scanner".into(), description: "Move number scanning\ninto its own fn.".into(), examples: "0x1F, 1e9".into(), acceptance: "scan_number exists; lexer tests pass".into(), testing: "hex, octal and exponent cases".into() };
+        let p = Plan { id: "p".into(), title: "Lexer".into(), body: "Why: the scanner grew.".into(), items: vec![it.clone(), Item { title: "Ship it".into(), ..Item::default() }], tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps: vec![], runs: 0 };
+        let md = markdown(&p);
+        assert!(md.starts_with("Why: the scanner grew.\n\n## 1. Split the scanner\n\nMove number scanning"), "{md}");
+        assert!(md.contains("**Acceptance criteria**\n\nscan_number exists") && md.contains("## 2. Ship it"), "{md}");
+        assert!(message(&p).contains("# Lexer\n\nWhy: the scanner grew."));
+        assert!(it.text().starts_with("Split the scanner\n\nMove number scanning") && it.text().contains("Testing:\nhex, octal"));
+        assert_eq!(it.goal(), "Split the scanner — Move number scanning into its own fn. — Examples: 0x1F, 1e9 — Done when: scan_number exists; lexer tests pass — Tested by: hex, octal and exponent cases");
+        assert!(Item { title: "x".repeat(50), description: "y ".repeat(2000), ..Item::default() }.goal().chars().count() <= 1991);
+        assert!(check("T", "", &[Item { title: "a".into(), ..Item::default() }]).is_ok());
+        assert!(check("T", "", &[]).is_err());
+        assert!(check("T", "", &[Item::default()]).is_err());
+        assert_eq!(title_for("", &[Item { title: "First thing".into(), ..Item::default() }]), "First thing");
+    }
+
 }

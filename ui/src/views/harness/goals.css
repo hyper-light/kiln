@@ -1,0 +1,211 @@
+/* An agent's goal stack (goals.tsx): its own panel under the Plan tab's plans, in hyperlight-site's
+   voice like the account card (a quiet panel in a #2a3039 hairline, the prism faint along its top
+   edge). The goals are a chain: numbered nodes joined by a line, met in the prism's green, the one
+   under way lit, not met in the console's red. The console's own fields and buttons. Phones first:
+   words wrap, nothing scrolls sideways, touch targets are 40px. */
+
+.gs-panel {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px 14px 16px;
+  border: 1px solid #2a3039;
+  border-radius: 9px;
+  background: #0a0c0f;
+}
+.gs-panel::before {
+  position: absolute;
+  top: -1px;
+  right: 14%;
+  left: 14%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #9fbab866, #a7aed070, #c4a8bd59, transparent);
+  content: "";
+}
+.gs-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+}
+.gs-h {
+  margin: 0;
+  color: #d8d9dd;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.gs-chip {
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.gs-chip[data-state="running"] {
+  color: #a6c4ed;
+}
+.gs-chip[data-state="paused"] {
+  color: #e3c9a0;
+}
+.gs-chip[data-state="done"] {
+  color: #b8d9d2;
+}
+.gs-what {
+  margin: 0;
+  color: #9a9da6;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.gs-reason {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 2px solid #e3c9a0;
+  border-radius: 0 6px 6px 0;
+  background: #14120d;
+  color: #e3c9a0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* The chain. */
+.gs-chain {
+  display: grid;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.gs-link {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 10px;
+  padding-bottom: 12px;
+  color: #c9cbd1;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+/* The line to the next link. */
+.gs-link:not(:last-child)::before {
+  position: absolute;
+  top: 22px;
+  bottom: 0;
+  left: 10.5px;
+  width: 1px;
+  background: #2a3039;
+  content: "";
+}
+.gs-link[data-status="met"]:not(:last-child)::before {
+  background: #5d7a74;
+}
+.gs-node {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid #343a45;
+  border-radius: 50%;
+  background: #0a0c0f;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.gs-link[data-status="met"] .gs-node {
+  border-color: #5d7a74;
+  color: #b8d9d2;
+}
+.gs-link[data-status="active"] .gs-node {
+  border-color: #a6c4ed;
+  color: #a6c4ed;
+  box-shadow: 0 0 0 3px rgb(166 196 237 / 12%);
+}
+.gs-link[data-status="unmet"] .gs-node {
+  border-color: #8a5a55;
+  color: #e3a7a0;
+}
+.gs-link[data-status="active"] {
+  color: #ededee;
+}
+.gs-link[data-status="met"],
+.gs-link[data-status="skipped"] {
+  color: #8d9099;
+}
+.gs-text {
+  min-width: 0;
+  padding-top: 2px;
+  overflow-wrap: anywhere;
+}
+.gs-word {
+  display: block;
+  color: #7d818b;
+  font-size: 11px;
+}
+.gs-link[data-status="unmet"] .gs-word {
+  color: #d9a29b;
+}
+.gs-more {
+  padding: 0 0 10px 32px;
+}
+.gs-more-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.gs-more-btn:hover {
+  color: #ededee;
+}
+
+/* Adding, editing, acting. */
+.gs-add {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+.gs-hint {
+  margin-top: -4px;
+}
+.gs-edit {
+  display: grid;
+  gap: 8px;
+}
+.gs-actions,
+.gs-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.gs-confirm {
+  color: #c9cbd1;
+  font-size: 12px;
+}
+.gs-error {
+  margin: 0;
+  color: #e3a7a0;
+  font-size: 12px;
+}
+
+@media (pointer: coarse) {
+  .gs-more-btn {
+    min-height: 40px;
+  }
+}
+.gs-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  margin-top: 2px;
+  color: #8d9099;
+  font-size: 11.5px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}

@@ -13,9 +13,11 @@ import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
 import { TodoList } from "./timeline";
 import { Background, isBackground } from "./background";
-import { PlanSourceContext, RunSavedPlan, SavePlan, todosAsPlan } from "@/views/plans/save";
+import { PlansHere } from "@/views/plans/here";
+import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
+import { Goals } from "./goals";
 
-/** Three places beside the conversation: what it changed, what it is doing (plan, subagents, commands), and what it works with (MCP, skills, usage). */
+/** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
 
 /** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
@@ -245,10 +247,13 @@ export function Inspector({
   className,
   hideTabs,
   agentId,
+  harness,
   send,
 }: {
   /** The agent, and how to send it commands (background tasks: output, stop). */
   agentId?: string;
+  /** The agent's harness, by name ("Claude Code"). */
+  harness?: string;
   send?: (c: Command) => void;
   /** The page shows its own tabs (phones). */
   hideTabs?: boolean;
@@ -276,8 +281,8 @@ export function Inspector({
   const mcp = state?.mcp ?? [];
   const tabs: { id: InspectorTab; label: string; count?: string }[] = [
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : tasks.length ? String(tasks.length) : undefined },
-    { id: "tools", label: "Tools", count: mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
+    { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined },
+    { id: "tools", label: "Tools", count: tasks.length ? String(tasks.length) : mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
   ];
   return (
     <div className={cn("hx-inspector", className)}>
@@ -294,9 +299,8 @@ export function Inspector({
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
-              {agentId && send && <Background state={state} agent={agentId} send={send} />}
               <section>
-                <h3 className="in-sec-head">Plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
+                <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
                 {todos.length > 0 ? (
                   <div className="hx-stack">
                     <div className="hx-progress">
@@ -311,7 +315,7 @@ export function Inspector({
                     <SavePlan body={proposed} />
                   </div>
                 ) : (
-                  <p className="in-none">No plan yet. It appears here when the agent writes one.</p>
+                  <p className="in-none">None yet: the plan it writes (or its to-do list) shows here, to keep as one of your plans.</p>
                 )}
               </section>
               {todos.length > 0 && proposed && (
@@ -323,11 +327,18 @@ export function Inspector({
               )}
               {agentId && (
                 <section>
-                  <h3 className="in-sec-head">Run a saved plan</h3>
-                  <RunSavedPlan session={agentId} />
+                  <h3 className="in-sec-head">Your plans</h3>
+                  <PlansHere session={agentId} />
                 </section>
               )}
+              {agentId && <Goals agent={agentId} harness={harness} />}
             </PlanSourceContext.Provider>
+          </div>
+        )}
+        {tab === "tools" && (
+          <div className="in-secs">
+            {/* What it has going: shells and monitors it left running, subagents, the commands it ran. */}
+            {agentId && send && <Background state={state} agent={agentId} send={send} />}
             {tasks.length > 0 && (
               <section>
                 <h3 className="in-sec-head">Subagents<span>{tasks.length}</span></h3>
@@ -340,10 +351,6 @@ export function Inspector({
                 <Runs events={events} />
               </section>
             )}
-          </div>
-        )}
-        {tab === "tools" && (
-          <div className="in-secs">
             <section>
               <h3 className="in-sec-head">MCP servers</h3>
               <McpPanel state={state} store={store} />

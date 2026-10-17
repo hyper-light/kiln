@@ -64,6 +64,9 @@ pub struct ChangeJob {
 pub enum Effect {
     /// Start the harness again, continuing its session from `resume_at` (a rewind).
     Restart { resume_at: Option<String> },
+    /// From its next start the harness may skip every permission check: a person chose a mode
+    /// that turns checks off, which it was not started able to use.
+    AllowBypass,
     /// Start a new session that branches off this one at `resume_at`.
     Branch { resume: String, resume_at: Option<String> },
     /// Run the harness's own CLI beside the session (`mcp add ...`), in its directory and
@@ -72,6 +75,10 @@ pub enum Effect {
     /// Answer `client` with the first of these files that can be read (`{"content", "path"}`),
     /// or `{"error"}`.
     Read { client: String, paths: Vec<String> },
+    /// Read the end of the harness's own transcript of `session` (Claude Code's, under its
+    /// configuration directory `config`). The lines come back as a run's end (`run_done`, code 0,
+    /// one record a line; code 1 when it can't be read) under `job`.
+    TranscriptTail { job: String, config: String, session: String, bytes: u64 },
     /// Make a GET request to a sign-in callback the harness listens for on this machine's
     /// loopback (a browser on another device cannot reach it). Only loopback addresses are
     /// fetched. Its result comes back as a run's end (`run_done`) under `job`.

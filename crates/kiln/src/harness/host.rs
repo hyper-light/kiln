@@ -201,6 +201,9 @@ impl Host {
         let pids: Vec<u32> = self.sessions.lock().values().filter_map(|s| *s.pid.lock()).collect();
         for pid in pids {
             stop_process(pid);
+            // This image re-executes next and the new one won't wait for it: reaped now.
+            #[cfg(unix)]
+            let _ = crate::os::try_reap(pid);
         }
     }
 
@@ -339,6 +342,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         last_activity: now,
         exit: Some(exit.clone()),
         goal: spec.prompt.clone().map(|p| super::model::clip_middle(&p, 200).0).unwrap_or_default(),
+        objective: None,
         summary: String::new(),
         doing: None,
         todos_done: 0,

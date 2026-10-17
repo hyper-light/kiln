@@ -236,6 +236,7 @@ pub fn ops() -> &'static [Op] {
         .into_iter()
         // Plans share the one table (crates/kiln/src/plans/ops.rs).
         .chain(crate::plans::ops::list_ops())
+        .chain(crate::goals::ops::list_ops())
         .collect()
     })
 }

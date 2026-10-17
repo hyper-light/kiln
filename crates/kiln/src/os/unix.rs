@@ -157,9 +157,107 @@ pub fn stop_processes(pids: &[u32], keep: Option<u32>, grace: std::time::Duratio
     }
 }
 
-/// Whether `pid` is still running (and signalable by us).
+/// Whether `pid` is still running (and signalable by us). A zombie (dead, not yet reaped) is not.
 pub fn pid_alive(pid: u32) -> bool {
-    i32::try_from(pid).is_ok_and(|p| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok())
+    i32::try_from(pid).is_ok_and(|p| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok()) && !is_zombie(pid)
+}
+
+/// Whether `pid` has died and not been reaped yet.
+#[cfg(target_os = "linux")]
+pub fn is_zombie(pid: u32) -> bool {
+    proc_stat(pid).is_some_and(|(state, _)| state == 'Z')
+}
+
+/// Whether `pid` has died and not been reaped yet (only Linux can tell cheaply).
+#[cfg(not(target_os = "linux"))]
+pub fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// A process's state letter and parent, from `/proc/<pid>/stat` (its name may hold spaces and
+/// parentheses, so the fields after its last `)` are read).
+#[cfg(target_os = "linux")]
+fn proc_stat(pid: u32) -> Option<(char, u32)> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = s.get(s.rfind(')')? + 1..)?;
+    let mut f = rest.split_whitespace();
+    let state = f.next()?.chars().next()?;
+    let ppid = f.next()?.parse().ok()?;
+    Some((state, ppid))
+}
+
+/// This process's children that have died and not been reaped.
+#[cfg(target_os = "linux")]
+fn zombie_children() -> Vec<u32> {
+    let me = std::process::id();
+    // Each thread's children, where the kernel lists them; else every process, by its parent.
+    let mut pids: Vec<u32> = Vec::new();
+    let mut listed = false;
+    if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+        for t in tasks.flatten() {
+            if let Ok(s) = std::fs::read_to_string(t.path().join("children")) {
+                listed = true;
+                pids.extend(s.split_whitespace().filter_map(|p| p.parse::<u32>().ok()));
+            }
+        }
+    }
+    if !listed {
+        pids = std::fs::read_dir("/proc").map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok()).collect()).unwrap_or_default();
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids.into_iter().filter(|&pid| proc_stat(pid).is_some_and(|(state, ppid)| state == 'Z' && ppid == me)).collect()
+}
+
+/// This process's children that have died and not been reaped.
+#[cfg(not(target_os = "linux"))]
+fn zombie_children() -> Vec<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
+    let me = sysinfo::Pid::from_u32(std::process::id());
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    sys.processes().values().filter(|p| p.parent() == Some(me) && p.status() == ProcessStatus::Zombie).map(|p| p.pid().as_u32()).collect()
+}
+
+/// Of these dead children, reaps the ones first seen dead (in `seen`) at least `grace` before
+/// `now`, and returns them. `seen` forgets children that are no longer there.
+fn reap_old(zombies: &[u32], seen: &mut std::collections::HashMap<u32, std::time::Instant>, grace: std::time::Duration, now: std::time::Instant) -> Vec<u32> {
+    seen.retain(|pid, _| zombies.contains(pid));
+    let mut reaped = Vec::new();
+    for &pid in zombies {
+        let first = *seen.entry(pid).or_insert(now);
+        if now.saturating_duration_since(first) >= grace && matches!(try_reap(pid), Ok(Some(_))) {
+            seen.remove(&pid);
+            reaped.push(pid);
+        }
+    }
+    reaped
+}
+
+/// How long a child may lie dead before the reaper takes it. Whoever waits for a child reaps it
+/// within a second of its death (`wait_pid_exit`, `Command::output`), so one dead this long has
+/// nobody waiting, and reaping it takes nothing from anyone.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reaps, every ten seconds for as long as this process runs, children that died with nobody
+/// waiting for them, so dead processes never pile up whatever left them: a wait that missed its
+/// wake-up, a handle dropped unwaited, a child an earlier image of this process started before an
+/// in-place upgrade. Started once per process.
+pub fn start_reaper() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        crate::rt::spawn(async {
+            let seen: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<u32, std::time::Instant>>> = std::sync::Arc::default();
+            loop {
+                crate::rt::sleep(std::time::Duration::from_secs(10)).await;
+                let s = seen.clone();
+                let reaped = crate::rt::blocking(move || reap_old(&zombie_children(), &mut s.lock(), REAP_GRACE, std::time::Instant::now())).await.unwrap_or_default();
+                if !reaped.is_empty() {
+                    tracing::info!(count = reaped.len(), pids = ?reaped, "reaped dead child processes nobody waited for");
+                }
+            }
+        });
+    });
 }
 
 /// Reap `pid` if it has exited: `Ok(Some(description))` once it has, `Ok(None)` while it runs.
@@ -186,4 +284,34 @@ pub fn pty_masters(pid: u32) -> Option<usize> {
             .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t == Path::new("/dev/ptmx") || t == Path::new("/dev/pts/ptmx")))
             .count(),
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_dead_child_nobody_waits_for_is_reaped_once_its_grace_is_over() -> anyhow::Result<()> {
+        let child = std::process::Command::new("true").spawn()?;
+        let pid = child.id();
+        // Nobody waits for it.
+        drop(child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !is_zombie(pid) {
+            anyhow::ensure!(Instant::now() < deadline, "the child never died");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pid_alive(pid), "a zombie is not alive");
+        assert!(zombie_children().contains(&pid));
+        let mut seen = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        // Within its grace it is left for a waiter; past it, reaped.
+        assert!(reap_old(&[pid], &mut seen, Duration::from_secs(30), t0).is_empty());
+        assert!(is_zombie(pid));
+        assert_eq!(reap_old(&[pid], &mut seen, Duration::from_secs(30), t0 + Duration::from_secs(31)), [pid]);
+        assert!(proc_stat(pid).is_none(), "gone from the process table");
+        assert!(seen.is_empty());
+        Ok(())
+    }
 }

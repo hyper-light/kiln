@@ -643,6 +643,8 @@ function Binaries({
         : b.origin === "built"
           ? `built by run #${b.run ?? "?"} from ${(b.sha ?? "").slice(0, 7)}, ${relativeTime(b.at)}`
           : `GitHub release, fetched ${relativeTime(b.at)}`;
+  // Not built from the commit the server runs: its machines run something else than the server.
+  const behind = (b: KilnBinary) => b.origin !== "server" && (data.build?.behind ?? []).includes(b.target);
   return (
     <section className="upd-section" aria-labelledby="upd-binaries">
       <div className="upd-section-head">
@@ -661,7 +663,10 @@ function Binaries({
             <span className="mono upd-dim">
               {b.build} · {formatBytes(b.size)}
             </span>
-            <span className="upd-dim">{origin(b)}</span>
+            <span className="upd-dim">
+              {origin(b)}
+              {behind(b) && <span className="upd-behind"> · behind the server</span>}
+            </span>
             {b.origin !== "server" && confirm?.target !== b.target && (
               <Button size="xs" variant="ghost" aria-label={`Remove the ${b.target} binary`} onClick={() => setConfirm(b)}>
                 <Trash2 />
@@ -736,17 +741,59 @@ function BuildEvery({ build, onStarted }: { build: ReleaseBuild; onStarted: () =
     }
   };
   const runLink = last ? <Link to={`/runs/${last.id}`}>run #{last.number}</Link> : null;
+  // The commit the server runs, when it knows it: every platform should be built from it.
+  const commit = build.commit ? build.commit.slice(0, 7) : null;
+  const behind = build.behind ?? [];
+  const lastOfIt = last !== null && build.commit != null && last.sha.toLowerCase() === build.commit.toLowerCase();
+  const tone = build.error
+    ? "timed_out"
+    : building
+      ? "running"
+      : build.in_step
+        ? "succeeded"
+        : commit
+          ? lastOfIt && last?.status === "failed"
+            ? "failed"
+            : "queued"
+          : last?.status === "failed"
+            ? "failed"
+            : last
+              ? "succeeded"
+              : "queued";
   return (
     <div className="upd-build-every">
-      <p className="upd-note" data-tone={build.error ? "timed_out" : building ? "running" : last?.status === "failed" ? "failed" : last ? "succeeded" : "queued"}>
-        <StatusDot status={build.error ? "timed_out" : building ? "running" : (last?.status ?? "queued")} />
+      <p className="upd-note" data-tone={tone}>
+        <StatusDot status={tone} />
         <span>
           {build.error ??
             (building ? (
-              <>Building every platform · {runLink}</>
+              <>
+                Building every platform from {last?.sha.slice(0, 7)}
+                {lastOfIt ? ", the commit the server runs" : ""} · {runLink}
+              </>
+            ) : build.in_step ? (
+              <>
+                Every platform is built from {commit}, the commit the server runs{runLink ? " · " : ""}
+                {runLink}
+              </>
+            ) : commit ? (
+              <span title={behind.join(", ")}>
+                {behind.length} platform{behind.length === 1 ? " isn't" : "s aren't"} built from {commit}, the commit the server runs
+                {lastOfIt && last?.status === "failed" ? (
+                  <>
+                    : the build failed · {runLink}
+                    {build.keeps_in_step ? ". kiln tries again in a while" : ""}
+                  </>
+                ) : build.keeps_in_step ? (
+                  ": kiln builds them on its own"
+                ) : (
+                  ""
+                )}
+              </span>
             ) : last?.status === "succeeded" ? (
               <>
-                Built every platform {relativeTime(last.finished_at ?? last.created_at)} from {last.branch} {last.sha.slice(0, 7)} · {runLink}
+                Built every platform {relativeTime(last.finished_at ?? last.created_at)} from {last.branch} {last.sha.slice(0, 7)} · {runLink}. The server doesn&rsquo;t know which commit it runs
+                (built without KILN_COMMIT), so kiln can&rsquo;t keep them in step with it.
               </>
             ) : last ? (
               <>The last build {last.status === "failed" ? "failed" : "didn't finish"} · {runLink}</>

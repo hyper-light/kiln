@@ -52,9 +52,17 @@ pub fn token_path(cfg: &Config) -> PathBuf {
 }
 
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
+    crate::os::start_reaper();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
+    // Earlier builds' UI assets stay servable (pages loaded before this deploy); in the background.
+    {
+        let dir = cfg.server.data_dir.clone();
+        crate::rt::spawn_spread(async move {
+            let _ = crate::rt::blocking(move || crate::ui::keep_assets(&dir)).await;
+        });
+    }
     crate::password::seed_from_env(&crate::password::path(&cfg));
     let store = crate::store::Store::open(&cfg.data("kiln.db"))?;
     let requeued = store.recover().await?;
@@ -117,6 +125,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     child!("retention", h => h.retention_loop());
     child!("terminals", h => h.terminal_loop());
     child!("agent-screens", h => crate::harness::screen::watch(h));
+    child!("goal-stacks", h => crate::goals::run(h));
     child!("harness", h => crate::harness::registry::Registry::run_local(h));
     child!("gitops-discover", h => crate::gitops::discover_loop(h));
     child!("gitops-poll", h => crate::gitops::poll_loop(h));
@@ -126,6 +135,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     child!("sync", h => h.sync_loop());
     child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
+    child!("in-step", h => crate::updates::in_step_loop(h));
     // Home-network discovery (multicast DNS): announce this server, list the kiln instances nearby.
     if cfg.discovery.enabled && (cfg.discovery.announce || cfg.discovery.browse) {
         child!("discovery", h => crate::discovery::Discovery::serve(h));

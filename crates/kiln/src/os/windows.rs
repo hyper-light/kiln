@@ -116,6 +116,9 @@ pub fn reexec(_exe: &Path, _args: &[std::ffi::OsString], _env: &[(&str, String)]
     io::Error::other("in-place upgrade is not supported on Windows")
 }
 
+/// Windows keeps a finished child's exit in its handle: there are no zombies to reap.
+pub fn start_reaper() {}
+
 pub fn pid_alive(_pid: u32) -> bool {
     false
 }

@@ -61,7 +61,8 @@ function modeRank(m: { id: string; label: string }): number | undefined {
   for (const raw of [m.id, m.label]) {
     const s = raw.toLowerCase().replace(/[^a-z]/g, "");
     if (!s) continue;
-    if (/dontask|donotask|neverask/.test(s)) return 4;
+    // It never asks, refusing whatever isn't already allowed: by read-only, not past auto.
+    if (/dontask|donotask|neverask|allowedonly/.test(s)) return 0.5;
     if (/^plan|readonly/.test(s)) return 0;
     if (/acceptedit|autoedit|editsok|allowedit/.test(s)) return 2;
     if (/^auto/.test(s)) return 3;
@@ -71,8 +72,8 @@ function modeRank(m: { id: string; label: string }): number | undefined {
 }
 
 /**
- * Read-only first, then ask, accept edits, auto, don't ask. Modes we don't recognise keep their
- * order after those; any that turn checks off come last.
+ * Read-only first, then the mode that refuses what isn't allowed, ask, accept edits, auto. Modes
+ * we don't recognise keep their order after those; any that turn checks off come last.
  */
 function byLatitude<T extends { id: string; label: string; dangerous?: boolean }>(modes: T[]): T[] {
   return modes

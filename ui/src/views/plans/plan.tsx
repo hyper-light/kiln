@@ -7,14 +7,15 @@ import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { api } from "@/api/client";
 import { harnessApi } from "@/api/harness";
-import { planHref, plansApi, shareUrl, type Plan, type PlanRan } from "@/api/plans";
+import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { CopyButton, ErrorState, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useDocumentTitle, useResource } from "@/lib/hooks";
 import { useAgents } from "@/views/harness/use-agents";
 import { Prose } from "@/views/harness/parts";
-import { planMarkdown, planSteps } from "./steps";
+import { PlanItemsEditor } from "./items";
+import { itemsMarkdown, planMarkdown, planSteps } from "./steps";
 import "./plans.css";
 
 const tagList = (s: string) =>
@@ -33,37 +34,41 @@ export default function PlanPage() {
 
   const [title, setTitle] = React.useState("");
   const [body, setBody] = React.useState("");
+  const [items, setItems] = React.useState<PlanItem[]>([]);
   const [tags, setTags] = React.useState("");
   // The saved plan the text here started from: changes are measured against it.
-  const [base, setBase] = React.useState<{ key: string; title: string; body: string; tags: string } | null>(null);
+  const [base, setBase] = React.useState<{ key: string; title: string; body: string; items: string; tags: string } | null>(null);
   const [preview, setPreview] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
   const take = React.useCallback((p: Plan) => {
-    const b = { key: keyOf(p), title: p.title, body: p.body, tags: p.tags.join(", ") };
+    const b = { key: keyOf(p), title: p.title, body: p.body, items: JSON.stringify(p.items ?? []), tags: p.tags.join(", ") };
     setBase(b);
     setTitle(b.title);
     setBody(b.body);
+    setItems(p.items ?? []);
     setTags(b.tags);
   }, []);
-  const dirty = isNew ? body.trim() !== "" || title.trim() !== "" : base !== null && (title !== base.title || body !== base.body || tagList(tags).join(",") !== tagList(base.tags).join(","));
+  const dirty = isNew
+    ? body.trim() !== "" || title.trim() !== "" || items.length > 0
+    : base !== null && (title !== base.title || body !== base.body || JSON.stringify(items) !== base.items || tagList(tags).join(",") !== tagList(base.tags).join(","));
   // Take the plan in when it arrives or changes, unless there are unsaved changes here.
   React.useEffect(() => {
     if (plan && keyOf(plan) !== base?.key && !dirty) take(plan);
   }, [plan, base, dirty, take]);
 
-  const steps = planSteps(body);
+  const steps = items.length ? items.map((it) => it.title || "Untitled step") : planSteps(body);
 
   const save = async () => {
     setBusy(true);
     setError(null);
     try {
       if (isNew) {
-        const p = await plansApi.create({ title, body, tags: tagList(tags) });
+        const p = await plansApi.create({ title, body, items, tags: tagList(tags) });
         navigate(planHref(p.id), { replace: true });
       } else {
-        const p = await plansApi.update(id, { title, body, tags: tagList(tags) });
+        const p = await plansApi.update(id, { title, body, items, tags: tagList(tags) });
         res.setData(() => p);
         take(p);
       }
@@ -97,21 +102,28 @@ export default function PlanPage() {
       <div className="plan-edit" data-preview={preview}>
         <div className="plan-text">
           <label htmlFor="plan-body" className="field-label">
-            Plan
+            {items.length ? "Overview" : "Plan"}
           </label>
           <textarea
             id="plan-body"
             className="plan-body"
+            data-short={items.length ? "" : undefined}
             value={body}
             onChange={(e) => setBody(e.target.value)}
-            placeholder={"Markdown. Each item of a top-level list is a step:\n\n1. Read the failing test\n2. Fix the parser\n3. Run the suite"}
+            placeholder={
+              items.length
+                ? "Why, and anything every step should know (optional)"
+                : "Markdown. Each item of a top-level list is a step:\n\n1. Read the failing test\n2. Fix the parser\n3. Run the suite\n\nOr add steps below: each with its description, examples, acceptance criteria and testing."
+            }
             spellCheck
           />
+          <div className="field-label plan-items-label">Steps</div>
+          <PlanItemsEditor items={items} onChange={setItems} idPrefix="plan-item" />
         </div>
         {preview && (
           <div className="plan-preview">
             <div className="field-label">Preview</div>
-            {body.trim() ? <Prose text={body} /> : <p className="plan-dim">Nothing yet.</p>}
+            {body.trim() || items.length ? <Prose text={[body.trim(), itemsMarkdown(items)].filter(Boolean).join("\n\n")} /> : <p className="plan-dim">Nothing yet.</p>}
             <div className="field-label plan-steps-label">{steps.length ? `${steps.length} step${steps.length === 1 ? "" : "s"}, as they run one by one` : "No steps: it runs as one message"}</div>
             {steps.length > 0 && (
               <ol className="plan-steps">
@@ -128,7 +140,7 @@ export default function PlanPage() {
       </label>
       <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="release, parser" hint="Separated by commas." />
       <div className="plan-actions">
-        <Button size="sm" disabled={!dirty || busy || !body.trim()} onClick={() => void save()}>
+        <Button size="sm" disabled={!dirty || busy || (!body.trim() && items.length === 0)} onClick={() => void save()}>
           {busy ? "Saving…" : isNew ? "Save plan" : "Save changes"}
         </Button>
         {!isNew && dirty && (
@@ -179,7 +191,7 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
   const [target, setTarget] = React.useState("local");
   const [kind, setKind] = React.useState("");
   const [cwd, setCwd] = React.useState("");
-  const [mode, setMode] = React.useState<"message" | "steps">("message");
+  const [mode, setMode] = React.useState<PlanMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -234,10 +246,15 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
         <SelectField
           label="As"
           value={mode}
-          onChange={(v) => setMode(v as "message" | "steps")}
+          onChange={(v) => setMode(v as PlanMode)}
           options={[
             { value: "message", label: "One message" },
-            ...(plan.steps.length ? [{ value: "steps", label: `Step by step (${plan.steps.length} messages, each after the last turn ends)` }] : []),
+            ...(plan.steps.length
+              ? [
+                  { value: "steps", label: `Step by step (${plan.steps.length} messages, each after the last turn ends)` },
+                  { value: "goals", label: `Goals (${plan.steps.length}, each a /goal once the one before is met)` },
+                ]
+              : []),
           ]}
         />
       </div>
@@ -249,7 +266,8 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
         {error && <span className="plan-error">{error}</span>}
         {ran && (
           <span className="plan-ok">
-            Sent {ran.sent === 1 ? "the plan" : `${ran.sent} messages`} · <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
+            {mode === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`} ·{" "}
+            <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
           </span>
         )}
       </div>
@@ -277,7 +295,7 @@ function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void
     }
   };
   const exportMd = () => {
-    const blob = new Blob([planMarkdown(plan.title, plan.body)], { type: "text/markdown" });
+    const blob = new Blob([planMarkdown(plan.title, plan.body, plan.items ?? [])], { type: "text/markdown" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = `${plan.title.replace(/[^\w.-]+/g, "-").replace(/^-+|-+$/g, "") || "plan"}.md`;

@@ -137,7 +137,9 @@ These hold for every line written under this spec.
   format only the files you changed).
 - **Merging and deploying.** Work happens in a worktree per workstream. When it passes the checks,
   the coordinating session merges it into `main` and builds the server image
-  (`docker build -q -t kiln:<sha> .` from main's checkout). Rolling the image out to the cluster
+  (`docker build -q --build-arg KILN_COMMIT=$(git rev-parse HEAD) -t kiln:<sha> .` from main's
+  checkout; with the commit, the server builds every other platform from it, docs/releases.md).
+  Rolling the image out to the cluster
   (`deploy-image.sh kiln:<sha>`) is a production deploy: the user runs or approves it, so hand
   them the exact command; never ask another session to deploy for you. Runner restarts kill the
   shells running in kiln terminals, Claude Code sessions included: never restart or swap a runner
