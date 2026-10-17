@@ -333,3 +333,22 @@ fn objects_argo_cd_deployed_are_found_by_its_tracking_name() {
     let s = status(&h, "default/web");
     assert_eq!(s.map(|s| (s.sync, s.resources, s.out_of_sync)), Some((Sync::Synced, 1, 0)), "{s:?}");
 }
+
+#[test]
+fn crds_deployed_by_argo_cd_carry_no_tracking_and_still_compare_synced() {
+    let (mut h, git) = harness(fast());
+    let crd = json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition", "metadata": {"name": "widgets.example.com"},
+        "spec": {"group": "example.com", "names": {"kind": "Widget", "plural": "widgets"}, "scope": "Namespaced", "versions": [{"name": "v1", "served": true, "storage": true}]}});
+    if let Some(c) = h.clusters.get_mut("dev") {
+        let _ = c.apply(0, crd.clone(), "argocd-controller", false);
+    }
+    let mut a = AppConfig::new("default/crds", "dev", "web");
+    a.tracking = crate::model::Tracking::ArgoAnnotation;
+    a.tracking_name = Some("crds".into());
+    a.read_only = true;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "default/crds", "r1", vec![crd]);
+    h.run_for(5_000);
+    let s = status(&h, "default/crds");
+    assert_eq!(s.map(|s| (s.sync, s.out_of_sync)), Some((Sync::Synced, 0)), "{s:?}");
+}

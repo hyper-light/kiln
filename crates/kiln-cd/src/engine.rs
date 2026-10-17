@@ -427,6 +427,8 @@ struct Res {
     state: ResState,
     /// What it last added to its app's counts: (differs, health, desired).
     counted: Option<(bool, Option<Health>, bool)>,
+    /// Where it differs, when it does.
+    why: Option<Box<str>>,
 }
 
 struct Live {
@@ -471,6 +473,8 @@ pub struct ResourceView {
     pub message: Option<String>,
     /// Whether it is a hook.
     pub hook: bool,
+    /// Where it differs, when it does (`.spec.replicas differs`).
+    pub why: Option<String>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1254,7 +1258,7 @@ impl Engine {
         if let Some(&ix) = cl.index.get(&key) {
             return ix;
         }
-        let res = Res { key: key.clone(), app: None, desired: None, live: None, state: ResState::None, counted: None };
+        let res = Res { key: key.clone(), app: None, desired: None, live: None, state: ResState::None, counted: None, why: None };
         let ix = match cl.free.pop() {
             Some(ix) => {
                 if let Some(slot) = cl.res.get_mut(ix as usize) {
@@ -1296,19 +1300,38 @@ impl Engine {
     }
 
     fn decorate(&self, app: &App, key: &ResKey, v: &mut Value) {
-        if let Some(meta) = obj::ensure_map(v, &["metadata"])
-            && !key.namespace.is_empty() {
+        // Argo CD's tracking id names the object's own namespace, or the app's destination
+        // namespace when it has none, cluster-scoped objects included.
+        let rendered_ns = obj::namespace(v).to_owned();
+        let tracking_ns = if !key.namespace.is_empty() {
+            key.namespace.to_string()
+        } else if !rendered_ns.is_empty() {
+            rendered_ns
+        } else {
+            app.cfg.namespace.to_string()
+        };
+        let tracking = format!("{}:{}/{}:{}/{}", app.cfg.tracked_as(), key.group, key.kind, tracking_ns, key.name);
+        if let Some(meta) = obj::ensure_map(v, &["metadata"]) {
+            if key.namespace.is_empty() {
+                // The API server drops a cluster-scoped object's namespace; comparing it would
+                // read as drift forever.
+                meta.remove("namespace");
+            } else {
                 meta.insert("namespace".into(), Value::String(key.namespace.to_string()));
             }
+        }
         match app.cfg.tracking {
             Tracking::Kiln => {
                 if let Some(labels) = obj::ensure_map(v, &["metadata", "labels"]) {
                     labels.insert(APP_LABEL.into(), Value::String(app.label.to_string()));
                 }
                 if let Some(ann) = obj::ensure_map(v, &["metadata", "annotations"]) {
-                    ann.insert(TRACKING.into(), Value::String(format!("{}:{}", app.cfg.tracked_as(), key.tracking())));
+                    ann.insert(TRACKING.into(), Value::String(tracking));
                 }
             }
+            // Argo CD tracks CRDs by their place in the manifests, never by metadata.
+            Tracking::ArgoAnnotation | Tracking::ArgoAnnotationAndLabel | Tracking::ArgoLabel
+                if &*key.group == "apiextensions.k8s.io" && &*key.kind == "CustomResourceDefinition" => {}
             Tracking::ArgoLabel => {
                 if let Some(labels) = obj::ensure_map(v, &["metadata", "labels"]) {
                     labels.insert(ARGO_INSTANCE.into(), Value::String(app.cfg.tracked_as().to_owned()));
@@ -1316,7 +1339,7 @@ impl Engine {
             }
             Tracking::ArgoAnnotation | Tracking::ArgoAnnotationAndLabel => {
                 if let Some(ann) = obj::ensure_map(v, &["metadata", "annotations"]) {
-                    ann.insert(ARGO_TRACKING.into(), Value::String(format!("{}:{}", app.cfg.tracked_as(), key.tracking())));
+                    ann.insert(ARGO_TRACKING.into(), Value::String(tracking));
                 }
                 if app.cfg.tracking == Tracking::ArgoAnnotationAndLabel
                     && let Some(labels) = obj::ensure_map(v, &["metadata", "labels"]) {
@@ -1331,7 +1354,7 @@ impl Engine {
     fn owner_of(&self, key: &ResKey, v: &Value) -> Option<AppIx> {
         for ann in [TRACKING, ARGO_TRACKING] {
             if let Some((app_id, rest)) = obj::annotation(v, ann).and_then(|t| t.split_once(':'))
-                && rest == key.tracking()
+                && tracking_names(rest, key)
             {
                 return self.app_by_tracking.get(app_id).copied();
             }
@@ -1454,26 +1477,27 @@ impl Engine {
 
     /// Compares a resource again and updates its app's counts.
     fn recompare(&mut self, c: ClusterIx, ix: ResIx) {
-        let state = self.classify(c, ix);
+        let (state, why) = self.classify(c, ix);
         self.uncount(c, ix);
         if let Some(res) = self.res_mut(c, ix) {
             res.state = state;
+            res.why = why;
         }
         self.count(c, ix);
     }
 
-    fn classify(&mut self, c: ClusterIx, ix: ResIx) -> ResState {
-        let Some(res) = self.res(c, ix) else { return ResState::None };
-        let Some(a) = res.app else { return ResState::None };
-        let Some(app) = self.app(a) else { return ResState::None };
+    fn classify(&mut self, c: ClusterIx, ix: ResIx) -> (ResState, Option<Box<str>>) {
+        let Some(res) = self.res(c, ix) else { return (ResState::None, None) };
+        let Some(a) = res.app else { return (ResState::None, None) };
+        let Some(app) = self.app(a) else { return (ResState::None, None) };
         match (&res.desired, &res.live) {
-            (None, Some(l)) if l.hook => ResState::None,
-            (None, Some(_)) => ResState::Prune,
-            (None, None) => ResState::None,
-            (Some(_), None) => ResState::Missing,
+            (None, Some(l)) if l.hook => (ResState::None, None),
+            (None, Some(_)) => (ResState::Prune, Some("not in git: requires pruning".into())),
+            (None, None) => (ResState::None, None),
+            (Some(_), None) => (ResState::Missing, Some("not in the cluster".into())),
             (Some(_), Some(l)) => {
-                let Some(d) = self.desired_object(app, res) else { return ResState::OutOfSync };
-                let Ok(live) = l.blob.decode() else { return ResState::OutOfSync };
+                let Some(d) = self.desired_object(app, res) else { return (ResState::OutOfSync, Some("the rendered object can't be read".into())) };
+                let Ok(live) = l.blob.decode() else { return (ResState::OutOfSync, Some("the live object can't be read".into())) };
                 let cfg = app.cfg.clone();
                 self.stats.comparisons += 1;
                 let view = LiveView::new(live, &cfg.manager);
@@ -1488,8 +1512,15 @@ impl Engine {
                     diff::compare(&d2, &l2, owned.as_ref())
                 };
                 match verdict {
-                    Verdict::Synced => ResState::Synced,
-                    Verdict::OutOfSync { .. } => ResState::OutOfSync,
+                    Verdict::Synced => (ResState::Synced, None),
+                    Verdict::OutOfSync { path, why } => {
+                        let what = match why {
+                            diff::Why::Missing => "is missing live",
+                            diff::Why::Differs => "differs",
+                            diff::Why::Removed => "is no longer set; the next apply removes it",
+                        };
+                        (ResState::OutOfSync, Some(format!("{path} {what}").into_boxed_str()))
+                    }
                 }
             }
         }
@@ -1627,6 +1658,7 @@ impl Engine {
                 health: if r.state == ResState::Missing { Some(Health::Missing) } else { r.live.as_ref().and_then(|l| l.health) },
                 message: r.live.as_ref().and_then(|l| l.message.as_deref().map(str::to_owned)),
                 hook: r.live.as_ref().is_some_and(|l| l.hook),
+                why: r.why.as_deref().map(str::to_owned),
             })
             .collect();
         out.sort_by(|x, y| x.key.cmp(&y.key));
@@ -2486,6 +2518,15 @@ impl Engine {
             }
         }
     }
+}
+
+/// Whether a tracking id's object part (`group/kind:namespace/name`) names `key`. The namespace
+/// counts only for namespaced kinds: Argo CD writes one for cluster-scoped objects too.
+fn tracking_names(rest: &str, key: &ResKey) -> bool {
+    let Some((gk, nsname)) = rest.split_once(':') else { return false };
+    let Some((g, k)) = gk.split_once('/') else { return false };
+    let Some((ns, name)) = nsname.split_once('/') else { return false };
+    g == &*key.group && k == &*key.kind && name == &*key.name && (key.namespace.is_empty() || ns == &*key.namespace)
 }
 
 fn op_status(op: &Op) -> OpStatus {

@@ -200,13 +200,16 @@ pub fn label<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     map_at(v, &["metadata", "labels"])?.get(key)?.as_str()
 }
 
-/// The mutable object at `path`, made (as empty objects) where it is missing. `None` when
-/// something on the way is not an object.
+/// The mutable object at `path`, made (as empty objects) where it is missing or null (charts
+/// render `annotations: null`). `None` when something on the way is another kind of value.
 pub fn ensure_map<'a>(v: &'a mut Value, path: &[&str]) -> Option<&'a mut Map<String, Value>> {
     let mut cur = v;
     for key in path {
         let map = cur.as_object_mut()?;
         cur = map.entry((*key).to_owned()).or_insert_with(|| Value::Object(Map::new()));
+        if cur.is_null() {
+            *cur = Value::Object(Map::new());
+        }
     }
     cur.as_object_mut()
 }
@@ -503,6 +506,15 @@ mod tests {
             key_of(&crb, &mut i, "web", &s).map(|k| k.tracking()),
             Some("rbac.authorization.k8s.io/ClusterRoleBinding:/x".to_owned())
         );
+    }
+
+    #[test]
+    fn null_maps_become_maps() {
+        let mut v = json!({"metadata": {"annotations": null}});
+        if let Some(a) = ensure_map(&mut v, &["metadata", "annotations"]) {
+            a.insert("k".into(), json!("v"));
+        }
+        assert_eq!(v, json!({"metadata": {"annotations": {"k": "v"}}}));
     }
 
     #[test]

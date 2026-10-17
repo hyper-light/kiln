@@ -5,6 +5,7 @@ pub mod agent;
 pub mod aisessions;
 pub mod api;
 pub mod autodetect;
+pub mod cd;
 pub mod http;
 pub mod kubeapi;
 pub mod config;

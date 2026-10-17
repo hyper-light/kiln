@@ -76,6 +76,9 @@ impl AppDef {
         c.tracking = self.tracking;
         if self.tracking != Tracking::Kiln {
             c.tracking_name = Some(self.name.as_str().into());
+            // Adopted from Argo CD: apply as Argo CD's own field manager, so what Argo CD owned
+            // stays owned (and removable) after the take-over.
+            c.manager = "argocd-controller".into();
         }
         if self.sync.options.create_namespace == Some(true) {
             let m = self.managed_namespace.clone().unwrap_or_default();

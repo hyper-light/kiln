@@ -68,8 +68,9 @@ const SERVER_METADATA: &[&str] = &[
 ];
 
 /// Prepares a rendered object for comparison and for applying: drops `status` and the fields the
-/// server sets, drops nulls (an explicit null means "not set"), and folds a Secret's `stringData`
-/// into `data`, as the API server does on write.
+/// server sets, and folds a Secret's `stringData` into `data`, as the API server does on write.
+/// Explicit nulls stay: a server-side apply of `field: null` still owns the field, so an object a
+/// chart renders that way is applied, owned and compared as rendered (a null never reads as drift).
 pub fn normalize_desired(obj: &mut Value) {
     if let Some(m) = obj.as_object_mut() {
         m.remove("status");
@@ -79,26 +80,8 @@ pub fn normalize_desired(obj: &mut Value) {
             meta.remove(*k);
         }
     }
-    drop_nulls(obj);
     if obj::kind(obj) == "Secret" && obj::group(obj).is_empty() {
         fold_string_data(obj);
-    }
-}
-
-fn drop_nulls(v: &mut Value) {
-    match v {
-        Value::Object(m) => {
-            m.retain(|_, item| !item.is_null());
-            for item in m.values_mut() {
-                drop_nulls(item);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                drop_nulls(item);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -973,6 +956,18 @@ mod tests {
         assert_eq!(s.pointer("/data/a"), Some(&json!("aGk=")));
         assert_eq!(s.pointer("/data/b"), Some(&json!("eA==")));
         assert!(s.get("stringData").is_none());
+    }
+
+    #[test]
+    fn a_field_rendered_null_but_owned_is_not_removed() {
+        let mut d = json!({"apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": {"name": "n"},
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "livenessProbe": {"httpGet": {"path": "/", "httpHeaders": null}}}]}}}});
+        normalize_desired(&mut d);
+        let live = json!({"apiVersion": "apps/v1", "kind": "DaemonSet", "metadata": {"name": "n", "managedFields": [{"manager": "argocd-controller", "operation": "Apply",
+            "fieldsV1": {"f:spec": {"f:template": {"f:spec": {"f:containers": {"k:{\"name\":\"c\"}": {".": {}, "f:name": {}, "f:livenessProbe": {"f:httpGet": {"f:path": {}, "f:httpHeaders": {}}}}}}}}}}]},
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "livenessProbe": {"httpGet": {"path": "/", "port": 9100}}}]}}}});
+        let view = LiveView::new(live, "argocd-controller");
+        assert!(compare(&d, &view.object, view.owned("argocd-controller").as_ref()).synced());
     }
 
     #[test]

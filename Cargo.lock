@@ -1346,6 +1346,7 @@ dependencies = [
  "hyper-rt-transport",
  "hyper-transport",
  "k8s-openapi",
+ "kiln-cd",
  "mime_guess",
  "nix 0.31.3",
  "parking_lot",

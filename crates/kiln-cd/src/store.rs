@@ -78,7 +78,7 @@ pub struct Store {
     tx: mpsc::Sender<Request>,
     thread: Thread,
     join: Option<JoinHandle<()>>,
-    changes: Option<mpsc::Receiver<Change>>,
+    changes: parking_lot::Mutex<Option<mpsc::Receiver<Change>>>,
     outbox: Arc<parking_lot::Mutex<Vec<Message>>>,
     leader: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -149,12 +149,12 @@ impl Store {
             Ok(Err(e)) => return Err(e),
             Err(_) => bail!("the store did not start within 30 s"),
         }
-        Ok(Store { data, tx, thread, join: Some(join), changes: Some(crx), outbox, leader })
+        Ok(Store { data, tx, thread, join: Some(join), changes: parking_lot::Mutex::new(Some(crx)), outbox, leader })
     }
 
     /// The changes the store applies, for one follower (the first caller).
-    pub fn changes(&mut self) -> Option<mpsc::Receiver<Change>> {
-        self.changes.take()
+    pub fn changes(&self) -> Option<mpsc::Receiver<Change>> {
+        self.changes.lock().take()
     }
 
     /// Proposes a command; the answer comes once it is committed and applied.
@@ -356,7 +356,7 @@ mod tests {
     fn a_sole_member_commits_and_reopens_with_what_it_committed() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         {
-            let mut s = Store::open(tmp.path(), 1, &[1])?;
+            let s = Store::open(tmp.path(), 1, &[1])?;
             assert!(s.is_leader());
             let changes = s.changes().context("changes")?;
             for i in 0..50 {

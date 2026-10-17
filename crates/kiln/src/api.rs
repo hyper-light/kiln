@@ -177,6 +177,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     }
     let q = srv::query(&req);
     match (&method, s.as_slice()) {
+        (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, &method, rest, &q, req.into_body()).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
