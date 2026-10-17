@@ -864,6 +864,8 @@ fn join_info(hub: &Hub) -> Response {
             // No token: the machine asks to join and an admin approves it (verification code).
             "join": format!("curl -fsSL {url}/install.sh | sh -s -- --join"),
             "join_manual": format!("kiln join --server {url}"),
+            // Windows: install.ps1 without a token asks to join the same way.
+            "join_windows": format!("irm '{url}/install.ps1' | iex"),
             // One line per OS that downloads kiln from this server and installs the agent with the
             // join token (`install.sh` passes `--token`/`--labels` to `kiln install --agent`).
             "install": {

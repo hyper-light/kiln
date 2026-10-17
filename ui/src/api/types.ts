@@ -244,6 +244,8 @@ export interface JoinInfo {
   /** Token-free install that asks to join (an admin approves it with a verification code). */
   join?: string;
   join_manual?: string;
+  /** Windows: `irm <server>/install.ps1 | iex` (no token: asks to join with a verification code). */
+  join_windows?: string;
 }
 
 export type JoinRequestStatus = "pending" | "approved" | "denied";
