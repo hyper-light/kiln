@@ -21,6 +21,7 @@ import { money, plain, tildify } from "./derive";
 import { DiffStat } from "./diff";
 import { HarnessMark, StatusPill, ToolIcon } from "./parts";
 import { AccountLimits } from "./limits";
+import { AgentMenu } from "./actions";
 import { SpawnDialog } from "./spawn";
 import { useAgents } from "./use-agents";
 
@@ -99,6 +100,7 @@ const AgentCard = React.memo(function AgentCard({ a, selected, onSelect, now }: 
           </span>
         </button>
         <StatusPill status={a.status} className="ml-auto" />
+        <AgentMenu a={a} />
       </div>
 
       <button type="button" className="hx-card-body" onClick={() => navigate(`/agents/${a.id}`)}>
@@ -197,7 +199,18 @@ function Broadcast({ ids, agents, onDone }: { ids: string[]; agents: AgentInfo[]
       <div className="hx-broadcast-head">
         <span className="hx-eyebrow">To {ids.length} agents</span>
         <span className="hx-dim hx-trunc">{names.join(", ")}</span>
-        <button type="button" className="hx-icon ml-auto" aria-label="Clear selection" onClick={onDone}>
+        <Button
+          size="xs"
+          variant="danger"
+          className="ml-auto"
+          onClick={() => {
+            if (!window.confirm(`End ${ids.length} agent${ids.length === 1 ? "" : "s"}? Their processes stop on the machines.`)) return;
+            void Promise.allSettled(ids.map((id) => harnessApi.stop(id))).then(onDone);
+          }}
+        >
+          End {ids.length}
+        </Button>
+        <button type="button" className="hx-icon" aria-label="Clear selection" onClick={onDone}>
           <X size={13} />
         </button>
       </div>
@@ -307,6 +320,19 @@ export default function Mission() {
 
       <div className="hx-section-head mt-8">
         <span className="hx-eyebrow">Agents</span>
+        {agents.some((a) => a.status === "exited") && (
+          <Button
+            size="xs"
+            variant="ghost"
+            className="ml-auto"
+            onClick={() => {
+              const gone = agents.filter((a) => a.status === "exited");
+              void Promise.allSettled(gone.map((a) => harnessApi.stop(a.id))).then(() => reload());
+            }}
+          >
+            Clear stopped ({agents.filter((a) => a.status === "exited").length})
+          </Button>
+        )}
         {agents.length > 0 && (
           <Segmented<Group>
             label="Group agents"

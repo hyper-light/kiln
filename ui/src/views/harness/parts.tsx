@@ -1,23 +1,10 @@
 /** Small shared pieces of the agent views: harness marks, status, tool icons, prose. */
 import * as React from "react";
 import "./harness.css";
-import {
-  Bot,
-  FilePen,
-  FileText,
-  Globe,
-  ListChecks,
-  Map as MapIcon,
-  MessageCircleQuestion,
-  Plug,
-  Search,
-  Sparkles,
-  SquareTerminal,
-  Wrench,
-  type LucideIcon,
-} from "lucide-react";
+import { Bot, FilePen, FileText, Globe, ListChecks, Map as MapIcon, MessageCircleQuestion, Plug, Search, Sparkles, SquareTerminal, Wrench, type LucideIcon } from "lucide-react";
 import type { Status, ToolKind } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/views/terminal/clipboard";
 
 /** A neutral two-letter mark per harness (never a vendor's logo). */
 const MARKS: Record<string, { code: string; hue: string }> = {
@@ -87,6 +74,25 @@ export function ToolIcon({ kind, size = 14, className }: { kind: ToolKind; size?
   return <I size={size} className={className} aria-hidden="true" />;
 }
 
+/** A small Copy button for a block of code or output. */
+export function CopyBlock({ text, className }: { text: string; className?: string }) {
+  const [done, setDone] = React.useState(false);
+  return (
+    <button
+      type="button"
+      className={cn("hx-copy", className)}
+      onClick={() =>
+        void copyText(text).then((ok) => {
+          setDone(ok);
+          if (ok) window.setTimeout(() => setDone(false), 1500);
+        })
+      }
+    >
+      {done ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
 /* ------------------------------------------------------------------ prose */
 
 /** Inline markdown: `code`, **bold**, *em*, [links](url). Text only; nothing is injected as HTML. */
@@ -133,9 +139,12 @@ export const Prose = React.memo(function Prose({ text, className }: { text: stri
         while (i < lines.length && !/^\s*```/.test(lines[i] ?? "")) body.push(lines[i++] ?? "");
         i++;
         out.push(
-          <pre key={key} className="hx-pre" data-lang={fence[1] || undefined}>
-            <code>{body.join("\n")}</code>
-          </pre>,
+          <div key={key} className="hx-pre-wrap">
+            <CopyBlock text={body.join("\n")} />
+            <pre className="hx-pre" data-lang={fence[1] || undefined}>
+              <code>{body.join("\n")}</code>
+            </pre>
+          </div>,
         );
         continue;
       }
@@ -190,9 +199,12 @@ export function Output({ text, truncated, error }: { text: string; truncated?: b
     if (el) el.scrollTop = el.scrollHeight;
   }, [text]);
   return (
-    <pre ref={ref} className="hx-out" data-error={error || undefined}>
-      {truncated && <span className="hx-out-cut">… earlier output omitted …{"\n"}</span>}
-      {text || " "}
-    </pre>
+    <div className="hx-pre-wrap">
+      {text && <CopyBlock text={text} />}
+      <pre ref={ref} className="hx-out" data-error={error || undefined}>
+        {truncated && <span className="hx-out-cut">… earlier output omitted …{"\n"}</span>}
+        {text || " "}
+      </pre>
+    </div>
   );
 }

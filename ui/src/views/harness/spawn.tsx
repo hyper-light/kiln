@@ -167,8 +167,8 @@ export function SpawnDialog({
   open: boolean;
   onOpenChange: (o: boolean) => void;
   onStarted: (agents: AgentInfo[]) => void;
-  /** Start inside this shell (its machine and folder). */
-  defaults?: { target?: string; shell?: string; cwd?: string };
+  /** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
+  defaults?: { target?: string; shell?: string; cwd?: string; kind?: string };
 }) {
   const [machines, setMachines] = React.useState<Agent[]>([]);
   const [shells, setShells] = React.useState<TerminalSessionInfo[]>([]);
@@ -194,6 +194,7 @@ export function SpawnDialog({
     setError(null);
     setPicked(defaults?.target ?? null);
     setShell(defaults?.shell ?? "");
+    if (defaults?.kind) setKind(defaults.kind);
     setByTarget(null);
     harnessApi.kindsAll().then(setByTarget, () => setByTarget({}));
     api.agents().then(

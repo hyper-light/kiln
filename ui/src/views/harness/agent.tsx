@@ -14,6 +14,7 @@ import { errorMessage, useDocumentTitle, useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { ApprovalCard } from "./approval";
 import { Composer } from "./composer";
+import { useAgentActions } from "./actions";
 import { SettingsButton, SettingsSheet, useAttachments } from "./controls";
 import { money, tildify } from "./derive";
 import { Inspector, type InspectorTab } from "./inspector";
@@ -88,6 +89,18 @@ export default function AgentPage() {
   useDocumentTitle(info ? `${info.name} · Agents` : "Agent");
 
   const cwd = state?.cwd || info?.cwd || "";
+  const actions = useAgentActions(
+    {
+      id,
+      name: info?.name ?? "this agent",
+      status: state?.status ?? info?.status ?? "starting",
+      kind: info?.kind ?? "claude",
+      target: info?.target ?? "local",
+      cwd,
+      harness_session: state?.harness_session ?? info?.harness_session,
+    },
+    { onGone: () => navigate("/agents") },
+  );
   const status = state?.status ?? info?.status ?? "starting";
   const features = meta?.features ?? [];
   const approvals = state?.approvals ?? [];
@@ -225,10 +238,15 @@ export default function AgentPage() {
               <span className="hidden lg:inline">Shell</span>
             </Button>
           )}
-          <Button size="sm" variant="ghost" onClick={() => setConfirmStop(true)} aria-label="Stop the agent">
-            <Power />
-            <span className="hidden lg:inline">End</span>
+          {status === "exited" ? (
+            <Button size="sm" variant="secondary" onClick={() => send({ type: "restart" })}>
+              <RotateCcw /> Restart
+            </Button>
+          ) : null}
+          <Button size="sm" variant="ghost" onClick={actions.end} aria-label={actions.live ? "End the agent" : "Remove the agent"}>
+            <Power /> {actions.live ? "End" : "Remove"}
           </Button>
+          {actions.menu()}
         </div>
       </header>
 
@@ -289,6 +307,7 @@ export default function AgentPage() {
       )}
 
       <SettingsSheet open={settings} onOpenChange={setSettings} meta={meta} state={state} send={send} />
+      {actions.dialogs}
       <ConfirmDialog
         open={confirmStop}
         onOpenChange={setConfirmStop}

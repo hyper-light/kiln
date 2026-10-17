@@ -2382,3 +2382,32 @@ textarea.hx-input {
   font-weight: 500;
   color: #f4e0e1;
 }
+
+.hx-pre-wrap {
+  position: relative;
+}
+.hx-copy {
+  position: absolute;
+  z-index: 1;
+  top: 6px;
+  right: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid #2a2c33;
+  border-radius: 7px;
+  background: #121317;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--color-secondary);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.hx-pre-wrap:hover .hx-copy,
+.hx-copy:focus-visible {
+  opacity: 1;
+}
+@media (pointer: coarse) {
+  .hx-copy {
+    opacity: 1;
+  }
+}
