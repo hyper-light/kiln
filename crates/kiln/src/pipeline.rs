@@ -316,6 +316,113 @@ fn yaml_scalar(v: &serde_yaml::Value) -> String {
     }
 }
 
+/// A kiln-dialect workflow, read by the new front end (docs/ci.md W02), as v1's model: the bridge
+/// that proves the new reader sees every v1 file as v1 does (W02-AC04) until W04's planner
+/// replaces [`plan`]. Workflows that use what v1 can't express are refused, naming the key.
+pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
+    use kiln_ci::wf::ir::{Axis, Matrix, RunsOn, YVal};
+    let num = |v: &YVal, what: &str| match v {
+        YVal::Num(n) if *n >= 0.0 && n.fract() == 0.0 && *n <= f64::from(u32::MAX) => Ok(*n as u32),
+        _ => Err(format!("{what} is not a whole number v1 can read")),
+    };
+    let map = |m: &[(String, kiln_ci::wf::ir::Tpl)]| m.iter().map(|(k, v)| (k.clone(), v.src.clone())).collect::<BTreeMap<_, _>>();
+    let mut on = Triggers { manual: false, ..Triggers::default() };
+    for t in &wf.on {
+        let filter = |branches: &Option<Vec<String>>| RefFilter { branches: branches.clone().unwrap_or_default(), paths: t.paths.clone().unwrap_or_default() };
+        match t.event.as_str() {
+            "push" if t.tags.is_some() => on.tag = Some(filter(&t.tags.as_ref().map(|v| v.iter().filter(|g| *g != "*").cloned().collect()))),
+            "push" => on.push = Some(filter(&t.branches)),
+            "pull_request" => on.pull_request = Some(filter(&t.branches)),
+            "schedule" => on.schedule.extend(t.schedules.iter().map(|s| s.cron.clone())),
+            "workflow_dispatch" => on.manual = true,
+            e => return Err(format!("on.{e} is not a v1 event")),
+        }
+    }
+    let concurrency = wf.concurrency.as_ref().map(|c| Concurrency { group: c.group.src.clone(), cancel_in_progress: c.cancel_in_progress.as_ref().and_then(YVal::as_bool).unwrap_or(false) });
+    let mut jobs = BTreeMap::new();
+    for j in &wf.jobs {
+        let at = |k: &str| format!("jobs.{}.{k}", j.id);
+        let runs_on = match &j.runs_on {
+            Some(RunsOn::Labels(l)) => l.iter().map(|t| t.src.clone()).collect(),
+            Some(RunsOn::Group { .. }) => return Err(format!("{} uses a runner group", at("runs-on"))),
+            None => default_runs_on(),
+        };
+        let mut matrix = BTreeMap::new();
+        match j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
+            Some(Matrix::Spec(m)) if m.include.is_none() && m.exclude.is_none() && m.filter.is_none() && m.platforms.is_none() => {
+                for (k, a) in &m.axes {
+                    let Axis::Values(vals) = a else { return Err(format!("{} is an expression", at(&format!("matrix.{k}")))) };
+                    matrix.insert(k.clone(), vals.iter().map(yaml_value).collect());
+                }
+            }
+            Some(_) => return Err(format!("{} uses more than v1's axes", at("matrix"))),
+            None => {}
+        }
+        let resources = match &j.kiln.resources {
+            Some(YVal::Map(m)) => {
+                let get = |k: &str| m.iter().find(|(x, _)| x == k).map(|(_, v)| yaml_scalar(&yaml_value(v)));
+                Resources { cpu: get("cpu"), memory: get("memory") }
+            }
+            Some(_) => return Err(format!("{} is not a mapping", at("resources"))),
+            None => Resources::default(),
+        };
+        let retries = match j.kiln.retry.as_ref().and_then(|r| r.get("max")) {
+            Some(n) => num(n, &at("retries"))?,
+            None => 0,
+        };
+        let mut steps = Vec::new();
+        for (i, s) in j.steps.iter().enumerate() {
+            let sat = at(&format!("steps[{i}]"));
+            let run = s.run.as_ref().ok_or_else(|| format!("{sat} has no `run`: v1 steps are commands"))?;
+            steps.push(StepSpec {
+                name: s.name.as_ref().map(|t| t.src.clone()),
+                run: run.src.clone(),
+                shell: s.shell.as_ref().map(|t| t.src.clone()),
+                env: map(&s.env),
+                working_directory: s.working_directory.as_ref().map(|t| t.src.clone()),
+                timeout_minutes: s.timeout_minutes.as_ref().map(|n| num(n, &format!("{sat}.timeout-minutes"))).transpose()?,
+                continue_on_error: s.continue_on_error.as_ref().and_then(YVal::as_bool).unwrap_or(false),
+                tty: s.kiln.tty,
+            });
+        }
+        let spec = JobSpec {
+            name: j.name.as_ref().map(|t| t.src.clone()),
+            runs_on,
+            needs: j.needs.iter().map(|n| n.job().to_owned()).collect(),
+            toolchain: j.kiln.toolchain.clone(),
+            image: j.kiln.image.as_ref().map(|t| t.src.clone()),
+            env: map(&j.env),
+            matrix,
+            timeout_minutes: j.timeout_minutes.as_ref().map(|n| num(n, &at("timeout-minutes"))).transpose()?.unwrap_or_else(default_timeout),
+            retries,
+            resources,
+            condition: j.cond.as_ref().map(|t| t.src.clone()),
+            exclusive: j.kiln.exclusive,
+            artifacts: j.kiln.artifacts.clone(),
+            cache: j.kiln.cache.iter().map(|c| c.as_str().map(str::to_owned).ok_or_else(|| format!("{} holds more than directories", at("cache")))).collect::<Result<_, _>>()?,
+            steps,
+        };
+        jobs.insert(j.id.clone(), spec);
+    }
+    let p = Pipeline { name: wf.name.clone().unwrap_or_default(), on, env: map(&wf.env), concurrency, jobs };
+    validate(&p).map_err(|e| e.to_string())?;
+    Ok(p)
+}
+
+/// A value of the new model as v1 read it: whole numbers are integers, as YAML wrote them.
+fn yaml_value(v: &kiln_ci::wf::ir::YVal) -> serde_yaml::Value {
+    use kiln_ci::wf::ir::YVal;
+    match v {
+        YVal::Null => serde_yaml::Value::Null,
+        YVal::Bool(b) => serde_yaml::Value::Bool(*b),
+        YVal::Num(n) if n.fract() == 0.0 && n.abs() < 9.0e15 => serde_yaml::Value::Number((*n as i64).into()),
+        YVal::Num(n) => serde_yaml::Value::Number((*n).into()),
+        YVal::Str(t) => serde_yaml::Value::String(t.src.clone()),
+        YVal::Seq(s) => serde_yaml::Value::Sequence(s.iter().map(yaml_value).collect()),
+        YVal::Map(m) => serde_yaml::Value::Mapping(m.iter().map(|(k, v)| (serde_yaml::Value::String(k.clone()), yaml_value(v))).collect()),
+    }
+}
+
 /// Expand matrices and interpolate expressions. `needs` are rewritten to matrix-expanded keys so a
 /// job depending on a matrix job waits for every leg.
 pub fn plan(p: &Pipeline, base: &Context) -> Result<Vec<PlannedJob>, SpecError> {

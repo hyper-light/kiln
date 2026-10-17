@@ -75,8 +75,18 @@ enum Cmd {
         #[command(flatten)]
         server: ServerArgs,
     },
-    /// Validate a pipeline file and show the planned jobs.
-    Validate { file: PathBuf },
+    /// Check workflows (GitHub's or kiln's), overlays and actions: each problem as
+    /// `file:line:col: severity code: message`, then each workflow's jobs. Exits 1 on any error.
+    Validate {
+        /// Read every file as a workflow of this dialect instead of by where it is.
+        #[arg(long, value_parser = ["gha", "kiln"])]
+        dialect: Option<String>,
+        /// Print JSON: one object per file.
+        #[arg(long)]
+        json: bool,
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
     /// Print the default configuration.
     DefaultConfig,
     /// Show server health and queue state.
@@ -215,6 +225,14 @@ async fn run_agent(opts: kiln::agent::Opts, shutdown: Shutdown) -> anyhow::Resul
 fn out(s: &str) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stdout(), "{s}");
+}
+
+/// A file's path as its repository sees it (from `.github/` or `.kiln/` on), which decides what
+/// it is (docs/ci.md W02-R01); any other path as given.
+fn repo_path(file: &std::path::Path) -> String {
+    let s = format!("/{}", file.to_string_lossy().replace('\\', "/"));
+    let at = ["/.github/", "/.kiln/"].iter().filter_map(|m| s.rfind(m)).max();
+    at.and_then(|i| s.get(i + 1..)).unwrap_or(s.trim_start_matches('/')).trim_start_matches("./").to_owned()
 }
 
 fn main() -> ExitCode {
@@ -417,22 +435,54 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             out(&format!("Password set. Sign in at {} from any device.", t.public_url.as_deref().unwrap_or(&t.url)));
             Ok(())
         }
-        Cmd::Validate { file } => {
-            let src = std::fs::read_to_string(&file)?;
-            let p = kiln::pipeline::parse(&src)?;
-            let mut ctx = kiln::pipeline::Context::default();
-            ctx.set("git.sha", "0000000000000000000000000000000000000000");
-            ctx.set("branch", "main");
-            let jobs = kiln::pipeline::plan(&p, &ctx)?;
-            out(&format!("{}: valid — {} job(s)", file.display(), jobs.len()));
-            for j in jobs {
-                out(&format!(
-                    "  {:<40} runs-on [{}]  needs [{}]  {} step(s)",
-                    j.display,
-                    j.labels.join(", "),
-                    j.needs.join(", "),
-                    j.steps.len()
-                ));
+        Cmd::Validate { dialect, json, files } => {
+            use kiln_ci::expr::Dialect;
+            let dialect = dialect.map(|d| if d == "gha" { Dialect::Gha } else { Dialect::Kiln });
+            let (mut errors, mut all) = (0usize, Vec::new());
+            for file in &files {
+                let src = std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+                let c = kiln_ci::wf::check(&repo_path(file), &src, dialect);
+                let name = file.display().to_string();
+                let errs = c.diagnostics.iter().filter(|d| d.is_error()).count();
+                errors += errs;
+                if json {
+                    all.push(serde_json::json!({ "file": name, "check": c }));
+                    continue;
+                }
+                for d in &c.diagnostics {
+                    out(&d.render(&name));
+                }
+                let jobs = c.outline.as_ref().and_then(|o| o["jobs"].as_array()).cloned().unwrap_or_default();
+                let dialect = if c.dialect == Dialect::Gha { "GitHub" } else { "kiln" };
+                let shape = match (c.kind, &c.outline) {
+                    ("workflow", Some(_)) => format!("{dialect} workflow, {} job(s)", jobs.len()),
+                    ("workflow", None) => format!("{dialect} workflow"),
+                    (kind, _) => kind.to_owned(),
+                };
+                let verdict = match (errs, c.diagnostics.len() - errs) {
+                    (0, 0) => "valid".to_owned(),
+                    (0, w) => format!("valid, {w} warning(s)"),
+                    (e, w) => format!("{e} error(s), {w} warning(s)"),
+                };
+                out(&format!("{name}: {shape}: {verdict}"));
+                for j in &jobs {
+                    let list = |k: &str| j[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                    let legs = match &j["legs_estimate"] {
+                        serde_json::Value::Number(n) => format!("{n} leg(s)"),
+                        _ => "legs from a matrix expression".to_owned(),
+                    };
+                    let on = match j["uses"].as_str() {
+                        Some(u) => format!("uses {u}"),
+                        None => format!("runs-on [{}]", list("runs_on")),
+                    };
+                    out(&format!("  {:<32} {on}  needs [{}]  {} step(s)  {legs}", j["id"].as_str().unwrap_or_default(), list("needs"), j["steps"]));
+                }
+            }
+            if json {
+                out(&serde_json::to_string_pretty(&all)?);
+            }
+            if errors > 0 {
+                anyhow::bail!("{errors} error(s)");
             }
             Ok(())
         }

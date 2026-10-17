@@ -11,9 +11,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use http::StatusCode;
+use http::{Method, StatusCode};
 
-use super::Fail;
+use super::{Fail, workflows};
 use crate::http::server::{Request, Response};
 use crate::hub::Hub;
 
@@ -33,6 +33,13 @@ pub fn is_open(seg: &[&str]) -> bool {
 
 /// `/api/ci/<rest>`, authenticated.
 pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
-    let _ = (hub, q, req);
-    Err((StatusCode::NOT_FOUND, format!("no such CI route: /api/ci/{}", rest.join("/"))))
+    let method = req.method().clone();
+    match (&method, rest) {
+        // W02: workflows.
+        (&Method::POST, ["validate"]) => workflows::validate(req.into_body()).await,
+        (&Method::GET, ["schema", kind]) => workflows::schema(kind),
+        (&Method::GET, ["repos", repo, "workflows"]) => workflows::list(hub, repo, q).await,
+        (&Method::GET, ["repos", repo, "workflows", path @ ..]) => workflows::get(hub, repo, &path.join("/"), q).await,
+        _ => Err((StatusCode::NOT_FOUND, format!("no such CI route: {method} /api/ci/{}", rest.join("/")))),
+    }
 }

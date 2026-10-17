@@ -3,6 +3,8 @@
 //! adds one line here and one arm in [`api`].
 
 pub mod api;
+pub mod load;
+pub mod workflows;
 
 /// A failure: an HTTP status and why (as `cd::ops::Fail`).
 pub type Fail = (http::StatusCode, String);

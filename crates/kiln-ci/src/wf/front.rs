@@ -996,7 +996,10 @@ impl Fe<'_> {
                 "run" => s.run = self.tpl(v, &at),
                 "shell" => s.shell = self.tpl(v, &at),
                 "with" => s.with = v.as_map().map(|m| m.iter().map(|(a, b)| (a.text().unwrap_or_default(), self.yval(b))).collect()).unwrap_or_default(),
-                "env" => s.env = self.str_map(v, &at),
+                "env" => {
+                    s.env = self.str_map(v, &at);
+                    s.env_range = Some(v.range);
+                }
                 "continue-on-error" => s.continue_on_error = self.bool_or_expr(v, &at),
                 "timeout-minutes" => s.timeout_minutes = self.num_or_expr(v, &at),
                 "working-directory" => s.working_directory = self.tpl(v, &at),

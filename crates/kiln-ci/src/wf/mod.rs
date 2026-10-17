@@ -93,6 +93,42 @@ pub fn github_workflows_run(setting: GithubWorkflows, commit_has_kiln_workflow: 
     }
 }
 
+/// What [`check`] found in one file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Checked {
+    /// `workflow`, `overlay`, `action` or `policy`.
+    pub kind: &'static str,
+    pub dialect: Dialect,
+    pub diagnostics: Vec<Diag>,
+    /// For workflows: [`outline`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline: Option<serde_json::Value>,
+}
+
+impl Checked {
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics.iter().any(Diag::is_error)
+    }
+}
+
+/// Checks one file as what its path says it is (W02-R01), or as a workflow of `dialect` when one
+/// is given: what `kiln validate` and `POST /api/ci/validate` answer (W02-R12). A path that is
+/// none of W02-R01's reads as a kiln workflow, the dialect that accepts both.
+pub fn check(path: &str, src: &str, dialect: Option<Dialect>) -> Checked {
+    let kind = file_kind(path);
+    let other = |kind, diagnostics| Checked { kind, dialect: Dialect::Kiln, diagnostics, outline: None };
+    match (kind, dialect) {
+        (Some(FileKind::Overlay { .. }), None) => other("overlay", parse_overlay(src).1),
+        (Some(FileKind::Action), None) => other("action", parse_action(src).1),
+        (Some(FileKind::Policy), None) => other("policy", Vec::new()),
+        (kind, given) => {
+            let dialect = given.unwrap_or(if kind == Some(FileKind::GhaWorkflow) { Dialect::Gha } else { Dialect::Kiln });
+            let (wf, diagnostics) = parse_workflow(path, src, dialect);
+            Checked { kind: "workflow", dialect, diagnostics, outline: wf.as_ref().map(outline) }
+        }
+    }
+}
+
 /// Reads and checks a workflow. The model is `None` only when the file isn't YAML or isn't a
 /// mapping; otherwise it holds whatever could be read, next to every diagnostic.
 pub fn parse_workflow(path: &str, src: &str, dialect: Dialect) -> (Option<Workflow>, Vec<Diag>) {
@@ -111,7 +147,7 @@ pub fn parse_workflow(path: &str, src: &str, dialect: Dialect) -> (Option<Workfl
         let mut fe = front::Fe { dialect, overlay: false, diags: &mut diags };
         fe.workflow(&root, path)
     };
-    validate::validate(&wf, dialect, &mut diags);
+    validate::validate(&wf, dialect, src, &mut diags);
     sort(&mut diags);
     (Some(wf), diags)
 }

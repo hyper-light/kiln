@@ -46,11 +46,68 @@ fn w02_s03_secrets_not_available_in_job_if() {
     assert_eq!(e.map(|x| (x.range.start.line, x.range.start.col)), Some((4, 13)), "points at `secrets`");
 }
 
+/// `src` with a diagnostic's fix applied (edits are 1-based line and column ranges of the
+/// original text, as an editor applies them).
+fn apply_fix(src: &str, d: &Diag) -> String {
+    let lines: Vec<&str> = src.split('\n').collect();
+    let offset = |p: crate::wf::diag::Pos| -> usize {
+        let line_start: usize = lines.iter().take(p.line as usize - 1).map(|l| l.len() + 1).sum();
+        let line = lines.get(p.line as usize - 1).copied().unwrap_or_default();
+        line_start + line.char_indices().nth(p.col as usize - 1).map_or(line.len(), |(i, _)| i)
+    };
+    let mut edits = d.fix.as_ref().map(|f| f.edits.clone()).unwrap_or_default();
+    edits.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.col)));
+    let mut out = src.to_owned();
+    for e in edits {
+        out.replace_range(offset(e.range.start)..offset(e.range.end), &e.text);
+    }
+    out
+}
+
+fn injection(d: &[Diag]) -> Option<&Diag> {
+    d.iter().find(|x| x.code == "KCI6004")
+}
+
 #[test]
 fn w02_s05_untrusted_input_in_run() {
-    let (_, d) = gha("on: pull_request\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo \"${{ github.event.pull_request.title }}\"\n");
-    assert!(codes(&d).contains(&"KCI6004"), "{d:?}");
-    assert!(d.iter().find(|x| x.code == "KCI6004").and_then(|x| x.fix.as_ref()).is_some());
+    let src = "on: pull_request\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo \"${{ github.event.pull_request.title }}\"\n";
+    let (_, d) = gha(src);
+    let fixed = injection(&d).map(|x| apply_fix(src, x)).unwrap_or_default();
+    assert_eq!(
+        fixed,
+        "on: pull_request\njobs:\n  a:\n    runs-on: x\n    steps:\n      - env:\n          PULL_REQUEST_TITLE: ${{ github.event.pull_request.title }}\n        run: echo \"${PULL_REQUEST_TITLE}\"\n"
+    );
+    let (wf, d) = gha(&fixed);
+    assert!(errors(&d).is_empty() && !codes(&d).contains(&"KCI6004"), "{d:?}");
+    let step = wf.as_ref().and_then(|w| w.jobs.first()).and_then(|j| j.steps.first()).map(|s| s.env.clone()).unwrap_or_default();
+    assert_eq!(step.first().map(|(k, v)| (k.as_str(), v.src.as_str())), Some(("PULL_REQUEST_TITLE", "${{ github.event.pull_request.title }}")));
+}
+
+#[test]
+fn w02_s05_fix_quotes_for_the_shell() {
+    // A block scalar, single and no quotes, an existing env, the same value twice.
+    let src = "on: issues\njobs:\n  a:\n    runs-on: x\n    steps:\n      - name: greet\n        env:\n          A: b\n        run: |\n          echo '${{ github.head_ref }}' # it's\n          echo ${{ github.event.issue.title }} ${{ github.event.issue.title }}\n";
+    let (_, d) = gha(src);
+    assert_eq!(
+        injection(&d).map(|x| apply_fix(src, x)).as_deref(),
+        Some("on: issues\njobs:\n  a:\n    runs-on: x\n    steps:\n      - name: greet\n        env:\n          HEAD_REF: ${{ github.head_ref }}\n          ISSUE_TITLE: ${{ github.event.issue.title }}\n          A: b\n        run: |\n          echo ''\"${HEAD_REF}\"'' # it's\n          echo \"${ISSUE_TITLE}\" \"${ISSUE_TITLE}\"\n")
+    );
+    // PowerShell on Windows.
+    let src = "on: issues\njobs:\n  a:\n    runs-on: windows-latest\n    steps:\n      - run: Write-Host \"${{ github.event.issue.body }}\"\n";
+    let (_, d) = gha(src);
+    assert!(injection(&d).map(|x| apply_fix(src, x)).is_some_and(|f| f.contains("ISSUE_BODY: ${{ github.event.issue.body }}\n        run: Write-Host \"$env:ISSUE_BODY\"")));
+    // A name that's taken gets a suffix; an element of an array matches its `*` pattern.
+    let src = "on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo ${{ github.event.commits[0].message }}\n        env:\n          COMMITS_0_MESSAGE: x\n";
+    let (_, d) = gha(src);
+    assert!(injection(&d).map(|x| apply_fix(src, x)).is_some_and(|f| f.contains("COMMITS_0_MESSAGE_2: ${{ github.event.commits[0].message }}")));
+    // No fix where the edit can't be made safely: a flow-style step, an unknown shell.
+    for src in [
+        "on: issues\njobs:\n  a:\n    runs-on: x\n    steps: [{run: \"echo ${{ github.event.issue.title }}\"}]\n",
+        "on: issues\njobs:\n  a:\n    runs-on: x\n    steps:\n      - shell: python\n        run: print(\"${{ github.event.issue.title }}\")\n",
+    ] {
+        let (_, d) = gha(src);
+        assert!(injection(&d).is_some_and(|x| x.fix.is_none()), "{src}");
+    }
 }
 
 #[test]
@@ -176,4 +233,19 @@ fn diagnostics_point_into_block_scalars() {
     let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: |\n          echo one\n          echo ${{ secrets }}\n          echo ${{ bad( }}\n");
     let e = d.iter().find(|x| x.is_error()).map(|x| (x.range.start.line, x.range.start.col));
     assert_eq!(e, Some((9, 23)), "the `(` of `bad(`: {d:?}");
+}
+
+#[test]
+fn check_reads_a_file_as_its_path_says() {
+    let wf = "on: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: echo}]\n";
+    let c = check(".github/workflows/ci.yml", wf, None);
+    assert_eq!((c.kind, c.dialect, c.has_errors()), ("workflow", Dialect::Gha, false));
+    assert_eq!(c.outline.as_ref().and_then(|o| o.pointer("/jobs/0/id").and_then(serde_json::Value::as_str)), Some("a"));
+    // The same text under .kiln/ is kiln's dialect; a dialect given wins over the path.
+    assert_eq!(check(".kiln/ci.yaml", wf, None).dialect, Dialect::Kiln);
+    assert_eq!(check("anything.yml", wf, Some(Dialect::Gha)).dialect, Dialect::Gha);
+    assert_eq!(check(".kiln/overlays/ci.yaml", "jobs: {}\n", None).kind, "overlay");
+    assert_eq!(check(".github/actions/x/action.yml", "name: x\nruns: {using: composite, steps: []}\n", None).kind, "action");
+    assert_eq!(check(".kiln/review.yaml", "anything: [", None).kind, "policy");
+    assert!(check(".github/workflows/bad.yml", "on: push\njobs: [", None).has_errors());
 }

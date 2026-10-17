@@ -414,6 +414,9 @@ pub struct Output {
 pub struct Step {
     #[serde(skip)]
     pub range: Range,
+    /// Where the step's `env` mapping is, when it has one (for fixes that add to it).
+    #[serde(skip)]
+    pub env_range: Option<Range>,
     pub id: Option<String>,
     pub name: Option<Tpl>,
     pub cond: Option<Tpl>,

@@ -2,8 +2,8 @@
 //! expression parsed with exactly the contexts and functions GitHub allows at its key (Appendix
 //! B), and the lints `KCI6001`–`KCI6006`.
 
-use super::diag::{Diag, Pos, Range, suggest};
-use super::ir::{Axis, JobSecrets, Matrix, Need, RunsOn, Tpl, Workflow, YVal};
+use super::diag::{Diag, Edit, Pos, Range, suggest};
+use super::ir::{Axis, Job, JobSecrets, Matrix, Need, RunsOn, Step, Tpl, Workflow, YVal};
 use crate::expr::{Condition, Dialect, Expr, ParseOptions, template_spans};
 
 /// Where an expression stands, which decides what it may read (Appendix B).
@@ -105,6 +105,7 @@ fn locate(t: &Tpl, byte: usize, col_in_body: Option<u32>) -> Range {
 
 struct V<'a> {
     dialect: Dialect,
+    src: &'a str,
     diags: &'a mut Vec<Diag>,
 }
 
@@ -177,9 +178,10 @@ impl V<'_> {
     }
 }
 
-/// Every check of W02 that needs the whole workflow.
-pub fn validate(wf: &Workflow, dialect: Dialect, diags: &mut Vec<Diag>) {
-    let mut v = V { dialect, diags };
+/// Every check of W02 that needs the whole workflow. `src` is the file's text, for fixes that
+/// edit it.
+pub fn validate(wf: &Workflow, dialect: Dialect, src: &str, diags: &mut Vec<Diag>) {
+    let mut v = V { dialect, src, diags };
     graph(wf, v.diags);
     if let Some(t) = &wf.run_name {
         v.tpl(t, Site::RunName, "run-name");
@@ -303,7 +305,9 @@ pub fn validate(wf: &Workflow, dialect: Dialect, diags: &mut Vec<Diag>) {
             }
             if let Some(t) = &s.run {
                 let exprs = v.tpl(t, Site::StepRun, &format!("{sp}.run"));
-                lint_run(v.diags, t, &exprs, &format!("{sp}.run"));
+                let shell = s.shell.as_ref().or(j.defaults.shell.as_ref()).or(wf.defaults.shell.as_ref()).map(|t| t.src.as_str());
+                let cx = RunCx { src: v.src, step: s, dialect: v.dialect, shell, windows: on_windows(j) };
+                lint_run(v.diags, t, &exprs, &format!("{sp}.run"), &cx);
             }
             if let Some(t) = &s.shell {
                 v.tpl(t, Site::StepRun, &format!("{sp}.shell"));
@@ -445,20 +449,210 @@ fn path_text(p: &crate::expr::ContextPath) -> String {
         .join(".")
 }
 
-fn lint_run(diags: &mut Vec<Diag>, t: &Tpl, exprs: &[Expr], path: &str) {
+/// Is `r` (a reference, as [`path_text`] writes it) one of [`UNTRUSTED`], or inside one?
+fn untrusted(r: &str) -> bool {
+    UNTRUSTED.iter().any(|u| {
+        let mut have = r.split('.');
+        u.split('.').all(|want| have.next().is_some_and(|h| want == "*" || h == want))
+    })
+}
+
+/// What the `KCI6004` fix needs to know about a `run:`.
+struct RunCx<'a> {
+    src: &'a str,
+    step: &'a Step,
+    dialect: Dialect,
+    /// The step's shell, or its job's or workflow's default.
+    shell: Option<&'a str>,
+    /// The job runs on Windows, where the default shell is `pwsh`.
+    windows: bool,
+}
+
+fn on_windows(j: &Job) -> bool {
+    let labels: Vec<&Tpl> = match &j.runs_on {
+        Some(RunsOn::Labels(ls)) => ls.iter().collect(),
+        Some(RunsOn::Group { group, labels }) => group.iter().chain(labels).collect(),
+        None => Vec::new(),
+    };
+    labels.iter().any(|l| l.src.to_ascii_lowercase().contains("windows"))
+}
+
+fn lint_run(diags: &mut Vec<Diag>, t: &Tpl, exprs: &[Expr], path: &str, cx: &RunCx<'_>) {
     let refs: Vec<String> = exprs.iter().flat_map(Expr::references).map(|p| path_text(&p)).collect();
-    if let Some(bad) = refs.iter().find(|r| UNTRUSTED.iter().any(|u| r.starts_with(u))) {
-        diags.push(
-            Diag::warning("KCI6004", format!("`{bad}` is untrusted input interpolated into a script, which allows script injection: pass it through `env:` and use the variable"), t.range)
-                .at(path)
-                .with_fix("Move the value into `env:` and reference it as an environment variable", Vec::new()),
-        );
+    if let Some(bad) = refs.iter().find(|r| untrusted(r)) {
+        let d = Diag::warning("KCI6004", format!("`{bad}` is untrusted input interpolated into a script, which allows script injection: pass it through `env:` and use the variable"), t.range).at(path);
+        diags.push(match injection_fix(t, cx) {
+            Some(edits) => d.with_fix("Move the value into `env:` and read it as an environment variable", edits),
+            None => d,
+        });
     }
     if refs.iter().any(|r| r.starts_with("secrets.")) {
         diags.push(Diag::warning("KCI6005", "a secret interpolated into a script can leak through the script file and process list: pass it through `env:`", t.range).at(path));
     }
     if t.src.contains("::set-output") || t.src.contains("::save-state") {
         diags.push(Diag::warning("KCI6006", "`::set-output` and `::save-state` are deprecated: write to `$GITHUB_OUTPUT` and `$GITHUB_STATE`", t.range).at(path));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shell {
+    Posix,
+    Pwsh,
+    Cmd,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    None,
+    Single,
+    Double,
+}
+
+/// The fix for `KCI6004` (W02-S05): each `${{ }}` of the script that reads untrusted input moves
+/// into the step's `env:`, and the script reads the variable instead, quoted for its shell (a
+/// variable is data to the shell; interpolated text is code). `None` when that can't be done
+/// safely: a flow-style step or `env`, a shell whose syntax isn't known, or a place in the file
+/// that doesn't hold the text it should (a quoted scalar with escapes, say).
+fn injection_fix(t: &Tpl, cx: &RunCx<'_>) -> Option<Vec<Edit>> {
+    let shell = match cx.shell {
+        Some(s) if s.contains("${{") => return None,
+        Some(s) => s.split_whitespace().next().unwrap_or_default(),
+        None if cx.windows => "pwsh",
+        None => "bash",
+    };
+    let shell = match shell {
+        "bash" | "sh" => Shell::Posix,
+        "pwsh" | "powershell" => Shell::Pwsh,
+        "cmd" => Shell::Cmd,
+        _ => return None,
+    };
+    let lines: Vec<&str> = cx.src.split('\n').collect();
+    let opts = options(Site::StepRun, cx.dialect);
+    let mut moved: Vec<(String, String)> = Vec::new();
+    let mut edits = Vec::new();
+    for (a, b) in template_spans(&t.src, cx.dialect).ok()? {
+        let body = t.src.get(a..b)?.trim();
+        let Ok(e) = Expr::parse_with(body, &opts) else { continue };
+        let Some(r) = e.references().iter().map(path_text).find(|r| untrusted(r)) else { continue };
+        let start = a.checked_sub(3)?;
+        let outer = t.src.get(start..b + 2)?;
+        let len = u32::try_from(outer.chars().count()).ok()?;
+        let at = locate(t, start, None).start;
+        if text_at(&lines, at, outer.chars().count())? != outer {
+            return None;
+        }
+        let name = match moved.iter().find(|(x, _)| x == body) {
+            Some((_, n)) => n.clone(),
+            None => {
+                let n = var_name(&r, cx.step, &moved);
+                moved.push((body.to_owned(), n.clone()));
+                n
+            }
+        };
+        let before = t.src.get(..start)?;
+        let text = match shell {
+            Shell::Posix => match quote_state(before, '\\') {
+                Quote::None => format!("\"${{{name}}}\""),
+                Quote::Double => format!("${{{name}}}"),
+                Quote::Single => format!("'\"${{{name}}}\"'"),
+            },
+            Shell::Pwsh => match quote_state(before, '`') {
+                Quote::Single => return None,
+                _ => format!("$env:{name}"),
+            },
+            Shell::Cmd => format!("%{name}%"),
+        };
+        edits.push(Edit { range: Range { start: at, end: Pos { col: at.col + len, ..at } }, text });
+    }
+    if moved.is_empty() {
+        return None;
+    }
+    // The new entries go first in the step's `env`, or start the step when it has none.
+    let s = cx.step;
+    let (at, open) = match s.env_range {
+        Some(r) if !s.env.is_empty() && s.env.iter().all(|(k, _)| !k.is_empty()) => (r.start, false),
+        Some(_) => return None,
+        None => (s.range.start, true),
+    };
+    if char_at(&lines, at)? == '{' {
+        return None;
+    }
+    let indent = " ".repeat(usize::try_from(at.col.checked_sub(1)?).ok()?);
+    let mut text = if open { "env:\n".to_owned() } else { String::new() };
+    for (i, (body, name)) in moved.iter().enumerate() {
+        if open {
+            text.push_str(&format!("{indent}  "));
+        } else if i > 0 {
+            text.push_str(&indent);
+        }
+        text.push_str(&format!("{name}: {}\n", yaml_scalar(&format!("${{{{ {body} }}}}"))));
+    }
+    text.push_str(&indent);
+    edits.insert(0, Edit { range: Range { start: at, end: at }, text });
+    edits.sort_by_key(|e| (e.range.start.line, e.range.start.col));
+    Some(edits)
+}
+
+/// `n` characters of the file from `at`.
+fn text_at(lines: &[&str], at: Pos, n: usize) -> Option<String> {
+    let line = lines.get(usize::try_from(at.line.checked_sub(1)?).ok()?)?;
+    let skip = usize::try_from(at.col.checked_sub(1)?).ok()?;
+    let out: String = line.chars().skip(skip).take(n).collect();
+    (out.chars().count() == n).then_some(out)
+}
+
+fn char_at(lines: &[&str], at: Pos) -> Option<char> {
+    text_at(lines, at, 1)?.chars().next()
+}
+
+/// Where a script is at its end, quote-wise: outside quotes, or inside single or double ones.
+/// `esc` is the shell's escape character (`\` for POSIX shells, `` ` `` for PowerShell);
+/// comments are skipped.
+fn quote_state(script: &str, esc: char) -> Quote {
+    let mut q = Quote::None;
+    let (mut escaped, mut comment, mut prev) = (false, false, '\n');
+    for c in script.chars() {
+        if comment {
+            comment = c != '\n';
+        } else if escaped {
+            escaped = false;
+        } else {
+            match q {
+                Quote::Single if c == '\'' => q = Quote::None,
+                Quote::Single => {}
+                Quote::Double if c == esc => escaped = true,
+                Quote::Double if c == '"' => q = Quote::None,
+                Quote::Double => {}
+                Quote::None if c == esc => escaped = true,
+                Quote::None if c == '\'' => q = Quote::Single,
+                Quote::None if c == '"' => q = Quote::Double,
+                Quote::None if c == '#' && prev.is_whitespace() => comment = true,
+                Quote::None => {}
+            }
+        }
+        prev = c;
+    }
+    q
+}
+
+/// An environment variable's name for a reference: `github.event.pull_request.title` →
+/// `PULL_REQUEST_TITLE`, unique within the step.
+fn var_name(r: &str, s: &Step, taken: &[(String, String)]) -> String {
+    let tail = r.strip_prefix("github.event.").or_else(|| r.strip_prefix("github.")).unwrap_or(r);
+    let base: String = tail.split('.').filter(|p| *p != "*").collect::<Vec<_>>().join("_").chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+    let free = |n: &str| !s.env.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) && !taken.iter().any(|(_, t)| t.eq_ignore_ascii_case(n));
+    if free(&base) {
+        return base;
+    }
+    (2..).map(|i| format!("{base}_{i}")).find(|n| free(n)).unwrap_or(base)
+}
+
+/// `v` as a YAML scalar: plain when that reads back the same, single-quoted otherwise.
+fn yaml_scalar(v: &str) -> String {
+    if v.contains(": ") || v.contains(" #") || v.contains('\'') || v.contains('"') || v.ends_with(':') {
+        format!("'{}'", v.replace('\'', "''"))
+    } else {
+        v.to_owned()
     }
 }
 

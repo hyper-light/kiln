@@ -24,7 +24,7 @@ use crate::pipeline::{self, Context, Pipeline};
 use crate::store::{Repo, Run, Status};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(600);
-const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn github_token(hub: &Hub) -> Option<String> {
     let p = hub.cfg.gitops.github_token_file.as_ref()?;
@@ -44,7 +44,7 @@ fn git(hub: &Hub) -> Command {
     c
 }
 
-async fn run_git(hub: &Hub, args: &[&str], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+pub(crate) async fn run_git(hub: &Hub, args: &[&str], timeout: Duration) -> anyhow::Result<Vec<u8>> {
     let mut cmd = git(hub);
     cmd.args(args);
     let out = crate::proc::output(cmd, timeout)
@@ -137,7 +137,7 @@ pub async fn sync_mirror(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-async fn ensure_commit(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<PathBuf> {
+pub(crate) async fn ensure_commit(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<PathBuf> {
     let path = mirror_path(hub, &repo.name);
     let p = path.to_string_lossy().to_string();
     let have = path.join("HEAD").exists()
