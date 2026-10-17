@@ -84,7 +84,7 @@ with its terminal, metrics and jobs: one pane of glass across the computers in t
  POST /api/join-requests ────────────────▶  keeps the request (memory, 10 min)
    {name, os, arch, labels, CSR, H(secret)}
                      ◀──────────────────── {id, nonce, CA}
- shows the verification code                Agents → Waiting to join: code ──────▶ same code?
+ shows the verification code                Runners → Add machines: code ─────▶ same code?
  GET /api/join-requests/<id>, every 2 s ─▶                                   ◀──── Approve
                      ◀──────────────────── {approved, cert, CA, QUIC}
                                             (the CSR signed by the kiln CA, as in enrollment)
@@ -153,7 +153,7 @@ Joining is never automatic: a machine asks, an admin decides.
    its CA certificate. At most 20 requests wait at once and each source address may send one every
    5 seconds (HTTP 429 with `Retry-After` otherwise).
 3. The machine polls `GET /api/join-requests/<id>` every 2 s with the secret as a bearer token. The
-   first poll confirms the request: from then on admins see it under **Agents → Waiting to join**,
+   first poll confirms the request: from then on admins see it under **Runners → Add machines**,
    with its address and verification code, and can approve or deny it.
 4. **The verification code** is six digits taken from SHA-256 over the CSR's public key, the
    server's CA certificate, the machine's secret and the server's nonce; both sides compute it.
