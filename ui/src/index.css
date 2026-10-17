@@ -920,6 +920,214 @@
   pointer-events: none;
 }
 
+/* A checkbox: the native control, drawn like the marks of an agent's questions (the prism when on). */
+.check {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1.5px solid #4a4c55;
+  border-radius: 4px;
+  background: transparent center / 10px 10px no-repeat;
+  appearance: none;
+  cursor: pointer;
+  transition:
+    border-color 0.15s,
+    background-color 0.15s;
+}
+.check:hover {
+  border-color: #6b6e78;
+}
+.check:checked,
+.check:indeterminate {
+  border-color: transparent;
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.4 6.3l2.4 2.3 4.8-5' fill='none' stroke='%2308090a' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"),
+    linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+  background-size:
+    10px 10px,
+    100% 100%;
+}
+.check:indeterminate {
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 6h6' stroke='%2308090a' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E"),
+    linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+}
+.check:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: 2px;
+}
+.check:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+/* A filter field (facet-box.tsx): chosen facets as chips in it, its list of facets under it. */
+.facet-box {
+  position: relative;
+  min-width: 0;
+}
+.facet-box > .field {
+  flex-wrap: wrap;
+  row-gap: 4px;
+  column-gap: 6px;
+  padding-block: 3px;
+  cursor: text;
+}
+.facet-box > .field > input {
+  flex: 1 1 12ch;
+  width: auto;
+  min-width: 12ch;
+  min-height: 32px;
+}
+.facet-chip {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 1px;
+  height: 26px;
+  padding: 0 1px 0 9px;
+  border: 1px solid #3a3c44;
+  border-radius: 4px;
+  background: #131418;
+  color: #e3e4e9;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.facet-chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.facet-chip > button,
+.facet-clear {
+  display: grid;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 3px;
+  color: #9499a5;
+}
+.facet-clear {
+  width: 34px;
+  height: 32px;
+  margin-left: auto;
+}
+.facet-chip > button:hover,
+.facet-clear:hover {
+  background: rgb(255 255 255 / 7%);
+  color: #fff;
+}
+/* It opens at once, like a select's list (over the menus' pop-in). */
+.facet-pop.popover {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  display: flex;
+  max-height: min(62dvh, 440px);
+  flex-direction: column;
+  padding: 0;
+  animation: none;
+}
+.facet-pop > [role="listbox"] {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+}
+.facet-group + .facet-group {
+  margin-top: 4px;
+}
+.facet-label {
+  padding: 9px 10px 5px;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.facet-opt {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: 5px;
+  color: #d4d6dc;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.facet-opt[data-active] {
+  background: rgb(255 255 255 / 6%);
+  color: #fff;
+}
+.facet-opt[data-empty] {
+  color: #7b7e88;
+}
+.facet-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.facet-mark {
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid #4a4c55;
+  border-radius: 4px;
+}
+.facet-opt[aria-selected="true"] .facet-mark {
+  border-color: transparent;
+  background:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.4 6.3l2.4 2.3 4.8-5' fill='none' stroke='%2308090a' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
+      center / 10px 10px no-repeat,
+    linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+}
+.facet-count {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.facet-none {
+  padding: 10px;
+  color: #9499a5;
+  font-size: 12.5px;
+}
+.facet-foot {
+  display: flex;
+  flex: none;
+  justify-content: space-between;
+  padding: 4px;
+  border-top: 1px solid rgb(255 255 255 / 9%);
+}
+.facet-act {
+  min-height: 32px;
+  padding: 0 10px;
+  border-radius: 5px;
+  color: #c9c3d8;
+  font-size: 12.5px;
+}
+.facet-act:hover:not(:disabled) {
+  background: rgb(255 255 255 / 6%);
+  color: #fff;
+}
+.facet-act:disabled {
+  color: #5d606a;
+}
+@media (pointer: coarse) {
+  .facet-opt {
+    min-height: 44px;
+  }
+  .facet-act {
+    min-height: 40px;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Chips / kbd / icon buttons                                          */
 /* ------------------------------------------------------------------ */

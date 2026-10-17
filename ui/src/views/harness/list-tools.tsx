@@ -1,40 +1,38 @@
 /**
- * Mission control's list, sorted and filtered the way you ask: by when each started, when it last
- * did something, its name, runner, harness, where it stands or what it cost; and only the ones
- * whose name, runner, harness or state you pick. One line says how the list is shown and opens in
- * place to change it. A sort is taken when you choose it (or ask again): rows never reorder on
- * their own while agents update; the line offers "Re-sort" once the order has gone stale.
+ * How Mission control's list is shown: one filter field (names as you type; runner, harness,
+ * state, folder, model and mode as checkboxes with counts) and a sort select beside it. The list
+ * holds still while agents work: it is taken when you change the filter or the sort (or refresh
+ * it), new agents come in on top, and the list says when it no longer matches what's chosen.
  */
 import * as React from "react";
-import { ChevronRight, RotateCcw, Search, X } from "lucide-react";
 import type { AgentInfo } from "@/api/harness";
-import { cn } from "@/lib/utils";
-import { Facet } from "./broadcast";
+import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
+import { SelectField } from "@/components/ui/misc";
+import { modelLabel, tildify } from "./derive";
 import { machineName } from "./parts";
 
-export type SortKey = "created" | "active" | "name" | "runner" | "harness" | "state" | "cost";
-export type Dir = "asc" | "desc";
-export interface View {
-  sort: SortKey;
-  dir: Dir;
-  q: string;
-  runners: string[];
-  kinds: string[];
-  stands: string[];
-}
-export const DEFAULT_VIEW: View = { sort: "created", dir: "desc", q: "", runners: [], kinds: [], stands: [] };
+export type SortId = "newest" | "oldest" | "active" | "name" | "name-desc" | "runner" | "harness" | "state" | "cost";
 
-const SORTS: { id: SortKey; label: string; dir: Dir }[] = [
-  { id: "created", label: "Created", dir: "desc" },
-  { id: "active", label: "Last active", dir: "desc" },
-  { id: "name", label: "Name", dir: "asc" },
-  { id: "runner", label: "Runner", dir: "asc" },
-  { id: "harness", label: "Harness", dir: "asc" },
-  { id: "state", label: "State", dir: "asc" },
-  { id: "cost", label: "Cost", dir: "desc" },
+export interface ListView {
+  sort: SortId;
+  /** Chosen options, by facet. */
+  facets: Chosen;
+}
+export const DEFAULT_VIEW: ListView = { sort: "newest", facets: {} };
+
+const SORTS: { value: SortId; label: string }[] = [
+  { value: "newest", label: "Newest first" },
+  { value: "oldest", label: "Oldest first" },
+  { value: "active", label: "Recently active" },
+  { value: "name", label: "Name, A to Z" },
+  { value: "name-desc", label: "Name, Z to A" },
+  { value: "runner", label: "Runner" },
+  { value: "harness", label: "Harness" },
+  { value: "state", label: "State, needs you first" },
+  { value: "cost", label: "Cost, highest first" },
 ];
 
-/** Where an agent stands, in Mission control's words; "State" sorts in this order. */
+/** Where an agent stands, in Mission control's words; sorting by state follows this order. */
 export const STANDS = [
   { id: "needs", label: "Needs you" },
   { id: "crashed", label: "Stopped" },
@@ -51,127 +49,202 @@ export interface ViewRow {
   stand: string;
 }
 
-const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const collator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+const folder = (cwd: string) => cwd.replace(/\/+$/, "").split("/").pop() || cwd;
+const modeLabel = (m: string) => {
+  const words = m
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+};
 
-export function sortRows<T extends ViewRow>(rows: T[], sort: SortKey, dir: Dir): T[] {
-  const by = (x: T, y: T): number => {
-    switch (sort) {
-      case "created":
-        return x.a.created_at - y.a.created_at;
-      case "active":
-        return x.a.last_activity - y.a.last_activity;
-      case "name":
-        return collator.compare(x.a.name, y.a.name);
-      case "runner":
-        return collator.compare(machineName(x.a.target), machineName(y.a.target));
-      case "harness":
-        return collator.compare(x.a.kind_name, y.a.kind_name);
-      case "state":
-        return (RANK.get(x.stand) ?? STANDS.length) - (RANK.get(y.stand) ?? STANDS.length);
-      case "cost":
-        return (x.a.cost_usd ?? 0) - (y.a.cost_usd ?? 0);
+/** The dimensions you can filter by: what each agent has, and what to call it. */
+const DIMENSIONS: {
+  id: string;
+  label: string;
+  of: (r: ViewRow) => string;
+  name: (v: string, rows: ViewRow[]) => string;
+  title?: (v: string) => string;
+  always?: boolean;
+}[] = [
+  {
+    id: "state",
+    label: "State",
+    of: (r) => r.stand,
+    name: (v) => STANDS.find((s) => s.id === v)?.label ?? v,
+    always: true,
+  },
+  {
+    id: "runner",
+    label: "Runner",
+    of: (r) => machineName(r.a.target),
+    name: (v) => v,
+  },
+  {
+    id: "harness",
+    label: "Harness",
+    of: (r) => r.a.kind,
+    name: (v, rows) => rows.find((r) => r.a.kind === v)?.a.kind_name ?? v,
+  },
+  {
+    id: "folder",
+    label: "Folder",
+    of: (r) => r.a.cwd,
+    name: (v) => folder(v),
+    title: (v) => tildify(v),
+  },
+  {
+    id: "model",
+    label: "Model",
+    of: (r) => r.a.model,
+    name: (v) => modelLabel(v),
+  },
+  {
+    id: "mode",
+    label: "Permissions",
+    of: (r) => r.a.mode,
+    name: (v) => modeLabel(v),
+  },
+];
+
+function sortBy(sort: SortId): (x: ViewRow, y: ViewRow) => number {
+  switch (sort) {
+    case "newest":
+      return (x, y) => y.a.created_at - x.a.created_at;
+    case "oldest":
+      return (x, y) => x.a.created_at - y.a.created_at;
+    case "active":
+      return (x, y) => y.a.last_activity - x.a.last_activity;
+    case "name":
+      return (x, y) => collator.compare(x.a.name, y.a.name);
+    case "name-desc":
+      return (x, y) => collator.compare(y.a.name, x.a.name);
+    case "runner":
+      return (x, y) => collator.compare(machineName(x.a.target), machineName(y.a.target));
+    case "harness":
+      return (x, y) => collator.compare(x.a.kind_name, y.a.kind_name);
+    case "state":
+      return (x, y) => (RANK.get(x.stand) ?? STANDS.length) - (RANK.get(y.stand) ?? STANDS.length);
+    case "cost":
+      return (x, y) => (y.a.cost_usd ?? 0) - (x.a.cost_usd ?? 0);
+  }
+}
+
+export function sortRows<T extends ViewRow>(rows: T[], sort: SortId): T[] {
+  const by = sortBy(SORTS.some((s) => s.value === sort) ? sort : "newest");
+  return [...rows].sort((x, y) => by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
+}
+
+/** Matches the typed words (its name or title) and every facet chosen (any of a facet's options). */
+export function matches(q: string, facets: Chosen, r: ViewRow, except?: string): boolean {
+  const words = q.trim().toLowerCase();
+  if (words && !r.a.name.toLowerCase().includes(words) && !(r.a.title ?? "").toLowerCase().includes(words)) return false;
+  return DIMENSIONS.every((d) => d.id === except || !facets[d.id]?.length || facets[d.id]!.includes(d.of(r)));
+}
+
+export const isFiltered = (q: string, facets: Chosen) => Boolean(q.trim()) || Object.values(facets).some((v) => v.length > 0);
+
+/** Each dimension's options with how many agents each would show, the other choices as they are. */
+function facetsOf(rows: ViewRow[], q: string, chosen: Chosen): Facet[] {
+  return DIMENSIONS.flatMap((d) => {
+    const seen = new Map<string, number>();
+    for (const r of rows) {
+      const v = d.of(r);
+      if (v && !seen.has(v)) seen.set(v, 0);
     }
-  };
-  const sign = dir === "asc" ? 1 : -1;
-  return [...rows].sort((x, y) => sign * by(x, y) || y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id));
+    for (const r of rows) {
+      const v = d.of(r);
+      if (v && matches(q, chosen, r, d.id)) seen.set(v, (seen.get(v) ?? 0) + 1);
+    }
+    const picked = chosen[d.id] ?? [];
+    // A dimension all agents share says nothing; it shows once two differ (or one is chosen).
+    if (seen.size < 2 && picked.length === 0 && !d.always) return [];
+    const options = [...seen.entries()].map(([id, count]) => ({
+      id,
+      label: d.name(id, rows),
+      count,
+      title: d.title?.(id),
+    }));
+    if (d.id === "state") options.sort((x, y) => (RANK.get(x.id) ?? 99) - (RANK.get(y.id) ?? 99));
+    else options.sort((x, y) => collator.compare(x.label, y.label));
+    return [{ id: d.id, label: d.label, options }];
+  });
 }
 
-export function matches(view: View, r: ViewRow): boolean {
-  const q = view.q.trim().toLowerCase();
+/** The filter field and the sort, side by side (stacked on a phone). */
+export function ListBar({ rows, q, onQuery, view, onView }: { rows: ViewRow[]; q: string; onQuery: (q: string) => void; view: ListView; onView: (v: ListView) => void }) {
+  const facets = React.useMemo(() => facetsOf(rows, q, view.facets), [rows, q, view.facets]);
   return (
-    (!q || r.a.name.toLowerCase().includes(q) || (r.a.title ?? "").toLowerCase().includes(q)) &&
-    (view.runners.length === 0 || view.runners.includes(machineName(r.a.target))) &&
-    (view.kinds.length === 0 || view.kinds.includes(r.a.kind)) &&
-    (view.stands.length === 0 || view.stands.includes(r.stand))
-  );
-}
-
-export const isFiltered = (v: View) => Boolean(v.q.trim() || v.runners.length || v.kinds.length || v.stands.length);
-
-export function ListTools({
-  view,
-  onView,
-  rows,
-  stale,
-  onResort,
-  shown,
-}: {
-  view: View;
-  onView: (v: View) => void;
-  /** Every agent (for the choices offered). */
-  rows: ViewRow[];
-  /** The order taken for this sort no longer matches it. */
-  stale: boolean;
-  onResort: () => void;
-  /** How many the filters leave. */
-  shown: number;
-}) {
-  const [open, setOpen] = React.useState(false);
-  const runners = [...new Set(rows.map((r) => machineName(r.a.target)))].sort(collator.compare);
-  const kinds = [...new Map(rows.map((r) => [r.a.kind, r.a.kind_name])).entries()];
-  const arrow = view.dir === "asc" ? "↑" : "↓";
-  const summary = [
-    `${SORTS.find((s) => s.id === view.sort)?.label ?? view.sort} ${arrow}`,
-    view.runners.length ? view.runners.join(" + ") : "all runners",
-    view.kinds.length ? view.kinds.map((k) => kinds.find(([id]) => id === k)?.[1] ?? k).join(" + ") : "any harness",
-    view.stands.length ? view.stands.map((s) => STANDS.find((x) => x.id === s)?.label ?? s).join(" + ") : "any state",
-  ].join(" · ");
-  const setSort = (id: SortKey) => {
-    const s = SORTS.find((x) => x.id === id);
-    if (!s) return;
-    onView(view.sort === id ? { ...view, dir: view.dir === "asc" ? "desc" : "asc" } : { ...view, sort: id, dir: s.dir });
-  };
-  const filtered = isFiltered(view);
-  return (
-    <div className="ms-tools">
-      <div className="ms-tools-line">
-        <label className="ms-find">
-          <Search size={13} aria-hidden="true" />
-          <input value={view.q} onChange={(e) => onView({ ...view, q: e.target.value })} placeholder="Find by name" aria-label="Find agents by name" />
-          {view.q && (
-            <button type="button" aria-label="Clear the name" onClick={() => onView({ ...view, q: "" })}>
-              <X size={12} />
-            </button>
-          )}
-        </label>
-        <button type="button" className="ms-bc-summary ms-tools-summary" aria-expanded={open} onClick={() => setOpen(!open)}>
-          <ChevronRight size={12} className={cn("ms-chev", open && "rotate-90")} aria-hidden="true" />
-          {summary}
-        </button>
-        <span className="ms-tools-end">
-          {stale && (
-            <button type="button" className="ms-tools-resort" onClick={onResort}>
-              <RotateCcw size={11} aria-hidden="true" /> Re-sort
-            </button>
-          )}
-          {filtered && (
-            <span className="ms-tools-count">
-              {shown} of {rows.length}
-            </span>
-          )}
-        </span>
-      </div>
-      {open && (
-        <div className="ms-bc-facets ms-tools-facets">
-          <div className="ms-bc-facet" role="group" aria-label="Sort by">
-            <span className="ms-bc-facet-label">Sort</span>
-            {SORTS.map((s) => (
-              <button key={s.id} type="button" className="ms-bc-chip" aria-pressed={view.sort === s.id} onClick={() => setSort(s.id)}>
-                {s.label}
-                {view.sort === s.id && <b className="ms-tools-dir">{arrow}</b>}
-              </button>
-            ))}
-          </div>
-          <Facet label="Runner" options={runners.map((m) => ({ id: m, label: m }))} chosen={view.runners} onChange={(runners) => onView({ ...view, runners })} />
-          <Facet label="Harness" options={kinds.map(([id, label]) => ({ id, label }))} chosen={view.kinds} onChange={(kinds) => onView({ ...view, kinds })} />
-          <Facet label="State" options={STANDS} chosen={view.stands} onChange={(stands) => onView({ ...view, stands })} />
-          {filtered && (
-            <button type="button" className="ms-link ms-tools-clear" onClick={() => onView({ ...DEFAULT_VIEW, sort: view.sort, dir: view.dir })}>
-              Clear filters
-            </button>
-          )}
-        </div>
-      )}
+    <div className="ms-bar">
+      <FacetBox
+        className="ms-filter"
+        label="Filter agents"
+        placeholder="Filter by name, runner, harness, state…"
+        query={q}
+        onQuery={onQuery}
+        facets={facets}
+        chosen={view.facets}
+        onChosen={(facets) => onView({ ...view, facets })}
+      />
+      <SelectField className="ms-sort" label="Sort agents" hideLabel value={view.sort} onChange={(v) => onView({ ...view, sort: v as SortId })} options={SORTS} />
     </div>
   );
+}
+
+interface Taken {
+  key: string;
+  /** In order: what showed, each in the list or among the ended. */
+  ids: string[];
+  ended: ReadonlySet<string>;
+  /** Every agent there was: one not among them is new. */
+  known: ReadonlySet<string>;
+}
+
+/**
+ * The list as shown: what the filter and sort gave when last applied, with each agent as it is now
+ * (an agent that no longer matches stays until then, its words saying where it stands). New agents
+ * come in on top. `stale`: applying them again would show something else.
+ */
+export function useShownList<T extends ViewRow>(all: T[], q: string, view: ListView, loaded: boolean) {
+  const now = React.useMemo(
+    () =>
+      sortRows(
+        all.filter((r) => matches(q, view.facets, r)),
+        view.sort,
+      ),
+    [all, q, view],
+  );
+  const [tick, setTick] = React.useState(0);
+  const key = `${JSON.stringify(view)}|${q}|${loaded ? 1 : 0}|${tick}`;
+  const [taken, setTaken] = React.useState<Taken | null>(null);
+  let t = taken;
+  if (!t || t.key !== key) {
+    t = {
+      key,
+      ids: now.map((r) => r.a.id),
+      ended: new Set(now.filter((r) => r.stand === "ended").map((r) => r.a.id)),
+      known: new Set(all.map((r) => r.a.id)),
+    };
+    setTaken(t);
+  }
+  const shown = React.useMemo(() => {
+    const byId = new Map(all.map((r) => [r.a.id, r]));
+    const fresh = now.filter((r) => !t.known.has(r.a.id));
+    const kept = t.ids.map((id) => byId.get(id)).filter((r): r is T => r !== undefined);
+    return {
+      live: [...fresh.filter((r) => r.stand !== "ended"), ...kept.filter((r) => !t.ended.has(r.a.id))],
+      ended: [...fresh.filter((r) => r.stand === "ended"), ...kept.filter((r) => t.ended.has(r.a.id))],
+    };
+  }, [all, now, t]);
+  const stale = React.useMemo(() => {
+    const live = now.filter((r) => r.stand !== "ended").map((r) => r.a.id);
+    const ended = now.filter((r) => r.stand === "ended").map((r) => r.a.id);
+    return live.join() !== shown.live.map((r) => r.a.id).join() || ended.join() !== shown.ended.map((r) => r.a.id).join();
+  }, [now, shown]);
+  const refresh = React.useCallback(() => setTick((n) => n + 1), []);
+  return { ...shown, stale, refresh, matching: now.length };
 }

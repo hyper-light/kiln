@@ -7,7 +7,7 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate, useSearchParams } from "react-router";
-import { ArrowUpRight, ChevronRight, Plus } from "lucide-react";
+import { ArrowUpRight, ChevronRight, Plus, RotateCcw } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
@@ -18,8 +18,8 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useLocalStorage } from "@/lib/hooks";
 import { plain } from "./derive";
 import { AgentMenu } from "./actions";
-import { MessageMany } from "./broadcast";
-import { DEFAULT_VIEW, isFiltered, ListTools, matches, sortRows, type View } from "./list-tools";
+import { MessageBar } from "./broadcast";
+import { DEFAULT_VIEW, isFiltered, ListBar, useShownList, type ListView } from "./list-tools";
 import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { useSeen } from "./seen";
@@ -39,7 +39,15 @@ function standOf(a: AgentInfo, seen: number | undefined): Stand {
   return "ended";
 }
 
-const WORD: Record<Stand, string> = { needs: "Needs you", crashed: "Stopped", working: "Working", finished: "Finished", ready: "Ready", offline: "Offline", ended: "Ended" };
+const WORD: Record<Stand, string> = {
+  needs: "Needs you",
+  crashed: "Stopped",
+  working: "Working",
+  finished: "Finished",
+  ready: "Ready",
+  offline: "Offline",
+  ended: "Ended",
+};
 
 /** The one line that matters for this agent right now. */
 function lineOf(a: AgentInfo, stand: Stand): string {
@@ -108,7 +116,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
   return (
     <li className="ms-row" data-stand={stand} data-selected={selected || undefined}>
       <label className="ms-check">
-        <input type="checkbox" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={selected ? `Deselect ${a.name}` : `Select ${a.name}`} />
+        <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${a.name}`} />
       </label>
       <button type="button" className="ms-main" onClick={open}>
         <span className="ms-name">{a.name}</span>
@@ -162,9 +170,7 @@ export default function Mission() {
   const [quiet, setQuiet] = React.useState<string[]>([]);
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [spawn, setSpawn] = React.useState(false);
-  const [selected, setSelected] = React.useState<Set<string>>(new Set());
-  // Message agents: open with rows selected, or from the header for every agent (or a filter).
-  const [messaging, setMessaging] = React.useState(false);
+  const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   // ?new=1 (links from elsewhere): open New agents.
@@ -181,19 +187,28 @@ export default function Mission() {
   // reads in a row miss it, rather than blinking out and back.
   const kept = React.useRef(new Map<string, { s: AiSession; missed: number }>());
   const readFound = React.useCallback(() => {
-    api.aiSessions().then((list) => {
-      const m = kept.current;
-      const here = new Set(list.map(sessionKey));
-      // An unchanged session keeps its object, so its row doesn't re-render.
-      for (const s of list) {
-        const k = sessionKey(s);
-        const was = m.get(k)?.s;
-        m.set(k, { s: was && JSON.stringify(was) === JSON.stringify(s) ? was : s, missed: 0 });
-      }
-      for (const [k, v] of m) if (!here.has(k) && ++v.missed >= 2) m.delete(k);
-      setFound([...m.values()].map((v) => v.s).sort(byStart));
-    }, () => undefined);
-    api.aiSilent().then((r) => setQuiet(r.machines), () => undefined);
+    api.aiSessions().then(
+      (list) => {
+        const m = kept.current;
+        const here = new Set(list.map(sessionKey));
+        // An unchanged session keeps its object, so its row doesn't re-render.
+        for (const s of list) {
+          const k = sessionKey(s);
+          const was = m.get(k)?.s;
+          m.set(k, {
+            s: was && JSON.stringify(was) === JSON.stringify(s) ? was : s,
+            missed: 0,
+          });
+        }
+        for (const [k, v] of m) if (!here.has(k) && ++v.missed >= 2) m.delete(k);
+        setFound([...m.values()].map((v) => v.s).sort(byStart));
+      },
+      () => undefined,
+    );
+    api.aiSilent().then(
+      (r) => setQuiet(r.machines),
+      () => undefined,
+    );
   }, []);
   React.useEffect(() => {
     readFound();
@@ -205,41 +220,25 @@ export default function Mission() {
   });
 
   const all = React.useMemo(() => (list ?? []).map((a) => ({ a, stand: standOf(a, seen[a.id]) })), [list, seen]);
-  // How the list is shown, kept across visits. Created order never changes by itself; any other
-  // sort is taken when chosen (or asked again), so rows don't reorder while agents update: new
-  // agents come in on top, and the tools offer "Re-sort" once the order has gone stale.
-  const [stored, setView] = useLocalStorage<Partial<View>>("kiln.agents.view", DEFAULT_VIEW);
+  // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
+  // to find a name are not. The list holds still while agents work: see useShownList.
+  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.list", DEFAULT_VIEW);
   const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored }), [stored]);
-  const [taken, setTaken] = React.useState<string[] | null>(null);
-  const latest = React.useRef(all);
-  React.useEffect(() => {
-    latest.current = all;
-  });
-  const loaded = list !== null;
-  const resort = React.useCallback(() => {
-    setTaken(view.sort === "created" ? null : sortRows(latest.current, view.sort, view.dir).map((r) => r.a.id));
-  }, [view.sort, view.dir]);
-  React.useEffect(resort, [resort, loaded]);
-  const ordered = React.useMemo(() => {
-    if (!taken) return sortRows(all, view.sort, view.dir);
-    const at = new Map(taken.map((id, i) => [id, i]));
-    const since = sortRows(
-      all.filter((r) => !at.has(r.a.id)),
-      "created",
-      "desc",
-    );
-    return [...since, ...all.filter((r) => at.has(r.a.id)).sort((x, y) => (at.get(x.a.id) ?? 0) - (at.get(y.a.id) ?? 0))];
-  }, [all, taken, view.sort, view.dir]);
-  const stale = React.useMemo(() => taken !== null && sortRows(all, view.sort, view.dir).some((r, i) => r.a.id !== ordered[i]?.a.id), [all, taken, ordered, view.sort, view.dir]);
-  const rows = ordered.filter((r) => matches(view, r));
-  const live = rows.filter((r) => r.stand !== "ended");
-  const ended = rows.filter((r) => r.stand === "ended");
+  const [q, setQ] = React.useState("");
+  const shown = useShownList(all, q, view, list !== null);
+  const { live, ended } = shown;
+  const filtered = isFiltered(q, view.facets);
   const n = (s: Stand) => all.filter((r) => r.stand === s).length;
   const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
   // Sessions found on your machines that kiln doesn't run itself (its own agents are rows above).
   const elsewhere = found.filter((s) => !s.managed_by && !all.some((r) => r.a.harness_session && r.a.harness_session === s.id));
 
-  const status = [n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`, n("crashed") && `${n("crashed")} stopped`, n("working") && `${n("working")} working`, n("finished") && `${n("finished")} finished`]
+  const status = [
+    n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`,
+    n("crashed") && `${n("crashed")} stopped`,
+    n("working") && `${n("working")} working`,
+    n("finished") && `${n("finished")} finished`,
+  ]
     .filter(Boolean)
     .join(", ");
   const lead = !list
@@ -256,27 +255,42 @@ export default function Mission() {
       return next;
     });
   }, []);
+  // Only what the list shows can be checked: a row the filter takes away is unchecked with it.
+  const shownIds = [...live, ...ended].map((r) => r.a.id).join(",");
+  React.useEffect(() => {
+    const here = new Set(shownIds.split(","));
+    setSelected((s) => ([...s].every((id) => here.has(id)) ? s : new Set([...s].filter((id) => here.has(id)))));
+  }, [shownIds]);
+  const checked = [...live, ...ended].filter((r) => selected.has(r.a.id));
+  const liveChecked = live.filter((r) => selected.has(r.a.id)).length;
+  const allBox = React.useRef<HTMLInputElement>(null);
+  React.useEffect(() => {
+    if (allBox.current) allBox.current.indeterminate = liveChecked > 0 && liveChecked < live.length;
+  }, [liveChecked, live.length]);
+  // The message goes to what's checked; with nothing checked, to every agent the list shows.
+  const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
+  const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
 
   return (
-    <div className="container-console page ms-page" data-selecting={selected.size > 0 || messaging || undefined}>
+    <div className="container-console page ms-page">
       <PageIntro
         index={5}
         label="Agents"
         title="Mission control."
         lead={lead}
         actions={
-          <div className="ms-actions-head">
-            <Button variant="secondary" onClick={() => setMessaging(true)} disabled={!list?.length}>
-              Message agents
-            </Button>
-            <Button onClick={() => setSpawn(true)}>
-              New agents <Plus />
-            </Button>
-          </div>
+          <Button onClick={() => setSpawn(true)}>
+            New agents <Plus />
+          </Button>
         }
       />
 
-      {all.length > 0 && <ListTools view={view} onView={setView} rows={all} stale={stale} onResort={resort} shown={rows.length} />}
+      {all.length > 0 && (
+        <>
+          <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
+          <MessageBar agents={targets} reach={reach} onEnded={() => setSelected(new Set())} />
+        </>
+      )}
 
       {error && !list ? (
         <ErrorState error={error} onRetry={reload} />
@@ -290,21 +304,62 @@ export default function Mission() {
             New agents <Plus />
           </Button>
         </div>
-      ) : rows.length === 0 ? (
-        <p className="ms-quiet">
-          No agent matches.{" "}
-          <button type="button" className="ms-link" onClick={() => setView({ ...DEFAULT_VIEW, sort: view.sort, dir: view.dir })}>
-            Clear filters
-          </button>
-        </p>
-      ) : live.length > 0 ? (
-        <ul className="ms-list">
-          {live.map(({ a, stand }) => (
-            <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />
-          ))}
-        </ul>
       ) : (
-        <p className="ms-quiet">Nothing running. Start something new, or pick up an ended agent below.</p>
+        <>
+          <div className="ms-listhead">
+            <label className="ms-all">
+              <input
+                ref={allBox}
+                type="checkbox"
+                className="check"
+                disabled={live.length === 0}
+                checked={live.length > 0 && liveChecked === live.length}
+                onChange={(e) => setSelected(e.target.checked ? new Set([...selected, ...live.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !live.some((r) => r.a.id === id))))}
+                aria-label={filtered ? `Select the ${live.length} agents shown` : `Select all ${live.length} agents`}
+              />
+              <span>
+                {checked.length > 0
+                  ? `${checked.length} of ${live.length + ended.length} selected`
+                  : filtered
+                    ? `${live.length + ended.length} of ${all.length} agents`
+                    : `${all.length} agent${all.length === 1 ? "" : "s"}`}
+              </span>
+            </label>
+            {checked.length > 0 && (
+              <button type="button" className="ms-link" onClick={() => setSelected(new Set())}>
+                Clear selection
+              </button>
+            )}
+            {shown.stale && (
+              <button type="button" className="ms-link ms-refresh" onClick={shown.refresh} title="The list stays as it was while agents work. Refresh to sort and filter it again.">
+                <RotateCcw size={12} aria-hidden="true" /> Refresh list
+              </button>
+            )}
+          </div>
+          {live.length > 0 ? (
+            <ul className="ms-list">
+              {live.map(({ a, stand }) => (
+                <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />
+              ))}
+            </ul>
+          ) : filtered && ended.length === 0 ? (
+            <p className="ms-quiet">
+              No agent matches.{" "}
+              <button
+                type="button"
+                className="ms-link"
+                onClick={() => {
+                  setQ("");
+                  setView({ ...view, facets: {} });
+                }}
+              >
+                Clear the filter
+              </button>
+            </p>
+          ) : (
+            <p className="ms-quiet">Nothing running. Start something new, or pick up an ended agent below.</p>
+          )}
+        </>
       )}
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
@@ -329,18 +384,6 @@ export default function Mission() {
             </ul>
           )}
         </section>
-      )}
-
-      {(selected.size > 0 || messaging) && (
-        <MessageMany
-          selected={[...selected]}
-          shown={isFiltered(view) ? rows.map((r) => r.a.id) : undefined}
-          agents={list ?? []}
-          onClose={() => {
-            setSelected(new Set());
-            setMessaging(false);
-          }}
-        />
       )}
 
       <SpawnDialog
