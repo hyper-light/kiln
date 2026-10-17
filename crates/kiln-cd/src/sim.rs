@@ -28,9 +28,16 @@ pub enum Event {
 }
 
 struct Object {
-    value: Value,
+    /// Kept compressed: a benchmark's cluster holds millions of these.
+    value: crate::obj::Blob,
     /// When its controller finishes rolling out the current generation.
     ready_at_ms: u64,
+}
+
+impl Object {
+    fn value(&self) -> Value {
+        self.value.decode().unwrap_or(Value::Null)
+    }
 }
 
 /// A simulated cluster.
@@ -91,8 +98,8 @@ impl Cluster {
     }
 
     /// One object.
-    pub fn get(&self, key: &ResKey) -> Option<&Value> {
-        self.objects.get(key).map(|o| &o.value)
+    pub fn get(&self, key: &ResKey) -> Option<Value> {
+        self.objects.get(key).map(Object::value)
     }
 
     /// Every object of a kind.
@@ -100,7 +107,7 @@ impl Cluster {
         self.objects
             .iter()
             .filter(|(k, _)| k.group == kind.group && k.kind == kind.kind)
-            .map(|(_, o)| o.value.clone())
+            .map(|(_, o)| o.value())
             .collect()
     }
 
@@ -116,7 +123,7 @@ impl Cluster {
             m.remove("status");
         }
         let fields = fields_of(&desired);
-        let previous = self.objects.get(&key).map(|o| o.value.clone());
+        let previous = self.objects.get(&key).map(Object::value);
         let mut next = match &previous {
             Some(prev) => merge_apply(prev, &desired),
             None => desired.clone(),
@@ -162,7 +169,7 @@ impl Cluster {
             self.seq += 1;
             self.due.push(Reverse((ready_at, self.seq, key.clone())));
         }
-        self.objects.insert(key, Object { value: next.clone(), ready_at_ms: ready_at });
+        self.objects.insert(key, Object { value: crate::obj::Blob::encode(&next), ready_at_ms: ready_at });
         Ok((next.clone(), Some(Event::Upsert(next))))
     }
 
@@ -189,25 +196,29 @@ impl Cluster {
     /// Someone else changes an object (drift): `f` edits it; the change is a new version.
     pub fn edit(&mut self, key: &ResKey, f: impl FnOnce(&mut Value)) -> Option<Event> {
         let o = self.objects.get_mut(key)?;
-        f(&mut o.value);
+        let mut v = o.value();
+        f(&mut v);
         self.rv += 1;
-        if let Some(meta) = obj::ensure_map(&mut o.value, &["metadata"]) {
+        if let Some(meta) = obj::ensure_map(&mut v, &["metadata"]) {
             meta.insert("resourceVersion".into(), Value::String(self.rv.to_string()));
         }
-        Some(Event::Upsert(o.value.clone()))
+        o.value = crate::obj::Blob::encode(&v);
+        Some(Event::Upsert(v))
     }
 
     /// Changes only an object's status, as controllers do all day (no new generation).
     pub fn touch_status(&mut self, key: &ResKey, f: impl FnOnce(&mut Map<String, Value>)) -> Option<Event> {
         let o = self.objects.get_mut(key)?;
-        if let Some(status) = obj::ensure_map(&mut o.value, &["status"]) {
+        let mut v = o.value();
+        if let Some(status) = obj::ensure_map(&mut v, &["status"]) {
             f(status);
         }
         self.rv += 1;
-        if let Some(meta) = obj::ensure_map(&mut o.value, &["metadata"]) {
+        if let Some(meta) = obj::ensure_map(&mut v, &["metadata"]) {
             meta.insert("resourceVersion".into(), Value::String(self.rv.to_string()));
         }
-        Some(Event::Upsert(o.value.clone()))
+        o.value = crate::obj::Blob::encode(&v);
+        Some(Event::Upsert(v))
     }
 
     /// The next time a controller has something to do.
@@ -227,12 +238,14 @@ impl Cluster {
             if o.ready_at_ms > t {
                 continue;
             }
-            finish_status(&mut o.value, &key, failing);
+            let mut v = o.value();
+            finish_status(&mut v, &key, failing);
             self.rv += 1;
-            if let Some(meta) = obj::ensure_map(&mut o.value, &["metadata"]) {
+            if let Some(meta) = obj::ensure_map(&mut v, &["metadata"]) {
                 meta.insert("resourceVersion".into(), Value::String(self.rv.to_string()));
             }
-            out.push(Event::Upsert(o.value.clone()));
+            o.value = crate::obj::Blob::encode(&v);
+            out.push(Event::Upsert(v));
         }
     }
 }

@@ -502,6 +502,8 @@ struct Op {
     applied: u32,
     pruned: u32,
     request: SyncRequest,
+    /// Requests this sync made (sent or not).
+    requests: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -518,7 +520,10 @@ struct App {
     cfg: Arc<AppConfig>,
     label: Str,
     cluster: ClusterIx,
+    /// The revision of the render it is compared against.
     revision: Option<Str>,
+    /// The revision of the inputs it was last given (rendering, if `key` moved).
+    wanted_revision: Option<Str>,
     key: Option<u64>,
     render: Option<Arc<Render>>,
     render_error: Option<String>,
@@ -583,6 +588,8 @@ struct Cluster {
     queue: [VecDeque<u64>; PRIORITIES],
     /// apps by their tracking label, for live objects to find their app.
     by_label: FxHashMap<Str, AppIx>,
+    /// When the pending budget timer fires, if one is set: one at a time per cluster.
+    budget_timer: Option<u64>,
 }
 
 enum ReqKind {
@@ -606,6 +613,36 @@ enum Timer {
     Retry(AppIx),
     Heal(AppIx),
     Budget(ClusterIx),
+}
+
+/// What the engine's memory holds (estimates, in bytes).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Footprint {
+    /// Apps.
+    pub apps: usize,
+    /// Resources tracked.
+    pub resources: usize,
+    /// Renders cached.
+    pub renders: usize,
+    /// App records and their resource sets.
+    pub app_bytes: usize,
+    /// Resource records.
+    pub resource_bytes: usize,
+    /// The key index.
+    pub index_bytes: usize,
+    /// Object names.
+    pub name_bytes: usize,
+    /// Live objects, compressed.
+    pub live_bytes: usize,
+    /// Rendered objects, compressed.
+    pub desired_bytes: usize,
+}
+
+impl Footprint {
+    /// Everything.
+    pub fn total(&self) -> usize {
+        self.app_bytes + self.resource_bytes + self.index_bytes + self.name_bytes + self.live_bytes + self.desired_bytes
+    }
 }
 
 /// Counters for benchmarks and `/metrics`.
@@ -688,6 +725,31 @@ impl Engine {
         self.stats
     }
 
+    /// An estimate of the memory the engine holds, by what holds it.
+    pub fn footprint(&self) -> Footprint {
+        let mut f = Footprint { apps: self.app_by_id.len(), ..Footprint::default() };
+        for cl in &self.clusters {
+            f.resources += cl.index.len();
+            f.index_bytes += cl.index.capacity() * (std::mem::size_of::<ResKey>() + std::mem::size_of::<ResIx>() + 8);
+            f.resource_bytes += cl.res.capacity() * std::mem::size_of::<Option<Res>>();
+            for res in cl.res.iter().flatten() {
+                f.name_bytes += res.key.name.len();
+                if let Some(l) = &res.live {
+                    f.live_bytes += l.blob.len();
+                }
+            }
+        }
+        for slot in self.renders.values() {
+            if let RenderSlot::Done(r) = slot {
+                f.renders += 1;
+                f.desired_bytes += r.objects.iter().map(|o| o.blob.len() + o.name.len() + std::mem::size_of::<Rendered>()).sum::<usize>();
+            }
+        }
+        f.app_bytes = self.apps.capacity() * std::mem::size_of::<Option<App>>()
+            + self.apps.iter().flatten().map(|a| a.resources.capacity() * 8 + a.cfg.id.len() * 2).sum::<usize>();
+        f
+    }
+
     /// The time of the last input.
     pub fn now(&self) -> u64 {
         self.now
@@ -759,7 +821,7 @@ impl Engine {
                 if let Some(&a) = self.app_by_id.get(&*app) {
                     if hard {
                         let (rev, key) = match self.app(a) {
-                            Some(x) => (x.revision.clone(), x.key),
+                            Some(x) => (x.wanted_revision.clone(), x.key),
                             None => (None, None),
                         };
                         if let (Some(rev), Some(key)) = (rev, key) {
@@ -816,6 +878,7 @@ impl Engine {
             max_inflight: self.cfg.cluster_inflight,
             queue: Default::default(),
             by_label: FxHashMap::default(),
+            budget_timer: None,
         });
         self.cluster_by_name.insert(name, c);
         c
@@ -865,6 +928,7 @@ impl Engine {
             cluster: c,
             cfg: Arc::new(cfg),
             revision: None,
+            wanted_revision: None,
             key: None,
             render: None,
             render_error: None,
@@ -935,8 +999,13 @@ impl Engine {
     fn set_inputs(&mut self, id: &str, revision: Str, key: u64, force: bool) {
         let Some(&a) = self.app_by_id.get(id) else { return };
         let same = self.app(a).is_some_and(|app| app.key == Some(key));
+        let rendered = self.app(a).is_some_and(|app| app.render.as_ref().is_some_and(|r| r.key == key));
         if let Some(app) = self.app_mut(a) {
-            app.revision = Some(revision.clone());
+            app.wanted_revision = Some(revision.clone());
+            // Same content at a new revision: what was compared is what this revision holds.
+            if same && rendered {
+                app.revision = Some(revision.clone());
+            }
         }
         self.mark(a);
         if same && !force {
@@ -1079,6 +1148,9 @@ impl Engine {
             }
         }
         if let Some(app) = self.app_mut(a) {
+            if app.key == Some(render.key) {
+                app.revision = app.wanted_revision.clone();
+            }
             app.render = Some(render);
             app.render_error = None;
             app.hooks = hooks;
@@ -1246,15 +1318,10 @@ impl Engine {
         let manager: Str = cfg.as_ref().map(|c| c.manager.clone()).unwrap_or_else(|| "kiln".into());
         let status = health::assess(&v, self.rules.as_ref())
             .or_else(|| if self.cfg.generic_health { health::generic_conditions(&v) } else { None });
-        let hook = sync::hook_of(&v).is_some();
         let terminating = obj::get(&v, &["metadata", "deletionTimestamp"]).is_some_and(|t| !t.is_null());
-        let mut view = LiveView::new(v, &manager);
-        // Only kiln's own apply and the managers its ignore rules name are ever read again.
-        view.managed.retain(|m| {
-            (m.operation == "Apply" && *m.manager == *manager)
-                || cfg.as_ref().is_some_and(|c| c.ignore.iter().any(|r| r.managers.contains(&m.manager)))
-        });
-        let (hash, health, message) = (view.hash, status.as_ref().map(|s| s.health), status.map(|s| s.message));
+        let hash = diff::live_hash(&v, &manager);
+        let (health, message) = (status.as_ref().map(|s| s.health), status.map(|s| s.message));
+        let message = message.filter(|m| !m.is_empty()).map(String::into_boxed_str);
         let mut moved = false;
         let mut health_moved = false;
         if let Some(res) = self.res_mut(c, ix) {
@@ -1262,22 +1329,21 @@ impl Engine {
                 res.app = owner;
             }
             match &mut res.live {
+                // Only status (or the server's bookkeeping) moved: no copy, no comparison.
                 Some(l) if l.hash == hash => {
                     health_moved = l.health != health || l.terminating != terminating;
                     l.health = health;
-                    l.message = message.filter(|m| !m.is_empty()).map(String::into_boxed_str);
+                    l.message = message;
                     l.terminating = terminating;
                 }
                 _ => {
                     moved = true;
-                    res.live = Some(Live {
-                        blob: Blob::encode(&recombine(view)),
-                        hash,
-                        health,
-                        message: message.filter(|m| !m.is_empty()).map(String::into_boxed_str),
-                        hook,
-                        terminating,
+                    let hook = sync::hook_of(&v).is_some();
+                    // Only kiln's own apply and the managers its ignore rules name are read again.
+                    let view = LiveView::keeping(v, &manager, |m| {
+                        cfg.as_ref().is_some_and(|c| c.ignore.iter().any(|r| r.managers.iter().any(|x| x == m)))
                     });
+                    res.live = Some(Live { blob: Blob::encode(&recombine(view)), hash, health, message, hook, terminating });
                 }
             }
         }
@@ -1681,6 +1747,7 @@ impl Engine {
             applied: 0,
             pruned: 0,
             request,
+            requests: Vec::new(),
         };
         if !plan.held.is_empty() {
             op.message = format!("{} objects need pruning but are kept by their Prune option", plan.held.len());
@@ -1694,7 +1761,10 @@ impl Engine {
             by: op.by.clone(),
             at_ms: now,
         }));
-        let dry_first = self.cfg.dry_run_first || op.dry_run_only;
+        // The dry run keeps a sync from applying half of what it holds; one object can't be half
+        // applied, so a sync of one object skips it and costs one request, not two.
+        let applies = op.tasks.iter().filter(|t| t.action != sync::Action::Prune).count();
+        let dry_first = (self.cfg.dry_run_first && applies > 1) || op.dry_run_only;
         if let Some(app) = self.app_mut(a) {
             app.op = Some(op);
             app.retry = None;
@@ -1747,6 +1817,7 @@ impl Engine {
                     manager: manager.clone(),
                 }),
             });
+            self.own_request(a, id);
             self.enqueue(c, id, trigger);
         }
         if let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) {
@@ -1860,7 +1931,7 @@ impl Engine {
                 }
             }
             OpPhase::Terminating => {
-                let inflight = self.requests.values().any(|r| r.app == Some(a) && r.op == op.id);
+                let inflight = op.requests.iter().any(|id| self.requests.contains_key(id));
                 if !inflight {
                     self.finish_op(a, false, "terminated".into());
                 }
@@ -2012,6 +2083,7 @@ impl Engine {
                 _ => continue,
             };
             self.requests.insert(id, Request { app: Some(a), op: op_id, cluster: c, kind, action: Some(action) });
+            self.own_request(a, id);
             self.enqueue(c, id, trigger);
         }
         if let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) {
@@ -2217,23 +2289,34 @@ impl Engine {
         let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) else { return };
         op.phase = OpPhase::Terminating;
         op.message = "terminating".into();
-        let id = op.id;
         // Requests not yet sent are dropped; those in flight are waited for.
-        let queued: Vec<u64> = self
-            .requests
-            .iter()
-            .filter(|(_, r)| r.app == Some(a) && r.op == id && r.action.is_some())
-            .map(|(k, _)| *k)
-            .collect();
-        for k in queued {
-            self.requests.remove(&k);
-        }
+        self.drop_requests(a);
         self.mark(a);
     }
 
+    /// Forgets the requests of the app's sync that were not sent yet.
     fn drop_requests(&mut self, a: AppIx) {
-        let Some(op_id) = self.app(a).and_then(|x| x.op.as_ref()).map(|o| o.id) else { return };
-        self.requests.retain(|_, r| !(r.app == Some(a) && r.op == op_id && r.action.is_some()));
+        let Some(ids) = self.app_mut(a).and_then(|x| x.op.as_mut()).map(|o| std::mem::take(&mut o.requests)) else { return };
+        let mut kept = Vec::new();
+        for id in ids {
+            match self.requests.get(&id) {
+                Some(r) if r.action.is_some() => {
+                    self.requests.remove(&id);
+                }
+                Some(_) => kept.push(id),
+                None => {}
+            }
+        }
+        if let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) {
+            op.requests = kept;
+        }
+    }
+
+    /// Records a request of the app's sync.
+    fn own_request(&mut self, a: AppIx, id: u64) {
+        if let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) {
+            op.requests.push(id);
+        }
     }
 
     // ---------------------------------------------------------------- requests
@@ -2268,7 +2351,10 @@ impl Engine {
             }
             if cl.bucket.tokens < 1.0 {
                 let at = cl.bucket.next_ms();
-                self.timers.push(Reverse((at, Timer::Budget(c))));
+                if cl.budget_timer.is_none_or(|t| t > at) {
+                    cl.budget_timer = Some(at);
+                    self.timers.push(Reverse((at, Timer::Budget(c))));
+                }
                 break;
             }
             let Some(id) = cl.queue.iter_mut().find_map(VecDeque::pop_front) else { break };
@@ -2316,7 +2402,15 @@ impl Engine {
                     }
                 }
                 Timer::Heal(a) => self.mark(a),
-                Timer::Budget(c) => self.pump(c),
+                Timer::Budget(c) => {
+                    let current = self.clusters.get(c as usize).and_then(|cl| cl.budget_timer) == Some(at);
+                    if current {
+                        if let Some(cl) = self.clusters.get_mut(c as usize) {
+                            cl.budget_timer = None;
+                        }
+                        self.pump(c);
+                    }
+                }
             }
         }
     }

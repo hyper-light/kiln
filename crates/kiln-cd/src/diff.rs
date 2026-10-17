@@ -143,14 +143,42 @@ pub struct Managed {
     pub fields: FieldSet,
 }
 
+/// The hash [`LiveView::new`] gives an object, computed on the object as it arrived, without
+/// copying it: what it says, without `status` and the server's bookkeeping, plus the field set
+/// `manager` owns by apply. Equal hashes mean nothing kiln compares has moved.
+pub fn live_hash(obj: &Value, manager: &str) -> u64 {
+    let Some(m) = obj.as_object() else { return hash_value(obj) };
+    let mut hash = obj::hash_object_without(m, &["status"], ("metadata", SERVER_METADATA));
+    let own = obj::list_at(obj, &["metadata", "managedFields"]).and_then(|entries| {
+        entries.iter().find(|e| {
+            e.get("manager").and_then(Value::as_str) == Some(manager) && e.get("operation").and_then(Value::as_str) == Some("Apply")
+        })
+    });
+    if let Some(fields) = own.and_then(|e| e.get("fieldsV1")) {
+        hash ^= hash_value(fields).rotate_left(17);
+    }
+    hash
+}
+
 impl LiveView {
     /// Prepares a live object; `manager` is the field manager kiln applies as.
-    pub fn new(mut obj: Value, manager: &str) -> LiveView {
+    pub fn new(obj: Value, manager: &str) -> LiveView {
+        Self::keeping(obj, manager, |_| true)
+    }
+
+    /// Prepares a live object, parsing only the managers `keep` names (beside `manager`'s apply).
+    pub fn keeping(mut obj: Value, manager: &str, keep: impl Fn(&str) -> bool) -> LiveView {
+        let hash = live_hash(&obj, manager);
         let raw_managed = obj.get_mut("metadata").and_then(Value::as_object_mut).and_then(|m| m.remove("managedFields"));
         let mut managed = Vec::new();
         if let Some(Value::Array(entries)) = raw_managed {
             for e in entries {
                 let get = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+                let name = e.get("manager").and_then(Value::as_str).unwrap_or("");
+                let op = e.get("operation").and_then(Value::as_str).unwrap_or("");
+                if !((name == manager && op == "Apply") || keep(name)) {
+                    continue;
+                }
                 managed.push(Managed {
                     manager: get("manager"),
                     operation: get("operation"),
@@ -166,10 +194,6 @@ impl LiveView {
             for k in SERVER_METADATA {
                 meta.remove(*k);
             }
-        }
-        let mut hash = hash_value(&obj);
-        if let Some(own) = managed.iter().find(|m| m.manager == manager && m.operation == "Apply") {
-            hash ^= own.fields.hash().rotate_left(17);
         }
         LiveView { object: obj, managed, hash }
     }

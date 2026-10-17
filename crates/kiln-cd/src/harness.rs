@@ -42,7 +42,11 @@ pub struct Harness {
     pub engine_ns: u128,
     /// Inputs given to the engine.
     pub inputs: u64,
+    /// Apps whose latest status is synced and healthy.
+    pub settled: usize,
     renderer: Renderer,
+    /// When each simulated cluster's controllers next have work.
+    due: BinaryHeap<Reverse<(u64, Str)>>,
     queue: BinaryHeap<Reverse<(u64, u64)>>,
     payloads: FxHashMap<u64, Input>,
     seq: u64,
@@ -63,7 +67,9 @@ impl Harness {
             records: Vec::new(),
             engine_ns: 0,
             inputs: 0,
+            settled: 0,
             renderer,
+            due: BinaryHeap::new(),
             queue: BinaryHeap::new(),
             payloads: FxHashMap::default(),
             seq: 0,
@@ -125,6 +131,9 @@ impl Harness {
                     Some(c) => c.apply(now, object, &manager, dry_run),
                     None => Err(format!("no cluster {cluster}")),
                 };
+                if let Some(t) = self.clusters.get(&cluster).and_then(sim::Cluster::next_due) {
+                    self.due.push(Reverse((t, cluster.clone())));
+                }
                 match result {
                     Ok((v, ev)) => {
                         self.later(self.latency_ms, Input::Answer { id, result: Ok(Some(v)) });
@@ -151,7 +160,13 @@ impl Harness {
                 }
             }
             Action::Status(s) => {
-                self.statuses.insert(s.app.clone(), s);
+                let now_settled = is_settled(&s);
+                let was = self.statuses.insert(s.app.clone(), s).is_some_and(|old| is_settled(&old));
+                match (was, now_settled) {
+                    (false, true) => self.settled += 1,
+                    (true, false) => self.settled = self.settled.saturating_sub(1),
+                    _ => {}
+                }
             }
             Action::Record(r) => self.records.push(r),
         }
@@ -199,7 +214,7 @@ impl Harness {
     fn next(&self) -> Option<u64> {
         let q = self.queue.peek().map(|Reverse((t, _))| *t);
         let e = self.engine.deadline();
-        let c = self.clusters.values().filter_map(sim::Cluster::next_due).min();
+        let c = self.due.peek().map(|Reverse((t, _))| *t);
         [q, e, c].into_iter().flatten().min()
     }
 
@@ -235,10 +250,22 @@ impl Harness {
         let now = self.now;
         // Controllers first: what they do is delivered after the latency, like any event.
         let mut events = std::mem::take(&mut self.events);
-        let names: Vec<Str> = self.clusters.keys().cloned().collect();
+        let mut names: Vec<Str> = Vec::new();
+        while let Some(Reverse((t, name))) = self.due.peek().cloned() {
+            if t > now {
+                break;
+            }
+            self.due.pop();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
         for name in names {
             if let Some(c) = self.clusters.get_mut(&name) {
                 c.advance(now, &mut events);
+                if let Some(t) = c.next_due() {
+                    self.due.push(Reverse((t, name.clone())));
+                }
             }
             for ev in events.drain(..) {
                 self.deliver(&name, ev, self.latency_ms);
@@ -259,17 +286,15 @@ impl Harness {
         }
     }
 
-    /// Whether every app is synced and healthy.
+    /// Whether every app is synced and healthy, with no sync running.
     pub fn all_settled(&self) -> bool {
-        self.engine.app_count() > 0
-            && self.statuses.len() == self.engine.app_count()
-            && self.statuses.values().all(|s| {
-                s.sync == Sync::Synced && s.health == Health::Healthy && s.operation.as_ref().is_none_or(|o| o.phase != crate::engine::OpPhase::Running)
-            })
+        self.engine.app_count() > 0 && self.settled == self.engine.app_count()
     }
+}
 
-    /// How many apps are synced and healthy.
-    pub fn settled_count(&self) -> usize {
-        self.statuses.values().filter(|s| s.sync == Sync::Synced && s.health == Health::Healthy).count()
-    }
+/// Synced, healthy, and no sync running.
+pub fn is_settled(s: &Summary) -> bool {
+    s.sync == Sync::Synced
+        && s.health == Health::Healthy
+        && s.operation.as_ref().is_none_or(|o| !matches!(o.phase, crate::engine::OpPhase::Running | crate::engine::OpPhase::DryRun))
 }

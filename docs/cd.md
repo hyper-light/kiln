@@ -157,8 +157,8 @@ Services, Ingresses, PersistentVolumeClaims, HorizontalPodAutoscalers and APISer
 Argo CD's. Other kinds use, in order: a rule from settings; the Lua script Argo CD's resource
 customizations library has for it (the library ships inside kiln, 290+ kinds); a generic rule for
 objects with `status.conditions` (`Ready` / `Available`); otherwise `Healthy` once it exists. An
-app's health is the worst of its resources' in the order Degraded, Missing, Progressing,
-Suspended, Healthy, as Argo CD orders them.
+app's health is the worst of its resources', in Argo CD's order from worst: Unknown, Degraded,
+Missing, Progressing, Suspended, Healthy.
 
 ## Syncing
 
@@ -406,9 +406,30 @@ Every change is audited with its principal, and with the person it acted for.
 3. When they agree, take over an app, a project or everything. kiln adopts the objects (Argo CD's
    tracking is read) and disables auto-sync in Argo CD for what it took. Nothing is recreated.
 
+### Measured
+
+`cargo run --release -p kiln-cd --example bench -- --apps N --clusters C --shards S` (also
+`--features mimalloc`) drives the engine against simulated clusters that admit 500 requests a
+second each, answer in 5 ms and roll Deployments out in 3 s. Three objects per app (a
+Deployment, a Service, a ConfigMap), every app distinct, automatic sync with prune and
+self-heal, dry runs on. On one 32-thread machine (Ryzen 9 9950X3D2, glibc malloc):
+
+| Apps | Shards | Cold start (simulated · wall · engine CPU) | Steady 10 min (engine CPU) | 1% new revision synced | 0.1% drift healed | Engine memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10,000 | 1 | 13 s · 1.9 s · 1.2 s | 0.10 s | 3.0 s | 3.0 s | 48 MiB |
+| 100,000 | 1 | 13 s · 24 s · 15 s | 1.5 s | 3.0 s | 3.0 s | 458 MiB |
+| 1,000,000 | 16 | 13 s · 45 s · 407 s | 27 s (0.05 cores) | 3.0 s | 3.0 s | 4.4 GiB |
+
+Cold start is bound by the clusters' request budgets (every object is dry-run, then applied),
+not by kiln. Status-only events, the bulk of what a quiet fleet sends, cost one hash and no
+comparison. With mimalloc, engine CPU drops by a quarter to two fifths under 16 shards. The
+simulated clusters are not real ones: watch-stream parsing (about 7 µs per event), rendering
+and the network come on top, and are measured separately as they are built.
+
 ## Status
 
 | Part | State |
 | --- | --- |
 | Spec | this document |
-| Everything else | not built yet |
+| Engine (`crates/kiln-cd`): health, diff, sync planning, controller, simulated clusters, benchmark | built, tested |
+| Rendering, git, clusters, API, CLI, UI, MCP, replication | not built yet |

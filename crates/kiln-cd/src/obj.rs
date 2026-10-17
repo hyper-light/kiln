@@ -372,20 +372,58 @@ fn feed(h: &mut Xxh3, v: &Value) {
             }
         }
         Value::Object(m) => {
-            // Entries combine by wrapping sum, so their order doesn't matter.
-            let mut acc = 0u64;
-            for (k, item) in m {
-                let mut e = Xxh3::new();
-                e.update(k.as_bytes());
-                e.update(&[0xff]);
-                e.update(&hash_value(item).to_le_bytes());
-                acc = acc.wrapping_add(e.digest());
-            }
-            h.update(&[5]);
-            h.update(&(m.len() as u64).to_le_bytes());
-            h.update(&acc.to_le_bytes());
+            let (acc, n) = m.iter().fold((0u64, 0u64), |(acc, n), (k, item)| (acc.wrapping_add(entry_hash(k, hash_value(item))), n + 1));
+            finish_object(h, acc, n);
         }
     }
+}
+
+/// One object entry's share of its object's hash. Entries combine by wrapping sum, so their
+/// order doesn't matter, and a hash that leaves some entries out ([`hash_object_without`]) is
+/// the hash of the object without them.
+pub fn entry_hash(key: &str, value_hash: u64) -> u64 {
+    let mut e = Xxh3::new();
+    e.update(key.as_bytes());
+    e.update(&[0xff]);
+    e.update(&value_hash.to_le_bytes());
+    e.digest()
+}
+
+fn finish_object(h: &mut Xxh3, acc: u64, n: u64) {
+    h.update(&[5]);
+    h.update(&n.to_le_bytes());
+    h.update(&acc.to_le_bytes());
+}
+
+/// The hash `hash_value` would give the object with the entries `skip` names removed, and with
+/// `inner` (an entry's key and the keys to drop inside it) removed one level down; computed
+/// without building that object.
+pub fn hash_object_without(m: &Map<String, Value>, skip: &[&str], inner: (&str, &[&str])) -> u64 {
+    let (inner_key, inner_skip) = inner;
+    let mut acc = 0u64;
+    let mut n = 0u64;
+    for (k, item) in m {
+        if skip.contains(&k.as_str()) {
+            continue;
+        }
+        let vh = match item {
+            Value::Object(im) if k == inner_key => {
+                let mut h = Xxh3::new();
+                let (iacc, inn) = im
+                    .iter()
+                    .filter(|(ik, _)| !inner_skip.contains(&ik.as_str()))
+                    .fold((0u64, 0u64), |(acc, n), (ik, iv)| (acc.wrapping_add(entry_hash(ik, hash_value(iv))), n + 1));
+                finish_object(&mut h, iacc, inn);
+                h.digest()
+            }
+            other => hash_value(other),
+        };
+        acc = acc.wrapping_add(entry_hash(k, vh));
+        n += 1;
+    }
+    let mut h = Xxh3::new();
+    finish_object(&mut h, acc, n);
+    h.digest()
 }
 
 /// A 64-bit hash of bytes (render keys, ids).

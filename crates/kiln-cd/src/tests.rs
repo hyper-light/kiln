@@ -83,7 +83,7 @@ fn an_automatic_app_deploys_and_turns_healthy() {
     // The API server's defaults (imagePullPolicy, protocols, clusterIP) are not drift.
     assert_eq!(status(&h, "web").map(|s| (s.resources, s.out_of_sync)), Some((3, 0)));
     let dep = ResKey::new("apps", "Deployment", "web", "web");
-    let live = h.clusters.get("dev").and_then(|c| c.get(&dep)).cloned().unwrap_or_default();
+    let live = h.clusters.get("dev").and_then(|c| c.get(&dep)).unwrap_or_default();
     assert_eq!(obj::label(&live, crate::engine::APP_LABEL), Some(crate::engine::app_label("web").as_str()));
 }
 

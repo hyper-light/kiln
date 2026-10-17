@@ -16,6 +16,7 @@
 //! - [`sim`] and [`harness`]: simulated clusters, and the engine driven against them on a
 //!   simulated clock (tests and `kiln cd bench`).
 
+pub mod bench;
 pub mod diff;
 pub mod engine;
 pub mod harness;
