@@ -147,6 +147,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
         (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
         (&Method::POST, ["api", "agents", "instance"]) => return enroll_instance(&hub, req).await,
+        (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return create_join(&hub, req).await,
         (&Method::GET, ["api", "join-requests", id]) => {
             let id = (*id).to_owned();
@@ -1526,6 +1527,21 @@ async fn github_hook(hub: &Hub, req: Request) -> R {
     // A webhook only hints; the poll decides what changed (GitOps: state comes from git).
     hub.gitops_kick.notify();
     Ok(srv::status(StatusCode::ACCEPTED))
+}
+
+// ------------------------------------------------------------------ agent tunnel
+
+/// `GET /api/agents/tunnel`: a runner's QUIC datagrams through a WebSocket, for runners whose
+/// UDP to the QUIC port is dropped (see `crate::tunnel`). Open: the QUIC mutual TLS inside it
+/// authenticates both ends.
+fn agent_tunnel(hub: &Arc<Hub>, req: Request) -> R {
+    let bind: std::net::SocketAddr = hub
+        .cfg
+        .server
+        .quic_addr
+        .parse()
+        .map_err(|_| err(StatusCode::SERVICE_UNAVAILABLE, "the QUIC listener address is not an address"))?;
+    crate::tunnel::serve(&hub.tunnels, crate::tunnel::listener_for(bind), req).map_err(|(status, why)| err(status, why))
 }
 
 // ------------------------------------------------------------------ events ws

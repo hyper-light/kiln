@@ -8,7 +8,6 @@
 //! * Serves PTY terminals so the UI can drive this machine.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -173,10 +172,6 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
     }
 }
 
-async fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
-    crate::rt::resolve(addr).await.with_context(|| format!("resolve {addr}"))
-}
-
 /// A dial that produced no transport event in this long is treated as lost (see `run`).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -237,6 +232,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTP(S) to the server (source archives, artifacts): public roots plus kiln's own CA.
     let http = Arc::new(Client::new(Roots::WebPkiPlusDer(ca.clone()), None)?);
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
+    // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
+    let mut paths = crate::tunnel::Paths::new(&o.server_url, &quic_addr);
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
     let uplink = Uplink(up_tx);
@@ -342,7 +339,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Redial => {
                 redial = None;
-                match resolve(&quic_addr).await {
+                match paths.target(&http, Instant::now()).await {
                     Ok(addr) => {
                         dialing_since = Some(Instant::now());
                         net.command(Out::Connect { addr }).await;
@@ -386,13 +383,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     tracing::warn!(server = %quic_addr, after = ?DIAL_TIMEOUT, "no answer from server; rebuilding transport and redialing");
                     dialing_since = None;
                     net.command(Out::Rebuild).await;
-                    redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
+                    let now = Instant::now();
+                    redial = Some(if paths.dial_failed(now) { now } else { now + crate::sup::jitter(dial_backoff) });
                     dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
+                }
+                // Direct dials unanswered for too long: through the tunnel now. Tunnelled and UDP
+                // answers again: drop this connection (what is sent meanwhile waits in the buffer)
+                // and dial directly; the tunnel stays open until that connection is up.
+                if paths.tick(connected, Instant::now()) {
+                    connected = false;
+                    dialing_since = None;
+                    redial = Some(Instant::now());
                 }
             }
             Ev::Net(None) => anyhow::bail!("transport stopped"),
-            Ev::Net(Some(NetEvent::Connected { .. })) => {
-                tracing::info!(server = %quic_addr, "connected to server");
+            Ev::Net(Some(NetEvent::Connected { binding, .. })) => {
+                tracing::info!(server = %quic_addr, via = %paths.via(), "connected to server");
+                paths.connected(binding, Instant::now());
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
                 // Which process of this machine this is, then Hello (an older server skips the first).
@@ -418,14 +425,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
+                let now = Instant::now();
+                let mut at_once = false;
                 if connected {
                     tracing::warn!(%reason, "disconnected from server");
+                    paths.disconnected();
                 } else {
-                    tracing::info!(%reason, retry_in = ?dial_backoff, "dial failed");
+                    tracing::info!(%reason, via = %paths.via(), retry_in = ?dial_backoff, "dial failed");
+                    // The path changed (to the tunnel, or back): dial that way now.
+                    at_once = paths.dial_failed(now);
                 }
                 connected = false;
                 dialing_since = None;
-                redial = Some(Instant::now() + crate::sup::jitter(dial_backoff));
+                redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
             Ev::Net(Some(NetEvent::Frame { data, .. })) => {
