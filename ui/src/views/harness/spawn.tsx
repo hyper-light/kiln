@@ -123,7 +123,8 @@ export function SpawnDialog({
     setError(null);
     const spec: Spec = {
       kind,
-      cwd: cwd.trim() || undefined,
+      // In a shell, the agent starts where the shell is.
+      cwd: shell ? undefined : cwd.trim() || undefined,
       mode: mode || undefined,
       model: model.trim() || undefined,
       name: name.trim() || undefined,
