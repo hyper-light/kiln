@@ -54,11 +54,28 @@ fn tail_lines(path: &Path, bytes: u64) -> Option<Vec<String>> {
 
 /// The conversation's records, oldest first: the parent chain back from the newest message
 /// (across compactions), so records other processes interleaved are left out.
-fn branch(records: Vec<Value>) -> Vec<Value> {
+fn branch(records: Vec<Value>, started: Option<i64>, upto: Option<&str>) -> Vec<Value> {
     let keep: HashSet<String> = {
         let msgs: Vec<&Value> = records.iter().filter(|r| r.get("uuid").and_then(Value::as_str).is_some()).collect();
         let by_id: HashMap<&str, &Value> = msgs.iter().filter_map(|r| Some((r.get("uuid")?.as_str()?, *r))).collect();
-        let Some(last) = msgs.iter().rev().find(|r| matches!(r.get("type").and_then(Value::as_str), Some("user" | "assistant"))) else { return Vec::new() };
+        let is_msg = |r: &&&Value| matches!(r.get("type").and_then(Value::as_str), Some("user" | "assistant"));
+        // Each process that wrote here stamps its records with its own `session_id` (a lane).
+        // The lane of the process started at `started` is the first to appear after it.
+        let lane = started.and_then(|t| {
+            let mut first: HashMap<&str, i64> = HashMap::new();
+            for r in &msgs {
+                if let (Some(l), Some(ts)) = (r.get("session_id").and_then(Value::as_str), r.get("timestamp").and_then(Value::as_str).and_then(unix_secs)) {
+                    first.entry(l).or_insert(ts);
+                }
+            }
+            first.into_iter().filter(|(_, ts)| *ts >= t - 5).min_by_key(|(_, ts)| *ts).map(|(l, _)| l)
+        });
+        let head = match (upto, lane) {
+            (Some(u), _) => msgs.iter().find(|r| r.get("uuid").and_then(Value::as_str) == Some(u)),
+            (None, Some(l)) => msgs.iter().rev().filter(is_msg).find(|r| r.get("session_id").and_then(Value::as_str) == Some(l)),
+            (None, None) => msgs.iter().rev().find(is_msg),
+        };
+        let Some(last) = head else { return Vec::new() };
         let mut keep: HashSet<String> = HashSet::new();
         let mut at = Some(*last);
         while let Some(r) = at {
@@ -72,6 +89,10 @@ fn branch(records: Vec<Value>) -> Vec<Value> {
         keep
     };
     records.into_iter().filter(|r| r.get("uuid").and_then(Value::as_str).is_some_and(|u| keep.contains(u))).collect()
+}
+
+fn unix_secs(ts: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339).ok().map(time::OffsetDateTime::unix_timestamp)
 }
 
 /// A transcript record in the stream-json shape the Claude adapter reads (None: not shown).
@@ -112,13 +133,28 @@ fn as_stream(r: &Value) -> Option<Value> {
 
 /// Render a transcript's conversation into `core` (history: nothing is left running).
 pub fn load(core: &mut Core, lines: &[String]) {
+    load_for(core, lines, None);
+}
+
+/// [`load`], only up to (and including) the entry `upto` (a branch taken from that point).
+pub fn load_upto(core: &mut Core, lines: &[String], upto: Option<&str>) {
+    load_with(core, lines, None, upto);
+}
+
+/// [`load`], for the conversation of the process started at `started` (unix seconds), when
+/// several processes write to one transcript.
+pub fn load_for(core: &mut Core, lines: &[String], started: Option<i64>) {
+    load_with(core, lines, started, None);
+}
+
+fn load_with(core: &mut Core, lines: &[String], started: Option<i64>, upto: Option<&str>) {
     let records: Vec<Value> = lines.iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
     // The title Claude Code gave the session, if any.
     if let Some(t) = records.iter().rev().find_map(|r| (r.get("type").and_then(Value::as_str) == Some("ai-title")).then(|| r.get("aiTitle").and_then(Value::as_str)).flatten()) {
         core.state.title = t.to_owned();
     }
     let mut adapter = Claude::new(false);
-    for r in branch(records) {
+    for r in branch(records, started, upto) {
         if let Some(v) = as_stream(&r) {
             adapter.line(core, &v.to_string());
         }
@@ -168,6 +204,22 @@ pub fn read(file: &Path) -> Option<Vec<String>> {
     tail_lines(file, HISTORY_BYTES)
 }
 
+/// The whole view of a Claude Code session running elsewhere (a terminal, another tool): its
+/// timeline, state and changeset, as JSON for the UI. Blocking (reads the transcript and the
+/// files it changed).
+pub fn view(file: &Path, cwd: &str, started: Option<i64>) -> Option<serde_json::Value> {
+    let lines = read(file)?;
+    let mut core = Core::new();
+    core.state.cwd = cwd.to_owned();
+    load_for(&mut core, &lines, started);
+    for job in std::mem::take(&mut core.change_jobs) {
+        let (change, resolved) = super::diff::file_change(&job);
+        core.set_change(&job.abs, change, resolved);
+    }
+    let events: Vec<&super::model::Event> = core.events().collect();
+    Some(json!({"events": events, "state": core.state, "changes": core.changes()}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +236,35 @@ mod tests {
         r#"{"type":"assistant","uuid":"a3","parentUuid":"r1","session_id":"A","message":{"id":"m3","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"edited"}]}}"#,
         r#"{"type":"ai-title","aiTitle":"Fix the thing","sessionId":"S"}"#,
     ];
+
+    #[test]
+    fn the_lane_of_a_process_picks_its_branch() {
+        // Two processes resumed one session: A started first, B later; each has its own lane.
+        let lines: Vec<String> = [
+            r#"{"type":"user","uuid":"u0","parentUuid":null,"session_id":"A","timestamp":"2026-10-16T10:00:00Z","origin":{"kind":"human"},"message":{"role":"user","content":"shared start"}}"#,
+            r#"{"type":"user","uuid":"a1","parentUuid":"u0","session_id":"A","timestamp":"2026-10-16T10:00:10Z","origin":{"kind":"human"},"message":{"role":"user","content":"from A"}}"#,
+            r#"{"type":"user","uuid":"b1","parentUuid":"u0","session_id":"B","timestamp":"2026-10-16T11:00:10Z","origin":{"kind":"human"},"message":{"role":"user","content":"from B"}}"#,
+            r#"{"type":"user","uuid":"a2","parentUuid":"a1","session_id":"A","timestamp":"2026-10-16T11:30:00Z","origin":{"kind":"human"},"message":{"role":"user","content":"A again"}}"#,
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let texts = |started: Option<i64>| -> Vec<String> {
+            let mut core = Core::new();
+            load_for(&mut core, &lines, started);
+            core.events().filter_map(|e| match &e.body {
+                Body::User { text, .. } => Some(text.clone()),
+                _ => None,
+            }).collect()
+        };
+        // B started at 11:00: its lane, though A wrote last.
+        let b_start = unix_secs("2026-10-16T11:00:00Z");
+        assert_eq!(texts(b_start), vec!["shared start", "from B"]);
+        // A started at 09:59.
+        assert_eq!(texts(unix_secs("2026-10-16T09:59:58Z")), vec!["shared start", "from A", "A again"]);
+        // Unknown start: the newest message's branch.
+        assert_eq!(texts(None), vec!["shared start", "from A", "A again"]);
+    }
 
     #[test]
     fn history_follows_the_conversation_branch() {

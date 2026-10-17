@@ -185,6 +185,15 @@ impl Reporter {
         });
     }
 
+    /// Answer the server's request for a session's whole view (timeline, state, changeset).
+    pub fn view(&self, req: u64, pid: u32, up: async_channel::Sender<crate::exec::Up>) {
+        let scanner = Arc::clone(&self.scanner);
+        crate::rt::spawn(async move {
+            let json = crate::rt::blocking(move || scanner.lock().view(pid)).await.ok().flatten().map(|v| v.to_string());
+            let _ = up.send(crate::exec::Up::Term(crate::proto::AgentMsg::AiView { req, json })).await;
+        });
+    }
+
     /// Answer the server's request for a session's recent messages.
     pub fn transcript(&self, req: u64, pid: u32, up: async_channel::Sender<crate::exec::Up>) {
         let scanner = Arc::clone(&self.scanner);
@@ -348,6 +357,18 @@ impl Scanner {
         out.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
         out.truncate(MAX_SESSIONS);
         out
+    }
+
+    /// The normalized view of the session running as `pid` (Claude Code; as of the last scan).
+    pub fn view(&self, pid: u32) -> Option<Value> {
+        let (tool, file) = self.open.get(&pid)?;
+        if *tool != Tool::Claude {
+            return None;
+        }
+        let p = self.sys.process(Pid::from_u32(pid));
+        let cwd = p.and_then(|p| p.cwd()).map(|c| c.to_string_lossy().into_owned()).unwrap_or_default();
+        let started = p.and_then(|p| i64::try_from(p.start_time()).ok());
+        crate::harness::transcript::view(file, &cwd, started)
     }
 
     /// Recent messages of the transcript of the session running as `pid` (as of the last scan).

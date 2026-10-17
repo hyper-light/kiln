@@ -12,9 +12,10 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 
-use super::core::{Baseline, Core};
+use super::core::{Baseline, Core, Effect};
 use super::model::{
-    AlwaysOption, Approval, Body, Command, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, Question,
+    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Level, ModeOption,
+    ModelOption, Question, SlashCommand,
     QuestionOption, QueueItem, SendMode, Status, Task, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle,
 };
 
@@ -55,6 +56,13 @@ enum Pending {
     Interrupt,
     Models,
     Suggest(String),
+    Skills,
+    Hooks,
+    Mcp,
+    /// thread/revert, cutting the timeline from this event.
+    Revert(String),
+    /// A request that just needs to succeed (its failure is shown).
+    Plain(String),
 }
 
 /// An approval request Codex is waiting on.
@@ -89,15 +97,41 @@ pub struct Codex {
     /// The message that started (or was steered into) the turn under way.
     turn_messages: Vec<String>,
     /// Messages to send once the thread exists or the turn under way has been interrupted.
-    waiting: Vec<(String, String)>,
+    waiting: Vec<QueueItem>,
+    /// The reasoning effort for turns (None: the model's default).
+    effort: Option<String>,
     resume: Option<String>,
     model: Option<String>,
     allow_bypass: bool,
     notice_seq: u64,
     mode: String,
+    /// Reasoning summaries in turns (auto, concise, detailed, none).
+    summary: Option<String>,
+    /// Approval policy and sandbox chosen directly (over the mode's).
+    approval: Option<String>,
+    sandbox: Option<String>,
+    /// Effort levels per model, from model/list.
+    efforts: HashMap<String, Vec<(String, String)>>,
+    /// The turn each prompt started (rewinds and branches name a prompt).
+    turns: HashMap<String, String>,
+    /// Skills (custom commands): name → path.
+    skills: HashMap<String, String>,
+    /// MCP servers: (name, status).
+    mcp: Vec<(String, String)>,
+    /// A new thread branched off `resume` at this turn (instead of resuming it).
+    fork_at: Option<Option<String>>,
 }
 
 impl Codex {
+    pub fn from_spec(spec: &super::session::Spec) -> Self {
+        let mut c = Self::new(spec.resume.clone(), spec.model.clone(), spec.mode.clone(), spec.allow_bypass);
+        c.effort = spec.effort.clone().filter(|e| !e.is_empty());
+        if spec.fork {
+            c.fork_at = Some(spec.resume_at.clone());
+        }
+        c
+    }
+
     pub fn new(resume: Option<String>, model: Option<String>, mode: Option<String>, allow_bypass: bool) -> Self {
         let mode = mode.filter(|m| modes(allow_bypass).iter().any(|x| &x.id == m)).unwrap_or_else(|| "auto".to_owned());
         Self {
@@ -108,11 +142,161 @@ impl Codex {
             turn: None,
             turn_messages: Vec::new(),
             waiting: Vec::new(),
+            effort: None,
             resume,
             model: model.filter(|m| !m.is_empty()),
             allow_bypass,
             notice_seq: 0,
             mode,
+            summary: None,
+            approval: None,
+            sandbox: None,
+            efforts: HashMap::new(),
+            turns: HashMap::new(),
+            skills: HashMap::new(),
+            mcp: Vec::new(),
+            fork_at: None,
+        }
+    }
+
+    /// The approval policy, sandbox (thread) and sandbox policy (turn) in force.
+    fn policies(&self, core: &Core) -> (String, String, Value) {
+        let (a, s, p) = policy(&core.state.mode);
+        let approval = self.approval.clone().unwrap_or_else(|| a.to_owned());
+        let sandbox = self.sandbox.clone().unwrap_or_else(|| s.to_owned());
+        let turn = match sandbox.as_str() {
+            "read-only" => json!({"type": "readOnly"}),
+            "danger-full-access" => json!({"type": "dangerFullAccess"}),
+            "workspace-write" => json!({"type": "workspaceWrite"}),
+            _ => p,
+        };
+        (approval, sandbox, turn)
+    }
+
+    fn refresh_controls(&mut self, core: &mut Core) {
+        let opt = |id: &str, label: &str, description: &str, dangerous: bool| ControlOption { id: id.to_owned(), label: label.to_owned(), description: description.to_owned(), dangerous };
+        let ctl = |id: &str, group: &str, label: &str, description: &str, kind: ControlKind| Control {
+            id: id.to_owned(),
+            group: group.to_owned(),
+            label: label.to_owned(),
+            description: description.to_owned(),
+            kind,
+            options: Vec::new(),
+            value: None,
+            dangerous: false,
+            per_turn: false,
+            requires: None,
+            scope: ControlScope::Session,
+            input: None,
+        };
+        let mut c = Vec::new();
+        let mut t = ctl("reasoning_summary", "Thinking", "Reasoning summaries", "How much of its reasoning Codex summarizes", ControlKind::Select);
+        t.options = vec![opt("auto", "Auto", "", false), opt("concise", "Concise", "", false), opt("detailed", "Detailed", "", false), opt("none", "None", "", false)];
+        c.push(t);
+        let mut t = ctl("approval_policy", "Permissions", "Approvals", "When Codex asks before acting", ControlKind::Select);
+        t.options = vec![
+            opt("untrusted", "Untrusted", "Asks before anything not known to be safe", false),
+            opt("on-request", "On request", "Asks when it needs more than its sandbox allows", false),
+            opt("never", "Never", "Never asks", true),
+        ];
+        c.push(t);
+        let mut t = ctl("sandbox", "Permissions", "Sandbox", "What commands may touch", ControlKind::Select);
+        t.options = vec![
+            opt("read-only", "Read only", "No writes anywhere", false),
+            opt("workspace-write", "Workspace", "Writes inside the working folder", false),
+            opt("danger-full-access", "Full access", "No sandbox at all", true),
+        ];
+        if !self.allow_bypass {
+            t.options.retain(|o| !o.dangerous);
+            if let Some(a) = c.iter_mut().find(|c| c.id == "approval_policy") {
+                a.options.retain(|o| !o.dangerous);
+            }
+        }
+        c.push(t);
+        c.push(ctl("compact", "Context", "Compact", "Summarize the conversation to free context", ControlKind::Action));
+        let mut t = ctl("review", "Context", "Review changes", "Have Codex review the uncommitted changes (or follow your instructions)", ControlKind::Action);
+        t.input = Some("Review instructions (optional)".into());
+        c.push(t);
+        c.push(ctl("rename", "Session", "Name", "The conversation's name", ControlKind::Text));
+        let mut t = ctl("rewind", "Session", "Rewind to here", "Undo this prompt and everything after it", ControlKind::Action);
+        t.scope = ControlScope::Turn;
+        t.dangerous = true;
+        c.push(t);
+        let mut t = ctl("branch", "Session", "Branch from here", "A new session with the conversation up to the end of this turn", ControlKind::Action);
+        t.scope = ControlScope::Turn;
+        c.push(t);
+        for (name, status) in &self.mcp {
+            c.push(ctl(&format!("mcp_info:{name}"), "MCP", name, &format!("MCP server ({status})"), ControlKind::Text));
+        }
+        c.push(ctl("mcp_refresh", "MCP", "Refresh servers", "Ask for every server's status again", ControlKind::Action));
+        c.push(ctl("mcp_reload", "MCP", "Reload configuration", "Reload the MCP servers from Codex's configuration", ControlKind::Action));
+        core.meta.controls = c;
+        let model = core.state.model.clone();
+        core.meta.efforts = self
+            .efforts
+            .get(&model)
+            .map(|l| l.iter().map(|(e, d)| opt(e, &capitalize(e), d, false)).collect())
+            .unwrap_or_default();
+        core.touch_meta();
+    }
+
+    fn control(&mut self, core: &mut Core, id: &str, value: Option<Value>) {
+        let text = || value.as_ref().and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("text").and_then(Value::as_str).map(str::to_owned))).unwrap_or_default();
+        let event = || value.as_ref().and_then(|v| v.get("event")).and_then(Value::as_str).map(str::to_owned);
+        let Some(thread) = self.thread.clone() else { return };
+        match id {
+            "reasoning_summary" => {
+                self.summary = Some(text());
+                core.set_control(id, json!(text()));
+            }
+            "approval_policy" | "sandbox" => {
+                let v = text();
+                let dangerous = matches!(v.as_str(), "never" | "danger-full-access");
+                if dangerous && !self.allow_bypass {
+                    self.notice(core, Level::Warn, "That needs the session to be started with bypass allowed.");
+                    return;
+                }
+                if id == "sandbox" {
+                    self.sandbox = Some(v.clone());
+                } else {
+                    self.approval = Some(v.clone());
+                }
+                core.set_control(id, json!(v));
+            }
+            "compact" => self.request(core, Pending::Plain("compact".into()), "thread/compact/start", json!({"threadId": thread})),
+            "review" => {
+                let t = text();
+                let target = if t.trim().is_empty() { json!({"type": "uncommittedChanges"}) } else { json!({"type": "custom", "instructions": t}) };
+                self.request(core, Pending::Plain("review".into()), "review/start", json!({"threadId": thread, "target": target}));
+            }
+            "rename" => {
+                let t = text();
+                self.request(core, Pending::Plain("rename".into()), "thread/name/set", json!({"threadId": thread, "name": t}));
+                core.state.title.clone_from(&t);
+                core.set_control(id, json!(t));
+            }
+            "rewind" => {
+                let Some(ev) = event() else { return };
+                let Some(turn) = self.turns.get(&ev).cloned() else {
+                    self.notice(core, Level::Warn, "That prompt's turn is not known.");
+                    return;
+                };
+                self.request(core, Pending::Revert(ev), "thread/revert", json!({"threadId": thread, "beforeTurnId": turn}));
+            }
+            "branch" => {
+                let Some(ev) = event() else { return };
+                let Some(turn) = self.turns.get(&ev).cloned() else {
+                    self.notice(core, Level::Warn, "That prompt's turn is not known.");
+                    return;
+                };
+                core.effects.push(Effect::Branch { resume: thread, resume_at: Some(turn) });
+            }
+            "mcp_refresh" => self.request(core, Pending::Mcp, "mcpServerStatus/list", json!({})),
+            "mcp_reload" => {
+                self.request(core, Pending::Plain("reload MCP servers".into()), "config/mcpServer/reload", json!({}));
+                self.request(core, Pending::Mcp, "mcpServerStatus/list", json!({}));
+            }
+            _ => {}
         }
     }
 
@@ -142,7 +326,10 @@ impl Codex {
             core.touch_state();
         }
         core.meta.modes = modes(self.allow_bypass);
-        core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "file_suggestions", "resume"].iter().map(|s| (*s).to_owned()).collect();
+        core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         core.touch_meta();
         self.request(
             core,
@@ -169,7 +356,7 @@ impl Codex {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode } => self.send(core, id, text, mode),
+            Command::Send { id, text, mode, attachments, overrides } => self.send(core, QueueItem { id, text, at: Core::now(), attachments, overrides }, mode),
             Command::QueueEdit { id, text } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
@@ -192,7 +379,7 @@ impl Codex {
                 if let Some(pos) = core.state.queue.iter().position(|q| q.id == id) {
                     let item = core.state.queue.remove(pos);
                     core.touch_state();
-                    self.send(core, item.id, item.text, SendMode::Now);
+                    self.send(core, item, SendMode::Now);
                 }
             }
             Command::Approve { id, decision, message, always, answers } => self.answer(core, &id, decision, message, always, answers),
@@ -213,6 +400,13 @@ impl Codex {
                 let root = core.state.cwd.clone();
                 self.request(core, Pending::Suggest(client), "fuzzyFileSearch", json!({"query": query, "roots": [root]}));
             }
+            Command::SetEffort { effort } => {
+                // Codex takes effort per turn: from the next one.
+                self.effort = Some(effort.clone()).filter(|e| !e.is_empty());
+                core.state.effort = effort;
+                core.touch_state();
+            }
+            Command::Control { id, value } => self.control(core, &id, value),
             Command::StopTask { .. } | Command::Restart | Command::Snapshot => {}
         }
     }
@@ -223,18 +417,18 @@ impl Codex {
         }
     }
 
-    fn send(&mut self, core: &mut Core, id: String, text: String, mode: SendMode) {
-        let text = text.trim_end().to_owned();
-        if text.is_empty() {
+    fn send(&mut self, core: &mut Core, mut m: QueueItem, mode: SendMode) {
+        m.text = m.text.trim_end().to_owned();
+        if m.text.is_empty() && m.attachments.is_empty() {
             return;
         }
         if core.state.goal.is_empty() {
-            core.state.goal = clip_middle(&text, 600).0;
+            core.state.goal = clip_middle(&m.text, 600).0;
         }
         let Some(thread) = self.thread.clone() else {
             // Not ready yet: goes out once the thread exists.
-            self.waiting.push((id.clone(), text.clone()));
-            self.show_sent(core, &id, &text, Delivery::Queued);
+            self.show_sent(core, &m, Delivery::Queued);
+            self.waiting.push(m);
             return;
         };
         let busy = self.busy(core);
@@ -242,52 +436,83 @@ impl Codex {
             (true, SendMode::Steer, Some(turn)) => {
                 self.request(
                     core,
-                    Pending::Steer(id.clone()),
+                    Pending::Steer(m.id.clone()),
                     "turn/steer",
-                    json!({"threadId": thread, "expectedTurnId": turn, "input": [{"type": "text", "text": text}], "clientUserMessageId": id}),
+                    json!({"threadId": thread, "expectedTurnId": turn, "input": input(&m.text, &m.attachments), "clientUserMessageId": m.id}),
                 );
-                self.turn_messages.push(id.clone());
-                self.show_sent(core, &id, &text, Delivery::Sent);
+                self.turn_messages.push(m.id.clone());
+                self.show_sent(core, &m, Delivery::Sent);
             }
             (true, SendMode::Now, Some(_)) => {
                 // Stop the turn; this message starts the next one.
-                self.waiting.insert(0, (id.clone(), text.clone()));
-                self.show_sent(core, &id, &text, Delivery::Queued);
+                self.show_sent(core, &m, Delivery::Queued);
+                self.waiting.insert(0, m);
                 self.interrupt(core);
             }
             (true, _, _) => {
-                core.state.queue.push(QueueItem { id, text, at: Core::now() });
+                core.state.queue.push(m);
                 core.touch_state();
             }
-            (false, _, _) => self.start_turn(core, &thread, id, text),
+            (false, _, _) => self.start_turn(core, &thread, m),
         }
     }
 
-    fn start_turn(&mut self, core: &mut Core, thread: &str, id: String, text: String) {
-        let (approval, _, sandbox) = policy(&core.state.mode);
+    fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        let (approval, _, sandbox) = self.policies(core);
+        // "/skill words": the skill, then the words.
+        let mut items = input(&m.text, &m.attachments);
+        if let Some(rest) = m.text.strip_prefix('/')
+            && let Some(name) = rest.split_whitespace().next()
+            && let Some(path) = self.skills.get(name).cloned()
+            && let Some(list) = items.as_array_mut()
+        {
+            let words = rest.get(name.len()..).unwrap_or("").trim();
+            list.retain(|i| i.get("type").and_then(Value::as_str) != Some("text"));
+            list.insert(0, json!({"type": "skill", "name": name, "path": path}));
+            if !words.is_empty() {
+                list.insert(1, json!({"type": "text", "text": words}));
+            }
+        }
         let mut params = json!({
             "threadId": thread,
-            "input": [{"type": "text", "text": text}],
-            "clientUserMessageId": id,
+            "input": items,
+            "clientUserMessageId": m.id,
             "approvalPolicy": approval,
             "sandboxPolicy": sandbox,
         });
-        if let (Some(m), Some(o)) = (&self.model, params.as_object_mut()) {
-            o.insert("model".into(), json!(m));
+        // The session's model and effort, or this message's own (Codex sets both per turn).
+        let o = m.overrides.clone().unwrap_or_default();
+        if let Some(obj) = params.as_object_mut() {
+            if let Some(model) = o.model.or_else(|| self.model.clone()) {
+                obj.insert("model".into(), json!(model));
+            }
+            if let Some(effort) = o.effort.or_else(|| self.effort.clone()) {
+                obj.insert("effort".into(), json!(effort));
+            }
+            if let Some(summary) = self.summary.clone() {
+                obj.insert("summary".into(), json!(summary));
+            }
         }
-        self.request(core, Pending::Turn(id.clone()), "turn/start", params);
-        self.turn_messages = vec![id.clone()];
-        self.show_sent(core, &id, &text, Delivery::Sent);
+        self.request(core, Pending::Turn(m.id.clone()), "turn/start", params);
+        self.turn_messages = vec![m.id.clone()];
+        self.show_sent(core, &m, Delivery::Sent);
         if core.state.turn_started.is_none() {
             core.state.turn_started = Some(Core::now());
         }
         self.settle(core);
     }
 
-    fn show_sent(&mut self, core: &mut Core, id: &str, text: &str, d: Delivery) {
-        core.state.delivery.insert(id.to_owned(), d);
-        core.upsert(id, None, Body::User { text: text.to_owned(), images: 0, client_id: Some(id.to_owned()), origin: Some("human".into()) });
+    fn show_sent(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
+        core.state.delivery.insert(m.id.clone(), d);
+        let (images, names) = super::model::attachment_summary(&m.attachments);
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments: names });
         core.touch_state();
+    }
+
+    /// Shown for a message kiln sends on its own (feedback after a refusal).
+    fn note(&mut self, core: &mut Core, id: &str, text: &str, d: Delivery) {
+        let m = QueueItem { id: id.to_owned(), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None };
+        self.show_sent(core, &m, d);
     }
 
     /// Between turns: the next waiting message, then kiln's queue.
@@ -297,14 +522,14 @@ impl Codex {
         }
         let Some(thread) = self.thread.clone() else { return };
         if !self.waiting.is_empty() {
-            let (id, text) = self.waiting.remove(0);
-            self.start_turn(core, &thread, id, text);
+            let m = self.waiting.remove(0);
+            self.start_turn(core, &thread, m);
             return;
         }
         if !core.state.queue.is_empty() {
             let item = core.state.queue.remove(0);
             core.touch_state();
-            self.start_turn(core, &thread, item.id, item.text);
+            self.start_turn(core, &thread, item);
         }
     }
 
@@ -358,12 +583,12 @@ impl Codex {
                 (true, Some(thread), Some(turn)) => {
                     self.request(core, Pending::Steer(mid.clone()), "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": [{"type": "text", "text": f}], "clientUserMessageId": mid}));
                     self.turn_messages.push(mid.clone());
-                    self.show_sent(core, &mid, &f, Delivery::Sent);
+                    self.note(core, &mid, &f, Delivery::Sent);
                 }
                 // Cancelled: the feedback starts the next turn.
                 _ => {
-                    self.waiting.insert(0, (mid.clone(), f.clone()));
-                    self.show_sent(core, &mid, &f, Delivery::Queued);
+                    self.note(core, &mid, &f, Delivery::Queued);
+                    self.waiting.insert(0, QueueItem { id: mid, text: f, at: Core::now(), attachments: Vec::new(), overrides: None });
                 }
             }
         }
@@ -409,7 +634,9 @@ impl Codex {
                     self.notice(core, Level::Error, format!("Codex could not open the conversation: {msg}"));
                     core.set_status(Status::Idle);
                 }
-                Pending::Models | Pending::Interrupt => {}
+                Pending::Models | Pending::Interrupt | Pending::Skills | Pending::Hooks | Pending::Mcp => {}
+                Pending::Revert(_) => self.notice(core, Level::Warn, format!("Could not rewind: {msg}")),
+                Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
                 Pending::Initialize => self.notice(core, Level::Error, format!("Codex did not start: {msg}")),
             }
             self.settle(core);
@@ -418,22 +645,35 @@ impl Codex {
         match kind {
             Pending::Initialize => {
                 core.write(&json!({"method": "initialized"}));
-                let (approval, sandbox, _) = policy(&core.state.mode);
+                let (approval, sandbox, _) = self.policies(core);
                 let cwd = core.state.cwd.clone();
                 let mut params = json!({"cwd": cwd, "approvalPolicy": approval, "sandbox": sandbox});
                 if let (Some(m), Some(o)) = (&self.model, params.as_object_mut()) {
                     o.insert("model".into(), json!(m));
                 }
-                match self.resume.clone() {
-                    Some(t) => {
+                match (self.resume.clone(), self.fork_at.take()) {
+                    // A branch: a new thread with that one's turns up to `at`.
+                    (Some(t), Some(at)) => {
+                        if let Some(o) = params.as_object_mut() {
+                            o.insert("threadId".into(), json!(t));
+                            if let Some(at) = at {
+                                o.insert("lastTurnId".into(), json!(at));
+                            }
+                        }
+                        self.request(core, Pending::Thread, "thread/fork", params);
+                    }
+                    (Some(t), None) => {
                         if let Some(o) = params.as_object_mut() {
                             o.insert("threadId".into(), json!(t));
                         }
                         self.request(core, Pending::Thread, "thread/resume", params);
                     }
-                    None => self.request(core, Pending::Thread, "thread/start", params),
+                    (None, _) => self.request(core, Pending::Thread, "thread/start", params),
                 }
                 self.request(core, Pending::Models, "model/list", json!({}));
+                self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd]}));
+                self.request(core, Pending::Hooks, "hooks/list", json!({"cwds": [core.state.cwd.clone()]}));
+                self.request(core, Pending::Mcp, "mcpServerStatus/list", json!({}));
                 if let Some(ua) = result.get("userAgent").and_then(Value::as_str) {
                     core.meta.version = ua.split_whitespace().next().unwrap_or(ua).to_owned();
                     core.touch_meta();
@@ -460,10 +700,16 @@ impl Codex {
                 }
                 // A resumed thread: its history, as items.
                 for turn in thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    let tid = turn.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
                     for item in turn.get("items").and_then(Value::as_array).cloned().unwrap_or_default() {
+                        if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+                            let key = item.get("clientId").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("").to_owned();
+                            self.turns.insert(key, tid.clone());
+                        }
                         self.item(core, &item, true);
                     }
                 }
+                self.refresh_controls(core);
                 core.touch_state();
                 core.set_status(Status::Idle);
                 self.next(core);
@@ -480,6 +726,32 @@ impl Codex {
                 core.touch_state();
             }
             Pending::Models => {
+                for m in result.get("data").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    let levels: Vec<(String, String)> = m
+                        .get("supportedReasoningEfforts")
+                        .and_then(Value::as_array)
+                        .map(|l| {
+                            l.iter()
+                                .filter_map(|e| {
+                                    let id = e.get("reasoningEffort").and_then(Value::as_str).or_else(|| e.as_str())?.to_owned();
+                                    Some((id, e.get("description").and_then(Value::as_str).unwrap_or("").to_owned()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for key in [m.get("model"), m.get("id")].into_iter().flatten().filter_map(Value::as_str) {
+                        self.efforts.insert(key.to_owned(), levels.clone());
+                    }
+                    if m.get("isDefault").and_then(Value::as_bool) == Some(true)
+                        && core.state.effort.is_empty()
+                        && let Some(d) = m.get("defaultReasoningEffort").and_then(Value::as_str)
+                    {
+                        core.state.effort = self.effort.clone().unwrap_or_else(|| d.to_owned());
+                    }
+                }
+                if let Some(e) = &self.effort {
+                    core.state.effort.clone_from(e);
+                }
                 core.meta.models = result
                     .get("data")
                     .and_then(Value::as_array)
@@ -497,7 +769,69 @@ impl Codex {
                     })
                     .unwrap_or_default();
                 core.touch_meta();
+                self.refresh_controls(core);
+                core.touch_state();
             }
+            Pending::Skills => {
+                let mut cmds = Vec::new();
+                for entry in result.get("data").and_then(Value::as_array).cloned().unwrap_or_default() {
+                    for sk in entry.get("skills").and_then(Value::as_array).cloned().unwrap_or_default() {
+                        if sk.get("enabled").and_then(Value::as_bool) == Some(false) {
+                            continue;
+                        }
+                        let (Some(name), Some(path)) = (sk.get("name").and_then(Value::as_str), sk.get("path").and_then(Value::as_str)) else { continue };
+                        self.skills.insert(name.to_owned(), path.to_owned());
+                        cmds.push(SlashCommand {
+                            name: name.to_owned(),
+                            description: sk.get("shortDescription").or_else(|| sk.get("description")).and_then(Value::as_str).unwrap_or("").to_owned(),
+                            hint: String::new(),
+                        });
+                    }
+                }
+                core.meta.commands = cmds;
+                core.touch_meta();
+            }
+            Pending::Hooks => {
+                core.meta.hooks = result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .map(|d| {
+                        d.iter()
+                            .flat_map(|e| e.get("hooks").and_then(Value::as_array).cloned().unwrap_or_default())
+                            .filter_map(|h| {
+                                Some(HookInfo {
+                                    event: h.get("eventName").and_then(Value::as_str)?.to_owned(),
+                                    matcher: h.get("matcher").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                    command: h.get("statusMessage").or_else(|| h.get("key")).and_then(Value::as_str).unwrap_or("").to_owned(),
+                                    source: h.get("source").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                core.touch_meta();
+            }
+            Pending::Mcp => {
+                self.mcp = result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .map(|d| {
+                        d.iter()
+                            .filter_map(|m| Some((m.get("name")?.as_str()?.to_owned(), m.get("runtimeStatus").and_then(Value::as_str).unwrap_or("unknown").to_owned())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (name, status) in self.mcp.clone() {
+                    core.set_control(&format!("mcp_info:{name}"), json!(status));
+                }
+                self.refresh_controls(core);
+            }
+            Pending::Revert(ev) => {
+                // Those turns are gone: so is their part of the timeline.
+                core.truncate_from(&ev);
+                self.turns.retain(|k, _| core.get(k).is_some());
+            }
+            Pending::Plain(_) => {}
             Pending::Suggest(client) => {
                 let cwd = core.state.cwd.clone();
                 let files: Vec<Value> = result
@@ -704,6 +1038,12 @@ impl Codex {
             }
             "item/started" | "item/completed" => {
                 if let Some(item) = p.get("item") {
+                    if item.get("type").and_then(Value::as_str) == Some("userMessage")
+                        && let Some(turn) = p.get("turnId").and_then(Value::as_str)
+                    {
+                        let key = item.get("clientId").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("").to_owned();
+                        self.turns.insert(key, turn.to_owned());
+                    }
                     self.item(core, item, method == "item/completed");
                 }
             }
@@ -815,6 +1155,7 @@ impl Codex {
                     .and_then(Value::as_array)
                     .map(|c| c.iter().filter_map(|x| x.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
                     .unwrap_or_default();
+                let text = text.split("\n\nAttached files:\n").next().unwrap_or(&text).to_owned();
                 let client = item.get("clientId").and_then(Value::as_str).map(str::to_owned);
                 let key = client.clone().unwrap_or(id);
                 if let Some(c) = &client
@@ -826,7 +1167,20 @@ impl Codex {
                 if core.state.goal.is_empty() && !text.trim().is_empty() {
                     core.state.goal = clip_middle(text.trim(), 600).0;
                 }
-                core.upsert(&key, None, Body::User { text, images: 0, client_id: client, origin: Some("human".into()) });
+                // What it carried: as kiln showed it when sending, else from its input items.
+                let content = item.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
+                let counted = u32::try_from(content.iter().filter(|x| matches!(x.get("type").and_then(Value::as_str), Some("image" | "localImage"))).count()).unwrap_or(0);
+                let named: Vec<String> = content
+                    .iter()
+                    .filter(|x| matches!(x.get("type").and_then(Value::as_str), Some("localImage" | "mention")))
+                    .filter_map(|x| x.get("name").or_else(|| x.get("path")).and_then(Value::as_str))
+                    .map(|p| p.rsplit('/').next().unwrap_or(p).to_owned())
+                    .collect();
+                let (images, attachments) = match core.get(&key).map(|e| &e.body) {
+                    Some(Body::User { images, attachments, .. }) if !attachments.is_empty() => ((*images).max(counted), attachments.clone()),
+                    _ => (counted, named),
+                };
+                core.upsert(&key, None, Body::User { text, images, client_id: client, origin: Some("human".into()), attachments });
             }
             "agentMessage" => {
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -1102,6 +1456,31 @@ fn unwrap_shell(full: &str) -> String {
     rest.to_owned()
 }
 
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// A message as Codex input items: its text (with other files listed by path, for Codex to
+/// read with its tools), then images by path.
+fn input(text: &str, attachments: &[super::model::Attachment]) -> Value {
+    let mut words = text.to_owned();
+    let listed: Vec<String> = attachments.iter().filter(|a| !a.is_image()).filter_map(|a| a.path.as_ref().map(|p| format!("- {} ({}): {p}", a.name, a.mime))).collect();
+    if !listed.is_empty() {
+        words.push_str(&format!("\n\nAttached files:\n{}", listed.join("\n")));
+    }
+    let mut items = Vec::new();
+    if !words.is_empty() {
+        items.push(json!({"type": "text", "text": words}));
+    }
+    for a in attachments.iter().filter(|a| a.is_image()) {
+        if let Some(p) = &a.path {
+            items.push(json!({"type": "localImage", "path": p}));
+        }
+    }
+    json!(items)
+}
+
 /// A command given as an array of words.
 fn joined(v: Option<&Value>) -> String {
     v.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default()
@@ -1146,12 +1525,12 @@ mod tests {
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("initialize"));
         // A message before the thread exists waits for it.
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "list files".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         assert!(core.take_writes().is_empty());
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         let w = written(&mut core);
         let methods: Vec<&str> = w.iter().filter_map(|v| v.get("method").and_then(Value::as_str)).collect();
-        assert_eq!(methods, vec!["initialized", "thread/start", "model/list"]);
+        assert_eq!(methods, vec!["initialized", "thread/start", "model/list", "skills/list", "hooks/list", "mcpServerStatus/list"]);
         assert_eq!(w.get(1).and_then(|v| v.pointer("/params/sandbox")).and_then(Value::as_str), Some("workspace-write"));
         feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th1", "cliVersion": "0.162.1", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
         let w = written(&mut core);
@@ -1176,7 +1555,7 @@ mod tests {
         assert_eq!((a.command.as_deref(), a.reason.as_deref()), (Some("rm -rf build"), Some("outside the sandbox")));
         assert_eq!(a.always.len(), 2);
         // A steer while the turn runs goes in as turn/steer.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "only build/".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/steer"));
         assert_eq!(w.first().and_then(|v| v.pointer("/params/expectedTurnId")).and_then(Value::as_str), Some("t1"));
@@ -1241,7 +1620,7 @@ mod tests {
         ]}]}, "model": "gpt-5"}})]);
         assert!(core.get("u0").is_some() && core.get("a0").is_some());
         core.take_writes();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/params/sandboxPolicy/type")).and_then(Value::as_str), Some("readOnly"));
         let rid = w.first().and_then(|v| v.get("id")).cloned().unwrap_or_default();
@@ -1258,14 +1637,14 @@ mod tests {
         assert_eq!(a.title, "a.rs");
         assert_eq!(a.diffs.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()), Some(vec!["-old".to_owned(), "+new".to_owned()]));
         // Queue while busy; deny with feedback declines and steers the feedback in.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         assert_eq!(core.state.queue.len(), 1);
         c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/decision")).and_then(Value::as_str), Some("decline"));
         assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/steer") && v.pointer("/params/input/0/text").and_then(Value::as_str) == Some("keep old")));
         // Send now: interrupt, and the message starts the next turn.
-        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now });
+        c.command(&mut core, Command::Send { id: "m3".into(), text: "stop and do X".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/interrupt"));
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "interrupted", "items": []}}})]);

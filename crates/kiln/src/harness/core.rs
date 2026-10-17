@@ -59,6 +59,15 @@ pub struct ChangeJob {
     pub baseline: Baseline,
 }
 
+/// Something only the session (which owns the process) can do, asked for by an adapter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// Start the harness again, continuing its session from `resume_at` (a rewind).
+    Restart { resume_at: Option<String> },
+    /// Start a new session that branches off this one at `resume_at`.
+    Branch { resume: String, resume_at: Option<String> },
+}
+
 /// Work the brain does off the event loop and feeds back: e.g. reading a file to show what an
 /// edit would change.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +103,10 @@ pub struct Core {
     /// The changeset: one entry per file that differs from its baseline (absolute path keys).
     changes: std::collections::BTreeMap<String, super::model::FileChange>,
     changes_dirty: bool,
+    /// What the session has to do for the adapter (restart, branch).
+    pub effects: Vec<Effect>,
+    /// The timeline was cut (a rewind): viewers start over from a snapshot.
+    reset: bool,
 }
 
 impl Default for Core {
@@ -121,6 +134,30 @@ impl Core {
             change_jobs: Vec::new(),
             changes: std::collections::BTreeMap::new(),
             changes_dirty: false,
+            effects: Vec::new(),
+            reset: false,
+        }
+    }
+
+    /// Drop `id` and every event after it (a rewind); viewers get the timeline again.
+    pub fn truncate_from(&mut self, id: &str) {
+        let Some(seq) = self.index.get(id).copied() else { return };
+        while self.events.back().is_some_and(|e| e.seq >= seq) {
+            if let Some(e) = self.events.pop_back() {
+                self.index.remove(&e.id);
+            }
+        }
+        self.changed.clear();
+        self.stream.clear();
+        self.reset = true;
+        self.state_dirty = true;
+    }
+
+    /// Set a control's live value (sent with the state).
+    pub fn set_control(&mut self, id: &str, value: serde_json::Value) {
+        if self.state.control_values.get(id) != Some(&value) {
+            self.state.control_values.insert(id.to_owned(), value);
+            self.state_dirty = true;
         }
     }
 
@@ -288,6 +325,16 @@ impl Core {
 
     /// Move everything pending into `out`, in order: changed events, streamed text, then state.
     pub fn flush(&mut self) {
+        if std::mem::take(&mut self.reset) {
+            let snap = self.snapshot(256 * 1024);
+            self.out.extend(snap);
+            self.changed.clear();
+            self.stream.clear();
+            self.state_dirty = false;
+            self.meta_dirty = false;
+            self.changes_dirty = false;
+            return;
+        }
         let changed = std::mem::take(&mut self.changed);
         if !changed.is_empty() {
             let events: Vec<Event> = changed.iter().filter_map(|id| self.get(id).cloned()).collect();

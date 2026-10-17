@@ -295,10 +295,19 @@ impl Hub {
     /// The recent messages of the AI session running as `pid` on a machine, as JSON (`None`: it
     /// has no transcript).
     pub async fn ai_transcript(&self, machine: &str, pid: u32) -> anyhow::Result<Option<String>> {
+        self.ai_ask(machine, |req| ServerMsg::AiTranscript { req, pid }).await
+    }
+
+    /// The normalized view (events, state, changeset) of an AI session running on a machine.
+    pub async fn ai_view(&self, machine: &str, pid: u32) -> anyhow::Result<Option<String>> {
+        self.ai_ask(machine, |req| ServerMsg::AiView { req, pid }).await
+    }
+
+    async fn ai_ask(&self, machine: &str, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<String>> {
         let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = futures::channel::oneshot::channel();
         self.ai_requests.lock().insert(req, tx);
-        if !self.send_to_agent(machine, LANE_TERM, &ServerMsg::AiTranscript { req, pid }).await {
+        if !self.send_to_agent(machine, LANE_TERM, &msg(req)).await {
             self.ai_requests.lock().remove(&req);
             anyhow::bail!("machine {machine} is not connected");
         }
@@ -549,6 +558,11 @@ impl Hub {
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable AI session report"),
             },
             AgentMsg::AiTranscript { req, json } => {
+                if let Some(tx) = self.ai_requests.lock().remove(&req) {
+                    let _ = tx.send(json);
+                }
+            }
+            AgentMsg::AiView { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
                 }

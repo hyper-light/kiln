@@ -56,6 +56,9 @@ pub enum AgentMsg {
     /// The agent sessions this machine runs and the harnesses it offers (JSON
     /// [`crate::harness::host::Inventory`]); sent on every (re)connect, before their snapshots.
     HarnessInventory { json: String },
+    /// Answer to [`ServerMsg::AiView`]: the session's normalized view (JSON: events, state,
+    /// changes), `None` when there is none. Appended last: postcard encodes variants by index.
+    AiView { req: u64, json: Option<String> },
 }
 
 /// A terminal session kept by an agent.
@@ -119,6 +122,13 @@ pub enum ServerMsg {
     HarnessCmd { session: String, json: String },
     /// Stop an agent session for good.
     HarnessClose { session: String },
+    /// Send the normalized view of the AI session running as `pid` (answered by AiView).
+    /// Appended last: postcard encodes variants by index.
+    AiView { req: u64, pid: u32 },
+    /// A piece of a file attached to a message for an agent session (frames are bounded, files
+    /// are not): written at `offset`; `done` on the last piece. The message refers to it by `file`.
+    /// Appended last: postcard encodes variants by index.
+    HarnessFile { session: String, file: String, offset: u64, data: Vec<u8>, done: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

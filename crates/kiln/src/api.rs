@@ -222,6 +222,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
+        (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
@@ -253,6 +254,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             harness_command(&hub, &id, req).await
         }
         (&Method::POST, ["api", "harness", "command"]) => harness_broadcast(&hub, req).await,
+        (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
@@ -296,6 +298,16 @@ fn ai_silent(hub: &Hub) -> Response {
 }
 
 /// The recent messages of one session, read from its machine.
+/// A session running elsewhere, as kiln's normalized view: events, state and changeset.
+async fn ai_view(hub: &Hub, machine: &str, pid: &str) -> R {
+    let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
+    match hub.ai_view(machine, pid).await {
+        Ok(Some(json)) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(json))),
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "no view for that session (not Claude Code, or no transcript)")),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    }
+}
+
 async fn ai_transcript(hub: &Hub, machine: &str, pid: &str) -> R {
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
     match hub.ai_transcript(machine, pid).await {
@@ -1336,8 +1348,12 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     if body.target == "local" && !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
     }
-    if crate::harness::kinds::Kind::get(&body.spec.kind).is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, format!("unknown harness {:?}", body.spec.kind)));
+    match crate::harness::kinds::Kind::get(&body.spec.kind) {
+        None => return Err(err(StatusCode::BAD_REQUEST, format!("unknown harness {:?}", body.spec.kind))),
+        Some(k) if !k.structured() => {
+            return Err(err(StatusCode::BAD_REQUEST, format!("{} has no structured mode: open a terminal and run `{}`", k.name, k.program)));
+        }
+        Some(_) => {}
     }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -1351,6 +1367,21 @@ async fn harness_command(hub: &Hub, id: &str, req: Request) -> R {
         crate::harness::registry::Sent::NoSession => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
         crate::harness::registry::Sent::Unreachable => Err(err(StatusCode::CONFLICT, "the session's machine is not connected")),
     }
+}
+
+/// A file for a message (larger than fits inline): kept briefly, sent with the message that
+/// names its `file_id`. `?name=&mime=`; the body is the file.
+async fn harness_upload(hub: &Hub, q: &HashMap<String, String>, req: Request) -> R {
+    let limit = usize::try_from(crate::harness::host::ATTACHMENT_MAX).unwrap_or(usize::MAX);
+    let data = srv::body_bytes(req.into_body(), limit).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
+    if data.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "empty file"));
+    }
+    let name = q.get("name").cloned().unwrap_or_else(|| "file".to_owned());
+    let mime = q.get("mime").cloned().unwrap_or_else(|| "application/octet-stream".to_owned());
+    let size = data.len();
+    let id = hub.harness.upload(name, mime, data).map_err(|e| err(StatusCode::INSUFFICIENT_STORAGE, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &json!({"file_id": id, "size": size})))
 }
 
 #[derive(Deserialize)]
@@ -1367,7 +1398,13 @@ async fn harness_broadcast(hub: &Hub, req: Request) -> R {
     let mut done = Vec::new();
     for id in b.ids.iter().take(256) {
         let c = match &b.command {
-            Command::Send { text, mode, .. } => Command::Send { id: crate::util::new_id(), text: text.clone(), mode: *mode },
+            Command::Send { text, mode, attachments, overrides, .. } => Command::Send {
+                id: crate::util::new_id(),
+                text: text.clone(),
+                mode: *mode,
+                attachments: attachments.clone(),
+                overrides: overrides.clone(),
+            },
             other => other.clone(),
         };
         if hub.harness.command(hub, id, c).await == crate::harness::registry::Sent::Ok {

@@ -562,6 +562,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             Err(e) => tracing::debug!(error = %e, "unreadable agent session command"),
                         }
                     }
+                    ServerMsg::AiView { req, pid } => match &ai {
+                        Some(ai) => ai.view(req, pid, uplink.0.clone()),
+                        None => {
+                            uplink.0.send(Up::Term(AgentMsg::AiView { req, json: None })).await.ok();
+                        }
+                    },
+                    ServerMsg::HarnessFile { session, file, offset, data, done } => {
+                        if let Some(h) = &harness
+                            && let Err(e) = h.receive(&session, &file, offset, &data, done)
+                        {
+                            tracing::warn!(%session, error = %format!("{e:#}"), "could not store an attachment");
+                        }
+                    }
                     ServerMsg::HarnessClose { session } => {
                         if let Some(h) = &harness {
                             h.close(&session);

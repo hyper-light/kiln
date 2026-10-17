@@ -132,8 +132,23 @@ pub struct Attachment {
     pub live: async_broadcast::Receiver<Arc<str>>,
 }
 
+/// A file uploaded for a message, kept briefly until the message is sent.
+struct Upload {
+    name: String,
+    mime: String,
+    data: bytes::Bytes,
+    at: std::time::Instant,
+}
+
+/// Uploads kept at most this long, and this much in all.
+const UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const UPLOADS_MAX: usize = 512 << 20;
+/// Pieces a file is sent to a machine in (lane frames are bounded).
+const FILE_CHUNK: usize = 512 * 1024;
+
 pub struct Registry {
     mirrors: Mutex<HashMap<String, Mirror>>,
+    uploads: Mutex<HashMap<String, Upload>>,
     /// What each machine offers ("local" included).
     kinds: Mutex<HashMap<String, Vec<KindInfo>>>,
     /// The server's own sessions.
@@ -153,6 +168,7 @@ impl Registry {
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         Self {
             mirrors: Mutex::new(HashMap::new()),
+            uploads: Mutex::new(HashMap::new()),
             kinds: Mutex::new(HashMap::new()),
             local,
             local_rx: rx,
@@ -432,9 +448,89 @@ impl Registry {
         Ok(out)
     }
 
+    /// Keep an uploaded file until a message refers to it (by the returned id).
+    pub fn upload(&self, name: String, mime: String, data: bytes::Bytes) -> anyhow::Result<String> {
+        let mut g = self.uploads.lock();
+        g.retain(|_, u| u.at.elapsed() < UPLOAD_TTL);
+        let used: usize = g.values().map(|u| u.data.len()).sum();
+        if used + data.len() > UPLOADS_MAX {
+            anyhow::bail!("too many uploads waiting; send them first");
+        }
+        let id = crate::util::new_id();
+        g.insert(id.clone(), Upload { name, mime, data, at: std::time::Instant::now() });
+        Ok(id)
+    }
+
+    /// A message's attachments, made ready for where the session runs: uploads resolved, and
+    /// for a machine, every file sent ahead in pieces (the message then refers to them by id).
+    async fn route_attachments(&self, hub: &Hub, id: &str, loc: &Location, c: Command) -> Result<Command, Sent> {
+        use base64::Engine as _;
+        let Command::Send { id: mid, text, mode, attachments, overrides } = c else { return Ok(c) };
+        if attachments.is_empty() {
+            return Ok(Command::Send { id: mid, text, mode, attachments, overrides });
+        }
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut out = Vec::new();
+        for mut a in attachments {
+            a.path = None;
+            // The bytes: inline, or an upload.
+            let data: Option<bytes::Bytes> = match a.file_id.take().and_then(|f| self.uploads.lock().remove(&f)) {
+                Some(u) => {
+                    if a.name.is_empty() {
+                        a.name = u.name;
+                    }
+                    if a.mime.is_empty() {
+                        a.mime = u.mime;
+                    }
+                    Some(u.data)
+                }
+                None => b64.decode(a.data_base64.as_bytes()).ok().map(bytes::Bytes::from),
+            };
+            let Some(data) = data.filter(|d| !d.is_empty()) else { continue };
+            match loc {
+                Location::Local => {
+                    let fid = crate::util::new_id();
+                    let (host, sid, f) = (Arc::clone(&self.local), id.to_owned(), fid.clone());
+                    let stored = crate::rt::blocking(move || host.receive(&sid, &f, 0, &data, true)).await;
+                    if !matches!(stored, Ok(Ok(()))) {
+                        continue;
+                    }
+                    a.data_base64.clear();
+                    a.file_id = Some(fid);
+                }
+                Location::Machine(machine) => {
+                    let fid = crate::util::new_id();
+                    let total = data.len();
+                    let mut offset = 0usize;
+                    while offset < total || total == 0 {
+                        let end = (offset + FILE_CHUNK).min(total);
+                        let piece = data.get(offset..end).map(<[u8]>::to_vec).unwrap_or_default();
+                        let msg = ServerMsg::HarnessFile { session: id.to_owned(), file: fid.clone(), offset: offset as u64, data: piece, done: end >= total };
+                        if !hub.send_to_agent(machine, LANE_TERM, &msg).await {
+                            return Err(Sent::Unreachable);
+                        }
+                        offset = end;
+                        if end >= total {
+                            break;
+                        }
+                    }
+                    a.data_base64.clear();
+                    a.file_id = Some(fid);
+                }
+            }
+            out.push(a);
+        }
+        Ok(Command::Send { id: mid, text, mode, attachments: out, overrides })
+    }
+
     /// A command for a session, from any device.
     pub async fn command(&self, hub: &Hub, id: &str, c: Command) -> Sent {
-        match self.location(id) {
+        let Some(loc) = self.location(id) else { return Sent::NoSession };
+        let c = match self.route_attachments(hub, id, &loc, c).await {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        match Some(loc) {
             None => Sent::NoSession,
             Some(Location::Local) => {
                 if self.local.command(id, c) {

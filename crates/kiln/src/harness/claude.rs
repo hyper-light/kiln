@@ -13,9 +13,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde_json::{Value, json};
 
-use super::core::{Core, PreviewJob};
+use super::core::{Core, Effect, PreviewJob};
 use super::model::{
-    AlwaysOption, Approval, Body, Command, Decision, Delivery, ExitInfo, FileDiff, Hunk, Level, ModeOption, ModelOption,
+    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Hunk, Level, ModeOption, ModelOption,
     Question, QuestionOption, QueueItem, SendMode, SlashCommand, Status, Task, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX,
     clip_json, clip_middle,
 };
@@ -37,7 +37,8 @@ pub const SCRUB_ENV: &[&str] = &[
 ];
 
 /// How kiln starts a Claude Code session.
-pub fn args(model: Option<&str>, mode: Option<&str>, resume: Option<&str>, session_id: Option<&str>, allow_bypass: bool) -> Vec<String> {
+pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String> {
+    let (model, mode, resume, allow_bypass) = (spec.model.as_deref(), spec.mode.as_deref(), spec.resume.as_deref(), spec.allow_bypass);
     let mut a: Vec<String> = [
         "-p",
         "--input-format",
@@ -63,8 +64,20 @@ pub fn args(model: Option<&str>, mode: Option<&str>, resume: Option<&str>, sessi
     if allow_bypass {
         a.push("--allow-dangerously-skip-permissions".to_owned());
     }
+    if let Some(e) = spec.effort.as_deref().filter(|e| !e.is_empty()) {
+        a.extend(["--effort".to_owned(), e.to_owned()]);
+    }
     match (resume, session_id) {
-        (Some(r), _) => a.extend(["--resume".to_owned(), r.to_owned()]),
+        (Some(r), _) => {
+            a.extend(["--resume".to_owned(), r.to_owned()]);
+            // Only up to a point of that conversation (a rewind or a branch).
+            if let Some(at) = spec.resume_at.as_deref() {
+                a.extend(["--resume-session-at".to_owned(), at.to_owned()]);
+            }
+            if spec.fork {
+                a.push("--fork-session".to_owned());
+            }
+        }
         (None, Some(id)) => a.extend(["--session-id".to_owned(), id.to_owned()]),
         (None, None) => {}
     }
@@ -81,6 +94,15 @@ enum Pending {
     StopTask,
     Suggest(String),
     ContextUsage,
+    /// apply_flag_settings: the settings applied (read back with get_settings).
+    ApplySettings,
+    Settings,
+    McpStatus,
+    Hooks,
+    /// A request whose answer goes to one client (task output, ...).
+    Reply(String),
+    /// A request that just needs to succeed (its failure is shown).
+    Plain(String),
 }
 
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
@@ -114,6 +136,14 @@ pub struct Claude {
     denied: BTreeSet<String>,
     notice_seq: u64,
     allow_bypass: bool,
+    /// Every conversation entry, in order: its uuid, and the prompt's event id when it is one
+    /// (rewinds and branches name an entry).
+    entries: Vec<(String, Option<String>)>,
+    /// Effort levels per model, as initialize lists them.
+    efforts: HashMap<String, Vec<String>>,
+    output_styles: Vec<String>,
+    /// MCP servers: (name, status).
+    mcp: Vec<(String, String)>,
 }
 
 impl Claude {
@@ -129,7 +159,196 @@ impl Claude {
             denied: BTreeSet::new(),
             notice_seq: 0,
             allow_bypass,
+            entries: Vec::new(),
+            efforts: HashMap::new(),
+            output_styles: Vec::new(),
+            mcp: Vec::new(),
         }
+    }
+
+    /// Note a conversation entry (`prompt`: the event id when it is a person's prompt).
+    fn entry(&mut self, uuid: &str, prompt: Option<&str>) {
+        if uuid.is_empty() || self.entries.last().is_some_and(|(u, _)| u == uuid) {
+            return;
+        }
+        self.entries.push((uuid.to_owned(), prompt.map(str::to_owned)));
+        if self.entries.len() > 20_000 {
+            self.entries.drain(..5_000);
+        }
+    }
+
+    /// For a prompt's event: (its entry index, the entry before it, the last entry of its turn).
+    fn turn_of(&self, event: &str) -> Option<(usize, Option<String>, String)> {
+        let i = self.entries.iter().position(|(_, p)| p.as_deref() == Some(event))?;
+        let before = i.checked_sub(1).and_then(|j| self.entries.get(j)).map(|(u, _)| u.clone());
+        let end = self.entries.iter().skip(i + 1).position(|(_, p)| p.is_some()).map_or(self.entries.len(), |n| i + 1 + n);
+        let last = self.entries.get(end.saturating_sub(1)).map(|(u, _)| u.clone())?;
+        Some((i, before, last))
+    }
+
+    /// The controls this session offers, from what the CLI said it has.
+    fn refresh_controls(&mut self, core: &mut Core) {
+        let opt = |id: &str, label: &str, description: &str| ControlOption { id: id.to_owned(), label: label.to_owned(), description: description.to_owned(), dangerous: false };
+        let ctl = |id: &str, group: &str, label: &str, description: &str, kind: ControlKind| Control {
+            id: id.to_owned(),
+            group: group.to_owned(),
+            label: label.to_owned(),
+            description: description.to_owned(),
+            kind,
+            options: Vec::new(),
+            value: None,
+            dangerous: false,
+            per_turn: false,
+            requires: None,
+            scope: ControlScope::Session,
+            input: None,
+        };
+        let mut c = Vec::new();
+        // Thinking.
+        let mut t = ctl("thinking_display", "Thinking", "Thinking shown", "How much of the model's thinking is shown", ControlKind::Select);
+        t.options = vec![opt("summarized", "Summaries", "A summary of each stretch of thinking"), opt("highlights", "Highlights", "One short title per stretch"), opt("omitted", "Hidden", "Only that it thought")];
+        c.push(t);
+        let mut t = ctl("thinking_budget", "Thinking", "Thinking budget", "Most tokens it may think for per step", ControlKind::Select);
+        t.options = vec![opt("default", "Default", "The model's own"), opt("4000", "4k", ""), opt("16000", "16k", ""), opt("32000", "32k", ""), opt("0", "Off", "No extended thinking")];
+        c.push(t);
+        // Output.
+        if !self.output_styles.is_empty() {
+            let mut t = ctl("output_style", "Output", "Output style", "How it writes its replies", ControlKind::Select);
+            t.options = self.output_styles.iter().map(|s| opt(s, s, "")).collect();
+            c.push(t);
+        }
+        // Context.
+        let mut t = ctl("compact", "Context", "Compact", "Summarize the conversation to free context", ControlKind::Action);
+        t.input = Some("What to keep (optional)".into());
+        c.push(t);
+        c.push(ctl("context_usage", "Context", "Context usage", "Measure how full the context is", ControlKind::Action));
+        let mut t = ctl("clear", "Context", "Clear conversation", "Start the conversation over (files stay as they are)", ControlKind::Action);
+        t.dangerous = true;
+        c.push(t);
+        // Session.
+        c.push(ctl("rename", "Session", "Name", "The session's name", ControlKind::Text));
+        let mut t = ctl("rewind", "Session", "Rewind to here", "Undo this prompt and everything after it: the conversation and the file changes", ControlKind::Action);
+        t.scope = ControlScope::Turn;
+        t.dangerous = true;
+        c.push(t);
+        let mut t = ctl("rewind_files", "Session", "Restore files to here", "Undo the file changes made since this prompt; keep the conversation", ControlKind::Action);
+        t.scope = ControlScope::Turn;
+        t.dangerous = true;
+        c.push(t);
+        let mut t = ctl("branch", "Session", "Branch from here", "A new session with the conversation up to the end of this turn", ControlKind::Action);
+        t.scope = ControlScope::Turn;
+        c.push(t);
+        // Subagents.
+        if !core.meta.agents.is_empty() {
+            let mut t = ctl("spawn_agent", "Subagents", "Start a subagent", "Ask it to hand a task to a subagent of this type", ControlKind::Action);
+            t.options = core.meta.agents.iter().map(|a| opt(a, a, "")).collect();
+            t.input = Some("The task".into());
+            c.push(t);
+        }
+        c.push(ctl("background", "Subagents", "Move to background", "Let running commands and subagents continue in the background", ControlKind::Action));
+        // MCP.
+        for (name, status) in &self.mcp {
+            let mut t = ctl(&format!("mcp:{name}"), "MCP", name, &format!("MCP server ({status})"), ControlKind::Toggle);
+            t.value = Some(json!(status != "disabled"));
+            c.push(t);
+            if matches!(status.as_str(), "failed" | "needs-auth" | "pending") {
+                c.push(ctl(&format!("mcp_reconnect:{name}"), "MCP", &format!("Reconnect {name}"), "", ControlKind::Action));
+            }
+        }
+        c.push(ctl("mcp_refresh", "MCP", "Refresh servers", "Ask for every server's status again", ControlKind::Action));
+        core.meta.controls = c;
+        // Effort levels of the model in use.
+        let model = core.state.model.clone();
+        let levels = self.efforts.get(&model).or_else(|| self.efforts.iter().find(|(k, _)| model.contains(k.as_str())).map(|(_, v)| v)).or_else(|| self.efforts.get("default"));
+        core.meta.efforts = levels.map(|l| l.iter().map(|e| opt(e, &capitalize(e), "")).collect()).unwrap_or_default();
+        core.touch_meta();
+    }
+
+    /// Set a control or run an action.
+    fn control(&mut self, core: &mut Core, id: &str, value: Option<Value>) {
+        let text = || value.as_ref().and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("text").and_then(Value::as_str).map(str::to_owned))).unwrap_or_default();
+        let event = || value.as_ref().and_then(|v| v.get("event")).and_then(Value::as_str).map(str::to_owned);
+        match id {
+            "thinking_display" => {
+                let d = text();
+                self.request(core, Pending::Plain("thinking shown".into()), json!({"subtype": "set_max_thinking_tokens", "thinking_display": d}));
+                core.set_control(id, json!(d));
+            }
+            "thinking_budget" => {
+                let v = text();
+                let budget = if v == "default" { Value::Null } else { v.parse::<u64>().map(|n| json!(n)).unwrap_or(Value::Null) };
+                self.request(core, Pending::Plain("thinking budget".into()), json!({"subtype": "set_max_thinking_tokens", "max_thinking_tokens": budget}));
+                core.set_control(id, json!(v));
+            }
+            "output_style" => {
+                let s = text();
+                self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"outputStyle": s}}));
+                core.set_control(id, json!(s));
+            }
+            "compact" => {
+                let t = text();
+                self.slash(core, &format!("/compact {t}"));
+            }
+            "clear" => self.slash(core, "/clear"),
+            "context_usage" => self.request(core, Pending::ContextUsage, json!({"subtype": "get_context_usage"})),
+            "rename" => {
+                let t = text();
+                self.request(core, Pending::Plain("rename".into()), json!({"subtype": "rename_session", "title": t, "source": "host"}));
+                core.state.title.clone_from(&t);
+                core.set_control(id, json!(t));
+            }
+            "spawn_agent" => {
+                let kind = value.as_ref().and_then(|v| v.get("option")).and_then(Value::as_str).unwrap_or("general-purpose").to_owned();
+                let t = text();
+                self.slash(core, &format!("Use the {kind} subagent for this task: {t}"));
+            }
+            "background" => self.request(core, Pending::Plain("background".into()), json!({"subtype": "background_tasks"})),
+            "task_output" => {
+                let task = value.as_ref().and_then(|v| v.get("task")).and_then(Value::as_str).unwrap_or("").to_owned();
+                let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("task_output").to_owned();
+                self.request(core, Pending::Reply(client), json!({"subtype": "get_task_output", "task_id": task}));
+            }
+            "mcp_refresh" => self.request(core, Pending::McpStatus, json!({"subtype": "mcp_status"})),
+            "rewind" | "rewind_files" => {
+                let Some(ev) = event() else { return };
+                let Some((i, before, _)) = self.turn_of(&ev) else {
+                    self.notice(core, Level::Warn, "That prompt is not in this session's history.", None);
+                    return;
+                };
+                let Some((uuid, _)) = self.entries.get(i).cloned() else { return };
+                self.request(core, Pending::Plain("restore files".into()), json!({"subtype": "rewind_files", "user_message_id": uuid}));
+                if id == "rewind" {
+                    // The conversation continues from just before that prompt.
+                    self.entries.truncate(i);
+                    core.truncate_from(&ev);
+                    core.effects.push(Effect::Restart { resume_at: before });
+                }
+            }
+            "branch" => {
+                let Some(ev) = event() else { return };
+                let (Some((_, _, last)), Some(session)) = (self.turn_of(&ev), core.state.harness_session.clone()) else {
+                    self.notice(core, Level::Warn, "That prompt is not in this session's history.", None);
+                    return;
+                };
+                core.effects.push(Effect::Branch { resume: session, resume_at: Some(last) });
+            }
+            other => {
+                if let Some(name) = other.strip_prefix("mcp_reconnect:") {
+                    self.request(core, Pending::Plain(format!("reconnect {name}")), json!({"subtype": "mcp_reconnect", "serverName": name}));
+                } else if let Some(name) = other.strip_prefix("mcp:") {
+                    let on = value.as_ref().and_then(Value::as_bool).unwrap_or(true);
+                    self.request(core, Pending::Plain(format!("MCP server {name}")), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": on}));
+                    core.set_control(other, json!(on));
+                    self.request(core, Pending::McpStatus, json!({"subtype": "mcp_status"}));
+                }
+            }
+        }
+    }
+
+    /// A slash command (or any text) sent as a message.
+    fn slash(&mut self, core: &mut Core, text: &str) {
+        let id = crate::util::new_id();
+        self.send(core, id, text.trim().to_owned(), SendMode::Queue, Vec::new(), None);
     }
 
     fn request(&mut self, core: &mut Core, kind: Pending, body: Value) {
@@ -167,7 +386,7 @@ impl Claude {
     /// Right after the process starts.
     pub fn start(&mut self, core: &mut Core) {
         core.meta.modes = modes(self.allow_bypass);
-        core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume"]
+        core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -197,7 +416,7 @@ impl Claude {
 
     pub fn command(&mut self, core: &mut Core, cmd: Command) {
         match cmd {
-            Command::Send { id, text, mode } => self.send(core, id, text, mode),
+            Command::Send { id, text, mode, attachments, overrides } => self.send(core, id, text, mode, attachments, overrides),
             Command::QueueEdit { id, text } => {
                 if let Some(q) = core.state.queue.iter_mut().find(|q| q.id == id) {
                     q.text = text;
@@ -220,7 +439,7 @@ impl Claude {
                 if let Some(pos) = core.state.queue.iter().position(|q| q.id == id) {
                     let item = core.state.queue.remove(pos);
                     core.touch_state();
-                    self.send(core, item.id, item.text, SendMode::Now);
+                    self.send(core, item.id, item.text, SendMode::Now, item.attachments, item.overrides);
                 }
             }
             Command::Approve { id, decision, message, always, answers } => self.answer(core, &id, decision, message, always, answers),
@@ -238,6 +457,12 @@ impl Claude {
             Command::StopTask { task } => {
                 self.request(core, Pending::StopTask, json!({"subtype": "stop_task", "task_id": task}));
             }
+            Command::SetEffort { effort } => {
+                self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
+                core.state.effort = effort;
+                core.touch_state();
+            }
+            Command::Control { id, value } => self.control(core, &id, value),
             Command::Suggest { client, query } => {
                 self.request(core, Pending::Suggest(client), json!({"subtype": "file_suggestions", "query": query}));
             }
@@ -246,20 +471,43 @@ impl Claude {
         }
     }
 
-    fn send(&mut self, core: &mut Core, id: String, text: String, mode: SendMode) {
+    fn send(&mut self, core: &mut Core, id: String, text: String, mode: SendMode, attachments: Vec<super::model::Attachment>, overrides: Option<super::model::Overrides>) {
         let text = text.trim_end().to_owned();
-        if text.is_empty() {
+        if text.is_empty() && attachments.is_empty() {
             return;
         }
         let busy = self.busy(core);
         if busy && mode == SendMode::Queue {
-            core.state.queue.push(QueueItem { id, text, at: Core::now() });
+            core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides });
             core.touch_state();
             return;
         }
+        // Images as image blocks; other files by path (the agent reads them with its tools).
+        let content = if attachments.is_empty() {
+            json!(text)
+        } else {
+            let mut blocks: Vec<Value> = attachments
+                .iter()
+                .filter(|a| a.is_image() && !a.data_base64.is_empty())
+                .map(|a| json!({"type": "image", "source": {"type": "base64", "media_type": a.mime, "data": a.data_base64}}))
+                .collect();
+            let mut words = text.clone();
+            let listed: Vec<String> = attachments
+                .iter()
+                .filter(|a| !(a.is_image() && !a.data_base64.is_empty()))
+                .filter_map(|a| a.path.as_ref().map(|p| format!("- {} ({}): {p}", a.name, a.mime)))
+                .collect();
+            if !listed.is_empty() {
+                words.push_str(&format!("\n\nAttached files:\n{}", listed.join("\n")));
+            }
+            if !words.trim().is_empty() {
+                blocks.push(json!({"type": "text", "text": words}));
+            }
+            json!(blocks)
+        };
         let mut msg = json!({
             "type": "user",
-            "message": {"role": "user", "content": text},
+            "message": {"role": "user", "content": content},
             "parent_tool_use_id": null,
             "session_id": core.state.harness_session.clone().unwrap_or_default(),
             "uuid": id,
@@ -276,7 +524,8 @@ impl Claude {
         self.inflight.insert(id.clone());
         core.state.delivery.insert(id.clone(), Delivery::Sent);
         prune_delivery(core);
-        core.upsert(&id, None, Body::User { text, images: 0, client_id: Some(id.clone()), origin: Some("human".into()) });
+        let (images, names) = super::model::attachment_summary(&attachments);
+        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some("human".into()), attachments: names });
         core.touch_state();
         self.settle(core);
     }
@@ -288,7 +537,7 @@ impl Claude {
         }
         let item = core.state.queue.remove(0);
         core.touch_state();
-        self.send(core, item.id, item.text, SendMode::Queue);
+        self.send(core, item.id, item.text, SendMode::Queue, item.attachments, item.overrides);
     }
 
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, answers: Option<std::collections::BTreeMap<String, String>>) {
@@ -386,8 +635,9 @@ impl Claude {
         if !ok {
             let err = str_of(resp, "error").unwrap_or("request failed").to_owned();
             match kind {
-                Pending::Suggest(client) => core.reply(client, json!({"error": err})),
-                Pending::Initialize | Pending::ContextUsage => {}
+                Pending::Suggest(client) | Pending::Reply(client) => core.reply(client, json!({"error": err})),
+                Pending::Initialize | Pending::ContextUsage | Pending::Settings | Pending::McpStatus | Pending::Hooks => {}
+                Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {err}"), None),
                 _ => self.notice(core, Level::Warn, err, None),
             }
             return;
@@ -407,6 +657,12 @@ impl Claude {
                         .collect();
                 }
                 if let Some(models) = body.get("models").and_then(Value::as_array) {
+                    for m in models {
+                        let levels: Vec<String> = m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                        for key in [str_of(m, "value"), str_of(m, "resolvedModel")].into_iter().flatten() {
+                            self.efforts.insert(key.to_owned(), levels.clone());
+                        }
+                    }
                     core.meta.models = models
                         .iter()
                         .filter_map(|m| {
@@ -428,10 +684,18 @@ impl Claude {
                 if let Some(ver) = str_of(&body, "claude_code_version") {
                     core.meta.version = ver.to_owned();
                 }
+                self.output_styles = body.get("available_output_styles").and_then(Value::as_array).map(|s| s.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                if let Some(s) = str_of(&body, "output_style") {
+                    core.set_control("output_style", json!(s));
+                }
                 core.touch_meta();
+                self.refresh_controls(core);
                 if core.state.status == Status::Starting {
                     core.set_status(Status::Idle);
                 }
+                self.request(core, Pending::Settings, json!({"subtype": "get_settings"}));
+                self.request(core, Pending::McpStatus, json!({"subtype": "mcp_status"}));
+                self.request(core, Pending::Hooks, json!({"subtype": "get_hooks_listing"}));
                 self.drain_queue(core);
             }
             Pending::SetMode(mode) => {
@@ -441,7 +705,52 @@ impl Claude {
             Pending::SetModel(model) => {
                 core.state.model = model;
                 core.touch_state();
+                // Effort levels follow the model.
+                self.refresh_controls(core);
+                self.request(core, Pending::Settings, json!({"subtype": "get_settings"}));
             }
+            Pending::ApplySettings => self.request(core, Pending::Settings, json!({"subtype": "get_settings"})),
+            Pending::Settings => {
+                if let Some(e) = body.pointer("/applied/effort").and_then(Value::as_str) {
+                    core.state.effort = e.to_owned();
+                    core.touch_state();
+                }
+                if let Some(s) = body.pointer("/effective/outputStyle").and_then(Value::as_str) {
+                    core.set_control("output_style", json!(s));
+                }
+            }
+            Pending::McpStatus => {
+                self.mcp = body
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .map(|l| l.iter().filter_map(|s| Some((str_of(s, "name")?.to_owned(), str_of(s, "status").unwrap_or("").to_owned()))).collect())
+                    .unwrap_or_default();
+                for (name, status) in self.mcp.clone() {
+                    core.set_control(&format!("mcp:{name}"), json!(status != "disabled"));
+                }
+                self.refresh_controls(core);
+            }
+            Pending::Hooks => {
+                core.meta.hooks = body
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|h| {
+                                Some(HookInfo {
+                                    event: str_of(h, "event")?.to_owned(),
+                                    matcher: str_of(h, "matcher").unwrap_or("").to_owned(),
+                                    command: str_of(h, "commandText").or_else(|| str_of(h, "displayText")).unwrap_or("").to_owned(),
+                                    source: str_of(h, "sourceLabel").or_else(|| str_of(h, "source")).unwrap_or("").to_owned(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                core.touch_meta();
+            }
+            Pending::Reply(client) => core.reply(client, body),
+            Pending::Plain(_) => {}
             Pending::Suggest(client) => core.reply(client, body),
             Pending::ContextUsage => {
                 let total = body.get("totalTokens").and_then(Value::as_u64);
@@ -755,6 +1064,9 @@ impl Claude {
     fn assistant(&mut self, core: &mut Core, v: &Value, parent: Option<String>) {
         self.begin(core);
         let Some(msg) = v.get("message") else { return };
+        if parent.is_none() {
+            self.entry(str_of(v, "uuid").unwrap_or(""), None);
+        }
         let msg_id = str_of(msg, "id").unwrap_or("").to_owned();
         if let Some(m) = str_of(msg, "model").filter(|_| parent.is_none())
             && core.state.model != m
@@ -834,6 +1146,11 @@ impl Claude {
     fn user(&mut self, core: &mut Core, v: &Value, parent: Option<String>) {
         let Some(msg) = v.get("message") else { return };
         let uuid = str_of(v, "uuid").unwrap_or("").to_owned();
+        if parent.is_none() {
+            // A person's prompt (our own, replayed, or one from the transcript) names its turn.
+            let human = v.get("isReplay").and_then(Value::as_bool) == Some(true);
+            self.entry(&uuid, human.then_some(uuid.as_str()));
+        }
         let content = msg.get("content").cloned().unwrap_or(Value::Null);
         let structured = v.get("tool_use_result").cloned().unwrap_or(Value::Null);
         match &content {
@@ -855,6 +1172,12 @@ impl Claude {
                 let text = texts.join("\n");
                 if !text.trim().is_empty() || images > 0 {
                     self.user_text(core, &uuid, &text, v, parent);
+                    if images > 0
+                        && let Some(e) = core.get_mut(&uuid)
+                        && let Body::User { images: n, .. } = &mut e.body
+                    {
+                        *n = (*n).max(images);
+                    }
                 }
             }
             _ => {}
@@ -881,12 +1204,19 @@ impl Claude {
             core.state.goal = clip_middle(t, 600).0;
             core.touch_state();
         }
+        let (keep_images, keep_names) = match core.get(&id).map(|e| &e.body) {
+            Some(Body::User { images, attachments, .. }) => (*images, attachments.clone()),
+            _ => (0, Vec::new()),
+        };
+        // The replay of our own message: its words without the attached-files list we added.
+        let t = t.split("\n\nAttached files:\n").next().unwrap_or(t);
         core.upsert(
             &id,
             parent,
             Body::User {
                 text: clip_middle(t, super::model::TEXT_MAX).0,
-                images: 0,
+                images: keep_images,
+                attachments: keep_names,
                 client_id: ours.then(|| id.clone()),
                 origin: Some(if human { "human".into() } else { "system".into() }),
             },
@@ -1193,6 +1523,11 @@ pub fn strip_ansi(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 fn fmt_tokens(n: u64) -> String {
@@ -1509,7 +1844,7 @@ mod tests {
         let init: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(init.pointer("/request/subtype").and_then(Value::as_str), Some("initialize"));
 
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "please RUN_BASH".into(), mode: SendMode::Queue });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "please RUN_BASH".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         let sent: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(sent.get("uuid").and_then(Value::as_str), Some("m1"));
         assert!(sent.get("priority").is_none());
@@ -1531,8 +1866,11 @@ mod tests {
         assert_eq!(a.always.first().map(|o| (o.label.as_str(), o.scope.as_str())), Some(("Always allow Bash(mkdir -p kiln-mock-dir), Bash(touch kiln-mock-dir/marker)", "this project, just you")));
         assert_eq!(tool(&core, "toolu_2").map(|t| t.status), Some(ToolStatus::Pending));
 
+        // After initialize it asks for settings, MCP servers and hooks.
+        let w = core.take_writes();
+        assert!(["get_settings", "mcp_status", "get_hooks_listing"].iter().all(|k| w.iter().any(|l| l.contains(k))), "{w:?}");
         // A message typed meanwhile waits in kiln's queue.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "next please".into(), mode: SendMode::Queue });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "next please".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         assert_eq!(core.state.queue.len(), 1);
         assert!(core.take_writes().is_empty());
 
@@ -1564,15 +1902,15 @@ mod tests {
         let mut core = Core::new();
         c.start(&mut core);
         core.take_writes();
-        c.command(&mut core, Command::Send { id: "m1".into(), text: "SLOW story".into(), mode: SendMode::Queue });
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "SLOW story".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         c.line(&mut core, r#"{"type":"command_lifecycle","command_uuid":"m1","state":"started"}"#);
         core.take_writes();
         // Steer goes straight to the CLI (it folds it into the running turn), without priority.
-        c.command(&mut core, Command::Send { id: "m2".into(), text: "also the moon".into(), mode: SendMode::Steer });
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "also the moon".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
         let w = core.take_writes();
         assert!(w.first().is_some_and(|l| l.contains("also the moon") && !l.contains("priority")));
         // Send now carries priority "now".
-        c.command(&mut core, Command::Send { id: "m3".into(), text: "urgent".into(), mode: SendMode::Now });
+        c.command(&mut core, Command::Send { id: "m3".into(), text: "urgent".into(), mode: SendMode::Now, attachments: vec![], overrides: None });
         let w = core.take_writes();
         assert!(w.first().is_some_and(|l| l.contains("\"priority\":\"now\"")));
         // A denial with feedback lets the model continue; without feedback it stops the turn.
@@ -1670,8 +2008,20 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m text"), "red text");
         assert_eq!(rel("/work/src/a.rs", "/work"), "src/a.rs");
         assert_eq!(rel("/other/a.rs", "/work"), "/other/a.rs");
-        let a = args(Some("opus"), Some("plan"), Some("abc"), None, false);
+        let spec = super::super::session::Spec {
+            kind: "claude".into(),
+            model: Some("opus".into()),
+            mode: Some("plan".into()),
+            resume: Some("abc".into()),
+            resume_at: Some("u9".into()),
+            fork: true,
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        let a = args(&spec, None);
         assert!(a.windows(2).any(|w| w == ["--resume", "abc"]) && a.windows(2).any(|w| w == ["--permission-mode", "plan"]));
+        assert!(a.windows(2).any(|w| w == ["--resume-session-at", "u9"]) && a.iter().any(|x| x == "--fork-session"));
+        assert!(a.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(!a.iter().any(|x| x == "--allow-dangerously-skip-permissions"));
     }
 }
