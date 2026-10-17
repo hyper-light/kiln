@@ -77,6 +77,9 @@ function Questions({ a, onDecide }: { a: Approval; onDecide: Decide }) {
 }
 
 /** The full card, where the decision is made. */
+/** Reasons that only restate that it's asking. */
+const GENERIC = /^(this |the )?(command|tool|action|operation|edit)s? (requires?|needs?) (your )?(approval|permission)\.?$/i;
+
 export function ApprovalCard({ a, cwd, onDecide, className }: { a: Approval; cwd: string; onDecide: Decide; className?: string }) {
   const [denying, setDenying] = React.useState(false);
   const [note, setNote] = React.useState("");
@@ -107,7 +110,7 @@ export function ApprovalCard({ a, cwd, onDecide, className }: { a: Approval; cwd
         <div className="hx-approval-title">{a.title}</div>
       ) : null}
       {a.detail && <div className="hx-dim text-[12px]">{a.detail}</div>}
-      {a.reason && <div className="hx-approval-reason">{a.reason}</div>}
+      {a.reason && !GENERIC.test(a.reason.trim()) && <div className="hx-approval-reason">{a.reason}</div>}
 
       {a.diffs && a.diffs.length > 0 && (
         <div className="hx-stack">
@@ -118,7 +121,7 @@ export function ApprovalCard({ a, cwd, onDecide, className }: { a: Approval; cwd
       )}
       {isPlan && <Prose text={a.plan ?? ""} className="hx-plan-text" />}
 
-      {!isQuestion && <div className="hx-approval-where">in {tildify(a.cwd || cwd)}</div>}
+      {!isQuestion && a.cwd && a.cwd !== cwd && <div className="hx-approval-where">in {tildify(a.cwd)}</div>}
 
       {isQuestion ? (
         <Questions a={a} onDecide={onDecide} />

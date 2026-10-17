@@ -245,7 +245,12 @@ export interface State {
   mcp?: McpServer[];
   skills?: Skill[];
   plugins?: Plugin[];
+  /** Which of those lists the harness has reported yet (servers that predate it omit this). */
+  inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
 }
+
+/** loading: not reported yet; ready: reported (an empty list means none); unsupported: the harness can't say. */
+export type Known = "loading" | "ready" | "unsupported";
 
 export interface ModeOption {
   id: string;

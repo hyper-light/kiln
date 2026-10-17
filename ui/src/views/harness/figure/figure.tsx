@@ -1,14 +1,13 @@
 /**
- * The frame every animated figure on hyper-light.dev shares: a mono eyebrow, a title and a line of
- * description, round motion controls, the stage, a rail of steps with a prism underline, a grid of
- * facts and a caption under a hairline.
+ * The frame hyper-light.dev's figures share, without the animation: a mono eyebrow, a title and a
+ * line of description, round controls, a rail of tabs with a prism underline, a grid of facts and a
+ * caption under a hairline.
  */
 import * as React from "react";
-import { Pause, Play } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { Tone } from "./geometry";
-import { useMotion } from "./motion";
 import "./figure.css";
+
+export type Tone = "neutral" | "pass" | "fail" | "pending" | "error";
 
 export function Figure({
   eyebrow,
@@ -64,16 +63,6 @@ export const RoundButton = React.forwardRef<HTMLButtonElement, React.ButtonHTMLA
     );
   },
 );
-
-/** Pause or resume every figure (remembered); follows the device's reduced-motion setting. */
-export function MotionButton({ what = "animations" }: { what?: string }) {
-  const { paused, reduced, toggle } = useMotion();
-  return (
-    <RoundButton label={reduced ? "Following your device's reduced-motion setting" : `${paused ? "Resume" : "Pause"} ${what}`} onClick={toggle} disabled={reduced} aria-pressed={paused}>
-      {paused ? <Play size={15} aria-hidden="true" /> : <Pause size={15} aria-hidden="true" />}
-    </RoundButton>
-  );
-}
 
 export interface RailItem<T extends string> {
   id: T;

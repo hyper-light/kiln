@@ -1,145 +1,141 @@
 /**
- * Mission control: every agent kiln runs, on every machine, at a glance — what each is doing, how
- * far along it is, what it changed, what it costs — with one inbox for everything waiting on you
- * and messages to one agent or many at once.
+ * Mission control: one list of your agents, the ones that need you first. Each row says in one line
+ * what that agent is doing — or what it wants, or what it finished — and you answer it right there.
  */
 import * as React from "react";
 import "./harness.css";
+import "./mission.css";
 import { Link, useNavigate, useSearchParams } from "react-router";
-import { Check, CheckSquare, Plus, Send, Square, X } from "lucide-react";
+import { ArrowUpRight, ChevronRight, Plus, Send, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import { clientId, harnessApi, type AgentInfo, type ApprovalBrief, type SendMode } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { EmptyState, ErrorState, PageIntro, SkeletonRows } from "@/components/ui/misc";
-import { Segmented } from "@/components/ui/tabs";
+import { ErrorState, PageIntro, SkeletonRows } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useLocalStorage, useNow } from "@/lib/hooks";
 import { relativeTime } from "@/lib/format";
-import { money, plain, tildify } from "./derive";
-import { DiffStat } from "./diff";
-import { HarnessMark, StatusPill, ToolIcon } from "./parts";
-import { AccountLimits } from "./limits";
+import { money, plain } from "./derive";
 import { AgentMenu } from "./actions";
+import { machineName } from "./parts";
+import { useSeen } from "./seen";
 import { SpawnDialog } from "./spawn";
 import { useAgents } from "./use-agents";
 
-type Group = "status" | "shell" | "machine";
+/** Where an agent stands, in the order you'd want to deal with them. */
+type Stand = "needs" | "crashed" | "working" | "finished" | "ready" | "ended";
+const RANK: Record<Stand, number> = { needs: 0, crashed: 1, working: 2, finished: 3, ready: 4, ended: 5 };
 
-const machineOf = (a: AgentInfo) => (a.target === "local" ? "server" : a.target.replace(/^agent:/, ""));
-const ORDER: Record<AgentInfo["status"], number> = { waiting: 0, running: 1, starting: 2, idle: 3, disconnected: 4, exited: 5 };
+function standOf(a: AgentInfo, seen: number | undefined): Stand {
+  if (a.approvals.length > 0 || a.status === "waiting") return "needs";
+  if (a.status === "exited" && a.exit?.error) return "crashed";
+  if (a.status === "running" || a.status === "starting") return "working";
+  if (a.status === "idle") return a.last_activity > (seen ?? 0) + 1500 ? "finished" : "ready";
+  return "ended";
+}
 
-function InboxRow({ agent, a }: { agent: AgentInfo; a: ApprovalBrief }) {
+const WORD: Record<Stand, string> = { needs: "Needs you", crashed: "Stopped", working: "Working", finished: "Finished", ready: "Ready", ended: "Ended" };
+
+/** The one line that matters for this agent right now. */
+function lineOf(a: AgentInfo, stand: Stand): string {
+  switch (stand) {
+    case "needs": {
+      const ap = a.approvals[0];
+      if (!ap) return "Waiting for you";
+      const more = a.approvals.length > 1 ? ` (+${a.approvals.length - 1} more)` : "";
+      return ap.tool === "question" ? `Asks: ${ap.title}${more}` : ap.tool === "plan" ? `Proposes a plan${more}` : `${ap.tool_name || ap.tool}: ${ap.title}${more}`;
+    }
+    case "crashed":
+      return a.exit?.error ?? "Stopped unexpectedly";
+    case "working": {
+      const plan = (a.todos_total ?? 0) > 0 ? `plan ${a.todos_done ?? 0}/${a.todos_total}` : "";
+      return [a.status === "starting" ? "Starting" : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
+    }
+    case "finished":
+      return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
+    case "ready":
+      return a.goal || a.title || "No task yet";
+    case "ended":
+      return a.status === "disconnected" ? "Its machine is offline" : a.goal || a.title || "Ended";
+  }
+}
+
+function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
   const [busy, setBusy] = React.useState(false);
   const decide = async (decision: "allow" | "deny") => {
     setBusy(true);
     try {
-      await harnessApi.command(agent.id, { type: "approve", id: a.id, decision });
+      await harnessApi.command(a.id, { type: "approve", id: ap.id, decision });
     } catch (e) {
       toast.error("Couldn't answer", errorMessage(e));
     } finally {
       setBusy(false);
     }
   };
-  const simple = a.tool !== "question" && a.tool !== "plan";
+  if (ap.tool === "question" || ap.tool === "plan")
+    return (
+      <Button size="xs" asChild>
+        <Link to={`/agents/${a.id}`}>{ap.tool === "plan" ? "Review the plan" : "Answer"}</Link>
+      </Button>
+    );
   return (
-    <li className="hx-inbox-row">
-      <HarnessMark kind={agent.kind} name={agent.kind_name} size={20} />
-      <span className="hx-inbox-who">{agent.name}</span>
-      <ToolIcon kind={a.tool} size={13} className="text-[var(--color-warn)]" />
-      <Link to={`/agents/${agent.id}`} className="hx-inbox-what">
-        {a.title}
+    <>
+      <Button size="xs" disabled={busy} onClick={() => decide("allow")}>
+        Allow
+      </Button>
+      <Button size="xs" variant="secondary" disabled={busy} onClick={() => decide("deny")}>
+        Deny
+      </Button>
+      <Link to={`/agents/${a.id}`} className="ms-link">
+        Review
       </Link>
-      <span className="hx-inbox-actions">
-        {simple && (
-          <>
-            <Button size="xs" disabled={busy} onClick={() => decide("allow")}>
-              <Check /> Allow
-            </Button>
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => decide("deny")} aria-label="Deny">
-              <X />
-            </Button>
-          </>
-        )}
-        <Button size="xs" variant="secondary" asChild>
-          <Link to={`/agents/${agent.id}`}>{simple ? "Review" : "Answer"}</Link>
-        </Button>
-      </span>
-    </li>
+    </>
   );
 }
 
-const AgentCard = React.memo(function AgentCard({ a, selected, onSelect, now }: { a: AgentInfo; selected: boolean; onSelect: (id: string, on: boolean) => void; now: number }) {
+const Row = React.memo(function Row({ a, stand, selected, onSelect, now }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void; now: number }) {
   const navigate = useNavigate();
-  const total = a.todos_total ?? 0;
-  const done = a.todos_done ?? 0;
-  const waiting = a.approvals.length;
+  const open = () => navigate(`/agents/${a.id}`);
+  const ap = a.approvals[0];
   return (
-    <article className="hx-card" data-status={a.status} data-selected={selected || undefined}>
-      <div className="hx-card-top">
-        <button type="button" className="hx-card-check" aria-pressed={selected} aria-label={selected ? `Deselect ${a.name}` : `Select ${a.name}`} onClick={() => onSelect(a.id, !selected)}>
-          {selected ? <CheckSquare size={15} /> : <Square size={15} />}
-        </button>
-        <HarnessMark kind={a.kind} name={a.kind_name} size={24} />
-        <button type="button" className="hx-card-name" onClick={() => navigate(`/agents/${a.id}`)}>
-          <span className="hx-trunc">{a.name}</span>
-          <span className="hx-card-where hx-trunc">
-            {machineOf(a)} · {tildify(a.cwd)}
+    <li className="ms-row" data-stand={stand} data-selected={selected || undefined}>
+      <label className="ms-check">
+        <input type="checkbox" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={selected ? `Deselect ${a.name}` : `Select ${a.name}`} />
+      </label>
+      <button type="button" className="ms-main" onClick={open}>
+        <span className="ms-name">{a.name}</span>
+        <span className="ms-line">
+          <span className="ms-word">
+            <i aria-hidden="true" />
+            {WORD[stand]}
           </span>
-        </button>
-        <StatusPill status={a.status} className="ml-auto" />
-        <AgentMenu a={a} />
-      </div>
-
-      <button type="button" className="hx-card-body" onClick={() => navigate(`/agents/${a.id}`)}>
-        <div className="hx-card-goal">{a.goal || a.title || "No task yet"}</div>
-        {a.status === "running" && (a.doing || a.activity) ? (
-          <div className="hx-card-now">
-            <span className="hx-live-dot" aria-hidden="true" />
-            <span className="hx-trunc">{a.doing || a.activity}</span>
-          </div>
-        ) : a.summary ? (
-          <div className="hx-card-summary">{plain(a.summary)}</div>
-        ) : null}
-        {waiting > 0 && (
-          <div className="hx-card-wait">
-            <ToolIcon kind={a.approvals[0]?.tool ?? "other"} size={12} />
-            <span className="hx-trunc">{a.approvals[0]?.title}</span>
-            {waiting > 1 && <span>+{waiting - 1}</span>}
-          </div>
-        )}
+          <span className="ms-text">{lineOf(a, stand)}</span>
+        </span>
       </button>
-
-      {total > 0 && (
-        <div className="hx-card-plan" title={`${done} of ${total} steps done`}>
-          <div className="hx-progress">
-            <span style={{ width: `${(done / total) * 100}%` }} />
-          </div>
-          <span className="hx-meta-num">
-            {done}/{total}
-          </span>
-        </div>
-      )}
-
-      <div className="hx-card-meters">
+      <span className="ms-meta">
+        <span>
+          {machineName(a.target)} · {relativeTime(Math.floor(a.last_activity / 1000), now)}
+        </span>
         {(a.files_changed ?? 0) > 0 && (
-          <span>
-            {a.files_changed} file{a.files_changed === 1 ? "" : "s"} <DiffStat add={a.lines_added ?? 0} del={a.lines_removed ?? 0} />
+          <span className="ms-changes">
+            {a.files_changed} file{a.files_changed === 1 ? "" : "s"} <b>+{a.lines_added ?? 0}</b> <i>−{a.lines_removed ?? 0}</i>
           </span>
         )}
-        {a.tasks_running > 0 && (
-          <span>
-            {a.tasks_running} subagent{a.tasks_running === 1 ? "" : "s"}
-          </span>
+      </span>
+      <span className="ms-actions">
+        {stand === "needs" && ap && <Decide a={a} ap={ap} />}
+        {stand === "crashed" && (
+          <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "restart" }).catch((e: unknown) => toast.error("Couldn't restart", errorMessage(e)))}>
+            Restart
+          </Button>
         )}
-        {a.queued > 0 && <span>{a.queued} queued</span>}
-        {(a.context_pct ?? 0) >= 1 && <span>context {Math.round(a.context_pct ?? 0)}%</span>}
-        {a.cost_usd > 0 && <span>{money(a.cost_usd)}</span>}
-        <span className="ml-auto">{relativeTime(Math.floor(a.last_activity / 1000), now)}</span>
-      </div>
-
-    </article>
+        <AgentMenu a={a} />
+        <button type="button" className="ms-go" onClick={open} aria-label={`Open ${a.name}`}>
+          <ArrowUpRight size={16} />
+        </button>
+      </span>
+    </li>
   );
 });
 
@@ -166,40 +162,36 @@ function Broadcast({ ids, agents, onDone }: { ids: string[]; agents: AgentInfo[]
   };
   const names = agents.filter((a) => ids.includes(a.id)).map((a) => a.name);
   return (
-    <div className="hx-broadcast" role="region" aria-label="Message the selected agents">
-      <div className="hx-broadcast-head">
-        <span className="hx-eyebrow">To {ids.length} agents</span>
-        <span className="hx-dim hx-trunc">{names.join(", ")}</span>
-        <Button
-          size="xs"
-          variant="danger"
-          className="ml-auto"
+    <div className="ms-broadcast" role="region" aria-label="Message the selected agents">
+      <div className="ms-broadcast-head">
+        <span className="ms-eyebrow">To {ids.length} agents</span>
+        <span className="ms-broadcast-names">{names.join(", ")}</span>
+        <button
+          type="button"
+          className="ms-link ms-danger"
           onClick={() => {
             if (!window.confirm(`End ${ids.length} agent${ids.length === 1 ? "" : "s"}? Their processes stop on the machines.`)) return;
             void Promise.allSettled(ids.map((id) => harnessApi.stop(id))).then(onDone);
           }}
         >
           End {ids.length}
-        </Button>
+        </button>
         <button type="button" className="hx-icon" aria-label="Clear selection" onClick={onDone}>
-          <X size={13} />
+          <X size={14} />
         </button>
       </div>
-      <div className="hx-compose-box">
-        <textarea className="hx-compose-input" rows={2} value={text} onChange={(e) => setText(e.target.value)} placeholder="Message every selected agent" />
-        <div className="hx-compose-bar">
-          <div className="hx-modes" role="radiogroup" aria-label="How to send">
-            {(["queue", "steer", "now"] as SendMode[]).map((m) => (
-              <button key={m} type="button" role="radio" aria-checked={mode === m} className="hx-mode" data-mode={m} onClick={() => setMode(m)}>
-                {m === "queue" ? "Queue" : m === "steer" ? "Steer" : "Now"}
-              </button>
-            ))}
-          </div>
-          <span className="flex-1" />
-          <Button size="sm" onClick={send} disabled={busy || !text.trim()}>
-            <Send /> Send to {ids.length}
-          </Button>
+      <textarea className="ms-broadcast-input" rows={2} value={text} onChange={(e) => setText(e.target.value)} placeholder="Message every selected agent" />
+      <div className="ms-broadcast-bar">
+        <div className="ms-modes" role="radiogroup" aria-label="How to send">
+          {(["queue", "steer", "now"] as SendMode[]).map((m) => (
+            <button key={m} type="button" role="radio" aria-checked={mode === m} onClick={() => setMode(m)}>
+              {m === "queue" ? "Queue" : m === "steer" ? "Steer" : "Now"}
+            </button>
+          ))}
         </div>
+        <Button size="sm" onClick={send} disabled={busy || !text.trim()}>
+          <Send /> Send to {ids.length}
+        </Button>
       </div>
     </div>
   );
@@ -208,8 +200,9 @@ function Broadcast({ ids, agents, onDone }: { ids: string[]; agents: AgentInfo[]
 export default function Mission() {
   useDocumentTitle("Agents");
   const { list, error, reload } = useAgents();
+  const seen = useSeen();
   const [found, setFound] = React.useState<AiSession[]>([]);
-  const [group, setGroup] = useLocalStorage<Group>("kiln.agents.group", "status");
+  const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [spawn, setSpawn] = React.useState(false);
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const now = useNow();
@@ -231,147 +224,108 @@ export default function Mission() {
     if (ev.type === "ai_sessions") api.aiSessions().then(setFound, () => undefined);
   });
 
-  const agents = React.useMemo(() => (list ?? []).slice().sort((a, b) => ORDER[a.status] - ORDER[b.status] || b.last_activity - a.last_activity), [list]);
-  const inbox = agents.flatMap((a) => a.approvals.map((ap) => ({ agent: a, ap }))).sort((x, y) => x.ap.at - y.ap.at);
-  const working = agents.filter((a) => a.status === "running").length;
-  const cost = agents.reduce((n, a) => n + a.cost_usd, 0);
+  const rows = React.useMemo(
+    () =>
+      (list ?? [])
+        .map((a) => ({ a, stand: standOf(a, seen[a.id]) }))
+        .sort((x, y) => RANK[x.stand] - RANK[y.stand] || (x.stand === "needs" ? (x.a.approvals[0]?.at ?? 0) - (y.a.approvals[0]?.at ?? 0) : y.a.last_activity - x.a.last_activity)),
+    [list, seen],
+  );
+  const live = rows.filter((r) => r.stand !== "ended");
+  const ended = rows.filter((r) => r.stand === "ended");
+  const n = (s: Stand) => rows.filter((r) => r.stand === s).length;
+  const machines = [...new Set(live.map((r) => machineName(r.a.target)))];
+  const cost = rows.reduce((t, r) => t + r.a.cost_usd, 0);
   // Sessions found on machines that kiln isn't running itself (started in a plain terminal).
-  const elsewhere = found.filter((s) => !agents.some((a) => a.harness_session && a.harness_session === s.id));
+  const elsewhere = found.filter((s) => !rows.some((r) => r.a.harness_session && r.a.harness_session === s.id));
 
-  const groups = React.useMemo(() => {
-    const m = new Map<string, AgentInfo[]>();
-    for (const a of agents) {
-      const k = group === "machine" ? machineOf(a) : group === "shell" ? (a.shell ? `shell ${a.shell.slice(0, 8)}` : "No shell") : "all";
-      m.set(k, [...(m.get(k) ?? []), a]);
-    }
-    return [...m.entries()];
-  }, [agents, group]);
+  const status = [n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`, n("crashed") && `${n("crashed")} stopped`, n("working") && `${n("working")} working`, n("finished") && `${n("finished")} finished`]
+    .filter(Boolean)
+    .join(", ");
+  const lead = !list
+    ? "Every coding agent kiln runs, on every machine."
+    : rows.length === 0
+      ? "Start coding agents on any of your machines and run them all from here."
+      : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}. ${money(cost)} so far.`;
 
   const select = React.useCallback((id: string, on: boolean) => {
     setSelected((s) => {
-      const n = new Set(s);
-      if (on) n.add(id);
-      else n.delete(id);
-      return n;
+      const next = new Set(s);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
     });
   }, []);
 
   return (
-    <div className="container-console page hx-mission">
+    <div className="container-console page ms-page" data-selecting={selected.size > 0 || undefined}>
       <PageIntro
         index={5}
         label="Agents"
-        title="Mission control"
-        lead={
-          list
-            ? `${agents.length} agent${agents.length === 1 ? "" : "s"} · ${working} working · ${inbox.length} waiting on you · ${money(cost)} so far`
-            : "Every coding agent kiln runs, on every machine."
-        }
+        title="Mission control."
+        lead={lead}
         actions={
           <Button onClick={() => setSpawn(true)}>
-            <Plus /> New agents
+            New agents <Plus />
           </Button>
         }
       />
-
-      <AccountLimits agents={agents} />
-
-      {inbox.length > 0 && (
-        <section className="hx-inbox" aria-label="Waiting on you">
-          <div className="hx-section-head">
-            <span className="hx-eyebrow">Waiting on you · {inbox.length}</span>
-          </div>
-          <ul>
-            {inbox.map(({ agent, ap }) => (
-              <InboxRow key={`${agent.id}-${ap.id}`} agent={agent} a={ap} />
-            ))}
-          </ul>
-        </section>
-      )}
-
-      <div className="hx-section-head mt-8">
-        <span className="hx-eyebrow">Agents</span>
-        {agents.some((a) => a.status === "exited") && (
-          <Button
-            size="xs"
-            variant="ghost"
-            className="ml-auto"
-            onClick={() => {
-              const gone = agents.filter((a) => a.status === "exited");
-              void Promise.allSettled(gone.map((a) => harnessApi.stop(a.id))).then(() => reload());
-            }}
-          >
-            Clear stopped ({agents.filter((a) => a.status === "exited").length})
-          </Button>
-        )}
-        {agents.length > 0 && (
-          <Segmented<Group>
-            label="Group agents"
-            value={group}
-            onChange={setGroup}
-            options={[
-              { value: "status", label: "All" },
-              { value: "shell", label: "By shell" },
-              { value: "machine", label: "By machine" },
-            ]}
-          />
-        )}
-      </div>
 
       {error && !list ? (
         <ErrorState error={error} onRetry={reload} />
       ) : !list ? (
         <SkeletonRows rows={4} cols={3} />
-      ) : agents.length === 0 ? (
-        <EmptyState
-          title="No agents yet"
-          action={
-            <Button onClick={() => setSpawn(true)}>
-              <Plus /> New agents
-            </Button>
-          }
-        >
-          Start Claude Code, Codex or any harness your machines have — one or a dozen. kiln runs them and is their whole front end: steer them, approve what they do, review their changes.
-        </EmptyState>
+      ) : rows.length === 0 ? (
+        <div className="ms-empty">
+          <p className="ms-empty-title">No agents yet.</p>
+          <p>Claude Code, Codex, or any harness your machines have — one or a dozen. kiln runs them: steer them, answer them, review what they change.</p>
+          <Button onClick={() => setSpawn(true)}>
+            New agents <Plus />
+          </Button>
+        </div>
       ) : (
-        groups.map(([k, as]) => (
-          <section key={k} className="hx-group">
-            {group !== "status" && <div className="hx-group-head">{k}</div>}
-            <div className="hx-board">
-              {as.map((a) => (
-                <AgentCard key={a.id} a={a} selected={selected.has(a.id)} onSelect={select} now={now} />
+        <>
+          {live.length > 0 ? (
+            <ul className="ms-list">
+              {live.map(({ a, stand }) => (
+                <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} now={now} />
               ))}
-            </div>
-          </section>
-        ))
+            </ul>
+          ) : (
+            <p className="ms-quiet">Nothing running. Start something new, or pick up an ended agent below.</p>
+          )}
+
+          {ended.length > 0 && (
+            <section className="ms-ended">
+              <div className="ms-fold">
+                <button type="button" className="ms-fold-btn" aria-expanded={showEnded} onClick={() => setShowEnded(!showEnded)}>
+                  <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
+                  Ended · {ended.length}
+                </button>
+                <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
+                  Clear
+                </button>
+              </div>
+              {showEnded && (
+                <ul className="ms-list">
+                  {ended.map(({ a, stand }) => (
+                    <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} now={now} />
+                  ))}
+                </ul>
+              )}
+            </section>
+          )}
+        </>
       )}
 
       {elsewhere.length > 0 && (
-        <section className="mt-10">
-          <div className="hx-section-head">
-            <span className="hx-eyebrow">Also on your machines · {elsewhere.length}</span>
-            <Link to="/agents/sessions" className="text-link text-[12px]">
-              See all
-            </Link>
-          </div>
-          <ul className="hx-found">
-            {elsewhere.slice(0, 6).map((s) => (
-              <li key={`${s.machine}:${s.pid}`}>
-                <HarnessMark kind={s.tool} size={18} />
-                <span className="hx-trunc">{s.title || s.name || s.cwd}</span>
-                <span className="hx-dim hx-trunc">
-                  {s.machine} · {tildify(s.cwd)}
-                </span>
-                <Link to={`/agents/sessions?session=${encodeURIComponent(`${s.machine}:${s.pid}`)}`} className="text-link ml-auto text-[12px]">
-                  Watch
-                </Link>
-              </li>
-            ))}
-          </ul>
-        </section>
+        <Link to="/agents/sessions" className="ms-elsewhere">
+          {elsewhere.length} session{elsewhere.length === 1 ? "" : "s"} running outside kiln on your machines — watch or take over
+          <ArrowUpRight size={13} aria-hidden="true" />
+        </Link>
       )}
 
-      {selected.size > 0 && <Broadcast ids={[...selected]} agents={agents} onDone={() => setSelected(new Set())} />}
+      {selected.size > 0 && <Broadcast ids={[...selected]} agents={rows.map((r) => r.a)} onDone={() => setSelected(new Set())} />}
 
       <SpawnDialog
         open={spawn}

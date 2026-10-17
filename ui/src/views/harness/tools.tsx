@@ -223,8 +223,11 @@ function ServerRow({ s, store }: { s: McpServer; store: SessionStore }) {
 
 export function McpPanel({ state, store }: { state: State | null; store: SessionStore }) {
   const [adding, setAdding] = React.useState(false);
+  const known = state?.inventory?.mcp;
   const servers = state?.mcp;
-  if (servers === undefined) return <div className="hx-empty">This agent's harness doesn't report MCP servers to kiln.</div>;
+  if (known === "unsupported" || (servers === undefined && !known)) return <p className="in-none">This agent's harness doesn't tell kiln about its MCP servers.</p>;
+  if (known === "loading" && !servers?.length) return <p className="in-none">Asking the agent for its MCP servers…</p>;
+  if (servers === undefined) return null;
   const connected = servers.filter((s) => s.status === "connected").length;
   return (
     <div className="hx-stack">
@@ -239,7 +242,7 @@ export function McpPanel({ state, store }: { state: State | null; store: Session
         )}
       </div>
       {adding && <AddServer store={store} onDone={() => setAdding(false)} />}
-      {servers.length === 0 && !adding && <div className="hx-dim text-[12.5px]">No MCP servers yet.</div>}
+      {servers.length === 0 && !adding && <p className="in-none">None configured for this agent.</p>}
       <ul className="hx-mcps">
         {servers.map((s) => (
           <ServerRow key={`${s.scope}:${s.name}`} s={s} store={store} />
@@ -305,8 +308,12 @@ function SkillRow({ k, store }: { k: Skill; store: SessionStore }) {
 
 export function SkillsPanel({ state, store }: { state: State | null; store: SessionStore }) {
   const [q, setQ] = React.useState("");
+  const known = state?.inventory?.skills;
   const skills = state?.skills;
-  if (skills === undefined) return <div className="hx-empty">This agent's harness doesn't report skills to kiln.</div>;
+  if (known === "unsupported" || (skills === undefined && !known)) return <p className="in-none">This agent's harness doesn't tell kiln about its skills.</p>;
+  if (known === "loading" && !skills?.length) return <p className="in-none">Asking the agent for its skills…</p>;
+  if (skills === undefined) return null;
+  if (skills.length === 0 && !(state?.plugins ?? []).length) return <p className="in-none">No skills installed for this agent.</p>;
   const ql = q.trim().toLowerCase();
   const shown = skills.filter((k) => !ql || `${k.name} ${k.description} ${k.source}`.toLowerCase().includes(ql));
   const plugins = state?.plugins ?? [];

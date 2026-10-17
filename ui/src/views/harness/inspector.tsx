@@ -1,6 +1,6 @@
 /**
- * Beside the timeline: everything the agent changed as one reviewable changeset, its plan, the
- * commands it ran, the subagents it started, and what it has cost.
+ * Beside the conversation, three places: everything the agent changed as one reviewable changeset;
+ * its plan, subagents and the commands it ran; and what it works with — MCP servers, skills, usage.
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
@@ -13,7 +13,8 @@ import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
 import { TodoList } from "./timeline";
 
-export type InspectorTab = "changes" | "plan" | "runs" | "agents" | "mcp" | "skills" | "usage";
+/** Three places beside the conversation: what it changed, what it is doing (plan, subagents, commands), and what it works with (MCP, skills, usage). */
+export type InspectorTab = "changes" | "plan" | "tools";
 
 /** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
 function fromServer(files: ServerChange[]): FileChange[] {
@@ -260,14 +261,11 @@ export function Inspector({
   const todos = state?.todos ?? [];
   const done = todos.filter((t) => t.status === "completed").length;
   const tasks = state?.tasks ?? [];
+  const mcp = state?.mcp ?? [];
   const tabs: { id: InspectorTab; label: string; count?: string }[] = [
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
-    { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined },
-    { id: "runs", label: "Runs", count: runs.length ? String(runs.length) : undefined },
-    { id: "agents", label: "Subagents", count: tasks.length ? String(tasks.length) : undefined },
-    { id: "mcp", label: "MCP", count: state?.mcp?.length ? `${state.mcp.filter((m) => m.status === "connected").length}/${state.mcp.length}` : undefined },
-    { id: "skills", label: "Skills", count: state?.skills?.length ? String(state.skills.length) : undefined },
-    { id: "usage", label: "Status" },
+    { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : tasks.length ? String(tasks.length) : undefined },
+    { id: "tools", label: "Tools", count: mcp.length ? `${mcp.filter((m) => m.status === "connected").length}/${mcp.length}` : undefined },
   ];
   return (
     <div className={cn("hx-inspector", className)}>
@@ -281,22 +279,51 @@ export function Inspector({
       </div>
       <div className="hx-inspector-body">
         {tab === "changes" && <Changes events={events} changes={changes} cwd={cwd} />}
-        {tab === "plan" &&
-          (todos.length > 0 ? (
-            <div className="hx-stack">
-              <div className="hx-progress">
-                <span style={{ width: `${(done / todos.length) * 100}%` }} />
-              </div>
-              <TodoList todos={todos} />
-            </div>
-          ) : (
-            <div className="hx-empty">No plan yet.</div>
-          ))}
-        {tab === "runs" && <Runs events={events} />}
-        {tab === "agents" && <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />}
-        {tab === "mcp" && <McpPanel state={state} store={store} />}
-        {tab === "skills" && <SkillsPanel state={state} store={store} />}
-        {tab === "usage" && <Status state={state} />}
+        {tab === "plan" && (
+          <div className="in-secs">
+            <section>
+              <h3 className="in-sec-head">Plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
+              {todos.length > 0 ? (
+                <div className="hx-stack">
+                  <div className="hx-progress">
+                    <span style={{ width: `${(done / todos.length) * 100}%` }} />
+                  </div>
+                  <TodoList todos={todos} />
+                </div>
+              ) : (
+                <p className="in-none">No plan yet. It appears here when the agent writes one.</p>
+              )}
+            </section>
+            {tasks.length > 0 && (
+              <section>
+                <h3 className="in-sec-head">Subagents<span>{tasks.length}</span></h3>
+                <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />
+              </section>
+            )}
+            {runs.length > 0 && (
+              <section>
+                <h3 className="in-sec-head">Commands it ran<span>{runs.length}</span></h3>
+                <Runs events={events} />
+              </section>
+            )}
+          </div>
+        )}
+        {tab === "tools" && (
+          <div className="in-secs">
+            <section>
+              <h3 className="in-sec-head">MCP servers</h3>
+              <McpPanel state={state} store={store} />
+            </section>
+            <section>
+              <h3 className="in-sec-head">Skills</h3>
+              <SkillsPanel state={state} store={store} />
+            </section>
+            <section>
+              <h3 className="in-sec-head">Usage and status</h3>
+              <Status state={state} />
+            </section>
+          </div>
+        )}
       </div>
     </div>
   );

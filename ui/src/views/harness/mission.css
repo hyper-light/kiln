@@ -1,0 +1,423 @@
+/* Mission control: one list, the agents that need you first. Each row is a name, one line of state
+   in words and colour, where it runs — and, when it needs you, the answer right there. */
+
+.ms-page {
+  container-type: inline-size;
+}
+.ms-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: #a1a3ab;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  line-height: 1.8;
+  text-transform: uppercase;
+}
+.ms-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #c9c3d8;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.ms-link:hover {
+  color: #ededee;
+}
+.ms-danger {
+  color: #d1aaad;
+}
+.ms-danger:hover {
+  color: #ecc9cc;
+}
+
+/* ---------------------------------------------------------------- the list */
+.ms-list {
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid #2b2d32;
+  list-style: none;
+}
+.ms-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto auto;
+  grid-template-areas: "check main meta actions";
+  align-items: center;
+  gap: 0 20px;
+  min-height: 84px;
+  padding: 16px 8px 16px 6px;
+  border-bottom: 1px solid #25272c;
+  transition: background-color 0.2s;
+}
+.ms-row:hover,
+.ms-row:focus-within {
+  background: #0c0d0f;
+}
+.ms-row[data-selected] {
+  background: #0f0e14;
+}
+.ms-row[data-stand="needs"] {
+  box-shadow: inset 2px 0 0 #c6b08e;
+}
+.ms-row[data-stand="crashed"] {
+  box-shadow: inset 2px 0 0 #d1aaad;
+}
+.ms-row[data-stand="ended"] .ms-name {
+  color: #a1a4ad;
+}
+.ms-check {
+  grid-area: check;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.ms-row:hover .ms-check,
+.ms-row:focus-within .ms-check,
+[data-selecting] .ms-check {
+  opacity: 1;
+}
+.ms-check input {
+  width: 14px;
+  height: 14px;
+  accent-color: #bab0e3;
+}
+.ms-main {
+  grid-area: main;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+  text-align: left;
+}
+.ms-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 18px;
+  font-weight: 400;
+  line-height: 1.3;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-main:hover .ms-name {
+  color: #ffffff;
+}
+.ms-line {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 12px;
+}
+.ms-word {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.ms-word > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+  transform: translateY(-1px);
+}
+.ms-text {
+  min-width: 0;
+  overflow: hidden;
+  color: #97999f;
+  font-size: 13px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-row[data-stand="needs"] .ms-word {
+  color: #e2cfae;
+}
+.ms-row[data-stand="needs"] .ms-word > i {
+  background: #d8bb95;
+}
+.ms-row[data-stand="needs"] .ms-text {
+  color: #ece0ca;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.ms-row[data-stand="crashed"] .ms-word {
+  color: #e2b9bd;
+}
+.ms-row[data-stand="crashed"] .ms-word > i {
+  background: #d1aaad;
+}
+.ms-row[data-stand="working"] .ms-word {
+  color: #cdc6ea;
+}
+.ms-row[data-stand="working"] .ms-word > i {
+  background: #bab0e3;
+}
+.ms-row[data-stand="working"] .ms-text {
+  color: #b9b5cc;
+}
+.ms-row[data-stand="finished"] .ms-word {
+  color: #bfdccf;
+}
+.ms-row[data-stand="finished"] .ms-word > i {
+  background: #a8c9bc;
+}
+.ms-row[data-stand="finished"] .ms-text {
+  color: #c3c5cb;
+}
+.ms-row[data-stand="ready"] .ms-word > i {
+  background: #6f8f84;
+}
+.ms-meta {
+  grid-area: meta;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ms-meta > span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ms-changes b {
+  color: #a8c9bc;
+  font-weight: 400;
+}
+.ms-changes i {
+  color: #d1aaad;
+  font-style: normal;
+}
+.ms-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.ms-actions .ms-link {
+  margin: 0 4px;
+}
+.ms-go {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 6px;
+  color: #a1a3ab;
+  transition: color 0.2s;
+}
+.ms-row:hover .ms-go,
+.ms-go:hover {
+  color: #ededee;
+}
+
+.ms-quiet {
+  padding: 28px 0;
+  border-top: 1px solid #2b2d32;
+  color: #97999f;
+  font-size: 13px;
+}
+.ms-ended {
+  margin-top: 28px;
+}
+.ms-fold {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px 12px 6px;
+}
+.ms-fold-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #a1a3ab;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.ms-fold-btn:hover {
+  color: #ededee;
+}
+.ms-chev {
+  transition: transform 0.2s;
+}
+.ms-fold-btn[aria-expanded="true"] .ms-chev {
+  transform: rotate(90deg);
+}
+.ms-elsewhere {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 36px;
+  color: #a1a4ad;
+  font-size: 13px;
+}
+.ms-elsewhere:hover {
+  color: #ededee;
+}
+.ms-empty {
+  padding: 56px 20px;
+  border: 1px dashed #30323a;
+  border-radius: 6px;
+  color: #9398a3;
+  font-size: 13px;
+  line-height: 1.7;
+  text-align: center;
+}
+.ms-empty p {
+  max-width: 460px;
+  margin: 0 auto 18px;
+}
+.ms-empty .ms-empty-title {
+  margin-bottom: 6px;
+  color: #ededee;
+  font-size: 19px;
+  font-weight: 450;
+  letter-spacing: -0.02em;
+}
+
+/* ---------------------------------------------------------------- message many */
+.ms-broadcast {
+  position: sticky;
+  bottom: 12px;
+  z-index: 20;
+  margin-top: 24px;
+  padding: 14px 16px;
+  border: 1px solid #2a3039;
+  border-radius: 9px;
+  background: rgb(10 12 15 / 96%);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 55%);
+  backdrop-filter: blur(10px);
+}
+.ms-broadcast-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.ms-broadcast-names {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: #797c84;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-broadcast-input {
+  display: block;
+  width: 100%;
+  margin: 12px 0 10px;
+  padding: 10px 12px;
+  border: 1px solid #303239;
+  border-radius: 6px;
+  background: #0b0c0e;
+  color: #ededee;
+  font-size: 16px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+}
+@media (pointer: fine) {
+  .ms-broadcast-input {
+    font-size: 14px;
+  }
+}
+.ms-broadcast-input:focus {
+  border-color: #47464f;
+}
+.ms-broadcast-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ms-modes {
+  display: inline-flex;
+  gap: 18px;
+}
+.ms-modes > button {
+  position: relative;
+  padding: 6px 0;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ms-modes > button[aria-checked="true"] {
+  color: #ededee;
+}
+.ms-modes > button[aria-checked="true"]::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
+  content: "";
+}
+
+/* ---------------------------------------------------------------- narrow: name and line on top, answers beneath */
+@container (max-width: 760px) {
+  .ms-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "main main"
+      "meta actions";
+    gap: 10px 12px;
+    min-height: 0;
+    padding: 16px 4px 12px 12px;
+  }
+  .ms-check {
+    display: none;
+  }
+  .ms-name {
+    font-size: 16px;
+    white-space: normal;
+  }
+  .ms-line {
+    flex-direction: column;
+    gap: 5px;
+  }
+  .ms-text {
+    display: -webkit-box;
+    white-space: normal;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+  .ms-meta {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    font-size: 10px;
+  }
+  /* The row's arrow opens it; one less word beside Allow and Deny. */
+  .ms-actions .ms-link {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ms-row,
+  .ms-check,
+  .ms-go,
+  .ms-chev {
+    transition: none;
+  }
+}

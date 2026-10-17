@@ -838,12 +838,11 @@ textarea.hx-input {
 .hx-streaming > :last-child::after {
   content: "";
   display: inline-block;
-  width: 7px;
-  height: 14px;
+  width: 2px;
+  height: 1.05em;
   margin-left: 3px;
-  vertical-align: -2px;
-  background: var(--color-run);
-  animation: hx-fade 0.8s ease-in-out infinite alternate;
+  vertical-align: -0.18em;
+  background: linear-gradient(180deg, #b8d9d2, #a6c4ed, #b8a6d5, #d6a2aa);
 }
 .hx-outcome {
   padding: 14px 16px;

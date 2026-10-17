@@ -1,6 +1,7 @@
 /** Small shared pieces of the agent views: harness marks, status, tool icons, prose. */
 import * as React from "react";
 import "./harness.css";
+import "./console.css";
 import { Bot, FilePen, FileText, Globe, ListChecks, Map as MapIcon, MessageCircleQuestion, Plug, Search, Sparkles, SquareTerminal, Wrench, type LucideIcon } from "lucide-react";
 import type { Status, ToolKind } from "@/api/harness";
 import { cn } from "@/lib/utils";
@@ -50,6 +51,20 @@ export function StatusPill({ status, activity, className }: { status: Status; ac
       <i className="dot" data-status={s.dot} aria-hidden="true" />
       <span>{s.label}</span>
       {activity && status === "running" && <span className="hx-pill-act">· {activity}</span>}
+    </span>
+  );
+}
+
+export const machineName = (target: string) => (target === "local" ? "server" : target.replace(/^agent:/, ""));
+
+/** Status as the site shows a project's: a dot and a word. Someone waiting on you outranks the rest. */
+export function StateWord({ a }: { a: { status: Status; approvals: readonly unknown[] } }) {
+  const s = a.approvals.length > 0 ? "waiting" : a.status;
+  const word = { waiting: "Needs you", running: "Working", starting: "Starting", idle: "Ready", exited: "Ended", disconnected: "Offline" }[s];
+  return (
+    <span className="st-word" data-state={s}>
+      <i aria-hidden="true" />
+      {word}
     </span>
   );
 }

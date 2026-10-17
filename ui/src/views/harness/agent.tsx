@@ -1,68 +1,35 @@
 /**
- * One agent, in full: its work as a timeline, what it's waiting on you for, the composer, and
- * beside it the changeset, plan, commands and subagents. On a phone the side panels become tabs.
+ * One agent: the conversation (what you asked, what it did, what it answered), what's waiting on
+ * you, and the composer — with, beside it, what it changed, its plan, and what it works with. On a
+ * phone those become four tabs.
  */
 import * as React from "react";
 import "./harness.css";
 import { Link, useNavigate, useParams } from "react-router";
-import { ArrowLeft, ChevronRight, Power, RotateCcw, SquareTerminal, X } from "lucide-react";
+import { ChevronRight, RotateCcw, X } from "lucide-react";
 import { harnessApi, useAgentSession, type Command } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useMediaQuery } from "@/lib/hooks";
-import { cn } from "@/lib/utils";
 import { ApprovalCard } from "./approval";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
-import { SettingsButton, SettingsSheet, useAttachments } from "./controls";
-import { money, tildify } from "./derive";
+import { SettingsSheet, useAttachments } from "./controls";
+import { changesetOf } from "./derive";
+import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
-import { LimitBadge } from "./limits";
-import { HarnessMark, StatusPill } from "./parts";
+import { useMarkSeen } from "./seen";
 import { Timeline } from "./timeline";
 
 type PhoneTab = "work" | InspectorTab;
-
-function Picker({
-  label,
-  value,
-  options,
-  onPick,
-}: {
-  label: string;
-  value: string;
-  options: { id: string; label: string; dangerous?: boolean; description?: string }[];
-  onPick: (id: string, dangerous: boolean) => void;
-}) {
-  if (options.length === 0) return null;
-  return (
-    <label className="hx-picker">
-      <span className="hx-eyebrow">{label}</span>
-      <select
-        value={value}
-        onChange={(e) => {
-          const o = options.find((x) => x.id === e.target.value);
-          if (o) onPick(o.id, Boolean(o.dangerous));
-        }}
-      >
-        {!options.some((o) => o.id === value) && value && <option value={value}>{value}</option>}
-        {options.map((o) => (
-          <option key={o.id} value={o.id} title={o.description}>
-            {o.label}
-            {o.dangerous ? " (no checks)" : ""}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
 
 export default function AgentPage() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
   const [snap, store] = useAgentSession(id);
   const { info, meta, state, events, conn, changes } = snap;
+  useMarkSeen(id);
   const wide = useMediaQuery("(min-width: 1100px)");
   const [tab, setTab] = React.useState<InspectorTab>("changes");
   const [phoneTab, setPhoneTab] = React.useState<PhoneTab>("work");
@@ -112,6 +79,10 @@ export default function AgentPage() {
     setPhoneTab("work");
   };
   const taskInfo = task ? state?.tasks.find((t) => t.tool_id === task) : null;
+  const showTools = () => {
+    setTab("tools");
+    setPhoneTab("tools");
+  };
 
   const stop = async () => {
     try {
@@ -173,6 +144,16 @@ export default function AgentPage() {
     </div>
   );
 
+  const fileCount = changes ? changes.length : changesetOf(events).length;
+  const todos = state?.todos ?? [];
+  const todosDone = todos.filter((t) => t.status === "completed").length;
+  const phoneTabs: { id: PhoneTab; label: string; n?: string; warn?: boolean }[] = [
+    { id: "work", label: "Work", n: approvals.length ? String(approvals.length) : undefined, warn: approvals.length > 0 },
+    { id: "changes", label: "Changes", n: fileCount ? String(fileCount) : undefined },
+    { id: "plan", label: "Plan", n: todos.length ? `${todosDone}/${todos.length}` : undefined },
+    { id: "tools", label: "Tools" },
+  ];
+
   const hasFiles = (e: React.DragEvent) => [...e.dataTransfer.types].includes("Files");
   return (
     <div
@@ -199,56 +180,19 @@ export default function AgentPage() {
           <span>{attachments.enabled ? "Drop screenshots or files to attach" : "This agent can't take attachments"}</span>
         </div>
       )}
-      <header className="hx-agent-head">
-        <Link to="/agents" className="hx-back" aria-label="All agents">
-          <ArrowLeft size={15} />
-        </Link>
-        {info && <HarnessMark kind={info.kind} name={info.kind_name} size={26} />}
-        <div className="hx-agent-id">
-          <div className="hx-agent-name">
-            <span className="hx-trunc">{info?.name ?? "Agent"}</span>
-            <StatusPill status={status} activity={state?.activity ?? info?.activity} />
-          </div>
-          <div className="hx-agent-where">
-            <span>{info?.target === "local" ? "server" : (info?.target ?? "").replace(/^agent:/, "")}</span>
-            <span className="hx-trunc">{tildify(cwd)}</span>
-            {state?.usage && state.usage.cost_usd > 0 && <span>{money(state.usage.cost_usd)}</span>}
-            <LimitBadge
-              limits={state?.limits ?? info?.limits}
-              onClick={() => {
-                setTab("usage");
-                setPhoneTab("usage");
-              }}
-            />
-            {conn === "reconnecting" && <span className="hx-warn">reconnecting…</span>}
-          </div>
-        </div>
-        <div className="hx-agent-actions">
-          {features.includes("set_mode") && (
-            <Picker label="Permissions" value={state?.mode ?? ""} options={meta?.modes ?? []} onPick={(m, dangerous) => (dangerous ? setRisky(m) : send({ type: "set_mode", mode: m }))} />
-          )}
-          {features.includes("set_model") && <Picker label="Model" value={state?.model ?? ""} options={meta?.models ?? []} onPick={(m) => send({ type: "set_model", model: m })} />}
-          {(meta?.efforts?.length ?? 0) > 0 && <Picker label="Effort" value={state?.effort ?? ""} options={meta?.efforts ?? []} onPick={(e) => send({ type: "set_effort", effort: e })} />}
-          {(meta?.controls ?? []).some((c) => (c.scope ?? "session") === "session") && (
-            <SettingsButton onClick={() => setSettings(true)} count={(meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session").length} />
-          )}
-          {info?.shell && (
-            <Button size="sm" variant="ghost" onClick={() => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`)} aria-label="Open its shell">
-              <SquareTerminal />
-              <span className="hidden lg:inline">Shell</span>
-            </Button>
-          )}
-          {status === "exited" ? (
-            <Button size="sm" variant="secondary" onClick={() => send({ type: "restart" })}>
-              <RotateCcw /> Restart
-            </Button>
-          ) : null}
-          <Button size="sm" variant="ghost" onClick={actions.end} aria-label={actions.live ? "End the agent" : "Remove the agent"}>
-            <Power /> {actions.live ? "End" : "Remove"}
-          </Button>
-          {actions.menu()}
-        </div>
-      </header>
+      <AgentHeader
+        info={info}
+        state={state}
+        meta={meta}
+        status={status}
+        conn={conn}
+        cwd={cwd}
+        actions={actions}
+        send={send}
+        onUsage={showTools}
+        onSettings={() => setSettings(true)}
+        onRisky={setRisky}
+      />
 
       {conn === "gone" ? (
         <div className="hx-empty mt-16">
@@ -264,44 +208,22 @@ export default function AgentPage() {
         </div>
       ) : (
         <div className="hx-agent-phone">
-          <div className="hx-tabs hx-phone-tabs" role="tablist">
-            {(["work", "changes", "plan", "runs", "agents", "mcp", "skills", "usage"] as PhoneTab[]).map((t) => (
-              <button key={t} type="button" role="tab" aria-selected={phoneTab === t} className="hx-tab" onClick={() => setPhoneTab(t)}>
-                {t === "work"
-                  ? "Work"
-                  : t === "changes"
-                    ? "Changes"
-                    : t === "plan"
-                      ? "Plan"
-                      : t === "runs"
-                        ? "Runs"
-                        : t === "agents"
-                          ? "Subagents"
-                          : t === "mcp"
-                            ? "MCP"
-                            : t === "skills"
-                              ? "Skills"
-                              : "Status"}
-                {t === "work" && approvals.length > 0 && <span className="hx-tab-count hx-tab-alert">{approvals.length}</span>}
+          <div className="pt" role="tablist" aria-label="Agent">
+            {phoneTabs.map((t) => (
+              <button key={t.id} type="button" role="tab" aria-selected={phoneTab === t.id} onClick={() => setPhoneTab(t.id)}>
+                {t.label}
+                {t.n && (
+                  <span className="pt-n" data-tone={t.warn ? "warn" : undefined}>
+                    {t.n}
+                  </span>
+                )}
               </button>
             ))}
           </div>
           {phoneTab === "work" ? (
             work
           ) : (
-            <Inspector
-              tab={phoneTab}
-              onTab={(t) => setPhoneTab(t)}
-              events={events}
-              changes={changes}
-              state={state}
-              meta={meta}
-              store={store}
-              cwd={cwd}
-              onOpenTask={openTask}
-              hideTabs
-              className={cn("hx-side hx-side-phone")}
-            />
+            <Inspector tab={phoneTab} onTab={(t) => setPhoneTab(t)} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} hideTabs className="hx-side hx-side-phone" />
           )}
         </div>
       )}

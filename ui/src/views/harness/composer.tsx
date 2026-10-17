@@ -5,9 +5,8 @@
  * on every device until they go out.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, CornerDownLeft, Paperclip, Pencil, Send, Square, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, CornerDownLeft, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, type Meta, type SendMode, type SessionStore, type State } from "@/api/harness";
-import { Button } from "@/components/ui/button";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { Attachments } from "./controls";
@@ -90,6 +89,8 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
   const { files, add, clear, chips, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
+  const approvals = state?.approvals.length ?? 0;
+  const sendLabel = running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
 
   // Grow with the text, up to a third of the screen.
   React.useLayoutEffect(() => {
@@ -150,6 +151,8 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
       setSuggest(null);
       clear();
       setOverride({});
+      // "Now" and "Steer" are for one message: the next one queues again unless chosen.
+      setMode("queue");
     }
   };
 
@@ -186,7 +189,7 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
   };
 
   return (
-    <div className="hx-composer">
+    <div className="hx-composer cp">
       {queue.length > 0 && (
         <div className="hx-queue">
           <div className="hx-queue-head">
@@ -261,18 +264,13 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
           enterKeyHint="send"
           autoCapitalize="sentences"
         />
-        <div className="hx-compose-bar">
-          {running && modes.length > 1 && (
-            <div className="hx-modes" role="radiogroup" aria-label="How to send while it works">
-              {modes.map((m) => (
-                <Tip key={m.id} content={m.hint}>
-                  <button type="button" role="radio" aria-checked={mode === m.id} className="hx-mode" data-mode={m.id} onClick={() => setMode(m.id)}>
-                    {m.label}
-                  </button>
-                </Tip>
-              ))}
-            </div>
-          )}
+        {running && mode === "now" && (
+          <div className="cp-warn" role="note">
+            Now stops the current turn
+            {approvals > 0 ? ` and cancels ${approvals === 1 ? "the request waiting on you" : `the ${approvals} requests waiting on you`}` : ""}, then sends this.
+          </div>
+        )}
+        <div className="cp-bar">
           {canAttach && (
             <>
               <input
@@ -287,14 +285,38 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
                 }}
               />
               <Tip content="Attach files or images">
-                <button type="button" className="hx-icon" aria-label="Attach files" onClick={() => picker.current?.click()}>
-                  <Paperclip size={14} />
+                <button type="button" className="cp-icon" aria-label="Attach files" onClick={() => picker.current?.click()}>
+                  <Paperclip size={15} />
+                  {files.length > 0 && <span className="cp-badge">{files.length}</span>}
                 </button>
               </Tip>
             </>
           )}
+          {running && modes.length > 1 && (
+            <>
+              <div className="cp-modes" role="radiogroup" aria-label="How to send while it works">
+                {modes.map((m) => (
+                  <Tip key={m.id} content={m.hint}>
+                    <button type="button" role="radio" aria-checked={mode === m.id} data-mode={m.id} onClick={() => setMode(m.id)}>
+                      {m.label}
+                    </button>
+                  </Tip>
+                ))}
+              </div>
+              <label className="cp-mode-pick" data-mode={mode}>
+                <span className="sr-only">How to send while it works</span>
+                <select value={mode} onChange={(e) => setMode(e.target.value as SendMode)}>
+                  {modes.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
+          )}
           {canOverride && (meta?.models.length || meta?.efforts?.length) ? (
-            <span className="hx-override">
+            <span className="cp-override">
               {meta?.models.length ? (
                 <select aria-label="Model for this message" value={override.model ?? ""} onChange={(e) => setOverride({ ...override, model: e.target.value || undefined })}>
                   <option value="">model</option>
@@ -317,18 +339,19 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
               ) : null}
             </span>
           ) : null}
-          <span className="flex-1" />
+          <span className="cp-gap" />
           {running && features.includes("interrupt") && (
             <Tip content="Stop the current turn (Esc)">
-              <button type="button" className="hx-stop" onClick={() => store.send({ type: "interrupt" })} aria-label="Stop the current turn">
-                <Square size={11} fill="currentColor" /> Stop
+              <button type="button" className="cp-stop" onClick={() => store.send({ type: "interrupt" })} aria-label="Stop the current turn">
+                <Square size={10} fill="currentColor" />
+                <span className="cp-label">Stop</span>
               </button>
             </Tip>
           )}
-          <Button size="sm" onClick={submit} disabled={(!text.trim() && files.length === 0) || disabled || pending > 0} aria-label="Send">
-            {running && mode === "queue" ? <CornerDownLeft /> : <Send />}
-            {running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send"}
-          </Button>
+          <button type="button" className="cp-send" data-mode={running ? mode : "send"} onClick={submit} disabled={(!text.trim() && files.length === 0) || disabled || pending > 0} aria-label={sendLabel}>
+            {running && mode === "queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}
+            <span className="cp-label">{sendLabel}</span>
+          </button>
         </div>
       </div>
     </div>

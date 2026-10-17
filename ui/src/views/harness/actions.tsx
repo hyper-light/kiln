@@ -41,7 +41,7 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },
   ];
-  const menu = (trigger?: React.ReactNode) => (
+  const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = []) => (
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
         {trigger ?? (
@@ -52,10 +52,10 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content className="popover w-56" sideOffset={6} align="end" collisionPadding={12}>
-          {items
-            .filter((i) => !i.hidden)
+          {[...extra, ...items]
+            .filter((i) => !("hidden" in i && i.hidden))
             .map((i) => (
-              <DropdownMenu.Item key={i.label} className="menu-item" onSelect={i.onSelect} style={i.danger ? { color: "var(--color-fail)" } : undefined}>
+              <DropdownMenu.Item key={i.label} className="menu-item" onSelect={i.onSelect} style={"danger" in i && i.danger ? { color: "var(--color-fail)" } : undefined}>
                 <span className="flex-1">{i.label}</span>
               </DropdownMenu.Item>
             ))}

@@ -5,13 +5,17 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { Brain, ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
+import { ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
 import type { Command, Delivery, HEvent, Meta, State, Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, diffStats, duration, relPath, stepStatus, stepSummary, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
 import { Output, Prose, ToolIcon } from "./parts";
+import { Beam, PrismLabel, ThinkingBody, ThinkingHead, type BeamStatus } from "./signals";
+
+/** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
+const Asking = React.createContext<ReadonlySet<string>>(new Set());
 
 const STEP_ICON: Record<Step["group"], Parameters<typeof ToolIcon>[0]["kind"]> = {
   explore: "read",
@@ -24,6 +28,7 @@ const STEP_ICON: Record<Step["group"], Parameters<typeof ToolIcon>[0]["kind"]> =
   tool: "other",
 };
 
+const beamFor = (s: ToolEvent["status"]): BeamStatus => (s === "running" || s === "done" || s === "error" || s === "denied" || s === "pending" || s === "cancelled" ? s : "done");
 const dotFor = (s: ToolEvent["status"]) =>
   s === "done" ? "succeeded" : s === "error" ? "failed" : s === "running" ? "running" : s === "pending" ? "queued" : s === "denied" ? "timed_out" : "cancelled";
 
@@ -220,6 +225,8 @@ function AgentBody({ calls, tasks, onOpenTask }: { calls: ToolEvent[]; tasks: Ta
 const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { step: Step; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
   const status = stepStatus(step.calls);
   const failures = step.calls.filter((c) => c.status === "error" || (c.tool === "shell" && c.exit_code !== undefined && c.exit_code !== 0)).length;
+  const asking = React.useContext(Asking);
+  const asked = step.calls.some((c) => asking.has(c.tool_id));
   // Open by default: what needs attention, and what is happening right now.
   const [open, setOpen] = React.useState<boolean | null>(null);
   const isOpen = open ?? (status === "running" || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
@@ -252,10 +259,10 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
         {subtitle && <span className="hx-step-sub">{subtitle}</span>}
         <span className="hx-step-end">
           {stats && (stats.add > 0 || stats.del > 0) && <DiffStat add={stats.add} del={stats.del} />}
-          {status === "pending" && <span className="hx-warn text-[11px]">waiting for you</span>}
+          {status === "pending" && (asked ? <span className="hx-warn text-[11px]">waiting for you</span> : <span className="hx-dim text-[11px]">queued</span>)}
           {failures > 0 && <span className="hx-bad">{failures} failed</span>}
           {status === "running" && first ? <Elapsed from={first.started} /> : first && last?.ended ? <span className="hx-meta-num">{duration(last.ended - first.started)}</span> : null}
-          <i className="dot" data-status={dotFor(failures > 0 ? "error" : status)} aria-hidden="true" />
+          <Beam status={beamFor(failures > 0 ? "error" : status)} />
           <ChevronRight size={13} className={cn("hx-chev", isOpen && "rotate-90")} />
         </span>
       </button>
@@ -282,11 +289,12 @@ function Thought({ e }: { e: Extract<HEvent, { kind: "thinking" }> }) {
   if (e.redacted) return null;
   return (
     <div className="hx-thought">
-      <button type="button" className="hx-thought-head" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <Brain size={12} /> {e.streaming ? "Thinking…" : "Thought"}
-        <ChevronRight size={12} className={cn("hx-chev", open && "rotate-90")} />
-      </button>
-      {open && <Prose text={e.text} className="hx-thought-text" />}
+      <ThinkingHead live={Boolean(e.streaming)} open={open} onToggle={() => setOpen(!open)} />
+      {open && (
+        <ThinkingBody live={Boolean(e.streaming)}>
+          <Prose text={e.text} className="hx-thought-text" />
+        </ThinkingBody>
+      )}
     </div>
   );
 }
@@ -374,7 +382,7 @@ const TurnView = React.memo(function TurnView({
         {turn.items.map((it) => (
           <ItemView key={it.key} item={it} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />
         ))}
-        {live && turn.items.length === 0 && !turn.outcome && <div className="hx-dim hx-pulse text-[12px]">Starting…</div>}
+        {live && turn.items.length === 0 && !turn.outcome && <PrismLabel live>Starting</PrismLabel>}
       </div>
       {turn.outcome && (
         <div className="hx-outcome">
@@ -433,24 +441,28 @@ export function Timeline({
   });
   const running = state?.status === "running";
   const tasks = state?.tasks ?? [];
+  const approvals = state?.approvals;
+  const asking = React.useMemo(() => new Set((approvals ?? []).map((a) => a.tool_id).filter((t): t is string => Boolean(t))), [approvals]);
   return (
-    <div ref={ref} className="hx-timeline" onScroll={onScroll}>
-      {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
-      {turns.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>}
-      {turns.map((t, i) => (
-        <TurnView
-          key={t.key}
-          turn={t}
-          cwd={cwd}
-          tasks={tasks}
-          delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
-          live={running && i === turns.length - 1}
-          onOpenTask={onOpenTask}
-          meta={meta}
-          onCommand={onCommand}
-        />
-      ))}
-      {footer}
-    </div>
+    <Asking.Provider value={asking}>
+      <div ref={ref} className="hx-timeline" onScroll={onScroll}>
+        {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
+        {turns.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>}
+        {turns.map((t, i) => (
+          <TurnView
+            key={t.key}
+            turn={t}
+            cwd={cwd}
+            tasks={tasks}
+            delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
+            live={running && i === turns.length - 1}
+            onOpenTask={onOpenTask}
+            meta={meta}
+            onCommand={onCommand}
+          />
+        ))}
+        {footer}
+      </div>
+    </Asking.Provider>
   );
 }
