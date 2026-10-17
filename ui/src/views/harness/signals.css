@@ -1,0 +1,371 @@
+/* Signals: motion primitives for the agent console. CSS-only motion; transform, opacity and background-position. */
+
+.sg-optic,
+.sg-label,
+.sg-think,
+.sg-beam,
+.sg-caret {
+  /* --prism, horizontal (rules, text) and as a seamless vertical loop (the thinking rule, the caret). */
+  --sg-prism: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+  --sg-prism-loop: linear-gradient(180deg, #b8d9d2 0%, #a6c4ed 22%, #b8a6d5 42%, #d6a2aa 60%, #d8cbb0 80%, #b8d9d2 100%);
+  --sg-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes sg-prism-current {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+
+/* ------------------------------------------------------------ optic */
+
+.sg-optic {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  vertical-align: -2px;
+  --sg-step: 1.6px;
+}
+.sg-optic[data-size="16"] {
+  width: 16px;
+  height: 16px;
+  vertical-align: -3px;
+  --sg-step: 1.8px;
+}
+/* Ring 0 is the outermost; inner rings sit brighter, as on the site. At rest the colours are the settled prism. */
+.sg-optic > span {
+  position: absolute;
+  inset: calc(var(--i) * var(--sg-step));
+  border: 1px solid;
+  border-color: #b8d9d2 #b8a6d5 #a6c4ed #d6a2aa;
+  border-radius: 50%;
+  transform: rotate(-35deg) scaleX(0.55) rotate(calc(var(--i) * 5deg));
+  opacity: calc(0.6 + var(--i) * 0.13);
+}
+.sg-optic[data-state="idle"] > span {
+  animation:
+    sg-optic-breathe 14s ease-in-out infinite,
+    sg-optic-chroma 18s linear infinite;
+  animation-delay: calc(var(--i) * -0.55s), calc(var(--i) * -0.9s);
+}
+/* Thinking: the idle motion, quickened. */
+.sg-optic[data-state="thinking"] > span {
+  animation:
+    sg-optic-breathe 3.5s ease-in-out infinite,
+    sg-optic-chroma 4.5s linear infinite;
+  animation-delay: calc(var(--i) * -0.14s), calc(var(--i) * -0.22s);
+}
+/* Tool: colour runs fast through the rings while the shape barely moves. */
+.sg-optic[data-state="tool"] > span {
+  animation:
+    sg-optic-sway 2.4s ease-in-out infinite,
+    sg-optic-chroma 1.6s linear infinite;
+  animation-delay: calc(var(--i) * -0.1s), calc(var(--i) * -0.4s);
+}
+/* Waiting on you: held still in amber, the outer ring lit. */
+.sg-optic[data-state="waiting"] {
+  filter: drop-shadow(0 0 2px rgb(216 187 149 / 45%));
+}
+.sg-optic[data-state="waiting"] > span {
+  border-color: #d8bb95;
+  opacity: 0.5;
+}
+.sg-optic[data-state="waiting"] > span:first-child {
+  opacity: 1;
+}
+.sg-optic[data-state="ended"] {
+  opacity: 0.45;
+}
+.sg-optic[data-state="ended"] > span {
+  border-color: #797c84;
+}
+/* Neighbouring rings share one breath with a small phase offset. */
+@keyframes sg-optic-breathe {
+  0%,
+  100% {
+    transform: translateY(-0.5px) rotate(-38deg) scaleX(0.55) rotate(calc(var(--i) * 5deg));
+  }
+  50% {
+    transform: translateY(0.5px) rotate(-28deg) scaleX(0.66) rotate(calc(var(--i) * 5deg + 6deg));
+  }
+}
+@keyframes sg-optic-sway {
+  0%,
+  100% {
+    transform: rotate(-36deg) scaleX(0.55) rotate(calc(var(--i) * 5deg));
+  }
+  50% {
+    transform: rotate(-32deg) scaleX(0.6) rotate(calc(var(--i) * 5deg + 2deg));
+  }
+}
+@keyframes sg-optic-chroma {
+  0%,
+  100% {
+    border-color: #b8d9d2 #b8a6d5 #a6c4ed #d6a2aa;
+  }
+  33.333% {
+    border-color: #d8cbb0 #a6c4ed #b8d9d2 #b8a6d5;
+  }
+  66.667% {
+    border-color: #b8a6d5 #b8d9d2 #d6a2aa #a6c4ed;
+  }
+}
+
+/* ------------------------------------------------------------ prism label */
+
+.sg-label {
+  font-family: var(--font-mono, "Geist Mono Variable", ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.09em;
+  line-height: 1.8;
+  text-transform: uppercase;
+  color: #97999f;
+}
+.sg-label[data-live="true"] {
+  color: transparent;
+  background: var(--sg-prism);
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: sg-prism-current 6s ease-in-out infinite alternate;
+}
+.sg-num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------ thinking */
+
+.sg-think-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: -5px;
+  padding: 2px 5px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--color-muted, #97999f);
+  cursor: pointer;
+}
+.sg-think-head:hover {
+  background: rgb(255 255 255 / 4%);
+}
+.sg-think-head:focus-visible {
+  outline: 1px solid var(--color-focus, #bab0e3);
+  outline-offset: 1px;
+}
+.sg-think-glyph {
+  display: inline-flex;
+}
+.sg-chev {
+  margin-left: -3px;
+  transition: transform 0.2s var(--sg-ease);
+}
+.sg-think-head[aria-expanded="true"] .sg-chev {
+  transform: rotate(90deg);
+}
+
+.sg-think {
+  position: relative;
+  padding-left: 14px;
+}
+.sg-think::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--color-border, #252629);
+}
+/* The loop tiles every 240px, so shifting it by one tile reads as an endless downward current. */
+.sg-think[data-live="true"]::before {
+  background: var(--sg-prism-loop);
+  background-size: 2px 240px;
+  animation: sg-think-current 4s linear infinite;
+}
+@keyframes sg-think-current {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 240px;
+  }
+}
+
+/* ------------------------------------------------------------ beam */
+
+/* A fixed 30px slot so settling never shifts the row; the chip settles at its left end. */
+.sg-beam {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 30px;
+  height: 6px;
+  vertical-align: middle;
+  --sg-tone: #97999f;
+}
+.sg-beam-rule,
+.sg-beam-dot,
+.sg-beam-chip {
+  position: absolute;
+  left: 0;
+}
+.sg-beam-rule {
+  top: 2px;
+  width: 30px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--sg-prism);
+  background-size: 250% 100%;
+  transform-origin: left center;
+  transform: scaleX(0.2);
+  opacity: 0;
+  transition:
+    transform 0.25s var(--sg-ease),
+    opacity 0.15s ease 0.1s;
+}
+/* The bead samples the rule's gradient at its own position, ringed in the page colour so it reads as a bead. */
+.sg-beam-dot {
+  top: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sg-prism);
+  background-size: 30px 6px;
+  box-shadow:
+    0 0 0 1.5px var(--background, #08090a),
+    0 0 6px rgb(186 176 227 / 50%);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.sg-beam-chip {
+  top: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sg-tone);
+  transform: scale(0.35);
+  opacity: 0;
+  transition:
+    transform 0.25s var(--sg-ease) 0.1s,
+    opacity 0.15s ease 0.1s;
+}
+.sg-beam[data-status="running"] .sg-beam-rule {
+  transform: none;
+  opacity: 1;
+  transition: none;
+  animation: sg-prism-current 6s ease-in-out infinite alternate;
+}
+.sg-beam[data-status="running"] .sg-beam-dot {
+  opacity: 1;
+  animation: sg-beam-travel 1.6s ease-in-out infinite alternate;
+}
+.sg-beam:not([data-status="running"]) .sg-beam-chip {
+  transform: none;
+  opacity: 1;
+}
+.sg-beam[data-status="done"] {
+  --sg-tone: #a8c9bc;
+}
+.sg-beam[data-status="error"] {
+  --sg-tone: #d8bb95;
+}
+.sg-beam[data-status="denied"] {
+  --sg-tone: #d5a4ad;
+}
+.sg-beam[data-status="pending"] {
+  --sg-tone: #aab8d2;
+}
+.sg-beam[data-status="pending"] .sg-beam-chip {
+  animation: sg-soft-pulse 2.4s ease-in-out infinite alternate;
+}
+/* Cancelled is hollow, like the cancelled status dot. */
+.sg-beam[data-status="cancelled"] .sg-beam-chip {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--sg-tone);
+}
+@keyframes sg-beam-travel {
+  from {
+    transform: translateX(0);
+    background-position: 0 0;
+  }
+  to {
+    transform: translateX(24px);
+    background-position: -24px 0;
+  }
+}
+@keyframes sg-soft-pulse {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.55;
+  }
+}
+
+/* ------------------------------------------------------------ caret */
+
+.sg-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 1px;
+  vertical-align: -0.15em;
+  border-radius: 1px;
+  background: var(--sg-prism-loop);
+  animation: sg-caret-breathe 1.1s ease-in-out infinite alternate;
+}
+@keyframes sg-caret-breathe {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.3;
+  }
+}
+
+/* ------------------------------------------------------------ motion preferences */
+
+:root[data-motion="paused"] .sg-optic > span,
+:root[data-motion="paused"] .sg-label,
+:root[data-motion="paused"] .sg-think::before,
+:root[data-motion="paused"] .sg-beam-rule,
+:root[data-motion="paused"] .sg-beam-dot,
+:root[data-motion="paused"] .sg-beam-chip,
+:root[data-motion="paused"] .sg-caret {
+  animation-play-state: paused;
+}
+
+/* No movement at all: live things show the static prism, the bead is hidden, settling is instant. */
+@media (prefers-reduced-motion: reduce) {
+  .sg-optic > span,
+  .sg-label,
+  .sg-think::before,
+  .sg-beam-rule,
+  .sg-beam-dot,
+  .sg-beam-chip,
+  .sg-caret,
+  .sg-chev {
+    animation: none !important;
+    transition: none !important;
+  }
+  .sg-beam[data-status="running"] .sg-beam-dot {
+    opacity: 0;
+  }
+}
+
+/* Clipped-gradient text would vanish under forced colours; fall back to the system text colour. */
+@media (forced-colors: active) {
+  .sg-label[data-live="true"] {
+    color: CanvasText;
+    background: none;
+  }
+}
