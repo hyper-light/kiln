@@ -1282,9 +1282,10 @@ impl Leg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::Up;
 
-    /// A leg run here, with what it sent: logs by step, and events.
+    /// A leg run here, with what it sent: logs by step, and events. (Its tests run `bash` and
+    /// `sh`, so they and their helpers are Unix-only.)
+    #[cfg(unix)]
     fn run_leg(workflow: &str, secrets: &[(&str, &str)]) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
         let (w, d) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", workflow, Dialect::Gha);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
@@ -1302,6 +1303,7 @@ mod tests {
             timeout_minutes: 5,
             ..AssignmentV2::default()
         };
+        use crate::exec::Up;
         let (tx, rx) = async_channel::unbounded();
         let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
         let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
@@ -1316,6 +1318,7 @@ mod tests {
         Ok((result, logs, events))
     }
 
+    #[cfg(unix)]
     fn finished(events: &[JobEventV2], idx: u32) -> Option<(Conclusion, Conclusion, BTreeMap<String, String>)> {
         events.iter().find_map(|e| match e {
             JobEventV2::StepFinished { idx: i, outcome, conclusion, outputs, .. } if *i == idx => Some((*outcome, *conclusion, outputs.clone())),
