@@ -201,6 +201,7 @@ function PlanEditor({ id }: { id: string }) {
               onRestored={(p) => {
                 res.setData(() => p);
                 take(p);
+                invalidate("plans");
               }}
             />
             <Runs plan={plan} />
@@ -377,8 +378,7 @@ function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void
 
 /** Every version, newest first; any one can be read and made current again. */
 function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => void }) {
-  // Read for each version the plan reaches (a save, a restore, another tab's change).
-  const versions = useSuspenseResource(`plans/${plan.id}/versions@${plan.version}`, (s) => plansApi.versions(plan.id, s)).data;
+  const versions = useSuspenseResource(`plans/${plan.id}/versions`, (s) => plansApi.versions(plan.id, s)).data;
   const [open, setOpen] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   if (versions.length <= 1) return null;
@@ -425,7 +425,7 @@ function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => v
 }
 
 function Runs({ plan }: { plan: Plan }) {
-  const runs = useSuspenseResource(`plans/${plan.id}/runs@${plan.runs}`, (s) => plansApi.runs(plan.id, s)).data;
+  const runs = useSuspenseResource(`plans/${plan.id}/runs`, (s) => plansApi.runs(plan.id, s)).data;
   const agents = useRes(harnessSessionsRes).data;
   if (runs.length === 0) return null;
   const nameOf = (session: string) => agents.find((a) => a.id === session)?.name ?? `agent ${session.slice(-6)}`;
