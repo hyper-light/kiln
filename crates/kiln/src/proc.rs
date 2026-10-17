@@ -4,7 +4,7 @@
 //! hyper-rt readiness fires and exits arrive through a pidfd (Linux) or a short poll (macOS); on
 //! Windows pipes are drained by threads and process trees are job objects.
 
-pub use crate::os::proc::{Duplex, Running, kill_orphan_group, output, spawn_duplex, spawn_group, stdout_stream, terminate_group, terminate_tree, wait_pid_exit};
+pub use crate::os::proc::{Duplex, Running, interrupt_group, kill_orphan_group, output, spawn_duplex, spawn_group, stdout_stream, terminate_group, terminate_tree, wait_pid_exit};
 
 #[cfg(all(test, unix))]
 mod tests {

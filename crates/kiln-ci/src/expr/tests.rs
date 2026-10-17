@@ -186,8 +186,8 @@ fn w01_ac04_templates() -> Result<(), ExprError> {
 
 #[test]
 fn w01_ac05_if_semantics() -> Result<(), ExprError> {
-    let failed = MapContexts { status: StatusView { failed: true, cancelled: false }, ..cx() };
-    let cancelled = MapContexts { status: StatusView { failed: false, cancelled: true }, ..cx() };
+    let failed = MapContexts { status: StatusView { failed: true, ..StatusView::default() }, ..cx() };
+    let cancelled = MapContexts { status: StatusView { cancelled: true, ..StatusView::default() }, ..cx() };
     let p = |s: &str| Expr::parse(s, Dialect::Gha);
     let b = &mut Budget::default();
     assert!(eval_if(&p("true")?, &cx(), b)?);

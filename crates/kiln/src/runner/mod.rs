@@ -3,3 +3,4 @@
 //! the runtime here takes over `AssignV2`; each workstream adds its own submodule here.
 
 pub mod hashfiles;
+pub mod runtime;
