@@ -7,6 +7,9 @@
 //! Its owner, the kiln server, does the I/O. Because nothing here waits on anything, the
 //! benchmarks drive the same engine production runs, against simulated clusters, at full speed.
 //!
+//! - [`apps`]: app definitions from `.kiln/deploy.yaml`, Argo CD Applications and the API.
+//! - [`git`]: mirrors, revisions, content hashes of paths, extraction (the `git` binary).
+//! - [`render`]: directories, Helm, Kustomize and plugins, with what each render reads.
 //! - [`obj`]: object identity, parsing, structural hashes, compressed storage.
 //! - [`model`]: app configuration, sync options and policies (Argo CD's spellings).
 //! - [`health`]: resource health, rule for rule as Argo CD assesses it.
@@ -16,13 +19,16 @@
 //! - [`sim`] and [`harness`]: simulated clusters, and the engine driven against them on a
 //!   simulated clock (tests and `kiln cd bench`).
 
+pub mod apps;
 pub mod bench;
 pub mod diff;
 pub mod engine;
+pub mod git;
 pub mod harness;
 pub mod health;
 pub mod model;
 pub mod obj;
+pub mod render;
 pub mod sim;
 pub mod sync;
 
