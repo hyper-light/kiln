@@ -149,8 +149,23 @@ fn selector(def: &AppDef) -> Option<String> {
     }
 }
 
+/// What a custom resource may own: the children the tree lists, and the workloads and Services an
+/// operator makes for it (a Prometheus' StatefulSet, a database's Service), whose own children are
+/// in the same lists.
+const OPERATED: &[(&str, &str)] = &[
+    ("", "Pod"),
+    ("apps", "ReplicaSet"),
+    ("apps", "ControllerRevision"),
+    ("batch", "Job"),
+    ("discovery.k8s.io", "EndpointSlice"),
+    ("apps", "StatefulSet"),
+    ("apps", "Deployment"),
+    ("apps", "DaemonSet"),
+    ("", "Service"),
+];
+
 /// The kinds of children an object of a kind can own, among those the tree lists. Kinds known to
-/// own none list nothing; kinds kiln doesn't know (custom resources) may own any.
+/// own none list nothing; kinds kiln doesn't know (custom resources) may own any of [`OPERATED`].
 fn child_kinds(group: &str, kind: &str) -> &'static [(&'static str, &'static str)] {
     match (group, kind) {
         ("apps", "Deployment") => &[("apps", "ReplicaSet"), ("", "Pod")],
@@ -181,7 +196,7 @@ fn child_kinds(group: &str, kind: &str) -> &'static [(&'static str, &'static str
             | "flowcontrol.apiserver.k8s.io",
             _,
         ) => &[],
-        _ => tree::CHILD_KINDS,
+        _ => OPERATED,
     }
 }
 
