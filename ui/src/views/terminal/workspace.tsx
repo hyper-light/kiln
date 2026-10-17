@@ -123,6 +123,16 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     setActiveId(id);
   }, []);
 
+  /** Bring up an existing session's tab, adding one if this device has none yet. */
+  const show = React.useCallback((sessionId: string, target: string) => {
+    setTabs((cur) => {
+      const tab = cur.find((t) => t.sessionId === sessionId);
+      setActiveId(tab ? tab.id : sessionId);
+      if (tab) return cur;
+      return [...cur, { id: sessionId, sessionId, target, title: targetLabel(target), hints: "", state: { kind: "connecting" } }];
+    });
+  }, []);
+
   /** The server named this tab's session: remember it, and drop any duplicate view of it. */
   const onSession = React.useCallback((tabId: string, info: TerminalSessionInfo) => {
     setTabs((cur) => {
@@ -157,16 +167,21 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     });
   }, []);
 
-  // ?open=<target> deep links (command palette, agent cards)
+  // Deep links: ?open=<target> starts a session (command palette, runner cards); ?session=<id>
+  // attaches to one (Agents).
   React.useEffect(() => {
     if (!visible) return;
     const params = new URLSearchParams(location.search);
     const target = params.get("open");
+    const session = params.get("session");
     if (target) {
       open(target);
       navigate("/terminal", { replace: true });
+    } else if (session) {
+      show(session, params.get("target") ?? "");
+      navigate("/terminal", { replace: true });
     }
-  }, [visible, location.search, open, navigate]);
+  }, [visible, location.search, open, show, navigate]);
 
   const patch = (id: string, p: Partial<Tab>) => setTabs((t) => t.map((x) => (x.id === id ? { ...x, ...p } : x)));
 

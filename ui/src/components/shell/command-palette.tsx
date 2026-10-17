@@ -4,6 +4,7 @@ import { useNavigate } from "react-router";
 import {
   Activity,
   ArrowUpRight,
+  Bot,
   Box,
   CornerDownLeft,
   GitBranch,
@@ -115,7 +116,8 @@ export function CommandPalette() {
       { id: "p-overview", group: "Pages", label: "Overview", icon: <LayoutGrid size={15} />, run: () => go("/") },
       { id: "p-runs", group: "Pages", label: "Runs", icon: <Activity size={15} />, run: () => go("/runs") },
       { id: "p-repos", group: "Pages", label: "Repositories", icon: <GitBranch size={15} />, run: () => go("/repos") },
-      { id: "p-agents", group: "Pages", label: "Agents", icon: <Server size={15} />, run: () => go("/agents") },
+      { id: "p-runners", group: "Pages", label: "Runners", icon: <Server size={15} />, run: () => go("/runners") },
+      { id: "p-agents", group: "Pages", label: "Agents", hint: "AI sessions", icon: <Bot size={15} />, run: () => go("/agents") },
       { id: "p-term", group: "Pages", label: "Terminal", icon: <SquareTerminal size={15} />, run: () => go("/terminal") },
       { id: "p-metrics", group: "Pages", label: "Metrics", icon: <Cpu size={15} />, run: () => go("/telemetry") },
       { id: "p-system", group: "Pages", label: "System", icon: <ListTree size={15} />, run: () => go("/system") },
@@ -123,7 +125,8 @@ export function CommandPalette() {
     ];
     const actions: Item[] = [
       { id: "a-term-local", group: "Actions", label: "Open terminal on server", hint: "local", icon: <SquareTerminal size={15} />, run: () => go("/terminal?open=local") },
-      { id: "a-add-agent", group: "Actions", label: "Add bare-metal agent", icon: <Server size={15} />, run: () => go("/agents?join=1") },
+      { id: "a-new-agent", group: "Actions", label: "New agent", hint: "Claude Code, Codex, Gemini", icon: <Bot size={15} />, run: () => go("/agents?new=1") },
+      { id: "a-add-runner", group: "Actions", label: "Add runner", icon: <Server size={15} />, run: () => go("/runners?join=1") },
       { id: "a-add-repo", group: "Actions", label: "Add repository", icon: <GitBranch size={15} />, run: () => go("/repos?add=1") },
       {
         id: "a-logout",
@@ -154,7 +157,7 @@ export function CommandPalette() {
       run: () => go(`/runs/${r.id}`),
     }));
     const agentItems: Item[] = agents
-      .filter((a) => a.connected)
+      .filter((a) => a.connected && !a.ephemeral)
       .map((a) => ({
         id: `ag-${a.name}`,
         group: "Terminals",
@@ -197,7 +200,7 @@ export function CommandPalette() {
             <input
               autoFocus
               className="cmdk-input"
-              placeholder="Jump to a page, repo, run, or agent…"
+              placeholder="Jump to a page, repo, run, or terminal…"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               role="combobox"

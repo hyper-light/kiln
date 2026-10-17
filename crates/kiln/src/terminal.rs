@@ -89,6 +89,10 @@ pub fn spawn(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("KILN_TERMINAL", "1");
+    // Programs started here can rely on it (`exec $SHELL -l` after an agent exits).
+    if cfg!(unix) {
+        cmd.env("SHELL", &shell);
+    }
     if cfg!(unix) && std::env::var_os("LANG").is_none() {
         cmd.env("LANG", "C.UTF-8");
     }
