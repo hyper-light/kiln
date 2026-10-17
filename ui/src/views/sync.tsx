@@ -60,7 +60,7 @@ export function SyncedRepos({
       )}
       {repos.length === 0 && !adding ? (
         needle ? (
-          <p className="sync-none">No synced folder matches.</p>
+          <p className="empty-line py-4">No synced folder matches.</p>
         ) : (
           <EmptyState
             title="Nothing is synced yet"

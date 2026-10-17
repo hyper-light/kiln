@@ -14,7 +14,7 @@ import { events, useServerEvents } from "@/api/events";
 import type { KilnBinary, ReleaseBuild, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatesOverview } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
-import { Confirm, Facts, Panel } from "@/components/ui/misc";
+import { Confirm, Facts, Panel, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { fuller, mergeJobs, updatesRes, useRes, useUpdateJobs } from "@/lib/data";
@@ -726,17 +726,7 @@ function Binaries({
         ))}
       </ul>
       <div className="upd-upload">
-        <label className="upd-select">
-          <span className="sr-only">Platform</span>
-          <select value={target} onChange={(e) => setTarget(e.target.value)}>
-            {data.targets.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-          <ChevronDown size={13} aria-hidden="true" />
-        </label>
+        <SelectField label="Platform" hideLabel value={target} onChange={setTarget} options={data.targets.map((t) => ({ value: t, label: t }))} className="upd-select" />
         <Button size="sm" variant="secondary" disabled={uploading !== null || !target} onClick={() => onUpload(target)}>
           <Upload /> {uploading ? "Uploading…" : "Upload binary"}
         </Button>

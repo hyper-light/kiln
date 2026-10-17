@@ -59,7 +59,7 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
         certificate kiln makes and renews, or with your own. Phones need HTTPS for voice input.
       </p>
       {runners.length === 0 ? (
-        <p className="fd-quiet">No runners yet: add a machine first.</p>
+        <p className="empty-line">No runners yet: add a machine first.</p>
       ) : (
         <>
           <div className="fd-runner">

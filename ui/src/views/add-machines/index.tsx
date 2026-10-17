@@ -5,11 +5,10 @@
  */
 import * as React from "react";
 import "./add-machines.css";
-import { Link } from "react-router";
 import type { InstallOs, JoinRequest } from "@/api/types";
 import { Hold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { SectionHeading } from "@/components/ui/misc";
+import { Crumbs, SectionHeading } from "@/components/ui/misc";
 import { agentsRes, useAgentsLive, useRes, warm } from "@/lib/data";
 import { detectOs, discoveryRes, joinRequestsRes, joinRes, type Arrival } from "./data";
 import { FoundSection, WaitingSection } from "./found";
@@ -22,16 +21,7 @@ export default function AddMachines() {
       <title>Add machines · kiln</title>
       <header className="page-intro">
         <div className="min-w-0">
-          <div className="eyebrow">
-            <span className="spectrum-rule" />
-            <span>
-              04 /{" "}
-              <Link to="/runners" className="am-crumb">
-                Runners
-              </Link>{" "}
-              / Add
-            </span>
-          </div>
+          <Crumbs index={5} items={[{ label: "Runners", to: "/runners" }, { label: "Add" }]} />
           <h1>Add machines</h1>
           <p className="lead">Run one command on a new machine, or pick one kiln already hears on your network.</p>
         </div>

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { ArrowLeft, ChevronRight, GitBranch, RotateCcw, Square, User, Workflow } from "lucide-react";
+import { ChevronRight, GitBranch, RotateCcw, Square, User, Workflow } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Job, RunDetail as RunData, Status, Step } from "@/api/types";
@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, EmptyState, ErrorState, Facts, Panel } from "@/components/ui/misc";
+import { Confirm, Crumbs, EmptyState, ErrorState, Facts, Panel } from "@/components/ui/misc";
 import { Chips, StatusBadge, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { upsert } from "@/lib/data";
@@ -210,7 +210,7 @@ function RunBody({ id }: { id: string }) {
 
       {/* DAG */}
       <Panel eyebrow={`Jobs · ${jobs.length}`} title="Pipeline graph" actions={<JobTally jobs={jobs} />} bodyClassName="px-0 pb-3">
-        {jobs.length === 0 ? <p className="px-5 py-8 text-center text-[13px] text-[#8f939e]">This run has no jobs (yet).</p> : <JobDag jobs={jobs} selected={selected?.id ?? null} onSelect={select} />}
+        {jobs.length === 0 ? <p className="empty-line px-5 py-8 text-center">This run has no jobs (yet).</p> : <JobDag jobs={jobs} selected={selected?.id ?? null} onSelect={select} />}
       </Panel>
 
       {/* jobs + selected job */}
@@ -250,21 +250,7 @@ function RunBody({ id }: { id: string }) {
 }
 
 function BackLink({ repo, repoId }: { repo?: string; repoId?: string }) {
-  return (
-    <nav aria-label="Breadcrumb" className="flex items-center gap-2 font-mono text-[10px] tracking-[0.08em] text-[#8c8f98] uppercase">
-      <Link to="/runs" className="inline-flex min-h-11 items-center gap-2 transition-colors hover:text-white">
-        <ArrowLeft size={13} /> Runs
-      </Link>
-      {repo && (
-        <>
-          <ChevronRight size={11} className="text-[#494e58]" />
-          <Link to={`/runs?repo=${encodeURIComponent(repoId ?? repo)}`} className="inline-flex min-h-11 items-center transition-colors hover:text-white">
-            {repo}
-          </Link>
-        </>
-      )}
-    </nav>
-  );
+  return <Crumbs index={2} items={[{ label: "Runs", to: "/runs" }, ...(repo ? [{ label: repo, to: `/runs?repo=${encodeURIComponent(repoId ?? repo)}` }] : [])]} />;
 }
 
 /** The run while it loads: the way back, the header's and the graph's space, the jobs' frame. */
@@ -379,7 +365,7 @@ function JobPanel({ job, onJobPatch }: { job: Job; onJobPatch: (j: Job) => void 
 
       {/* steps */}
       <div className="border-t border-[#28313d]">
-        {job.steps.length === 0 && <p className="px-5 py-6 text-[12.5px] text-[#8f939e]">No steps reported yet.</p>}
+        {job.steps.length === 0 && <p className="empty-line px-5 py-6">No steps reported yet.</p>}
         {job.steps.map((s) => (
           <StepRow
             key={s.idx}

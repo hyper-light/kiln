@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Link } from "react-router";
 import { AlertTriangle, ChevronDown, RotateCcw, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";
@@ -31,6 +32,34 @@ export function PageIntro({
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </header>
+  );
+}
+
+/**
+ * Where a page sits, above its title, the way every page's eyebrow reads: `NN / Section / …`, each
+ * part before the last a link back up.
+ */
+export function Crumbs({ index, items }: { index: number; items: { label: React.ReactNode; to?: string }[] }) {
+  return (
+    <nav className="eyebrow crumbs" aria-label="Breadcrumb">
+      <span className="spectrum-rule" />
+      {items.map((it, i) => (
+        <React.Fragment key={i}>
+          {i > 0 && <span aria-hidden="true">/</span>}
+          {it.to ? (
+            <Link to={it.to}>
+              {i === 0 ? `${pad2(index)} / ` : ""}
+              {it.label}
+            </Link>
+          ) : (
+            <span>
+              {i === 0 ? `${pad2(index)} / ` : ""}
+              {it.label}
+            </span>
+          )}
+        </React.Fragment>
+      ))}
+    </nav>
   );
 }
 

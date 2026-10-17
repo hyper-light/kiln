@@ -246,7 +246,7 @@ function Palette() {
           />
         </div>
         <div id="cmdk-list" role="listbox" className="palette-list">
-          {filtered.length === 0 && <div className="px-4 py-10 text-center text-[13px] text-[#8f939e]">No matches.</div>}
+          {filtered.length === 0 && <p className="empty-line px-4 py-10 text-center">No matches.</p>}
           {filtered.map((it, i) => {
             const header = it.group !== lastGroup ? it.group : null;
             lastGroup = it.group;

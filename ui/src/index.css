@@ -430,6 +430,31 @@
   line-height: 1.8;
   color: #a1a4ad;
 }
+/* Crumbs (misc.tsx): a detail page's eyebrow, its parts linking back up. */
+.crumbs {
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.crumbs .spectrum-rule {
+  margin-right: 4px;
+}
+.crumbs a {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  color: inherit;
+  transition: color 0.2s;
+}
+.crumbs a:hover {
+  color: #ededee;
+}
+/* A quiet line where a list or a chart has nothing to show yet. */
+.empty-line {
+  margin: 0;
+  color: #8f939e;
+  font-size: 13px;
+  line-height: 1.6;
+}
 .section-heading {
   display: flex;
   justify-content: space-between;
@@ -2923,40 +2948,9 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   align-items: center;
   gap: 8px;
 }
-.upd-select {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
+.upd-upload > .upd-select {
+  flex: 0 1 260px;
   min-width: 0;
-  max-width: 100%;
-}
-.upd-select select {
-  min-width: 0;
-  max-width: 100%;
-  min-height: 36px;
-  padding: 0 32px 0 14px;
-  appearance: none;
-  border: 1px solid rgb(255 255 255 / 15%);
-  border-radius: 999px;
-  background: rgb(255 255 255 / 3%);
-  color: #e4e5e7;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  text-overflow: ellipsis;
-}
-.upd-select select:focus-visible {
-  outline: 2px solid rgb(255 255 255 / 80%);
-  outline-offset: 3px;
-}
-.upd-select option {
-  background: #0a0c0f;
-  color: #e4e5e7;
-}
-.upd-select svg {
-  position: absolute;
-  right: 12px;
-  color: #9aa3b1;
-  pointer-events: none;
 }
 
 @media (max-width: 640px) {

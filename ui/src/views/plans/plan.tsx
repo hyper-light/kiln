@@ -10,7 +10,7 @@ import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, 
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, CopyButton, SelectField, TextField } from "@/components/ui/misc";
+import { Confirm, CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc";
 import { useAuth } from "@/lib/auth";
 import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
@@ -44,14 +44,16 @@ export default function PlanPage() {
   );
 }
 
+function PlanCrumbs() {
+  return <Crumbs index={6} items={[{ label: "Agents", to: "/agents" }, { label: "Plans", to: "/agents/plans" }]} />;
+}
+
 /** The plan while it loads: the way back, its title's and text's space. */
 function PlanHold() {
   return (
     <>
       <title>Plan · kiln</title>
-      <div className="plan-crumbs">
-        <Link to="/agents/plans">Plans</Link>
-      </div>
+      <PlanCrumbs />
       <Hold height={420} label="Loading the plan" />
     </>
   );
@@ -127,17 +129,14 @@ function PlanEditor({ id }: { id: string }) {
   return (
     <>
       <title>{`${plan ? plan.title : "New plan"} · kiln`}</title>
-      <div className="plan-crumbs">
-        <Link to="/agents/plans">Plans</Link>
-        {plan && (
-          <span>
-            {" "}
-            · v{plan.version} · changed {relativeTime(plan.updated_at)}
-            {plan.runs ? ` · run ${plan.runs}×` : ""}
-            {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
-          </span>
-        )}
-      </div>
+      <PlanCrumbs />
+      {plan && (
+        <p className="plan-dim plan-meta">
+          v{plan.version} · changed {relativeTime(plan.updated_at)}
+          {plan.runs ? ` · run ${plan.runs}×` : ""}
+          {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
+        </p>
+      )}
       <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder={isNew ? "From the first heading when left empty" : ""} />
       <div className="plan-edit" data-preview={preview}>
         <div className="plan-text">

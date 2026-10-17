@@ -146,7 +146,7 @@ function RecentRuns() {
   return (
     <RecentRunsFrame>
       {runs.length === 0 ? (
-        <p className="py-10 text-center text-[13px] text-[#8f939e]">No runs yet. Add a repository to get started.</p>
+        <p className="empty-line py-10 text-center">No runs yet. Add a repository to get started.</p>
       ) : (
         <div className="-mx-1 max-h-[300px] divide-y divide-[#1d1f23] overflow-y-auto" aria-live="polite">
           {runs.map((r) => (
@@ -265,7 +265,7 @@ function ServerSection({ d }: { d: OverviewData }) {
           ]}
         />
       ) : (
-        <p className="py-6 text-[12.5px] text-[#8f939e]">No sample yet.</p>
+        <p className="empty-line py-6">No sample yet.</p>
       )}
     </ServerHeadings>
   );

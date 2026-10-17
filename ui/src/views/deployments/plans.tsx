@@ -15,7 +15,7 @@ import type { CdPlan, CdPlanApp, CdPlanAsk, CdPlanChanges, CdPlanDiff, CdPlanObj
 import { Button } from "@/components/ui/button";
 import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { EmptyState, SelectField, TextField } from "@/components/ui/misc";
+import { Crumbs, EmptyState, SelectField, TextField } from "@/components/ui/misc";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
@@ -223,12 +223,7 @@ function PlanView({ plan, show, onShow, onAgain, busy }: { plan: CdPlan; show: S
 function PlansHead() {
   return (
     <header className="cd-head">
-      <nav className="eyebrow cd-crumbs" aria-label="Breadcrumb">
-        <span className="spectrum-rule" />
-        <Link to="/deployments">03 / Deployments</Link>
-        <span aria-hidden="true">/</span>
-        <span>Deploy plans</span>
-      </nav>
+      <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Deploy plans" }]} />
       <h1 className="cd-title">Deploy plans</h1>
       <p className="cd-note">
         What a branch, a commit or a pull request would deploy before it lands: each commit's own change, the whole stack's against trunk, and what a sync would do against what runs.

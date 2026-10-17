@@ -226,18 +226,6 @@
   gap: 12px;
   padding-bottom: 8px;
 }
-.cd-crumbs {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 8px;
-}
-.cd-crumbs a {
-  color: inherit;
-}
-.cd-crumbs a:hover {
-  color: #ededee;
-}
 .cd-title {
   margin: 6px 0 0;
   font-size: clamp(30px, 3.2vw, 44px);
@@ -395,8 +383,9 @@
 .cd-empty {
   margin: 0;
   padding: 28px 4px;
-  color: #8c8f98;
+  color: #8f939e;
   font-size: 13px;
+  line-height: 1.6;
 }
 /* Diff and History open in the page, under the head. */
 .cd-panel-flow {

@@ -518,7 +518,7 @@ function AgentDetails({
       <div className="mt-8">
         <div className="label mb-2">Running jobs</div>
         {agent.running.length === 0 ? (
-          <p className="text-[12.5px] text-[#8f939e]">Idle.</p>
+          <p className="empty-line">Idle.</p>
         ) : (
           <div className="row-list">
             {jobs.map((j) => (
@@ -542,7 +542,7 @@ function AgentDetails({
 
       <div className="mt-8">
         <div className="label mb-3">Last hour · 5 s resolution</div>
-        {samples.length < 2 ? <p className="text-[12.5px] text-[#8f939e]">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={2} />}
+        {samples.length < 2 ? <p className="empty-line">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={2} />}
       </div>
     </section>
   );

@@ -114,14 +114,14 @@ function MetricsBody({ range, onRange, source, onSource }: { range: Range; onRan
   return (
     <>
       <Toolbar range={range} onRange={onRange} source={source} onSource={onSource} sources={sources} />
-      {samples.length < 2 ? <p className="py-10 text-center text-[13px] text-[#8f939e]">No samples for {source} in this range yet.</p> : <HostCharts samples={samples} height={170} columns={3} />}
+      {samples.length < 2 ? <p className="empty-line py-10 text-center">No samples for {source} in this range yet.</p> : <HostCharts samples={samples} height={170} columns={3} />}
 
       <section className="mt-14">
         <SectionHeading index="02" label="Scheduler" title="Queue & throughput" />
         <div className="grid gap-4 lg:grid-cols-2">
           <Panel eyebrow="Queue depth" title={`${ov.queue.queued} queued · ${ov.queue.running} running`} description="Recorded from the live event stream since this console opened.">
             {queue.length < 2 ? (
-              <p className="flex min-h-[196px] items-center justify-center font-mono text-[11px] text-[#7f8a9a]">Waiting for queue events…</p>
+              <p className="empty-line flex min-h-[196px] items-center justify-center">Waiting for queue events…</p>
             ) : (
               <Chart
                 ariaLabel="Queue depth"

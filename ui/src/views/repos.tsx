@@ -179,7 +179,7 @@ function ReposBody() {
               Register an owner/name and the branches to watch. kiln starts polling immediately.
             </EmptyState>
           ) : list.length === 0 ? (
-            <p className="py-4 text-[13px] text-[#8c8f98]">No repository kiln builds matches.</p>
+            <p className="empty-line py-4">No repository kiln builds matches.</p>
           ) : (
             <div className="table-wrap">
               <table className="data-table">

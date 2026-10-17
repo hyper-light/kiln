@@ -21,7 +21,7 @@ import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, EmptyState, SelectField } from "@/components/ui/misc";
+import { Confirm, Crumbs, EmptyState, SelectField } from "@/components/ui/misc";
 import { errorMessage, useElementWidth, useMediaQuery, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
 import { useRes, warm } from "@/lib/data";
@@ -413,14 +413,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
 }
 
 function AppCrumbs({ project }: { project: string }) {
-  return (
-    <nav className="eyebrow cd-crumbs" aria-label="Breadcrumb">
-      <span className="spectrum-rule" />
-      <Link to="/deployments">03 / Deployments</Link>
-      <span aria-hidden="true">/</span>
-      <span>{project}</span>
-    </nav>
-  );
+  return <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: project }]} />;
 }
 
 /** The app while it loads: its crumbs and name (both from the address), then its head's and its objects' space. */

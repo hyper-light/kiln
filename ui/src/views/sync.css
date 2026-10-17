@@ -21,12 +21,6 @@
   text-underline-offset: 3px;
 }
 
-.sync-none {
-  margin: 0;
-  padding: 18px 4px;
-  color: #8c8f98;
-  font-size: 13px;
-}
 
 .sync-off {
   margin: 0;
