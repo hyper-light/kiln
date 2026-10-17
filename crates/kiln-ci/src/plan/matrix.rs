@@ -36,6 +36,11 @@ pub fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Whether two combinations hold the same values (in any order).
+pub fn same_combo(a: &Combo, b: &Combo) -> bool {
+    a.len() == b.len() && a.iter().all(|(k, v)| get(b, k).is_some_and(|w| same(v, w)))
+}
+
 fn members(v: &Value, what: &str) -> Result<Vec<(String, Value)>, String> {
     match v {
         Value::Object(m) => Ok(m.0.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()),
@@ -92,7 +97,9 @@ pub fn expand(axes: &[(String, Vec<Value>)], include: &[Value], exclude: &[Value
                 fitted = true;
             }
         }
-        if !fitted {
+        // An entry that fits nothing is a leg of its own, once: the same entry again would only
+        // repeat the leg.
+        if !fitted && !combos.iter().skip(originals).any(|c| same_combo(c, &entry)) {
             combos.push(entry);
         }
     }
