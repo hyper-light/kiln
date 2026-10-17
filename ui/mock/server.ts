@@ -1639,6 +1639,13 @@ function handleTerminal(ws: WebSocket, params: URLSearchParams) {
   }
   addAudit("admin", "terminal.open", target);
   const banner = target === "local" ? "" : `\x1b[2m[mock] ${target} → local shell on ${os.hostname()}\x1b[0m\r\n`;
+  // Which session this socket is on (the server's first frame on every attach).
+  ws.send(
+    JSON.stringify({
+      type: "session",
+      session: { id: params.get("session") ?? rid("ts_"), target, command: null, title: "", name: null, created_at: now(), attached: 1, cols, rows, idle_seconds: 0, exited: false, exit_code: null, error: null },
+    }),
+  );
 
   if (!ptyMod) {
     // Echo terminal fallback

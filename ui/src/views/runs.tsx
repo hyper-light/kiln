@@ -239,7 +239,7 @@ function RunsBody() {
                       {r.event.replace("_", " ")}
                     </span>
                   </td>
-                  <td className="num cell-mono">
+                  <td className="num cell-mono whitespace-nowrap">
                     <LiveDuration start={r.started_at} end={r.finished_at} />
                   </td>
                   <td className="num cell-dim hidden font-mono text-[11px] whitespace-nowrap sm:table-cell">
