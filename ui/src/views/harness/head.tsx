@@ -1,12 +1,14 @@
 /**
  * The agent page's head, in hyper-light.dev's figure-header voice: a mono eyebrow (where you are),
- * the agent's name, a line of state, round controls; and beneath, how it runs — permissions, model,
- * effort, settings — as quiet chips that open the device's own picker. The same on a phone: the
- * name wraps instead of truncating and the chip row scrolls; End and the shell move into ⋯.
+ * the agent's name, a line of state, round controls. How it runs — permissions, model, effort,
+ * settings — is a row of quiet chips on wide screens, and one tappable line on a phone that opens
+ * a sheet, so the head stays a few lines tall.
  */
+import * as React from "react";
 import { Link, useNavigate } from "react-router";
-import { ArrowLeft, ChevronDown, MoreHorizontal, Pause, Power, RotateCcw, SlidersHorizontal, SquareTerminal } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronRight, MoreHorizontal, Pause, Power, RotateCcw, SlidersHorizontal, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { costText, modelLabel, tildify } from "./derive";
 import { RoundButton } from "./figure/figure";
@@ -22,7 +24,9 @@ interface Option {
   description?: string;
 }
 
-/** A chip that shows a setting and opens the native picker to change it. */
+const labelOf = (options: Option[], value: string, pretty: (v: string) => string = (v) => v) => options.find((o) => o.id === value)?.label ?? (value ? pretty(value) : "");
+
+/** A chip that shows a setting and opens the native picker to change it (wide screens). */
 function Chip({
   label,
   value,
@@ -38,12 +42,11 @@ function Chip({
   empty?: string;
   pretty?: (v: string) => string;
 }) {
-  const cur = options.find((o) => o.id === value);
   const disabled = options.length === 0;
   return (
-    <label className={cn("ag-chip", disabled && "ag-chip-off")} title={disabled ? empty : cur?.description}>
+    <label className={cn("ag-chip", disabled && "ag-chip-off")} title={disabled ? empty : options.find((o) => o.id === value)?.description}>
       <span className="ag-chip-label">{label}</span>
-      <span className="ag-chip-value">{cur?.label ?? (value ? pretty(value) : "—")}</span>
+      <span className="ag-chip-value">{labelOf(options, value, pretty) || "—"}</span>
       {!disabled && <ChevronDown size={12} aria-hidden="true" />}
       <select
         aria-label={label}
@@ -59,6 +62,25 @@ function Chip({
           <option key={o.id} value={o.id}>
             {o.label}
             {o.dangerous ? " (no checks)" : ""}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+/** A full-width row in the phone sheet: the setting, its value, and the native picker over it. */
+function SheetRow({ label, value, options, onPick, pretty = (v) => v }: { label: string; value: string; options: Option[]; onPick: (id: string) => void; pretty?: (v: string) => string }) {
+  return (
+    <label className={cn("rs-row", options.length === 0 && "rs-row-off")}>
+      <span className="rs-label">{label}</span>
+      <span className="rs-value">{labelOf(options, value, pretty) || "—"}</span>
+      <ChevronDown size={14} aria-hidden="true" />
+      <select aria-label={label} value={value} disabled={options.length === 0} onChange={(e) => onPick(e.target.value)}>
+        {!options.some((o) => o.id === value) && <option value={value}>{value ? pretty(value) : "—"}</option>}
+        {options.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.label}
           </option>
         ))}
       </select>
@@ -92,15 +114,30 @@ export function AgentHeader({
   onRisky: (mode: string) => void;
 }) {
   const navigate = useNavigate();
+  const [sheet, setSheet] = React.useState(false);
   const features = meta?.features ?? [];
   const sessionControls = (meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session").length;
   const running = status === "running" || status === "waiting";
   const activity = state?.activity ?? info?.activity;
   const cost = state?.usage?.cost_usd ?? info?.cost_usd ?? 0;
+  const plan = state?.plan ?? info?.plan;
   const approvals = state?.approvals ?? [];
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
   const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), ...(sessionControls > 0 ? [{ label: "Settings…", onSelect: onSettings }] : [])];
-  const showEffort = features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0;
+  const canMode = features.includes("set_mode");
+  const canModel = features.includes("set_model");
+  const canEffort = features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0;
+  const mode = state?.mode ?? info?.mode ?? "";
+  const model = state?.model ?? info?.model ?? "";
+  const effort = state?.effort ?? "";
+  const modes = meta?.modes ?? [];
+  const pickMode = (m: string, dangerous: boolean) => (dangerous ? onRisky(m) : send({ type: "set_mode", mode: m }));
+  // The kind already names an agent that has no name of its own.
+  const named = Boolean(info && info.name.trim().toLowerCase() !== info.kind_name.trim().toLowerCase());
+  const summary = [canMode && labelOf(modes, mode), canModel && labelOf(meta?.models ?? [], model, modelLabel), canEffort && labelOf(meta?.efforts ?? [], effort)].filter(Boolean).join(" · ");
+  const where = [tildify(cwd), cost > 0 ? costText(cost, plan).text : ""].filter(Boolean).join(" · ");
+  const hasControls = canMode || canModel || canEffort || sessionControls > 0;
+
   return (
     <header className="ag-head">
       <div className="ag-top">
@@ -110,29 +147,35 @@ export function AgentHeader({
               <ArrowLeft size={12} aria-hidden="true" /> Agents
             </Link>
             <span aria-hidden="true">/</span>
-            <span>{info?.kind_name ?? "Agent"}</span>
-            {info && (
+            {named && (
               <>
+                <span>{info?.kind_name}</span>
                 <span aria-hidden="true">·</span>
-                <span>{machineName(info.target)}</span>
               </>
             )}
+            {info && <span>{machineName(info.target)}</span>}
           </p>
           <h1 className="ag-title">{info?.name ?? "Agent"}</h1>
           <div className="ag-state">
             <StateWord a={{ status, approvals }} />
             {status === "running" && activity && <span className="ag-activity">{activity}</span>}
-            <span className="ag-cwd" title={cwd}>
+            <span className="ag-cwd ag-wide-only" title={cwd}>
               {tildify(cwd)}
             </span>
             {cost > 0 && (
-              <span className="ag-cost" title={costText(cost, state?.plan ?? info?.plan).title}>
-                {costText(cost, state?.plan ?? info?.plan).text}
+              <span className="ag-cost ag-wide-only" title={costText(cost, plan).title}>
+                {costText(cost, plan).text}
               </span>
             )}
             <LimitBadge limits={state?.limits ?? info?.limits} onClick={onUsage} />
             {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
           </div>
+          {hasControls && (
+            <button type="button" className="ag-summary" onClick={() => setSheet(true)} aria-label="How it runs: permissions, model, effort, settings">
+              <span className="ag-summary-text">{summary || "Settings"}</span>
+              <ChevronDown size={12} aria-hidden="true" />
+            </button>
+          )}
         </div>
         <div className="ag-actions">
           {running && features.includes("interrupt") && (
@@ -161,18 +204,14 @@ export function AgentHeader({
           )}
         </div>
       </div>
-      {(features.includes("set_mode") || features.includes("set_model") || showEffort || sessionControls > 0) && (
+      {hasControls && (
         <div className="ag-controls" role="group" aria-label="How it runs">
-          {features.includes("set_mode") && (
-            <Chip label="Permissions" value={state?.mode ?? info?.mode ?? ""} options={meta?.modes ?? []} onPick={(m, dangerous) => (dangerous ? onRisky(m) : send({ type: "set_mode", mode: m }))} />
-          )}
-          {features.includes("set_model") && (
-            <Chip label="Model" value={state?.model ?? info?.model ?? ""} options={meta?.models ?? []} pretty={modelLabel} onPick={(m) => send({ type: "set_model", model: m })} />
-          )}
-          {showEffort && (
+          {canMode && <Chip label="Permissions" value={mode} options={modes} onPick={pickMode} />}
+          {canModel && <Chip label="Model" value={model} options={meta?.models ?? []} pretty={modelLabel} onPick={(m) => send({ type: "set_model", model: m })} />}
+          {canEffort && (
             <Chip
               label="Effort"
-              value={state?.effort ?? ""}
+              value={effort}
               options={meta?.efforts ?? []}
               onPick={(e) => send({ type: "set_effort", effort: e })}
               empty="This agent's harness hasn't said which effort levels it supports yet."
@@ -187,6 +226,62 @@ export function AgentHeader({
           )}
         </div>
       )}
+
+      <Dialog open={sheet} onOpenChange={setSheet}>
+        {sheet && (
+          <DialogContent title="How it runs" eyebrow={info?.name ?? "Agent"} description={where || undefined} className="ag-sheet">
+            <div className="rs">
+              {canMode && modes.length > 0 && (
+                <section>
+                  <h3 className="rs-head">Permissions</h3>
+                  <div role="radiogroup" aria-label="Permissions" className="rs-opts">
+                    {modes.map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={m.id === mode}
+                        className="rs-opt"
+                        data-danger={m.dangerous || undefined}
+                        onClick={() => {
+                          setSheet(false);
+                          if (m.id !== mode) pickMode(m.id, Boolean(m.dangerous));
+                        }}
+                      >
+                        <span className="rs-opt-label">
+                          {m.label}
+                          {m.dangerous && <span className="rs-danger">no checks</span>}
+                        </span>
+                        {m.description && <span className="rs-opt-desc">{m.description}</span>}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              )}
+              {(canModel || canEffort) && (
+                <section className="rs-rows">
+                  {canModel && <SheetRow label="Model" value={model} options={meta?.models ?? []} pretty={modelLabel} onPick={(m) => send({ type: "set_model", model: m })} />}
+                  {canEffort && <SheetRow label="Effort" value={effort} options={meta?.efforts ?? []} onPick={(e) => send({ type: "set_effort", effort: e })} />}
+                </section>
+              )}
+              {sessionControls > 0 && (
+                <button
+                  type="button"
+                  className="rs-row rs-link"
+                  onClick={() => {
+                    setSheet(false);
+                    onSettings();
+                  }}
+                >
+                  <span className="rs-label">Settings</span>
+                  <span className="rs-value">{sessionControls}</span>
+                  <ChevronRight size={14} aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          </DialogContent>
+        )}
+      </Dialog>
     </header>
   );
 }
