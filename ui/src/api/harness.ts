@@ -715,29 +715,39 @@ const LINGER_MS = 30_000;
 /** Conversations kept in memory once left (the latest ones). */
 const KEEP = 8;
 
-/** Whether two values parsed from JSON are equal. */
-function same(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  if (Array.isArray(a)) {
-    const c = b as unknown[];
-    if (a.length !== c.length) return false;
-    for (let i = 0; i < a.length; i++) if (!same(a[i], c[i])) return false;
-    return true;
+/**
+ * What came, with every part equal to what was there kept as it was (the whole of it when it's all
+ * equal), so whatever shows a part that didn't change doesn't render again.
+ */
+function share<T>(was: T, now: T): T {
+  if (was === now || typeof was !== "object" || typeof now !== "object" || was === null || now === null) return now;
+  if (Array.isArray(now)) {
+    if (!Array.isArray(was)) return now;
+    let equal = was.length === now.length;
+    const out = now.map((x: unknown, i) => {
+      const y = share(was[i] as unknown, x);
+      if (y !== was[i]) equal = false;
+      return y;
+    });
+    return (equal ? was : out) as T;
   }
-  const x = a as Record<string, unknown>;
-  const y = b as Record<string, unknown>;
-  const keys = Object.keys(x);
-  if (keys.length !== Object.keys(y).length) return false;
-  for (const k of keys) if (!Object.hasOwn(y, k) || !same(x[k], y[k])) return false;
-  return true;
+  if (Array.isArray(was)) return now;
+  const a = was as Record<string, unknown>;
+  const b = now as Record<string, unknown>;
+  const keys = Object.keys(b);
+  let equal = keys.length === Object.keys(a).length;
+  const out: Record<string, unknown> = {};
+  for (const k of keys) {
+    const y = share(a[k], b[k]);
+    if (y !== a[k] || !Object.hasOwn(a, k)) equal = false;
+    out[k] = y;
+  }
+  return (equal ? was : out) as T;
 }
 
-/** What was there when it's equal to what came (so what shows it doesn't render again). */
-const keep = <T>(was: T, now: T): T => (same(was, now) ? was : now);
-
-const withState = (info: AgentInfo | null, s: State): AgentInfo | null => (info ? { ...info, status: s.status, title: s.title, model: s.model, mode: s.mode } : null);
+/** The agent's info with its state's words, the same object while they're the same. */
+const withState = (info: AgentInfo | null, s: State): AgentInfo | null =>
+  !info || (info.status === s.status && info.title === s.title && info.model === s.model && info.mode === s.mode) ? info : { ...info, status: s.status, title: s.title, model: s.model, mode: s.mode };
 
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
 interface Incoming {
@@ -1072,7 +1082,7 @@ export class SessionStore {
     const byId = new Map<string, HEvent>();
     for (const [id, e] of inc.byId) {
       const was = this.byId.get(id);
-      byId.set(id, was && same(was, e) ? was : e);
+      byId.set(id, was ? share(was, e) : e);
     }
     this.byId = byId;
     this.reorder = true;
@@ -1080,10 +1090,10 @@ export class SessionStore {
     this.snap = {
       ...s,
       conn: "open",
-      info: keep(s.info, inc.info),
-      meta: keep(s.meta, inc.meta),
-      state: keep(s.state, inc.state),
-      changes: keep(s.changes, inc.changes),
+      info: share(s.info, inc.info),
+      meta: share(s.meta, inc.meta),
+      state: share(s.state, inc.state),
+      changes: share(s.changes, inc.changes),
       error: null,
       ready: true,
     };
@@ -1115,19 +1125,28 @@ export class SessionStore {
   private take(u: Update) {
     switch (u.t) {
       case "changes":
-        this.snap = { ...this.snap, changes: u.files };
+        this.snap = { ...this.snap, changes: share(this.snap.changes, u.files) };
         break;
-      case "state":
-        this.snap = { ...this.snap, state: u.state, info: withState(this.snap.info, u.state) };
+      case "state": {
+        const state = share<State | null>(this.snap.state, u.state) ?? u.state;
+        this.snap = { ...this.snap, state, info: withState(this.snap.info, state) };
         break;
+      }
       case "meta":
-        this.snap = { ...this.snap, meta: u.meta };
+        this.snap = { ...this.snap, meta: share(this.snap.meta, u.meta) };
         break;
       case "events":
         for (const e of u.events) {
-          if (this.byId.has(e.id)) this.touched.add(e.id);
-          else this.grew = true;
-          this.byId.set(e.id, e);
+          const was = this.byId.get(e.id);
+          if (!was) {
+            this.grew = true;
+            this.byId.set(e.id, e);
+            continue;
+          }
+          const now = share(was, e);
+          if (now === was) continue;
+          this.byId.set(e.id, now);
+          this.touched.add(e.id);
         }
         break;
       case "stream": {

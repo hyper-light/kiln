@@ -6,10 +6,11 @@
  */
 import * as React from "react";
 import { ArrowDown, ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
-import type { Command, Delivery, HEvent, Meta, State, Task } from "@/api/harness";
+import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type SessionStore, type Task } from "@/api/harness";
+import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { AccountCard, saysSignedOut } from "./account-card";
-import { changesetOf, diffStats, duration, relPath, stepStatus, stepSummary, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
+import { changesetOf, diffStats, duration, relPath, shareTurns, stepStatus, stepSummary, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
@@ -17,6 +18,7 @@ import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindN
 import { Output, Prose, ToolIcon } from "./parts";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { Beam, PrismLabel, ThinkingBody, ThinkingHead, type BeamStatus } from "./signals";
+import { usePlaces, type Place } from "./state";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -24,11 +26,30 @@ const Asking = React.createContext<ReadonlySet<string>>(new Set());
 /** The notice saying the harness isn't signed in (the latest, unless it has worked since), and where to sign it in. */
 const SignIn = React.createContext<{ notice: string; target: string; kind: string } | null>(null);
 
-function Contexts({ asking, signIn, findNow, children }: { asking: ReadonlySet<string>; signIn: React.ContextType<typeof SignIn>; findNow: FindNow | null; children: React.ReactNode }) {
+const NO_TASKS: Task[] = [];
+
+/** The agent's tasks: only the steps that started a subagent read them (so the rest don't re-render as they change). */
+const Tasks = React.createContext<Task[]>(NO_TASKS);
+
+function Contexts({
+  asking,
+  signIn,
+  findNow,
+  tasks,
+  children,
+}: {
+  asking: ReadonlySet<string>;
+  signIn: React.ContextType<typeof SignIn>;
+  findNow: FindNow | null;
+  tasks: Task[];
+  children: React.ReactNode;
+}) {
   return (
     <Asking.Provider value={asking}>
       <SignIn.Provider value={signIn}>
-        <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+        <Tasks.Provider value={tasks}>
+          <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+        </Tasks.Provider>
       </SignIn.Provider>
     </Asking.Provider>
   );
@@ -50,13 +71,13 @@ const dotFor = (s: ToolEvent["status"]) =>
   s === "done" ? "succeeded" : s === "error" ? "failed" : s === "running" ? "running" : s === "pending" ? "queued" : s === "denied" ? "timed_out" : "cancelled";
 
 function Elapsed({ from, to }: { from: number; to?: number | null }) {
-  const [now, setNow] = React.useState(() => Date.now());
-  React.useEffect(() => {
-    if (to) return;
-    const t = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(t);
-  }, [to]);
-  return <span className="hx-meta-num">{duration((to ?? now) - from)}</span>;
+  return to ? <span className="hx-meta-num">{duration(to - from)}</span> : <Ticking from={from} />;
+}
+
+/** Counts by itself (the shared clock), so only this text re-renders each second. */
+function Ticking({ from }: { from: number }) {
+  const now = useNow();
+  return <span className="hx-meta-num">{duration(now - from)}</span>;
 }
 
 /* ------------------------------------------------------------------ step bodies */
@@ -397,10 +418,16 @@ function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "
   );
 }
 
-function ItemView({ item, cwd, tasks, onOpenTask }: { item: Item; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
+/** A step that started a subagent: it shows the subagent's task as it goes. */
+function AgentStep({ step, cwd, onOpenTask }: { step: Step; cwd: string; onOpenTask?: (t: string) => void }) {
+  const tasks = React.useContext(Tasks);
+  return <StepRow step={step} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
+}
+
+function ItemView({ item, cwd, onOpenTask }: { item: Item; cwd: string; onOpenTask?: (t: string) => void }) {
   switch (item.type) {
     case "step":
-      return <StepRow step={item} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
+      return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
     case "note":
       return <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} ev={item.event.id} />;
     case "thought":
@@ -413,7 +440,6 @@ function ItemView({ item, cwd, tasks, onOpenTask }: { item: Item; cwd: string; t
 const TurnView = React.memo(function TurnView({
   turn,
   cwd,
-  tasks,
   delivery,
   live,
   onOpenTask,
@@ -425,7 +451,6 @@ const TurnView = React.memo(function TurnView({
   agentLabel?: string;
   turn: Turn;
   cwd: string;
-  tasks: Task[];
   delivery?: Delivery;
   live: boolean;
   onOpenTask?: (t: string) => void;
@@ -441,7 +466,7 @@ const TurnView = React.memo(function TurnView({
       <div className="hx-work">
         {agentLabel && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{agentLabel}</div>}
         {turn.items.map((it) => (
-          <ItemView key={it.key} item={it} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />
+          <ItemView key={it.key} item={it} cwd={cwd} onOpenTask={onOpenTask} />
         ))}
         {live && turn.items.length === 0 && !turn.outcome && <PrismLabel live>Starting</PrismLabel>}
       </div>
@@ -464,15 +489,150 @@ const TurnView = React.memo(function TurnView({
   );
 });
 
+/* ------------------------------------------------------------------ where you are in it */
+
+/** The parts a place in the conversation is kept by: what you asked, each thing it did or said, its answer. */
+const PARTS = ".hx-turn > [data-ev], .hx-work > [data-ev]";
+/** This close to the end counts as at the end: it follows what comes. */
+const END_PX = 40;
+/** A part you tapped (or keyed) that changes size this soon after (a step opening) stays where it was. */
+const TOUCH_MS = 1000;
+
+const partId = (el: Element) => (el.getAttribute("data-ev") ?? "").split(" ")[0] ?? "";
+
+function partOf(root: HTMLElement, id: string): HTMLElement | null {
+  const ev = `[data-ev~="${CSS.escape(id)}"]`;
+  return root.querySelector<HTMLElement>(`.hx-turn > ${ev}, .hx-work > ${ev}`);
+}
+
+/** The first part in view, and how far below the view's top it starts (negative: above it). */
+function firstInView(root: HTMLElement): { id: string; offset: number } | null {
+  const top = root.getBoundingClientRect().top;
+  const all = root.querySelectorAll<HTMLElement>(PARTS);
+  let lo = 0;
+  let hi = all.length - 1;
+  let found: HTMLElement | null = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const el = all[mid];
+    if (!el) break;
+    if (el.getBoundingClientRect().bottom > top + 1) {
+      found = el;
+      hi = mid - 1;
+    } else lo = mid + 1;
+  }
+  const id = found ? partId(found) : "";
+  return found && id ? { id, offset: found.getBoundingClientRect().top - top } : null;
+}
+
+/** Scrolls so that part `at.id` starts `at.offset` below the view's top; false when it isn't there. */
+function goTo(root: HTMLElement, at: { id: string; offset: number }): boolean {
+  const el = partOf(root, at.id);
+  if (!el) return false;
+  const by = el.getBoundingClientRect().top - root.getBoundingClientRect().top - at.offset;
+  if (Math.abs(by) >= 1) root.scrollTop += by;
+  return true;
+}
+
+interface Keep {
+  root: HTMLElement | null;
+  /** At the end: it follows what comes. */
+  end: boolean;
+  /** Otherwise: what's being read, and where. */
+  at: { id: string; offset: number } | null;
+  /** The part last tapped or keyed in, its height then, and when. */
+  touched: { el: HTMLElement; h: number; t: number } | null;
+  saving: number;
+}
+
 /**
- * The timeline of the main thread, or of one subagent (`parent`: its spawning tool call). Keeps
- * itself scrolled to the newest work while you are at the bottom, and leaves you be when you
- * scrolled up to read.
+ * Keeps the conversation where you are, whatever comes in, loads or reflows: at its end it follows
+ * what comes; scrolled up, what you're reading stays exactly where it is; a step you open opens
+ * under your finger. Your place is kept under `key` for the next visit (and a reload).
  */
-export function Timeline({
-  events,
-  state,
-  meta,
+function useKeeper(key: string) {
+  const k = React.useRef<Keep>({ root: null, end: true, at: null, touched: null, saving: 0 });
+  /** Where the view is now. */
+  const read = React.useCallback(() => {
+    const s = k.current;
+    if (!s.root) return;
+    s.end = s.root.scrollHeight - s.root.scrollTop - s.root.clientHeight < END_PX;
+    s.at = s.end ? null : firstInView(s.root);
+  }, []);
+  const save = React.useCallback(() => {
+    const s = k.current;
+    window.clearTimeout(s.saving);
+    s.saving = 0;
+    const place: Place = s.end || !s.at ? { end: true } : s.at;
+    usePlaces.getState().setPlace(key, place);
+  }, [key]);
+  const ref = React.useCallback(
+    (root: HTMLDivElement | null) => {
+      if (!root) return;
+      const s = k.current;
+      s.root = root;
+      // Where you were; the end the first time.
+      const was = usePlaces.getState().places[key];
+      if (was && "id" in was && goTo(root, was)) {
+        s.end = false;
+        s.at = { id: was.id, offset: was.offset };
+      } else {
+        root.scrollTop = root.scrollHeight;
+        s.end = true;
+        s.at = null;
+      }
+      // Something changed size (it came in, loaded, opened, the view resized): before it's painted,
+      // the end stays at the end, or what you were reading stays where it was.
+      const hold = () => {
+        const t = s.touched;
+        if (t && performance.now() - t.t < TOUCH_MS && t.el.isConnected && t.el.offsetHeight !== t.h) {
+          // What you just opened (or closed) opens in place; where that leaves you is where you are.
+          goTo(root, { id: partId(t.el), offset: t.el.getBoundingClientRect().top - root.getBoundingClientRect().top });
+          s.touched = null;
+          read();
+        } else if (s.end) root.scrollTop = root.scrollHeight;
+        else if (s.at) goTo(root, s.at);
+      };
+      const watch = new ResizeObserver(hold);
+      watch.observe(root);
+      if (root.firstElementChild) watch.observe(root.firstElementChild);
+      window.addEventListener("pagehide", save);
+      return () => {
+        watch.disconnect();
+        window.removeEventListener("pagehide", save);
+        save();
+        s.root = null;
+      };
+    },
+    [key, read, save],
+  );
+  const onScroll = () => {
+    read();
+    const s = k.current;
+    window.clearTimeout(s.saving);
+    s.saving = window.setTimeout(save, 250);
+  };
+  /** A tap or a key on a part: if it changes size because of it, it does so in place. */
+  const onTouch = (e: React.SyntheticEvent) => {
+    const el = e.target instanceof Element ? e.target.closest<HTMLElement>(PARTS) : null;
+    k.current.touched = el ? { el, h: el.offsetHeight, t: performance.now() } : null;
+  };
+  return { ref, onScroll, onTouch, read };
+}
+
+/** Where a conversation's place is kept: the agent's, or one of its subagents' threads. */
+export const placeKey = (agent: string, parent?: string) => (parent ? `${agent}/${parent}` : agent);
+
+const NO_APPROVALS: Approval[] = [];
+
+/**
+ * The timeline of the main thread, or of one subagent (`parent`: its spawning tool call), live from
+ * the agent's session. Keeps your place: at the end it follows the newest work, scrolled up it
+ * leaves you be, and coming back puts you where you were.
+ */
+export const Timeline = React.memo(function Timeline({
+  store,
+  agent,
   cwd,
   parent,
   onOpenTask,
@@ -486,6 +646,9 @@ export function Timeline({
   accountOpen,
   find,
 }: {
+  store: SessionStore;
+  /** The agent's id: where your place in it is kept. */
+  agent: string;
   /** Find in the conversation: the words, and the match being shown. */
   find?: { q: string; now: FindNow | null };
   agentLabel?: string;
@@ -498,9 +661,6 @@ export function Timeline({
   kind?: string;
   /** The account is open already: the notice doesn't offer it twice. */
   accountOpen?: boolean;
-  events: HEvent[];
-  state: State | null;
-  meta?: Meta | null;
   cwd: string;
   parent?: string;
   onOpenTask?: (t: string) => void;
@@ -508,56 +668,60 @@ export function Timeline({
   onCommand?: (c: Command) => void;
   footer?: React.ReactNode;
 }) {
+  const events = useSession(store, (s) => s.events);
+  const state = useSession(store, (s) => s.state);
+  const meta = useSession(store, (s) => s.meta);
   const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
   const going = parent ? task?.status === "running" || task?.status === "pending" : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
-  const turns = React.useMemo(() => turnsOf(events, parent, going), [events, parent, going]);
-  const ref = React.useRef<HTMLDivElement>(null);
-  const pinned = React.useRef(true);
-  const onScroll = () => {
-    const el = ref.current;
-    if (el) pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  };
-  React.useLayoutEffect(() => {
-    const el = ref.current;
-    if (el && pinned.current) el.scrollTop = el.scrollHeight;
-  });
-  // Find: every match on the page marked in place (again as the conversation grows), and the one
-  // being shown brought into view when it's chosen (not again after: you may scroll away).
+  // Turns that didn't change stay the same objects, so only what changed renders again.
+  const [kept] = React.useState(() => new Map<string, Turn>());
+  const turns = React.useMemo(() => shareTurns(kept, turnsOf(events, parent, going)), [kept, events, parent, going]);
+  const keeper = useKeeper(placeKey(agent, parent));
+  const { read } = keeper;
+  // Find: every match marked in place (again as the conversation grows), and the one shown brought
+  // into view when it's chosen (not again after: you may scroll away).
+  const findQ = find?.q ?? "";
+  const findNow = find?.now ?? null;
   const shown = React.useRef(0);
-  React.useLayoutEffect(() => {
-    const root = ref.current;
-    if (!root) return;
-    const now = find?.now ?? null;
-    const at = now ? elementOf(root, now.id) : null;
-    const first = mark(root, find?.q ?? "", at);
-    if (now && now.n !== shown.current) {
-      shown.current = now.n;
-      const target = first ?? at;
-      if (target) {
-        bringIntoView(target, root);
-        pinned.current = root.scrollHeight - root.scrollTop - root.clientHeight < 80;
+  const grows = findQ ? events : null;
+  const marks = React.useCallback(
+    (flow: HTMLDivElement | null) => {
+      const root = flow?.parentElement;
+      if (!flow || !root) return;
+      // Marked again as the conversation grows, while finding.
+      void grows;
+      const at = findNow ? elementOf(flow, findNow.id) : null;
+      const first = mark(flow, findQ, at);
+      if (findNow && findNow.n !== shown.current) {
+        shown.current = findNow.n;
+        const target = first ?? at;
+        if (target) {
+          bringIntoView(target, root);
+          read();
+        }
       }
-    }
-  });
-  React.useEffect(() => () => void mark(document.body, "", null), []);
+      return () => void mark(flow, "", null);
+    },
+    [findQ, findNow, grows, read],
+  );
   const running = state?.status === "running";
-  const tasks = state?.tasks ?? [];
-  const approvals = state?.approvals;
-  const asking = React.useMemo(() => new Set((approvals ?? []).map((a) => a.tool_id).filter((t): t is string => Boolean(t))), [approvals]);
+  const tasks = state?.tasks ?? NO_TASKS;
+  const approvals = state?.approvals ?? NO_APPROVALS;
+  const askingKey = approvals.map((a) => a.tool_id ?? "").join(" ");
+  const asking = React.useMemo(() => new Set(askingKey.split(" ").filter(Boolean)), [askingKey]);
   // What waits on you sits where it was asked: the latest thing the agent did, the conversation's
   // end. Scrolled away from it, a pill floating over the bottom edge says so (nothing moves).
-  const pending = onDecide ? (approvals ?? []) : [];
+  const pending = onDecide ? approvals : NO_APPROVALS;
   const hasAsks = pending.length > 0;
-  const asksRef = React.useRef<HTMLDivElement>(null);
+  const asksEl = React.useRef<HTMLDivElement | null>(null);
   const [asksSeen, setAsksSeen] = React.useState(true);
-  React.useEffect(() => {
-    const el = asksRef.current;
-    const root = ref.current;
-    if (!hasAsks || !el || !root) return;
-    const io = new IntersectionObserver(([e]) => setAsksSeen(Boolean(e?.isIntersecting)), { root, threshold: 0.05 });
+  const asksRef = React.useCallback((el: HTMLDivElement | null) => {
+    asksEl.current = el;
+    if (!el) return;
+    const io = new IntersectionObserver(([e]) => setAsksSeen(Boolean(e?.isIntersecting)), { root: el.closest<HTMLElement>(".hx-timeline"), threshold: 0.05 });
     io.observe(el);
     return () => io.disconnect();
-  }, [hasAsks]);
+  }, []);
   const signedOut = React.useMemo(() => {
     if (parent || !kind || accountOpen) return null;
     for (let i = events.length - 1; i >= 0; i--) {
@@ -571,51 +735,52 @@ export function Timeline({
   }, [events, parent, kind, accountOpen]);
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Contexts asking={asking} signIn={signIn} findNow={find?.now ?? null}>
-      <div ref={ref} className="hx-timeline" onScroll={onScroll}>
-        {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
-        {turns.length === 0 &&
-          (parent ? (
-            <div className="hx-sub-empty">
-              <p className="hx-sub-what">{task?.description || "Subagent"}</p>
-              {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
-              {going ? <PrismLabel live>Starting</PrismLabel> : <p className="hx-dim text-[12px]">Nothing from this subagent has reached kiln.</p>}
-            </div>
-          ) : (
-            <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
-          ))}
-        {turns.map((t, i) => (
-          <TurnView
-            key={t.key}
-            turn={t}
-            cwd={cwd}
-            tasks={tasks}
-            delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
-            live={running && i === turns.length - 1}
-            onOpenTask={onOpenTask}
-            meta={meta}
-            onCommand={onCommand}
-            agentLabel={agentLabel}
-          />
-        ))}
-        {hasAsks && onDecide && (
-          <div ref={asksRef} className="hx-asks">
-            {pending.map((a) => (
-              <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} />
+    <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks}>
+      <div ref={keeper.ref} className="hx-timeline" onScroll={keeper.onScroll} onPointerDownCapture={keeper.onTouch} onKeyDownCapture={keeper.onTouch}>
+        <div ref={marks} className="hx-flow">
+          {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
+          {turns.length === 0 &&
+            (parent ? (
+              <div className="hx-sub-empty">
+                <p className="hx-sub-what">{task?.description || "Subagent"}</p>
+                {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
+                {going ? <PrismLabel live>Starting</PrismLabel> : <p className="hx-dim text-[12px]">Nothing from this subagent has reached kiln.</p>}
+              </div>
+            ) : (
+              <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
             ))}
-          </div>
-        )}
-        {footer}
-        <div className="hx-waiting-anchor">
-          {hasAsks && !asksSeen && (
-            <button type="button" className="hx-waiting" onClick={() => asksRef.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
-              <i aria-hidden="true" />
-              {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
-              <ArrowDown size={12} aria-hidden="true" />
-            </button>
+          {turns.map((t, i) => (
+            <TurnView
+              key={t.key}
+              turn={t}
+              cwd={cwd}
+              delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
+              live={running && i === turns.length - 1}
+              onOpenTask={onOpenTask}
+              meta={meta}
+              onCommand={onCommand}
+              agentLabel={agentLabel}
+            />
+          ))}
+          {hasAsks && onDecide && (
+            <div ref={asksRef} className="hx-asks">
+              {pending.map((a) => (
+                <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} />
+              ))}
+            </div>
           )}
+          {footer}
+          <div className="hx-waiting-anchor">
+            {hasAsks && !asksSeen && (
+              <button type="button" className="hx-waiting" onClick={() => asksEl.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+                <i aria-hidden="true" />
+                {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+                <ArrowDown size={12} aria-hidden="true" />
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </Contexts>
   );
-}
+});

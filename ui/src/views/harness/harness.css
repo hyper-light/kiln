@@ -627,7 +627,13 @@ textarea.hx-input {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* The conversation keeps your place itself (timeline.tsx), the same in every browser. */
+  overflow-anchor: none;
   padding: 22px max(16px, calc((100% - 860px) / 2)) 28px;
+}
+/* Placeholder words that hold a line's height while the page loads. */
+.hx-ghost {
+  visibility: hidden;
 }
 .hx-turn {
   display: flex;

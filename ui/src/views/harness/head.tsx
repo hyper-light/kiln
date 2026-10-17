@@ -8,6 +8,7 @@ import { Link, useNavigate } from "react-router";
 import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
 import { costText, modelLabel, tildify } from "./derive";
+import { useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
 import { LimitBadge, UsagePanel } from "./limits";
 import { machineName, StateWord } from "./parts";
@@ -62,14 +63,14 @@ export function AgentHeader({
   const limits = state?.limits ?? info?.limits ?? [];
   const [usage, setUsage] = React.useState(false);
   const usageId = React.useId();
-  React.useEffect(() => {
-    if (!usage) return;
-    const onKey = (e: KeyboardEvent) => {
+  useListener<KeyboardEvent>(
+    document,
+    "keydown",
+    (e) => {
       if (e.key === "Escape") setUsage(false);
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [usage]);
+    },
+    { on: usage },
+  );
   // The kind already names an agent that has no name of its own.
   const named = Boolean(info && info.name.trim().toLowerCase() !== info.kind_name.trim().toLowerCase());
 

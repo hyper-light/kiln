@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { ChevronRight, Square } from "lucide-react";
-import { harnessApi, type Command, type State, type Task } from "@/api/harness";
+import { harnessApi, useSession, type Command, type SessionStore, type State, type Task } from "@/api/harness";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { duration, tildify } from "./derive";
@@ -24,44 +24,72 @@ export function backgroundOf(state: State | null): Task[] {
   return (state?.tasks ?? []).filter(isBackground);
 }
 
+interface Tail {
+  text: string;
+  note: string | null;
+  offset?: number;
+}
+
+const NO_TAIL: Tail = { text: "", note: null };
+/** Each task's output read so far (opened again, it's there at once and goes on from where it was). */
+const tails = new Map<string, Tail>();
+
+/** A task's output: read while shown, every moment while it runs (subscribed to as a store is). */
+function useTail(agent: string, task: string, live: boolean): Tail {
+  const key = `${agent}\n${task}`;
+  const subscribe = React.useCallback(
+    (changed: () => void) => {
+      let stop = false;
+      let timer = 0;
+      const poll = async () => {
+        const was = tails.get(key) ?? NO_TAIL;
+        try {
+          const r = await harnessApi.taskOutput(agent, task, was.offset);
+          // Read meanwhile by another view of it: that one's is the newer.
+          if (stop || (tails.get(key) ?? NO_TAIL) !== was) return;
+          tails.set(
+            key,
+            r.error
+              ? { ...was, note: r.error }
+              : { text: r.data ? (was.text + r.data).slice(-200_000) : was.text, offset: r.offset ?? was.offset, note: r.gone ? "Its output file is gone: the task has ended." : null },
+          );
+          changed();
+        } catch (e) {
+          if (stop) return;
+          tails.set(key, { ...(tails.get(key) ?? NO_TAIL), note: e instanceof Error ? e.message : String(e) });
+          changed();
+        }
+        if (!stop && live) timer = window.setTimeout(poll, 1500);
+      };
+      void poll();
+      return () => {
+        stop = true;
+        window.clearTimeout(timer);
+      };
+    },
+    [key, agent, task, live],
+  );
+  return React.useSyncExternalStore(
+    subscribe,
+    () => tails.get(key) ?? NO_TAIL,
+    () => NO_TAIL,
+  );
+}
+
 /** The task's output, tailed while it runs. */
 export function Output({ agent, task }: { agent: string; task: Task }) {
-  const [text, setText] = React.useState("");
-  const [note, setNote] = React.useState<string | null>(null);
-  const offset = React.useRef<number | undefined>(undefined);
-  const pre = React.useRef<HTMLPreElement>(null);
-  const live = isLive(task);
-  React.useEffect(() => {
-    let stop = false;
-    let timer = 0;
-    const poll = async () => {
-      try {
-        const r = await harnessApi.taskOutput(agent, task.id, offset.current);
-        if (stop) return;
-        if (r.error) setNote(r.error);
-        else {
-          if (r.data) setText((t) => (t + r.data).slice(-200_000));
-          if (r.offset !== undefined) offset.current = r.offset;
-          setNote(r.gone ? "Its output file is gone: the task has ended." : null);
-        }
-      } catch (e) {
-        if (!stop) setNote(e instanceof Error ? e.message : String(e));
-      }
-      if (!stop && live) timer = window.setTimeout(poll, 1500);
-    };
-    void poll();
-    return () => {
-      stop = true;
-      window.clearTimeout(timer);
-    };
-  }, [agent, task.id, live]);
-  React.useLayoutEffect(() => {
-    const el = pre.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [text]);
+  const { text, note } = useTail(agent, task.id, isLive(task));
+  // The newest output stays in view.
+  const end = React.useCallback(
+    (el: HTMLPreElement | null) => {
+      void text;
+      if (el) el.scrollTop = el.scrollHeight;
+    },
+    [text],
+  );
   return (
     <div className="bg-out">
-      <pre ref={pre}>{text || (note ? "" : "No output yet.")}</pre>
+      <pre ref={end}>{text || (note ? "" : "No output yet.")}</pre>
       {note && <p className="bg-note">{note}</p>}
     </div>
   );
@@ -179,11 +207,18 @@ export function BackgroundStrip({ state, onView }: { state: State | null; onView
  * monitors it started — as one line that opens in place. A subagent opens its thread; a shell or
  * monitor shows its output right there.
  */
-export function ActivityLine({ state, agent, onOpenTask }: { state: State | null; agent: string; onOpenTask: (toolId: string) => void }) {
+const NO_TASKS: Task[] = [];
+
+/** How long it has run, counting by itself (only this text renders each second). */
+function Since({ from }: { from: number }) {
+  const now = useNow();
+  return <>{duration(now - from)}</>;
+}
+
+export function ActivityLine({ store, agent, onOpenTask }: { store: SessionStore; agent: string; onOpenTask: (toolId: string) => void }) {
   const [open, setOpen] = React.useState(false);
   const [shown, setShown] = React.useState<string | null>(null);
-  const now = useNow();
-  const tasks = state?.tasks ?? [];
+  const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
   const subs = tasks.filter((t) => !isBackground(t) && isLive(t));
   const bg = tasks.filter((t) => isBackground(t) && isLive(t));
   if (subs.length + bg.length === 0) return null;
@@ -236,7 +271,7 @@ export function ActivityLine({ state, agent, onOpenTask }: { state: State | null
                   </span>
                   <span className="al-time">
                     {last && <span className="al-last">{last}</span>}
-                    {duration(now - t.started)}
+                    <Since from={t.started} />
                   </span>
                 </button>
                 {shown === t.id && <Output agent={agent} task={t} />}

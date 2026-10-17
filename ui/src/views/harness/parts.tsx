@@ -204,11 +204,14 @@ export const Prose = React.memo(function Prose({ text, className, ev }: { text: 
 
 /** Output a command printed: the end matters most, so long output opens at its tail. */
 export function Output({ text, truncated, error }: { text: string; truncated?: boolean; error?: boolean }) {
-  const ref = React.useRef<HTMLPreElement>(null);
-  React.useLayoutEffect(() => {
-    const el = ref.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [text]);
+  // At its tail when it shows, and again as more comes.
+  const ref = React.useCallback(
+    (el: HTMLPreElement | null) => {
+      void text;
+      if (el) el.scrollTop = el.scrollHeight;
+    },
+    [text],
+  );
   return (
     <div className="hx-pre-wrap">
       {text && <CopyBlock text={text} />}

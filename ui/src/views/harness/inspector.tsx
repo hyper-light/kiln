@@ -4,7 +4,7 @@
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
-import type { Command, FileChange as ServerChange, HEvent, Meta, SessionStore, State, Task } from "@/api/harness";
+import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, duration, money, relPath, runsOf, tokens, type FileChange, type ToolEvent } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
@@ -237,10 +237,6 @@ function Usage({ state }: { state: State | null }) {
 export function Inspector({
   tab,
   onTab,
-  events,
-  changes,
-  state,
-  meta,
   store,
   cwd,
   onOpenTask,
@@ -259,15 +255,16 @@ export function Inspector({
   hideTabs?: boolean;
   tab: InspectorTab;
   onTab: (t: InspectorTab) => void;
-  events: HEvent[];
-  changes: ServerChange[] | null;
-  state: State | null;
-  meta: Meta | null;
+  /** The agent's live session: what's shown here is read from it. */
   store: SessionStore;
   cwd: string;
   onOpenTask?: (toolId: string) => void;
   className?: string;
 }) {
+  const events = useSession(store, (s) => s.events);
+  const changes = useSession(store, (s) => s.changes);
+  const state = useSession(store, (s) => s.state);
+  const meta = useSession(store, (s) => s.meta);
   const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(events).length), [changes, events]);
   const runs = React.useMemo(() => runsOf(events), [events]);
   const todos = state?.todos ?? [];
