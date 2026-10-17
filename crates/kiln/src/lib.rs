@@ -42,6 +42,7 @@ pub mod ui;
 pub mod updates;
 pub mod upgrade;
 pub mod util;
+pub mod voice;
 
 /// Process-wide shutdown signal, set once by `main`.
 pub static SHUTDOWN: std::sync::OnceLock<rt::Shutdown> = std::sync::OnceLock::new();
