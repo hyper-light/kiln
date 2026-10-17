@@ -137,9 +137,10 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SyncAsk {
-    /// The tree as the asker has it, in pieces (`more` until the last). `key` names the copy on
-    /// the other side, kept between syncs so the next one sends only what changed.
-    Plan { key: String, entries: Vec<Entry>, more: bool },
+    /// The tree as the asker has it, in pieces (`start` on the first, `more` until the last).
+    /// `key` names the copy on the other side, kept between syncs so the next one sends only what
+    /// changed.
+    Plan { key: String, entries: Vec<Entry>, start: bool, more: bool },
     /// A piece of a file the other side asked for.
     File { key: String, path: String, offset: u64, data: Vec<u8>, last: bool },
     /// Every file asked for was sent: make the copy match the plan.
@@ -150,6 +151,8 @@ pub enum SyncAsk {
 pub enum SyncSay {
     /// The files to send (they differ, or are missing); `root` is where the copy lives.
     Need { key: String, root: String, paths: Vec<String> },
+    /// File bytes written so far: the asker keeps at most [`WINDOW`] beyond this in flight.
+    Got { key: String, bytes: u64 },
     Done { key: String, root: String, written: u32, removed: u32, bytes: u64 },
     Failed { key: String, error: String },
 }
@@ -179,7 +182,7 @@ impl Deframer {
     }
 
     /// The next whole message, if one arrived. An error (too large, undecodable) ends the link.
-    pub fn next<T: for<'de> Deserialize<'de>>(&mut self) -> anyhow::Result<Option<T>> {
+    pub fn take<T: for<'de> Deserialize<'de>>(&mut self) -> anyhow::Result<Option<T>> {
         let Some(head) = self.buf.first_chunk::<4>() else { return Ok(None) };
         let len = usize::try_from(u32::from_be_bytes(*head))?;
         if len > MAX_MESSAGE {
@@ -202,7 +205,7 @@ mod tests {
             Ask::Hello { version: VERSION, session: "s".into(), resume: vec![Resume { id: 3, from: 77 }] },
             Ask::Run(Box::new(RunSpec { id: 1, command: "cargo test".into(), cwd: Some("crates/kiln".into()), ..RunSpec::default() })),
             Ask::Stdin { id: 1, data: vec![0, 1, 2, 255] },
-            Ask::Sync(SyncAsk::Plan { key: "k".into(), entries: vec![Entry { path: "a/b".into(), kind: EntryKind::File, size: 3, mtime_ns: -1, mode: 0o644, target: None }], more: false }),
+            Ask::Sync(SyncAsk::Plan { key: "k".into(), entries: vec![Entry { path: "a/b".into(), kind: EntryKind::File, size: 3, mtime_ns: -1, mode: 0o644, target: None }], start: true, more: false }),
         ];
         let mut bytes = Vec::new();
         for m in &msgs {
@@ -213,7 +216,7 @@ mod tests {
         let mut got = Vec::new();
         for b in &bytes {
             d.push(std::slice::from_ref(b));
-            while let Some(m) = d.next::<Ask>()? {
+            while let Some(m) = d.take::<Ask>()? {
                 got.push(m);
             }
         }
@@ -225,9 +228,9 @@ mod tests {
     fn an_oversized_or_garbled_message_is_an_error() {
         let mut d = Deframer::default();
         d.push(&u32::MAX.to_be_bytes());
-        assert!(d.next::<Say>().is_err());
+        assert!(d.take::<Say>().is_err());
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 2, 0xff, 0xff]);
-        assert!(d.next::<Say>().is_err());
+        assert!(d.take::<Say>().is_err());
     }
 }

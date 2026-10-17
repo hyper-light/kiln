@@ -1,0 +1,291 @@
+//! Two reach nodes, as two runners would run them, talking through the relay the server runs:
+//! runs, a dropped connection mid-run, a sync then a run in the copy, an impostor.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use parking_lot::Mutex;
+
+use super::directory::RunnerInfo;
+use super::local::{self, Ev, RunReq};
+use super::node::{self, Config, Handle, In};
+use super::relay::{Announce, Frame, Relay};
+use crate::proto::{AgentMsg, ServerMsg};
+
+/// What the test does to the "server".
+enum Ctl {
+    /// Drop a runner's connection (its links close; it hears the server went).
+    Drop(&'static str),
+    /// It reconnects (a new connection).
+    Back(&'static str),
+    /// Change what the directory says a runner's key is.
+    Key(&'static str, String),
+}
+
+struct Lab {
+    mac: Handle,
+    linux: Handle,
+    ctl: async_channel::Sender<Ctl>,
+    _dirs: Vec<tempfile::TempDir>,
+    mirrors: std::path::PathBuf,
+}
+
+fn info(name: &str, fp: &str) -> RunnerInfo {
+    RunnerInfo {
+        name: name.into(),
+        hostname: format!("{name}.lan"),
+        os: if name == "mac" { "macos".into() } else { "linux".into() },
+        arch: if name == "mac" { "aarch64".into() } else { "x86_64".into() },
+        connected: true,
+        reach: true,
+        fingerprint: Some(fp.into()),
+        cpus: 8,
+        mem_total: 16 << 30,
+        mem_used: 4 << 30,
+        slots: 2,
+        via: "direct".into(),
+        ..RunnerInfo::default()
+    }
+}
+
+async fn lab() -> anyhow::Result<Lab> {
+    let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
+    let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
+    let cfg = |name: &str, d: &tempfile::TempDir| Config { name: name.into(), dir: d.path().join("reach"), accept: true, mirrors: mirrors.clone() };
+    let (mac, mac_out) = node::start(cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?))?;
+    let (linux, linux_out) = node::start(cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?))?;
+    let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
+    // Each runner's current connection, as the server would number them.
+    let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
+    let (ctl_tx, ctl_rx) = async_channel::unbounded::<Ctl>();
+    let (m, l) = (mac.clone(), linux.clone());
+    crate::rt::spawn(async move {
+        let mut relay = Relay::default();
+        relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: 1 });
+        relay.announce("linux", Announce { fingerprint: l.fingerprint().into(), accept: true, version: 1 });
+        let handle_of = |n: &str| if n == "mac" { m.clone() } else { l.clone() };
+        loop {
+            use futures::FutureExt as _;
+            let (from, msg) = futures::select_biased! {
+                c = ctl_rx.recv().fuse() => {
+                    match c {
+                        Ok(Ctl::Drop(name)) => {
+                            let peer = peers.lock().get(name).copied().unwrap_or(0);
+                            for (to, sm) in relay.lost(peer, "disconnected") {
+                                deliver(&peers, &handle_of, to, sm).await;
+                            }
+                            peers.lock().remove(name);
+                            handle_of(name).feed(In::Server(false)).await;
+                        }
+                        Ok(Ctl::Back(name)) => {
+                            let next = peers.lock().values().max().copied().unwrap_or(0) + 1;
+                            peers.lock().insert(name, next);
+                            handle_of(name).feed(In::Server(true)).await;
+                        }
+                        Ok(Ctl::Key(name, fp)) => {
+                            if let Some(r) = directory.lock().iter_mut().find(|r| r.name == name) {
+                                r.fingerprint = Some(fp);
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                    continue;
+                }
+                x = mac_out.recv().fuse() => ("mac", x),
+                x = linux_out.recv().fuse() => ("linux", x),
+            };
+            let Ok(msg) = msg else { return };
+            let Some(from_peer) = peers.lock().get(from).copied() else { continue };
+            match msg {
+                AgentMsg::Reach { to, link, open, data, close } => {
+                    let p = Arc::clone(&peers);
+                    let out = relay.forward(from, from_peer, Frame { to, link, open, data, close }, move |n| p.lock().get(n).copied());
+                    for (to, sm) in out {
+                        deliver(&peers, &handle_of, to, sm).await;
+                    }
+                }
+                AgentMsg::ReachAsk { req, .. } => {
+                    let json = serde_json::json!({ "runners": *directory.lock() }).to_string();
+                    handle_of(from).feed(In::Answer { req, json }).await;
+                }
+                _ => {}
+            }
+        }
+    });
+    mac.feed(In::Server(true)).await;
+    linux.feed(In::Server(true)).await;
+    Ok(Lab { mac, linux, ctl: ctl_tx, _dirs: dirs, mirrors })
+}
+
+async fn deliver(peers: &Mutex<HashMap<&'static str, u64>>, handle_of: &impl Fn(&str) -> Handle, to: u64, sm: ServerMsg) {
+    let name = peers.lock().iter().find(|(_, p)| **p == to).map(|(n, _)| *n);
+    let (Some(name), ServerMsg::Reach { from, link, open, data, close }) = (name, sm) else { return };
+    handle_of(name).feed(In::Frame { from, link, open, data, close }).await;
+}
+
+/// Run `req` from mac through the local driver; every event until the end.
+async fn run_from_mac(lab: &Lab, req: RunReq, mid: impl Fn(&Ev) -> Option<Ctl>) -> anyhow::Result<Vec<Ev>> {
+    let (ev_tx, ev_rx) = async_channel::unbounded();
+    let (_ctl_tx, ctl_rx) = async_channel::unbounded();
+    let mac = lab.mac.clone();
+    crate::rt::spawn(async move { local::run(&mac, "mac", req, ev_tx, ctl_rx).await });
+    let mut evs = Vec::new();
+    loop {
+        match crate::rt::timeout(Duration::from_secs(60), ev_rx.recv()).await {
+            Ok(Ok(e)) => {
+                if let Some(c) = mid(&e) {
+                    lab.ctl.send(c).await?;
+                }
+                let end = matches!(e, Ev::Exit { .. } | Ev::Error(_));
+                evs.push(e);
+                if end {
+                    return Ok(evs);
+                }
+            }
+            Ok(Err(_)) => return Ok(evs),
+            Err(_) => anyhow::bail!("timed out; so far: {evs:?}"),
+        }
+    }
+}
+
+fn output(evs: &[Ev], err: bool) -> String {
+    evs.iter().filter_map(|e| if let Ev::Output { err: e2, data } = e { (*e2 == err).then(|| String::from_utf8_lossy(data).into_owned()) } else { None }).collect()
+}
+
+fn exit(evs: &[Ev]) -> Option<(Option<i32>, Option<String>, u64)> {
+    evs.iter().find_map(|e| if let Ev::Exit { code, error, lost } = e { Some((*code, error.clone(), *lost)) } else { None })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_run_on_another_runner_streams_back_over_a_post_quantum_link() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let req = RunReq { target: "linux/amd64".into(), command: "echo hello from $KILN_REACH_FROM; echo oops >&2; exit 3".into(), ..RunReq::default() };
+        let evs = run_from_mac(&lab, req, |_| None).await?;
+        assert!(evs.iter().any(|e| matches!(e, Ev::Picked { runner, .. } if runner == "linux")), "{evs:?}");
+        assert!(evs.iter().any(|e| matches!(e, Ev::Started { runner, .. } if runner == "linux")));
+        assert_eq!(output(&evs, false), "hello from mac\n");
+        assert_eq!(output(&evs, true), "oops\n");
+        assert_eq!(exit(&evs), Some((Some(3), None, 0)));
+        // Both pinned each other's key, and the link is ML-KEM hybrid with AES-256-GCM.
+        let s = lab.mac.status().await?;
+        let peer = s.get("peers").and_then(|p| p.as_array()).and_then(|p| p.first()).cloned().unwrap_or_default();
+        assert_eq!(peer.pointer("/secured/suite").and_then(|v| v.as_str()), Some("TLS13_AES_256_GCM_SHA384"), "{s}");
+        assert_eq!(peer.pointer("/secured/group").and_then(|v| v.as_str()), Some("secp384r1MLKEM1024"));
+        assert!(s.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("linux"))));
+        let l = lab.linux.status().await?;
+        assert!(l.get("pins").and_then(|p| p.as_array()).is_some_and(|p| p.iter().any(|x| x.get("runner").and_then(|r| r.as_str()) == Some("mac"))));
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dropped_connection_mid_run_loses_nothing() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let ctl = lab.ctl.clone();
+        let req = RunReq { target: "linux".into(), command: "for i in 1 2 3 4 5 6 7 8; do echo line$i; sleep 0.15; done".into(), ..RunReq::default() };
+        // After the second line, mac loses the server for a moment, then comes back.
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = Arc::clone(&dropped);
+        let evs = run_from_mac(&lab, req, move |e| {
+            if let Ev::Output { data, .. } = e
+                && String::from_utf8_lossy(data).contains("line2")
+                && !d.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                let ctl = ctl.clone();
+                crate::rt::spawn(async move {
+                    crate::rt::sleep(Duration::from_millis(400)).await;
+                    let _ = ctl.send(Ctl::Back("mac")).await;
+                });
+                return Some(Ctl::Drop("mac"));
+            }
+            None
+        })
+        .await?;
+        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed));
+        let lines: Vec<String> = output(&evs, false).lines().map(str::to_owned).collect();
+        assert_eq!(lines, (1..=8).map(|i| format!("line{i}")).collect::<Vec<_>>(), "every line exactly once, in order");
+        assert_eq!(exit(&evs), Some((Some(0), None, 0)));
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tree_syncs_over_and_the_command_runs_in_the_copy() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let repo = tempfile::tempdir()?;
+        let r = repo.path();
+        let git = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(r).args(args).env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t").output();
+        git(&["init", "-q"])?;
+        std::fs::create_dir_all(r.join("crates/app"))?;
+        std::fs::write(r.join("crates/app/data.txt"), "synced!\n")?;
+        std::fs::write(r.join(".gitignore"), "target/\n")?;
+        std::fs::create_dir_all(r.join("target"))?;
+        std::fs::write(r.join("target/big"), vec![0u8; 4096])?;
+        git(&["add", "."])?;
+        git(&["commit", "-qm", "init"])?;
+        std::fs::write(r.join("crates/app/data.txt"), "synced and edited!\n")?;
+        let req = RunReq {
+            target: "linux".into(),
+            command: "cat data.txt; git status --porcelain; test -e ../../target && echo LEAKED || true".into(),
+            cwd: Some(r.join("crates/app").to_string_lossy().into_owned()),
+            sync: true,
+            ..RunReq::default()
+        };
+        let evs = run_from_mac(&lab, req.clone(), |_| None).await?;
+        assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent, .. } if *sent >= 2)), "{evs:?}");
+        let out = output(&evs, false);
+        assert!(out.starts_with("synced and edited!\n"), "{out}");
+        assert!(out.contains("M crates/app/data.txt"), "git sees the same change over there: {out}");
+        assert!(!out.contains("LEAKED"), "ignored build output stays home");
+        assert!(evs.iter().any(|e| matches!(e, Ev::Started { cwd, .. } if cwd.starts_with(&lab.mirrors.join("mac").to_string_lossy().into_owned()) && cwd.ends_with("crates/app"))));
+        // Again: nothing changed here, so all that goes is the index `git status` refreshed there.
+        let evs = run_from_mac(&lab, req.clone(), |_| None).await?;
+        assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent: 0 | 1, .. })), "{evs:?}");
+        let evs = run_from_mac(&lab, RunReq { command: "true".into(), ..req }, |_| None).await?;
+        assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent: 1, .. })), "{evs:?}");
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn an_impostor_key_is_refused_and_a_changed_key_is_not_believed() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        // First contact goes fine and pins linux's key.
+        let ok = run_from_mac(&lab, RunReq { target: "linux".into(), command: "true".into(), ..RunReq::default() }, |_| None).await?;
+        assert_eq!(exit(&ok).map(|e| e.0), Some(Some(0)), "{ok:?}");
+        // The server now says linux has another key (a compromised server, a swapped machine).
+        lab.ctl.send(Ctl::Key("linux", "ab".repeat(32))).await?;
+        // mac's connection drops and comes back: the next link checks the pin against that.
+        lab.ctl.send(Ctl::Drop("mac")).await?;
+        crate::rt::sleep(Duration::from_millis(100)).await;
+        lab.ctl.send(Ctl::Back("mac")).await?;
+        crate::rt::sleep(Duration::from_millis(100)).await;
+        let evs = run_from_mac(&lab, RunReq { target: "linux".into(), command: "echo must-not-run".into(), ..RunReq::default() }, |_| None).await?;
+        assert!(!output(&evs, false).contains("must-not-run"));
+        assert!(evs.iter().any(|e| matches!(e, Ev::Error(w) if w.contains("reach key changed"))), "{evs:?}");
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn a_runner_that_presents_the_wrong_key_gets_nothing() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        // Before anything is pinned, the directory lists a key that isn't linux's.
+        lab.ctl.send(Ctl::Key("linux", "cd".repeat(32))).await?;
+        let evs = run_from_mac(&lab, RunReq { target: "linux".into(), command: "echo should-not-run".into(), ..RunReq::default() }, |_| None).await?;
+        assert!(!output(&evs, false).contains("should-not-run"));
+        assert!(evs.iter().any(|e| matches!(e, Ev::Error(_) | Ev::Exit { code: None, .. })), "{evs:?}");
+        Ok(())
+    })
+}

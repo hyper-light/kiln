@@ -4,6 +4,12 @@
 
 pub mod directory;
 pub mod e2e;
+pub mod local;
+pub mod node;
 pub mod relay;
 pub mod serve;
+pub mod sync;
 pub mod wire;
+
+#[cfg(test)]
+mod tests;
