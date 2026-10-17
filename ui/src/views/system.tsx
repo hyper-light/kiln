@@ -1,12 +1,19 @@
 import * as React from "react";
 import { RefreshCw } from "lucide-react";
 import { api } from "@/api/client";
-import { CopyButton, EmptyState, ErrorState, PageIntro, Panel, SearchField, SectionHeading, Skeleton, SkeletonRows } from "@/components/ui/misc";
+import type { AuditEntry, SystemInfo } from "@/api/types";
+import { Hold, TableHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { CopyButton, EmptyState, PageIntro, Panel, SearchField, SectionHeading } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Button } from "@/components/ui/button";
+import { useRes, warm, type Res } from "@/lib/data";
 import { absoluteTime, formatUptime } from "@/lib/format";
-import { useDocumentTitle, useResource } from "@/lib/hooks";
+import { invalidate } from "@/lib/resource";
 import { childStatus, RelTime } from "./shared";
+
+const systemRes: Res<SystemInfo> = { key: "system", fetch: (s) => api.system(s), opts: { pollMs: 15_000 } };
+const auditRes: Res<AuditEntry[]> = { key: "audit", fetch: (s) => api.audit(300, s), opts: { pollMs: 60_000 } };
 
 /** Lightweight JSON syntax colouring using the site's prose palette. */
 function JsonView({ value }: { value: unknown }) {
@@ -44,104 +51,136 @@ function JsonView({ value }: { value: unknown }) {
 }
 
 export default function System() {
-  useDocumentTitle("System");
-  const sys = useResource((s) => api.system(s), [], { pollMs: 15_000 });
-  const audit = useResource((s) => api.audit(300, s), []);
-  const [q, setQ] = React.useState("");
-  const d = sys.data;
-
-  const auditRows = (audit.data ?? []).filter((a) => !q || `${a.actor} ${a.action} ${a.detail}`.toLowerCase().includes(q.toLowerCase()));
-
   return (
     <div className="container-console page">
+      <title>System · kiln</title>
       <PageIntro
         index={9}
         label="System"
         title="System"
         lead="kiln runs every subsystem under an Erlang-style supervisor; `kiln supervise` restarts the whole server with backoff. Generation increments on each process restart."
         actions={
-          <Button variant="ghost" onClick={() => { sys.reload(); audit.reload(); }}>
+          <Button
+            variant="ghost"
+            onClick={() => {
+              invalidate("system");
+              invalidate("audit");
+            }}
+          >
             <RefreshCw /> Refresh
           </Button>
         }
       />
+      <Loadable label="the system" fallback={<SystemHold />}>
+        <SystemBody />
+      </Loadable>
+    </div>
+  );
+}
 
-      {sys.error && !d && <ErrorState error={sys.error} onRetry={sys.reload} />}
-
-      <div className="kpi-row !grid-cols-2 md:!grid-cols-4">
-        <div className="kpi">
-          <div className="label">Version</div>
-          <div className="kpi-value">{d ? d.version : <Skeleton className="h-8 w-20" />}</div>
-        </div>
-        <div className="kpi">
-          <div className="label">Uptime</div>
-          <div className="kpi-value">{d ? formatUptime(d.uptime_s) : <Skeleton className="h-8 w-20" />}</div>
-        </div>
-        <div className="kpi">
-          <div className="label">Generation</div>
-          <div className="kpi-value">{d ? d.generation : <Skeleton className="h-8 w-12" />}</div>
-          <div className="kpi-foot">process restarts by supervise</div>
-        </div>
-        <div className="kpi">
-          <div className="label">Subsystems</div>
-          <div className="kpi-value">
-            {d ? (
-              <>
-                {d.children.filter((c) => c.state === "running").length}
-                <small>/ {d.children.length} running</small>
-              </>
-            ) : (
-              <Skeleton className="h-8 w-16" />
-            )}
-          </div>
+function Kpis({ d }: { d: SystemInfo | null }) {
+  const blank = "\u00a0";
+  return (
+    <div className="kpi-row !grid-cols-2 md:!grid-cols-4">
+      <div className="kpi">
+        <div className="label">Version</div>
+        <div className="kpi-value">{d ? d.version : blank}</div>
+      </div>
+      <div className="kpi">
+        <div className="label">Uptime</div>
+        <div className="kpi-value">{d ? formatUptime(d.uptime_s) : blank}</div>
+      </div>
+      <div className="kpi">
+        <div className="label">Generation</div>
+        <div className="kpi-value">{d ? d.generation : blank}</div>
+        <div className="kpi-foot">process restarts by supervise</div>
+      </div>
+      <div className="kpi">
+        <div className="label">Subsystems</div>
+        <div className="kpi-value">
+          {d ? (
+            <>
+              {d.children.filter((c) => c.state === "running").length}
+              <small>/ {d.children.length} running</small>
+            </>
+          ) : (
+            blank
+          )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function ChildrenHead() {
+  return (
+    <thead>
+      <tr>
+        <th className="w-6" aria-label="Health" />
+        <th>Child</th>
+        <th>State</th>
+        <th className="num">Restarts</th>
+        <th className="hidden sm:table-cell">Since</th>
+        <th>Last error</th>
+      </tr>
+    </thead>
+  );
+}
+
+function AuditHead() {
+  return (
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Actor</th>
+        <th>Action</th>
+        <th>Detail</th>
+      </tr>
+    </thead>
+  );
+}
+
+function SystemBody() {
+  warm(systemRes, auditRes);
+  const d = useRes(systemRes).data;
+  const audit = useRes(auditRes).data;
+  const [q, setQ] = React.useState("");
+  const auditRows = audit.filter((a) => !q || `${a.actor} ${a.action} ${a.detail}`.toLowerCase().includes(q.toLowerCase()));
+
+  return (
+    <>
+      <Kpis d={d} />
 
       <section className="mt-12">
         <SectionHeading index="01" label="Supervisor" title="Children" />
-        {!d ? (
-          <SkeletonRows rows={6} cols={4} />
-        ) : (
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th className="w-6" aria-label="Health" />
-                  <th>Child</th>
-                  <th>State</th>
-                  <th className="num">Restarts</th>
-                  <th className="hidden sm:table-cell">Since</th>
-                  <th>Last error</th>
+        <div className="table-wrap">
+          <table className="data-table">
+            <ChildrenHead />
+            <tbody>
+              {d.children.map((c) => (
+                <tr key={c.name}>
+                  <td>
+                    <StatusDot status={childStatus(c)} title={c.state} />
+                  </td>
+                  <td className="text-[#e4e5e7]">{c.name}</td>
+                  <td className="cell-mono">{c.state}</td>
+                  <td className={`num cell-mono ${c.restarts > 0 ? "!text-[#cbb69a]" : ""}`}>{c.restarts}</td>
+                  <td className="cell-mono hidden whitespace-nowrap sm:table-cell" title={absoluteTime(c.since_unix)}>
+                    <RelTime ts={c.since_unix} />
+                  </td>
+                  <td className="truncate-cell font-mono text-[11px] text-[#cbb69a]" title={c.last_error ?? undefined}>
+                    {c.last_error ?? <span className="text-[#6d7078]">—</span>}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {d.children.map((c) => (
-                  <tr key={c.name}>
-                    <td>
-                      <StatusDot status={childStatus(c)} title={c.state} />
-                    </td>
-                    <td className="text-[#e4e5e7]">{c.name}</td>
-                    <td className="cell-mono">{c.state}</td>
-                    <td className={`num cell-mono ${c.restarts > 0 ? "!text-[#cbb69a]" : ""}`}>{c.restarts}</td>
-                    <td className="cell-mono hidden whitespace-nowrap sm:table-cell" title={absoluteTime(c.since_unix)}>
-                      <RelTime ts={c.since_unix} />
-                    </td>
-                    <td className="truncate-cell font-mono text-[11px] text-[#cbb69a]" title={c.last_error ?? undefined}>
-                      {c.last_error ?? <span className="text-[#6d7078]">—</span>}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section className="mt-12 grid gap-4 lg:grid-cols-2">
         <Panel eyebrow="Process" title="Crash log" description="Recorded by kiln supervise when the server exits abnormally.">
-          {!d ? (
-            <Skeleton className="h-40 w-full" />
-          ) : d.crash_log.length === 0 ? (
+          {d.crash_log.length === 0 ? (
             <div className="flex items-center gap-2.5 py-6 font-mono text-[11px] text-[#a8c9bc]">
               <i className="dot" data-status="succeeded" /> No crashes recorded.
             </div>
@@ -152,34 +191,18 @@ export default function System() {
           )}
         </Panel>
         <Panel eyebrow="Read-only" title="Effective configuration" description="Secrets are redacted by the server.">
-          {!d ? <Skeleton className="h-40 w-full" /> : <JsonView value={d.config} />}
+          <JsonView value={d.config} />
         </Panel>
       </section>
 
       <section className="mt-12">
-        <SectionHeading
-          index="02"
-          label="Audit"
-          title="Audit log"
-          aside={<SearchField className="w-56" label="Filter audit log" placeholder="Filter…" value={q} onChange={setQ} />}
-        />
-        {audit.error && !audit.data ? (
-          <ErrorState error={audit.error} onRetry={audit.reload} />
-        ) : !audit.data ? (
-          <SkeletonRows rows={8} cols={4} />
-        ) : auditRows.length === 0 ? (
+        <SectionHeading index="02" label="Audit" title="Audit log" aside={<SearchField className="w-56" label="Filter audit log" placeholder="Filter…" value={q} onChange={setQ} />} />
+        {auditRows.length === 0 ? (
           <EmptyState title={q ? "No entries match." : "No audit entries yet."} />
         ) : (
           <div className="table-wrap max-h-[640px] overflow-y-auto">
             <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Actor</th>
-                  <th>Action</th>
-                  <th>Detail</th>
-                </tr>
-              </thead>
+              <AuditHead />
               <tbody>
                 {auditRows.map((a, i) => (
                   <tr key={`${a.ts}-${i}`}>
@@ -200,6 +223,31 @@ export default function System() {
           </div>
         )}
       </section>
-    </div>
+    </>
+  );
+}
+
+/** The page while it loads: its figures' labels, its tables' heads, its panels' frames. */
+function SystemHold() {
+  return (
+    <>
+      <Kpis d={null} />
+      <section className="mt-12">
+        <SectionHeading index="01" label="Supervisor" title="Children" />
+        <TableHold head={<ChildrenHead />} rows={8} rowHeight={39} label="Loading the system" />
+      </section>
+      <section className="mt-12 grid gap-4 lg:grid-cols-2">
+        <Panel eyebrow="Process" title="Crash log" description="Recorded by kiln supervise when the server exits abnormally.">
+          <Hold height={160} />
+        </Panel>
+        <Panel eyebrow="Read-only" title="Effective configuration" description="Secrets are redacted by the server.">
+          <Hold height={160} />
+        </Panel>
+      </section>
+      <section className="mt-12">
+        <SectionHeading index="02" label="Audit" title="Audit log" />
+        <TableHold head={<AuditHead />} rows={8} rowHeight={39} />
+      </section>
+    </>
   );
 }
