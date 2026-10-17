@@ -1,0 +1,26 @@
+# kiln ships itself. One Linux runner cross-builds every platform's binary with zig
+# (ci/release/build.sh) and hands them to this kiln server (ci/release/publish.sh). The server then
+# serves them at /dl/kiln/<target>, so `install.sh` / `install.ps1` work on Linux, macOS and Windows
+# with nothing but this server. Needs KILN_RELEASE_URL and KILN_RELEASE_TOKEN in the server's
+# [secrets].
+name: release
+on:
+  tag: { branches: ["v*"] }
+  manual: true
+concurrency: { group: release, cancel-in-progress: false }
+jobs:
+  binaries:
+    name: build and publish every platform
+    # A Linux machine with rustup, python3 and node: the server's own runner. Release builds are
+    # CPU-bound; nothing else should share the machine meanwhile.
+    runs-on: [baremetal, local]
+    exclusive: true
+    timeout-minutes: 90
+    steps:
+      - name: ui
+        run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+      - name: build
+        run: ci/release/build.sh
+      - name: publish
+        run: ci/release/publish.sh
+    artifacts: ["dist/*"]
