@@ -17,7 +17,7 @@ use super::core::{Core, Effect, PreviewJob};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Hunk, Known, Level, Limit, McpServer, McpStatus,
     McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall, ToolKind, ToolStatus,
-    OUTPUT_MAX, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url,
+    OUTPUT_MAX, Route, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog,
 };
 
 /// Environment variables a Claude Code session sets for its children; a harness kiln starts must
@@ -114,6 +114,10 @@ enum Pending {
     McpChange(String),
     McpAuth { client: String, name: String },
     McpCallback { client: String, name: String },
+    /// A request whose answer is shown to one client as `{title, text}` (what it was for).
+    Info { client: String, what: &'static str },
+    /// reload_plugins: its commands, plugins and servers.
+    Plugins,
 }
 
 /// A run of the CLI kiln is waiting on.
@@ -176,6 +180,8 @@ pub struct Claude {
     skill_names: Vec<String>,
     /// The skill commands (reload_skills, asked for at start: before the first turn).
     skill_cmds: Vec<String>,
+    /// Commands bound to the terminal the CLI runs in (system/init; None before it).
+    terminal_cmds: Option<Vec<String>>,
     /// The plugins came from init (else from the settings' enabled plugins).
     plugins_from_init: bool,
     /// When the process started (ms), and how many times it has listed its MCP servers: servers
@@ -228,6 +234,7 @@ impl Claude {
             commands: Vec::new(),
             skill_names: Vec::new(),
             skill_cmds: Vec::new(),
+            terminal_cmds: None,
             plugins_from_init: false,
             started_at: 0,
             mcp_answers: 0,
@@ -393,6 +400,29 @@ impl Claude {
                 self.slash(core, &format!("Use the {kind} subagent for this task: {t}"));
             }
             "background" => self.request(core, Pending::Plain("background".into()), json!({"subtype": "background_tasks"})),
+            "fork" => match core.state.harness_session.clone() {
+                Some(session) => core.effects.push(Effect::Branch { resume: session, resume_at: None }),
+                None => self.notice(core, Level::Info, "Nothing to branch yet: the conversation starts with the first message.", None),
+            },
+            // Requests the catalog runs: their answer is shown to the client that asked.
+            "side_question" | "session_cost" | "export" | "plan" | "permission_rules" | "memory" | "workspace_diff" => {
+                let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("").to_owned();
+                let (what, body): (&'static str, Value) = match id {
+                    "side_question" => ("side_question", json!({"subtype": "side_question", "question": text()})),
+                    "session_cost" => ("session_cost", json!({"subtype": "get_session_cost"})),
+                    "export" => ("export", json!({"subtype": "export_conversation"})),
+                    "plan" => ("plan", json!({"subtype": "get_plan"})),
+                    "permission_rules" => ("permission_rules", json!({"subtype": "list_permission_rules"})),
+                    "memory" => ("memory", json!({"subtype": "get_memory_dialog"})),
+                    _ => ("workspace_diff", json!({"subtype": "get_workspace_diff"})),
+                };
+                if what == "side_question" && text().trim().is_empty() {
+                    core.reply(client, json!({"error": "Ask something after /btw."}));
+                    return;
+                }
+                self.request(core, Pending::Info { client, what }, body);
+            }
+            "reload_plugins" => self.request(core, Pending::Plugins, json!({"subtype": "reload_plugins"})),
             "task_output" => {
                 let task = value.as_ref().and_then(|v| v.get("task")).and_then(Value::as_str).unwrap_or("").to_owned();
                 let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("task_output").to_owned();
@@ -478,6 +508,10 @@ impl Claude {
         core.meta.modes = modes(self.allow_bypass);
         // Effort can be set from the start (initialize narrows the levels to the model's).
         core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
+        // kiln's commands until the CLI lists its own.
+        if core.meta.commands.is_empty() {
+            core.meta.commands = sort_catalog(claude_catalog());
+        }
         core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images"]
             .iter()
             .map(|s| (*s).to_owned())
@@ -876,18 +910,75 @@ impl Claude {
     /// The slash commands, for the console's menu and the skills.
     fn set_commands(&mut self, core: &mut Core, cmds: &[Value]) {
         self.commands = cmds.to_vec();
-        core.meta.commands = cmds
-            .iter()
-            .filter_map(|c| {
-                Some(SlashCommand {
-                    name: str_of(c, "name")?.to_owned(),
-                    description: str_of(c, "description").unwrap_or("").chars().take(300).collect(),
-                    hint: str_of(c, "argumentHint").unwrap_or("").to_owned(),
-                })
-            })
-            .collect();
-        core.touch_meta();
         self.rebuild_skills(core);
+        self.refresh_catalog(core);
+    }
+
+    fn refresh_catalog(&self, core: &mut Core) {
+        let catalog = self.catalog(core);
+        if core.meta.commands != catalog {
+            core.meta.commands = catalog;
+            core.touch_meta();
+        }
+    }
+
+    /// The command catalog: the CLI's own commands (sent as they are, or done by kiln's panels and
+    /// controls where kiln does them itself), its skills, plugins' and MCP servers' commands, and
+    /// the commands of Claude Code's terminal interface kiln does itself (/btw, /cost, /export ...)
+    /// or cannot do (with why).
+    fn catalog(&self, core: &Core) -> Vec<SlashCommand> {
+        let table = claude_catalog();
+        // Bound to the CLI's terminal: init says which; until it comes (with the first turn), the
+        // ones 2.1.296 names.
+        let terminal: Vec<&str> = match &self.terminal_cmds {
+            Some(t) => t.iter().map(String::as_str).collect(),
+            None => TERMINAL_COMMANDS.to_vec(),
+        };
+        // Rows can share a name: /name runs the one marked builtin.
+        let marked: std::collections::HashSet<&str> = self.commands.iter().filter(|c| c.get("builtin").and_then(Value::as_bool) == Some(true)).filter_map(|c| str_of(c, "name")).collect();
+        let mut out = Vec::new();
+        for c in &self.commands {
+            let Some(name) = str_of(c, "name") else { continue };
+            let builtin = c.get("builtin").and_then(Value::as_bool) == Some(true);
+            if name.starts_with("__") || (!builtin && marked.contains(name)) {
+                continue;
+            }
+            let (desc, source) = split_source(str_of(c, "description").unwrap_or(""));
+            let desc = clip_middle(&desc, 300).0;
+            let hint = str_of(c, "argumentHint").unwrap_or("");
+            // Claude Code's own (marked so; or, from CLIs that do not mark them, not a user's,
+            // project's or plugin's).
+            let own = builtin || (source.is_none() && !name.contains(':') && !core.state.skills.iter().any(|s| s.name == name && s.source != "built-in"));
+            let mut entry = if let Some(k) = table.iter().find(|k| k.name == name).filter(|_| own) {
+                // kiln's way of running it, in the CLI's words.
+                let mut k = k.clone();
+                if !desc.is_empty() {
+                    k.description.clone_from(&desc);
+                }
+                k
+            } else if terminal.contains(&name) {
+                SlashCommand::unsupported(name, &desc, "Session", "it works on the terminal Claude Code runs in")
+            } else if name.ends_with(" (MCP)") {
+                SlashCommand::prompt(name, &desc, hint, "Tools & MCP")
+            } else if core.state.skills.iter().any(|s| s.name == name) {
+                let group = if name.contains(':') && !name.starts_with("anthropic-skills:") { "Plugins" } else { "Skills" };
+                SlashCommand::new(name, &desc, hint, group, Route::Prompt { text: None, skill: true })
+            } else if name.contains(':') {
+                SlashCommand::prompt(name, &desc, hint, "Plugins")
+            } else if builtin {
+                SlashCommand::prompt(name, &desc, hint, claude_group(name))
+            } else {
+                SlashCommand::prompt(name, &desc, hint, "Skills")
+            };
+            let aliases: Vec<&str> = c.get("aliases").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+            if !aliases.is_empty() {
+                entry = entry.aka(&aliases);
+            }
+            out.push(entry);
+        }
+        // Those the CLI does not list (it lists what works without its terminal interface).
+        out.extend(table);
+        sort_catalog(out)
     }
 
     /// State::skills (and the plugins' skill lists) from the commands, init's skills and the
@@ -901,7 +992,9 @@ impl Claude {
             let builtin = c.get("builtin").and_then(Value::as_bool) == Some(true);
             let r = row(name);
             // Claude Code's own commands (/compact ...) are not skills; its bundled skills are.
-            if builtin && r.is_none() && !known(name) {
+            // (Older CLIs do not mark their own commands: those kiln knows count as such.)
+            let cli_own = builtin || (claude_catalog().iter().any(|k| k.name == name) && split_source(str_of(c, "description").unwrap_or("")).1.is_none());
+            if cli_own && r.is_none() && !known(name) {
                 continue;
             }
             let (desc, hint) = split_source(str_of(c, "description").unwrap_or(""));
@@ -956,6 +1049,7 @@ impl Claude {
             core.state.skills = out;
             core.state.plugins = plugins;
             core.touch_state();
+            self.refresh_catalog(core);
         }
     }
 
@@ -1185,7 +1279,8 @@ impl Claude {
         if !ok {
             let err = str_of(resp, "error").unwrap_or("request failed").to_owned();
             match kind {
-                Pending::Suggest(client) | Pending::Reply(client) | Pending::McpAuth { client, .. } | Pending::McpCallback { client, .. } => core.reply(client, json!({"error": err})),
+                Pending::Suggest(client) | Pending::Reply(client) | Pending::McpAuth { client, .. } | Pending::McpCallback { client, .. } | Pending::Info { client, .. } => core.reply(client, json!({"error": err})),
+                Pending::Plugins => self.notice(core, Level::Warn, format!("Reloading plugins: {err}"), None),
                 Pending::Initialize | Pending::ContextUsage | Pending::Settings | Pending::McpStatus | Pending::Hooks | Pending::SkillsDialog => {}
                 Pending::Usage => {
                     core.state.inventory.limits = Known::Unsupported;
@@ -1347,6 +1442,21 @@ impl Claude {
                 core.reply(client, json!({"ok": true, "message": format!("Signed in to {name}.")}));
                 // Signed in through kiln, the CLI does not connect by itself: it is asked to.
                 self.request(core, Pending::McpChange(format!("Reconnect {name}")), json!({"subtype": "mcp_reconnect", "serverName": name}));
+            }
+            Pending::Info { client, what } => core.reply(client, info_reply(what, &body)),
+            Pending::Plugins => {
+                if let Some(list) = body.get("mcpServers").and_then(Value::as_array) {
+                    core.state.mcp = list.iter().filter_map(claude_server).collect();
+                    core.touch_state();
+                }
+                if let Some(pl) = body.get("plugins").and_then(Value::as_array) {
+                    self.plugins = plugins_of(pl);
+                    self.plugins_from_init = true;
+                }
+                if let Some(cmds) = body.get("commands").and_then(Value::as_array) {
+                    self.set_commands(core, cmds);
+                }
+                self.ask_mcp(core);
             }
             Pending::Usage => {
                 core.state.inventory.limits = Known::Ready;
@@ -1519,6 +1629,8 @@ impl Claude {
                     self.skill_names = sk.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect();
                     core.state.inventory.skills = Known::Ready;
                 }
+                // (Absent when there are none, and from CLIs that predate it.)
+                self.terminal_cmds = Some(v.get("terminal_slash_commands").and_then(Value::as_array).into_iter().flatten().filter_map(|x| x.as_str().map(str::to_owned)).collect());
                 if let Some(pl) = v.get("plugins").and_then(Value::as_array) {
                     self.plugins = plugins_of(pl);
                     self.plugins_from_init = true;
@@ -1541,6 +1653,8 @@ impl Claude {
                     self.count_prompts(core);
                 }
                 self.rebuild_skills(core);
+                // Commands bound to the CLI's terminal are known now.
+                self.refresh_catalog(core);
                 core.touch_state();
                 // The model in use is known now: its effort levels.
                 self.refresh_controls(core);
@@ -2242,6 +2356,171 @@ impl Claude {
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
+}
+
+/// Claude Code's commands kiln runs itself (with a panel or a control) instead of sending them as
+/// text, and those of its terminal interface kiln cannot run, with why. The CLI's list wins for
+/// the rest: what it lists works when sent as text.
+fn claude_catalog() -> Vec<SlashCommand> {
+    let c = |name: &str, desc: &str, hint: &str, group: &str, command: Value| SlashCommand::control(name, desc, hint, group, command);
+    // A request whose answer is shown to the client that asked.
+    let ask = |name: &str, desc: &str, group: &str, id: &str| SlashCommand::control(name, desc, "", group, json!({"type": "control", "id": id, "value": {"client": "{client}"}}));
+    let v = SlashCommand::view;
+    let no = SlashCommand::unsupported;
+    let account = "it changes the account or its settings: use Claude Code in a terminal";
+    let cloud = "it hands the session to Anthropic's cloud or another app: use Claude Code in a terminal";
+    let terminal = "a setting of Claude Code's terminal interface";
+    vec![
+        // Session.
+        ask("cost", "What this session has cost so far", "Session", "session_cost"),
+        ask("export", "The conversation as text", "Session", "export"),
+        v("status", "Version, model, account, API connectivity and tool statuses", "Session", "status").aka(&["version"]),
+        v("usage", "Session cost, plan usage and what counts against the limits", "Session", "usage").aka(&["stats"]),
+        c("rename", "Rename the conversation", "<name>", "Session", json!({"type": "control", "id": "rename", "value": "{args}"})).aka(&["name"]),
+        c("branch", "Continue this conversation in another agent", "", "Session", json!({"type": "control", "id": "fork"})),
+        no("resume", "Resume a previous conversation", "Session", "continue another conversation from kiln's agents list").aka(&["continue"]),
+        no("exit", "Quit", "Session", "close the agent in kiln").aka(&["quit"]),
+        no("stop", "Stop this background session", "Session", "close the agent in kiln"),
+        no("background", "Send this session to the background", "Session", "an agent in kiln runs on its own: closing the console leaves it running").aka(&["bg"]),
+        no("login", "Sign in", "Session", "signing in or out changes the account: do it in a terminal"),
+        no("logout", "Sign out", "Session", "signing in or out changes the account: do it in a terminal"),
+        no("feedback", "Send feedback or report a bug", "Session", "it sends the conversation to Anthropic: use the CLI for that").aka(&["bug"]),
+        no("copy", "Copy the last response", "Session", "copy from the console"),
+        no("cd", "Move this session to another folder", "Session", "an agent's folder is set when it starts"),
+        no("fork", "A background agent that inherits the conversation", "Session", "Claude Code's in-session forks need its terminal interface: /branch continues the conversation in another agent"),
+        no("upgrade", "Upgrade the plan", "Session", account),
+        no("usage-credits", "Usage credits", "Session", account),
+        no("privacy-settings", "Privacy settings", "Session", account),
+        no("setup-bedrock", "Amazon Bedrock setup", "Session", account),
+        no("setup-vertex", "Google Vertex AI setup", "Session", account),
+        no("install-github-app", "Set up Claude GitHub Actions", "Session", "it sets up an integration step by step: use Claude Code in a terminal"),
+        no("install-slack-app", "Install the Claude Slack app", "Session", "it sets up an integration step by step: use Claude Code in a terminal"),
+        no("import", "Import another agent's configuration", "Session", "it changes Claude Code's settings: run it in a terminal"),
+        no("teleport", "Send the session to the cloud, or resume one from claude.ai", "Session", cloud).aka(&["tp"]),
+        no("remote-control", "Control this session from claude.ai", "Session", cloud).aka(&["rc"]),
+        no("session", "The cloud session's address", "Session", cloud).aka(&["remote"]),
+        no("desktop", "Continue in Claude Desktop", "Session", cloud).aka(&["app"]),
+        no("mobile", "The Claude mobile app", "Session", cloud).aka(&["ios", "android"]),
+        no("remote-env", "The cloud agents' environment", "Session", cloud),
+        no("web-setup", "Set up cloud sessions", "Session", cloud),
+        no("ultraplan", "Plan in the cloud", "Session", cloud),
+        no("ultrareview", "Review in the cloud", "Session", cloud),
+        no("autofix-pr", "Watch and fix the current pull request", "Session", cloud),
+        no("theme", "Change the theme", "Session", terminal),
+        no("color", "The prompt bar's color", "Session", terminal),
+        no("focus", "Focus view", "Session", terminal),
+        no("tui", "The terminal renderer", "Session", terminal),
+        no("scroll-speed", "Mouse wheel scroll speed", "Session", terminal),
+        no("terminal-setup", "Terminal key bindings", "Session", terminal),
+        no("voice", "Voice mode", "Session", terminal),
+        no("ide", "IDE integrations", "Context", "Claude Code's IDE integration needs its terminal interface"),
+        // Model & mode.
+        v("model", "The model and its effort", "Model & mode", "model"),
+        v("effort", "The model's effort", "Model & mode", "model"),
+        v("output-style", "How it writes its replies", "Model & mode", "settings"),
+        ask("permissions", "The permission rules in force, and where each comes from", "Model & mode", "permission_rules").aka(&["allowed-tools"]),
+        ask("plan", "Show the current plan", "Model & mode", "plan"),
+        // Context.
+        c("compact", "Summarize the conversation to free context", "[instructions]", "Context", json!({"type": "control", "id": "compact", "value": {"text": "{args}"}})),
+        c("clear", "Start the conversation over (files stay as they are)", "", "Context", json!({"type": "control", "id": "clear"})),
+        c("btw", "Ask a side question; the answer is not added to the conversation", "<question>", "Context", json!({"type": "control", "id": "side_question", "value": {"text": "{args}", "client": "{client}"}})),
+        v("context", "How full the context is", "Context", "context"),
+        ask("memory", "The memory files this session reads", "Context", "memory"),
+        v("diff", "What this agent changed", "Context", "changes"),
+        ask("git-diff", "The workspace's git diff, file by file", "Context", "workspace_diff"),
+        // Tools & MCP.
+        v("mcp", "MCP servers: status, tools, sign-in", "Tools & MCP", "mcp"),
+        v("hooks", "Hooks that run on events", "Tools & MCP", "hooks"),
+        v("tasks", "Subagents, shells and monitors", "Tools & MCP", "tasks").aka(&["bashes"]),
+        v("workflows", "Running and finished workflows", "Tools & MCP", "tasks"),
+        // Skills and plugins.
+        v("skills", "Skills: view and run", "Skills", "skills"),
+        SlashCommand::new("reload-skills", "Pick up skills added or changed on disk", "", "Skills", Route::Control { command: json!({"type": "skills_reload"}) }),
+        v("plugin", "Installed plugins", "Plugins", "plugins").aka(&["plugins"]),
+        c("reload-plugins", "Activate plugin changes in this session", "", "Plugins", json!({"type": "control", "id": "reload_plugins"})),
+        // kiln's own.
+        c("stop-tasks", "Stop every shell, monitor and task this agent left running", "", "Kiln", json!({"type": "stop_tasks"})),
+        c("restart", "Start Claude Code again, continuing the conversation", "", "Kiln", json!({"type": "restart"})),
+    ]
+}
+
+/// The commands Claude Code 2.1.296 binds to its terminal (init's terminal_slash_commands).
+const TERMINAL_COMMANDS: &[&str] = &["doctor", "color", "focus", "reload-plugins"];
+
+/// The group of a command of Claude Code's own that is sent as text.
+fn claude_group(name: &str) -> &'static str {
+    match name {
+        "init" | "security-review" | "autocompact" => "Context",
+        "fast" | "auto-mode-setup" => "Model & mode",
+        "agents" | "list-agents" => "Tools & MCP",
+        _ => "Session",
+    }
+}
+
+/// The answer to an informational request, as `{title, text, format?, ...}`.
+fn info_reply(what: &str, body: &Value) -> Value {
+    match what {
+        "side_question" => json!({"title": "Side question", "text": str_of(body, "response").unwrap_or(""), "format": "markdown"}),
+        "session_cost" => json!({"title": "Cost", "text": strip_ansi(str_of(body, "text").unwrap_or(""))}),
+        "export" => json!({"title": "Conversation", "text": str_of(body, "text").unwrap_or(""), "filename": str_of(body, "default_filename")}),
+        "plan" => match body.get("exists").and_then(Value::as_bool) {
+            Some(true) => json!({"title": "Plan", "text": str_of(body, "content").unwrap_or(""), "format": "markdown", "path": str_of(body, "path")}),
+            _ => json!({"title": "Plan", "text": "No plan has been written in this session."}),
+        },
+        "permission_rules" => {
+            let st = body.get("state").unwrap_or(body);
+            let mut lines: Vec<String> = st
+                .get("rules")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|r| format!("{:<5} {}  ({})", str_of(r, "behavior").unwrap_or(""), str_of(r, "rule").unwrap_or(""), str_of(r, "source").unwrap_or("")))
+                .collect();
+            if lines.is_empty() {
+                lines.push("No permission rules: everything not allowed by the mode asks.".to_owned());
+            }
+            let dirs: Vec<&str> = st.get("workspaceDirectories").and_then(Value::as_array).into_iter().flatten().filter_map(|d| d.as_str().or_else(|| str_of(d, "path"))).collect();
+            if !dirs.is_empty() {
+                lines.push(format!("\nWorkspace directories: {}", dirs.join(", ")));
+            }
+            json!({"title": "Permission rules", "text": lines.join("\n")})
+        }
+        "memory" => {
+            let row = |f: &Value| {
+                let missing = if f.get("exists").and_then(Value::as_bool) == Some(false) { " (not created)" } else { "" };
+                format!("{}  {}{missing}", str_of(f, "label").unwrap_or(""), str_of(f, "path").unwrap_or(""))
+            };
+            let mut lines: Vec<String> = body.get("files").and_then(Value::as_array).into_iter().flatten().map(row).collect();
+            if lines.is_empty() {
+                lines.push("No memory files.".to_owned());
+            }
+            let folders: Vec<String> = body.get("folders").and_then(Value::as_array).into_iter().flatten().map(row).collect();
+            if !folders.is_empty() {
+                lines.push(String::new());
+                lines.extend(folders);
+            }
+            if let Some(on) = body.pointer("/auto_memory/enabled").and_then(Value::as_bool) {
+                lines.push(format!("\nAuto-memory: {}", if on { "on" } else { "off" }));
+            }
+            json!({"title": "Memory", "text": lines.join("\n")})
+        }
+        _ => match body.get("diff").filter(|d| d.is_object()) {
+            Some(d) => {
+                let mut lines: Vec<String> = d
+                    .get("perFileStats")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|f| format!("+{:<5} -{:<5} {}", f.get("added").and_then(Value::as_i64).unwrap_or(0), f.get("removed").and_then(Value::as_i64).unwrap_or(0), str_of(f, "path").unwrap_or("")))
+                    .collect();
+                if let Some(s) = d.get("stats") {
+                    lines.insert(0, format!("{} files, +{} -{}", s.get("filesCount").and_then(Value::as_i64).unwrap_or(0), s.get("linesAdded").and_then(Value::as_i64).unwrap_or(0), s.get("linesRemoved").and_then(Value::as_i64).unwrap_or(0)));
+                }
+                json!({"title": "Git diff", "text": lines.join("\n")})
+            }
+            None => json!({"title": "Git diff", "text": "No changes (or not a git repository)."}),
+        },
+    }
 }
 
 /// What a task is, from Claude Code's `task_type` and the tool that started it.
@@ -2999,7 +3278,9 @@ mod tests {
 
         // Meta from initialize, state from init.
         assert_eq!(core.meta.version, "2.1.296");
-        assert_eq!(core.meta.commands.first().map(|c| c.name.as_str()), Some("compact"));
+        // The CLI's /compact, done through kiln's control.
+        let compact = core.meta.commands.iter().find(|c| c.name == "compact").cloned().unwrap_or_else(|| SlashCommand::prompt("", "", "", ""));
+        assert!(matches!(&compact.route, Route::Control { command } if command.get("id") == Some(&json!("compact"))) && compact.group == "Context");
         assert_eq!(core.state.harness_session.as_deref(), Some("9e27860a-3c18-4752-86c6-d427ca280b36"));
         assert_eq!(core.state.cwd, "/work");
         // The prompt (our id), the streamed reply and the call, in order.
@@ -3244,6 +3525,126 @@ mod tests {
     }
 
     #[test]
+    fn the_command_catalog_routes_each_command() -> anyhow::Result<()> {
+        let mut c = Claude::new(false).with_config_dir("/home/u/.claude".into());
+        let mut core = Core::new();
+        c.start(&mut core);
+        // Before the CLI lists its commands: kiln's.
+        assert!(core.meta.commands.iter().any(|e| e.name == "btw"));
+        let reqs = requests(&mut core);
+        // Claude Code 2.1.296's list (abridged): its own commands and bundled skills marked
+        // builtin, with aliases; a user's skill; an MCP prompt; a hidden one.
+        let commands = json!([
+            {"name": "kiln-test", "description": "A test skill. (user)", "argumentHint": "<word>"},
+            {"name": "init", "description": "My own init. (user)", "argumentHint": ""},
+            {"name": "deep-research", "description": "Deep research.", "argumentHint": "", "builtin": true},
+            {"name": "doctor", "description": "Health-check the setup", "argumentHint": "", "aliases": ["checkup"], "builtin": true},
+            {"name": "clear", "description": "Start a new session with empty context", "argumentHint": "[name]", "aliases": ["reset", "new"], "builtin": true},
+            {"name": "compact", "description": "Free up context", "argumentHint": "<optional custom summarization instructions>", "builtin": true},
+            {"name": "color", "description": "Set the prompt bar color", "argumentHint": "", "builtin": true},
+            {"name": "init", "description": "Initialize a new CLAUDE.md", "argumentHint": "", "builtin": true},
+            {"name": "config", "description": "Set a setting by key", "argumentHint": "key=value", "aliases": ["settings"], "builtin": true},
+            {"name": "reload-plugins", "description": "Activate pending plugin changes", "argumentHint": "[--force]", "builtin": true},
+            {"name": "usage", "description": "Show session cost and plan usage", "argumentHint": "", "aliases": ["cost", "stats"], "builtin": true},
+            {"name": "__remote-workflow", "description": "Internal", "argumentHint": "", "builtin": true},
+            {"name": "echo-srv:greet (MCP)", "description": "Greets", "argumentHint": "[name]"}
+        ]);
+        reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": commands, "models": [], "claude_code_version": "2.1.296"}));
+        // Before init (it comes with the first turn): the terminal's commands 2.1.296 names.
+        assert!(core.meta.commands.iter().any(|e| e.name == "doctor" && matches!(e.route, Route::Unsupported { .. })));
+        c.line(
+            &mut core,
+            &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s1", "model": "m", "permissionMode": "default",
+                "skills": ["kiln-test", "deep-research"], "terminal_slash_commands": ["doctor", "color", "reload-plugins"]})
+            .to_string(),
+        );
+        let cat = core.meta.commands.clone();
+        let get = |n: &str| cat.iter().find(|e| e.name == n).cloned().unwrap_or_else(|| SlashCommand::prompt("", "", "", ""));
+        let control = |n: &str| match get(n).route {
+            Route::Control { command } => command.get("id").or_else(|| command.get("type")).and_then(Value::as_str).unwrap_or("").to_owned(),
+            _ => String::new(),
+        };
+        // The CLI's own commands kiln does itself, in the CLI's words.
+        assert_eq!((control("compact"), get("compact").group.as_str(), get("compact").description.as_str()), ("compact".to_owned(), "Context", "Free up context"));
+        assert_eq!(control("clear"), "clear");
+        assert_eq!(get("clear").aliases, vec!["reset", "new"]);
+        assert_eq!(control("reload-plugins"), "reload_plugins");
+        assert!(matches!(get("usage").route, Route::View { view } if view == "usage"));
+        // kiln's /cost takes the name the CLI uses as an alias of /usage.
+        assert_eq!((control("cost"), get("usage").aliases), ("session_cost".to_owned(), vec!["stats".to_owned()]));
+        // What the CLI lists that kiln leaves to it: sent as text (/init runs the CLI's own, not
+        // the user's row of that name).
+        assert!(matches!(get("init").route, Route::Prompt { text: None, .. }) && get("init").description == "Initialize a new CLAUDE.md");
+        assert!(matches!(get("config").route, Route::Prompt { .. }) && get("config").aliases == ["settings"]);
+        // Skills (bundled ones too), MCP prompts.
+        assert!(matches!(get("kiln-test").route, Route::Prompt { skill: true, .. }) && get("kiln-test").group == "Skills" && get("kiln-test").args == "required");
+        assert!(matches!(get("deep-research").route, Route::Prompt { skill: true, .. }));
+        assert_eq!(get("echo-srv:greet (MCP)").group, "Tools & MCP");
+        // Bound to the CLI's terminal, or not runnable from kiln: why.
+        assert!(matches!(get("doctor").route, Route::Unsupported { reason } if reason.contains("terminal")));
+        assert!(matches!(get("color").route, Route::Unsupported { .. }));
+        assert!(matches!(get("login").route, Route::Unsupported { reason } if reason.contains("account")));
+        // kiln's own requests: the CLI does not list them.
+        assert_eq!((control("btw"), get("btw").args.as_str()), ("side_question".to_owned(), "required"));
+        assert_eq!((control("permissions"), control("plan"), control("memory"), control("git-diff"), control("export")), ("permission_rules".into(), "plan".into(), "memory".into(), "workspace_diff".into(), "export".into()));
+        assert!(!cat.iter().any(|e| e.name.starts_with("__")));
+        let mut names: Vec<&str> = cat.iter().flat_map(|e| std::iter::once(e.name.as_str()).chain(e.aliases.iter().map(String::as_str))).collect();
+        let n = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), n, "a name or alias twice");
+        Ok(())
+    }
+
+    #[test]
+    fn the_catalogs_requests_answer_the_client_that_asked() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = started();
+        let ask = |c: &mut Claude, core: &mut Core, id: &str, value: Value| {
+            c.command(core, Command::Control { id: id.into(), value: Some(value) });
+            requests(core)
+        };
+        // /btw: a side question, its answer to that client alone.
+        let reqs = ask(&mut c, &mut core, "side_question", json!({"text": "what is 2+2?", "client": "k1"}));
+        assert_eq!(reqs.first().map(|r| r.2.clone()), Some(json!({"subtype": "side_question", "question": "what is 2+2?"})));
+        reply_to(&mut c, &mut core, &reqs, "side_question", json!({"response": "4", "synthetic": false}));
+        assert_eq!(replies(&mut core), vec![("k1".to_owned(), json!({"title": "Side question", "text": "4", "format": "markdown"}))]);
+        // Nothing asked: not sent.
+        let reqs = ask(&mut c, &mut core, "side_question", json!({"text": " ", "client": "k2"}));
+        assert!(reqs.is_empty() && replies(&mut core).iter().any(|(cl, v)| cl == "k2" && v.get("error").is_some()));
+        // /cost without the terminal's colors.
+        let reqs = ask(&mut c, &mut core, "session_cost", json!({"client": "k3"}));
+        reply_to(&mut c, &mut core, &reqs, "get_session_cost", json!({"text": "\u{1b}[1mTotal cost:\u{1b}[22m $0.12"}));
+        assert_eq!(replies(&mut core).first().and_then(|r| r.1.get("text").cloned()), Some(json!("Total cost: $0.12")));
+        // /plan with none written; /git-diff outside a repository; /memory's files and folders.
+        let reqs = ask(&mut c, &mut core, "plan", json!({"client": "k4"}));
+        reply_to(&mut c, &mut core, &reqs, "get_plan", json!({"exists": false}));
+        let reqs = ask(&mut c, &mut core, "workspace_diff", json!({"client": "k5"}));
+        reply_to(&mut c, &mut core, &reqs, "get_workspace_diff", json!({"diff": null}));
+        let reqs = ask(&mut c, &mut core, "memory", json!({"client": "k6"}));
+        reply_to(
+            &mut c,
+            &mut core,
+            &reqs,
+            "get_memory_dialog",
+            json!({"files": [{"kind": "user", "path": "/home/u/.claude/CLAUDE.md", "label": "User memory", "description": "", "exists": false}], "folders": [{"kind": "auto", "path": "/home/u/.claude/projects/w/memory", "label": "Auto-memory folder", "description": ""}], "auto_memory": {"enabled": true, "toggleable": true}}),
+        );
+        let r = replies(&mut core);
+        let text = |cl: &str| r.iter().find(|x| x.0 == cl).and_then(|x| x.1.get("text").and_then(Value::as_str).map(str::to_owned)).unwrap_or_default();
+        assert!(text("k4").starts_with("No plan"), "{r:?}");
+        assert!(text("k5").starts_with("No changes"), "{r:?}");
+        assert!(text("k6").contains("User memory  /home/u/.claude/CLAUDE.md (not created)") && text("k6").contains("Auto-memory folder") && text("k6").ends_with("Auto-memory: on"), "{r:?}");
+        // A request the CLI refuses answers with its error.
+        let reqs = ask(&mut c, &mut core, "permission_rules", json!({"client": "k7"}));
+        let id = reqs.first().map(|r| r.0.clone()).unwrap_or_default();
+        c.line(&mut core, &json!({"type": "control_response", "response": {"subtype": "error", "request_id": id, "error": "nope"}}).to_string());
+        assert_eq!(replies(&mut core), vec![("k7".to_owned(), json!({"error": "nope"}))]);
+        // /branch: the whole conversation, continued in another agent.
+        c.command(&mut core, Command::Control { id: "fork".into(), value: None });
+        assert!(matches!(core.effects.pop(), Some(Effect::Branch { resume, resume_at: None }) if resume == "s1"));
+        Ok(())
+    }
+
+    #[test]
     fn plan_limits_account_and_status_as_the_cli_reports_them() -> anyhow::Result<()> {
         let (mut c, mut core, reqs) = started();
         let subtypes: Vec<&str> = reqs.iter().map(|r| r.1.as_str()).collect();
@@ -3457,7 +3858,8 @@ mod tests {
         assert!(requests(&mut core).iter().any(|r| r.1 == "get_skills_dialog"));
         // A pushed command list replaces the old one.
         c.line(&mut core, &json!({"type": "system", "subtype": "commands_changed", "commands": [{"name": "kiln-test", "description": "Changed. (user)", "argumentHint": ""}], "uuid": "u", "session_id": "s1"}).to_string());
-        assert!(core.meta.commands.len() == 1 && core.state.skills.iter().any(|s| s.name == "kiln-test" && s.description == "A test skill."));
+        let skills_in_catalog: Vec<&str> = core.meta.commands.iter().filter(|c| c.group == "Skills" && matches!(c.route, Route::Prompt { skill: true, .. })).map(|c| c.name.as_str()).collect();
+        assert!(skills_in_catalog == ["kiln-test"] && core.state.skills.iter().any(|s| s.name == "kiln-test" && s.description == "A test skill."), "{skills_in_catalog:?}");
         Ok(())
     }
 

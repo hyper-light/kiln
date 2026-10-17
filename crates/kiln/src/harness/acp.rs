@@ -17,8 +17,20 @@ use serde_json::{Value, json};
 use super::core::{Baseline, Core};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, QueueItem, SendMode,
-    Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle,
+    Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle, sort_catalog,
 };
+
+/// kiln's own commands for an ACP agent.
+fn acp_extras() -> Vec<SlashCommand> {
+    vec![
+        SlashCommand::control("export", "The conversation as Markdown", "", "Session", json!({"type": "control", "id": "export", "value": {"client": "{client}"}})),
+        SlashCommand::view("status", "The agent and what it can do", "Session", "status"),
+        SlashCommand::view("model", "The model and mode", "Model & mode", "model"),
+        SlashCommand::view("diff", "What this agent changed", "Context", "changes"),
+        SlashCommand::control("restart", "Start the agent again", "", "Kiln", json!({"type": "restart"})),
+        SlashCommand::view("new", "Start another agent", "Kiln", "new_agent"),
+    ]
+}
 
 /// What an ACP agent cannot do from kiln.
 const UNSUPPORTED: &str = "This agent's protocol (ACP) has no way to manage its MCP servers or skills from kiln.";
@@ -143,6 +155,10 @@ impl Acp {
     pub fn start(&mut self, core: &mut Core) {
         core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments"].iter().map(|s| (*s).to_owned()).collect();
         core.touch_meta();
+        // kiln's commands until the agent lists its own.
+        if core.meta.commands.is_empty() {
+            core.meta.commands = sort_catalog(acp_extras());
+        }
         // ACP has no way to report MCP servers, skills, plugins or plan limits.
         core.state.inventory = Inventory { mcp: Known::Unsupported, skills: Known::Unsupported, plugins: Known::Unsupported, limits: Known::Unsupported };
         core.touch_state();
@@ -214,7 +230,12 @@ impl Acp {
                 }
             }
             Command::Suggest { client, .. } => core.reply(client, json!({"suggestions": []})),
-            // ACP has no effort setting and no other controls than modes and models.
+            // ACP has no effort setting and no other controls than modes and models; kiln exports
+            // the conversation from its timeline.
+            Command::Control { id, value } if id == "export" => {
+                let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("").to_owned();
+                core.reply(client, json!({"title": "Conversation", "text": core.export(), "format": "markdown", "filename": "conversation.md"}));
+            }
             Command::SetEffort { .. } | Command::Control { .. } => {}
             Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::Snapshot => {}
             // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
@@ -679,21 +700,21 @@ impl Acp {
                 core.touch_state();
             }
             "available_commands_update" => {
-                core.meta.commands = u
+                let mut cmds: Vec<SlashCommand> = u
                     .get("availableCommands")
                     .and_then(Value::as_array)
                     .map(|cs| {
                         cs.iter()
                             .filter_map(|c| {
-                                Some(SlashCommand {
-                                    name: c.get("name")?.as_str()?.to_owned(),
-                                    description: c.get("description").and_then(Value::as_str).unwrap_or("").to_owned(),
-                                    hint: c.pointer("/input/hint").and_then(Value::as_str).unwrap_or("").to_owned(),
-                                })
+                                let name = c.get("name")?.as_str()?;
+                                let hint = c.pointer("/input/hint").and_then(Value::as_str).map(|h| format!("[{h}]")).unwrap_or_default();
+                                Some(SlashCommand::prompt(name, c.get("description").and_then(Value::as_str).unwrap_or(""), &hint, "Session"))
                             })
                             .collect()
                     })
                     .unwrap_or_default();
+                cmds.extend(acp_extras());
+                core.meta.commands = sort_catalog(cmds);
                 core.touch_meta();
             }
             "current_mode_update" => {
@@ -848,6 +869,37 @@ mod tests {
         for m in msgs {
             a.line(core, &m.to_string());
         }
+    }
+
+    #[test]
+    fn the_agents_commands_and_kilns_in_one_catalog() -> anyhow::Result<()> {
+        use super::super::model::Route;
+        let mut core = Core::new();
+        let mut a = Acp::new(None);
+        a.start(&mut core);
+        assert!(core.meta.commands.iter().any(|c| c.name == "export"));
+        feed(
+            &mut a,
+            &mut core,
+            &[json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "available_commands_update", "availableCommands": [
+                {"name": "init", "description": "Write AGENTS.md", "input": null},
+                {"name": "review", "description": "Review changes", "input": {"hint": "what to review"}},
+                {"name": "export", "description": "The agent's own export"}
+            ]}}})],
+        );
+        let get = |n: &str| core.meta.commands.iter().find(|c| c.name == n).cloned();
+        // The agent's commands are sent as text; its own wins over kiln's of the same name.
+        assert!(matches!(get("review"), Some(c) if c.hint == "[what to review]" && c.args == "optional" && matches!(c.route, Route::Prompt { text: None, skill: false })));
+        assert!(matches!(get("export").map(|c| c.route), Some(Route::Prompt { .. })));
+        assert!(matches!(get("diff").map(|c| c.route), Some(Route::View { view }) if view == "changes"));
+        // kiln's export from the timeline.
+        a.command(&mut core, Command::Control { id: "export".into(), value: Some(json!({"client": "k1"})) });
+        let reply = core.take_out().into_iter().find_map(|u| match u {
+            super::super::core::Update::Reply { client, value } => Some((client, value)),
+            _ => None,
+        });
+        assert!(matches!(reply, Some((c, v)) if c == "k1" && v.get("format") == Some(&json!("markdown"))));
+        Ok(())
     }
 
     #[test]

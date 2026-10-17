@@ -445,6 +445,26 @@ impl Core {
     pub fn take_writes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.writes)
     }
+
+    /// The conversation as Markdown, from the timeline (for harnesses without an export of their
+    /// own): what was said, and the tool calls in one line each.
+    pub fn export(&self) -> String {
+        use super::model::Body;
+        let mut out = String::new();
+        if !self.state.title.is_empty() {
+            out.push_str(&format!("# {}\n\n", self.state.title));
+        }
+        for e in self.events().filter(|e| e.parent.is_none()) {
+            match &e.body {
+                Body::User { text, origin, .. } if origin.as_deref() != Some("system") => out.push_str(&format!("## You\n\n{}\n\n", text.trim())),
+                Body::Assistant { text, .. } if !text.trim().is_empty() => out.push_str(&format!("## Agent\n\n{}\n\n", text.trim())),
+                Body::Tool(t) => out.push_str(&format!("- `{}` {}\n\n", t.name, t.title.lines().next().unwrap_or(""))),
+                Body::Notice { text, .. } => out.push_str(&format!("> {}\n\n", text.lines().next().unwrap_or(""))),
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
