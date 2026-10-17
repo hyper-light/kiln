@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
+pub mod ci;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
@@ -26,6 +28,8 @@ pub struct Config {
     pub discovery: Discovery,
     /// Deployments (docs/cd.md).
     pub cd: Cd,
+    /// CI (docs/ci.md).
+    pub ci: ci::Ci,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,

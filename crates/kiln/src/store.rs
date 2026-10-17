@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::PlannedJob;
 
+pub mod migrations;
+
 #[derive(Clone)]
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
@@ -214,14 +216,16 @@ impl Store {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d).with_context(|| format!("create {}", d.display()))?;
         }
-        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        let mut conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
+        migrations::apply(&mut conn).context("apply migrations")?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     pub fn in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrations::apply(&mut conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 

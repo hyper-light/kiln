@@ -1359,6 +1359,7 @@ dependencies = [
  "hyper-transport",
  "k8s-openapi",
  "kiln-cd",
+ "kiln-ci",
  "mime_guess",
  "nix 0.31.3",
  "parking_lot",
@@ -1414,6 +1415,15 @@ dependencies = [
  "tempfile",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "kiln-ci"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
