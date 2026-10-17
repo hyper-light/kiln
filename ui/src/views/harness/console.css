@@ -136,14 +136,9 @@
 }
 .ag-controls {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 14px;
-  padding-bottom: 2px;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.ag-controls::-webkit-scrollbar {
-  display: none;
 }
 .ag-chip {
   position: relative;
@@ -222,9 +217,42 @@
   .ag-cwd {
     max-width: 100%;
   }
+  /* Phones: equal tiles, two to a row, label over value — everything visible, nothing scrolls. */
   .ag-controls {
-    margin: 12px -14px 0;
-    padding: 0 14px 2px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .ag-chip {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "label chev"
+      "value chev";
+    row-gap: 2px;
+    height: auto;
+    min-height: 48px;
+    padding: 7px 12px;
+  }
+  .ag-chip-label {
+    grid-area: label;
+  }
+  .ag-chip-value {
+    grid-area: value;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .ag-chip > svg {
+    grid-area: chev;
+  }
+  .ag-chip:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+  .ag-chip-btn {
+    display: flex;
+    min-height: 48px;
   }
 }
 
@@ -375,23 +403,40 @@
   background: #d5a4ad;
 }
 .cp-mode-pick {
+  position: relative;
   display: none;
   flex: none;
-}
-.cp-mode-pick select {
-  height: 32px;
-  padding: 0 26px 0 11px;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 11px 0 13px;
   border: 1px solid #303239;
   border-radius: 999px;
-  background: #0b0c0e
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' fill='none' stroke='%23a1a4ad' stroke-width='1.5'%3E%3Cpath d='m2 3.5 3 3 3-3'/%3E%3C/svg%3E")
-    no-repeat right 10px center;
   color: #ededee;
-  font-family: var(--font-mono);
-  font-size: 16px;
-  appearance: none;
+  cursor: pointer;
 }
-.cp-mode-pick[data-mode="now"] select {
+.cp-mode-value {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.cp-mode-pick > svg {
+  color: #8f929b;
+}
+.cp-mode-pick select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  font-size: 16px;
+  cursor: pointer;
+}
+.cp-mode-pick:focus-within {
+  border-color: #bab0e3;
+}
+.cp-mode-pick[data-mode="now"] {
   border-color: #8a5d64;
   color: #ecc9cc;
 }
@@ -486,8 +531,8 @@
   }
   .cp-stop,
   .cp-send {
-    width: 36px;
-    height: 36px;
+    width: 34px;
+    height: 34px;
     padding: 0;
     justify-content: center;
   }
@@ -531,4 +576,46 @@
   color: #8f929b;
   font-size: 12.5px;
   line-height: 1.6;
+}
+
+/* ---------------------------------------------------------------- the conversation: your words on a slate, the agent's on the page */
+.hx-turn .hx-prompt {
+  position: relative;
+  overflow: hidden;
+  padding: 12px 14px 13px;
+  border: 1px solid #24242c;
+  border-radius: 9px;
+  background: #101015;
+}
+.hx-turn .hx-prompt::before {
+  position: absolute;
+  top: 0;
+  right: 18%;
+  left: 18%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #a7aed070, #b9a6c560, transparent);
+  content: "";
+}
+.hx-turn .hx-prompt[data-origin]:not([data-origin="human"]) {
+  background: #0d0d10;
+}
+.hx-turn .hx-prompt-text {
+  font-size: 15px;
+  line-height: 1.6;
+  color: #f2f2f3;
+}
+.hx-agent-label {
+  padding: 16px 0 4px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.hx-turn .hx-work {
+  border-top: 0;
+}
+.hx-turn .hx-note,
+.hx-turn .hx-outcome {
+  color: #d9dade;
 }

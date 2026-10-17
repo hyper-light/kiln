@@ -362,7 +362,10 @@ const TurnView = React.memo(function TurnView({
   onOpenTask,
   meta,
   onCommand,
+  agentLabel,
 }: {
+  /** Who answers (the harness's name), over the agent's side of the turn. */
+  agentLabel?: string;
   turn: Turn;
   cwd: string;
   tasks: Task[];
@@ -379,6 +382,7 @@ const TurnView = React.memo(function TurnView({
     <section className="hx-turn">
       {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} meta={meta} onCommand={onCommand} />}
       <div className="hx-work">
+        {agentLabel && (turn.items.length > 0 || turn.outcome || live) && <div className="hx-agent-label">{agentLabel}</div>}
         {turn.items.map((it) => (
           <ItemView key={it.key} item={it} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />
         ))}
@@ -417,7 +421,9 @@ export function Timeline({
   onOpenTask,
   onCommand,
   footer,
+  agentLabel,
 }: {
+  agentLabel?: string;
   events: HEvent[];
   state: State | null;
   meta?: Meta | null;
@@ -459,6 +465,7 @@ export function Timeline({
             onOpenTask={onOpenTask}
             meta={meta}
             onCommand={onCommand}
+            agentLabel={agentLabel}
           />
         ))}
         {footer}

@@ -1400,11 +1400,10 @@ textarea.hx-input {
 .hx-tabs {
   display: flex;
   flex: none;
+  flex-wrap: wrap;
   gap: 2px;
-  overflow-x: auto;
   padding: 0 10px;
   border-bottom: 1px solid #1d1f23;
-  scrollbar-width: none;
 }
 .hx-tab {
   position: relative;

@@ -5,7 +5,7 @@
  * on every device until they go out.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, CornerDownLeft, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, type Meta, type SendMode, type SessionStore, type State } from "@/api/harness";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -304,8 +304,9 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
                 ))}
               </div>
               <label className="cp-mode-pick" data-mode={mode}>
-                <span className="sr-only">How to send while it works</span>
-                <select value={mode} onChange={(e) => setMode(e.target.value as SendMode)}>
+                <span className="cp-mode-value">{modes.find((m) => m.id === mode)?.label ?? "Queue"}</span>
+                <ChevronDown size={11} aria-hidden="true" />
+                <select aria-label="How to send while it works" value={mode} onChange={(e) => setMode(e.target.value as SendMode)}>
                   {modes.map((m) => (
                     <option key={m.id} value={m.id}>
                       {m.label}

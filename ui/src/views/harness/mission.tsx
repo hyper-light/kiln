@@ -16,9 +16,9 @@ import { ErrorState, PageIntro, SkeletonRows } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useLocalStorage, useNow } from "@/lib/hooks";
 import { relativeTime } from "@/lib/format";
-import { money, plain } from "./derive";
+import { plain } from "./derive";
 import { AgentMenu } from "./actions";
-import { machineName } from "./parts";
+import { HarnessMark, machineName } from "./parts";
 import { useSeen } from "./seen";
 import { SpawnDialog } from "./spawn";
 import { useAgents } from "./use-agents";
@@ -235,7 +235,6 @@ export default function Mission() {
   const ended = rows.filter((r) => r.stand === "ended");
   const n = (s: Stand) => rows.filter((r) => r.stand === s).length;
   const machines = [...new Set(live.map((r) => machineName(r.a.target)))];
-  const cost = rows.reduce((t, r) => t + r.a.cost_usd, 0);
   // Sessions found on machines that kiln isn't running itself (started in a plain terminal).
   const elsewhere = found.filter((s) => !rows.some((r) => r.a.harness_session && r.a.harness_session === s.id));
 
@@ -246,7 +245,7 @@ export default function Mission() {
     ? "Every coding agent kiln runs, on every machine."
     : rows.length === 0
       ? "Start coding agents on any of your machines and run them all from here."
-      : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}. ${money(cost)} so far.`;
+      : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}.`;
 
   const select = React.useCallback((id: string, on: boolean) => {
     setSelected((s) => {
@@ -320,8 +319,17 @@ export default function Mission() {
 
       {elsewhere.length > 0 && (
         <Link to="/agents/sessions" className="ms-elsewhere">
-          {elsewhere.length} session{elsewhere.length === 1 ? "" : "s"} running outside kiln on your machines — watch or take over
-          <ArrowUpRight size={13} aria-hidden="true" />
+          <span className="ms-elsewhere-marks" aria-hidden="true">
+            {[...new Set(elsewhere.map((s) => s.tool))].slice(0, 3).map((t) => (
+              <HarnessMark key={t} kind={t} size={16} />
+            ))}
+          </span>
+          <span className="ms-elsewhere-text">
+            {elsewhere.length} session{elsewhere.length === 1 ? "" : "s"} running outside kiln · watch or take over
+          </span>
+          <span className="ms-go" aria-hidden="true">
+            <ArrowUpRight size={16} />
+          </span>
         </Link>
       )}
 

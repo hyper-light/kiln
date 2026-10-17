@@ -213,6 +213,28 @@ export function money(usd: number): string {
   return usd < 0.01 ? "<$0.01" : usd < 10 ? `$${usd.toFixed(2)}` : `$${Math.round(usd)}`;
 }
 
+/**
+ * What a harness's cost figure is: Claude Code and Codex report their own estimate at API list
+ * prices. On a subscription nobody is billed that; on an API key it's an estimate of the bill.
+ */
+export function costText(usd: number, plan?: string | null): { text: string; title: string } {
+  const m = money(usd);
+  const p = (plan ?? "").toLowerCase();
+  if (/api|bedrock|vertex|foundry|azure/.test(p)) return { text: `≈${m} est.`, title: "The agent's own estimate of the cost at API list prices." };
+  if (p && !/signed out|unknown/.test(p))
+    return { text: `≈${m} API value`, title: `The agent's estimate at API list prices. Your ${plan} plan isn't billed per token; its limits are under Tools → Usage.` };
+  return { text: `≈${m}`, title: "The agent's own estimate at API list prices." };
+}
+
+/** "claude-opus-5-5[1m]" → "Opus 5.5 (1M)"; anything else is shown as it is. */
+export function modelLabel(id: string): string {
+  const m = id.match(/^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)(?:-\d{8})?(\[1m\])?$/i);
+  if (m) return `${m[1]!.charAt(0).toUpperCase()}${m[1]!.slice(1).toLowerCase()} ${m[2]}.${m[3]}${m[4] ? " (1M)" : ""}`;
+  const alias = id.match(/^(opus|sonnet|haiku|fable|default)(\[1m\])?$/i);
+  if (alias) return `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1).toLowerCase()}${alias[2] ? " (1M)" : ""}`;
+  return id;
+}
+
 export function tokens(n: number | undefined): string {
   if (!n) return "0";
   return n < 1000 ? String(n) : n < 1_000_000 ? `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k` : `${(n / 1_000_000).toFixed(1)}M`;

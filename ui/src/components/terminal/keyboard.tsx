@@ -1,6 +1,6 @@
 import * as React from "react";
 import { ChevronDown, ChevronUp, Keyboard as KeyboardIcon, Smartphone } from "lucide-react";
-import { useLocalStorage } from "@/lib/hooks";
+import { useLocalStorage, useScrollEdges } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { charKey, namedKey, strokeBytes, type Mods, type NamedKey } from "./keys";
 import { PRESETS, presetFor } from "./presets";
@@ -97,6 +97,8 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
   const [shift, setShift] = React.useState<Latch>("off");
   const [layer, setLayer] = React.useState<Layer>("abc");
   const [presetOpen, setPresetOpen] = React.useState(false);
+  const shortcutEdges = useScrollEdges<HTMLDivElement>();
+  const extraEdges = useScrollEdges<HTMLDivElement>();
   // Per device: how tall the keys are (null: the default for the screen).
   const [keyHeight, setKeyHeight] = useLocalStorage<number | null>("kiln.term.keyboardKeyHeight", null);
   const open = fold === "open";
@@ -327,7 +329,7 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
             </div>
           )}
           {/* Shortcuts for the program in this session. */}
-          <div className="vk-row vk-scroll">
+          <div className="vk-row vk-scroll" ref={shortcutEdges}>
             <button type="button" className="vk-key vk-chip vk-preset" aria-haspopup="listbox" aria-expanded={presetOpen} {...press(() => setPresetOpen((o) => !o))}>
               {preset.name} <ChevronDown size={12} />
             </button>
@@ -347,7 +349,7 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
 
           {/* Keys a phone keyboard lacks. */}
           {open && (
-            <div className="vk-row vk-scroll">
+            <div className="vk-row vk-scroll" ref={extraEdges}>
               {onPaste && (
                 <button type="button" className="vk-key" aria-label="Paste" {...press(onPaste)}>
                   Paste

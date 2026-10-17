@@ -260,16 +260,32 @@
 .ms-fold-btn[aria-expanded="true"] .ms-chev {
   transform: rotate(90deg);
 }
+/* Sessions outside kiln: one more row, with the list's geometry. */
 .ms-elsewhere {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
+  gap: 0 20px;
   margin-top: 36px;
+  padding: 14px 8px 14px 6px;
+  border-top: 1px solid #2b2d32;
+  border-bottom: 1px solid #25272c;
   color: #a1a4ad;
   font-size: 13px;
 }
-.ms-elsewhere:hover {
+.ms-elsewhere:hover,
+.ms-elsewhere:hover .ms-go {
   color: #ededee;
+}
+.ms-elsewhere-marks {
+  display: flex;
+  justify-content: center;
+}
+.ms-elsewhere-marks > * + * {
+  margin-left: -6px;
+}
+.ms-elsewhere-text {
+  min-width: 0;
 }
 .ms-empty {
   padding: 56px 20px;
@@ -401,6 +417,11 @@
     white-space: normal;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
+  }
+  .ms-elsewhere {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 0 12px;
+    padding: 14px 4px 14px 12px;
   }
   .ms-meta {
     flex-direction: row;
