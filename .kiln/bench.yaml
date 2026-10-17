@@ -23,6 +23,7 @@ jobs:
       - name: hardware
         run: nproc && grep -m1 "model name" /proc/cpuinfo && free -h | head -2
   noise:
-    runs-on: [baremetal]
+    # The bench's own machine: the point is that it waits for the exclusive bench there.
+    runs-on: [baremetal, bench]
     steps:
       - run: echo "independent work; must not overlap the exclusive bench"; sleep 5
