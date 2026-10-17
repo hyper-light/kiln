@@ -33,6 +33,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -942,6 +948,8 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash",
 ]
 
@@ -1064,12 +1072,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-block"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "hyper-rt",
+ "libc",
+ "rustix",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hyper-datagram"
 version = "0.1.0"
 source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "aws-lc-rs",
  "crc32c",
+]
+
+[[package]]
+name = "hyper-durable"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "hyper-block",
+ "hyper-liveness",
+ "hyper-log",
+ "hyper-raft",
+ "hyper-timing",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hyper-liveness"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "hyper-timing",
+]
+
+[[package]]
+name = "hyper-log"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "hyper-block",
+ "hyper-seal",
+ "hyper-timing",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1093,6 +1149,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-raft"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "crc32c",
+ "hyper-timing",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "hyper-rt"
 version = "0.1.0"
 source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
@@ -1113,6 +1179,18 @@ dependencies = [
  "hyper-datagram",
  "hyper-rt",
  "hyper-transport",
+]
+
+[[package]]
+name = "hyper-seal"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "aws-lc-rs",
+ "getrandom 0.4.3",
+ "rustix",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1276,6 +1354,7 @@ dependencies = [
  "hyper-rt-transport",
  "hyper-transport",
  "k8s-openapi",
+ "kiln-cd",
  "mime_guess",
  "nix 0.31.3",
  "parking_lot",
@@ -1284,6 +1363,7 @@ dependencies = [
  "rand",
  "rcgen",
  "rpassword",
+ "rquickjs",
  "rusqlite",
  "rust-embed",
  "rustix",
@@ -1308,6 +1388,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiln-cd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "futures",
+ "glob",
+ "hyper-block",
+ "hyper-durable",
+ "hyper-log",
+ "hyper-raft",
+ "lz4_flex",
+ "mimalloc",
+ "parking_lot",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tar",
+ "tempfile",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1324,6 +1429,15 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "libsqlite3-sys"
@@ -1377,6 +1491,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1398,6 +1521,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -1800,6 +1932,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relative-path"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2a073568cd8b9c4825429d3e9fc5f52851b4f97cc1348800689408921e6b8f8"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1822,6 +1963,35 @@ dependencies = [
  "libc",
  "rtoolbox",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rquickjs"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0a22bf72f515cc4189dd7c63d016f6de92a11eee98ddf7dd64794198f6eb34e"
+dependencies = [
+ "rquickjs-core",
+]
+
+[[package]]
+name = "rquickjs-core"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6657979a24d543e5fc66f32cef2f47ca82ce8eb55cec5f7d59a12b7b570bbf24"
+dependencies = [
+ "hashbrown 0.17.1",
+ "relative-path",
+ "rquickjs-sys",
+]
+
+[[package]]
+name = "rquickjs-sys"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cee271d0eeba64f0915b846cb7ae02e16faf3dfdffdca91731101d9d30fe3423"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -2521,6 +2691,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2957,6 +3133,12 @@ dependencies = [
  "libc",
  "rustix",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yasna"

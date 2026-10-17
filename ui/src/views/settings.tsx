@@ -18,7 +18,7 @@ export default function Settings() {
 
   return (
     <div className="container-console page max-w-[880px]">
-      <PageIntro index={9} label="Settings" title="Settings" lead="Preferences here are stored in this browser only." />
+      <PageIntro index={10} label="Settings" title="Settings" lead="Preferences here are stored in this browser only." />
       <div className="space-y-4">
         <UpdatesPanel />
         <Panel eyebrow="Integrations" title="Grafana" description="Linked from the Metrics page. kiln ships dashboards as ConfigMaps under deploy/.">

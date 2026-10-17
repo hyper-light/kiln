@@ -139,6 +139,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     // Open routes (their own auth, if any).
     match (&method, s.as_slice()) {
+        (&Method::POST, ["api", "mcp"]) => {
+            let actor = crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers()));
+            return match actor {
+                Some(actor) => crate::mcp::http(&hub, actor, req.into_body()).await.map_err(|(c, m)| err(c, m)),
+                None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
+            };
+        }
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req)),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
@@ -179,6 +186,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     }
     let q = srv::query(&req);
     match (&method, s.as_slice()) {
+        (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, &method, rest, &q, req.into_body()).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,

@@ -351,7 +351,11 @@ export type ServerEvent =
   /** Settings → Updates changed: refetch GET /api/updates. */
   | { type: "updates" }
   /** An upgrade moved on (new output, or it finished). */
-  | { type: "update_job"; job: UpdateJob };
+  | { type: "update_job"; job: UpdateJob }
+  /** Apps' statuses changed (batched, at most every 300 ms). */
+  | { type: "cd_apps"; apps: CdStatus[] }
+  /** An app was deleted. */
+  | { type: "cd_app_deleted"; app: string };
 
 /* ---------------------------- updates (Settings → Updates) ---------------------------- */
 
@@ -516,6 +520,175 @@ export type TerminalControlFrame =
   | { type: "reconnect" }
   /** The session's size changed (the device in use set it): draw at exactly this size. */
   | { type: "size"; cols: number; rows: number };
+
+/* ---------------------------- deployments (docs/cd.md) ---------------------------- */
+
+export type CdSync = "Synced" | "OutOfSync" | "Unknown";
+export type CdHealth = "Healthy" | "Progressing" | "Degraded" | "Suspended" | "Missing" | "Unknown";
+
+/** An app's sync: the one under way, or the last. */
+export interface CdOperation {
+  id: number;
+  phase: "DryRun" | "Running" | "Failing" | "Terminating" | "Succeeded" | "Failed";
+  trigger: "manual" | "rollback" | "promotion" | "auto" | "self-heal";
+  attempt: number;
+  message: string;
+}
+
+/** An app's status, as `cd_apps` events carry it. */
+export interface CdStatus {
+  /** `<project>/<name>`. */
+  app: string;
+  sync: CdSync;
+  health: CdHealth;
+  /** The commit its sources are at. */
+  revision?: string | null;
+  /** Objects in git. */
+  resources?: number;
+  /** Objects that differ, missing and to-prune ones included. */
+  out_of_sync?: number;
+  /** Why the status is what it is, when that isn't obvious. */
+  message?: string | null;
+  operation?: CdOperation | null;
+}
+
+/** An app as lists show it. */
+export interface CdApp extends CdStatus {
+  name: string;
+  project: string;
+  cluster: string;
+  namespace: string;
+  environment: string | null;
+  /** Syncs when git moves. */
+  auto: boolean;
+  labels: Record<string, string>;
+  origin: { kind: "deploy"; repo: string } | { kind: "argo"; parent: string | null } | { kind: "api" };
+  /** Adopted from Argo CD and not taken over: kiln compares it and never writes. */
+  shadow: boolean;
+  /** Held at an earlier deployment by a rollback, until git changes the app. */
+  pinned?: CdPin | null;
+  /** Why its sources can't be read. */
+  source_error?: string;
+}
+
+/** A rollback's hold on an app. */
+export interface CdPin {
+  /** The deployment it went back to. */
+  to: number;
+  revision: string | null;
+  by: string | null;
+  at_ms: number;
+}
+
+/** One of an app's sources. */
+export interface CdSource {
+  repo: string;
+  path: string;
+  revision: string;
+  chart: string | null;
+  as_ref: string | null;
+}
+
+export interface CdAppDetail extends CdApp {
+  definition: {
+    sources: CdSource[];
+    sync: { auto: boolean; prune: boolean; self_heal: boolean; allow_empty: boolean };
+    [k: string]: unknown;
+  } | null;
+  /** Each source's commit, as last resolved. */
+  commits: (string | null)[];
+  /** Apps it renders (app of apps), by id. */
+  children: string[];
+}
+
+export interface CdResourceKey {
+  group: string;
+  kind: string;
+  namespace: string;
+  name: string;
+}
+
+export interface CdResource extends CdResourceKey {
+  /** "Hook" for hooks, which run rather than compare. */
+  sync: CdSync | "Hook";
+  missing: boolean;
+  requires_pruning: boolean;
+  health: CdHealth | null;
+  message: string | null;
+  hook: boolean;
+  /** Where it differs: `.spec.replicas differs`. */
+  why: string | null;
+}
+
+/** A unified-diff hunk; each line keeps its ' ', '-' or '+'. */
+export interface CdHunk {
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  lines: string[];
+}
+
+/** What a sync changes in one object. */
+export interface CdDiff {
+  key: CdResourceKey;
+  why: string | null;
+  /** The live object as YAML ("" when it is missing). */
+  live: string;
+  /** What a sync makes of it ("" when it is pruned). */
+  predicted: string;
+  /** From live to predicted. */
+  hunks: CdHunk[];
+}
+
+/** One deployment of an app. */
+export interface CdDeployment {
+  app: string;
+  /** Its number in the app's history. */
+  id: number;
+  /** Each source's commit. */
+  commits?: (string | null)[];
+  op: number;
+  revision: string | null;
+  trigger: string;
+  by: string | null;
+  succeeded: boolean;
+  message: string;
+  applied: number;
+  pruned: number;
+  /** ms since the epoch. */
+  at_ms: number;
+}
+
+export interface CdCluster {
+  name: string;
+  server: string;
+  labels: Record<string, string>;
+  mode: string;
+  auth: string;
+  connected: boolean;
+  version: string | null;
+  kinds: number | null;
+}
+
+export interface CdSummary {
+  apps: number;
+  sync: Record<string, number>;
+  health: Record<string, number>;
+  /** Connected clusters. */
+  clusters: number;
+}
+
+/** How many apps each filter value would show given the other filters, and how many match all. */
+export interface CdFacets {
+  total: number;
+  facets: {
+    sync: Record<string, number>;
+    health: Record<string, number>;
+    cluster: Record<string, number>;
+    project: Record<string, number>;
+  };
+}
 
 /* ---------------------------- discovery v2 + Add machines ---------------------------- */
 // The fields and types of .claude/contracts/discovery.md. The interfaces named like ones above are

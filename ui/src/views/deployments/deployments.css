@@ -1,0 +1,519 @@
+/* Deployments: the fleet as one list, and one app. Rows have one fixed height, so a list of a
+   hundred thousand apps draws only what is on screen. Every control sits in the page: a name
+   search and a filter box above the list, checkboxes on rows, options beside the buttons they
+   change, and confirmations right under the action they confirm. On phones the same controls
+   take the full width, and a row's two states stack at its right edge. */
+
+.cd-page {
+  container-type: inline-size;
+}
+
+/* ---------------------------------------------------------------- finding apps */
+.cd-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.cd-search {
+  flex: 1 1 240px;
+  max-width: 360px;
+}
+.cd-filter {
+  flex: 1 1 280px;
+  max-width: 520px;
+}
+@container (max-width: 640px) {
+  .cd-search,
+  .cd-filter {
+    flex-basis: 100%;
+    max-width: none;
+  }
+}
+.cd-list-head {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 4px;
+  margin-top: 14px;
+}
+.cd-count {
+  color: #a1a3ab;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  line-height: 1.8;
+  text-transform: uppercase;
+}
+.cd-bulk {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+.cd-link {
+  color: #c9c3d8;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.cd-link:hover {
+  color: #ededee;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.cd-notice {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.cd-notice[data-tone="ok"] {
+  color: #a8c9bc;
+}
+.cd-notice[data-tone="fail"] {
+  color: #d8b9bb;
+}
+
+/* A checkbox in its own column, the whole cell its target. */
+.cd-pick {
+  display: grid;
+  width: 28px;
+  height: 100%;
+  min-height: 32px;
+  flex: none;
+  place-items: center;
+  cursor: pointer;
+}
+.cd-pick input,
+.cd-opt input {
+  width: 14px;
+  height: 14px;
+  accent-color: #bab0e3;
+}
+
+/* ---------------------------------------------------------------- the fleet */
+.cd-list {
+  border-top: 1px solid #2b2d32;
+}
+.cd-item {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  height: 68px;
+  align-items: stretch;
+  border-bottom: 1px solid #25272c;
+  transition: background-color 0.2s;
+}
+.cd-item:hover,
+.cd-item[data-checked] {
+  background: #0c0d0f;
+}
+.cd-item[data-tone="warn"] {
+  box-shadow: inset 2px 0 0 #c6b08e;
+}
+.cd-item[data-tone="fail"] {
+  box-shadow: inset 2px 0 0 #d1aaad;
+}
+.cd-item[data-live] {
+  box-shadow: inset 2px 0 0 #bab0e3;
+}
+.cd-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 0.8fr);
+  grid-template-areas: "main states note";
+  min-width: 0;
+  align-items: center;
+  gap: 0 28px;
+  padding: 0 10px 0 4px;
+  overflow: hidden;
+  color: inherit;
+  text-decoration: none;
+}
+.cd-row:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: -2px;
+}
+.cd-row-main {
+  grid-area: main;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+.cd-row-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 15px;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-row:hover .cd-row-name {
+  color: #fff;
+}
+.cd-row-meta {
+  overflow: hidden;
+  color: #8c8f98;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-row-states {
+  grid-area: states;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+/* One width per state, so sync and health line up down the list. */
+.cd-row-states > * {
+  width: 92px;
+}
+.cd-row-note {
+  grid-area: note;
+  overflow: hidden;
+  color: #a1a4ad;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-item[data-tone="fail"] .cd-row-note {
+  color: #d8b9bb;
+}
+.cd-item[data-live] .cd-row-note {
+  color: #c9c1ec;
+}
+.cd-none {
+  color: #6d7078;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.cd-more {
+  margin: 14px 0 0;
+  color: #8c8f98;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-align: center;
+  text-transform: uppercase;
+}
+@container (max-width: 640px) {
+  .cd-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "main states";
+    gap: 0 14px;
+    padding-right: 6px;
+  }
+  .cd-row-note {
+    display: none;
+  }
+  .cd-row-states {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .cd-row-states > * {
+    width: auto;
+  }
+}
+
+/* ---------------------------------------------------------------- one app */
+.cd-head {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 8px;
+}
+.cd-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.cd-crumbs a {
+  color: inherit;
+}
+.cd-crumbs a:hover {
+  color: #ededee;
+}
+.cd-title {
+  margin: 6px 0 0;
+  font-size: clamp(30px, 3.2vw, 44px);
+  font-weight: 450;
+  line-height: 1.1;
+  letter-spacing: -0.045em;
+  overflow-wrap: anywhere;
+}
+.cd-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+}
+.cd-meta {
+  color: #8c8f98;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.cd-mono {
+  color: #a7aab3;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.cd-from {
+  margin: 0;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.cd-note {
+  max-width: 68ch;
+  margin: 0;
+  color: #c9c1ec;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.cd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-top: 4px;
+}
+.cd-opt {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  color: #c8cad0;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+/* A confirmation, in the page, under what it confirms. */
+.cd-confirm {
+  max-width: 72ch;
+  padding: 12px 14px;
+  border: 1px solid #2b2d32;
+  border-left: 2px solid #c6b08e;
+  border-radius: 6px;
+  background: #0b0c0e;
+  color: #c8cad0;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.cd-confirm p {
+  margin: 0 0 6px;
+}
+.cd-confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.cd-op {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 16px;
+  margin-top: 24px;
+  padding: 12px 14px;
+  border: 1px solid #25272c;
+  border-radius: 8px;
+  background: #0b0c0e;
+}
+.cd-op[data-tone="running"] {
+  border-color: rgb(186 176 227 / 30%);
+}
+.cd-op[data-tone="failed"] {
+  border-color: rgb(209 170 173 / 30%);
+}
+.cd-op-label {
+  color: #8c8f98;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.cd-op-msg {
+  min-width: 0;
+  flex: 1 1 240px;
+  color: #c8cad0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.cd-warn {
+  margin: 12px 0 0;
+  padding: 9px 12px;
+  border: 1px solid rgb(203 182 154 / 25%);
+  border-radius: 6px;
+  background: rgb(203 182 154 / 3%);
+  color: #d8c8b0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.cd-show {
+  max-width: 280px;
+  margin-top: 28px;
+}
+@container (max-width: 640px) {
+  .cd-show {
+    max-width: none;
+  }
+}
+.cd-panel {
+  margin-top: 14px;
+}
+.cd-empty {
+  margin: 0;
+  padding: 28px 4px;
+  color: #8c8f98;
+  font-size: 13px;
+}
+
+/* ---------------------------------------------------------------- resources */
+.cd-resources {
+  min-width: 0;
+  border-top: 1px solid #2b2d32;
+}
+.cd-res {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "main states"
+    "why states";
+  align-content: center;
+  align-items: center;
+  gap: 3px 24px;
+  height: 56px;
+  padding: 0 10px;
+  overflow: hidden;
+  border-bottom: 1px solid #1d1f23;
+}
+.cd-res[data-tone="warn"] {
+  box-shadow: inset 2px 0 0 #c6b08e;
+}
+.cd-res[data-tone="fail"] {
+  box-shadow: inset 2px 0 0 #d1aaad;
+}
+.cd-res-main {
+  grid-area: main;
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+}
+.cd-res-name {
+  overflow: hidden;
+  color: #e4e5e7;
+  font-size: 13.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-res-kind {
+  flex: none;
+  color: #8c8f98;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.cd-res-why {
+  grid-area: why;
+  overflow: hidden;
+  color: #a1a4ad;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-res .cd-row-states {
+  grid-area: states;
+}
+@container (max-width: 640px) {
+  .cd-res {
+    gap: 3px 12px;
+    padding: 0 6px;
+  }
+  .cd-res .cd-row-states {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+}
+
+/* ---------------------------------------------------------------- diff and history */
+.cd-diffs {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.cd-diff {
+  min-width: 0;
+}
+.cd-why {
+  margin: 0 0 6px;
+  color: #cbb69a;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.cd-history {
+  min-width: 0;
+  border-top: 1px solid #2b2d32;
+}
+.cd-history-row {
+  display: grid;
+  grid-template-columns: 110px 128px minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: 4px 18px;
+  padding: 13px 10px;
+  border-bottom: 1px solid #1d1f23;
+}
+.cd-history-what {
+  min-width: 0;
+  color: #c8cad0;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.cd-history-act {
+  justify-self: end;
+}
+.cd-history-msg {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  color: #d8b9bb;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.cd-history-confirm {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+}
+@container (max-width: 640px) {
+  .cd-history-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    padding: 12px 6px;
+  }
+  .cd-history-at {
+    order: 1;
+    margin-left: auto;
+  }
+  .cd-history-act {
+    order: 1;
+  }
+  .cd-history-what {
+    order: 2;
+    flex-basis: 100%;
+  }
+  .cd-history-msg,
+  .cd-history-confirm {
+    order: 3;
+    flex-basis: 100%;
+  }
+}

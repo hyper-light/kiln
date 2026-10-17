@@ -22,6 +22,8 @@ pub struct Config {
     /// Speech to text for the console's microphone where the browser can't do it itself.
     pub voice: crate::voice::Voice,
     pub discovery: Discovery,
+    /// Deployments (docs/cd.md).
+    pub cd: Cd,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
@@ -195,6 +197,49 @@ fn hostname() -> String {
 
 /// `/var/lib/kiln` as root; otherwise per user: `~/.local/share/kiln` (`$XDG_DATA_HOME`) on Unix,
 /// `%LOCALAPPDATA%\kiln` on Windows.
+/// Deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cd {
+    pub enabled: bool,
+    /// How often sources are checked for new commits (webhooks check at once).
+    pub poll_seconds: u64,
+    /// Outside Kubernetes, the kubeconfig context that stands in for Argo CD's in-cluster
+    /// destination (`https://kubernetes.default.svc`).
+    pub in_cluster_context: String,
+    /// The kubeconfig file contexts are read from (the default one when empty).
+    pub kubeconfig: String,
+    pub helm: String,
+    pub kubectl: String,
+    /// The kustomize binary; `kubectl kustomize` when empty.
+    pub kustomize: String,
+    /// Extra `kustomize build` options (Argo CD's `kustomize.buildOptions`).
+    pub kustomize_options: Vec<String>,
+    pub render_timeout_seconds: u64,
+    /// Requests a second kiln sends a cluster, unless the cluster says otherwise.
+    pub qps: f64,
+    /// Wait between sync waves (Argo CD's `ARGOCD_SYNC_WAVE_DELAY`).
+    pub wave_delay_ms: u64,
+}
+
+impl Default for Cd {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_seconds: 60,
+            in_cluster_context: String::new(),
+            kubeconfig: String::new(),
+            helm: "helm".into(),
+            kubectl: "kubectl".into(),
+            kustomize: String::new(),
+            kustomize_options: Vec::new(),
+            render_timeout_seconds: 90,
+            qps: 50.0,
+            wave_delay_ms: 2_000,
+        }
+    }
+}
+
 pub fn default_data_dir() -> PathBuf {
     if crate::os::is_root() {
         return crate::os::system_dirs().0;

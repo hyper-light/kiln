@@ -14,6 +14,8 @@ import { BrandMark } from "@/components/shell/brand";
 const Overview = React.lazy(() => import("@/views/overview"));
 const Runs = React.lazy(() => import("@/views/runs"));
 const RunDetail = React.lazy(() => import("@/views/run-detail/index"));
+const Deployments = React.lazy(() => import("@/views/deployments/index"));
+const DeploymentApp = React.lazy(() => import("@/views/deployments/app"));
 const Repos = React.lazy(() => import("@/views/repos"));
 const Runners = React.lazy(() => import("@/views/runners"));
 const AddMachines = React.lazy(() => import("@/views/add-machines"));
@@ -76,6 +78,8 @@ export function App() {
                   <Route path="runs" element={<Runs />} />
                   <Route path="runs/:id" element={<RunDetail />} />
                   <Route path="runs/:id/jobs/:jobId" element={<RunDetail />} />
+                  <Route path="deployments" element={<Deployments />} />
+                  <Route path="deployments/apps/:project/:name" element={<DeploymentApp />} />
                   <Route path="repos" element={<Repos />} />
                   <Route path="runners" element={<Runners />} />
                   <Route path="runners/add" element={<AddMachines />} />

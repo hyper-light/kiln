@@ -52,7 +52,7 @@ export function isAuthed() {
 
 /* ---------------------------- core fetch ---------------------------- */
 
-async function request<T>(
+export async function request<T>(
   method: string,
   path: string,
   body?: unknown,
