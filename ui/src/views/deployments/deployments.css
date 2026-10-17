@@ -997,7 +997,7 @@ button.cd-gnode:hover {
 }
 .cd-facts {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
   gap: 12px 22px;
   margin: 0;
 }
@@ -1088,12 +1088,18 @@ button.cd-gnode:hover {
 }
 @container (max-width: 640px) {
   .cd-kv li,
-  .cd-containers li,
-  .cd-conditions li {
+  .cd-containers li {
     grid-template-columns: minmax(0, 1fr);
   }
   .cd-c-state {
     grid-column: 1;
+  }
+  /* A condition: its name and status on a line, why and when under them. */
+  .cd-conditions li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .cd-conditions li > :nth-child(n + 3) {
+    grid-column: 1 / -1;
   }
 }
 .cd-manifest-bar {

@@ -18,7 +18,7 @@ import { HEALTH_TONE, KindBadge, NodeMarks, nodeLine } from "./parts";
 const NODE_H = 54;
 const ROW_GAP = 10;
 const COL_GAP = 52;
-const NODE_MAX = 252;
+const NODE_MAX = 300;
 /** Narrower than this, the graph gives way to the list. */
 export const NODE_MIN = 156;
 
