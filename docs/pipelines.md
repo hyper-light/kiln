@@ -141,6 +141,7 @@ They are `${{ inputs.target }}` in expressions. Scheduled runs may pass `inputs`
 | `approval` ✦ | turns the job into a gate that waits for people to approve |
 | `debug` ✦ | `on-failure`: keep the workspace alive so it can be opened in kiln's terminal |
 | `uses` ✦ | build the job from a template; see [Templates](#templates) |
+| `permissions` ✦ | what the job's token may do beyond its own run, e.g. `{ binaries: publish }` ([access.md](access.md)) |
 | `agents` ✦ | what attached agents may do with this job, e.g. `{ rerun: false }` for deploys ([ci-agents.md](ci-agents.md)) |
 | `steps` | what to run, in order |
 
