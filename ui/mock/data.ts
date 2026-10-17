@@ -346,3 +346,86 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
   if (fail.length === 0) fail.push(bred("error: step failed"));
   return { lines: L, failLines: fail };
 }
+
+/* ---------------------------- discovery (Add machines) ---------------------------- */
+
+export type MockOs = "linux" | "macos" | "windows";
+
+/** This server as discovery knows it. */
+export const SERVER_INSTANCE_ID = "c0ffee12d4e5f6071829a3b4c5d6e7f8";
+/** First 16 hex digits of the SHA-256 of a CA certificate: ours, and the one of the NAS's kiln. */
+export const SERVER_CA = "9f3c2a77d1e04b58";
+export const OTHER_CA = "a71e09c4b23f8d16";
+export const SERVER_ADDR = "192.168.1.50";
+export const SERVER_URL = `http://${SERVER_ADDR}:7070`;
+/** The LAN subnets the server sits on (a scan's default). */
+export const SUBNETS = ["192.168.1.0/24", "10.0.8.0/24"];
+export const DNS_SD_DOMAINS = ["lan.example.com", "corp.example.net"];
+
+export interface InstanceSeed {
+  id: string;
+  name: string;
+  role: "server" | "agent";
+  version: string;
+  os: string;
+  arch: string;
+  port: number;
+  quic: number;
+  ca: string | null;
+  enrolled: string | null;
+  addresses: string[];
+  via: ("mdns" | "native" | "dns-sd" | "scan" | "probe" | "tailscale" | "seed")[];
+  /** Seconds ago it was first and last heard. */
+  firstAgo: number;
+  lastAgo: number;
+  invited?: boolean;
+}
+
+/** What the network holds besides this server: runners already here, machines not set up yet,
+ * another kiln server and one of its runners. `version` "" means this server's version. */
+export const INSTANCE_SEEDS: InstanceSeed[] = [
+  { id: "4b1d9e0c7a2f45e8b6c3d1a0f9e8d7c6", name: "ryzen-01.lan", role: "agent", version: "", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: ["192.168.1.21"], via: ["mdns", "native"], firstAgo: 86400 * 3, lastAgo: 9 },
+  { id: "7e2a6c1f9b0d4e3a8c5b2f1e0d9c8b7a", name: "mac-mini.lan", role: "agent", version: "", os: "macos", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: ["192.168.1.27", "100.88.12.4"], via: ["mdns", "native", "tailscale"], firstAgo: 86400 * 3, lastAgo: 14 },
+  { id: "1a9f3e7d2c6b4a5f8e0d1c2b3a4f5e6d", name: "pi-04.lan", role: "agent", version: "0.0.9", os: "linux", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: SERVER_CA, addresses: ["192.168.1.44"], via: ["mdns"], firstAgo: 86400 * 3, lastAgo: 21 },
+  { id: "d3c8b2a19f0e4d7c6b5a4f3e2d1c0b9a", name: "studio-mbp.lan", role: "agent", version: "", os: "macos", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.34", "fe80::14d2:7cff:fe0a:3b91"], via: ["mdns", "native"], firstAgo: 640, lastAgo: 6 },
+  { id: "5f0e9d8c7b6a4f3e2d1c0b9a8f7e6d5c", name: "ryzen-03.lan", role: "agent", version: "", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.23"], via: ["mdns", "scan"], firstAgo: 2400, lastAgo: 11 },
+  { id: "9a8b7c6d5e4f43a2b1c0d9e8f7a6b5c4", name: "pi-05.lan", role: "agent", version: "0.0.9", os: "linux", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.38"], via: ["scan"], firstAgo: 760, lastAgo: 731, invited: true },
+  { id: "2c3d4e5f6a7b48c9d0e1f2a3b4c5d6e7", name: "win-build-01", role: "agent", version: "", os: "windows", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["10.0.8.31"], via: ["probe"], firstAgo: 5400, lastAgo: 5400 },
+  { id: "e6f5a4b3c2d14e0f9a8b7c6d5e4f3a2b", name: "nas.lan", role: "server", version: "0.0.9", os: "linux", arch: "x86_64", port: 7070, quic: 7071, ca: OTHER_CA, enrolled: null, addresses: ["192.168.1.40"], via: ["mdns", "dns-sd"], firstAgo: 86400 * 3, lastAgo: 17 },
+  { id: "0f1e2d3c4b5a46978a9b0c1d2e3f4a5b", name: "lab-runner-7", role: "agent", version: "0.0.9", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: OTHER_CA, addresses: ["100.101.12.7"], via: ["tailscale"], firstAgo: 86400, lastAgo: 48 },
+];
+
+/** Machines the mock "finds" when asked: on a scan of 192.168.1.0/24, and by address. */
+export const SCAN_FIND: InstanceSeed = { id: "8c7d6e5f4a3b42c1d0e9f8a7b6c5d4e3", name: "nuc-lab.lan", role: "agent", version: "", os: "linux", arch: "x86_64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["192.168.1.61"], via: ["scan"], firstAgo: 0, lastAgo: 0 };
+export const PROBE_FIND: InstanceSeed = { id: "3e4f5a6b7c8d49e0f1a2b3c4d5e6f7a8", name: "build-box", role: "agent", version: "", os: "linux", arch: "aarch64", port: 0, quic: 0, ca: null, enrolled: null, addresses: ["10.0.4.12"], via: ["probe"], firstAgo: 0, lastAgo: 0 };
+/** The machine that "runs the one-liner" a while after the Add machines page asked for it. */
+export const AUTOJOIN = { name: "metal-pi-06", hostname: "pi-06.lan", id: "6a5b4c3d2e1f40a9b8c7d6e5f4a3b2c1", address: "192.168.1.46", os: "linux", arch: "aarch64" };
+
+/** Interfaces the server's multicast DNS runs on, by the server's OS. */
+export function mdnsInterfaces(os: MockOs): string {
+  if (os === "macos") return `en0 (${SERVER_ADDR}), en7 (10.0.8.5)`;
+  if (os === "windows") return `Ethernet (${SERVER_ADDR}), vEthernet (10.0.8.5)`;
+  return `enp5s0 (${SERVER_ADDR}), enp6s0 (10.0.8.5)`;
+}
+
+/** The DNS-SD instance label and the zone-file lines that would publish this server. */
+export function dnsSdRecords(host: string, version: string, os: string, arch: string, zone: string): string[] {
+  const label = `kiln\\032server\\032on\\032${host}\\032(${SERVER_INSTANCE_ID.slice(0, 8)})`;
+  const inst = `${label}._kiln._tcp.${zone}.`;
+  return [
+    `b._dns-sd._udp.${zone}. 3600 IN PTR ${zone}.`,
+    `_kiln._tcp.${zone}. 3600 IN PTR ${inst}`,
+    `${inst} 3600 IN SRV 0 0 7070 ${host}.${zone}.`,
+    `${inst} 3600 IN TXT "id=${SERVER_INSTANCE_ID}" "name=${host}" "role=server" "version=${version}" "quic=7071" "ca=${SERVER_CA}" "os=${os}" "arch=${arch}"`,
+    `${host}.${zone}. 3600 IN A ${SERVER_ADDR}`,
+  ];
+}
+
+/** Why multicast DNS hears less than a scan does, and the fix on each system. */
+export const SILENT_NETWORK_FIXES = [
+  { os: "linux" as const, text: "On each Linux machine with ufw:", command: "sudo ufw allow from 192.168.1.0/24 to any port 5353 proto udp" },
+  { os: "linux" as const, text: "With firewalld:", command: "sudo firewall-cmd --permanent --add-service=mdns && sudo firewall-cmd --reload" },
+  { os: "macos" as const, text: "On each Mac, let kiln take incoming connections:", command: "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/.local/bin/kiln && sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/.local/bin/kiln" },
+  { os: "windows" as const, text: "On each Windows machine, in an elevated PowerShell:", command: 'New-NetFirewallRule -DisplayName "kiln mDNS" -Direction Inbound -Protocol UDP -LocalPort 5353 -Action Allow' },
+  { text: "On Wi-Fi, turn off client (AP) isolation for this network in the router." },
+];

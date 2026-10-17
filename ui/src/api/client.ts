@@ -199,3 +199,21 @@ export function wsUrl(path: string): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}${path}`;
 }
+
+/* ---------------------------- discovery v2 + Add machines ---------------------------- */
+// The routes of .claude/contracts/discovery.md, kept apart from `api` above. Join requests are
+// decided with `api.approveJoin` / `api.denyJoin`.
+
+import type { DiscoveredInstance, ScanState } from "./types";
+
+export const discoveryApi = {
+  /** Scan subnets for kiln (each at most a /22; none: the detected `subnets`). 202; progress arrives as `discovery` events. */
+  scan: (cidrs?: string[]) => post<ScanState>("/api/discovery/scan", cidrs?.length ? { cidrs } : {}),
+  /** Ask one address (IP or host name, optional `:port`) whether kiln runs there; answers within ~3 s. */
+  probe: (address: string) => post<{ found: DiscoveredInstance[] }>("/api/discovery/probe", { address }),
+  /** Invite a machine that is not set up yet: it asks to join, and its request waits for approval as usual. */
+  invite: (instance: string) => post<{ invited: true }>("/api/discovery/invite", { instance }),
+  uninvite: (instance: string) => del<void>(`/api/discovery/invite/${enc(instance)}`),
+  /** Open (rate-limited): what an invited machine polls. */
+  invited: (instance: string, signal?: AbortSignal) => get<{ invited: boolean; ca: string }>(`/api/join/invited${qs({ instance })}`, signal),
+};
