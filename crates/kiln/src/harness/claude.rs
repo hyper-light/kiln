@@ -140,6 +140,8 @@ const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 #[derive(Debug, Clone)]
 struct Ask {
     input: Value,
+    /// An MCP server's request for input (MCP elicitation), not a tool's.
+    elicitation: bool,
 }
 
 /// The streaming state of one API message: which event each content block index became.
@@ -1196,6 +1198,15 @@ impl Claude {
         let Some(approval) = core.take_approval(id) else { return };
         let ask = self.asks.remove(id);
         let mut input = ask.as_ref().map(|a| a.input.clone()).unwrap_or_else(|| approval.input.clone());
+        if ask.as_ref().is_some_and(|a| a.elicitation) {
+            let (response, why) = super::elicit::answer(input.get("requested_schema"), decision != Decision::Deny, choices.as_deref().unwrap_or_default());
+            if let Some(why) = why {
+                self.notice(core, Level::Warn, format!("Declined it for you, as the answers didn't fit: {why}"), None);
+            }
+            core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": response}}));
+            self.settle(core);
+            return;
+        }
         let response = match decision {
             Decision::Allow | Decision::Always => {
                 // Answers as AskUserQuestion takes them: question → label(s), several joined
@@ -1560,9 +1571,38 @@ impl Claude {
             "can_use_tool" => self.can_use_tool(core, id, &req),
             // kiln registers no hooks or in-process MCP servers; answer so nothing hangs.
             "hook_callback" => core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {}}})),
-            "elicitation" => core.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {"action": "decline"}}})),
+            "elicitation" => self.elicitation(core, id, &req),
             other => core.write(&json!({"type": "control_response", "response": {"subtype": "error", "request_id": id, "error": format!("kiln does not handle {other}")}})),
         }
+    }
+
+    /// An MCP server asks the person for input (MCP elicitation): asked as questions, like any.
+    fn elicitation(&mut self, core: &mut Core, id: String, req: &Value) {
+        let server = str_of(req, "display_name").or_else(|| str_of(req, "mcp_server_name")).unwrap_or("");
+        let a = super::elicit::ask(server, str_of(req, "message").unwrap_or(""), str_of(req, "mode"), req.get("requested_schema"), str_of(req, "url"));
+        let approval = Approval {
+            id: id.clone(),
+            tool_id: None,
+            tool_name: "elicitation".to_owned(),
+            tool: ToolKind::Question,
+            title: a.title,
+            detail: a.detail,
+            input: req.clone(),
+            command: None,
+            cwd: core.state.cwd.clone(),
+            diffs: Vec::new(),
+            reason: None,
+            always: Vec::new(),
+            default_to_no: false,
+            questions: a.questions,
+            plan: None,
+            agent: None,
+            at: Core::now(),
+        };
+        core.state.doing = Some("Asking you a question".to_owned());
+        core.touch_state();
+        self.asks.insert(id, Ask { input: req.clone(), elicitation: true });
+        core.add_approval(approval);
     }
 
     fn can_use_tool(&mut self, core: &mut Core, id: String, req: &Value) {
@@ -1610,7 +1650,7 @@ impl Claude {
             ToolKind::Plan => "Waiting for you to review a plan".to_owned(),
             _ => "Waiting for your approval".to_owned(),
         });
-        self.asks.insert(id, Ask { input });
+        self.asks.insert(id, Ask { input, elicitation: false });
         core.add_approval(approval);
         self.settle(core);
     }
@@ -3460,6 +3500,22 @@ mod tests {
         assert_eq!(d.first().map(|d| d.path.as_str()), Some("a.rs"));
         let w = preview("Write", &json!({"file_path": "new.txt", "content": "one\ntwo\n"}), &cwd);
         assert!(w.first().is_some_and(|d| d.created && d.hunks.first().is_some_and(|h| h.new_lines == 2)));
+        Ok(())
+    }
+
+    #[test]
+    fn an_mcp_servers_request_for_input_is_asked_and_answered() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        let req = json!({"subtype": "elicitation", "mcp_server_name": "linear", "message": "Your API token", "mode": "form", "requested_schema": {"type": "object", "properties": {"token": {"type": "string", "title": "API token"}}, "required": ["token"]}});
+        c.line(&mut core, &json!({"type": "control_request", "request_id": "el1", "request": req}).to_string());
+        let a = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no approval"))?;
+        assert_eq!((a.title.as_str(), a.questions.first().map(|q| q.other)), ("linear asks: Your API token", Some(true)));
+        let choices = vec![ChoiceAnswer { id: Some("token".into()), other: Some("lin_1".into()), ..ChoiceAnswer::default() }];
+        c.command(&mut core, Command::Approve { id: "el1".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: Some(choices) });
+        let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(resp.pointer("/response/response").cloned(), Some(json!({"action": "accept", "content": {"token": "lin_1"}})));
+        assert!(core.state.approvals.is_empty());
         Ok(())
     }
 

@@ -19,6 +19,7 @@ pub mod cli;
 pub mod codex;
 pub mod core;
 pub mod diff;
+pub mod elicit;
 pub mod host;
 pub mod kinds;
 pub mod model;
