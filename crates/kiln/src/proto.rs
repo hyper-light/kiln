@@ -76,6 +76,9 @@ pub enum AgentMsg {
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
 pub const CAP_UPGRADE: u32 = 1;
+/// [`AgentMsg::Build`] capability: the runner waits for a taken-over session's process to end
+/// before it resumes the conversation (`Spec::takeover_pid`). Without it, take-over would race.
+pub const CAP_TAKEOVER: u32 = 2;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

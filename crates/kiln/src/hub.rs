@@ -907,6 +907,13 @@ impl Hub {
 
     /// Every runner process of a machine and what each one holds (Settings → Updates lists
     /// them always; agent views only while a machine has more than one).
+    /// What a machine's newest runner process says it can do ([`crate::proto::CAP_UPGRADE`] …);
+    /// 0 for runners from before builds were announced.
+    pub fn runner_caps(&self, name: &str) -> u32 {
+        let inst = self.instances.lock();
+        inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| i.caps)
+    }
+
     pub fn runner_processes(&self, name: &str) -> Vec<crate::instances::InstanceView> {
         use crate::instances::Owned;
         let target = format!("agent:{name}");

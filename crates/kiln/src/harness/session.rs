@@ -54,6 +54,10 @@ pub struct Spec {
     /// With `resume`: a new session that branches off it, leaving it as it is.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fork: bool,
+    /// With `resume`: it takes over that session, found running as this process (which is being
+    /// ended): the harness starts only once the process is gone, never beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover_pid: Option<u32>,
 }
 
 /// A pending approval, as lists show it.
@@ -450,6 +454,47 @@ const RUN_OUTPUT_MAX: usize = 32 * 1024;
 const READ_MAX: u64 = 512 * 1024;
 /// How often the adapter gets a tick while the process runs.
 const TICK: Duration = Duration::from_secs(5);
+/// How long a take-over waits for the session it takes over to end.
+const TAKEOVER_WAIT: Duration = Duration::from_secs(15);
+
+/// Wait (up to `wait`) for `pid` to be gone: whether it is.
+async fn gone(pid: u32, wait: Duration) -> bool {
+    let end = Instant::now() + wait;
+    while crate::os::pid_alive(pid) {
+        if Instant::now() >= end {
+            return false;
+        }
+        crate::rt::sleep(Duration::from_millis(200)).await;
+    }
+    true
+}
+
+/// A take-over waits for the process it takes over to end (its terminal is being closed): an
+/// error to show when it has not, `None` once it is gone (and the spec forgets it).
+async fn takeover_ready(s: &Session, sink: &Sink, wait: Duration) -> Option<String> {
+    let pid = s.spec.lock().takeover_pid?;
+    // Said in the session's state, not its timeline (which its history fills once it is free).
+    let waiting = crate::os::pid_alive(pid);
+    if waiting {
+        {
+            let mut core = s.core.lock();
+            core.state.doing = Some(format!("Waiting for the session it takes over (process {pid}) to end"));
+            core.touch_state();
+        }
+        flush(s, sink, None).await;
+    }
+    let free = gone(pid, wait).await;
+    if waiting {
+        let mut core = s.core.lock();
+        core.state.doing = None;
+        core.touch_state();
+    }
+    if free {
+        s.spec.lock().takeover_pid = None;
+        return None;
+    }
+    Some(format!("The session found running as process {pid} has not ended, so kiln did not start a second one beside it. Quit it, then restart this agent."))
+}
 
 impl Done {
     fn apply(self, adapter: &mut super::kinds::Adapter, core: &mut Core) {
@@ -648,6 +693,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
     let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
     let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
+    // Taking over a session: its transcript is read once it has ended (checked again before each
+    // start while it has not).
+    let _ = takeover_ready(&s, &sink, TAKEOVER_WAIT).await;
     // A resumed Claude Code session starts from its transcript (its history), not empty.
     if kind.protocol == super::kinds::Protocol::ClaudeStreamJson {
         let (resume, env, upto) = {
@@ -684,7 +732,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         }
         let mut adapter = kind.adapter(&spec);
         let started = Instant::now();
-        let spawned = kind.launch(&spec).and_then(crate::proc::spawn_duplex);
+        let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
+        let spawned = match blocked {
+            Some(why) => Err(anyhow::anyhow!(why)),
+            None => kind.launch(&spec).and_then(crate::proc::spawn_duplex),
+        };
         let mut code = None;
         let mut error = None;
         match spawned {
@@ -1037,5 +1089,25 @@ mod tests {
         assert_eq!(read_first(&[pattern]).get("content").and_then(serde_json::Value::as_str), Some("new"));
         std::fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_takeover_waits_for_the_process_to_end() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let mut short = std::process::Command::new("sleep").arg("0.3").spawn()?;
+            let pid = short.id();
+            // Reaped as soon as it exits (as the taken-over session's parent would).
+            let reaper = std::thread::spawn(move || short.wait());
+            assert!(gone(pid, Duration::from_secs(5)).await);
+            let _ = reaper.join();
+            let mut long = std::process::Command::new("sleep").arg("30").spawn()?;
+            let t = Instant::now();
+            assert!(!gone(long.id(), Duration::from_millis(400)).await);
+            assert!(t.elapsed() < Duration::from_secs(3));
+            let _ = long.kill();
+            let _ = long.wait();
+            anyhow::Ok(())
+        })
     }
 }

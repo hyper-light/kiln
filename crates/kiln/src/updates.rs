@@ -1305,7 +1305,7 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
 
 /// What a runner announces after Hello ([`AgentMsg::Build`]).
 pub fn runner_build() -> AgentMsg {
-    AgentMsg::Build { build: own_build(), caps: CAP_UPGRADE }
+    AgentMsg::Build { build: own_build(), caps: CAP_UPGRADE | crate::proto::CAP_TAKEOVER }
 }
 
 #[cfg(test)]
