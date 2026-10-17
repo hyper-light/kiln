@@ -32,6 +32,9 @@ use crate::model::{AppConfig, Health, Propagation, Retry, Sync, SyncOptions, Tra
 use crate::obj::{self, Blob, GroupKind, Interner, ResKey, Scopes, Str};
 use crate::sync::{self, Phase, TaskState};
 
+mod plan;
+pub use plan::{Plan, Planned, Step, StepKind};
+
 /// The label kiln's watches select on: a hash of the app's id.
 pub const APP_LABEL: &str = "kiln.dev/app";
 /// The annotation naming the app and key an object was applied for.
@@ -1187,35 +1190,8 @@ impl Engine {
     }
 
     fn build_render(&mut self, key: u64, objects: Vec<Value>) -> Render {
-        let mut out = Vec::with_capacity(objects.len());
-        let mut scopes = Vec::new();
-        for mut o in objects {
-            if !o.is_object() || sync::is_skipped(&o) {
-                continue;
-            }
-            diff::normalize_desired(&mut o);
-            let kind = obj::kind(&o);
-            let name = obj::name(&o);
-            if kind.is_empty() || name.is_empty() {
-                continue;
-            }
-            if kind == "CustomResourceDefinition"
-                && obj::group(&o) == "apiextensions.k8s.io"
-                && let (Some(g), Some(k)) = (obj::str_at(&o, &["spec", "group"]), obj::str_at(&o, &["spec", "names", "kind"]))
-            {
-                scopes.push((GroupKind::new(g, k), obj::str_at(&o, &["spec", "scope"]) != Some("Cluster")));
-            }
-            out.push(Rendered {
-                hash: obj::hash_value(&o),
-                group: self.interner.intern(obj::group(&o)),
-                kind: self.interner.intern(kind),
-                name: name.into(),
-                namespace: self.interner.intern(obj::namespace(&o)),
-                hook: sync::hook_of(&o).is_some(),
-                blob: Blob::encode(&o),
-            });
-        }
-        Render { key, objects: out, scopes }
+        let interner = &mut self.interner;
+        render_of(key, objects, &mut |s| interner.intern(s))
     }
 
     /// The Namespace an app creates (`CreateNamespace=true`), as a render of its own: never
@@ -1649,14 +1625,7 @@ impl Engine {
                 };
                 match verdict {
                     Verdict::Synced => (ResState::Synced, None),
-                    Verdict::OutOfSync { path, why } => {
-                        let what = match why {
-                            diff::Why::Missing => "is missing live",
-                            diff::Why::Differs => "differs",
-                            diff::Why::Removed => "is no longer set; the next apply removes it",
-                        };
-                        (ResState::OutOfSync, Some(format!("{path} {what}").into_boxed_str()))
-                    }
+                    Verdict::OutOfSync { path, why } => (ResState::OutOfSync, Some(differs(&path, why).into_boxed_str())),
                 }
             }
         }
@@ -2761,6 +2730,50 @@ impl Engine {
 
 /// Whether a tracking id's object part (`group/kind:namespace/name`) names `key`. The namespace
 /// counts only for namespaced kinds: Argo CD writes one for cluster-scoped objects too.
+/// A render of what the owner rendered: each object normalized and compressed, `Skip` hooks left
+/// out, the kinds its CRDs define noted.
+fn render_of(key: u64, objects: Vec<Value>, intern: &mut dyn FnMut(&str) -> Str) -> Render {
+    let mut out = Vec::with_capacity(objects.len());
+    let mut scopes = Vec::new();
+    for mut o in objects {
+        if !o.is_object() || sync::is_skipped(&o) {
+            continue;
+        }
+        diff::normalize_desired(&mut o);
+        let kind = obj::kind(&o);
+        let name = obj::name(&o);
+        if kind.is_empty() || name.is_empty() {
+            continue;
+        }
+        if kind == "CustomResourceDefinition"
+            && obj::group(&o) == "apiextensions.k8s.io"
+            && let (Some(g), Some(k)) = (obj::str_at(&o, &["spec", "group"]), obj::str_at(&o, &["spec", "names", "kind"]))
+        {
+            scopes.push((GroupKind::new(g, k), obj::str_at(&o, &["spec", "scope"]) != Some("Cluster")));
+        }
+        out.push(Rendered {
+            hash: obj::hash_value(&o),
+            group: intern(obj::group(&o)),
+            kind: intern(kind),
+            name: name.into(),
+            namespace: intern(obj::namespace(&o)),
+            hook: sync::hook_of(&o).is_some(),
+            blob: Blob::encode(&o),
+        });
+    }
+    Render { key, objects: out, scopes }
+}
+
+/// Where a desired object and a live one differ, as people read it.
+fn differs(path: &str, why: diff::Why) -> String {
+    let what = match why {
+        diff::Why::Missing => "is missing live",
+        diff::Why::Differs => "differs",
+        diff::Why::Removed => "is no longer set; the next apply removes it",
+    };
+    format!("{path} {what}")
+}
+
 fn tracking_names(rest: &str, key: &ResKey) -> bool {
     let Some((gk, nsname)) = rest.split_once(':') else { return false };
     let Some((g, k)) = gk.split_once('/') else { return false };
