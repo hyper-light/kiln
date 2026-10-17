@@ -218,6 +218,10 @@ export const frontDoorApi = {
   /** A certificate chain and its key for the runner (which keeps them; the key is never sent back). */
   uploadCert: (runner: string, cert_pem: string, key_pem: string) =>
     post<{ cert: CertInfo; front_door: FrontDoorView }>(`/api/runners/${enc(runner)}/front-door/cert`, { cert_pem, key_pem }),
+  /** A new key and self-signed certificate now (409 for your own certificate, or with HTTPS off). */
+  renewCert: (runner: string) => post<FrontDoorView>(`/api/runners/${enc(runner)}/front-door/cert/renew`, {}),
+  /** The certificate chain the runner serves, as a PEM download (certificates only, never the key). */
+  certUrl: (runner: string) => `/api/runners/${enc(runner)}/front-door/cert`,
 };
 
 /** Build a ws:// or wss:// URL for a same-origin path. */

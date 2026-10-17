@@ -360,6 +360,7 @@ export type ServerEvent =
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
 export type DnsMode = "resolver" | "authoritative";
+/** `kiln`: self-signed, from kiln's own root (made, installed and renewed by kiln). `custom`: your own. */
 export type CertMode = "kiln" | "custom";
 
 /** A runner's front door, as set in the UI (`PUT /api/runners/:name/front-door`). */
@@ -415,7 +416,8 @@ export interface FrontDoorStatus {
   https: FrontDoorListener;
   http: FrontDoorListener;
   mdns: FrontDoorListener;
-  cert: { mode: CertMode; state: FrontDoorState; info: CertInfo | null; kiln: boolean; missing: string[]; error: string | null };
+  /** `renewing`: a new self-signed certificate was asked for (renew now) and is not in yet. */
+  cert: { mode: CertMode; state: FrontDoorState; info: CertInfo | null; kiln: boolean; missing: string[]; error: string | null; renewing: boolean };
   want: string[];
   asked: number;
   fixes: FrontDoorFix[];

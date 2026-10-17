@@ -1,17 +1,19 @@
 /**
  * Runners → Domain & HTTPS: a runner made into kiln's address on the network (its "front door"):
- * DNS for a domain, HTTPS in front of the server with kiln's certificate or your own, and a
- * `.local` name. All in the page's flow, from standard controls: a runner select, text fields,
- * switches, selects, one Save. Live status lines keep their place and height whatever they say
+ * DNS for a domain of any name (kiln.dev), HTTPS in front of the server with a self-signed
+ * certificate kiln makes, installs and renews, or your own; a `.local` name as a quiet extra. All
+ * in the page's flow, from standard controls: a runner select, text fields, switches, one Save.
+ * The certificate in use is shown where it is managed (renew, download, upload, how devices trust
+ * it), each action done in place. Live status lines keep their place and height whatever they say
  * (a failing line shows its fix with a copy button in its second line); the one-time setup a
- * runner needs and how each kind of device trusts kiln's certificate follow.
+ * runner needs follows.
  */
 import * as React from "react";
 import { Switch } from "radix-ui";
-import { Check, Copy, Download } from "lucide-react";
+import { Check, Copy, Download, Minus, Plus } from "lucide-react";
 import { frontDoorApi } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, CertMode, DnsMode, FrontDoorFix, FrontDoorListener, FrontDoorSettings, FrontDoorState, FrontDoorView } from "@/api/types";
+import type { Agent, CertInfo, CertMode, DnsMode, FrontDoorFix, FrontDoorListener, FrontDoorSettings, FrontDoorState, FrontDoorStatus, FrontDoorView } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SectionHeading } from "@/components/ui/misc";
 import { errorMessage, useLocalStorage, useResource } from "@/lib/hooks";
@@ -46,8 +48,8 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
         aside={summary && summary.origins.length > 0 ? <span className="fd-aside">{summary.origins[0]}</span> : undefined}
       />
       <p className="fd-lead">
-        Make a runner kiln&apos;s address on your network: a name like <code>kiln.home</code> that its DNS answers, HTTPS in front of the server with kiln&apos;s certificate or
-        your own, and a <code>.local</code> name that needs no setup at all. Phones need HTTPS for voice input.
+        Give kiln any name you like, such as <code>kiln.dev</code>, and make a runner its address on your network: DNS on the runner answers the name, and HTTPS serves kiln under it with a self-signed
+        certificate kiln makes and renews, or with your own. Phones need HTTPS for voice input.
       </p>
       {runners.length === 0 ? (
         <p className="fd-quiet">No runners yet: add a machine first.</p>
@@ -125,8 +127,9 @@ function draftOf(s: FrontDoorSettings): Draft {
   };
 }
 
-/** The settings a draft says, or the field that is not a number. */
-function settingsOf(d: Draft): FrontDoorSettings | string {
+/** The settings a draft says, on top of the stored ones (so a save keeps what the form does not
+ * show), or the field that is not a number. */
+function settingsOf(d: Draft, base: FrontDoorSettings): FrontDoorSettings | string {
   const port = (v: string, what: string, zero = false) => {
     const n = Number(v.trim());
     return Number.isInteger(n) && n >= (zero ? 0 : 1) && n <= 65535 ? n : `${what}: ${v.trim() || "nothing"} is not a port`;
@@ -136,12 +139,13 @@ function settingsOf(d: Draft): FrontDoorSettings | string {
   const httpPort = port(d.httpPort, "HTTP redirect port", true);
   for (const p of [dnsPort, httpsPort, httpPort]) if (typeof p === "string") return p;
   return {
+    ...base,
     domain: d.domain.trim(),
     aliases: words(d.aliases),
-    dns: { enabled: d.dnsEnabled, port: dnsPort as number, mode: d.dnsMode, upstream: words(d.upstream), addresses: words(d.addresses) },
-    https: { enabled: d.httpsEnabled, port: httpsPort as number, http_port: httpPort as number, upstream: d.httpsUpstream.trim() },
-    cert: { mode: d.certMode },
-    mdns: { enabled: d.mdnsEnabled, name: d.mdnsName.trim() },
+    dns: { ...base.dns, enabled: d.dnsEnabled, port: dnsPort as number, mode: d.dnsMode, upstream: words(d.upstream), addresses: words(d.addresses) },
+    https: { ...base.https, enabled: d.httpsEnabled, port: httpsPort as number, http_port: httpPort as number, upstream: d.httpsUpstream.trim() },
+    cert: { ...base.cert, mode: d.certMode },
+    mdns: { ...base.mdns, enabled: d.mdnsEnabled, name: d.mdnsName.trim() },
   };
 }
 
@@ -164,8 +168,8 @@ function FrontDoorPanel({ runner, onSaved }: { runner: string; onSaved: () => vo
   };
 
   const save = async () => {
-    if (!d) return;
-    const s = settingsOf(d);
+    if (!d || !v) return;
+    const s = settingsOf(d, v.settings);
     if (typeof s === "string") {
       setMsg({ tone: "error", text: s });
       return;
@@ -198,8 +202,7 @@ function FrontDoorPanel({ runner, onSaved }: { runner: string; onSaved: () => vo
         >
           <NamesGroup d={d} set={set} />
           <DnsGroup d={d} set={set} v={v} />
-          <HttpsGroup d={d} set={set} v={v} onUploaded={(next) => view.setData(() => next)} />
-          <LocalGroup d={d} set={set} />
+          <HttpsGroup d={d} set={set} v={v} onView={(next) => view.setData(() => next)} />
           <div className="fd-actions">
             <Button type="submit" size="xs" className="fd-btn" disabled={saving || !dirty}>
               {saving ? "Saving…" : "Save"}
@@ -215,7 +218,6 @@ function FrontDoorPanel({ runner, onSaved }: { runner: string; onSaved: () => vo
       ) : (
         <div className="fd-form fd-loading" aria-hidden="true" />
       )}
-      {v && <InstallCa v={v} />}
       {v?.status && v.status.fixes.length > 0 && <Setup runner={runner} fixes={v.status.fixes} />}
     </div>
   );
@@ -231,9 +233,14 @@ function appliedWords(v: FrontDoorView): string {
 
 /* ------------------------------------------------------------------ status lines */
 
-type Line = { name: string; state: FrontDoorState; text: string; detail?: string; fix?: FrontDoorFix | null; muted?: boolean };
+/** A line's state: the runner's, or `warn` when it works but needs you soon (amber). */
+type Line = { name: string; state: FrontDoorState | "warn"; text: string; detail?: string; fix?: FrontDoorFix | null; muted?: boolean };
 
 const date = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
+/** A certificate this close to its end is a problem (the runner renews a self-signed one then). */
+const SOON_DAYS = 30;
+const daysLeft = (unix: number) => Math.round((unix - Date.now() / 1000) / 86_400);
+const days = (n: number) => `${n} day${n === 1 ? "" : "s"}`;
 
 /** The address to show for a listener: a LAN one before loopback, IPv4 before IPv6. */
 function where(on: string[]): string {
@@ -260,7 +267,7 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
   if (!v || !s || !st || !v.connected || v.supported === false) {
     const lines = [offline("DNS", dnsOn, names), offline("HTTPS", httpsOn, names)];
     if (httpOn) lines.push(offline("HTTP", true, "plain HTTP redirects to HTTPS"));
-    lines.push(offline(".local", localOn, `${s?.mdns.name ?? "kiln"}.local`));
+    if (localOn) lines.push(offline(".local", true, `${s?.mdns.name ?? "kiln"}.local`));
     return lines;
   }
   const standby = (name: string, l: FrontDoorListener): Line | null =>
@@ -295,20 +302,33 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
 
   const h = st.https;
   const cert = st.cert;
-  const certWords = cert.info ? `${cert.mode === "kiln" ? "kiln certificate" : `${cert.info.issuer || "own"} certificate`} until ${date(cert.info.not_after)}` : "";
+  const kind = cert.mode === "kiln" ? "self-signed" : "your own";
   let httpsLine: Line;
   if (!httpsOn) httpsLine = { name: "HTTPS", state: "off", text: "off", muted: true };
   else if (standby("HTTPS", h)) httpsLine = standby("HTTPS", h) as Line;
+  else if (h.state === "on" && cert.state === "error") httpsLine = { name: "HTTPS", state: "error", text: cert.error ?? "its certificate cannot be used", detail: "upload a new certificate below" };
   else if (h.state === "on") {
-    const missing = cert.missing.length ? `not valid for ${cert.missing.join(", ")}${cert.mode === "kiln" ? " yet (renewing)" : ""}` : "";
-    httpsLine = {
-      name: "HTTPS",
-      state: missing && cert.mode === "custom" ? "error" : "on",
-      text: `${port(h.on[0] ?? "")} ✓ · ${certWords}`,
-      detail: missing || [cert.info?.names.join(", "), h.to[0] ? `→ ${h.to[0]}` : "", h.served ? `${h.served.toLocaleString()} connections` : ""].filter(Boolean).join(" · "),
-    };
+    // What is wrong with the certificate it serves: names it does not cover, its end near.
+    const left = cert.info ? daysLeft(cert.info.not_after) : null;
+    const problem = [cert.missing.length ? `not valid for ${cert.missing.join(", ")}` : "", left !== null && left < SOON_DAYS ? (left < 1 ? "expires today" : `expires in ${days(left)}`) : ""]
+      .filter(Boolean)
+      .join(" · ");
+    const at = port(h.on[0] ?? "");
+    const usual = [cert.info?.names.join(", "), h.to[0] ? `→ ${h.to[0]}` : "", h.served ? `${h.served.toLocaleString()} connection${h.served === 1 ? "" : "s"}` : ""].filter(Boolean).join(" · ");
+    if (cert.mode === "kiln" && (cert.renewing || problem))
+      httpsLine = { name: "HTTPS", state: "on", text: `${at} ✓ · self-signed · renewing`, detail: problem ? `${problem}: kiln is renewing it` : "a new key and certificate are on their way" };
+    else if (problem)
+      httpsLine = {
+        name: "HTTPS",
+        state: "warn",
+        text: `${at} ✓ · your own · ${problem}`,
+        detail: cert.missing.length
+          ? `upload one that covers them${left !== null && left < SOON_DAYS ? `, before ${date(cert.info?.not_after ?? 0)}` : ""}`
+          : `upload a new one before ${date(cert.info?.not_after ?? 0)}`,
+      };
+    else httpsLine = { name: "HTTPS", state: "on", text: `${at} ✓ · ${kind}${cert.info ? `, until ${date(cert.info.not_after)}` : ""}`, detail: usual };
   } else if (h.state === "waiting" || cert.state === "waiting")
-    httpsLine = { name: "HTTPS", state: "waiting", text: cert.state === "waiting" ? "waiting for kiln's CA to issue its certificate" : (h.error ?? "waiting"), detail: cert.error ?? names };
+    httpsLine = { name: "HTTPS", state: "waiting", text: cert.state === "waiting" ? "waiting for its self-signed certificate" : (h.error ?? "waiting"), detail: cert.error ?? names };
   else if (cert.state === "error") httpsLine = { name: "HTTPS", state: "error", text: cert.error ?? "no certificate", detail: cert.mode === "custom" ? "upload a certificate and its key below" : undefined };
   else httpsLine = failed("HTTPS", h, "not listening");
 
@@ -321,8 +341,8 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
     else lines.push(failed("HTTP", x, "not listening"));
   }
   const m = st.mdns;
-  if (!localOn) lines.push({ name: ".local", state: "off", text: "off", muted: true });
-  else if (standby(".local", m)) lines.push(standby(".local", m) as Line);
+  if (!localOn) return lines;
+  if (standby(".local", m)) lines.push(standby(".local", m) as Line);
   else if (m.state === "on") lines.push({ name: ".local", state: "on", text: `${m.on[0] ?? `${s.mdns.name}.local`} ✓`, detail: "multicast DNS on this network: nothing to set up" });
   else lines.push({ name: ".local", state: m.state === "error" ? "error" : "waiting", text: m.error ?? "starting", detail: `${s.mdns.name}.local` });
   return lines;
@@ -414,12 +434,37 @@ function NamesGroup({ d, set }: GroupProps) {
     <fieldset className="fd-group">
       <legend className="fd-key">Names</legend>
       <div className="fd-grid">
-        <Field label="Domain" hint={<>Every name under it answers too (<code>*.{d.domain || "kiln.home"}</code>).</>}>
-          {(id) => <input id={id} className="fd-input" value={d.domain} placeholder="kiln.home" autoCapitalize="off" autoCorrect="off" spellCheck={false} onChange={(e) => set({ domain: e.target.value })} />}
+        <Field
+          label="Domain"
+          hint={
+            <>
+              Any name you choose. Every name under it answers too (<code>*.{d.domain || "kiln.dev"}</code>).
+            </>
+          }
+        >
+          {(id) => (
+            <input id={id} className="fd-input" value={d.domain} placeholder="kiln.dev" autoCapitalize="off" autoCorrect="off" spellCheck={false} onChange={(e) => set({ domain: e.target.value })} />
+          )}
         </Field>
         <Field label="Aliases" hint="More names for the same door, separated by commas.">
           {(id) => <input id={id} className="fd-input" value={d.aliases} placeholder="ci.home" autoCapitalize="off" autoCorrect="off" spellCheck={false} onChange={(e) => set({ aliases: e.target.value })} />}
         </Field>
+      </div>
+      {/* A .local name: an extra for networks whose DNS you can't set, quieter than the names. */}
+      <div className="fd-extra">
+        <Toggle checked={d.mdnsEnabled} onChange={(mdnsEnabled) => set({ mdnsEnabled })} label="Also answer a .local name">
+          Also answer <code>{d.mdnsName || "kiln"}.local</code> on this network (multicast DNS, no setup)
+        </Toggle>
+        {d.mdnsEnabled && (
+          <Field label=".local name">
+            {(id) => (
+              <span className="fd-suffix">
+                <input id={id} className="fd-input" value={d.mdnsName} placeholder="kiln" autoCapitalize="off" spellCheck={false} onChange={(e) => set({ mdnsName: e.target.value })} />
+                <span aria-hidden="true">.local</span>
+              </span>
+            )}
+          </Field>
+        )}
       </div>
     </fieldset>
   );
@@ -467,7 +512,7 @@ function DnsGroup({ d, set, v }: GroupProps & { v: FrontDoorView }) {
               </>
             ) : (
               <>
-                Have your router forward just <code>{d.domain || "kiln.home"}</code> to <code>{lan ?? "this runner"}</code> (conditional forwarding); it keeps answering the rest.
+                Have your router forward just <code>{d.domain || "kiln.dev"}</code> to <code>{lan ?? "this runner"}</code> (conditional forwarding); it keeps answering the rest.
               </>
             )}
           </p>
@@ -489,29 +534,8 @@ async function readPems(files: FileList | null): Promise<{ cert?: string; key?: 
   return out;
 }
 
-function HttpsGroup({ d, set, v, onUploaded }: GroupProps & { v: FrontDoorView; onUploaded: (v: FrontDoorView) => void }) {
+function HttpsGroup({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView: (v: FrontDoorView) => void }) {
   const st = v.status;
-  const [certPem, setCertPem] = React.useState("");
-  const [keyPem, setKeyPem] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const [note, setNote] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
-  const fileId = React.useId();
-  const current = st?.cert.mode === "custom" ? st.cert.info : null;
-  const upload = async () => {
-    setBusy(true);
-    setNote(null);
-    try {
-      const r = await frontDoorApi.uploadCert(v.runner, certPem, keyPem);
-      onUploaded(r.front_door);
-      setCertPem("");
-      setKeyPem("");
-      setNote({ tone: "ok", text: `Sent to ${v.runner}: ${r.cert.names.join(", ")}, until ${date(r.cert.not_after)}. The key stays on the runner.` });
-    } catch (e) {
-      setNote({ tone: "error", text: errorMessage(e) });
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <fieldset className="fd-group">
       <legend className="fd-key">HTTPS</legend>
@@ -521,21 +545,13 @@ function HttpsGroup({ d, set, v, onUploaded }: GroupProps & { v: FrontDoorView; 
       {d.httpsEnabled && (
         <>
           <div className="fd-grid">
-            <Field label="Certificate">
-              {(id) => (
-                <select id={id} className="fd-select" value={d.certMode} onChange={(e) => set({ certMode: e.target.value as CertMode })}>
-                  <option value="kiln">kiln&apos;s own (from kiln&apos;s CA, renewed by itself)</option>
-                  <option value="custom">Your own (paste or upload it)</option>
-                </select>
-              )}
-            </Field>
             <Field label="Port">
               {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpsPort} onChange={(e) => set({ httpsPort: e.target.value })} />}
             </Field>
             <Field label="HTTP redirect port" hint="0: no plain-HTTP redirect.">
               {(id) => <input id={id} className="fd-input fd-port" inputMode="numeric" value={d.httpPort} onChange={(e) => set({ httpPort: e.target.value })} />}
             </Field>
-            <Field label="Forward to" hint="Empty: the runner's own server URL.">
+            <Field label="Forward to" hint="Empty: the runner's own server URL." wide>
               {(id) => (
                 <input
                   id={id}
@@ -549,78 +565,257 @@ function HttpsGroup({ d, set, v, onUploaded }: GroupProps & { v: FrontDoorView; 
               )}
             </Field>
           </div>
-          {d.certMode === "custom" && (
-            <div className="fd-custom">
-              {current && (
-                <p className="fd-hint">
-                  In use: {current.issuer || "self-signed"} certificate for {current.names.join(", ")}, until {date(current.not_after)}.
-                </p>
-              )}
-              <div className="fd-grid">
-                <Field label="Certificate chain (PEM)" wide>
-                  {(id) => (
-                    <textarea id={id} className="fd-input fd-area" value={certPem} placeholder="-----BEGIN CERTIFICATE-----" spellCheck={false} onChange={(e) => setCertPem(e.target.value)} />
-                  )}
-                </Field>
-                <Field label="Private key (PEM)" hint="Sent to the runner once and kept there (mode 0600); never shown again." wide>
-                  {(id) => (
-                    <textarea id={id} className="fd-input fd-area" value={keyPem} placeholder="-----BEGIN PRIVATE KEY-----" spellCheck={false} autoComplete="off" onChange={(e) => setKeyPem(e.target.value)} />
-                  )}
-                </Field>
-              </div>
-              <div className="fd-actions">
-                <label className="fd-file" htmlFor={fileId}>
-                  Choose files…
-                </label>
-                <input
-                  id={fileId}
-                  className="fd-sr"
-                  type="file"
-                  multiple
-                  accept=".pem,.crt,.cer,.key,.txt"
-                  onChange={(e) => {
-                    void readPems(e.target.files).then((r) => {
-                      if (r.cert) setCertPem(r.cert);
-                      if (r.key) setKeyPem(r.key);
-                    });
-                    e.target.value = "";
-                  }}
-                />
-                <Button type="button" size="xs" variant="secondary" className="fd-btn" disabled={busy || !certPem.trim() || !keyPem.trim()} onClick={() => void upload()}>
-                  {busy ? "Uploading…" : "Upload certificate"}
-                </Button>
-                <span className="fd-msg" role="status" data-tone={note?.tone ?? "quiet"}>
-                  {note?.text ?? (v.connected ? "" : `${v.runner} must be online to take it.`)}
-                </span>
-              </div>
-            </div>
-          )}
+          <CertPart d={d} set={set} v={v} onView={onView} />
         </>
       )}
     </fieldset>
   );
 }
 
-function LocalGroup({ d, set }: GroupProps) {
+/* ------------------------------------------------------------------ the certificate */
+
+/** Top-level domains every browser treats as HTTPS-only (the HSTS preload list): nobody can click
+ * through a certificate warning under them, so the certificate must be trusted first. */
+const PRELOADED = new Set("android app bank boo chrome dad day dev esq foo gle gmail google hangout ing insurance meet meme mov new nexus page phd play prof rsvp search youtube zip".split(" "));
+const tldOf = (name: string) => name.trim().toLowerCase().replace(/\.$/, "").split(".").pop() ?? "";
+
+/** The file a certificate downloads as (the server names it the same way): its first name. */
+function pemName(info: CertInfo, runner: string): string {
+  const first = info.names.find((n) => !/^[\d.]+$/.test(n) && !n.includes(":"))?.replace(/^\*\./, "") ?? "";
+  return `${first.replace(/[^a-z0-9.-]/gi, "") || runner}.pem`;
+}
+
+/** A SHA-256 fingerprint as two lines of 16 bytes, the way devices show it. */
+function Fingerprint({ sha256 }: { sha256: string }) {
+  const bytes = sha256.toUpperCase().match(/.{2}/g) ?? [];
   return (
-    <fieldset className="fd-group">
-      <legend className="fd-key">.local name</legend>
-      <Toggle checked={d.mdnsEnabled} onChange={(mdnsEnabled) => set({ mdnsEnabled })} label="Answer a .local name">
-        Answer <code>{d.mdnsName || "kiln"}.local</code> on this network (multicast DNS, no setup)
-      </Toggle>
-      {d.mdnsEnabled && (
-        <div className="fd-grid">
-          <Field label="Name">
-            {(id) => (
-              <span className="fd-suffix">
-                <input id={id} className="fd-input" value={d.mdnsName} placeholder="kiln" autoCapitalize="off" spellCheck={false} onChange={(e) => set({ mdnsName: e.target.value })} />
-                <span aria-hidden="true">.local</span>
+    <span className="fd-fp">
+      <span>{bytes.slice(0, 16).join(":")}</span>
+      <span>{bytes.slice(16).join(":")}</span>
+    </span>
+  );
+}
+
+/** The certificate installed on the runner now (what it reports), the same four rows whether
+ * there is one or not, so nothing moves when it arrives. */
+function CertFacts({ cert, runner }: { cert: FrontDoorStatus["cert"] | null; runner: string }) {
+  const id = React.useId();
+  const info = cert?.info ?? null;
+  const left = info ? daysLeft(info.not_after) : 0;
+  return (
+    <div className="fd-facts">
+      <span id={`${id}-in-use`} className="fd-key">
+        In use on {runner}
+      </span>
+      <dl aria-labelledby={`${id}-in-use`}>
+        <div className="fd-fact">
+          <dt className="fd-key">Names</dt>
+          <dd>{info ? info.names.join(", ") || "—" : <span className="fd-none">none installed yet</span>}</dd>
+        </div>
+        <div className="fd-fact">
+          <dt className="fd-key">Valid</dt>
+          <dd>
+            {info ? (
+              <>
+                {date(info.not_before)} → {date(info.not_after)}
+                <span className="fd-none"> · {left < 1 ? (info.not_after * 1000 < Date.now() ? "expired" : "ends today") : `${days(left)} left`}</span>
+              </>
+            ) : (
+              <span className="fd-none">—</span>
+            )}
+          </dd>
+        </div>
+        <div className="fd-fact">
+          <dt className="fd-key">Issuer</dt>
+          <dd>{info ? cert?.kiln ? `${info.issuer || "kiln CA"}, kiln's own root` : info.issuer || "—" : <span className="fd-none">—</span>}</dd>
+        </div>
+        <div className="fd-fact">
+          <dt className="fd-key">SHA-256</dt>
+          <dd>
+            {info ? (
+              <Fingerprint sha256={info.sha256} />
+            ) : (
+              <span className="fd-fp fd-none">
+                <span>—</span>
+                <span> </span>
               </span>
             )}
-          </Field>
+          </dd>
         </div>
+      </dl>
+    </div>
+  );
+}
+
+/** HTTPS's certificate, managed where it is shown: which kind (self-signed or your own), the one
+ * installed now, and what can be done with it in place: renew, download, upload, trust. */
+function CertPart({ d, set, v, onView }: GroupProps & { v: FrontDoorView; onView: (v: FrontDoorView) => void }) {
+  const cert = v.status?.cert ?? null;
+  const info = cert?.info ?? null;
+  const self = d.certMode === "kiln";
+  const online = v.connected && v.supported !== false;
+  const savedSelf = v.settings.https.enabled && v.settings.cert.mode === "kiln";
+  const tld = PRELOADED.has(tldOf(d.domain)) ? tldOf(d.domain) : null;
+  const ownInstalled = cert?.mode === "custom" && Boolean(info);
+  const [uploading, setUploading] = React.useState(false);
+
+  // Renew now: asked, then done once the runner serves a certificate with another fingerprint.
+  const [renew, setRenew] = React.useState<{ from: string; asking?: boolean; error?: string } | null>(null);
+  const renewed = renew && !renew.asking && !renew.error && info && info.sha256 !== renew.from ? info : null;
+  const renewing = !renewed && (Boolean(cert?.renewing) || Boolean(renew && !renew.error));
+  const startRenew = async () => {
+    const from = info?.sha256 ?? "";
+    setRenew({ from, asking: true });
+    try {
+      onView(await frontDoorApi.renewCert(v.runner));
+      setRenew({ from });
+    } catch (e) {
+      setRenew({ from, error: errorMessage(e) });
+    }
+  };
+  const note: { tone: "ok" | "error" | "quiet"; text: string } | null = renew?.error
+    ? { tone: "error", text: renew.error }
+    : renewed
+      ? { tone: "ok", text: `Renewed: a new key and certificate, until ${date(renewed.not_after)}.` }
+      : renewing
+        ? { tone: "quiet", text: `Renewing: ${v.runner} makes a new key and kiln's root signs it.` }
+        : self && !savedSelf
+          ? { tone: "quiet", text: "Save first; then it can be renewed here." }
+          : !v.connected
+            ? { tone: "quiet", text: `${v.runner} is offline.` }
+            : !online
+              ? { tone: "quiet", text: `${v.runner} runs a kiln too old to renew it.` }
+              : null;
+
+  return (
+    <div className="fd-cert">
+      <Field
+        label="Certificate"
+        hint={
+          self ? (
+            <>
+              kiln makes it from its own root, installs it on {v.runner} and renews it before it ends. Trust that root once on a device and the device trusts every runner&apos;s certificate, renewals
+              too.
+            </>
+          ) : (
+            <>A certificate for these names and its key, from your own CA or a public one. The key goes to {v.runner} once and stays there; kiln never shows it again.</>
+          )
+        }
+      >
+        {(id) => (
+          <select id={id} className="fd-select" value={d.certMode} onChange={(e) => set({ certMode: e.target.value as CertMode })}>
+            <option value="kiln">Self-signed: kiln makes and renews it</option>
+            <option value="custom">Your own: upload it with its key</option>
+          </select>
+        )}
+      </Field>
+      <CertFacts cert={cert} runner={v.runner} />
+      <div className="fd-actions">
+        {self && (
+          <Button
+            type="button"
+            size="xs"
+            variant="secondary"
+            className="fd-btn"
+            disabled={!savedSelf || !online || renewing}
+            title="A new key and certificate now; the one in use serves until it is in"
+            onClick={() => void startRenew()}
+          >
+            {renewing ? "Renewing…" : "Renew now"}
+          </Button>
+        )}
+        {info ? (
+          <a className="fd-download" href={frontDoorApi.certUrl(v.runner)} download title="The certificate chain it serves (PEM), never its key">
+            <Download size={13} aria-hidden="true" /> {pemName(info, v.runner)}
+          </a>
+        ) : (
+          <span className="fd-download" aria-disabled="true">
+            <Download size={13} aria-hidden="true" /> Download
+          </span>
+        )}
+        {!self && ownInstalled && !uploading && (
+          <Button type="button" size="xs" variant="secondary" className="fd-btn" onClick={() => setUploading(true)}>
+            Upload a new one
+          </Button>
+        )}
+        {self && note && (
+          <span className="fd-msg" role="status" data-tone={note.tone}>
+            {note.text}
+          </span>
+        )}
+      </div>
+      {!self && (uploading || !ownInstalled) && <Upload v={v} onView={onView} onDone={() => setUploading(false)} />}
+      {self && tld && (
+        <p className="fd-hint">
+          Browsers never let anyone click through a certificate warning on <code>.{tld}</code> (it is HSTS-preloaded): trust kiln&apos;s root on each device first.
+        </p>
       )}
-    </fieldset>
+      {self && <TrustDevices v={v} />}
+    </div>
+  );
+}
+
+/** Your own certificate: its chain and key, pasted or read from files, sent to the runner. */
+function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoorView) => void; onDone: () => void }) {
+  const [certPem, setCertPem] = React.useState("");
+  const [keyPem, setKeyPem] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [note, setNote] = React.useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  const fileId = React.useId();
+  const upload = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      const r = await frontDoorApi.uploadCert(v.runner, certPem, keyPem);
+      onView(r.front_door);
+      setCertPem("");
+      setKeyPem("");
+      setNote({ tone: "ok", text: `Sent to ${v.runner}: ${r.cert.names.join(", ")}, until ${date(r.cert.not_after)}. The key stays on the runner.` });
+      onDone();
+    } catch (e) {
+      setNote({ tone: "error", text: errorMessage(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="fd-custom">
+      <div className="fd-grid">
+        <Field label="Certificate chain (PEM)" wide>
+          {(id) => <textarea id={id} className="fd-input fd-area" value={certPem} placeholder="-----BEGIN CERTIFICATE-----" spellCheck={false} onChange={(e) => setCertPem(e.target.value)} />}
+        </Field>
+        <Field label="Private key (PEM)" hint="Sent to the runner once and kept there (mode 0600); never shown again." wide>
+          {(id) => (
+            <textarea id={id} className="fd-input fd-area" value={keyPem} placeholder="-----BEGIN PRIVATE KEY-----" spellCheck={false} autoComplete="off" onChange={(e) => setKeyPem(e.target.value)} />
+          )}
+        </Field>
+      </div>
+      <div className="fd-actions">
+        <label className="fd-file" htmlFor={fileId}>
+          Choose files…
+        </label>
+        <input
+          id={fileId}
+          className="fd-sr"
+          type="file"
+          multiple
+          accept=".pem,.crt,.cer,.key,.txt"
+          onChange={(e) => {
+            void readPems(e.target.files).then((r) => {
+              if (r.cert) setCertPem(r.cert);
+              if (r.key) setKeyPem(r.key);
+            });
+            e.target.value = "";
+          }}
+        />
+        <Button type="button" size="xs" variant="secondary" className="fd-btn" disabled={busy || !certPem.trim() || !keyPem.trim()} onClick={() => void upload()}>
+          {busy ? "Uploading…" : "Upload certificate"}
+        </Button>
+        <span className="fd-msg" role="status" data-tone={note?.tone ?? "quiet"}>
+          {note?.text ?? (v.connected ? "" : `${v.runner} must be online to take it.`)}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -630,10 +825,14 @@ const DEVICES: { os: string; steps: React.ReactNode }[] = [
   {
     os: "iPhone, iPad",
     steps: (
-      <>
-        Open <a href="/ca.mobileconfig">ca.mobileconfig</a> in Safari and allow it, then Settings → General → VPN &amp; Device Management → kiln CA → Install. Then Settings → General → About →
-        Certificate Trust Settings: turn on <b>kiln CA</b> (Enable full trust).
-      </>
+      <ol className="fd-steps">
+        <li>
+          Open <a href="/ca.mobileconfig">ca.mobileconfig</a> in Safari and allow it, then install the profile: Settings → General → VPN &amp; Device Management → kiln CA → Install.
+        </li>
+        <li>
+          Settings → General → About → Certificate Trust Settings: turn on <b>kiln CA</b> (Enable full trust for root certificates).
+        </li>
+      </ol>
     ),
   },
   {
@@ -674,33 +873,49 @@ const DEVICES: { os: string; steps: React.ReactNode }[] = [
   },
 ];
 
-function InstallCa({ v }: { v: FrontDoorView }) {
-  const fp = v.ca?.sha256.toUpperCase().match(/.{2}/g)?.join(":") ?? "";
+/** How a device trusts kiln's root (and so every self-signed certificate kiln makes): a quiet
+ * disclosure inside the certificate part, closed until asked for. */
+function TrustDevices({ v }: { v: FrontDoorView }) {
+  const [open, setOpen] = React.useState(false);
+  const id = React.useId();
   return (
-    <div className="fd-ca">
-      <h3 className="fd-key">Install kiln&apos;s certificate</h3>
-      <p className="fd-hint">
-        With kiln&apos;s own certificate, each device trusts the front door once it trusts kiln&apos;s CA. Check the fingerprint on the device: SHA-256 <code className="fd-fp">{fp}</code>
-      </p>
-      <div className="fd-downloads">
-        <a className="fd-download" href="/ca.mobileconfig" download>
-          <Download size={13} aria-hidden="true" /> ca.mobileconfig
-        </a>
-        <a className="fd-download" href="/ca.crt" download>
-          <Download size={13} aria-hidden="true" /> kiln-ca.crt
-        </a>
-        <a className="fd-download" href="/ca.pem" download>
-          <Download size={13} aria-hidden="true" /> kiln-ca.pem
-        </a>
-      </div>
-      <dl className="fd-devices">
-        {DEVICES.map((x) => (
-          <div key={x.os} className="fd-device">
-            <dt className="fd-key">{x.os}</dt>
-            <dd>{x.steps}</dd>
+    <div className="fd-trust">
+      <button type="button" className="fd-disclose" aria-expanded={open} aria-controls={id} onClick={() => setOpen(!open)}>
+        {open ? <Minus size={13} aria-hidden="true" /> : <Plus size={13} aria-hidden="true" />}
+        Trust it on your devices
+      </button>
+      {open && (
+        <div id={id} className="fd-trust-body">
+          <p className="fd-hint">
+            Once on each device: trust kiln&apos;s root, and the device trusts every certificate it signs, on every runner, renewals included. On the device, check that it is this root:
+          </p>
+          {v.ca && (
+            <p className="fd-root">
+              <span className="fd-key">SHA-256</span>
+              <Fingerprint sha256={v.ca.sha256} />
+            </p>
+          )}
+          <div className="fd-downloads">
+            <a className="fd-download" href="/ca.mobileconfig" download>
+              <Download size={13} aria-hidden="true" /> ca.mobileconfig
+            </a>
+            <a className="fd-download" href="/ca.crt" download>
+              <Download size={13} aria-hidden="true" /> kiln-ca.crt
+            </a>
+            <a className="fd-download" href="/ca.pem" download>
+              <Download size={13} aria-hidden="true" /> kiln-ca.pem
+            </a>
           </div>
-        ))}
-      </dl>
+          <dl className="fd-devices">
+            {DEVICES.map((x) => (
+              <div key={x.os} className="fd-device">
+                <dt className="fd-key">{x.os}</dt>
+                <dd>{x.steps}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      )}
     </div>
   );
 }

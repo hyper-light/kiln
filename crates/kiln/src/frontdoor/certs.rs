@@ -98,12 +98,14 @@ impl Store {
     }
 
     /// Keep an uploaded certificate and key (both 0600), once they are checked to belong
-    /// together. Errors never quote the key.
+    /// together: the chain's certificates alone in one file (a key pasted with them is dropped
+    /// there), the key in the other. Errors never quote the key.
     pub fn store_custom(&self, c: &CustomCert) -> anyhow::Result<CertInfo> {
         crate::http::tls::ServerTls::from_pem(&c.cert_pem, &c.key_pem)?;
         let info = crate::pki::cert_info(&c.cert_pem)?;
+        let chain = crate::pki::public_chain_pem(&c.cert_pem)?;
         crate::util::write_secret(&self.dir.join(CUSTOM_KEY), c.key_pem.as_bytes(), 0o600).context("store the key")?;
-        crate::util::write_secret(&self.dir.join(CUSTOM_CERT), c.cert_pem.as_bytes(), 0o600).context("store the certificate")?;
+        crate::util::write_secret(&self.dir.join(CUSTOM_CERT), chain.as_bytes(), 0o600).context("store the certificate")?;
         Ok(info)
     }
 }
@@ -156,7 +158,10 @@ mod tests {
         assert!(store.custom().is_none());
         let info = store.store_custom(&CustomCert { cert_pem: cert.clone(), key_pem: key.clone() })?;
         assert_eq!(info.names, ["kiln.home"]);
-        assert_eq!(store.custom(), Some((cert, key)));
+        assert_eq!(store.custom(), Some((crate::pki::public_chain_pem(&cert)?, key.clone())));
+        // Pasted with its key in the certificate field: the certificate file holds no key.
+        store.store_custom(&CustomCert { cert_pem: format!("{cert}{key}"), key_pem: key.clone() })?;
+        assert!(store.custom().is_some_and(|(c, k)| !c.contains("PRIVATE KEY") && k == key));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
