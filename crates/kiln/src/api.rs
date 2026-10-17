@@ -418,7 +418,7 @@ async fn ai_fork(hub: &Hub, machine: &str, pid: &str) -> R {
         return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than branching found sessions: upgrade it in Settings → Updates first")));
     }
     let Some(spec) = found.fork_spec() else {
-        return Err(if found.id.trim().is_empty() || found.cwd.trim().is_empty() {
+        return Err(if !found.started() {
             err(StatusCode::CONFLICT, "it has no conversation to continue yet")
         } else {
             err(StatusCode::BAD_REQUEST, format!("kiln cannot branch a {} session", found.tool))

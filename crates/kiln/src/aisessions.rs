@@ -156,7 +156,7 @@ impl AiSession {
         let Some(kind) = crate::harness::kinds::Kind::get(&self.tool).filter(|k| k.structured()) else {
             return TakeOver::Unsupported;
         };
-        if self.id.trim().is_empty() || self.cwd.trim().is_empty() {
+        if !self.started() {
             TakeOver::NoId
         } else if held && self.terminal.is_some() {
             TakeOver::Ready
@@ -179,9 +179,16 @@ impl AiSession {
         })
     }
 
+    /// It has a conversation to continue: an id, a folder, and a transcript with a first message.
+    /// A brand-new session reports its id before its transcript holds anything to resume (taking it
+    /// over or branching it then would wait on a transcript that isn't there).
+    pub fn started(&self) -> bool {
+        !self.id.trim().is_empty() && !self.cwd.trim().is_empty() && self.transcript && !(self.last_prompt.trim().is_empty() && self.last_reply.trim().is_empty())
+    }
+
     /// Whether a copy of it can be continued as an agent session, leaving it running as it is.
     pub fn forkable(&self) -> bool {
-        crate::harness::kinds::Kind::get(&self.tool).is_some_and(native) && !self.id.trim().is_empty() && !self.cwd.trim().is_empty()
+        crate::harness::kinds::Kind::get(&self.tool).is_some_and(native) && self.started()
     }
 
     /// The agent session that continues a copy of it (a branch of its conversation), leaving it
@@ -1498,6 +1505,8 @@ mod tests {
             cwd: "/work".into(),
             model: "claude-opus-5-5".into(),
             terminal: Some("term1".into()),
+            transcript: true,
+            last_prompt: "fix the build".into(),
             ..AiSession::default()
         };
         assert_eq!(s.takeover(true), TakeOver::Ready);
@@ -1518,6 +1527,10 @@ mod tests {
         let fork = s.fork_spec().unwrap_or_default();
         assert_eq!((fork.fork, fork.takeover_pid, fork.resume.as_deref(), fork.name.as_deref()), (true, None, Some("8b2c"), Some("fix the build (branch)")));
         assert!(acp.fork_spec().is_none() && AiSession { id: String::new(), ..s.clone() }.fork_spec().is_none());
+        // Brand new: its id is known before its transcript holds a first message.
+        for fresh in [AiSession { transcript: false, ..s.clone() }, AiSession { last_prompt: String::new(), ..s.clone() }] {
+            assert_eq!((fresh.takeover(true), fresh.takeover(false), fresh.forkable()), (TakeOver::NoId, TakeOver::NoId, false));
+        }
         // Nothing to continue yet; a harness kiln cannot run as an agent session.
         assert_eq!(AiSession { id: String::new(), ..s.clone() }.takeover(true), TakeOver::NoId);
         assert_eq!(AiSession { tool: "antigravity".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
