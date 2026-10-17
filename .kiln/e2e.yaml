@@ -13,12 +13,13 @@ jobs:
     steps:
       - name: toolchain
         run: cargo --version && rustc --version
+      # Outside the checkout: inside it, cargo would make the crate a member of kiln's workspace.
       - name: create a crate
         run: |
-          cargo new --lib --vcs none e2e_demo
-          printf '\npub fn fib(n: u64) -> u64 {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n\n#[test]\nfn fib_20() {\n    assert_eq!(fib(20), 6765);\n}\n' >> e2e_demo/src/lib.rs
+          cd /tmp && cargo new --lib --vcs none e2e_demo
+          printf '\npub fn fib(n: u64) -> u64 {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n\n#[test]\nfn fib_20() {\n    assert_eq!(fib(20), 6765);\n}\n' >> /tmp/e2e_demo/src/lib.rs
       - name: build + test
-        run: cd e2e_demo && cargo build --offline && cargo test --offline
+        run: cd /tmp/e2e_demo && cargo build --offline && cargo test --offline
 
   go:
     name: go vet + test (pod)
