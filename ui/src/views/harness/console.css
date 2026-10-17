@@ -935,3 +935,8 @@
   font-family: var(--font-mono);
   font-size: 10px;
 }
+
+/* A question gets the room it needs, so its Next is in view. */
+.hx-dock-approvals:has(.hx-approval-q) {
+  max-height: 74dvh;
+}
