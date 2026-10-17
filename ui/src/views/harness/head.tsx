@@ -24,6 +24,12 @@ interface Option {
   description?: string;
 }
 
+/** "bypassPermissions" → "Bypass permissions": a mode the harness didn't list, in words. */
+const modeWords = (v: string) => {
+  const w = v.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[-_]+/g, " ").toLowerCase();
+  return w.charAt(0).toUpperCase() + w.slice(1);
+};
+
 const labelOf = (options: Option[], value: string, pretty: (v: string) => string = (v) => v) => options.find((o) => o.id === value)?.label ?? (value ? pretty(value) : "");
 
 /** A chip that shows a setting and opens the native picker to change it (wide screens). */
@@ -137,7 +143,7 @@ export function AgentHeader({
   const pickMode = (m: string, dangerous: boolean) => (dangerous ? onRisky(m) : send({ type: "set_mode", mode: m }));
   // The kind already names an agent that has no name of its own.
   const named = Boolean(info && info.name.trim().toLowerCase() !== info.kind_name.trim().toLowerCase());
-  const summary = [canMode && labelOf(modes, mode), canModel && labelOf(meta?.models ?? [], model, modelLabel), canEffort && labelOf(meta?.efforts ?? [], effort)].filter(Boolean).join(" · ");
+  const summary = [canMode && labelOf(modes, mode, modeWords), canModel && labelOf(meta?.models ?? [], model, modelLabel), canEffort && labelOf(meta?.efforts ?? [], effort)].filter(Boolean).join(" · ");
   const where = [tildify(cwd), cost > 0 ? costText(cost, plan).text : ""].filter(Boolean).join(" · ");
   const hasControls = canMode || canModel || canEffort || sessionControls > 0;
 
@@ -214,7 +220,7 @@ export function AgentHeader({
       </div>
       {hasControls && (
         <div className="ag-controls" role="group" aria-label="How it runs">
-          {canMode && <Chip label="Permissions" value={mode} options={modes} onPick={pickMode} />}
+          {canMode && <Chip label="Permissions" value={mode} options={modes} pretty={modeWords} onPick={pickMode} />}
           {canModel && <Chip label="Model" value={model} options={meta?.models ?? []} pretty={modelLabel} onPick={(m) => send({ type: "set_model", model: m })} />}
           {canEffort && (
             <Chip
