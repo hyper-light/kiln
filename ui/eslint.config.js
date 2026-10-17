@@ -17,6 +17,15 @@ export default tseslint.config(
       "react-hooks/rules-of-hooks": "error",
       "react-hooks/exhaustive-deps": "warn",
       "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],
+      // No effects in kiln's UI (warnings while the last ones are replaced; then an error).
+      "no-restricted-syntax": [
+        "warn",
+        {
+          selector: "CallExpression[callee.name=/^use(Layout)?Effect$/], CallExpression[callee.object.name='React'][callee.property.name=/^use(Layout)?Effect$/]",
+          message:
+            "No effects: load data with useSuspenseResource (lib/resource.ts) inside Loadable, subscribe to outside state with useSyncExternalStore or a zustand store, act in event handlers, and wire DOM objects with a ref callback (it can return its cleanup).",
+        },
+      ],
     },
   },
 );

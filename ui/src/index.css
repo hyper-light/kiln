@@ -2881,3 +2881,67 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   -webkit-mask-image: linear-gradient(90deg, transparent, #000 36px, #000 calc(100% - 36px), transparent);
   mask-image: linear-gradient(90deg, transparent, #000 36px, #000 calc(100% - 36px), transparent);
 }
+
+/* ---------------------------------------------------------------- loading (Suspense fallbacks) */
+/* hyperlight's spectrum rule: a short prism line that drifts while something loads. It appears
+   only after a moment, so a fast load shows nothing, and holds still under reduced motion. */
+.hl-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+}
+.hl-loading-block {
+  min-height: 120px;
+}
+.hl-rule {
+  width: 34px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--prism);
+  background-size: 250% 100%;
+  opacity: 0;
+  animation:
+    hl-appear 0.2s ease-out 0.18s forwards,
+    hl-drift 1.4s ease-in-out infinite alternate;
+}
+@keyframes hl-appear {
+  to {
+    opacity: 0.9;
+  }
+}
+@keyframes hl-drift {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hl-rule {
+    animation: hl-appear 0.01s linear 0.18s forwards;
+  }
+}
+:root[data-motion="paused"] .hl-rule {
+  animation: hl-appear 0.01s linear 0.18s forwards;
+}
+/* Loading failed: said in place, with a way to try again. */
+.hl-failed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+  padding: 14px 0;
+  color: #d8c8b0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.hl-retry {
+  color: var(--color-bright, #ededee);
+  text-decoration: underline;
+  text-decoration-color: rgb(237 237 238 / 35%);
+  text-underline-offset: 3px;
+}
+
