@@ -17,6 +17,8 @@ const RunDetail = React.lazy(() => import("@/views/run-detail/index"));
 const Repos = React.lazy(() => import("@/views/repos"));
 const Runners = React.lazy(() => import("@/views/runners"));
 const Agents = React.lazy(() => import("@/views/agents"));
+const Mission = React.lazy(() => import("@/views/harness/mission"));
+const AgentPage = React.lazy(() => import("@/views/harness/agent"));
 const Metrics = React.lazy(() => import("@/views/metrics"));
 const System = React.lazy(() => import("@/views/system"));
 const Settings = React.lazy(() => import("@/views/settings"));
@@ -74,7 +76,9 @@ export function App() {
                   <Route path="runs/:id/jobs/:jobId" element={<RunDetail />} />
                   <Route path="repos" element={<Repos />} />
                   <Route path="runners" element={<Runners />} />
-                  <Route path="agents" element={<Agents />} />
+                  <Route path="agents" element={<Mission />} />
+                  <Route path="agents/sessions" element={<Agents />} />
+                  <Route path="agents/:id" element={<AgentPage />} />
                   <Route path="terminal" element={null} />
                   <Route path="telemetry" element={<Metrics />} />
                   <Route path="system" element={<System />} />

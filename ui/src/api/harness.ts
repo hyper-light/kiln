@@ -1,0 +1,535 @@
+/**
+ * kiln as the harness: the normalized agent-session model (mirrors crates/kiln/src/harness/model.rs),
+ * the API to list, start and stop agents, and a live session store fed by its websocket.
+ * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
+ */
+import * as React from "react";
+import { wsUrl } from "@/api/client";
+
+/* ------------------------------------------------------------------ model */
+
+export type Level = "info" | "warn" | "error";
+export type ToolKind = "shell" | "edit" | "read" | "search" | "web" | "agent" | "skill" | "todo" | "question" | "plan" | "mcp" | "other";
+export type ToolStatus = "pending" | "running" | "done" | "error" | "denied" | "cancelled";
+export type Status = "starting" | "idle" | "running" | "waiting" | "exited" | "disconnected";
+export type SendMode = "queue" | "steer" | "now";
+export type Delivery = "sent" | "queued" | "started" | "completed" | "cancelled";
+export type Decision = "allow" | "always" | "deny";
+
+export interface Hunk {
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  /** Each line keeps its ' ', '-' or '+' prefix. */
+  lines: string[];
+}
+
+export interface FileDiff {
+  path: string;
+  created?: boolean;
+  hunks: Hunk[];
+}
+
+export interface Todo {
+  text: string;
+  status: "pending" | "in_progress" | "completed" | string;
+}
+
+export interface ToolCall {
+  tool_id: string;
+  name: string;
+  tool: ToolKind;
+  title: string;
+  detail?: string;
+  input: unknown;
+  status: ToolStatus;
+  output?: string;
+  truncated?: boolean;
+  diffs?: FileDiff[];
+  todos?: Todo[];
+  task?: string;
+  exit_code?: number;
+  started: number;
+  ended?: number;
+}
+
+export type Body =
+  | { kind: "user"; text: string; images?: number; client_id?: string; origin?: string }
+  | { kind: "assistant"; text: string; streaming?: boolean }
+  | { kind: "thinking"; text: string; streaming?: boolean; redacted?: boolean }
+  | ({ kind: "tool" } & ToolCall)
+  | { kind: "notice"; level: Level; text: string };
+
+export type HEvent = { id: string; seq: number; at: number; parent?: string } & Body;
+
+export interface AlwaysOption {
+  label: string;
+  scope: string;
+  value: unknown;
+}
+
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface Question {
+  question: string;
+  header?: string;
+  multi?: boolean;
+  options: QuestionOption[];
+}
+
+export interface Approval {
+  id: string;
+  tool_id?: string | null;
+  tool_name: string;
+  tool: ToolKind;
+  title: string;
+  detail?: string;
+  input: unknown;
+  command?: string;
+  cwd: string;
+  diffs?: FileDiff[];
+  reason?: string;
+  always?: AlwaysOption[];
+  default_to_no?: boolean;
+  questions?: Question[];
+  plan?: string;
+  agent?: string;
+  at: number;
+}
+
+export interface QueueItem {
+  id: string;
+  text: string;
+  at: number;
+}
+
+export interface Task {
+  id: string;
+  tool_id?: string;
+  description: string;
+  kind?: string;
+  status: string;
+  background?: boolean;
+  depth?: number;
+  parent_task?: string;
+  prompt?: string;
+  summary?: string;
+  last_tool?: string;
+  tokens?: number;
+  tool_uses?: number;
+  duration_ms?: number;
+  started: number;
+  ended?: number;
+}
+
+export interface Usage {
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  turns: number;
+  context_tokens?: number;
+  context_window?: number;
+}
+
+export interface ExitInfo {
+  code: number | null;
+  error?: string;
+}
+
+/** One file's change since the agent first touched it (the server keeps it cumulative). */
+export interface FileChange {
+  path: string;
+  created?: boolean;
+  deleted?: boolean;
+  added: number;
+  removed: number;
+  hunks: Hunk[];
+  truncated?: boolean;
+  at: number;
+}
+
+export interface State {
+  status: Status;
+  goal?: string;
+  turn_started?: number;
+  summary?: string;
+  /** What it is doing right now, in plain words. */
+  doing?: string;
+  files_changed?: number;
+  lines_added?: number;
+  lines_removed?: number;
+  harness_session?: string;
+  cwd: string;
+  model: string;
+  mode: string;
+  title: string;
+  approvals: Approval[];
+  queue: QueueItem[];
+  delivery: Record<string, Delivery>;
+  tasks: Task[];
+  todos: Todo[];
+  usage: Usage;
+  activity?: string;
+  exit?: ExitInfo;
+  dropped: number;
+}
+
+export interface ModeOption {
+  id: string;
+  label: string;
+  description: string;
+  dangerous?: boolean;
+}
+
+export interface ModelOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface SlashCommand {
+  name: string;
+  description?: string;
+  hint?: string;
+}
+
+export interface Meta {
+  version: string;
+  modes: ModeOption[];
+  models: ModelOption[];
+  commands: SlashCommand[];
+  agents: string[];
+  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume" */
+  features: string[];
+}
+
+export interface ApprovalBrief {
+  id: string;
+  tool: ToolKind;
+  tool_name: string;
+  title: string;
+  at: number;
+}
+
+/** An agent session as lists show it. */
+export interface AgentInfo {
+  id: string;
+  kind: string;
+  kind_name: string;
+  /** "local" or "agent:<machine>". */
+  target: string;
+  name: string;
+  shell?: string;
+  cwd: string;
+  created_at: number;
+  status: Status;
+  title: string;
+  model: string;
+  mode: string;
+  harness_session?: string;
+  approvals: ApprovalBrief[];
+  queued: number;
+  tasks_running: number;
+  cost_usd: number;
+  activity?: string;
+  last_activity: number;
+  exit?: ExitInfo;
+  /** Board summary (optional: older servers don't send them). */
+  goal?: string;
+  summary?: string;
+  todos_done?: number;
+  todos_total?: number;
+  files_changed?: number;
+  lines_added?: number;
+  lines_removed?: number;
+  context_pct?: number;
+  doing?: string;
+  turn_started?: number;
+}
+
+export interface KindInfo {
+  id: string;
+  name: string;
+  verified: boolean;
+  available: boolean;
+}
+
+/** What to start. */
+export interface Spec {
+  kind: string;
+  cwd?: string;
+  model?: string;
+  mode?: string;
+  resume?: string;
+  prompt?: string;
+  name?: string;
+  shell?: string;
+  allow_bypass?: boolean;
+}
+
+export type Command =
+  | { type: "send"; id: string; text: string; mode?: SendMode }
+  | { type: "queue_edit"; id: string; text: string }
+  | { type: "queue_remove"; id: string }
+  | { type: "queue_move"; id: string; index: number }
+  | { type: "queue_send_now"; id: string }
+  | { type: "approve"; id: string; decision: Decision; message?: string; always?: number; answers?: Record<string, string> }
+  | { type: "interrupt" }
+  | { type: "set_mode"; mode: string }
+  | { type: "set_model"; model: string }
+  | { type: "stop_task"; task: string }
+  | { type: "restart" }
+  | { type: "suggest"; client: string; query: string }
+  | { type: "snapshot" };
+
+export type Update =
+  | { t: "open"; info: AgentInfo }
+  | { t: "changes"; files: FileChange[] }
+  | { t: "error"; error: string }
+  | { t: "closed" }
+  | { t: "state"; state: State }
+  | { t: "meta"; meta: Meta }
+  | { t: "events"; events: HEvent[] }
+  | { t: "stream"; id: string; text: string }
+  | { t: "reply"; client: string; value: unknown }
+  | { t: "reset" };
+
+/* ------------------------------------------------------------------ REST */
+
+async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method,
+    credentials: "same-origin",
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const j = (await res.json()) as { error?: string };
+      if (j.error) msg = j.error;
+    } catch {
+      /* not json */
+    }
+    throw new Error(msg);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+export const harnessApi = {
+  kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
+  list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
+  stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
+  /** A command without opening the session's socket (inbox answers). */
+  command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
+  /** One command to many agents (each send gets its own message id). */
+  broadcast: (ids: string[], c: Command) => call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }),
+};
+
+let seq = 0;
+/** A client-made id for a message or request (delivery state is reported under it). */
+export const clientId = () => `c${Date.now().toString(36)}${(++seq).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+
+/* ------------------------------------------------------------------ live session */
+
+export type Conn = "connecting" | "open" | "reconnecting" | "gone";
+
+export interface Snapshot {
+  conn: Conn;
+  info: AgentInfo | null;
+  meta: Meta | null;
+  state: State | null;
+  /** In timeline order. */
+  events: HEvent[];
+  /** The changeset, file by file (null until the server sends one). */
+  changes: FileChange[] | null;
+  error: string | null;
+  /** Bumped on every change (cheap memo key). */
+  version: number;
+}
+
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, version: 0 };
+const BACKOFF = [250, 500, 1000, 2000, 4000];
+
+/**
+ * One agent session, live: a websocket that receives the session's snapshot and then its updates,
+ * and sends commands. Batches updates to one notification per animation frame, so a streaming
+ * reply re-renders at most once a frame however fast it arrives.
+ */
+export class SessionStore {
+  private snap: Snapshot = EMPTY;
+  private byId = new Map<string, HEvent>();
+  private order: HEvent[] | null = [];
+  private listeners = new Set<() => void>();
+  private ws: WebSocket | null = null;
+  private stopped = false;
+  private attempt = 0;
+  private timer = 0;
+  private raf = 0;
+  private dirty = false;
+  private replies = new Map<string, (v: unknown) => void>();
+
+  constructor(readonly id: string) {}
+
+  subscribe = (fn: () => void) => {
+    this.listeners.add(fn);
+    if (this.listeners.size === 1) this.connect();
+    return () => {
+      this.listeners.delete(fn);
+      if (this.listeners.size === 0) this.close();
+    };
+  };
+
+  get = () => this.snap;
+
+  /** Send a command; false when the session isn't connected. */
+  send = (c: Command): boolean => {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(c));
+    return true;
+  };
+
+  /** Ask for something answered by a `reply` update (file suggestions ...). */
+  request = (make: (client: string) => Command, timeoutMs = 4000): Promise<unknown> =>
+    new Promise((resolve) => {
+      const client = clientId();
+      const t = window.setTimeout(() => {
+        this.replies.delete(client);
+        resolve(null);
+      }, timeoutMs);
+      this.replies.set(client, (v) => {
+        window.clearTimeout(t);
+        resolve(v);
+      });
+      if (!this.send(make(client))) {
+        window.clearTimeout(t);
+        this.replies.delete(client);
+        resolve(null);
+      }
+    });
+
+  private connect() {
+    this.stopped = false;
+    const ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws`));
+    this.ws = ws;
+    ws.onopen = () => {
+      this.attempt = 0;
+      this.patch({ conn: "open" });
+    };
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== "string") return;
+      let u: Update;
+      try {
+        u = JSON.parse(ev.data) as Update;
+      } catch {
+        return;
+      }
+      this.apply(u);
+    };
+    ws.onclose = () => {
+      if (this.ws === ws) this.ws = null;
+      if (this.stopped || this.snap.conn === "gone") return;
+      this.patch({ conn: "reconnecting" });
+      const delay = BACKOFF[Math.min(this.attempt, BACKOFF.length - 1)] ?? 4000;
+      this.attempt += 1;
+      this.timer = window.setTimeout(() => this.connect(), delay);
+    };
+  }
+
+  private close() {
+    this.stopped = true;
+    window.clearTimeout(this.timer);
+    cancelAnimationFrame(this.raf);
+    this.ws?.close();
+    this.ws = null;
+  }
+
+  private apply(u: Update) {
+    switch (u.t) {
+      case "open":
+        // Always first, and again after the server resynced: the timeline starts over.
+        this.byId.clear();
+        this.order = [];
+        this.snap = { ...this.snap, info: u.info, error: null };
+        break;
+      case "changes":
+        this.snap = { ...this.snap, changes: u.files };
+        break;
+      case "error":
+        this.snap = { ...this.snap, error: u.error };
+        break;
+      case "closed":
+        this.snap = { ...this.snap, conn: "gone" };
+        break;
+      case "state":
+        this.snap = { ...this.snap, state: u.state, info: this.snap.info ? { ...this.snap.info, status: u.state.status, title: u.state.title, model: u.state.model, mode: u.state.mode } : null };
+        break;
+      case "meta":
+        this.snap = { ...this.snap, meta: u.meta };
+        break;
+      case "reset":
+        this.byId.clear();
+        this.order = [];
+        break;
+      case "events":
+        for (const e of u.events) this.byId.set(e.id, e);
+        this.order = null;
+        break;
+      case "stream": {
+        const e = this.byId.get(u.id);
+        if (e && (e.kind === "assistant" || e.kind === "thinking")) this.byId.set(u.id, { ...e, text: e.text + u.text });
+        this.order = null;
+        break;
+      }
+      case "reply": {
+        const r = this.replies.get(u.client);
+        this.replies.delete(u.client);
+        r?.(u.value);
+        return;
+      }
+    }
+    this.schedule();
+  }
+
+  private patch(p: Partial<Snapshot>) {
+    this.snap = { ...this.snap, ...p };
+    this.schedule();
+  }
+
+  private schedule() {
+    this.dirty = true;
+    if (this.raf) return;
+    this.raf = requestAnimationFrame(() => {
+      this.raf = 0;
+      if (!this.dirty) return;
+      this.dirty = false;
+      if (this.order === null) this.order = [...this.byId.values()].sort((a, b) => a.seq - b.seq);
+      this.snap = { ...this.snap, events: this.order, version: this.snap.version + 1 };
+      this.listeners.forEach((l) => l());
+    });
+  }
+}
+
+const stores = new Map<string, SessionStore>();
+export function sessionStore(id: string): SessionStore {
+  let s = stores.get(id);
+  if (!s) {
+    s = new SessionStore(id);
+    stores.set(id, s);
+  }
+  return s;
+}
+
+/** A live agent session: its snapshot, re-rendered at most once per frame. */
+export function useAgentSession(id: string): [Snapshot, SessionStore] {
+  const store = React.useMemo(() => sessionStore(id), [id]);
+  const snap = React.useSyncExternalStore(store.subscribe, store.get, store.get);
+  return [snap, store];
+}

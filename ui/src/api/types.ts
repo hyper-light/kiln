@@ -1,3 +1,4 @@
+import type { AgentInfo } from "./harness";
 // Types mirror docs/api.md (and crates/kiln/src/store.rs). Timestamps are unix
 // seconds unless the field name ends in `_ms`. Ids are opaque strings.
 
@@ -317,7 +318,11 @@ export type ServerEvent =
   /** The discovery table changed: refetch GET /api/discovery. */
   | { type: "discovery" }
   /** A machine's AI sessions changed: refetch GET /api/ai-sessions. */
-  | { type: "ai_sessions"; machine: string };
+  | { type: "ai_sessions"; machine: string }
+  /** An agent session kiln runs appeared or changed. */
+  | { type: "harness"; info: AgentInfo }
+  /** An agent session kiln ran is gone. */
+  | { type: "harness_closed"; id: string };
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
 

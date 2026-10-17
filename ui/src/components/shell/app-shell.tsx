@@ -58,6 +58,8 @@ function useRunFailureToasts() {
 export function AppShell({ me }: { me: Me | null }) {
   const location = useLocation();
   const onTerminal = location.pathname.startsWith("/terminal");
+  // An agent's workspace fills the window like the terminal does (no footer, no page scroll).
+  const fullHeight = onTerminal || /^\/agents\/(?!sessions(?:\/|$))[^/]+/.test(location.pathname);
   const [termMounted, setTermMounted] = React.useState(onTerminal);
   const [menuOpen, setMenuOpen] = React.useState(false);
   React.useEffect(() => {
@@ -166,7 +168,7 @@ export function AppShell({ me }: { me: Me | null }) {
         </Dialog.Portal>
       </Dialog.Root>
 
-      <main id="main" className={onTerminal ? "relative flex min-h-0 flex-1 flex-col" : "flex-1"}>
+      <main id="main" className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "flex-1"}>
         {!onTerminal && (
           <ErrorBoundary resetKey={location.pathname}>
             <React.Suspense fallback={<RouteFallback />}>
@@ -185,7 +187,7 @@ export function AppShell({ me }: { me: Me | null }) {
         )}
       </main>
 
-      {!onTerminal && (
+      {!fullHeight && (
         <footer className="site-footer">
           <div className="container-console flex flex-wrap items-center justify-between gap-x-6 gap-y-1">
             <span className="flex items-center gap-2.5">
