@@ -773,3 +773,67 @@ export function useAgentSession(id: string): [Snapshot, SessionStore] {
   const snap = React.useSyncExternalStore(store.subscribe, store.get, store.get);
   return [snap, store];
 }
+
+/* ------------------------------------------------------------------ accounts */
+
+/** A way to sign a harness in. `asks`: what it will want given back (the code the page shows, or an API key). */
+export interface AccountMethod {
+  id: string;
+  label: string;
+  asks?: "code" | "api_key";
+}
+
+/** Which account a harness runs as on one machine, as its own CLI reports it. */
+export interface Account {
+  /** "claude", "codex" … */
+  kind: string;
+  /** "Claude Code", "Codex" … */
+  name: string;
+  /** null: kiln couldn't tell (`error` says why). */
+  signed_in: boolean | null;
+  /** How it is signed in: "Claude subscription", "ChatGPT", "API key" … */
+  method?: string;
+  email?: string;
+  org?: string;
+  /** "max", "pro", "plus" … */
+  plan?: string;
+  /** The ways it can be signed in. */
+  methods: AccountMethod[];
+  error?: string;
+}
+
+/** A sign-in or sign-out, run by the harness's own CLI in a hidden terminal on its machine. */
+export interface AccountFlow {
+  id: string;
+  target: string;
+  kind: string;
+  action: "login" | "logout";
+  method?: string;
+  state: "running" | "done" | "failed" | "cancelled";
+  /** The sign-in page to open (on any device). */
+  url?: string;
+  /** A one-time code to enter on that page (device sign-in). */
+  code?: string;
+  /** Waiting to be given something: the code the page shows after signing in, or an API key. */
+  asks?: "code" | "api_key";
+  /** The CLI's own output, as plain text. */
+  lines: string[];
+  /** Once it ended: the account as it is now. */
+  account?: Account;
+  error?: string;
+  /** Unix seconds. */
+  started_at: number;
+  ended_at?: number;
+}
+
+export const accountsApi = {
+  /** Every harness's account on a machine ("local" or "agent:<machine>"). */
+  list: (target: string) => call<Account[]>("GET", `/api/accounts?target=${encodeURIComponent(target)}`),
+  login: (target: string, kind: string, method: string) => call<AccountFlow>("POST", "/api/accounts/login", { target, kind, method }),
+  flow: (id: string) => call<AccountFlow>("GET", `/api/accounts/flows/${encodeURIComponent(id)}`),
+  /** What a flow asks for (the page's code, or an API key): in the body only, never in a URL. */
+  input: (id: string, text: string) => call<void>("POST", `/api/accounts/flows/${encodeURIComponent(id)}/input`, { text }),
+  cancel: (id: string) => call<void>("DELETE", `/api/accounts/flows/${encodeURIComponent(id)}`),
+  /** Signs out at once: the flow comes back finished, with the account as it is now. */
+  logout: (target: string, kind: string) => call<AccountFlow>("POST", "/api/accounts/logout", { target, kind }),
+};

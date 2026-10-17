@@ -1,0 +1,695 @@
+/* Accounts (account-card.tsx): which account each harness runs as on a machine, and signing it in
+   or out, in place. hyperlight-site's voice: a quiet panel inside a #2a3039 hairline with the prism
+   faint along its top edge; names as mono uppercase words; state as a dot and a word; the agent's
+   own harness lit. A step hangs from its line's dot on a hairline that carries the prism while it
+   waits on you. Phones first: words wrap or give way at their end, nothing scrolls sideways, and
+   every target is 40px on touch. Nothing animates in, and nothing reflows while it polls. */
+
+.ac {
+  --ac-prism: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+  --ac-pad: 14px;
+  /* where the dot's centre sits, and where the words after it start */
+  --ac-axis: 21px;
+  --ac-text: 36px;
+  position: relative;
+  min-width: 0;
+  container: ac / inline-size;
+  border: 1px solid #2a3039;
+  border-radius: 9px;
+  background: #0a0c0f;
+  color: #ededee;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.ac::before {
+  position: absolute;
+  top: -1px;
+  right: 14%;
+  left: 14%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #9fbab866, #a7aed070, #c4a8bd59, transparent);
+  content: "";
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------- head */
+.ac-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 2px 4px 0 var(--ac-pad);
+}
+.ac-eyebrow {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ac .ac-close {
+  flex: none;
+  width: 32px;
+  height: 32px;
+}
+
+/* ---------------------------------------------------------------- one line per harness */
+.ac-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ac-acct {
+  position: relative;
+}
+.ac-acct + .ac-acct {
+  border-top: 1px solid #1d1f24;
+}
+.ac-acct:last-child {
+  border-radius: 0 0 8px 8px;
+}
+.ac-acct:only-child {
+  border-radius: 8px;
+}
+/* The agent's own harness, among the machine's others: a raised surface. */
+.ac-acct[data-lit] {
+  background: #0e0f13;
+}
+.ac-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 4px 8px 4px var(--ac-pad);
+}
+.ac-glyph {
+  display: inline-grid;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+}
+.ac-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+}
+.ac-dot[data-state="in"] {
+  background: #a8c9bc;
+}
+.ac-dot[data-state="out"] {
+  background: #d8bb95;
+}
+.ac-dot[data-state="loading"] {
+  background: #4f525a;
+}
+.ac-name {
+  flex: none;
+  color: #c9cbd1;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  line-height: 16px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ac-acct[data-lit] .ac-name,
+.ac-compact .ac-name {
+  color: #f2f2f3;
+}
+.ac-status {
+  flex: none;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.ac-status[data-state="out"] {
+  color: #e2cfae;
+}
+.ac-status[data-state="busy"] {
+  color: #cdc6ea;
+}
+/* Waiting on you: the console's amber. */
+.ac-status[data-state="wait"] {
+  color: #e2cfae;
+}
+/* What a sign-in under way is doing: briefly on a phone, whole where there's room. */
+.ac-long {
+  display: none;
+}
+@container ac (min-width: 500px) {
+  .ac-short {
+    display: none;
+  }
+  .ac-long {
+    display: inline;
+  }
+}
+.ac-status[data-state="loading"] {
+  color: #7b7e88;
+}
+/* Who it's signed in as gives way first: it ends in an ellipsis before anything else moves. */
+.ac-facts {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ac-facts::before {
+  color: #6d7078;
+  content: "· ";
+}
+.ac-slot {
+  display: flex;
+  flex: none;
+  margin-left: auto;
+  padding-left: 4px;
+}
+/* Steps aside while a step is open under it, keeping its room. */
+.ac-slot[data-away] {
+  visibility: hidden;
+}
+.ac .ac-btn {
+  min-height: 32px;
+}
+.ac .ac-act[data-act="out"]:hover {
+  border-color: #8a5d6466;
+  color: #f2d4d6;
+}
+@media (pointer: coarse) {
+  .ac .ac-btn {
+    min-height: 40px;
+  }
+  .ac .ac-close {
+    width: 40px;
+    height: 40px;
+  }
+}
+
+/* ---------------------------------------------------------------- a step, under its line */
+/* It hangs from the line's dot on a hairline; the words line up with the harness's name. */
+.ac-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  /* a step reads as one column, even across a wide dock */
+  max-width: 620px;
+  padding: 0 var(--ac-pad) 14px var(--ac-text);
+}
+/* Focus comes here only to carry on from a step that went away; the controls inside show theirs. */
+.ac-panel:focus {
+  outline: none;
+}
+.ac-panel::before {
+  position: absolute;
+  top: -11px;
+  bottom: 16px;
+  left: var(--ac-axis);
+  width: 1px;
+  background: #2a2c33;
+  content: "";
+}
+/* Under way, the hairline carries the prism (still: it may wait on you for minutes). */
+.ac-panel[data-live]::before {
+  background: linear-gradient(180deg, #b8d9d2, #a6c4ed 30%, #b8a6d5 55%, #d6a2aa 80%, #d8cbb0);
+  opacity: 0.7;
+}
+.ac-panel[data-tone="fail"]::before {
+  background: #8a5d6466;
+}
+.ac-quiet {
+  margin: 0;
+  color: #8f929b;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.ac-ask {
+  margin: 0;
+  color: #d9dade;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.ac-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ---------------------------------------------------------------- how to sign in: words */
+/* WITH, then the ways; a way that doesn't fit goes under the first, not under WITH. */
+.ac-with {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  margin: -6px 0 -4px;
+}
+.ac-key {
+  flex: none;
+  padding: 0 4px 0 0;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  line-height: 16px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ac-words {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-width: 0;
+}
+.ac-cell {
+  display: inline-flex;
+  align-items: baseline;
+  min-width: 0;
+  max-width: 100%;
+}
+.ac-sep {
+  flex: none;
+  color: #4f525a;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 16px;
+  user-select: none;
+}
+.ac-word {
+  position: relative;
+  min-width: 0;
+  margin: 0;
+  padding: 12px 6px;
+  border: 0;
+  background: none;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  line-height: 16px;
+  text-align: left;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: color 0.15s;
+}
+.ac-word[aria-checked="true"] {
+  color: #ededee;
+}
+/* The picked word sits on the composer's prism hairline. */
+.ac-word[aria-checked="true"]::after {
+  position: absolute;
+  right: 6px;
+  bottom: 9px;
+  left: 6px;
+  height: 1px;
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
+  content: "";
+}
+.ac-word.ac-none {
+  color: #6d7078;
+  cursor: default;
+  text-transform: none;
+  letter-spacing: 0;
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+@media (hover: hover) {
+  .ac-word:not(.ac-none):hover {
+    color: #d6d7db;
+  }
+  .ac-word[aria-checked="true"]:hover {
+    color: #ededee;
+  }
+}
+.ac-word:focus-visible {
+  border-radius: 6px;
+  outline: 2px solid #bab0e3;
+  outline-offset: -6px;
+}
+
+/* ---------------------------------------------------------------- a sign-in under way */
+.ac-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ac-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.ac-n {
+  flex: none;
+  width: 10px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 32px;
+}
+.ac-step-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+}
+.ac-step-text {
+  margin: 0;
+  color: #c4c6cd;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+/* The step's text sits level with the number beside it. */
+.ac-step-main > .ac-step-text:first-child {
+  margin-top: 6px;
+}
+.ac-linkrow {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.ac-open {
+  flex: none;
+}
+.ac-open[aria-disabled="true"] {
+  cursor: default;
+}
+.ac-url {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ac .ac-copy {
+  flex: none;
+  width: 32px;
+  height: 32px;
+}
+.ac .ac-copy[data-away] {
+  visibility: hidden;
+}
+@media (pointer: coarse) {
+  .ac .ac-copy {
+    width: 40px;
+    height: 40px;
+  }
+}
+/* The device code: large, mono, on the prism hairline, selected whole by a tap. */
+.ac-coderow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.ac-code {
+  position: relative;
+  min-width: 0;
+  padding: 0 0 4px;
+  color: #f2f2f3;
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 450;
+  letter-spacing: 0.12em;
+  line-height: 32px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.ac-code::after {
+  position: absolute;
+  right: 0.12em;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: var(--ac-prism);
+  content: "";
+}
+.ac-code[data-empty] {
+  color: #3d4048;
+  user-select: none;
+}
+.ac-code[data-empty]::after {
+  background: #2a2c33;
+}
+.ac-fieldrow {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.ac-input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid #303239;
+  border-radius: 5px;
+  background: #0b0c0e;
+  color: #ededee;
+  font-size: 13px;
+  outline: none;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.ac-mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+.ac-input::placeholder {
+  color: #6d7078;
+}
+.ac-input:focus {
+  border-color: #6b6290;
+  box-shadow: 0 0 0 3px rgb(186 176 227 / 12%);
+}
+.ac-input:disabled {
+  opacity: 0.55;
+}
+/* Phones zoom into fields under 16px. */
+@media (pointer: coarse) {
+  .ac-input,
+  .ac-mono {
+    height: 40px;
+    font-size: 16px;
+  }
+}
+.ac-hint {
+  margin: 0;
+  color: #d8bb95;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.ac-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+.ac-gap {
+  flex: 1 1 auto;
+}
+.ac-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 32px;
+  margin-right: -6px;
+  padding: 0 6px;
+  border-radius: 5px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  transition: color 0.15s;
+}
+.ac-more:hover {
+  color: #ededee;
+}
+.ac-more > svg {
+  transition: transform 0.15s;
+}
+.ac-more[aria-expanded="true"] > svg {
+  transform: rotate(90deg);
+}
+.ac-more:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: -2px;
+}
+@media (pointer: coarse) {
+  .ac-more {
+    min-height: 40px;
+  }
+}
+.ac-lines {
+  max-height: min(22dvh, 180px);
+  margin: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 12px;
+  border: 1px solid #1f2126;
+  border-radius: 6px;
+  background: #08090b;
+  color: #c3c7cf;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ac-lines:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- how it ended */
+.ac-done {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: #ededee;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.ac-done > svg {
+  flex: none;
+  margin-top: 3px;
+  color: #a8c9bc;
+}
+.ac-done-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ac-done b {
+  font-weight: 500;
+}
+.ac-fail {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: #e2c4c6;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.ac-fail > svg {
+  flex: none;
+  margin-top: 3px;
+  color: #d1aaad;
+}
+
+/* Cancel is a word-weight button: its letters line up with the steps above it. */
+.ac .ac-cancel {
+  margin-left: -12px;
+}
+
+/* ---------------------------------------------------------------- over the composer */
+/* However much it holds, the composer stays in view: past this, the card's lines scroll. */
+.hx-dock > .ac .ac-list {
+  max-height: min(46dvh, 460px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* ---------------------------------------------------------------- placed under a message */
+.ac-under {
+  margin: 2px 0 6px 8px;
+  max-width: 560px;
+}
+
+.ac-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  border: 0;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- motion: colours only, and not even those when asked */
+@media (prefers-reduced-motion: reduce) {
+  .ac *,
+  .ac *::before,
+  .ac *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+:root[data-motion="paused"] .ac *,
+:root[data-motion="paused"] .ac *::before,
+:root[data-motion="paused"] .ac *::after {
+  transition: none !important;
+}
+
+/* ---------------------------------------------------------------- contrast */
+@media (prefers-contrast: more) {
+  .ac {
+    border-color: #555864;
+  }
+  .ac-eyebrow,
+  .ac-name,
+  .ac-status,
+  .ac-facts,
+  .ac-key,
+  .ac-word,
+  .ac-n,
+  .ac-url,
+  .ac-more,
+  .ac-quiet {
+    color: #c4c5ce;
+  }
+  .ac-word[aria-checked="true"],
+  .ac-acct[data-lit] .ac-name {
+    color: #ffffff;
+  }
+}
+/* Gradient fills would vanish under forced colours. */
+@media (forced-colors: active) {
+  .ac-word[aria-checked="true"]::after,
+  .ac-code::after,
+  .ac-panel[data-live]::before {
+    background: Highlight;
+    forced-color-adjust: none;
+  }
+  .ac-dot {
+    background: CanvasText;
+    forced-color-adjust: none;
+  }
+}

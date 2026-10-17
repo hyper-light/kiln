@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useMediaQuery } from "@/lib/hooks";
+import { AccountCard } from "./account-card";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
 import { SettingsSheet, useAttachments } from "./controls";
@@ -36,6 +37,8 @@ export default function AgentPage() {
   const [task, setTask] = React.useState<string | null>(null);
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [settings, setSettings] = React.useState(false);
+  /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
+  const [account, setAccount] = React.useState<"login" | "logout" | null>(null);
   const attachments = useAttachments((meta?.features ?? []).includes("attachments") ? "any" : (meta?.features ?? []).includes("images") ? "images" : "none");
   const [dragging, setDragging] = React.useState(false);
   const addFiles = attachments.add;
@@ -90,6 +93,7 @@ export default function AgentPage() {
   /** A slash command that opens one of kiln's panels. */
   const openView = (view: string) => {
     if (view === "settings") setSettings(true);
+    else if (view === "login" || view === "logout") setAccount(view);
     else if (view === "model" || view === "permissions") document.querySelector<HTMLButtonElement>(".ag-head .rs-line")?.click();
     else if (view === "tasks") showPlan();
     else if (view === "changes") {
@@ -122,7 +126,21 @@ export default function AgentPage() {
           </button>
         </div>
       )}
-      <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} agentLabel={task ? "Subagent" : info?.kind_name} agentName={info?.name} onDecide={send} />
+      <Timeline
+        events={events}
+        state={state}
+        meta={meta}
+        cwd={cwd}
+        parent={task ?? undefined}
+        onOpenTask={openTask}
+        onCommand={send}
+        agentLabel={task ? "Subagent" : info?.kind_name}
+        agentName={info?.name}
+        onDecide={send}
+        target={info?.target}
+        kind={info?.kind}
+        accountOpen={account !== null}
+      />
       <div className="hx-dock">
         <ActivityLine state={state} agent={id} onOpenTask={openTask} />
         {status === "exited" && state?.exit?.error && events.length === 0 ? (
@@ -147,6 +165,7 @@ export default function AgentPage() {
             )}
           </div>
         ) : null}
+        {account && info && <AccountCard key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />}
         <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} onView={openView} />
       </div>
     </div>

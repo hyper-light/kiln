@@ -17,6 +17,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
+import { handleAccounts, handleDemoSession } from "./accounts.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -1236,6 +1237,8 @@ const server = http.createServer(async (req, res) => {
     if (!authed(req)) return err(res, 401, "unauthorized");
 
     if (p === "/api/me") return json(res, 200, { authenticated: true, version: VERSION, hostname: HOSTNAME });
+    // ---- harness accounts (and the demo agents to see them from) ----
+    if (await handleAccounts(req, res, url)) return;
     if (p === "/api/overview") return json(res, 200, overview());
 
     // ---- repos ----
@@ -1588,6 +1591,8 @@ server.on("upgrade", (req, socket, head) => {
     const lm = p.match(/^\/api\/jobs\/([^/]+)\/logs\/ws$/);
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
+    const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
+    if (hm && handleDemoSession(ws, decodeURIComponent(hm[1]!))) return;
     ws.close(1008, "no such socket");
   });
 });
