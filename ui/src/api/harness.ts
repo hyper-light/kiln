@@ -52,6 +52,11 @@ export interface ToolCall {
   exit_code?: number;
   started: number;
   ended?: number;
+  /** MCP calls: the server and the tool's own name. */
+  server?: string;
+  tool_short?: string;
+  /** Skill calls: which skill. */
+  skill?: string;
 }
 
 export type Body =
@@ -136,6 +141,37 @@ export interface Usage {
   context_window?: number;
 }
 
+/** An MCP server the agent can use. `target` is the command line or URL, never with secrets. */
+export interface McpServer {
+  name: string;
+  scope: string;
+  transport: string;
+  status: "connected" | "pending" | "failed" | "needs_auth" | "disabled" | string;
+  error?: string;
+  enabled: boolean;
+  tools: { name: string; description?: string }[];
+  resources?: number;
+  prompts?: number;
+  target?: string;
+}
+
+export interface Skill {
+  name: string;
+  description: string;
+  source: string;
+  path?: string;
+  args_hint?: string;
+  user_invocable: boolean;
+}
+
+export interface Plugin {
+  name: string;
+  source?: string;
+  enabled: boolean;
+  skills?: string[];
+  commands?: string[];
+}
+
 /** A plan limit of the account the agent runs as (5-hour window, weekly …). */
 export interface Limit {
   id: string;
@@ -206,6 +242,9 @@ export interface State {
   limits?: Limit[];
   /** The harness's own status lines (`status` is the session's lifecycle). */
   harness_status?: StatusItem[];
+  mcp?: McpServer[];
+  skills?: Skill[];
+  plugins?: Plugin[];
 }
 
 export interface ModeOption {
@@ -356,6 +395,13 @@ export interface Spec {
 export type Command =
   | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
   | { type: "control"; id: string; value?: unknown }
+  | { type: "mcp_enable"; name: string; enabled: boolean }
+  | { type: "mcp_reconnect"; name: string }
+  | { type: "mcp_auth"; name: string; client: string }
+  | { type: "mcp_add"; scope: string; name: string; transport: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }
+  | { type: "mcp_remove"; scope: string; name: string }
+  | { type: "skill_view"; name: string; client: string }
+  | { type: "skill_run"; name: string; args?: string }
   | { type: "set_effort"; effort: string }
   | { type: "queue_edit"; id: string; text: string }
   | { type: "queue_remove"; id: string }

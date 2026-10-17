@@ -10,9 +10,10 @@ import { changesetOf, duration, money, relPath, runsOf, tokens, type FileChange,
 import { DiffStat, FileDiffView } from "./diff";
 import { Output } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
+import { McpPanel, SkillsPanel } from "./tools";
 import { TodoList } from "./timeline";
 
-export type InspectorTab = "changes" | "plan" | "runs" | "agents" | "usage";
+export type InspectorTab = "changes" | "plan" | "runs" | "agents" | "mcp" | "skills" | "usage";
 
 /** The server's cumulative changeset as the file list and diffs show it (one diff per file). */
 function fromServer(files: ServerChange[]): FileChange[] {
@@ -264,6 +265,8 @@ export function Inspector({
     { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined },
     { id: "runs", label: "Runs", count: runs.length ? String(runs.length) : undefined },
     { id: "agents", label: "Subagents", count: tasks.length ? String(tasks.length) : undefined },
+    { id: "mcp", label: "MCP", count: state?.mcp?.length ? `${state.mcp.filter((m) => m.status === "connected").length}/${state.mcp.length}` : undefined },
+    { id: "skills", label: "Skills", count: state?.skills?.length ? String(state.skills.length) : undefined },
     { id: "usage", label: "Status" },
   ];
   return (
@@ -291,6 +294,8 @@ export function Inspector({
           ))}
         {tab === "runs" && <Runs events={events} />}
         {tab === "agents" && <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />}
+        {tab === "mcp" && <McpPanel state={state} store={store} />}
+        {tab === "skills" && <SkillsPanel state={state} store={store} />}
         {tab === "usage" && <Status state={state} />}
       </div>
     </div>

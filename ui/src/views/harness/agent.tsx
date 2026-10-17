@@ -235,9 +235,23 @@ export default function AgentPage() {
       ) : (
         <div className="hx-agent-phone">
           <div className="hx-tabs hx-phone-tabs" role="tablist">
-            {(["work", "changes", "plan", "runs", "agents", "usage"] as PhoneTab[]).map((t) => (
+            {(["work", "changes", "plan", "runs", "agents", "mcp", "skills", "usage"] as PhoneTab[]).map((t) => (
               <button key={t} type="button" role="tab" aria-selected={phoneTab === t} className="hx-tab" onClick={() => setPhoneTab(t)}>
-                {t === "work" ? "Work" : t === "changes" ? "Changes" : t === "plan" ? "Plan" : t === "runs" ? "Runs" : t === "agents" ? "Subagents" : "Status"}
+                {t === "work"
+                  ? "Work"
+                  : t === "changes"
+                    ? "Changes"
+                    : t === "plan"
+                      ? "Plan"
+                      : t === "runs"
+                        ? "Runs"
+                        : t === "agents"
+                          ? "Subagents"
+                          : t === "mcp"
+                            ? "MCP"
+                            : t === "skills"
+                              ? "Skills"
+                              : "Status"}
                 {t === "work" && approvals.length > 0 && <span className="hx-tab-count hx-tab-alert">{approvals.length}</span>}
               </button>
             ))}

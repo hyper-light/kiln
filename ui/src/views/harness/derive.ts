@@ -172,8 +172,13 @@ export function stepSummary(group: StepGroup, calls: ToolCall[]): string {
       return calls.some((c) => c.tool === "plan") ? "Proposed a plan" : "Updated the plan";
     case "ask":
       return "Asked you";
-    default:
-      return n === 1 ? `Used ${calls[0]?.name ?? "a tool"}` : `Used ${n} tools`;
+    default: {
+      const servers = [...new Set(calls.map((c) => c.server).filter(Boolean))];
+      const skills = [...new Set(calls.map((c) => c.skill).filter(Boolean))];
+      if (skills.length && skills.length === calls.length) return skills.length === 1 ? `Used the ${skills[0]} skill` : `Used ${skills.length} skills`;
+      if (servers.length === 1 && calls.every((c) => c.server)) return n === 1 ? `Used ${servers[0]}` : `Used ${servers[0]} ${n} times`;
+      return n === 1 ? `Used ${calls[0]?.tool_short ?? calls[0]?.name ?? "a tool"}` : `Used ${n} tools`;
+    }
   }
 }
 

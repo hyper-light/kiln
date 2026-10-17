@@ -158,16 +158,29 @@ function AskBody({ calls }: { calls: ToolEvent[] }) {
 function ToolBody({ calls }: { calls: ToolEvent[] }) {
   return (
     <div className="hx-stack">
-      {calls.map((c) => (
-        <div key={c.id} className="hx-generic">
-          <div className="hx-list-row">
-            <ToolIcon kind={c.tool} size={12} />
-            <span className="hx-mono">{c.name}</span>
-            <span className="hx-dim hx-trunc">{c.title}</span>
+      {calls.map((c) => {
+        const input = c.input && typeof c.input === "object" && Object.keys(c.input as object).length ? JSON.stringify(c.input, null, 2) : null;
+        return (
+          <div key={c.id} className="hx-generic">
+            <div className="hx-list-row">
+              <ToolIcon kind={c.tool} size={12} />
+              {c.server ? (
+                <span className="hx-mono">
+                  <span className="hx-dim">{c.server} · </span>
+                  {c.tool_short ?? c.name}
+                </span>
+              ) : c.skill ? (
+                <span className="hx-mono">/{c.skill}</span>
+              ) : (
+                <span className="hx-mono">{c.name}</span>
+              )}
+              <span className="hx-dim hx-trunc">{c.title}</span>
+            </div>
+            {input && (c.server || c.tool === "other" || c.tool === "mcp") && <pre className="hx-pre hx-tool-input">{input}</pre>}
+            {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
           </div>
-          {c.output && <Output text={c.output} truncated={c.truncated} error={c.status === "error"} />}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
