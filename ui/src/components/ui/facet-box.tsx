@@ -1,7 +1,9 @@
 /**
- * A filter field: what you type matches names, and its list offers every facet (runner, harness,
- * state…) as checkboxes, each with how many it would show. What's chosen sits in the field as chips
- * you can remove. The list opens under the field, over the page, like a select's: nothing moves.
+ * A filter field: its list offers every facet (runner, harness, state…) as checkboxes, each with how
+ * many it would show, and what you type finds them (and, given `onQuery`, matches names in the
+ * caller's list too). What's chosen sits in the field as chips you can remove. The list opens under
+ * the field, over the page, like a select's: nothing moves. Within a facet, choices widen (any of
+ * them); across facets they narrow (all of them).
  */
 import * as React from "react";
 import { Search, X } from "lucide-react";
@@ -10,8 +12,8 @@ import { cn } from "@/lib/utils";
 export interface FacetOption {
   id: string;
   label: string;
-  /** How many would show with it chosen (the other facets as they are). */
-  count: number;
+  /** How many would show with it chosen (the other facets as they are), when known. */
+  count?: number;
   /** More about it, on hover (a folder's whole path). */
   title?: string;
 }
@@ -27,8 +29,8 @@ export type Chosen = Record<string, string[]>;
 export function FacetBox({
   label,
   placeholder,
-  query,
-  onQuery,
+  query: queryProp,
+  onQuery: onQueryProp,
   facets,
   chosen,
   onChosen,
@@ -37,8 +39,9 @@ export function FacetBox({
   /** What the field filters ("Filter agents"). */
   label: string;
   placeholder: string;
-  query: string;
-  onQuery: (q: string) => void;
+  /** The words typed, when they also match names in the caller's list (kept by the caller). */
+  query?: string;
+  onQuery?: (q: string) => void;
   facets: Facet[];
   chosen: Chosen;
   onChosen: (next: Chosen) => void;
@@ -50,6 +53,10 @@ export function FacetBox({
   const root = React.useRef<HTMLDivElement>(null);
   const uid = React.useId();
   const listId = `${uid}-list`;
+  // Without the caller's words, the field keeps its own: they only find options.
+  const [own, setOwn] = React.useState("");
+  const query = queryProp ?? own;
+  const onQuery = onQueryProp ?? setOwn;
 
   // The typed words also find options (a facet named by them shows all of its own).
   const q = query.trim().toLowerCase();
@@ -202,7 +209,7 @@ export function FacetBox({
       {open && (
         <div className="facet-pop popover">
           <div id={listId} role="listbox" aria-multiselectable="true" aria-label={label}>
-            {groups.length === 0 && <p className="facet-none">Filtering names by “{query.trim()}”.</p>}
+            {groups.length === 0 && <p className="facet-none">{onQueryProp ? `Filtering names by “${query.trim()}”.` : `Nothing matches “${query.trim()}”.`}</p>}
             {groups.map((f) => (
               <div key={f.id} role="group" aria-labelledby={`${uid}-${f.id}`} className="facet-group">
                 <div id={`${uid}-${f.id}`} className="facet-label">
@@ -228,7 +235,7 @@ export function FacetBox({
                     >
                       <span className="facet-mark" aria-hidden="true" />
                       <span className="facet-name">{o.label}</span>
-                      <span className="facet-count">{o.count}</span>
+                      {o.count !== undefined && <span className="facet-count">{o.count}</span>}
                     </div>
                   );
                 })}
