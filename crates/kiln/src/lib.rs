@@ -36,6 +36,7 @@ pub mod sup;
 pub mod supervise;
 pub mod terminal;
 pub mod termsess;
+pub mod tunnel;
 pub mod ui;
 pub mod updates;
 pub mod upgrade;

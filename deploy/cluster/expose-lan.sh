@@ -9,7 +9,8 @@
 #   deploy/cluster/expose-lan.sh up | down | status
 #
 # Agents then join with server http://<this-host-LAN-IP>:7070 and QUIC <this-host-LAN-IP>:7071.
-# Open the ports in your host firewall if one is active (e.g. ufw allow 7070/tcp; ufw allow 7071/udp).
+# Only 7070/tcp has to be open in your host firewall if one is active (e.g. ufw allow 7070/tcp):
+# agents use 7071/udp when it is reachable and tunnel QUIC through 7070 when it is not.
 set -euo pipefail
 PROFILE="${KILN_MINIKUBE_PROFILE:-kiln}"
 SOCAT_IMAGE="${KILN_SOCAT_IMAGE:-alpine/socat:1.8.0.3}"
@@ -35,6 +36,7 @@ up)
     lan_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") print $(i+1)}' | head -n1)"
     echo "forwarding ${lan_ip:-<lan-ip>}:${HTTP_PORT}/tcp → ${ip}:${NODE_HTTP_PORT}, ${lan_ip:-<lan-ip>}:${QUIC_PORT}/udp → ${ip}:${NODE_QUIC_PORT}"
     echo "note: set kiln publicURL/quicAdvertise for external agents to ${lan_ip:-<lan-ip>}:${HTTP_PORT}/${QUIC_PORT} (see deploy/README.md)"
+    echo "note: only ${HTTP_PORT}/tcp must be open in this host's firewall; agents use ${QUIC_PORT}/udp when it is reachable and tunnel through HTTP when it is not"
     ;;
 down)
     for c in kiln-lan-http kiln-lan-quic; do docker rm -f "$c" >/dev/null 2>&1 || true; done

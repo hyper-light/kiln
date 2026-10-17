@@ -75,6 +75,9 @@ pub struct AgentLive {
     /// restart: the old one keeps its terminals until they end). See `crate::instances`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub instances: Vec<crate::instances::InstanceView>,
+    /// How its connection reaches the server, while connected (`GET /api/agents`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<crate::tunnel::Transport>,
 }
 
 /// Output from a remote (agent) terminal session, routed to its websocket.
@@ -97,6 +100,8 @@ pub struct Hub {
     pub agents: Mutex<HashMap<String, AgentLive>>,
     peers: Mutex<HashMap<PeerId, String>>,
     pending_peers: Mutex<HashMap<PeerId, String>>,
+    /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
+    pub tunnels: Arc<crate::tunnel::Registry>,
     pub events: Broadcast<Arc<str>>,
     pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
     /// Every terminal session, local and on machines.
@@ -162,6 +167,7 @@ impl Hub {
             agents: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             pending_peers: Mutex::new(HashMap::new()),
+            tunnels: Arc::default(),
             events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
             terminals: crate::termsess::Sessions::new(),
@@ -283,6 +289,7 @@ impl Hub {
                     exclusive: false,
                     lost_at: None,
                     instances: vec![],
+                    transport: None,
                 },
             })
             .collect();
@@ -293,6 +300,9 @@ impl Hub {
             if !out.iter().any(|a| &a.name == name) {
                 out.push(l.clone());
             }
+        }
+        for a in &mut out {
+            a.transport = a.peer.filter(|_| a.connected).map(|p| self.tunnels.transport(p));
         }
         out.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
         out
@@ -454,12 +464,14 @@ impl Hub {
 
     async fn on_net(self: &Arc<Self>, ev: NetEvent) -> anyhow::Result<()> {
         match ev {
-            NetEvent::Connected { peer, name } => {
+            NetEvent::Connected { peer, name, binding } => {
+                self.tunnels.connected(peer, binding);
                 if let Some(n) = name {
                     self.pending_peers.lock().insert(peer, n);
                 }
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
+                self.tunnels.closed(peer);
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
                 let lost = self.instances.lock().lost(peer);
@@ -828,6 +840,7 @@ impl Hub {
             exclusive: false,
             lost_at: None,
             instances: Vec::new(),
+            transport: None,
         };
         let prev = self.agents.lock().get(&name).cloned();
         let draining = prev.as_ref().is_some_and(|a| a.draining);

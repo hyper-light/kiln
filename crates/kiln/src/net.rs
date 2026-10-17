@@ -151,6 +151,9 @@ impl Directory for AgentBook {
     }
 }
 
+/// The TLS exporter label (RFC 8446 §7.5) of a connection's binding ([`NetEvent::Connected`]).
+pub const BINDING_LABEL: &[u8] = b"EXPORTER-kiln-transport-binding";
+
 /// Commands into the net thread.
 #[derive(Debug)]
 pub enum Out {
@@ -168,7 +171,9 @@ pub enum Out {
 /// Events out of the net thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    Connected { peer: PeerId, name: Option<String> },
+    /// `binding`: the connection's TLS exporter value under [`BINDING_LABEL`], the same at both
+    /// ends of one connection and unknowable to anyone else (see `crate::tunnel`).
+    Connected { peer: PeerId, name: Option<String>, binding: Option<[u8; 32]> },
     Closed { peer: PeerId, reason: String },
     Unreachable { peer: PeerId, reason: String },
     Frame { peer: PeerId, lane: u32, kind: Kind, data: Vec<u8> },
@@ -634,7 +639,9 @@ fn on_event<B, D>(
 {
     match ev {
         Event::Connected { peer, .. } => {
-            out.push(NetEvent::Connected { peer, name: ep.directory().name_of(peer) });
+            let mut binding = [0u8; 32];
+            let binding = ep.export_keying_material(peer, BINDING_LABEL, b"", &mut binding).ok().map(|_| binding);
+            out.push(NetEvent::Connected { peer, name: ep.directory().name_of(peer), binding });
         }
         Event::Frame { peer, lane, kind, frame } => {
             crate::metrics::global().quic_streams.inc();
@@ -711,6 +718,8 @@ mod tests {
             agent.command(Out::Connect { addr }).await;
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut agent_peer = None;
+            // Each connection's binding, as the server and the agent computed it.
+            let (mut srv_binding, mut agent_binding) = (None, None);
             let mut rebuilt = false;
             let mut logs = 0;
             let mut replies = 0;
@@ -720,8 +729,11 @@ mod tests {
                     ev = next_event(&agent_ev, deadline).fuse() => (false, ev?),
                 };
                 match ev {
-                    (true, NetEvent::Connected { peer, name }) => {
+                    (true, NetEvent::Connected { peer, name, binding }) => {
                         assert_eq!(name.as_deref(), Some("bench-1"));
+                        assert!(binding.is_some());
+                        assert_ne!(binding, srv_binding, "a new connection has a new binding");
+                        srv_binding = binding;
                         agent_peer = Some(peer);
                     }
                     (true, NetEvent::Frame { kind: Kind::Log, data, .. }) => {
@@ -732,7 +744,9 @@ mod tests {
                         assert_eq!(data, b"hello server");
                         srv.send(peer, 0, Kind::Control, b"hello agent".to_vec()).await;
                     }
-                    (false, NetEvent::Connected { .. }) => {
+                    (false, NetEvent::Connected { binding, .. }) => {
+                        assert!(binding.is_some());
+                        agent_binding = binding;
                         // Big log frame through the bulk lane, then a control frame.
                         agent.send(SERVER_PEER, 2, Kind::Log, vec![7u8; 1 << 20]).await;
                         agent.send(SERVER_PEER, 0, Kind::Control, b"hello server".to_vec()).await;
@@ -740,6 +754,8 @@ mod tests {
                     (false, NetEvent::Frame { data, .. }) => {
                         assert_eq!(data, b"hello agent");
                         assert!(agent_peer.is_some());
+                        // Both ends derived the same binding for the connection that carried this.
+                        assert_eq!(srv_binding, agent_binding);
                         replies += 1;
                     }
                     _ => {}
