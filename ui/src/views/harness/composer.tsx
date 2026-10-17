@@ -5,11 +5,12 @@
  * on every device until they go out.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, CornerDownLeft, Pencil, Send, Square, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, CornerDownLeft, Paperclip, Pencil, Send, Square, X, Zap } from "lucide-react";
 import { clientId, type Meta, type SendMode, type SessionStore, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { useAttachments } from "./controls";
 
 const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -84,6 +85,11 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
   const running = state?.status === "running" || state?.status === "waiting";
   const modes = MODES.filter((m) => !m.feature || features.includes(m.feature));
   const queue = state?.queue ?? [];
+  const canAttach = features.includes("attachments");
+  const canOverride = features.includes("turn_overrides");
+  const { files, add, clear, chips } = useAttachments(canAttach);
+  const picker = React.useRef<HTMLInputElement>(null);
+  const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
 
   // Grow with the text, up to a third of the screen.
   React.useLayoutEffect(() => {
@@ -106,11 +112,13 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
     if (at && features.includes("file_suggestions")) {
       let live = true;
       const t = window.setTimeout(() => {
-        void store.request((client) => ({ type: "suggest", client, query: at[1] ?? "" })).then((v) => {
-          if (!live) return;
-          const list = Array.isArray(v) ? (v as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 8) : [];
-          setSuggest(list.length ? { kind: "@", items: list.map((p) => ({ label: `@${p}` })), index: 0 } : null);
-        });
+        void store
+          .request((client) => ({ type: "suggest", client, query: at[1] ?? "" }))
+          .then((v) => {
+            if (!live) return;
+            const list = Array.isArray(v) ? (v as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 8) : [];
+            setSuggest(list.length ? { kind: "@", items: list.map((p) => ({ label: `@${p}` })), index: 0 } : null);
+          });
       }, 120);
       return () => {
         live = false;
@@ -129,10 +137,19 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
   const submit = () => {
     const body = text.trim();
     if (!body || disabled) return;
-    const ok = store.send({ type: "send", id: clientId(), text: body, mode: running ? mode : "queue" });
+    const ok = store.send({
+      type: "send",
+      id: clientId(),
+      text: body,
+      mode: running ? mode : "queue",
+      attachments: files.length ? files.map(({ name, mime, data_base64 }) => ({ name, mime, data_base64 })) : undefined,
+      overrides: override.model || override.effort ? override : undefined,
+    });
     if (ok) {
       setText("");
       setSuggest(null);
+      clear();
+      setOverride({});
     }
   };
 
@@ -205,14 +222,39 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
         </ul>
       )}
 
-      <div className={cn("hx-compose-box", running && "hx-compose-live")}>
+      <div
+        className={cn("hx-compose-box", running && "hx-compose-live")}
+        onDragOver={(e) => canAttach && e.preventDefault()}
+        onDrop={(e) => {
+          if (!canAttach || !e.dataTransfer.files.length) return;
+          e.preventDefault();
+          void add(e.dataTransfer.files);
+        }}
+      >
+        {chips}
         <textarea
+          onPaste={(e) => {
+            if (canAttach && e.clipboardData.files.length) {
+              e.preventDefault();
+              void add(e.clipboardData.files);
+            }
+          }}
           ref={ta}
           className="hx-compose-input"
           rows={1}
           value={text}
           disabled={disabled}
-          placeholder={disabled ? "Not connected" : running ? (mode === "steer" ? "Steer it — it reads this at its next step" : mode === "now" ? "Stop and say…" : "Queue a message for when it finishes") : "Tell the agent what to do"}
+          placeholder={
+            disabled
+              ? "Not connected"
+              : running
+                ? mode === "steer"
+                  ? "Steer it — it reads this at its next step"
+                  : mode === "now"
+                    ? "Stop and say…"
+                    : "Queue a message for when it finishes"
+                : "Tell the agent what to do"
+          }
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
           aria-label="Message to the agent"
@@ -231,6 +273,40 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
               ))}
             </div>
           )}
+          {canAttach && (
+            <>
+              <input ref={picker} type="file" multiple hidden onChange={(e) => e.target.files && void add(e.target.files)} />
+              <Tip content="Attach files or images">
+                <button type="button" className="hx-icon" aria-label="Attach files" onClick={() => picker.current?.click()}>
+                  <Paperclip size={14} />
+                </button>
+              </Tip>
+            </>
+          )}
+          {canOverride && (meta?.models.length || meta?.efforts?.length) ? (
+            <span className="hx-override">
+              {meta?.models.length ? (
+                <select aria-label="Model for this message" value={override.model ?? ""} onChange={(e) => setOverride({ ...override, model: e.target.value || undefined })}>
+                  <option value="">model</option>
+                  {meta.models.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+              {meta?.efforts?.length ? (
+                <select aria-label="Effort for this message" value={override.effort ?? ""} onChange={(e) => setOverride({ ...override, effort: e.target.value || undefined })}>
+                  <option value="">effort</option>
+                  {meta.efforts.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+            </span>
+          ) : null}
           <span className="flex-1" />
           {running && features.includes("interrupt") && (
             <Tip content="Stop the current turn (Esc)">

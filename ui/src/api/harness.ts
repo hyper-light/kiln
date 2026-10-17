@@ -177,6 +177,9 @@ export interface State {
   activity?: string;
   exit?: ExitInfo;
   dropped: number;
+  effort?: string;
+  /** Live values of Meta.controls, by id. */
+  control_values?: Record<string, unknown>;
 }
 
 export interface ModeOption {
@@ -198,8 +201,44 @@ export interface SlashCommand {
   hint?: string;
 }
 
+export interface ControlOption {
+  id: string;
+  label: string;
+  description?: string;
+  dangerous?: boolean;
+}
+
+/**
+ * Anything a harness lets you set or do, described generically so the console can offer it without
+ * knowing the harness: effort, sandboxes, MCP servers, compaction, rewinds, output styles ...
+ */
+export interface Control {
+  id: string;
+  group: string;
+  label: string;
+  description?: string;
+  kind: "select" | "toggle" | "action" | "text";
+  options?: ControlOption[];
+  value?: unknown;
+  dangerous?: boolean;
+  /** Can be set for one message only. */
+  per_turn?: boolean;
+  /** "turn": an action on one turn (rewind to it, branch from it). */
+  scope?: "session" | "turn";
+  requires?: string;
+}
+
+export interface Attachment {
+  name: string;
+  mime: string;
+  data_base64: string;
+}
+
 export interface Meta {
   version: string;
+  controls?: Control[];
+  /** Reasoning effort levels, when the harness has them. */
+  efforts?: ControlOption[];
   modes: ModeOption[];
   models: ModelOption[];
   commands: SlashCommand[];
@@ -273,7 +312,9 @@ export interface Spec {
 }
 
 export type Command =
-  | { type: "send"; id: string; text: string; mode?: SendMode }
+  | { type: "send"; id: string; text: string; mode?: SendMode; attachments?: Attachment[]; overrides?: { model?: string; effort?: string } }
+  | { type: "control"; id: string; value?: unknown }
+  | { type: "set_effort"; effort: string }
   | { type: "queue_edit"; id: string; text: string }
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }

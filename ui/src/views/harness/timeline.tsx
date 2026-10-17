@@ -6,10 +6,11 @@
  */
 import * as React from "react";
 import { Brain, ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
-import type { Delivery, HEvent, State, Task } from "@/api/harness";
+import type { Command, Delivery, HEvent, Meta, State, Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, diffStats, duration, relPath, stepStatus, stepSummary, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
+import { TurnMenu } from "./controls";
 import { Output, Prose, ToolIcon } from "./parts";
 
 const STEP_ICON: Record<Step["group"], Parameters<typeof ToolIcon>[0]["kind"]> = {
@@ -203,17 +204,7 @@ function AgentBody({ calls, tasks, onOpenTask }: { calls: ToolEvent[]; tasks: Ta
 
 /* ------------------------------------------------------------------ step */
 
-const StepRow = React.memo(function StepRow({
-  step,
-  cwd,
-  tasks,
-  onOpenTask,
-}: {
-  step: Step;
-  cwd: string;
-  tasks: Task[];
-  onOpenTask?: (t: string) => void;
-}) {
+const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { step: Step; cwd: string; tasks: Task[]; onOpenTask?: (t: string) => void }) {
   const status = stepStatus(step.calls);
   const failures = step.calls.filter((c) => c.status === "error" || (c.tool === "shell" && c.exit_code !== undefined && c.exit_code !== 0)).length;
   // Open by default: what needs attention, and what is happening right now.
@@ -304,7 +295,7 @@ const DELIVERY: Record<Delivery, string> = {
   cancelled: "dropped",
 };
 
-function Prompt({ e, delivery }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery }) {
+function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
   const system = e.origin && e.origin !== "human";
   return (
     <div className="hx-prompt" data-origin={e.origin ?? "human"}>
@@ -312,7 +303,12 @@ function Prompt({ e, delivery }: { e: Extract<HEvent, { kind: "user" }>; deliver
         <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
         <span className="hx-dim">{new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
         {delivery && <span className="hx-dim">· {DELIVERY[delivery]}</span>}
-        {e.images ? <span className="hx-dim">· {e.images} image{e.images === 1 ? "" : "s"}</span> : null}
+        {e.images ? (
+          <span className="hx-dim">
+            · {e.images} image{e.images === 1 ? "" : "s"}
+          </span>
+        ) : null}
+        {!system && onCommand && <TurnMenu meta={meta ?? null} eventId={e.id} send={onCommand} />}
       </div>
       <div className={cn("hx-prompt-text", system && "hx-dim")}>{e.text}</div>
     </div>
@@ -339,6 +335,8 @@ const TurnView = React.memo(function TurnView({
   delivery,
   live,
   onOpenTask,
+  meta,
+  onCommand,
 }: {
   turn: Turn;
   cwd: string;
@@ -346,13 +344,15 @@ const TurnView = React.memo(function TurnView({
   delivery?: Delivery;
   live: boolean;
   onOpenTask?: (t: string) => void;
+  meta?: Meta | null;
+  onCommand?: (c: Command) => void;
 }) {
   const edits = React.useMemo(() => changesetOf(turn.items.flatMap((i) => (i.type === "step" ? i.calls : []))), [turn]);
   const add = edits.reduce((n, f) => n + f.add, 0);
   const del = edits.reduce((n, f) => n + f.del, 0);
   return (
     <section className="hx-turn">
-      {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} />}
+      {turn.prompt && <Prompt e={turn.prompt} delivery={delivery} meta={meta} onCommand={onCommand} />}
       <div className="hx-work">
         {turn.items.map((it) => (
           <ItemView key={it.key} item={it} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />
@@ -386,16 +386,21 @@ const TurnView = React.memo(function TurnView({
 export function Timeline({
   events,
   state,
+  meta,
   cwd,
   parent,
   onOpenTask,
+  onCommand,
   footer,
 }: {
   events: HEvent[];
   state: State | null;
+  meta?: Meta | null;
   cwd: string;
   parent?: string;
   onOpenTask?: (t: string) => void;
+  /** Turn actions (rewind, branch) go out through this. */
+  onCommand?: (c: Command) => void;
   footer?: React.ReactNode;
 }) {
   const turns = React.useMemo(() => turnsOf(events, parent), [events, parent]);
@@ -424,6 +429,8 @@ export function Timeline({
           delivery={t.prompt?.client_id ? state?.delivery[t.prompt.client_id] : undefined}
           live={running && i === turns.length - 1}
           onOpenTask={onOpenTask}
+          meta={meta}
+          onCommand={onCommand}
         />
       ))}
       {footer}

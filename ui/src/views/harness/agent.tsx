@@ -14,6 +14,7 @@ import { errorMessage, useDocumentTitle, useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { ApprovalCard } from "./approval";
 import { Composer } from "./composer";
+import { SettingsButton, SettingsSheet } from "./controls";
 import { money, tildify } from "./derive";
 import { Inspector, type InspectorTab } from "./inspector";
 import { HarnessMark, StatusPill } from "./parts";
@@ -66,6 +67,7 @@ export default function AgentPage() {
   const [task, setTask] = React.useState<string | null>(null);
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [risky, setRisky] = React.useState<string | null>(null);
+  const [settings, setSettings] = React.useState(false);
   useDocumentTitle(info ? `${info.name} · Agents` : "Agent");
 
   const cwd = state?.cwd || info?.cwd || "";
@@ -104,7 +106,7 @@ export default function AgentPage() {
           </button>
         </div>
       )}
-      <Timeline events={events} state={state} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} />
+      <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} />
       <div className="hx-dock">
         {approvals.length > 0 && (
           <div className="hx-dock-approvals">
@@ -150,14 +152,13 @@ export default function AgentPage() {
         </div>
         <div className="hx-agent-actions">
           {features.includes("set_mode") && (
-            <Picker
-              label="Permissions"
-              value={state?.mode ?? ""}
-              options={meta?.modes ?? []}
-              onPick={(m, dangerous) => (dangerous ? setRisky(m) : send({ type: "set_mode", mode: m }))}
-            />
+            <Picker label="Permissions" value={state?.mode ?? ""} options={meta?.modes ?? []} onPick={(m, dangerous) => (dangerous ? setRisky(m) : send({ type: "set_mode", mode: m }))} />
           )}
           {features.includes("set_model") && <Picker label="Model" value={state?.model ?? ""} options={meta?.models ?? []} onPick={(m) => send({ type: "set_model", model: m })} />}
+          {(meta?.efforts?.length ?? 0) > 0 && <Picker label="Effort" value={state?.effort ?? ""} options={meta?.efforts ?? []} onPick={(e) => send({ type: "set_effort", effort: e })} />}
+          {(meta?.controls ?? []).some((c) => (c.scope ?? "session") === "session") && (
+            <SettingsButton onClick={() => setSettings(true)} count={(meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session").length} />
+          )}
           {info?.shell && (
             <Button size="sm" variant="ghost" onClick={() => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`)} aria-label="Open its shell">
               <SquareTerminal />
@@ -213,6 +214,7 @@ export default function AgentPage() {
         </div>
       )}
 
+      <SettingsSheet open={settings} onOpenChange={setSettings} meta={meta} state={state} send={send} />
       <ConfirmDialog
         open={confirmStop}
         onOpenChange={setConfirmStop}
