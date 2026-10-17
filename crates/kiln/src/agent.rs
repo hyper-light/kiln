@@ -46,12 +46,22 @@ pub struct Opts {
     pub shell: Option<String>,
     /// In-process agent: credentials handed over directly, no enrollment.
     pub credentials: Option<(Vec<u8>, Leaf)>,
+    /// A runner process beside the machine's usual one (`kiln install --agent --upgrade`): its
+    /// own certificate and files under `<state>/instances/<id>` (see `crate::upgrade`).
+    pub instance: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct EnrollRequest {
     pub token: String,
     pub name: String,
+    pub csr: String,
+}
+
+/// `POST /api/agents/instance`: see `api::enroll_instance`.
+#[derive(Serialize, Deserialize)]
+pub struct InstanceRequest {
+    pub cert_pem: String,
     pub csr: String,
 }
 
@@ -73,6 +83,9 @@ fn ca_der(pem: &str) -> anyhow::Result<Vec<u8>> {
 async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
     if let Some((ca, leaf)) = &o.credentials {
         return Ok((ca.clone(), leaf.clone(), None));
+    }
+    if let Some(id) = &o.instance {
+        return instance_credentials(o, id, shutdown).await;
     }
     let cert_p = o.state_dir.join("agent.pem");
     let key_p = o.state_dir.join("agent.key");
@@ -125,6 +138,41 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
     }
 }
 
+/// A runner process beside the machine's usual one: the machine's key with this instance's own
+/// certificate, fetched (or renewed) from the server with a current certificate as proof — this
+/// instance's own while it is valid, else the machine's.
+async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, Leaf, Option<String>)> {
+    let dir = crate::upgrade::instance_dir(&o.state_dir, id);
+    let ca = std::fs::read_to_string(o.state_dir.join("ca.pem")).context("this machine is not enrolled (no ca.pem)")?;
+    let (machine_cert, key) = crate::upgrade::machine_credentials(&o.state_dir)?;
+    let quic = std::fs::read_to_string(o.state_dir.join("quic")).ok().map(|s| s.trim().to_owned());
+    let cert_p = dir.join("agent.pem");
+    let own = std::fs::read_to_string(&cert_p).ok();
+    if let Some(c) = &own
+        && !crate::pki::needs_renewal(c)
+    {
+        return Ok((ca_der(&ca)?, Leaf { cert_pem: c.clone(), key_pem: key }, quic));
+    }
+    std::fs::create_dir_all(&dir)?;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        for proof in own.iter().chain(std::iter::once(&machine_cert)) {
+            match crate::upgrade::fetch_certificate(&o.server_url, Some(&ca), &o.name, proof, &key).await {
+                Ok(e) => {
+                    crate::util::write_secret(&cert_p, e.cert_pem.as_bytes(), 0o644)?;
+                    tracing::info!(instance = %id, "certificate for this runner process issued");
+                    return Ok((ca_der(&e.ca_pem)?, Leaf { cert_pem: e.cert_pem, key_pem: key }, quic.or(Some(e.quic))));
+                }
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "no certificate for this runner process yet; retrying"),
+            }
+        }
+        if !shutdown.sleep(crate::sup::jitter(backoff)).await {
+            anyhow::bail!("shutdown");
+        }
+        backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
 async fn resolve(addr: &str) -> anyhow::Result<SocketAddr> {
     crate::rt::resolve(addr).await.with_context(|| format!("resolve {addr}"))
 }
@@ -164,6 +212,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         tracing::warn!(orphans, "killed job processes left over from a previous agent run");
     }
     let (ca, leaf, enrolled_quic) = credentials(&o, &shutdown).await?;
+    // This process's own files (a runner beside another one of the machine shares the state
+    // directory, never a file).
+    let own_dir = crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref());
+    let _ = std::fs::create_dir_all(&own_dir);
+    let instance_id = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
+    let instance_hello = proto::InstanceHello {
+        id: instance_id.clone(),
+        created_at: crate::upgrade::created_at(&o.state_dir, &instance_id),
+        pid: std::process::id(),
+    };
     // The certificate names this agent (the server checks Hello against it); an approved join may
     // have given a variant of the requested name.
     let name = crate::pki::leaf_name(&leaf).unwrap_or_else(|| o.name.clone());
@@ -211,12 +269,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // this process's restarts: each continues its harness session.
     let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        let h = crate::harness::host::Host::new(harness_tx.clone(), Some(o.state_dir.join("harness.json")), Default::default());
+        let h = crate::harness::host::Host::new(harness_tx.clone(), Some(own_dir.join("harness.json")), Default::default());
         h.restore();
         h
     });
     // What `kiln spawn` in this machine's terminals talks to.
-    let harness_sock = harness.as_ref().and_then(|h| match crate::harness::socket::serve(h, crate::harness::socket::path(&name, &o.state_dir)) {
+    let harness_sock = harness.as_ref().and_then(|h| match crate::harness::socket::serve(h, crate::harness::socket::path(&name, &own_dir)) {
         Ok(p) => Some(p.to_string_lossy().into_owned()),
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
@@ -336,6 +394,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 tracing::info!(server = %quic_addr, "connected to server");
                 dialing_since = None;
                 dial_backoff = Duration::from_millis(500);
+                // Which process of this machine this is, then Hello (an older server skips the first).
+                if !o.ephemeral
+                    && let Ok(b) = proto::encode(&AgentMsg::Instance(instance_hello.clone()))
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
                 let msg = AgentMsg::Hello(hello(jobs.keys().cloned().collect()));
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
@@ -368,6 +432,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 match msg {
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
+                        if o.instance.is_some() {
+                            // `kiln install --agent --upgrade` waits for this.
+                            let _ = std::fs::write(own_dir.join("connected"), crate::util::now_unix().to_string());
+                        }
                         let sessions: Vec<proto::TermInfo> = terms
                             .iter()
                             .map(|(id, (_, s))| {
@@ -455,6 +523,26 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     ServerMsg::Drain => draining = true,
+                    ServerMsg::Retire { instance } => {
+                        // An older runner process of this machine holds nothing any more: stop
+                        // the service this instance replaces (it checks for terminals itself).
+                        let state_dir = o.state_dir.clone();
+                        let me = instance_id.clone();
+                        crate::rt::spawn(async move {
+                            match crate::rt::blocking(move || crate::upgrade::retire(&state_dir, &me)).await {
+                                Ok(Ok(crate::upgrade::Retired::Stopped(unit))) => {
+                                    tracing::info!(%instance, %unit, "retired the older runner process: its service is stopped and disabled");
+                                }
+                                Ok(Ok(crate::upgrade::Retired::Busy(n))) => {
+                                    tracing::warn!(%instance, terminals = n, "the older runner process still holds terminals; leaving it running");
+                                }
+                                Ok(Ok(crate::upgrade::Retired::Nothing)) => {
+                                    tracing::info!(%instance, "an older runner process of this machine can be stopped; this one did not start it, so it is left to whoever did");
+                                }
+                                Ok(Err(e)) | Err(e) => tracing::warn!(%instance, error = %format!("{e:#}"), "could not retire the older runner process"),
+                            }
+                        });
+                    }
                     ServerMsg::TermOpen { session, cols, rows, command } => {
                         if !o.terminal {
                             uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal disabled on this agent".into()) })).await.ok();
@@ -676,7 +764,7 @@ struct HandedTerm {
 }
 
 fn handover_path(o: &Opts) -> PathBuf {
-    o.state_dir.join("terminal-handover.json")
+    crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref()).join("terminal-handover.json")
 }
 
 /// Re-execute this process from `exe` (same pid), handing every terminal to the new image.

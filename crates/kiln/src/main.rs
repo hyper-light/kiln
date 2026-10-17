@@ -134,6 +134,10 @@ struct AgentArgs {
     work_dir: Option<PathBuf>,
     #[arg(long, env = "KILN_STATE_DIR")]
     state_dir: Option<PathBuf>,
+    /// Run as another process of this machine beside its usual runner (set up by
+    /// `kiln install --agent --upgrade`; files under <state>/instances/<id>).
+    #[arg(long, env = "KILN_INSTANCE")]
+    instance: Option<String>,
     /// Run one job then exit (Kubernetes pods).
     #[arg(long)]
     ephemeral: bool,
@@ -287,6 +291,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 terminal: !a.no_terminal && !a.ephemeral,
                 shell: a.shell,
                 credentials: None,
+                instance: a.instance,
             };
             let result = run_agent(opts, shutdown).await;
             if let Some(ann) = announcer {
@@ -304,7 +309,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Supervise { detach, args } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let state_dir = if args.first().is_some_and(|a| a == "agent") {
-                config::default_data_dir().join("agent")
+                // The agent's own state directory, when it has one of its own.
+                kiln::upgrade::arg_value(&args, "--state-dir").map_or_else(|| config::default_data_dir().join("agent"), PathBuf::from)
             } else {
                 cfg.server.data_dir.clone()
             };

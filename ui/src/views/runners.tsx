@@ -4,7 +4,7 @@ import { DropdownMenu, Switch } from "radix-ui";
 import { LayoutGrid, List, MoreHorizontal, Plus, Server, SquareTerminal, Trash2 } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, HostSample, Job, JoinInfo } from "@/api/types";
+import type { Agent, HostSample, Job, JoinInfo, RunnerInstance } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { CopyButton, EmptyState, ErrorState, Facts, Meter, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
@@ -208,6 +208,7 @@ export default function Runners() {
                       <div className="truncate font-mono text-[10px] text-[#7b7e88]">
                         {a.connected ? `${a.hostname} · ${a.os}/${a.arch} · v${a.version}` : <>last seen <RelTime ts={a.last_seen} /></>}
                       </div>
+                      <UpgradeNote agent={a} />
                     </td>
                     <td className="hidden md:table-cell">
                       <Chips labels={a.labels} max={4} />
@@ -263,6 +264,54 @@ export default function Runners() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/** What keeps an older runner process alive, in words ("2 terminals, 1 job"). */
+function holding(i: RunnerInstance) {
+  const parts = [
+    i.terminals ? `${i.terminals} terminal${i.terminals === 1 ? "" : "s"}` : "",
+    i.agents ? `${i.agents} agent session${i.agents === 1 ? "" : "s"}` : "",
+    i.jobs ? `${i.jobs} job${i.jobs === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join(", ") : "nothing";
+}
+
+/**
+ * A runner being replaced without a restart: the new process takes new work while the old one
+ * keeps what it runs, and retires itself once that ends.
+ */
+function UpgradeNote({ agent, detailed }: { agent: Agent; detailed?: boolean }) {
+  const inst = agent.instances ?? [];
+  if (inst.length < 2) return null;
+  const old = inst.filter((i) => !i.newest);
+  if (!detailed) {
+    const held = old.reduce((n, i) => n + i.terminals + i.agents + i.jobs, 0);
+    return (
+      <div className="truncate font-mono text-[10px] text-[#cbb69a]">
+        upgrading · old runner {held ? `keeps ${old.map(holding).join("; ")}` : "is retiring"}
+      </div>
+    );
+  }
+  return (
+    <div className="mt-5 rounded-xl border border-[#cbb69a]/30 bg-[#cbb69a]/[0.04] px-4 py-3">
+      <div className="label mb-2">Upgrading without a restart</div>
+      <ul className="flex flex-col gap-1.5 text-[12.5px] text-[#c8cad0]">
+        {inst.map((i) => (
+          <li key={i.id} className="flex flex-wrap items-baseline gap-x-2">
+            <StatusDot status={i.newest ? "succeeded" : "timed_out"} />
+            <span>{i.newest ? "New runner" : i.legacy ? "Old runner" : "Older runner"}</span>
+            <span className="font-mono text-[10.5px] text-[#7b7e88]">
+              {i.legacy ? "legacy" : i.id.slice(0, 8)} · v{i.version}
+              {i.pid ? ` · pid ${i.pid}` : ""}
+            </span>
+            <span className="text-[#a1a4ad]">
+              {i.newest ? "takes new terminals, agents and jobs" : `keeps ${holding(i)}; retires itself when ${i.terminals + i.agents + i.jobs ? "they end" : "it is stopped"}`}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -469,6 +518,8 @@ function AgentDrawer({
               <Trash2 /> Forget
             </Button>
           </div>
+
+          <UpgradeNote agent={agent} detailed />
 
           <div className="mt-6">
             <Facts

@@ -162,6 +162,25 @@ export interface Agent {
   busy: number;
   draining: boolean;
   sample: HostSample | null;
+  /** While a new runner replaces an old one without a restart: both processes, newest first. */
+  instances?: RunnerInstance[];
+}
+
+/** One runner process of a machine (see `crates/kiln/src/instances.rs`). */
+export interface RunnerInstance {
+  /** "legacy" for a runner from before instances. */
+  id: string;
+  legacy: boolean;
+  version: string;
+  created_at: number;
+  connected_at: number;
+  pid: number | null;
+  /** New work goes here. */
+  newest: boolean;
+  /** What it still holds (for an older one: what keeps it running). */
+  terminals: number;
+  agents: number;
+  jobs: number;
 }
 
 export type ChildState = "starting" | "running" | "restarting" | "stopped" | "finished";

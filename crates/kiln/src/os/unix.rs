@@ -141,3 +141,16 @@ pub fn try_reap(pid: u32) -> io::Result<Option<(Option<i32>, String)>> {
         Err(e) => Err(io::Error::from(e)),
     }
 }
+
+/// How many PTY masters process `pid` holds open (its terminals), where the platform can tell.
+pub fn pty_masters(pid: u32) -> Option<usize> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(
+        fds.flatten()
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t == Path::new("/dev/ptmx") || t == Path::new("/dev/pts/ptmx")))
+            .count(),
+    )
+}

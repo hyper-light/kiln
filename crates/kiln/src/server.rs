@@ -200,6 +200,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             terminal: false, // the server already offers the "local" terminal
             shell: cfg.terminal.shell.clone(),
             credentials: Some(creds),
+            instance: None,
         };
         sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), shutdown_child()));
     }
