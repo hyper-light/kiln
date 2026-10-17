@@ -203,13 +203,12 @@
   color: #8a8e98;
   line-height: 1.6;
 }
+/* Still: an eyebrow's rule is the prism, not a state (motion marks what changes). */
 .spectrum-rule {
   display: inline-block;
   width: 30px;
   height: 2px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
   flex: 0 0 auto;
 }
 @keyframes prism-current {
@@ -356,8 +355,6 @@
   right: 8px;
   height: 1px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
 }
 .desktop-nav a .nav-index {
   font-family: var(--font-mono);
@@ -1399,8 +1396,6 @@
   margin: auto;
   border-radius: 50%;
   border: 1px solid;
-  animation: optic-breathe 14s ease-in-out infinite;
-  animation-delay: calc(var(--i) * -0.55s);
 }
 @keyframes optic-breathe {
   50% {
@@ -1776,8 +1771,6 @@
   bottom: -1px;
   height: 1px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
 }
 
 /* On-screen terminal keyboard */
