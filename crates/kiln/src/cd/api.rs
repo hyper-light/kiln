@@ -195,9 +195,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
                 return Err(bad("plans of kiln's own diffs (D123) come with its review, which isn't built yet: plan the commit (commit=) or the stack (head=, base=)"));
             }
             let keys = ["repo", "commit", "head", "base", "trunk", "pr", "brief", "max_apps", "project", "cluster", "namespace", "environment", "q"];
-            ("cd.plan".into(), from_query(q, &keys))
+            ("cd.plans.get".into(), from_query(q, &keys))
         }
-        (&Method::POST, ["plans"]) => ("cd.plan".into(), json_body(body).await?),
+        (&Method::POST, ["plans"]) => ("cd.plans.get".into(), json_body(body).await?),
+        (&Method::GET, ["plans", "repos"]) => ("cd.plans.repos".into(), json!({})),
         (&Method::GET, ["clusters"]) => ("cd.clusters.list".into(), json!({})),
         (&Method::POST, ["clusters"]) => ("cd.clusters.add".into(), json_body(body).await?),
         (&Method::DELETE, ["clusters", name]) => ("cd.clusters.remove".into(), json!({"name": name})),

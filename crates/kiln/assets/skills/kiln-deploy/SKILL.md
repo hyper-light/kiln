@@ -14,13 +14,14 @@ the cluster and syncs. Don't edit the cluster by hand: an app with self-heal und
    `cd_apps_list` tool). An app id is `project/name`.
 2. **Change git.** Edit the app's source (its definition names the repository and path:
    `kiln.cd.apps.get({ app })` → `definition.sources`). Commit it as a reviewed change.
-3. **Plan it before it lands.** Push the branch, then `kiln.cd.plan({ head: "<branch>", repo })`
-   (MCP: `cd_plan`; one commit: `commit`; a pull request: `pr`). Every commit of the branch gets,
-   for each app it touches, its own change, the whole branch's change against trunk, and the
-   steps a sync would take against what runs now: what it creates, changes (`why`, with hunks),
-   prunes, and the hooks it runs. `ok: false` means a diff fails: read its `problems` (a render
-   that fails, an object `Prune=false` keeps) and fix them before landing. `notes` say what to
-   know, such as an object another app deploys. `brief: true` leaves out the hunks.
+3. **Plan it before it lands.** Push the branch, then
+   `kiln.cd.plans.get({ head: "<branch>", repo })` (MCP: `cd_plans_get`; one commit: `commit`;
+   a pull request: `pr`). Every commit of the branch gets, for each app it touches, its own
+   change, the whole branch's change against trunk, and the steps a sync would take against what
+   runs now: what it creates, changes (`why`, with hunks), prunes, and the hooks it runs.
+   `ok: false` means a diff fails: read its `problems` (a render that fails, an object
+   `Prune=false` keeps) and fix them before landing. `notes` say what to know, such as an object
+   another app deploys. `brief: true` leaves out the hunks.
 4. **Let kiln see it.** Sources are polled; to look now: `kiln.cd.apps.refresh({ app })`.
 5. **Sync.** Apps with `auto` sync by themselves. Otherwise `kiln.cd.apps.sync({ app })`
    (`prune: true` deletes what git no longer holds; `dry_run: true` only validates).
@@ -43,7 +44,7 @@ Fleets: `kiln.cd.apps.sync_many({ project, health, ... })` starts every matching
 
 ```js
 // code_run: what a branch would deploy, as one line per app and diff
-const p = await kiln.cd.plan({ head: input.branch, repo: input.repo, brief: true });
+const p = await kiln.cd.plans.get({ head: input.branch, repo: input.repo, brief: true });
 return { ok: p.ok, diffs: p.diffs.map(d => ({ commit: d.commit.subject, ok: d.ok,
   apps: d.apps.filter(a => a.touched).map(a => ({ app: a.app, problems: a.problems,
     steps: a.sync && a.sync.steps.map(s => `${s.step} ${s.key.kind} ${s.key.name}`) })) })) };

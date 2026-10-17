@@ -152,7 +152,7 @@ pub fn ops() -> &'static [Op] {
                 input: app_only, run: diff),
             op!("cd.apps.history", "An app's deployments, newest first.", ro: true, destructive: false,
                 input: app_only, run: history),
-            op!("cd.plan", "What a commit, or every diff of a stack, would deploy before it lands. For each app it touches: its own change (its render against the render of the diff below), the stack's change (against trunk), and the steps a sync would take against what runs, in order: what it creates, what it changes (live and predicted, with hunks), the hooks it runs, what it prunes and what Prune=false keeps. A diff fails when its sources can't be read or rendered, or it drops an object Prune=false keeps. Renders are kept by content, so planning again is cheap.", ro: true, destructive: false,
+            op!("cd.plans.get", "What a commit, or every diff of a stack, would deploy before it lands. For each app it touches: its own change (its render against the render of the diff below), the stack's change (against trunk), and the steps a sync would take against what runs, in order: what it creates, what it changes (live and predicted, with hunks), the hooks it runs, what it prunes and what Prune=false keeps. A diff fails when its sources can't be read or rendered, or it drops an object Prune=false keeps. Renders are kept by content, so planning again is cheap.", ro: true, destructive: false,
                 input: || {
                     let mut p = selector_props();
                     if let Some(m) = p.as_object_mut() {
@@ -167,6 +167,8 @@ pub fn ops() -> &'static [Op] {
                     }
                     obj_schema(p, &[])
                 }, run: plan),
+            op!("cd.plans.repos", "The repositories apps deploy from, for choosing what to plan: each with how many apps deploy from it, its default branch and its newest branches.", ro: true, destructive: false,
+                input: || obj_schema(json!({}), &[]), run: plan_repos),
             op!("cd.apps.sync", "Start a sync of an app (optionally only some resources, with pruning, as a dry run, with Argo CD sync options).", ro: false, destructive: true,
                 input: || obj_schema(json!({
                     "app": {"type": "string", "description": APP},
@@ -851,6 +853,10 @@ async fn history(cx: Cx, v: Value) -> Out {
 
 async fn plan(cx: Cx, v: Value) -> Out {
     super::plans::plan(&cx.cd, super::plans::Ask::from_json(&v)).await
+}
+
+async fn plan_repos(cx: Cx, _: Value) -> Out {
+    super::plans::repos(&cx.cd).await
 }
 
 fn sync_request(v: &Value, by: &str) -> Result<SyncRequest, Fail> {

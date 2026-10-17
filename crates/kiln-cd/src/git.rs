@@ -337,6 +337,20 @@ impl Mirror {
         run(c).ok().map(text).filter(|b| !b.is_empty())
     }
 
+    /// Branches, the most recently committed first (at most `max`): name, commit, and when it
+    /// was committed (seconds since the epoch).
+    pub fn branches(&self, max: usize) -> Result<Vec<(String, String, i64)>> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["for-each-ref", "--sort=-committerdate", &format!("--count={max}"), "--format=%(refname:short)%00%(objectname)%00%(committerdate:unix)", "refs/heads"]);
+        Ok(text(run(c)?)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split('\0');
+                Some((f.next()?.to_owned(), f.next()?.to_owned(), f.next()?.trim().parse().unwrap_or(0)))
+            })
+            .collect())
+    }
+
     /// A commit's first parent; `None` for a root commit.
     pub fn parent(&self, commit: &str) -> Result<Option<String>> {
         let mut c = git(Some(&self.dir), &self.auth);
@@ -430,6 +444,10 @@ mod tests {
         let moved = commit("moved")?;
         let m = Mirror::open(&tmp.path().join("mirror.git"), work.to_str().unwrap_or(""), Auth::default())?;
         assert_eq!(m.default_branch().as_deref(), Some("main"));
+        let names: Vec<String> = m.branches(10)?.into_iter().map(|(name, _, _)| name).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"main".to_owned()) && names.contains(&"stack".to_owned()));
+        assert_eq!(m.branches(1)?.len(), 1);
         assert!(m.has(&d2) && !m.has("0000000000000000000000000000000000000000"));
         assert_eq!(m.parent(&d1)?.as_deref(), Some(trunk.as_str()));
         assert_eq!(m.parent(&root)?, None);

@@ -39,6 +39,8 @@ const MAX_LINES: usize = 2_000;
 const KEPT_BYTES: usize = 64 << 20;
 /// Objects one app's plan reads from its cluster itself, at most.
 const MAX_READS: usize = 200;
+/// Branches listed per repository, the newest first.
+const MAX_BRANCHES: usize = 50;
 
 fn bad(msg: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, msg.into())
@@ -78,7 +80,7 @@ pub struct Ask {
 }
 
 impl Ask {
-    /// Reads `cd.plan`'s input.
+    /// Reads `cd.plans.get`'s input.
     pub fn from_json(v: &Value) -> Ask {
         let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).map(str::to_owned);
         Ask {
@@ -284,6 +286,53 @@ fn mirror(cd: &Cd, url: &str) -> anyhow::Result<Mirror> {
     Mirror::open(&cd.mirror_dir(url), url, cd.git_auth(url))
 }
 
+/// Every repository an app deploys from, by name, its spellings together, and how many apps
+/// deploy from it.
+fn repo_groups(cd: &Cd) -> BTreeMap<String, (Vec<String>, usize)> {
+    let mut groups: BTreeMap<String, (Vec<String>, usize)> = BTreeMap::new();
+    for e in cd.apps.read().values() {
+        let mut seen = BTreeSet::new();
+        for s in e.def.sources.iter().filter(|s| s.chart.is_none()) {
+            let name = repo_name(&s.repo);
+            let g = groups.entry(name.clone()).or_default();
+            if !g.0.contains(&s.repo) {
+                g.0.push(s.repo.clone());
+            }
+            if seen.insert(name) {
+                g.1 += 1;
+            }
+        }
+    }
+    groups
+}
+
+/// The repositories apps deploy from, for choosing what to plan: each with how many apps
+/// deploy from it, its default branch, and its newest branches.
+pub async fn repos(cd: &Arc<Cd>) -> Result<Value, Fail> {
+    let cd = cd.clone();
+    let list = crate::rt::blocking(move || {
+        repo_groups(&cd)
+            .into_values()
+            .filter_map(|(urls, apps)| {
+                let url = urls.first()?.clone();
+                // Only mirrors already fetched: listing never clones.
+                let m = cd.mirror_dir(&url).join("HEAD").exists().then(|| mirror(&cd, &url).ok()).flatten();
+                let branches: Vec<Value> = m
+                    .as_ref()
+                    .and_then(|m| m.branches(MAX_BRANCHES).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, commit, at)| json!({"name": name, "commit": commit, "at_ms": at * 1000}))
+                    .collect();
+                Some(json!({"url": url, "urls": urls, "apps": apps, "default_branch": m.as_ref().and_then(Mirror::default_branch), "branches": branches}))
+            })
+            .collect::<Vec<Value>>()
+    })
+    .await
+    .map_err(failed)?;
+    Ok(json!({"repos": list}))
+}
+
 /// Finds what `ask` names: the repository, trunk, the base and the stack's commits.
 fn find(cd: &Cd, ask: &Ask) -> Result<Stack, Fail> {
     // Revisions go to git as arguments: none may read as an option.
@@ -299,16 +348,7 @@ fn find(cd: &Cd, ask: &Ask) -> Result<Stack, Fail> {
         (None, None, None) => return Err(bad("say what to plan: a commit, a stack's head, or a pull request (pr)")),
         _ => return Err(bad("plan one of commit, head and pr")),
     };
-    // Every repository an app deploys from, its spellings together.
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for e in cd.apps.read().values() {
-        for s in e.def.sources.iter().filter(|s| s.chart.is_none()) {
-            let g = groups.entry(repo_name(&s.repo)).or_default();
-            if !g.contains(&s.repo) {
-                g.push(s.repo.clone());
-            }
-        }
-    }
+    let mut groups: BTreeMap<String, Vec<String>> = repo_groups(cd).into_iter().map(|(name, (urls, _))| (name, urls)).collect();
     if let Some(r) = &ask.repo {
         groups.retain(|name, _| *name == repo_name(r));
         if groups.is_empty() {
