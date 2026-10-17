@@ -18,7 +18,8 @@ import { errorMessage, useDocumentTitle, useLocalStorage, useNow } from "@/lib/h
 import { relativeTime } from "@/lib/format";
 import { plain } from "./derive";
 import { AgentMenu } from "./actions";
-import { HarnessMark, machineName } from "./parts";
+import { FoundSessions } from "./found";
+import { machineName } from "./parts";
 import { useSeen } from "./seen";
 import { SpawnDialog } from "./spawn";
 import { useAgents } from "./use-agents";
@@ -203,6 +204,7 @@ export default function Mission() {
   const { list, error, reload } = useAgents();
   const seen = useSeen();
   const [found, setFound] = React.useState<AiSession[]>([]);
+  const [quiet, setQuiet] = React.useState<string[]>([]);
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [spawn, setSpawn] = React.useState(false);
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
@@ -218,11 +220,19 @@ export default function Mission() {
     setParams(n, { replace: true });
   }, [params, setParams]);
 
-  React.useEffect(() => {
+  // Sessions found on your machines: told when they change, and re-read now and then for their
+  // state and last activity.
+  const readFound = React.useCallback(() => {
     api.aiSessions().then(setFound, () => undefined);
+    api.aiSilent().then((r) => setQuiet(r.machines), () => undefined);
   }, []);
+  React.useEffect(() => {
+    readFound();
+    const t = window.setInterval(readFound, 20_000);
+    return () => window.clearInterval(t);
+  }, [readFound]);
   useServerEvents((ev) => {
-    if (ev.type === "ai_sessions") api.aiSessions().then(setFound, () => undefined);
+    if (ev.type === "ai_sessions") readFound();
   });
 
   const rows = React.useMemo(
@@ -236,8 +246,8 @@ export default function Mission() {
   const ended = rows.filter((r) => r.stand === "ended");
   const n = (s: Stand) => rows.filter((r) => r.stand === s).length;
   const machines = [...new Set(live.map((r) => machineName(r.a.target)))];
-  // Sessions found on machines that kiln isn't running itself (started in a plain terminal).
-  const elsewhere = found.filter((s) => !rows.some((r) => r.a.harness_session && r.a.harness_session === s.id));
+  // Sessions found on your machines that kiln doesn't run itself (its own agents are rows above).
+  const elsewhere = found.filter((s) => !s.managed_by && !rows.some((r) => r.a.harness_session && r.a.harness_session === s.id));
 
   const status = [n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`, n("crashed") && `${n("crashed")} stopped`, n("working") && `${n("working")} working`, n("finished") && `${n("finished")} finished`]
     .filter(Boolean)
@@ -283,55 +293,37 @@ export default function Mission() {
             New agents <Plus />
           </Button>
         </div>
+      ) : live.length > 0 ? (
+        <ul className="ms-list">
+          {live.map(({ a, stand }) => (
+            <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} now={now} />
+          ))}
+        </ul>
       ) : (
-        <>
-          {live.length > 0 ? (
+        <p className="ms-quiet">Nothing running. Start something new, or pick up an ended agent below.</p>
+      )}
+
+      <FoundSessions sessions={elsewhere} quiet={quiet} now={now} />
+
+      {ended.length > 0 && (
+        <section className="ms-ended">
+          <div className="ms-fold">
+            <button type="button" className="ms-fold-btn" aria-expanded={showEnded} onClick={() => setShowEnded(!showEnded)}>
+              <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
+              Ended · {ended.length}
+            </button>
+            <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
+              Clear
+            </button>
+          </div>
+          {showEnded && (
             <ul className="ms-list">
-              {live.map(({ a, stand }) => (
+              {ended.map(({ a, stand }) => (
                 <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} now={now} />
               ))}
             </ul>
-          ) : (
-            <p className="ms-quiet">Nothing running. Start something new, or pick up an ended agent below.</p>
           )}
-
-          {ended.length > 0 && (
-            <section className="ms-ended">
-              <div className="ms-fold">
-                <button type="button" className="ms-fold-btn" aria-expanded={showEnded} onClick={() => setShowEnded(!showEnded)}>
-                  <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
-                  Ended · {ended.length}
-                </button>
-                <button type="button" className="ms-link" onClick={() => void Promise.allSettled(ended.map((r) => harnessApi.stop(r.a.id))).then(() => reload())}>
-                  Clear
-                </button>
-              </div>
-              {showEnded && (
-                <ul className="ms-list">
-                  {ended.map(({ a, stand }) => (
-                    <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} now={now} />
-                  ))}
-                </ul>
-              )}
-            </section>
-          )}
-        </>
-      )}
-
-      {elsewhere.length > 0 && (
-        <Link to="/agents/sessions" className="ms-elsewhere">
-          <span className="ms-elsewhere-marks" aria-hidden="true">
-            {[...new Set(elsewhere.map((s) => s.tool))].slice(0, 3).map((t) => (
-              <HarnessMark key={t} kind={t} size={16} />
-            ))}
-          </span>
-          <span className="ms-elsewhere-text">
-            {elsewhere.length} session{elsewhere.length === 1 ? "" : "s"} running outside kiln · watch or take over
-          </span>
-          <span className="ms-go" aria-hidden="true">
-            <ArrowUpRight size={16} />
-          </span>
-        </Link>
+        </section>
       )}
 
       {selected.size > 0 && <Broadcast ids={[...selected]} agents={rows.map((r) => r.a)} onDone={() => setSelected(new Set())} />}

@@ -260,32 +260,116 @@
 .ms-fold-btn[aria-expanded="true"] .ms-chev {
   transform: rotate(90deg);
 }
-/* Sessions outside kiln: one more row, with the list's geometry. */
-.ms-elsewhere {
+/* ---------------------------------------------------------------- found on your machines */
+.ms-found {
+  margin-top: 28px;
+}
+.ms-fold-note {
+  color: #a49ccf;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+/* The tool's mark stands where an agent row has its checkbox. */
+.ms-mark {
+  grid-area: check;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 0 20px;
-  margin-top: 36px;
-  padding: 14px 8px 14px 6px;
-  border-top: 1px solid #2b2d32;
-  border-bottom: 1px solid #25272c;
-  color: #a1a4ad;
-  font-size: 13px;
+  place-items: center;
 }
-.ms-elsewhere:hover,
-.ms-elsewhere:hover .ms-go {
+.ms-tool {
+  display: none;
+}
+.ms-reason {
+  color: #8f939e;
+  font-size: 12px;
+  white-space: nowrap;
+}
+a.ms-reason:hover {
   color: #ededee;
+  text-decoration: underline;
 }
-.ms-elsewhere-marks {
-  display: flex;
-  justify-content: center;
-}
-.ms-elsewhere-marks > * + * {
-  margin-left: -6px;
-}
-.ms-elsewhere-text {
+/* Take over's confirmation and the transcript open beneath the row, across it. */
+.ms-confirm,
+.ms-watch {
+  grid-column: 1 / -1;
   min-width: 0;
+  margin-top: 14px;
+}
+.ms-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 12px 14px;
+  border: 1px solid #39344a;
+  border-radius: 7px;
+  background: #0f0e14;
+  color: #c8cad0;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.ms-confirm p {
+  min-width: 0;
+  margin: 0;
+}
+.ms-confirm-actions {
+  display: flex;
+  gap: 8px;
+}
+.ms-watch {
+  padding-top: 12px;
+  border-top: 1px solid #25272c;
+}
+.ms-watch-facts {
+  margin: 0 0 10px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+.ms-watch-note {
+  margin: 0;
+  color: #8f939e;
+  font-size: 12.5px;
+}
+.ms-watch-log {
+  display: flex;
+  max-height: min(56dvh, 520px);
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ms-entry {
+  margin: 0;
+  color: #c8cad0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ms-entry[data-role="user"] {
+  padding: 8px 12px;
+  border: 1px solid #2b2e39;
+  border-radius: 7px;
+  background: #101217;
+  color: #e4e5e7;
+}
+.ms-entry[data-role="tool"] {
+  overflow: hidden;
+  color: #8c8f98;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-found-quiet {
+  margin: 12px 8px 0 6px;
+  color: #8f939e;
+  font-size: 12px;
 }
 .ms-empty {
   padding: 56px 20px;
@@ -418,10 +502,28 @@
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
   }
-  .ms-elsewhere {
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    gap: 0 12px;
-    padding: 14px 4px 14px 12px;
+  .ms-mark {
+    display: none;
+  }
+  .ms-tool {
+    display: inline;
+  }
+  /* A found session's two actions need the row's width: where it runs, then what to do. */
+  .ms-found-row {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "main"
+      "meta"
+      "actions";
+  }
+  .ms-found-row .ms-meta {
+    justify-content: flex-start;
+  }
+  .ms-found-row .ms-actions {
+    justify-content: flex-start;
+  }
+  .ms-found-row .ms-go {
+    margin-left: auto;
   }
   .ms-meta {
     flex-direction: row;
