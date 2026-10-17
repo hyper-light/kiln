@@ -76,6 +76,9 @@ pub enum AgentMsg {
     /// `None` when this machine has no such session. Appended last: postcard encodes variants by
     /// index.
     HarnessTaskOutput { req: u64, json: Option<String> },
+    /// Answer to [`ServerMsg::DirList`]: JSON [`crate::dirs::Listing`]. Appended last: postcard
+    /// encodes variants by index.
+    DirList { req: u64, json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -83,6 +86,8 @@ pub const CAP_UPGRADE: u32 = 1;
 /// [`AgentMsg::Build`] capability: the runner waits for a taken-over session's process to end
 /// before it resumes the conversation (`Spec::takeover_pid`). Without it, take-over would race.
 pub const CAP_TAKEOVER: u32 = 2;
+/// [`AgentMsg::Build`] capability: the runner answers [`ServerMsg::DirList`] (lists its folders).
+pub const CAP_DIRS: u32 = 4;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -175,6 +180,10 @@ pub enum ServerMsg {
     /// one); answered by [`AgentMsg::HarnessTaskOutput`]. Appended last: postcard encodes
     /// variants by index.
     HarnessTaskOutput { req: u64, session: String, task: String, since: Option<u64> },
+    /// List the folders at `path` on this machine (see `crate::dirs`); answered by
+    /// [`AgentMsg::DirList`]. Only sent to runners that announced [`CAP_DIRS`]. Appended last:
+    /// postcard encodes variants by index.
+    DirList { req: u64, path: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -247,6 +256,28 @@ mod tests {
         assert!(d.first() > b.first());
         let u = encode(&ServerMsg::Upgrade { job: "j".into(), path: "/dl/kiln/x".into(), sha256: "00".into(), size: 1 })?;
         assert!(u.first() > r.first(), "Upgrade must be appended after Retire");
+        Ok(())
+    }
+
+    #[test]
+    fn dir_list_round_trips_after_every_older_variant() -> anyhow::Result<()> {
+        let ask = ServerMsg::DirList { req: 7, path: "~/Projects".into() };
+        let a = encode(&ask)?;
+        assert_eq!(decode::<ServerMsg>(&a)?, ask);
+        let t = encode(&ServerMsg::HarnessTaskOutput { req: 1, session: "s".into(), task: "t".into(), since: None })?;
+        assert!(a.first() > t.first(), "ServerMsg::DirList must be appended after HarnessTaskOutput");
+        assert_eq!(a.first(), Some(&19), "ServerMsg::DirList is variant 19 on the wire");
+
+        let answer = AgentMsg::DirList { req: 7, json: r#"{"path":"~/Projects"}"#.into() };
+        let b = encode(&answer)?;
+        assert_eq!(decode::<AgentMsg>(&b)?, answer);
+        let o = encode(&AgentMsg::HarnessTaskOutput { req: 1, json: None })?;
+        assert!(b.first() > o.first(), "AgentMsg::DirList must be appended after HarnessTaskOutput");
+        assert_eq!(b.first(), Some(&23), "AgentMsg::DirList is variant 23 on the wire");
+
+        // A cut-off frame is an error, never a panic.
+        assert!(decode::<ServerMsg>(a.get(..a.len() - 1).unwrap_or_default()).is_err());
+        assert!(CAP_DIRS.is_power_of_two() && CAP_DIRS & (CAP_UPGRADE | CAP_TAKEOVER) == 0, "CAP_DIRS is a bit of its own");
         Ok(())
     }
 }
