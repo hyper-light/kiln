@@ -112,7 +112,7 @@ for (let i = 1; i <= TURNS; i++) {
 const LIVE_AT = T0 + (TURNS + 1) * 90_000;
 add({ id: "L-u-live", at: LIVE_AT, kind: "user", text: "Now do the same for the websocket reconnects, and keep going until the suite is green." });
 add({ id: "L-s-live", at: LIVE_AT + 3_000, kind: "tool", tool_id: "ts-live", name: "Bash", tool: "shell", title: "cargo test -p kiln ws::reconnect", input: {}, status: "running", started: LIVE_AT + 3_000 });
-const live = add({ id: "L-a-live", at: LIVE_AT + 5_000, kind: "assistant", text: "Working through the reconnect path:", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
+let live = add({ id: "L-a-live", at: LIVE_AT + 5_000, kind: "assistant", text: "Working through the reconnect path:", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
 
 const info: AgentInfo = {
   id: ID,
@@ -181,7 +181,7 @@ let w = 0;
 let step = 0;
 let timer: NodeJS.Timeout | null = null;
 
-/** While anyone watches: the reply streams, and now and then a step goes by. */
+/** While anyone watches: the reply streams, and now and then it stops to take a step and goes on after it (as a harness's turn does). */
 function tick() {
   if (viewers.size === 0) {
     timer = null;
@@ -194,9 +194,12 @@ function tick() {
   if (w % 40 === 0) {
     step += 1;
     const at = Date.now();
+    // The words so far are done; a step; then the reply goes on, in a note of its own.
+    live.streaming = false;
     const e = add({ id: `L-step-${step}`, at, kind: "tool", tool_id: `tstep${step}`, name: "Read", tool: "read", title: `/home/ada/src/kiln/${FILES[step % FILES.length]}`, input: {}, status: "done", started: at, ended: at + 120 });
-    // A step lands before the reply that's streaming: it goes where its seq says.
-    broadcast({ t: "events", events: [e] });
+    const done = { ...live };
+    live = add({ id: `L-a-live-${step}`, at: at + 200, kind: "assistant", text: "", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
+    broadcast({ t: "events", events: [done, e, { ...live }] });
     activity = step % 2 ? "Reading files" : "Running cargo test";
     broadcast({ t: "state", state: state() });
   }

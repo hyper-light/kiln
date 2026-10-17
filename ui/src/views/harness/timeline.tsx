@@ -540,8 +540,8 @@ interface Keep {
   end: boolean;
   /** Otherwise: what's being read, and where. */
   at: { id: string; offset: number } | null;
-  /** The part last tapped or keyed in, its height then, and when. */
-  touched: { el: HTMLElement; h: number; t: number } | null;
+  /** The part last tapped or keyed in: its height and place then, and when. */
+  touched: { el: HTMLElement; h: number; offset: number; t: number } | null;
   saving: number;
 }
 
@@ -587,7 +587,7 @@ function useKeeper(key: string) {
         const t = s.touched;
         if (t && performance.now() - t.t < TOUCH_MS && t.el.isConnected && t.el.offsetHeight !== t.h) {
           // What you just opened (or closed) opens in place; where that leaves you is where you are.
-          goTo(root, { id: partId(t.el), offset: t.el.getBoundingClientRect().top - root.getBoundingClientRect().top });
+          goTo(root, { id: partId(t.el), offset: t.offset });
           s.touched = null;
           read();
         } else if (s.end) root.scrollTop = root.scrollHeight;
@@ -614,8 +614,9 @@ function useKeeper(key: string) {
   };
   /** A tap or a key on a part: if it changes size because of it, it does so in place. */
   const onTouch = (e: React.SyntheticEvent) => {
+    const root = k.current.root;
     const el = e.target instanceof Element ? e.target.closest<HTMLElement>(PARTS) : null;
-    k.current.touched = el ? { el, h: el.offsetHeight, t: performance.now() } : null;
+    k.current.touched = el && root ? { el, h: el.offsetHeight, offset: el.getBoundingClientRect().top - root.getBoundingClientRect().top, t: performance.now() } : null;
   };
   return { ref, onScroll, onTouch, read };
 }
