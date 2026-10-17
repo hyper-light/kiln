@@ -361,6 +361,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::DELETE, ["api", "harness", "sessions", id]) => {
             let id = (*id).to_owned();
             if hub.harness.close(&hub, &id).await {
+                let _ = crate::goals::forget(&hub, &id).await;
                 hub.store.audit("admin".into(), "agent.close".into(), id).await;
                 Ok(srv::status(StatusCode::NO_CONTENT))
             } else {
@@ -376,6 +377,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "sessions", id, "goals"]) => crate::goals::get(&hub, id).await.map(|g| srv::json(StatusCode::OK, &g)).map_err(goals_err),
+        (&Method::PUT, ["api", "harness", "sessions", id, "goals"]) => goals_set(&hub, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals"]) => goals_add(&hub, id, req).await,
+        (&Method::POST, ["api", "harness", "sessions", id, "goals", action]) => goals_control(&hub, id, action).await,
         (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
         (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
             let id = (*id).to_owned();
@@ -2241,6 +2246,50 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
+}
+
+fn goals_err(e: crate::goals::Error) -> ApiError {
+    match e {
+        crate::goals::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
+        crate::goals::Error::NoAgent => err(StatusCode::NOT_FOUND, "no such agent"),
+        crate::goals::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct GoalsSet {
+    goals: Vec<crate::goals::Given>,
+}
+
+/// An agent's goals not yet started, as they should be (`crate::goals::set`).
+async fn goals_set(hub: &Hub, id: &str, req: Request) -> R {
+    let b: GoalsSet = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let s = crate::goals::set(hub, id, b.goals).await.map_err(goals_err)?;
+    hub.store.audit("admin".into(), "goals.set".into(), id.to_owned()).await;
+    Ok(srv::json(StatusCode::OK, &s))
+}
+
+#[derive(Deserialize)]
+struct GoalsAdd {
+    goals: Vec<String>,
+    #[serde(default)]
+    start: bool,
+}
+
+/// Goals lined up after the agent's others (`crate::goals::add`).
+async fn goals_add(hub: &Hub, id: &str, req: Request) -> R {
+    let b: GoalsAdd = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let s = crate::goals::add(hub, id, b.goals, b.start).await.map_err(goals_err)?;
+    hub.store.audit("admin".into(), "goals.add".into(), id.to_owned()).await;
+    Ok(srv::json(StatusCode::OK, &s))
+}
+
+/// Start, pause, skip or clear an agent's goal stack.
+async fn goals_control(hub: &Hub, id: &str, action: &str) -> R {
+    let a: crate::goals::Action = serde_json::from_value(json!(action)).map_err(|_| err(StatusCode::NOT_FOUND, "not found"))?;
+    let s = crate::goals::control(hub, id, a).await.map_err(goals_err)?;
+    hub.store.audit("admin".into(), "goals.control".into(), format!("{id}: {action}")).await;
+    Ok(srv::json(StatusCode::OK, &s))
 }
 
 /// A terminal beside an agent: a shell in its folder, or its harness's own screen

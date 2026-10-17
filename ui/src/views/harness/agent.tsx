@@ -167,7 +167,7 @@ export default function AgentPage() {
     else if (view === "model" || view === "effort" || view === "permissions") openSetting(view === "model" ? "Model" : view === "effort" ? "Effort" : "Permissions");
     else if (view === "terminal") openBeside({ what: "shell" });
     else if (view === "screen") openBeside({ what: "screen" });
-    else if (view === "tasks") showPlan();
+    else if (view === "tasks" || view === "goals") showPlan();
     else if (view === "changes") {
       setTab("changes");
       setPhoneTab("changes");
@@ -328,7 +328,7 @@ export default function AgentPage() {
       ) : wide ? (
         <div className="hx-agent-body">
           {work}
-          <Inspector tab={tab} onTab={setTab} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} send={send} className="hx-side" />
+          <Inspector tab={tab} onTab={setTab} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} harness={info?.kind_name} send={send} className="hx-side" />
         </div>
       ) : (
         <div className="hx-agent-phone">
@@ -358,6 +358,7 @@ export default function AgentPage() {
               cwd={cwd}
               onOpenTask={openTask}
               agentId={id}
+              harness={info?.kind_name}
               send={send}
               hideTabs
               className="hx-side hx-side-phone"

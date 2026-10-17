@@ -327,6 +327,27 @@ export interface SlashCommand {
     | { kind: "terminal"; command: string };
 }
 
+/** One goal of an agent's goal stack. */
+export interface GoalItem {
+  id: string;
+  text: string;
+  status: "pending" | "active" | "met" | "unmet" | "skipped";
+  reason?: string;
+  /** How it went to the agent: its harness's /goal, its goal control, or a message. */
+  how?: "goal" | "goal_control" | "message";
+  started_at?: number;
+  ended_at?: number;
+}
+
+/** An agent's goals, one after another: each goes once the one before is met. */
+export interface GoalStack {
+  agent: string;
+  state: "running" | "paused" | "done";
+  reason?: string;
+  items: GoalItem[];
+  updated_at: number;
+}
+
 /** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */
 export interface BesideTerminal {
   terminal: TerminalSessionInfo;
@@ -600,6 +621,14 @@ export const harnessApi = {
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  /** An agent's goal stack. */
+  goals: (id: string) => call<GoalStack>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/goals`),
+  /** Its goals not yet started, as they should be (existing ones by id). */
+  setGoals: (id: string, goals: { id?: string; text: string }[]) => call<GoalStack>("PUT", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals }),
+  /** Goals after its others; `start` runs the stack. */
+  addGoals: (id: string, goals: string[], start = false) => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals`, { goals, start }),
+  /** Start (or resume), pause, skip the goal under way, or clear. */
+  goalAction: (id: string, action: "start" | "pause" | "skip" | "clear") => call<GoalStack>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/goals/${action}`),
   /** The terminals beside an agent (its shell, its harness's own screen), live ones first. */
   terminals: (id: string) => call<BesideTerminal[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`),
   /** Open one beside it: its shell (the one already open, with `command` run in it), or its harness's own screen on `command`. */

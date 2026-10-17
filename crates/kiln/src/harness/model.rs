@@ -885,6 +885,26 @@ pub struct Overrides {
     pub effort: Option<String>,
 }
 
+/// A goal the harness itself pursues across turns (Claude Code's /goal, Codex's thread goal).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Objective {
+    /// The condition or objective, as given.
+    pub text: String,
+    /// "active", "met", "unmet" (it gave up, or it can't be met: `reason`), "paused", "cleared".
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Unix ms it last changed.
+    #[serde(default)]
+    pub at: i64,
+}
+
+impl Objective {
+    pub fn new(text: &str, status: &str, reason: Option<String>) -> Self {
+        Self { text: text.trim().to_owned(), status: status.to_owned(), reason, at: super::core::Core::now() }
+    }
+}
+
 /// Everything about a session that is not the timeline. Small; sent whole on change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct State {
@@ -903,6 +923,10 @@ pub struct State {
     /// What the person first asked for (the session's goal), shortened.
     #[serde(default)]
     pub goal: String,
+    /// The goal the harness itself pursues across turns (Claude Code's /goal, Codex's thread
+    /// goal), and how it stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<Objective>,
     /// Unix ms the current turn started (None when idle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started: Option<i64>,

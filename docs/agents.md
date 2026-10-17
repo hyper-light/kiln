@@ -28,6 +28,8 @@ browsers watching it.
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
 | WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
 | GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
+| GET / POST / PUT | `/api/harness/sessions/:id/goals` | its goal stack: goals one after another (docs/goals.md) |
+| POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear}` | run, pause, skip the goal under way, or empty its goal stack |
 | POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
@@ -271,8 +273,8 @@ feedback that uploads the conversation, and handing this session to the cloud, a
   Codex; `/goal` alone shows it with its status and the tokens used.
 - **ACP agents**: the agent's own commands, sent as text (one named like kiln's wins), and
   kiln's: `/export` (the timeline as Markdown), `/status`, `/model`, `/diff`, `/restart`, `/new`.
-- Every harness: `/stop-tasks` (`stop_tasks`), `/restart`, `/terminal` (`/shell`) and `/screen`
-  in "Kiln".
+- Every harness: `/stop-tasks` (`stop_tasks`), `/restart`, `/terminal` (`/shell`), `/screen` and
+  `/goals` (its goal stack, docs/goals.md) in "Kiln".
 
 `control` ids the catalog uses: Claude Code `side_question {text, client}`, `session_cost`,
 `export`, `plan`, `permission_rules`, `memory`, `workspace_diff` (each `{client}`),
@@ -286,6 +288,10 @@ changed outside it.
 Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`, `tasks`,
 `todos`, `usage`, …):
 
+- `objective?` — the goal the harness itself pursues across turns (Claude Code's `/goal`,
+  Codex's thread goal) and how it stands: `{text, status: "active" | "met" | "unmet" | "paused" |
+  "cleared", reason?, at}`. Claude Code's comes from its `/goal` output and the verdict it writes
+  to its transcript; Codex's from `thread/goal/updated`. Goal stacks follow it (docs/goals.md).
 - `limits: Limit[]` — the account's plan limits, window by window: `id`, `label`,
   `used_percent`, `resets_at` (Unix ms), `window` ("5h", "7d"), `used`/`limit`/`unit` (extra
   usage, spend caps), `status` ("allowed", "warning", "rejected").

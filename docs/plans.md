@@ -29,6 +29,8 @@ From the plan: **Run it**, on an agent that runs or on a new one (machine, harne
 - **One message**: the whole plan, asking the agent to carry it out.
 - **Step by step**: each step its own message, waiting in the agent's queue until the turn before it
   ends, so the agent does one step a turn.
+- **Goals**: each step a goal in the agent's goal stack (docs/goals.md): the next goes once the one
+  before is met, as its harness's own `/goal` where it has one.
 
 From an agent: its **Plan** tab shows the plan it proposed (with **Save plan**) and **Run a saved
 plan**, which runs any kept plan on that agent the same two ways.
