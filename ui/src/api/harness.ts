@@ -516,6 +516,11 @@ export interface KindInfo {
   name: string;
   verified: boolean;
   available: boolean;
+  /** Its permission modes; those that turn checks off are `dangerous` (runners before this left them out). */
+  modes?: ModeOption[];
+  default_mode?: string;
+  /** Effort levels a new agent can start at, lowest first (older runners don't say). */
+  efforts?: ControlOption[];
 }
 
 /** What to start. */

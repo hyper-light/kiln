@@ -2346,6 +2346,18 @@ textarea.hx-input {
   font-size: 12px;
   color: var(--color-subtle);
 }
+.sp-hint-warn {
+  color: #ead8bd;
+}
+.sp-chip-warn {
+  color: #ead8bd;
+}
+.sp-confirm {
+  margin-left: 2px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  color: #f0e6d6;
+}
 .sp-note {
   padding: 10px 12px;
   border-radius: 10px;
