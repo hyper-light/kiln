@@ -2125,6 +2125,8 @@ html[data-motion="paused"] .skeleton::after {
   select {
     font-size: max(16px, 1em) !important;
   }
+}
+
 @layer components {
 /* ------------------------------------------------------------------ */
 /* Settings → Updates                                                  */
