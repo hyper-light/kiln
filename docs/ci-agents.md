@@ -1,5 +1,7 @@
 # Agents on pipelines and repositories
 
+> **Superseded by [ci.md](ci.md), W20** (2026-10-17), which adapts this draft. Kept for history.
+
 > **Draft spec.** None of this is built yet.
 
 Attach an agent session to a repository, a pipeline, a job or an environment, and it looks after
