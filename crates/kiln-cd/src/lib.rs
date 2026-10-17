@@ -17,6 +17,7 @@
 //! - [`diff`]: comparing desired and live objects by field ownership.
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
 //! - [`engine`]: the controller.
+//! - [`tree`]: an app's resource tree: its objects and the live objects they own.
 //! - [`state`] and [`store`]: what is kept durably, replicated by hyper-raft on hyper-log.
 //! - [`sim`] and [`harness`]: simulated clusters, and the engine driven against them on a
 //!   simulated clock (tests and `kiln cd bench`).
@@ -36,6 +37,7 @@ pub mod sim;
 pub mod state;
 pub mod store;
 pub mod sync;
+pub mod tree;
 
 #[cfg(test)]
 mod tests;

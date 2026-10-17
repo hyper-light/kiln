@@ -13,6 +13,7 @@
 pub mod api;
 pub mod cli;
 pub mod kube;
+pub mod live;
 pub mod ops;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -114,6 +115,8 @@ pub struct Cd {
     in_cluster_context: String,
     kubeconfig: String,
     kick: crate::rt::Notify,
+    /// What viewers read from clusters (trees, logs), kept a few seconds.
+    pub live: live::Live,
 }
 
 impl Cd {
@@ -881,6 +884,9 @@ pub fn summary_json(s: &Summary) -> Value {
             "trigger": o.trigger.as_str(),
             "attempt": o.attempt,
             "message": o.message,
+            "by": o.by,
+            "started_ms": o.started_ms,
+            "finished_ms": o.finished_ms,
         })),
     })
 }
@@ -975,6 +981,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         in_cluster_context: cfg.in_cluster_context.clone(),
         kubeconfig: cfg.kubeconfig.clone(),
         kick: crate::rt::Notify::new(),
+        live: live::Live::default(),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

@@ -1,6 +1,20 @@
 /** Deployments (docs/cd.md): the /api/cd routes, each an operation of the server's one table. */
 import { request } from "./client";
-import type { CdApp, CdAppDetail, CdCluster, CdDeployment, CdDiff, CdFacets, CdResource, CdSummary } from "./types";
+import type {
+  CdApp,
+  CdAppDetail,
+  CdCluster,
+  CdDeployment,
+  CdDiff,
+  CdEvent,
+  CdFacets,
+  CdLogs,
+  CdResource,
+  CdResourceDetail,
+  CdResourceKey,
+  CdSummary,
+  CdTree,
+} from "./types";
 
 const enc = encodeURIComponent;
 const appPath = (id: string) => `/api/cd/apps/${id.split("/").map(enc).join("/")}`;
@@ -18,9 +32,26 @@ export interface CdFilters {
   health?: string[];
   cluster?: string[];
   project?: string[];
+  namespace?: string[];
   /** A part of the app's id, any case. */
   q?: string;
 }
+
+/** How the apps list is ordered. */
+export type CdSort = "name" | "health" | "sync" | "deployed";
+
+/** How a log is read. */
+export interface CdLogQuery {
+  container?: string;
+  pod?: string;
+  tail_lines?: number;
+  since_seconds?: number;
+  previous?: boolean;
+}
+
+/** An object's key in a path: `<group>~<kind>~<namespace>~<name>`. */
+export const resourceKey = (k: CdResourceKey) => [k.group, k.kind, k.namespace, k.name].join("~");
+const resPath = (id: string, k: CdResourceKey) => `${appPath(id)}/resources/${enc(resourceKey(k))}`;
 
 /** The filters as the server takes them: each field's values joined by commas. */
 const selector = (f: CdFilters) => ({
@@ -28,23 +59,37 @@ const selector = (f: CdFilters) => ({
   health: f.health?.join(","),
   cluster: f.cluster?.join(","),
   project: f.project?.join(","),
+  namespace: f.namespace?.join(","),
   q: f.q,
 });
 
 export const cdApi = {
   summary: (signal?: AbortSignal) => request<CdSummary>("GET", "/api/cd/summary", undefined, { signal }),
-  apps: (f: CdFilters & { limit?: number; cursor?: string }, signal?: AbortSignal) =>
-    request<{ apps: CdApp[]; next: string | null }>("GET", `/api/cd/apps${qs({ ...selector(f), limit: f.limit, cursor: f.cursor })}`, undefined, {
-      signal,
-    }),
+  apps: (f: CdFilters & { limit?: number; cursor?: string; sort?: CdSort }, signal?: AbortSignal) =>
+    request<{ apps: CdApp[]; next: string | null }>(
+      "GET",
+      `/api/cd/apps${qs({ ...selector(f), limit: f.limit, cursor: f.cursor, sort: f.sort && f.sort !== "name" ? f.sort : undefined })}`,
+      undefined,
+      { signal },
+    ),
   facets: (f: CdFilters, signal?: AbortSignal) => request<CdFacets>("GET", `/api/cd/facets${qs(selector(f))}`, undefined, { signal }),
   app: (id: string, signal?: AbortSignal) => request<CdAppDetail>("GET", appPath(id), undefined, { signal }),
   resources: (id: string, signal?: AbortSignal) =>
     request<{ resources: CdResource[] }>("GET", `${appPath(id)}/resources`, undefined, { signal }),
   diff: (id: string, signal?: AbortSignal) => request<{ diffs: CdDiff[] }>("GET", `${appPath(id)}/diff`, undefined, { signal }),
+  /** The app's objects and every live object they own. */
+  tree: (id: string, signal?: AbortSignal) => request<CdTree>("GET", `${appPath(id)}/tree`, undefined, { signal }),
+  /** One object in depth: live and desired manifests, diff, labels, conditions, owners. */
+  resource: (id: string, k: CdResourceKey, signal?: AbortSignal) => request<CdResourceDetail>("GET", resPath(id, k), undefined, { signal }),
+  events: (id: string, k: CdResourceKey, signal?: AbortSignal) =>
+    request<{ events: CdEvent[] }>("GET", `${resPath(id, k)}/events`, undefined, { signal }),
+  logs: (id: string, k: CdResourceKey, q: CdLogQuery, signal?: AbortSignal) =>
+    request<CdLogs>("GET", `${resPath(id, k)}/logs${qs({ ...q, previous: q.previous ? "true" : undefined })}`, undefined, { signal }),
+  /** The path of a WebSocket that follows the logs. */
+  logsFollowPath: (id: string, k: CdResourceKey, q: CdLogQuery) => `${resPath(id, k)}/logs/ws${qs({ ...q, previous: undefined })}`,
   history: (id: string, signal?: AbortSignal) =>
     request<{ history: CdDeployment[] }>("GET", `${appPath(id)}/history`, undefined, { signal }),
-  sync: (id: string, body: { prune?: boolean; dry_run?: boolean; options?: string[] }) =>
+  sync: (id: string, body: { prune?: boolean; dry_run?: boolean; options?: string[]; resources?: CdResourceKey[] }) =>
     request<unknown>("POST", `${appPath(id)}/sync`, body),
   /** Syncs every app the filters show. */
   syncMany: (f: CdFilters) => request<{ started: number }>("POST", "/api/cd/ops/cd.apps.sync_many", { ...selector(f), max: 100_000 }),
