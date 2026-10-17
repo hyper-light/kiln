@@ -132,6 +132,11 @@ jobServiceAccount:
 
 rbac:
   create: true
+  # Deployments (docs/cd.md) in the cluster kiln runs in: "read" lets kiln compare every app with
+  # what runs (shadow mode for apps adopted from Argo CD; Secrets included, masked in diffs);
+  # "write" also lets it sync, as Argo CD's application controller may; "none" keeps kiln to its
+  # own namespaces.
+  deployments: read
 
 replicaCount: 1   # kiln uses a local sqlite database: run exactly one replica.
 
