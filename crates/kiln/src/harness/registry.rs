@@ -232,6 +232,19 @@ impl Registry {
         self.mirrors.lock().get(id).map(|m| m.location.clone())
     }
 
+    /// A task's output, read on the session's machine (`None`: no such session).
+    pub async fn task_output(&self, hub: &Hub, id: &str, task: &str, since: Option<u64>) -> anyhow::Result<Option<Value>> {
+        match self.location(id) {
+            None => Ok(None),
+            Some(Location::Local) => {
+                let Some(s) = self.local.get(id) else { return Ok(None) };
+                let task = task.to_owned();
+                Ok(Some(crate::rt::blocking(move || s.task_output(&task, since)).await?))
+            }
+            Some(Location::Machine(m)) => Ok(hub.harness_task_output(&m, id, task, since).await?.and_then(|j| serde_json::from_str(&j).ok())),
+        }
+    }
+
     /// Apply one update from a machine and pass it on to the session's viewers.
     pub fn ingest(&self, hub: &Hub, from: &Location, id: &str, u: Update) {
         let mut changed: Option<Info> = None;
@@ -460,6 +473,7 @@ impl Registry {
                         limits: Vec::new(),
                         account: None,
                         plan: None,
+                        left_behind: 0,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);

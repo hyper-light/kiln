@@ -393,6 +393,51 @@ pub struct Task {
     pub started: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<i64>,
+    /// What it is: "shell" (a command left running), "monitor" (a watch whose events wake the
+    /// agent), "agent" (a subagent), "workflow", "mcp" (an MCP call moved to the background).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// The command it runs (shells, monitors) and where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Where its output is written on its machine (read through the task output endpoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// The harness's own handle for its process (Codex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// A monitor's events so far, and the latest one (one line).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
+    /// Who a monitor's events wake: "agent" (the session), or the subagent task that started it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wakes: Option<String>,
+    /// kiln can stop it (`stop_task`).
+    #[serde(default)]
+    pub stoppable: bool,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Task {
+    /// Still running (or paused): not finished in any way.
+    pub fn live(&self) -> bool {
+        matches!(self.status.as_str(), "running" | "pending" | "paused")
+    }
+
+    /// Something it leaves running on its own: a shell, a monitor, a workflow, a background call
+    /// or a subagent sent to the background.
+    pub fn left_running(&self) -> bool {
+        self.live() && (self.background || matches!(self.class.as_deref(), Some("shell" | "monitor" | "workflow" | "mcp")))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -780,6 +825,20 @@ pub struct State {
     /// Which of those lists the harness has reported yet (loading / ready / unsupported).
     #[serde(default)]
     pub inventory: Inventory,
+    /// Tasks left running while the agent is idle or exited (shells, monitors, background
+    /// work): `Task::left_running` ones, counted when no turn is under way.
+    #[serde(default)]
+    pub left_behind: u32,
+}
+
+impl State {
+    /// How many tasks are left running with no turn under way (`State::left_behind`).
+    pub fn count_left_behind(&self) -> u32 {
+        if !matches!(self.status, Status::Idle | Status::Exited) {
+            return 0;
+        }
+        u32::try_from(self.tasks.iter().filter(|t| t.left_running()).count()).unwrap_or(u32::MAX)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -966,6 +1025,8 @@ pub enum Command {
     },
     /// Read the skills from disk again.
     SkillsReload,
+    /// Stop every task still running (shells, monitors, background agents).
+    StopTasks,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

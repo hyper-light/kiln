@@ -139,6 +139,13 @@ pub struct Info {
     pub account: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Tasks it left running with no turn under way (as `State::left_behind`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub left_behind: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Info {
@@ -179,6 +186,7 @@ impl Info {
         self.limits.clone_from(&s.limits);
         self.account.clone_from(&s.account);
         self.plan.clone_from(&s.plan);
+        self.left_behind = s.count_left_behind();
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -294,6 +302,36 @@ impl Session {
         out
     }
 
+    /// A task's output after byte `since` (its last `TASK_TAIL` bytes without one), read where the
+    /// harness keeps it: `{data, offset, live, truncated}` (ask from `offset` next), or `{error}`.
+    /// Blocking (reads a file).
+    pub fn task_output(&self, task: &str, since: Option<u64>) -> serde_json::Value {
+        use serde_json::json;
+        let (t, kept, session, cwd, env) = {
+            let core = self.core.lock();
+            (core.state.tasks.iter().find(|x| x.id == task).cloned(), core.task_output.get(task).cloned(), core.state.harness_session.clone(), core.state.cwd.clone(), self.spec.lock().env.clone())
+        };
+        let Some(t) = t else { return json!({"error": "no such task in this session"}) };
+        // Kept by kiln (a harness that streams it).
+        if let Some(k) = kept {
+            let (bytes, offset, truncated) = k.since(since.unwrap_or_else(|| k.total.saturating_sub(TASK_TAIL)));
+            return json!({"data": String::from_utf8_lossy(&bytes), "offset": offset, "live": t.live(), "truncated": truncated});
+        }
+        // A file the harness writes (Claude Code: while the task lives).
+        let Some(path) = t.output.clone().or_else(|| claude_task_file(&env, &cwd, session.as_deref(), task)) else {
+            return json!({"error": "this task's output is not kept anywhere kiln can read", "live": t.live()});
+        };
+        let p = std::path::Path::new(&path);
+        let named = p.extension().and_then(|e| e.to_str()) == Some("output") && p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()) == Some("tasks");
+        if !named || !p.is_absolute() {
+            return json!({"error": "not a task output file", "live": t.live()});
+        }
+        read_tail(p, since).map_or_else(
+            || json!({"data": "", "offset": since.unwrap_or(0), "live": t.live(), "gone": true}),
+            |(data, offset, truncated)| json!({"data": data, "offset": offset, "live": t.live(), "truncated": truncated, "path": path}),
+        )
+    }
+
     /// What resuming this session takes: its spec with the harness's session id to continue.
     pub fn resume_spec(&self) -> Spec {
         let mut s = self.spec.lock().clone();
@@ -375,6 +413,7 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
         limits: Vec::new(),
         account: None,
         plan: None,
+        left_behind: 0,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -456,6 +495,91 @@ const READ_MAX: u64 = 512 * 1024;
 const TICK: Duration = Duration::from_secs(5);
 /// How long a take-over waits for the session it takes over to end.
 const TAKEOVER_WAIT: Duration = Duration::from_secs(15);
+
+/// Most of a task's output returned at once, and the tail returned without an offset.
+const TASK_READ_MAX: u64 = 256 * 1024;
+const TASK_TAIL: u64 = 64 * 1024;
+
+/// Where Claude Code streams a task's output while it lives: `<tmp>/<cwd as a name>/<session>/
+/// tasks/<task>.output`, `<tmp>` being `CLAUDE_CODE_TMPDIR` or the system's `claude-<uid>`.
+fn claude_task_file(env: &[(String, String)], cwd: &str, session: Option<&str>, task: &str) -> Option<String> {
+    let session = session.filter(|s| !s.is_empty() && !s.contains(['/', '\\']))?;
+    if task.is_empty() || task.contains(['/', '\\', '.']) {
+        return None;
+    }
+    let root = env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "CLAUDE_CODE_TMPDIR")
+        .map(|(_, v)| std::path::PathBuf::from(v))
+        .or_else(|| std::env::var_os("CLAUDE_CODE_TMPDIR").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("claude-{}", crate::os::uid())));
+    let dir: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    Some(root.join(dir).join(session).join("tasks").join(format!("{task}.output")).to_string_lossy().into_owned())
+}
+
+/// A file's bytes after `since` (its tail without one, the start again when it shrank below
+/// `since`), at most `TASK_READ_MAX`: (text, the offset after them, whether older bytes were
+/// skipped). None when it cannot be read. Blocking.
+fn read_tail(p: &std::path::Path, since: Option<u64>) -> Option<(String, u64, bool)> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = std::fs::File::open(p).ok()?;
+    let len = f.metadata().ok()?.len();
+    let want = match since {
+        Some(s) if s <= len => s,
+        Some(_) => 0,
+        None => len.saturating_sub(TASK_TAIL),
+    };
+    let start = want.max(len.saturating_sub(TASK_READ_MAX));
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.take(len - start).read_to_end(&mut buf).ok()?;
+    Some((String::from_utf8_lossy(&buf).into_owned(), start + buf.len() as u64, start > want || (since.is_none() && start > 0)))
+}
+
+/// The processes under `root`, newest first: (pid, command line). Blocking.
+fn descendants(root: u32) -> Vec<(u32, Vec<String>)> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).without_tasks());
+    let mut kids: std::collections::HashMap<Pid, Vec<Pid>> = std::collections::HashMap::new();
+    for (pid, p) in sys.processes() {
+        if let Some(parent) = p.parent() {
+            kids.entry(parent).or_default().push(*pid);
+        }
+    }
+    let mut out: Vec<(u64, u32, Vec<String>)> = Vec::new();
+    let mut todo = vec![Pid::from_u32(root)];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(p) = todo.pop() {
+        for c in kids.get(&p).into_iter().flatten() {
+            if seen.insert(*c) {
+                todo.push(*c);
+                if let Some(proc_) = sys.process(*c) {
+                    out.push((proc_.start_time(), c.as_u32(), proc_.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect()));
+                }
+            }
+        }
+    }
+    out.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    out.into_iter().map(|(_, pid, cmd)| (pid, cmd)).collect()
+}
+
+/// Stop the newest process under `root` that runs `command` (its command line, or the last
+/// argument of a `shell -c` one), with what it started: whether one was found. Blocking.
+fn kill_command(root: u32, command: &str) -> bool {
+    let want = command.trim();
+    if want.is_empty() {
+        return false;
+    }
+    let all = descendants(root);
+    let found = all.iter().find(|(_, cmd)| cmd.join(" ") == want || cmd.last().is_some_and(|a| a.trim() == want));
+    let Some((pid, _)) = found else { return false };
+    let mut pids: Vec<u32> = vec![*pid];
+    pids.extend(descendants(*pid).into_iter().map(|(p, _)| p));
+    crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
+    true
+}
 
 /// Wait (up to `wait`) for `pid` to be gone: whether it is.
 async fn gone(pid: u32, wait: Duration) -> bool {
@@ -561,6 +685,18 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 let tx = done.clone();
                 crate::rt::spawn(async move {
                     let (code, output) = crate::rt::blocking(move || fetch_loopback(&url)).await.unwrap_or_else(|e| (None, format!("{e:#}")));
+                    let _ = tx.send(Done::Run { job, code, output }).await;
+                });
+            }
+            super::core::Effect::Kill { job, command } => {
+                let tx = done.clone();
+                let root = *s.pid.lock();
+                crate::rt::spawn(async move {
+                    let killed = match root {
+                        Some(root) => crate::rt::blocking(move || kill_command(root, &command)).await.unwrap_or(false),
+                        None => false,
+                    };
+                    let (code, output) = if killed { (Some(0), String::new()) } else { (None, "it is not running any more".to_owned()) };
                     let _ = tx.send(Done::Run { job, code, output }).await;
                 });
             }
@@ -839,6 +975,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         },
                         Ev::Ctl(Some(Ctl::Close)) | Ev::Ctl(None) => {
+                            // Ending the agent ends what it left running: stopped through the
+                            // harness first, then whatever is still under it (shells and
+                            // terminals that left its process group included), then the harness.
+                            if s.core.lock().state.tasks.iter().any(super::model::Task::live) {
+                                adapter.command(&mut s.core.lock(), Command::StopTasks);
+                                let _ = flush(&s, &sink, Some(&p.stdin)).await;
+                                crate::rt::sleep(Duration::from_millis(1500)).await;
+                            }
+                            let root = p.pid;
+                            let _ = crate::rt::blocking(move || {
+                                let pids: Vec<u32> = descendants(root).into_iter().map(|(pid, _)| pid).collect();
+                                crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
+                            })
+                            .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
                             let _ = sink.send((s.id.clone(), Update::Closed)).await;
@@ -1015,6 +1165,7 @@ mod tests {
             limits: vec![],
             account: None,
             plan: None,
+            left_behind: 0,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };
@@ -1109,5 +1260,23 @@ mod tests {
             let _ = long.wait();
             anyhow::Ok(())
         })
+    }
+
+    #[test]
+    fn task_output_files_and_their_tails() -> anyhow::Result<()> {
+        let env = vec![("CLAUDE_CODE_TMPDIR".to_owned(), "/tmp/cc".to_owned())];
+        assert_eq!(claude_task_file(&env, "/home/u/my app", Some("s1"), "b7").as_deref(), Some("/tmp/cc/-home-u-my-app/s1/tasks/b7.output"));
+        assert!(claude_task_file(&env, "/w", Some("s1"), "../x").is_none());
+        assert!(claude_task_file(&env, "/w", None, "b7").is_none());
+        let dir = std::env::temp_dir().join(format!("kiln-tail-{}", crate::util::new_id())).join("tasks");
+        std::fs::create_dir_all(&dir)?;
+        let f = dir.join("b7.output");
+        std::fs::write(&f, "one\ntwo\n")?;
+        assert_eq!(read_tail(&f, None), Some(("one\ntwo\n".to_owned(), 8, false)));
+        assert_eq!(read_tail(&f, Some(4)), Some(("two\n".to_owned(), 8, false)));
+        // Shorter than asked for (written again from the start): from the start.
+        assert_eq!(read_tail(&f, Some(100)), Some(("one\ntwo\n".to_owned(), 8, false)));
+        std::fs::remove_dir_all(dir.parent().unwrap_or(&dir))?;
+        Ok(())
     }
 }

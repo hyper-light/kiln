@@ -694,6 +694,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             up.msg(AgentMsg::UpgradeDone { job, ok: error.is_none(), error }).await;
                         });
                     }
+                    ServerMsg::HarnessTaskOutput { req, session, task, since } => {
+                        let s = harness.as_ref().and_then(|h| h.get(&session));
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let json = match s {
+                                Some(s) => crate::rt::blocking(move || s.task_output(&task, since).to_string()).await.ok(),
+                                None => None,
+                            };
+                            let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
+                        });
+                    }
                 }
             }
             Ev::Term(session, out) => {

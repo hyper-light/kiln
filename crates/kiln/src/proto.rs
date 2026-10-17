@@ -72,6 +72,10 @@ pub enum AgentMsg {
     UpgradeLog { job: String, line: String },
     /// That upgrade finished (`ok`), or failed with `error`.
     UpgradeDone { job: String, ok: bool, error: Option<String> },
+    /// Answer to [`ServerMsg::HarnessTaskOutput`]: JSON `{data, offset, live, ...}` or `{error}`,
+    /// `None` when this machine has no such session. Appended last: postcard encodes variants by
+    /// index.
+    HarnessTaskOutput { req: u64, json: Option<String> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -167,6 +171,10 @@ pub enum ServerMsg {
     /// with UpgradeLog / UpgradeDone under `job`. Only sent to runners that announced
     /// [`CAP_UPGRADE`]. Appended last: postcard encodes variants by index.
     Upgrade { job: String, path: String, sha256: String, size: u64 },
+    /// Read the output of one of an agent session's tasks after byte `since` (its tail without
+    /// one); answered by [`AgentMsg::HarnessTaskOutput`]. Appended last: postcard encodes
+    /// variants by index.
+    HarnessTaskOutput { req: u64, session: String, task: String, since: Option<u64> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

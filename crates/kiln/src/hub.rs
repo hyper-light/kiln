@@ -323,6 +323,12 @@ impl Hub {
         self.ai_ask(machine, |req| ServerMsg::AiView { req, pid }).await
     }
 
+    /// The output of a task of an agent session running on a machine (JSON).
+    pub async fn harness_task_output(&self, machine: &str, session: &str, task: &str, since: Option<u64>) -> anyhow::Result<Option<String>> {
+        let (session, task) = (session.to_owned(), task.to_owned());
+        self.ai_ask(machine, move |req| ServerMsg::HarnessTaskOutput { req, session, task, since }).await
+    }
+
     async fn ai_ask(&self, machine: &str, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<String>> {
         let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -619,7 +625,7 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
-            AgentMsg::AiView { req, json } => {
+            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
                 }
