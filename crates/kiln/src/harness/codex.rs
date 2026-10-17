@@ -144,6 +144,8 @@ enum AskKind {
     Permissions,
     LegacyExec,
     LegacyPatch,
+    /// An MCP server asks the person for input (MCP elicitation).
+    Elicitation,
 }
 
 pub struct Codex {
@@ -1115,6 +1117,13 @@ impl Codex {
         let Some(ask) = self.asks.remove(id) else { return };
         let feedback = message.filter(|m| !m.trim().is_empty());
         let result = match ask.kind {
+            AskKind::Elicitation => {
+                let (r, why) = super::elicit::answer(approval.input.get("requestedSchema"), decision != Decision::Deny, choices.as_deref().unwrap_or_default());
+                if let Some(why) = why {
+                    self.notice(core, Level::Warn, format!("Declined it for you, as the answers didn't fit: {why}"));
+                }
+                r
+            }
             AskKind::UserInput => {
                 let mut out = serde_json::Map::new();
                 if decision != Decision::Deny {
@@ -1634,6 +1643,8 @@ impl Codex {
         let offered: Option<Vec<Value>> = p.get("availableDecisions").and_then(Value::as_array).cloned();
         let offers = |name: &str| offered.as_ref().is_none_or(|d| d.iter().any(|x| x.as_str() == Some(name) || x.get(name).is_some()));
         let can_decline = offers("decline");
+        // What an MCP server's request for input shows beyond its questions (a page to open).
+        let mut shown: Option<String> = None;
         let (kind, tool, title, command, mut always, questions, diffs) = match method {
             "item/commandExecution/requestApproval" | "execCommandApproval" => {
                 let full = p.get("command").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| joined(p.get("command")));
@@ -1721,19 +1732,24 @@ impl Codex {
             }
             "item/permissions/requestApproval" => (AskKind::Permissions, ToolKind::Other, "More access".to_owned(), None, Vec::new(), Vec::new(), Vec::new()),
             "mcpServer/elicitation/request" => {
-                core.write(&json!({"id": rpc, "result": {"action": "decline"}}));
-                return;
+                let s = |k: &str| p.get(k).and_then(Value::as_str);
+                let a = super::elicit::ask(s("serverName").unwrap_or(""), s("message").unwrap_or(""), s("mode"), p.get("requestedSchema"), s("url"));
+                shown = a.detail;
+                (AskKind::Elicitation, ToolKind::Question, a.title, None, Vec::new(), a.questions, Vec::new())
             }
             other => {
                 core.write(&json!({"id": rpc, "error": {"code": -32601, "message": format!("kiln does not handle {other}")}}));
                 return;
             }
         };
-        let question_ids: Vec<(String, String)> = p
-            .get("questions")
-            .and_then(Value::as_array)
-            .map(|qs| qs.iter().filter_map(|q| Some((q.get("id")?.as_str()?.to_owned(), q.get("question")?.as_str()?.to_owned()))).collect())
-            .unwrap_or_default();
+        let question_ids: Vec<(String, String)> = if kind == AskKind::Elicitation {
+            questions.iter().map(|q| (q.id.clone(), q.question.clone())).collect()
+        } else {
+            p.get("questions")
+                .and_then(Value::as_array)
+                .map(|qs| qs.iter().filter_map(|q| Some((q.get("id")?.as_str()?.to_owned(), q.get("question")?.as_str()?.to_owned()))).collect())
+                .unwrap_or_default()
+        };
         if kind == AskKind::LegacyExec || kind == AskKind::LegacyPatch {
             always.truncate(1);
         }
@@ -1743,7 +1759,7 @@ impl Codex {
             tool_name: method.to_owned(),
             tool,
             title,
-            detail: None,
+            detail: shown,
             input: clip_json(&p, 64 * 1024),
             command,
             cwd,
@@ -2754,6 +2770,26 @@ mod tests {
         c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers), choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/answers/db/answers/0")).and_then(Value::as_str), Some("SQLite"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_mcp_servers_request_for_input_is_asked_and_answered() -> anyhow::Result<()> {
+        let mut c = Codex::from_spec(&super::super::session::Spec { kind: "codex".into(), ..Default::default() });
+        let mut core = Core::new();
+        let schema = json!({"type": "object", "properties": {"team": {"type": "string", "enum": ["eng", "ops"], "enumNames": ["Engineering", "Operations"]}}, "required": ["team"]});
+        feed(&mut c, &mut core, &[json!({"id": "el1", "method": "mcpServer/elicitation/request", "params": {"threadId": "th1", "turnId": "t1", "serverName": "linear", "mode": "form", "message": "Pick a team", "requestedSchema": schema}})]);
+        let a = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no approval"))?;
+        assert_eq!((a.title.as_str(), a.tool, a.questions.first().map(|q| q.options.len())), ("linear asks: Pick a team", ToolKind::Question, Some(2)));
+        let choices = vec![ChoiceAnswer { id: Some("team".into()), selected: vec!["Operations".into()], ..ChoiceAnswer::default() }];
+        c.command(&mut core, Command::Approve { id: "el1".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: Some(choices) });
+        assert_eq!(written(&mut core).first().and_then(|v| v.get("result")).cloned(), Some(json!({"action": "accept", "content": {"team": "ops"}})));
+        // A page to open, declined.
+        feed(&mut c, &mut core, &[json!({"id": "el2", "method": "mcpServer/elicitation/request", "params": {"serverName": "gh", "mode": "url", "message": "Sign in", "url": "https://github.com/login/device", "elicitationId": "e2"}})]);
+        let a = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no approval"))?;
+        assert!(a.detail.as_deref().is_some_and(|d| d.contains("https://github.com/login/device")));
+        c.command(&mut core, Command::Approve { id: "el2".into(), decision: Decision::Deny, message: None, always: None, answers: None, choices: None });
+        assert_eq!(written(&mut core).first().and_then(|v| v.get("result")).cloned(), Some(json!({"action": "decline"})));
         Ok(())
     }
 
