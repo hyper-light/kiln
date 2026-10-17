@@ -24,6 +24,7 @@ import { Loadable } from "@/components/ui/loading";
 import { Confirm, EmptyState, SelectField } from "@/components/ui/misc";
 import { errorMessage, useElementWidth, useMediaQuery, useNow } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
+import { useRes, warm } from "@/lib/data";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
@@ -147,9 +148,18 @@ async function readApp(id: string, signal: AbortSignal): Promise<CdAppDetail | {
   }
 }
 
+/** One app's data: its detail, its objects and its history, loaded together. */
+const appRes = (id: string) => ({
+  detail: { key: `${appKey(id)}detail`, fetch: (s: AbortSignal) => readApp(id, s), opts: { pollMs: 10_000 } },
+  objects: { key: `${appKey(id)}tree`, fetch: (s: AbortSignal) => readObjects(id, s), opts: { pollMs: 5_000 } },
+  history: { key: `${appKey(id)}history`, fetch: (s: AbortSignal) => cdApi.history(id, s) },
+});
+
 function DeploymentApp({ project, name }: { project: string; name: string }) {
   const id = `${project}/${name}`;
-  const app = useSuspenseResource(`${appKey(id)}detail`, (s) => readApp(id, s), { pollMs: 10_000 }).data;
+  const r = appRes(id);
+  warm(r.detail, r.objects, r.history);
+  const app = useRes(r.detail).data;
   if ("missing" in app) {
     return (
       <EmptyState icon={<Rocket size={20} />} title="No such app." action={<Link to="/deployments">All deployments</Link>}>
@@ -162,8 +172,9 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
 
 function AppPage({ id, project, name, a }: { id: string; project: string; name: string; a: CdAppDetail }) {
   const navigate = useNavigate();
-  const objects = useSuspenseResource(`${appKey(id)}tree`, (s) => readObjects(id, s), { pollMs: 5_000 }).data;
-  const history = useSuspenseResource(`${appKey(id)}history`, (s) => cdApi.history(id, s)).data.history;
+  const r = appRes(id);
+  const objects = useRes(r.objects).data;
+  const history = useRes(r.history).data.history;
   const [ask, setAsk] = React.useState<Ask>(null);
   const [orphan, setOrphan] = React.useState(false);
   const [busy, setBusy] = React.useState(false);

@@ -19,7 +19,8 @@ import { RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate, useSuspenseResource } from "@/lib/resource";
+import { useRes, warm, type Res } from "@/lib/data";
+import { invalidate } from "@/lib/resource";
 import { useWindowedRows } from "@/lib/virtual";
 import { HEALTH_TONE, HealthPair, StatePair, SYNC_TONE, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
 import "./deployments.css";
@@ -200,9 +201,13 @@ function DeploymentsBody() {
     }, 250);
   };
 
-  const summary = useSuspenseResource("cd/summary", (s) => cdApi.summary(s), { pollMs: 30_000 }).data;
-  const facets = useSuspenseResource(`cd/facets?${key}`, (s) => cdApi.facets(filters, s), { pollMs: 30_000 }).data;
-  const first = useSuspenseResource(`cd/apps?${key}&sort=${sort}`, (s) => cdApi.apps({ ...filters, sort, limit: PAGE }, s)).data;
+  const summaryRes: Res<CdSummary> = { key: "cd/summary", fetch: (s) => cdApi.summary(s), opts: { pollMs: 30_000 } };
+  const facetsRes: Res<CdFacets> = { key: `cd/facets?${key}`, fetch: (s) => cdApi.facets(filters, s), opts: { pollMs: 30_000 } };
+  const appsRes: Res<{ apps: CdApp[]; next: string | null }> = { key: `cd/apps?${key}&sort=${sort}`, fetch: (s) => cdApi.apps({ ...filters, sort, limit: PAGE }, s) };
+  warm(summaryRes, facetsRes, appsRes);
+  const summary = useRes(summaryRes).data;
+  const facets = useRes(facetsRes).data;
+  const first = useRes(appsRes).data;
   const groups: Facet[] = FACETS.flatMap((f) => {
     const counts = facets.facets[f.id] ?? {};
     const order = ORDER[f.id];

@@ -9,7 +9,7 @@ import { Loadable } from "@/components/ui/loading";
 import { EmptyState, Facts, PageIntro, Panel, SectionHeading } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { useAuth } from "@/lib/auth";
-import { lastSamples, useAgentsLive, useMetricsHistory, useOverview, useRecentRuns } from "@/lib/data";
+import { agentsRes, historyRes, lastSamples, overviewRes, recentRunsRes, useAgentsLive, useMetricsHistory, useOverview, useRecentRuns, warm } from "@/lib/data";
 import { formatBytes, formatDuration, formatPct, formatUptime } from "@/lib/format";
 import { AgentMiniCard, RelTime, RunActivityRow, childStatus, diskPct, memPct } from "./shared";
 
@@ -28,6 +28,7 @@ export default function Overview() {
 }
 
 function OverviewBody() {
+  warm(overviewRes, recentRunsRes(14), agentsRes, historyRes);
   const ov = useOverview();
   const d = ov.data;
   return (

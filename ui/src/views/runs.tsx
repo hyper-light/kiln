@@ -10,7 +10,7 @@ import { Loadable } from "@/components/ui/loading";
 import { EmptyState, ErrorState, PageIntro, SearchField, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
-import { useRepos } from "@/lib/data";
+import { reposRes, useRepos, warm } from "@/lib/data";
 import { firstLine, shortSha, statusLabel } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
@@ -64,9 +64,11 @@ function RunsBody() {
     setRepoChoice(repo);
   }
 
-  const repos = useRepos().data;
   const key = repo || "all";
-  const first = useSuspenseResource(`runs/list/${key}`, (s) => api.runs({ repo: repo || undefined, limit: PAGE }, s), { pollMs: 60_000 });
+  const firstRes = { key: `runs/list/${key}`, fetch: (s: AbortSignal) => api.runs({ repo: repo || undefined, limit: PAGE }, s), opts: { pollMs: 60_000 } };
+  warm(reposRes, firstRes);
+  const repos = useRepos().data;
+  const first = useSuspenseResource(firstRes.key, firstRes.fetch, firstRes.opts);
   useServerEvents((ev) => {
     if (ev.type !== "run") return;
     const r = ev.run;
