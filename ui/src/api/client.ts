@@ -206,6 +206,20 @@ export const api = {
 export const machineDirs = (target: string, path: string, signal?: AbortSignal) =>
   get<DirListing>(`/api/machines/${enc(target)}/dirs${qs({ path })}`, signal);
 
+/* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
+
+import type { CertInfo, FrontDoorSettings, FrontDoorView } from "./types";
+
+export const frontDoorApi = {
+  /** Every runner with front-door settings. */
+  list: (signal?: AbortSignal) => get<FrontDoorView[]>("/api/front-doors", signal),
+  get: (runner: string, signal?: AbortSignal) => get<FrontDoorView>(`/api/runners/${enc(runner)}/front-door`, signal),
+  save: (runner: string, settings: FrontDoorSettings) => request<FrontDoorView>("PUT", `/api/runners/${enc(runner)}/front-door`, settings),
+  /** A certificate chain and its key for the runner (which keeps them; the key is never sent back). */
+  uploadCert: (runner: string, cert_pem: string, key_pem: string) =>
+    post<{ cert: CertInfo; front_door: FrontDoorView }>(`/api/runners/${enc(runner)}/front-door/cert`, { cert_pem, key_pem }),
+};
+
 /** Build a ws:// or wss:// URL for a same-origin path. */
 export function wsUrl(path: string): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";

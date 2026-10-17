@@ -1,0 +1,579 @@
+/* Runners → Domain & HTTPS (front-door.tsx), in hyperlight-site's voice and in the page's flow:
+   mono uppercase keys, hairline rules, state as a dot and words; standard controls at 30px, boxed
+   the way the console's and the account card's fields are (#303239 edge, 5px radius, the violet
+   focus ring). Live lines keep their place and their height whatever they say: one line when a
+   part is off, two when it is on (state, then detail or its fix). Nothing scrolls sideways and
+   nothing pops up: words wrap or end in an ellipsis, fields stack on phones. */
+
+.fd {
+  --fd-edge: #303239;
+  --fd-field: #0b0c0e;
+  --fd-text: #ededee;
+  --fd-muted: #8f929b;
+  --fd-faint: #7b7e88;
+  --fd-line: #222428;
+  --fd-focus: #6b6290;
+  --fd-ctl: 30px;
+  margin-top: 56px;
+  container: fd / inline-size;
+  color: var(--fd-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.fd .section-heading {
+  flex-wrap: wrap;
+  gap: 6px 24px;
+  margin-bottom: 10px;
+}
+.fd-aside {
+  color: var(--fd-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.fd-lead {
+  max-width: 760px;
+  margin: 0 0 18px;
+  color: var(--fd-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.fd code {
+  color: #cdc4e0;
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+.fd-quiet {
+  margin: 0;
+  color: var(--fd-muted);
+  font-size: 12.5px;
+}
+
+/* ---------------------------------------------------------------- keys and the runner line */
+.fd-key {
+  display: block;
+  margin: 0;
+  padding: 0;
+  color: var(--fd-muted);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  line-height: 16px;
+  text-transform: uppercase;
+}
+.fd-runner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-height: var(--fd-ctl);
+}
+.fd-runner > .fd-select {
+  width: auto;
+  min-width: 160px;
+  max-width: 100%;
+}
+.fd-runner-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--fd-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- live lines */
+.fd-body {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  margin-top: 18px;
+}
+.fd-live-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--fd-line);
+}
+.fd-when {
+  min-height: 16px;
+  color: var(--fd-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.fd-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.fd-line {
+  display: grid;
+  grid-template-columns: 12px 56px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  min-height: 34px;
+  padding: 7px 0;
+  border-bottom: 1px solid #1d1f24;
+}
+.fd-line[data-two] {
+  grid-template-rows: 18px 18px;
+  row-gap: 2px;
+}
+.fd-line[data-two] > .fd-dot,
+.fd-line[data-two] > .fd-name {
+  grid-row: 1;
+}
+.fd-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #7e818a;
+}
+.fd-dot[data-state="on"] {
+  background: #a8c9bc;
+  box-shadow: 0 0 6px rgb(155 212 178 / 18%);
+}
+.fd-dot[data-state="waiting"] {
+  background: #cdc6ea;
+}
+.fd-dot[data-state="error"] {
+  background: #d1aaad;
+  box-shadow: 0 0 6px rgb(209 170 173 / 22%);
+}
+.fd-dot[data-state="off"] {
+  border: 1px solid #7e818a;
+  background: transparent;
+}
+.fd-name {
+  color: #c9cbd1;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  line-height: 18px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.fd-text {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fd-text);
+  font-size: 12.5px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fd-line[data-state="off"] .fd-text {
+  color: var(--fd-faint);
+}
+.fd-line[data-state="error"] .fd-text {
+  color: #e2c4c6;
+}
+.fd-line[data-state="waiting"] .fd-text {
+  color: #d7d1ef;
+}
+.fd-detail {
+  grid-column: 3;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fd-muted);
+  font-size: 11.5px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fd-fixline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.fd-fixline > code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+/* A copy button inside an 18px line, without making it taller. */
+.fd-copy {
+  display: inline-grid;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  margin: -4px 0;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--fd-muted);
+  transition: color 0.15s;
+}
+.fd-copy:hover {
+  color: var(--fd-text);
+}
+.fd-copy:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: -2px;
+}
+
+/* ---------------------------------------------------------------- the form */
+.fd-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 980px;
+}
+.fd-loading {
+  min-height: 240px;
+}
+.fd-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px 0 0;
+  border: 0;
+  border-top: 1px solid var(--fd-line);
+}
+.fd-group > legend {
+  float: left;
+  width: 100%;
+  margin-bottom: -2px;
+}
+.fd-group > legend + * {
+  clear: both;
+}
+.fd-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px 20px;
+}
+@container fd (min-width: 640px) {
+  .fd-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .fd-wide {
+    grid-column: 1 / -1;
+  }
+}
+@container fd (min-width: 960px) {
+  .fd-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .fd-grid > .fd-field:has(.fd-select) {
+    grid-column: span 2;
+  }
+  .fd-wide {
+    grid-column: span 2;
+  }
+}
+.fd-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+.fd-hint {
+  margin: 0;
+  color: var(--fd-faint);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.fd-input,
+.fd-select {
+  width: 100%;
+  min-width: 0;
+  height: var(--fd-ctl);
+  padding: 0 10px;
+  border: 1px solid var(--fd-edge);
+  border-radius: 5px;
+  background: var(--fd-field);
+  color: var(--fd-text);
+  font-size: 12.5px;
+  outline: none;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.fd-input::placeholder {
+  color: #6d7078;
+}
+.fd-input:focus,
+.fd-select:focus-visible {
+  border-color: var(--fd-focus);
+  box-shadow: 0 0 0 3px rgb(186 176 227 / 12%);
+}
+.fd-select {
+  padding-right: 28px;
+  overflow: hidden;
+  /* a chevron, drawn here so the native one can go */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E");
+  background-position: right 10px center;
+  background-repeat: no-repeat;
+  background-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  appearance: none;
+  cursor: pointer;
+}
+.fd-port {
+  max-width: 120px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.fd-area {
+  display: block;
+  height: auto;
+  min-height: 96px;
+  max-height: 260px;
+  padding: 7px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.fd-suffix {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  color: var(--fd-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+/* Phones zoom into fields under 16px. */
+@media (pointer: coarse) {
+  .fd {
+    --fd-ctl: 34px;
+  }
+  .fd-input,
+  .fd-select {
+    font-size: 16px;
+  }
+  .fd-area {
+    font-size: 13px;
+  }
+}
+
+.fd-toggle {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 10px;
+  min-height: var(--fd-ctl);
+  color: #d9dade;
+  font-size: 13px;
+  cursor: pointer;
+}
+.fd-custom {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-left: 14px;
+  border-left: 1px solid #2a2c33;
+}
+.fd-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--fd-ctl);
+}
+.fd .fd-btn {
+  min-height: var(--fd-ctl);
+  height: var(--fd-ctl);
+  padding: 0 14px;
+  font-size: 12.5px;
+}
+.fd-file {
+  display: inline-flex;
+  align-items: center;
+  height: var(--fd-ctl);
+  padding: 0 14px;
+  border: 1px solid rgb(255 255 255 / 15%);
+  border-radius: 999px;
+  color: #e4e5e7;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    border-color 0.2s,
+    background-color 0.2s;
+}
+.fd-file:hover {
+  border-color: rgb(255 255 255 / 30%);
+  background: rgb(255 255 255 / 7%);
+}
+.fd-sr:focus-visible + .fd-btn,
+.fd-file:has(+ .fd-sr:focus-visible) {
+  outline: 2px solid #bab0e3;
+  outline-offset: 2px;
+}
+.fd-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  border: 0;
+  white-space: nowrap;
+}
+.fd-msg {
+  flex: 1 1 220px;
+  min-width: 0;
+  min-height: 18px;
+  margin: 0;
+  color: var(--fd-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.fd-msg[data-tone="ok"] {
+  color: #b9d6ca;
+}
+.fd-msg[data-tone="error"] {
+  color: #e2c4c6;
+}
+
+/* ---------------------------------------------------------------- the CA, and setup */
+.fd-ca,
+.fd-setup {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 980px;
+  padding-top: 12px;
+  border-top: 1px solid var(--fd-line);
+}
+.fd-ca a {
+  color: #d1c6e6;
+  text-decoration: underline;
+  text-decoration-color: rgb(209 198 230 / 35%);
+  text-underline-offset: 3px;
+}
+.fd-fp {
+  overflow-wrap: anywhere;
+}
+.fd-downloads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.fd .fd-download {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--fd-ctl);
+  padding: 0 12px;
+  border: 1px solid rgb(255 255 255 / 15%);
+  border-radius: 999px;
+  color: #e4e5e7;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-decoration: none;
+  transition:
+    border-color 0.2s,
+    background-color 0.2s;
+}
+.fd .fd-download:hover {
+  border-color: rgb(255 255 255 / 30%);
+  background: rgb(255 255 255 / 7%);
+}
+.fd-devices {
+  margin: 0;
+  border-top: 1px solid #1d1f24;
+}
+.fd-device {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
+  padding: 8px 0;
+  border-bottom: 1px solid #1d1f24;
+}
+@container fd (min-width: 640px) {
+  .fd-device {
+    grid-template-columns: 120px minmax(0, 1fr);
+    gap: 16px;
+  }
+}
+.fd-device > dt {
+  line-height: 20px;
+}
+.fd-device > dd {
+  margin: 0;
+  color: #c4c6cd;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.fd-device b {
+  color: var(--fd-text);
+  font-weight: 500;
+}
+.fd-fix {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fd-code {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 2px 2px 2px 12px;
+  border: 1px solid #262933;
+  border-radius: 6px;
+  background: #0d0f13;
+}
+.fd-code > code {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.fd-code > .fd-copy {
+  margin: 1px 0;
+}
+.fd-prompt {
+  color: #6d7078;
+  user-select: none;
+}
+
+/* ---------------------------------------------------------------- motion and contrast */
+@media (prefers-reduced-motion: reduce) {
+  .fd *,
+  .fd *::before,
+  .fd *::after {
+    transition: none !important;
+  }
+}
+:root[data-motion="paused"] .fd * {
+  transition: none !important;
+}
+@media (prefers-contrast: more) {
+  .fd-key,
+  .fd-name,
+  .fd-detail,
+  .fd-hint,
+  .fd-when {
+    color: #c4c5ce;
+  }
+  .fd-input,
+  .fd-select {
+    border-color: #555864;
+  }
+}
+@media (forced-colors: active) {
+  .fd-dot {
+    background: CanvasText;
+    forced-color-adjust: none;
+  }
+}

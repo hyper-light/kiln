@@ -425,6 +425,9 @@ pub struct Listener {
     pub to: Vec<String>,
     /// Queries answered (DNS), connections taken (HTTPS), since it started.
     pub served: u64,
+    /// What fixes its error, when that is one-time setup on the machine (also in the status's
+    /// `fixes`).
+    pub fix: Option<Fix>,
 }
 
 /// The certificate HTTPS serves.

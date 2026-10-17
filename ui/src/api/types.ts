@@ -31,6 +31,8 @@ export interface Me {
   hostname: string;
   /** Where the server says it is reachable from other devices. */
   public_url?: string;
+  /** Its runners' front doors (`https://kiln.home`, …). */
+  origins?: string[];
 }
 
 export interface Repo {
@@ -351,7 +353,87 @@ export type ServerEvent =
   /** Settings → Updates changed: refetch GET /api/updates. */
   | { type: "updates" }
   /** An upgrade moved on (new output, or it finished). */
-  | { type: "update_job"; job: UpdateJob };
+  | { type: "update_job"; job: UpdateJob }
+  /** A runner's front door changed (settings, or what the runner reported): refetch it. */
+  | { type: "front_door"; runner: string };
+
+/* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
+
+export type DnsMode = "resolver" | "authoritative";
+export type CertMode = "kiln" | "custom";
+
+/** A runner's front door, as set in the UI (`PUT /api/runners/:name/front-door`). */
+export interface FrontDoorSettings {
+  domain: string;
+  aliases: string[];
+  dns: { enabled: boolean; port: number; mode: DnsMode; upstream: string[]; addresses: string[] };
+  /** `http_port` 0: no plain-HTTP redirect. `upstream` "": the runner's own server URL. */
+  https: { enabled: boolean; port: number; http_port: number; upstream: string };
+  cert: { mode: CertMode };
+  mdns: { enabled: boolean; name: string };
+}
+
+export type FrontDoorState = "off" | "on" | "waiting" | "error";
+
+export interface FrontDoorListener {
+  state: FrontDoorState;
+  /** `192.168.1.77:53`, `[::]:443`, `kiln.local`. */
+  on: string[];
+  error: string | null;
+  /** HTTPS: where it forwards; DNS: its upstream resolvers. */
+  to: string[];
+  served: number;
+  /** The one-time setup that fixes its error (also among the status's `fixes`). */
+  fix: FrontDoorFix | null;
+}
+
+export interface CertInfo {
+  subject: string;
+  issuer: string;
+  names: string[];
+  not_before: number;
+  not_after: number;
+  sha256: string;
+  server_auth: boolean;
+}
+
+export interface FrontDoorFix {
+  why: string;
+  commands: string[];
+}
+
+/** What the runner reports. */
+export interface FrontDoorStatus {
+  /** Fingerprint of the settings it applied. */
+  settings: string;
+  standby: boolean;
+  os: string;
+  /** The runner's own server URL (HTTPS forwards there by default). */
+  server: string;
+  addresses: string[];
+  dns: FrontDoorListener;
+  https: FrontDoorListener;
+  http: FrontDoorListener;
+  mdns: FrontDoorListener;
+  cert: { mode: CertMode; state: FrontDoorState; info: CertInfo | null; kiln: boolean; missing: string[]; error: string | null };
+  want: string[];
+  asked: number;
+  fixes: FrontDoorFix[];
+}
+
+export interface FrontDoorView {
+  runner: string;
+  connected: boolean;
+  /** null while the runner is offline (unknown). */
+  supported: boolean | null;
+  settings: FrontDoorSettings;
+  /** The runner applied these settings; null before it reported. */
+  applied: boolean | null;
+  status: FrontDoorStatus | null;
+  status_at: number | null;
+  origins: string[];
+  ca: { subject: string; sha256: string; not_after: number } | null;
+}
 
 /* ---------------------------- updates (Settings → Updates) ---------------------------- */
 

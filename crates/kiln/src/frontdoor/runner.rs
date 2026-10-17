@@ -544,13 +544,14 @@ impl FrontDoor {
             None => Listener::default(),
             Some(server) => {
                 let bound = server.bound();
-                let first = self.dns_failures.first().map(|f| f.message.clone());
+                let first = self.dns_failures.first();
                 Listener {
                     state: if bound.is_empty() { State::Error } else { State::On },
                     on: bound.iter().map(SocketAddr::to_string).collect(),
-                    error: first,
+                    error: first.map(|f| f.message.clone()),
                     to: self.dns_shared.upstream.read().iter().map(SocketAddr::to_string).collect(),
                     served: self.dns_shared.served.load(Ordering::Relaxed),
+                    fix: first.and_then(|f| f.fix.clone()),
                 }
             }
         });
@@ -561,8 +562,15 @@ impl FrontDoor {
             let to = self.https_shared.upstream.read().as_ref().map(|u| u.url.clone()).into_iter().collect();
             let served = self.https_shared.served.load(Ordering::Relaxed);
             match (&self.https, &self.https_failure, &self.https_wait) {
-                (Some(l), failure, _) => Listener { state: if failure.is_some() { State::Error } else { State::On }, on: vec![l.bound.to_string()], error: failure.as_ref().map(|f| f.message.clone()), to, served },
-                (None, Some(f), _) => Listener { state: State::Error, error: Some(f.message.clone()), to, served, ..Listener::default() },
+                (Some(l), failure, _) => Listener {
+                    state: if failure.is_some() { State::Error } else { State::On },
+                    on: vec![l.bound.to_string()],
+                    error: failure.as_ref().map(|f| f.message.clone()),
+                    to,
+                    served,
+                    fix: failure.as_ref().and_then(|f| f.fix.clone()),
+                },
+                (None, Some(f), _) => Listener { state: State::Error, error: Some(f.message.clone()), to, served, fix: f.fix.clone(), ..Listener::default() },
                 (None, None, wait) => Listener { state: State::Waiting, error: wait.clone(), to, served, ..Listener::default() },
             }
         });
@@ -572,7 +580,7 @@ impl FrontDoor {
             }
             match (&self.http, &self.http_failure) {
                 (Some(l), _) => Listener { state: State::On, on: vec![l.bound.to_string()], ..Listener::default() },
-                (None, Some(f)) => Listener { state: State::Error, error: Some(f.message.clone()), ..Listener::default() },
+                (None, Some(f)) => Listener { state: State::Error, error: Some(f.message.clone()), fix: f.fix.clone(), ..Listener::default() },
                 (None, None) => Listener { state: State::Waiting, error: Some("Waits for HTTPS.".to_owned()), ..Listener::default() },
             }
         });
