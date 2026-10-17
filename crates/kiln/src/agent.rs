@@ -705,6 +705,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
+                    ServerMsg::DirList { req, path } => {
+                        // The console's folder picker: this machine's folders, read off this loop.
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let json = crate::dirs::answer(path).await;
+                            let _ = up.send(Up::Term(AgentMsg::DirList { req, json })).await;
+                        });
+                    }
                 }
             }
             Ev::Term(session, out) => {

@@ -3,6 +3,7 @@ import type {
   AiSession,
   AiTranscriptEntry,
   AuditEntry,
+  DirListing,
   DiscoveryInfo,
   Job,
   JoinInfo,
@@ -193,6 +194,17 @@ export const api = {
   uploadBinary: (target: string, file: Blob) => request<KilnBinary>("POST", `/api/updates/binaries${qs({ target })}`, undefined, { file }),
   deleteBinary: (target: string) => del<void>(`/api/updates/binaries/${enc(target)}`),
 };
+
+/* ---------------------------- folders on a machine ---------------------------- */
+
+/**
+ * The folders in a folder on a machine, for the folder picker. `target` is "local" (the kiln
+ * server), "agent:<name>" or a machine's name; `path` as typed (`~` is home; "" is home too).
+ * What can't be listed (no such folder, permission denied) comes back in `error` with a 200; a
+ * runner too old to list folders is a 409.
+ */
+export const machineDirs = (target: string, path: string, signal?: AbortSignal) =>
+  get<DirListing>(`/api/machines/${enc(target)}/dirs${qs({ path })}`, signal);
 
 /** Build a ws:// or wss:// URL for a same-origin path. */
 export function wsUrl(path: string): string {

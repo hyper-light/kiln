@@ -510,3 +510,29 @@ export type TerminalControlFrame =
   | { type: "reconnect" }
   /** The session's size changed (the device in use set it): draw at exactly this size. */
   | { type: "size"; cols: number; rows: number };
+
+/* ---------------------------- folders on a machine (GET /api/machines/:target/dirs) ---------------------------- */
+
+/** One folder inside another. */
+export interface DirEntry {
+  name: string;
+  /** Last modified, unix seconds (0: unknown). */
+  modified: number;
+}
+
+/** The folders in one folder on a machine, most recently modified first (at most 200). */
+export interface DirListing {
+  /** The folder, normalized: `~` form under the home of the user kiln runs as. */
+  path: string;
+  /** The same folder, absolute. */
+  abs: string;
+  /** The folder above it (`~` form under home); null at the root. */
+  parent: string | null;
+  /** A folder is there. False when nothing is (or not a folder); true when one is but can't be read. */
+  exists: boolean;
+  dirs: DirEntry[];
+  /** It has more folders than were sent. */
+  truncated: boolean;
+  /** Why it can't be listed: "no such folder", "not a folder", "permission denied", ... */
+  error?: string;
+}
