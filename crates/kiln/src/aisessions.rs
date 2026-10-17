@@ -130,50 +130,88 @@ pub struct AiSession {
 }
 
 /// Whether a found session can be taken over: continued as a kiln agent session (its kiln
-/// terminal is ended, the harness resumes it in the same folder).
+/// terminal is ended, or its process when it runs outside kiln, and the harness resumes it in the
+/// same folder).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TakeOver {
     Ready,
-    /// It runs outside kiln: quit it there first (an ended session is resumed with `spec.resume`).
+    /// It runs outside kiln: taking it over ends it there first (kiln quits its process).
+    Stop,
+    /// It runs outside kiln, as a harness kiln can't be sure to resume (an ACP agent may only start
+    /// anew): quit it there first (an ended session is resumed with `spec.resume`).
     Outside,
     /// It has no session id to continue yet (still starting).
     NoId,
     /// kiln cannot run that harness as an agent session.
     Unsupported,
-    /// The machine's runner predates take-over (it would not wait for the session to end):
-    /// upgrade it first.
+    /// The machine's runner predates this take-over (it would not wait for the session to end, or
+    /// could not end one running outside kiln): upgrade it first.
     Upgrade,
 }
 
 impl AiSession {
     /// Whether it can be taken over; `held`: kiln holds the terminal it runs in.
     pub fn takeover(&self, held: bool) -> TakeOver {
-        let structured = crate::harness::kinds::Kind::get(&self.tool).is_some_and(crate::harness::kinds::Kind::structured);
-        if !structured {
-            TakeOver::Unsupported
-        } else if self.id.trim().is_empty() || self.cwd.trim().is_empty() {
+        let Some(kind) = crate::harness::kinds::Kind::get(&self.tool).filter(|k| k.structured()) else {
+            return TakeOver::Unsupported;
+        };
+        if self.id.trim().is_empty() || self.cwd.trim().is_empty() {
             TakeOver::NoId
-        } else if !held || self.terminal.is_none() {
-            TakeOver::Outside
-        } else {
+        } else if held && self.terminal.is_some() {
             TakeOver::Ready
+        } else if native(kind) {
+            TakeOver::Stop
+        } else {
+            TakeOver::Outside
         }
     }
 
     /// The agent session that continues it: the same harness, folder, conversation and model,
-    /// started once its process (ended with its terminal) is gone. `None` unless it is `Ready`.
+    /// started once its process (ended with its terminal, or by kiln when it runs outside kiln) is
+    /// gone. `None` unless it is `Ready` or `Stop`.
     pub fn takeover_spec(&self, held: bool) -> Option<crate::harness::session::Spec> {
-        (self.takeover(held) == TakeOver::Ready).then(|| crate::harness::session::Spec {
+        let t = self.takeover(held);
+        matches!(t, TakeOver::Ready | TakeOver::Stop).then(|| crate::harness::session::Spec {
+            takeover_pid: Some(self.pid),
+            takeover_stop: t == TakeOver::Stop,
+            ..self.continued()
+        })
+    }
+
+    /// Whether a copy of it can be continued as an agent session, leaving it running as it is.
+    pub fn forkable(&self) -> bool {
+        crate::harness::kinds::Kind::get(&self.tool).is_some_and(native) && !self.id.trim().is_empty() && !self.cwd.trim().is_empty()
+    }
+
+    /// The agent session that continues a copy of it (a branch of its conversation), leaving it
+    /// running as it is. `None` unless it is `forkable`.
+    pub fn fork_spec(&self) -> Option<crate::harness::session::Spec> {
+        self.forkable().then(|| {
+            let s = self.continued();
+            let name = format!("{} (branch)", s.name.as_deref().unwrap_or(&self.tool));
+            crate::harness::session::Spec { fork: true, name: Some(name), ..s }
+        })
+    }
+
+    /// Its harness, folder, conversation, model and name, as an agent session's spec.
+    fn continued(&self) -> crate::harness::session::Spec {
+        crate::harness::session::Spec {
             kind: self.tool.clone(),
             cwd: Some(self.cwd.clone()),
             resume: Some(self.id.clone()),
             model: Some(self.model.clone()).filter(|m| !m.is_empty()),
             name: [&self.name, &self.title].into_iter().find(|n| !n.trim().is_empty()).map(|n| n.chars().take(80).collect()),
-            takeover_pid: Some(self.pid),
             ..crate::harness::session::Spec::default()
-        })
+        }
     }
+}
+
+/// A harness that resumes and branches a session itself (Claude Code, Codex); an ACP agent may only
+/// be able to start a new one.
+fn native(kind: &crate::harness::kinds::Kind) -> bool {
+    use crate::harness::kinds::Protocol;
+    matches!(kind.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer)
 }
 
 /// One message of an opened transcript.
@@ -861,6 +899,51 @@ fn tool_of(p: &Process) -> Option<Tool> {
     None
 }
 
+/// Whether `pid` runs the harness `kind` (`"claude"`, `"codex"` or `"gemini"`), as a scan would
+/// find it.
+pub fn runs(pid: u32, kind: &str) -> bool {
+    let p = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[p]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always).with_exe(UpdateKind::Always).without_tasks(),
+    );
+    sys.process(p).and_then(tool_of).is_some_and(|t| t.name() == kind)
+}
+
+/// Ends a session running outside kiln, for a take-over: asks its process to quit (SIGTERM;
+/// Windows has no such ask, so there it is `false`), or with `force` kills it and everything it
+/// started, never kiln itself. Whether that was done.
+pub fn end(pid: u32, force: bool) -> bool {
+    let root = Pid::from_u32(pid);
+    let ours = Pid::from_u32(std::process::id());
+    if pid <= 1 || root == ours {
+        return false;
+    }
+    let mut sys = System::new();
+    if !force {
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[root]), true, ProcessRefreshKind::nothing().without_tasks());
+        return sys.process(root).and_then(|p| p.kill_with(sysinfo::Signal::Term)).unwrap_or(false);
+    }
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().without_tasks());
+    // Its tree, parents first, leaving out kiln's own (were kiln started from inside it).
+    let mut tree = vec![root];
+    let mut i = 0;
+    while let Some(&parent) = tree.get(i) {
+        let kids: Vec<Pid> = sys.processes().iter().filter(|(c, p)| p.parent() == Some(parent) && **c != ours && !tree.contains(*c)).map(|(c, _)| *c).collect();
+        tree.extend(kids);
+        i += 1;
+    }
+    let ended = sys.process(root).is_some_and(Process::kill);
+    for c in tree.iter().skip(1) {
+        if let Some(p) = sys.process(*c) {
+            p.kill();
+        }
+    }
+    ended
+}
+
 /// An interactive session rather than a one-shot or helper run of the tool.
 fn interactive(tool: Tool, args: &[String]) -> bool {
     // A Node-hosted CLI's own arguments follow its script.
@@ -1406,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn found_sessions_are_taken_over_only_from_a_kiln_terminal() {
+    fn found_sessions_are_taken_over_or_branched() {
         let s = AiSession {
             tool: "claude".into(),
             id: "8b2c".into(),
@@ -1421,13 +1504,43 @@ mod tests {
         let spec = s.takeover_spec(true).unwrap_or_default();
         assert_eq!((spec.kind.as_str(), spec.cwd.as_deref(), spec.resume.as_deref(), spec.takeover_pid), ("claude", Some("/work"), Some("8b2c"), Some(4242)));
         assert_eq!((spec.model.as_deref(), spec.name.as_deref()), (Some("claude-opus-5-5"), Some("fix the build")));
-        // kiln does not hold its terminal (any more), or it runs outside kiln: quit it first.
-        assert_eq!(s.takeover(false), TakeOver::Outside);
-        assert_eq!(AiSession { terminal: None, ..s.clone() }.takeover(true), TakeOver::Outside);
-        assert!(s.takeover_spec(false).is_none());
+        assert!(!spec.takeover_stop && !spec.fork);
+        // kiln does not hold its terminal (any more), or it runs outside kiln: kiln ends it first.
+        assert_eq!(s.takeover(false), TakeOver::Stop);
+        assert_eq!(AiSession { terminal: None, ..s.clone() }.takeover(true), TakeOver::Stop);
+        let stop = s.takeover_spec(false).unwrap_or_default();
+        assert_eq!((stop.takeover_pid, stop.takeover_stop, stop.resume.as_deref()), (Some(4242), true, Some("8b2c")));
+        // An ACP agent might start anew rather than resume it: never ended to find out.
+        let acp = AiSession { tool: "gemini".into(), terminal: None, ..s.clone() };
+        assert_eq!(acp.takeover(true), TakeOver::Outside);
+        assert!(acp.takeover_spec(true).is_none());
+        // A copy leaves it running: a branch of its conversation, with no process to wait for.
+        let fork = s.fork_spec().unwrap_or_default();
+        assert_eq!((fork.fork, fork.takeover_pid, fork.resume.as_deref(), fork.name.as_deref()), (true, None, Some("8b2c"), Some("fix the build (branch)")));
+        assert!(acp.fork_spec().is_none() && AiSession { id: String::new(), ..s.clone() }.fork_spec().is_none());
         // Nothing to continue yet; a harness kiln cannot run as an agent session.
         assert_eq!(AiSession { id: String::new(), ..s.clone() }.takeover(true), TakeOver::NoId);
         assert_eq!(AiSession { tool: "antigravity".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
         assert_eq!(serde_json::to_value(TakeOver::NoId).ok(), Some(serde_json::json!("no_id")));
+        assert_eq!(serde_json::to_value(TakeOver::Stop).ok(), Some(serde_json::json!("stop")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_taken_over_from_outside_is_asked_to_quit_then_killed() -> anyhow::Result<()> {
+        use std::os::unix::process::ExitStatusExt as _;
+        let mut asked = std::process::Command::new("sleep").arg("30").spawn()?;
+        // Not a harness, whatever it was found as: a take-over leaves it alone.
+        assert!(!runs(asked.id(), "claude"));
+        assert!(end(asked.id(), false));
+        assert_eq!(asked.wait()?.signal(), Some(15));
+        // Killed, with what it started.
+        let mut killed = std::process::Command::new("sh").args(["-c", "sleep 30; true"]).spawn()?;
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(end(killed.id(), true));
+        assert_eq!(killed.wait()?.signal(), Some(9));
+        // Never kiln itself.
+        assert!(!end(std::process::id(), true) && !end(1, false));
+        Ok(())
     }
 }

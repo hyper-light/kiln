@@ -91,6 +91,10 @@ pub const CAP_UPGRADE: u32 = 1;
 pub const CAP_TAKEOVER: u32 = 2;
 /// [`AgentMsg::Build`] capability: the runner answers [`ServerMsg::DirList`] (lists its folders).
 pub const CAP_DIRS: u32 = 4;
+/// [`AgentMsg::Build`] capability: the runner ends a taken-over session that runs outside kiln
+/// itself (`Spec::takeover_stop`), then resumes the conversation. Without it, such a session has to
+/// be quit by hand first.
+pub const CAP_TAKEOVER_STOP: u32 = 8;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -285,6 +289,7 @@ mod tests {
         // A cut-off frame is an error, never a panic.
         assert!(decode::<ServerMsg>(a.get(..a.len() - 1).unwrap_or_default()).is_err());
         assert!(CAP_DIRS.is_power_of_two() && CAP_DIRS & (CAP_UPGRADE | CAP_TAKEOVER) == 0, "CAP_DIRS is a bit of its own");
+        assert!(CAP_TAKEOVER_STOP.is_power_of_two() && CAP_TAKEOVER_STOP & (CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS) == 0, "CAP_TAKEOVER_STOP is a bit of its own");
         Ok(())
     }
 }

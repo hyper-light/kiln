@@ -58,6 +58,10 @@ pub struct Spec {
     /// ended): the harness starts only once the process is gone, never beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub takeover_pid: Option<u32>,
+    /// With `takeover_pid`: that session runs outside kiln, so kiln ends its process itself (asks
+    /// it to quit, then kills it) rather than only waiting for it to end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub takeover_stop: bool,
 }
 
 /// A pending approval, as lists show it.
@@ -495,6 +499,8 @@ const READ_MAX: u64 = 512 * 1024;
 const TICK: Duration = Duration::from_secs(5);
 /// How long a take-over waits for the session it takes over to end.
 const TAKEOVER_WAIT: Duration = Duration::from_secs(15);
+/// How long a session taken over from outside kiln has to quit before it is killed.
+const TAKEOVER_QUIT: Duration = Duration::from_secs(10);
 
 /// Most of a task's output returned at once, and the tail returned without an offset.
 const TASK_READ_MAX: u64 = 256 * 1024;
@@ -593,19 +599,33 @@ async fn gone(pid: u32, wait: Duration) -> bool {
     true
 }
 
-/// A take-over waits for the process it takes over to end (its terminal is being closed): an
-/// error to show when it has not, `None` once it is gone (and the spec forgets it).
+/// A take-over waits for the process it takes over to end (its terminal is being closed, or with
+/// `takeover_stop` kiln ends it): an error to show when it has not, `None` once it is gone (and
+/// the spec forgets it).
 async fn takeover_ready(s: &Session, sink: &Sink, wait: Duration) -> Option<String> {
-    let pid = s.spec.lock().takeover_pid?;
+    let (pid, stop, kind) = {
+        let sp = s.spec.lock();
+        (sp.takeover_pid?, sp.takeover_stop, sp.kind.clone())
+    };
+    // Only the harness it was found as: never whatever has since been given its pid.
+    let stop = stop && crate::aisessions::runs(pid, &kind);
     // Said in the session's state, not its timeline (which its history fills once it is free).
-    let waiting = crate::os::pid_alive(pid);
+    let waiting = stop || crate::os::pid_alive(pid);
     if waiting {
         {
             let mut core = s.core.lock();
-            core.state.doing = Some(format!("Waiting for the session it takes over (process {pid}) to end"));
+            core.state.doing = Some(if stop {
+                format!("Ending the session it takes over (process {pid})")
+            } else {
+                format!("Waiting for the session it takes over (process {pid}) to end")
+            });
             core.touch_state();
         }
         flush(s, sink, None).await;
+    }
+    // Asked to quit first (it keeps its conversation); killed, with what it started, if it won't.
+    if stop && !(crate::aisessions::end(pid, false) && gone(pid, TAKEOVER_QUIT).await) {
+        crate::aisessions::end(pid, true);
     }
     let free = gone(pid, wait).await;
     if waiting {
@@ -614,7 +634,9 @@ async fn takeover_ready(s: &Session, sink: &Sink, wait: Duration) -> Option<Stri
         core.touch_state();
     }
     if free {
-        s.spec.lock().takeover_pid = None;
+        let mut sp = s.spec.lock();
+        sp.takeover_pid = None;
+        sp.takeover_stop = false;
         return None;
     }
     Some(format!("The session found running as process {pid} has not ended, so kiln did not start a second one beside it. Quit it, then restart this agent."))

@@ -26,8 +26,9 @@ browsers watching it.
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
 | WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
-| GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it) and `takeover` |
-| POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); see below |
+| GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
+| POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
+| POST | `/api/ai-sessions/:machine/:pid/fork` | continue a copy of a found session, leaving it running → `Info[]`; see below |
 | GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,
@@ -41,22 +42,33 @@ take-over: start only once that process has ended).
 
 ### Taking over a found session
 
-A session found running in one of kiln's terminals (a Claude Code or Codex TUI someone started
-there) can be continued as a kiln agent session. `takeover` on each found session says whether:
+A session found running on a machine (a Claude Code or Codex TUI someone started, in one of
+kiln's terminals or any other) can be continued as a kiln agent session. `takeover` on each found
+session says whether:
 
 | `takeover` | meaning | the console |
 |---|---|---|
 | `"ready"` | it runs in a kiln terminal: taking it over ends that terminal and continues the conversation as an agent session | offer it |
-| `"outside"` | it runs outside kiln: it must be quit there first | explain; once it has ended, resume it with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` |
+| `"stop"` | it runs outside kiln: taking it over ends it there (asked to quit, killed after 10 s), then continues the conversation as an agent session | offer it, saying so; confirm with `{"stop": true}` |
+| `"outside"` | it runs outside kiln as an ACP agent, which might start anew rather than resume it: it must be quit there first | explain; once it has ended, resume it with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` |
+| `"upgrade"` | the machine's runner is too old for this take-over | link to Settings → Updates |
 | `"no_id"` | it has no conversation to continue yet (still starting) | wait |
 | `"unsupported"` | kiln cannot run that harness as an agent session | — |
 
-`POST /api/ai-sessions/:machine/:pid/takeover` (no body): kiln closes the terminal, starts an
-agent session on that machine with the same harness, folder, conversation (its session id) and
-model, and answers with its `Info[]` (status `starting`). The machine starts the harness only once
-the old process has ended (up to 15 s; meanwhile `state.doing` says it is waiting); the session's
-history is loaded from the conversation. Errors: 404 (not found: it may have ended), 409
-(`outside`, `no_id`), 400 (`unsupported`).
+`POST /api/ai-sessions/:machine/:pid/takeover` (no body for `ready`; `{"stop": true}`, or
+`?stop=1`, for `stop`): kiln closes the terminal, or for `stop` the machine ends the process
+(SIGTERM, then SIGKILL with what it started after 10 s; only if that pid still runs the same
+harness), starts an agent session on that machine with the same harness, folder, conversation
+(its session id) and model, and answers with its `Info[]` (status `starting`). The machine starts
+the harness only once the old process has ended (up to 15 s; meanwhile `state.doing` says it is
+waiting, or ending it); the session's history is loaded from the conversation. Errors: 404 (not
+found: it may have ended), 409 (`stop` without `{"stop": true}`, `outside`, `upgrade`, `no_id`),
+400 (`unsupported`).
+
+`POST /api/ai-sessions/:machine/:pid/fork` (no body; when `fork` is true): starts an agent session
+that continues a copy of the conversation (Claude Code's `--fork-session`, Codex's
+`thread/fork`), named `<name> (branch)`, leaving the found session running as it is. Errors: 404,
+409 (no conversation yet, or a runner too old to branch), 400 (a harness that can't branch).
 
 ### Continuing a past session
 
