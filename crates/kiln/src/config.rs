@@ -39,9 +39,15 @@ pub struct Server {
     pub metrics_public: bool,
     /// Extra DNS names / IPs for the server certificate.
     pub tls_names: Vec<String>,
-    /// Serve the HTTP API over TLS using the kiln CA (self-signed). Browsers will warn unless the
-    /// CA (`<data>/pki/ca.pem`) is trusted.
+    /// Also serve HTTPS on `http_addr` (plain HTTP keeps working there: each connection is
+    /// answered in what it starts with). The certificate is `https_cert`/`https_key` when given,
+    /// else one from the kiln CA, which devices trust once they install `/ca.pem` (or
+    /// `/ca.mobileconfig`). See docs/front-door.md for HTTPS on a runner instead.
     pub https: bool,
+    /// A PEM certificate chain (leaf first) for `https`, instead of the kiln CA's.
+    pub https_cert: Option<PathBuf>,
+    /// Its PEM private key.
+    pub https_key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +231,8 @@ impl Default for Server {
             metrics_public: true,
             tls_names: Vec::new(),
             https: false,
+            https_cert: None,
+            https_key: None,
         }
     }
 }

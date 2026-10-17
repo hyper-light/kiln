@@ -1,0 +1,415 @@
+//! The server's side of runners' front doors: their settings (in the `kv` table, one key per
+//! runner), what each runner last reported, the certificates the kiln CA issues for them, and the
+//! API (`/api/runners/:name/front-door`, `/ca.pem`, `/ca.mobileconfig`).
+//!
+//! * **Pushing.** A runner that announces `CAP_FRONT_DOOR` gets its settings when it connects
+//!   and whenever they change. While a machine runs two runner processes (an upgrade beside the
+//!   old one), the newest runs the front door and the older ones are told to stand by.
+//! * **Issuing.** A status with a CSR asks for a certificate: signed by the kiln CA when the
+//!   runner's settings use kiln's certificate and HTTPS is on, for the names those settings serve
+//!   and the addresses the runner reports, at most once a minute per runner.
+//! * **Uploads.** A certificate and key uploaded for a runner are checked (they parse, the key
+//!   is the certificate's, it serves TLS, it has not expired) and sent to the runner, which keeps
+//!   them; the server keeps neither, logs neither, and never sends the key back.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use http::{StatusCode, header};
+use parking_lot::Mutex;
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::http::server::{self as srv, Request, Response};
+use crate::hub::Hub;
+use crate::instances::PeerId;
+use crate::net::Kind;
+use crate::proto::{CAP_FRONT_DOOR, LANE_CONTROL, ServerMsg};
+
+use super::{CertMode, CustomCert, Push, Settings, Status};
+
+const KEY_PREFIX: &str = "front_door/";
+/// At most one certificate a minute for a runner.
+const ISSUE_EVERY: Duration = Duration::from_secs(60);
+/// An uploaded chain and key, as JSON.
+const UPLOAD_LIMIT: usize = 256 * 1024;
+
+pub type Answer = Result<Response, (StatusCode, String)>;
+
+fn fail(code: StatusCode, msg: impl Into<String>) -> (StatusCode, String) {
+    (code, msg.into())
+}
+
+#[derive(Clone, Debug, Default)]
+struct Entry {
+    settings: Settings,
+    status: Option<Status>,
+    status_at: i64,
+    issued_at: Option<Instant>,
+}
+
+/// Every runner's front door, as the server knows it.
+#[derive(Default)]
+pub struct FrontDoors {
+    inner: Mutex<HashMap<String, Entry>>,
+}
+
+impl FrontDoors {
+    /// Read the stored settings (at server start).
+    pub async fn load(&self, store: &crate::store::Store) -> anyhow::Result<()> {
+        let rows = store.kv_prefix(KEY_PREFIX.to_owned()).await?;
+        let mut g = self.inner.lock();
+        for (k, v) in rows {
+            let Some(runner) = k.strip_prefix(KEY_PREFIX) else { continue };
+            match serde_json::from_str::<Settings>(&v).map_err(|e| e.to_string()).and_then(|s| s.validated()) {
+                Ok(settings) => {
+                    g.entry(runner.to_owned()).or_default().settings = settings;
+                }
+                Err(e) => tracing::warn!(runner, error = %e, "front door: stored settings unreadable; that runner's front door is off"),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn settings(&self, runner: &str) -> Settings {
+        self.inner.lock().get(runner).map(|e| e.settings.clone()).unwrap_or_default()
+    }
+
+    fn status(&self, runner: &str) -> (Option<Status>, i64) {
+        self.inner.lock().get(runner).map(|e| (e.status.clone(), e.status_at)).unwrap_or_default()
+    }
+
+    /// `https://…` for every name a runner's front door serves.
+    pub fn origins(&self) -> Vec<String> {
+        let g = self.inner.lock();
+        let mut runners: Vec<&String> = g.keys().collect();
+        runners.sort();
+        let mut out: Vec<String> = Vec::new();
+        for r in runners {
+            for o in g.get(r).map(|e| e.settings.origins()).unwrap_or_default() {
+                if !out.contains(&o) {
+                    out.push(o);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `host` (no port) is a name some runner's front door serves over HTTPS: a request
+    /// for it came through a front door, so the browser is on HTTPS.
+    pub fn serves(&self, host: &str) -> bool {
+        self.inner.lock().values().any(|e| e.settings.serves(host))
+    }
+
+    /// The runners with front-door settings, in name order.
+    fn runners(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.inner.lock().iter().filter(|(_, e)| e.settings != Settings::default() || e.status.is_some()).map(|(k, _)| k.clone()).collect();
+        v.sort();
+        v
+    }
+
+    /// Forget a runner (it was forgotten itself).
+    pub async fn forget(&self, store: &crate::store::Store, runner: &str) {
+        self.inner.lock().remove(runner);
+        if let Err(e) = store.kv_delete(format!("{KEY_PREFIX}{runner}")).await {
+            tracing::warn!(runner, error = %format!("{e:#}"), "front door: settings not deleted");
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------ to runners
+
+/// The process of `machine` that runs its front door (its newest, when that one can), and its
+/// other processes that can run one (they stand by).
+fn peers(hub: &Hub, machine: &str) -> (Option<PeerId>, Vec<PeerId>) {
+    let inst = hub.instances.lock();
+    let newest = inst.newest(machine);
+    let capable = |p: PeerId| inst.get(p).is_some_and(|i| i.caps & CAP_FRONT_DOOR != 0);
+    let others = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && capable(*p)).collect();
+    (newest.filter(|p| capable(*p)), others)
+}
+
+async fn send(hub: &Hub, peer: PeerId, push: &Push) -> bool {
+    let Ok(json) = serde_json::to_string(push) else { return false };
+    match crate::proto::encode(&ServerMsg::FrontDoor { json }) {
+        Ok(b) => hub.net.send(peer, LANE_CONTROL, Kind::Control, b).await,
+        Err(_) => false,
+    }
+}
+
+/// Send `machine` its front door (to the process that runs it; the others stand by), with a
+/// certificate or an uploaded one when given. Whether the process running it got it.
+pub async fn push(hub: &Hub, machine: &str, issued: Option<String>, custom: Option<CustomCert>) -> bool {
+    let (runs, others) = peers(hub, machine);
+    for p in others {
+        send(hub, p, &Push { standby: true, ..Push::default() }).await;
+    }
+    let Some(peer) = runs else { return false };
+    let settings = hub.front_doors.settings(machine);
+    send(hub, peer, &Push { settings, standby: false, issued, custom }).await
+}
+
+/// A runner process said what it can do (`AgentMsg::Build`): one that runs front doors gets
+/// its machine's (and its other processes stand by).
+pub async fn on_build(hub: &Hub, machine: &str, caps: u32) {
+    if caps & CAP_FRONT_DOOR != 0 {
+        push(hub, machine, None, None).await;
+    }
+}
+
+/// A runner process of `machine` went away: another one may run its front door now.
+pub async fn on_instance_lost(hub: &Hub, machine: &str) {
+    push(hub, machine, None, None).await;
+}
+
+/// A runner reported its front door (`AgentMsg::FrontDoorStatus`).
+pub async fn on_status(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
+    let status: Status = match serde_json::from_str(json) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(machine, error = %e, "front door: unreadable status");
+            return;
+        }
+    };
+    // Only the process that runs it speaks for the machine.
+    if status.standby || peers(hub, machine).0 != Some(peer) {
+        return;
+    }
+    let changed = {
+        let mut g = hub.front_doors.inner.lock();
+        let e = g.entry(machine.to_owned()).or_default();
+        let changed = e.status.as_ref() != Some(&status);
+        e.status = Some(status.clone());
+        e.status_at = crate::util::now_unix();
+        changed
+    };
+    if changed {
+        hub.emit(&json!({ "type": "front_door", "runner": machine }));
+    }
+    if let Some(csr) = &status.csr {
+        issue(hub, peer, machine, csr, &status).await;
+    }
+}
+
+/// The names a certificate for `status` may carry: those `settings` serve, and the runner's own
+/// addresses (not loopback, wildcard or multicast ones).
+fn names_to_sign(settings: &Settings, status: &Status) -> Vec<String> {
+    let served = settings.cert_names();
+    let mut names = Vec::new();
+    for n in &status.want {
+        let ok = if let Ok(ip) = n.parse::<IpAddr>() {
+            status.addresses.contains(n) && !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
+        } else {
+            served.contains(n)
+        };
+        if ok && !names.contains(n) {
+            names.push(n.clone());
+        }
+    }
+    names
+}
+
+async fn issue(hub: &Hub, peer: PeerId, machine: &str, csr: &str, status: &Status) {
+    let settings = hub.front_doors.settings(machine);
+    // Asked for settings that are not (or no longer) the runner's: it asks again with the new ones.
+    if !(settings.https.enabled && settings.cert.mode == CertMode::Kiln) || status.settings != settings.fingerprint() {
+        return;
+    }
+    {
+        let mut g = hub.front_doors.inner.lock();
+        let e = g.entry(machine.to_owned()).or_default();
+        if e.issued_at.is_some_and(|t| t.elapsed() < ISSUE_EVERY) {
+            return;
+        }
+        e.issued_at = Some(Instant::now());
+    }
+    let names = names_to_sign(&settings, status);
+    if names.is_empty() {
+        return;
+    }
+    let pem = match hub.pki.sign_front_door(csr, &names, crate::pki::FRONT_DOOR_DAYS) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(machine, error = %format!("{e:#}"), "front door: certificate not issued");
+            return;
+        }
+    };
+    let until = crate::pki::cert_info(&pem).map(|i| i.not_after).unwrap_or_default();
+    tracing::info!(machine, names = ?names, "front door: issued a certificate from the kiln CA");
+    hub.store.audit(machine.to_owned(), "front_door.certificate".into(), format!("kiln CA certificate for {} until {}", names.join(", "), date(until))).await;
+    let settings = hub.front_doors.settings(machine);
+    send(hub, peer, &Push { settings, standby: false, issued: Some(pem), custom: None }).await;
+}
+
+fn date(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| t.format(&time::macros::format_description!("[year]-[month]-[day]")).ok())
+        .unwrap_or_else(|| unix.to_string())
+}
+
+// ------------------------------------------------------------------------------ the API
+
+/// A runner the server knows (enrolled, or connected now).
+async fn known(hub: &Hub, name: &str) -> bool {
+    hub.agents.lock().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
+}
+
+/// `GET /api/runners/:name/front-door` (and what the others answer with).
+pub async fn view(hub: &Hub, name: &str) -> serde_json::Value {
+    let settings = hub.front_doors.settings(name);
+    let (status, status_at) = hub.front_doors.status(name);
+    let connected = hub.agents.lock().get(name).is_some_and(|a| a.connected);
+    let supported = connected.then(|| hub.runner_caps(name) & CAP_FRONT_DOOR != 0);
+    let applied = status.as_ref().map(|s| s.settings == settings.fingerprint());
+    let status = status.map(|mut s| {
+        s.csr = None;
+        s
+    });
+    let ca = crate::pki::cert_info_der(&hub.pki.ca_der).ok();
+    json!({
+        "runner": name,
+        "connected": connected,
+        "supported": supported,
+        "settings": settings,
+        "applied": applied,
+        "status": status,
+        "status_at": (status_at > 0).then_some(status_at),
+        "origins": settings.origins(),
+        "ca": ca.map(|c| json!({ "subject": c.subject, "sha256": c.sha256, "not_after": c.not_after })),
+    })
+}
+
+pub async fn get(hub: &Hub, name: &str) -> Answer {
+    if !known(hub, name).await {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
+    }
+    Ok(srv::json(StatusCode::OK, &view(hub, name).await))
+}
+
+/// `GET /api/front-doors`: every runner with front-door settings.
+pub async fn list(hub: &Hub) -> Answer {
+    let mut out = Vec::new();
+    for r in hub.front_doors.runners() {
+        out.push(view(hub, &r).await);
+    }
+    Ok(srv::json(StatusCode::OK, &out))
+}
+
+/// `PUT /api/runners/:name/front-door`: new settings, checked, stored, and sent to the runner.
+pub async fn put(hub: &Hub, name: &str, req: Request) -> Answer {
+    if !known(hub, name).await {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
+    }
+    let asked: Settings = srv::body_json(req.into_body(), 64 * 1024).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let settings = asked.validated().map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    let json = serde_json::to_string(&settings).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    hub.store.kv_set(format!("{KEY_PREFIX}{name}"), json).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.front_doors.inner.lock().entry(name.to_owned()).or_default().settings = settings.clone();
+    hub.store.audit("admin".into(), "front_door.update".into(), format!("{name}: {}", settings.summary())).await;
+    push(hub, name, None, None).await;
+    hub.emit(&json!({ "type": "front_door", "runner": name }));
+    Ok(srv::json(StatusCode::OK, &view(hub, name).await))
+}
+
+#[derive(Deserialize)]
+struct Upload {
+    cert_pem: String,
+    key_pem: String,
+}
+
+/// `POST /api/runners/:name/front-door/cert`: a certificate chain and its key for the runner's
+/// front door. Checked here, handed to the runner (which must be connected: only it keeps them),
+/// never stored here, never logged, never sent back.
+pub async fn upload(hub: &Hub, name: &str, req: Request) -> Answer {
+    if !known(hub, name).await {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
+    }
+    let up: Upload = srv::body_json(req.into_body(), UPLOAD_LIMIT)
+        .await
+        .map_err(|_| fail(StatusCode::BAD_REQUEST, "expected {\"cert_pem\": \"…\", \"key_pem\": \"…\"}"))?;
+    crate::http::tls::ServerTls::from_pem(&up.cert_pem, &up.key_pem).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let info = crate::pki::cert_info(&up.cert_pem).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if info.not_after <= crate::util::now_unix() {
+        return Err(fail(StatusCode::BAD_REQUEST, format!("that certificate expired on {}", date(info.not_after))));
+    }
+    if !info.server_auth {
+        return Err(fail(StatusCode::BAD_REQUEST, "that certificate is not for TLS servers (its extended key usage lacks serverAuth)"));
+    }
+    if peers(hub, name).0.is_none() {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            format!("{name} is not connected (or too old for a front door): the key is only ever kept on the runner, so it has to be online to take it"),
+        ));
+    }
+    let mut settings = hub.front_doors.settings(name);
+    settings.cert.mode = CertMode::Custom;
+    let json = serde_json::to_string(&settings).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    hub.store.kv_set(format!("{KEY_PREFIX}{name}"), json).await.map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.front_doors.inner.lock().entry(name.to_owned()).or_default().settings = settings;
+    let sent = push(hub, name, None, Some(CustomCert { cert_pem: up.cert_pem, key_pem: up.key_pem })).await;
+    if !sent {
+        return Err(fail(StatusCode::BAD_GATEWAY, format!("{name} could not be reached; try again")));
+    }
+    let short: String = info.sha256.chars().take(16).collect();
+    hub.store
+        .audit("admin".into(), "front_door.cert".into(), format!("{name}: uploaded a certificate for {} (sha256 {short}…, until {})", info.names.join(", "), date(info.not_after)))
+        .await;
+    hub.emit(&json!({ "type": "front_door", "runner": name }));
+    Ok(srv::json(StatusCode::OK, &json!({ "cert": info, "front_door": view(hub, name).await })))
+}
+
+/// `GET /ca.pem`, `/ca.crt` (DER) and `/ca.mobileconfig`: kiln's CA certificate for devices,
+/// open (it is public).
+pub fn ca(hub: &Arc<Hub>, which: &str) -> Response {
+    let (mime, file, body): (&str, &str, Vec<u8>) = match which {
+        "crt" => ("application/x-x509-ca-cert", "kiln-ca.crt", hub.pki.ca_der.clone()),
+        "mobileconfig" => ("application/x-apple-aspen-config", "kiln-ca.mobileconfig", super::mobileconfig::profile(&hub.pki.ca_der).into_bytes()),
+        _ => ("application/x-pem-file", "kiln-ca.pem", hub.pki.ca_pem.clone().into_bytes()),
+    };
+    let r = srv::response(StatusCode::OK, mime, srv::full(body));
+    let r = srv::with_header(r, header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{file}\""));
+    srv::with_header(r, header::CACHE_CONTROL, "no-cache")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontdoor::{Https, Mdns};
+
+    #[test]
+    fn certificates_carry_only_the_names_settings_serve_and_the_runners_addresses() {
+        let settings = Settings {
+            domain: "kiln.home".into(),
+            aliases: vec!["ci.home".into()],
+            https: Https { enabled: true, ..Https::default() },
+            mdns: Mdns { enabled: true, name: "kiln".into() },
+            ..Settings::default()
+        };
+        let status = Status {
+            want: ["kiln.home", "*.kiln.home", "ci.home", "kiln.local", "evil.example", "kiln-server", "192.168.1.77", "10.0.0.1", "127.0.0.1", "kiln.home"]
+                .map(str::to_owned)
+                .to_vec(),
+            addresses: vec!["192.168.1.77".into(), "127.0.0.1".into()],
+            ..Status::default()
+        };
+        assert_eq!(names_to_sign(&settings, &status), ["kiln.home", "*.kiln.home", "ci.home", "kiln.local", "192.168.1.77"]);
+        assert_eq!(date(1_825_000_000), "2027-10-31");
+    }
+
+    #[test]
+    fn origins_come_from_every_front_door_with_https() {
+        let doors = FrontDoors::default();
+        {
+            let mut g = doors.inner.lock();
+            g.entry("b".into()).or_default().settings = Settings { domain: "kiln.home".into(), https: Https { enabled: true, ..Https::default() }, ..Settings::default() };
+            g.entry("a".into()).or_default().settings = Settings { domain: "ci.lan".into(), https: Https { enabled: false, ..Https::default() }, ..Settings::default() };
+        }
+        assert_eq!(doors.origins(), ["https://kiln.home"]);
+        assert!(doors.serves("kiln.home") && doors.serves("x.kiln.home"));
+        assert!(!doors.serves("ci.lan"), "HTTPS is off there");
+        assert_eq!(doors.runners(), ["a", "b"]);
+    }
+}

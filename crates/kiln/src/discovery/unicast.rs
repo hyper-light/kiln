@@ -135,6 +135,17 @@ fn id_of(data: &[u8]) -> Option<u16> {
 /// One exchange with `server` over UDP: the answer with `id`, from that server. A truncated
 /// answer is asked again over TCP.
 pub async fn exchange(server: SocketAddr, query: &[u8], id: u16, timeout: Duration) -> Result<Vec<u8>, String> {
+    let data = exchange_udp(server, query, id, timeout).await?;
+    let flags = u16::from_be_bytes([data.get(2).copied().unwrap_or(0), data.get(3).copied().unwrap_or(0)]);
+    if flags & dns::FLAG_TRUNCATED != 0 {
+        return exchange_tcp(server, query, id, TCP_TIMEOUT).await;
+    }
+    Ok(data)
+}
+
+/// One exchange with `server` over UDP only, from a fresh socket (a random source port): the
+/// answer with `id`, from that server, truncated or not.
+pub async fn exchange_udp(server: SocketAddr, query: &[u8], id: u16, timeout: Duration) -> Result<Vec<u8>, String> {
     let bind: SocketAddr = if server.is_ipv4() { (Ipv4Addr::UNSPECIFIED, 0).into() } else { (Ipv6Addr::UNSPECIFIED, 0).into() };
     let sock = hyper_rt::udp::UdpSocket::bind(bind).map_err(|e| format!("UDP socket: {e}"))?;
     sock.send_to_writable(query, server).await.map_err(|e| format!("send to {server}: {e}"))?;
@@ -154,10 +165,6 @@ pub async fn exchange(server: SocketAddr, query: &[u8], id: u16, timeout: Durati
         // Only the server asked, with the query's id (anything else is spoofed or stale).
         if from != server || id_of(data) != Some(id) || data.len() < 12 {
             continue;
-        }
-        let flags = u16::from_be_bytes([data.get(2).copied().unwrap_or(0), data.get(3).copied().unwrap_or(0)]);
-        if flags & dns::FLAG_TRUNCATED != 0 {
-            return exchange_tcp(server, query, id, TCP_TIMEOUT).await;
         }
         return Ok(data.to_vec());
     }

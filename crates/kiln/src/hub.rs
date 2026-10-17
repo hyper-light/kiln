@@ -140,6 +140,8 @@ pub struct Hub {
     lost_instances: Mutex<HashMap<PeerId, (String, Instant, Vec<String>)>>,
     /// Upgrades of runners and of this server, started from Settings → Updates.
     pub updates: crate::updates::Updates,
+    /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
+    pub front_doors: crate::frontdoor::control::FrontDoors,
 }
 
 impl Hub {
@@ -193,6 +195,7 @@ impl Hub {
             instances: Mutex::new(crate::instances::Instances::default()),
             lost_instances: Mutex::new(HashMap::new()),
             updates: crate::updates::Updates::default(),
+            front_doors: crate::frontdoor::control::FrontDoors::default(),
         })
     }
 
@@ -446,6 +449,7 @@ impl Hub {
         self.net.command(crate::net::Out::Revoke { name: agent.to_owned() }).await;
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
+        self.front_doors.forget(&self.store, agent).await;
         self.update_slot_gauges();
         Ok(())
     }
@@ -683,7 +687,9 @@ impl Hub {
                 self.instances.lock().set_build(peer, build.clone(), caps);
                 self.updates.on_build(self, &agent, &build);
                 self.emit(&serde_json::json!({ "type": "updates" }));
+                crate::frontdoor::control::on_build(self, &agent, caps).await;
             }
+            AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -951,6 +957,8 @@ impl Hub {
         self.emit_terminals();
         self.update_slot_gauges();
         self.check_retire().await;
+        // The front door moves to the process that is newest now.
+        crate::frontdoor::control::on_instance_lost(self, name).await;
     }
 
     /// A machine's runner processes, while it has more than one, with what each holds.

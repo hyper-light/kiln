@@ -102,12 +102,31 @@ fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
     cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", &c))
 }
 
-fn session_cookie(hub: &Hub) -> String {
-    let secure = if hub.cfg.server.public_url.starts_with("https") { "; Secure" } else { "" };
+/// The cookie a sign-in sets; `Secure` when the browser reached kiln over HTTPS.
+fn session_cookie(hub: &Hub, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}",
         signed_expiring(hub, "session", SESSION_TTL)
     )
+}
+
+/// A `Host` header without its port (IPv6 literals keep their brackets).
+fn host_only(h: &str) -> &str {
+    let h = h.trim();
+    if h.starts_with('[') {
+        return h.split_inclusive(']').next().unwrap_or(h);
+    }
+    h.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(h, |(n, _)| n)
+}
+
+/// Whether the browser reached this server over HTTPS: the server's own TLS (`server.https`),
+/// a runner's front door (the request is for a name one of them serves, see `crate::frontdoor`),
+/// or a public URL that says https (TLS ends in front of kiln).
+fn is_secure(hub: &Hub, req: &Request) -> bool {
+    hub.cfg.server.public_url.starts_with("https")
+        || req.extensions().get::<srv::Secure>().is_some()
+        || srv::header_str(req, &header::HOST).is_some_and(|h| hub.front_doors.serves(host_only(h)))
 }
 
 // ------------------------------------------------------------------ router
@@ -167,6 +186,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
         (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
         (&Method::GET, ["install.ps1"]) => return Ok(install_powershell(&hub)),
+        // kiln's CA for devices (it is public): PEM, DER, and an Apple configuration profile.
+        (&Method::GET, ["ca.pem"]) => return Ok(crate::frontdoor::control::ca(&hub, "pem")),
+        (&Method::GET, ["ca.crt"]) => return Ok(crate::frontdoor::control::ca(&hub, "crt")),
+        (&Method::GET, ["ca.mobileconfig"]) => return Ok(crate::frontdoor::control::ca(&hub, "mobileconfig")),
         _ => {}
     }
 
@@ -234,6 +257,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let name = (*name).to_owned();
             drain_agent(&hub, &name, req).await
         }
+        (&Method::GET, ["api", "front-doors"]) => front_door(crate::frontdoor::control::list(&hub).await),
+        (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(crate::frontdoor::control::get(&hub, name).await),
+        (&Method::PUT, ["api", "runners", name, "front-door"]) => {
+            let name = (*name).to_owned();
+            front_door(crate::frontdoor::control::put(&hub, &name, req).await)
+        }
+        (&Method::POST, ["api", "runners", name, "front-door", "cert"]) => {
+            let name = (*name).to_owned();
+            front_door(crate::frontdoor::control::upload(&hub, &name, req).await)
+        }
         (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
@@ -300,6 +333,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+/// A front-door handler's answer as the API's.
+fn front_door(a: crate::frontdoor::control::Answer) -> R {
+    a.map_err(|(code, msg)| err(code, msg))
 }
 
 // ------------------------------------------------------------------ AI sessions
@@ -519,10 +557,11 @@ struct Login {
 }
 
 async fn login(hub: &Hub, req: Request) -> R {
+    let secure = is_secure(hub, &req);
     let l: Login = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if crate::util::ct_eq(l.token.trim().as_bytes(), hub.admin_token.as_bytes()) {
         hub.store.audit("admin".into(), "login".into(), "token".into()).await;
-        Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub)))
+        Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub, secure)))
     } else {
         crate::rt::sleep(Duration::from_millis(500)).await;
         Err(err(StatusCode::UNAUTHORIZED, "invalid token"))
@@ -538,7 +577,7 @@ fn otp(hub: &Hub, req: &Request) -> Response {
             hub_store.audit("admin".into(), "login".into(), "one-time link".into()).await;
         });
         let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/");
-        srv::with_header(r, header::SET_COOKIE, &session_cookie(hub))
+        srv::with_header(r, header::SET_COOKIE, &session_cookie(hub, is_secure(hub, req)))
     } else {
         // Back to the login page, which explains what went wrong and offers the other methods.
         srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &format!("/?signin={}", otp_problem(hub, code)))
@@ -571,6 +610,7 @@ struct PasswordLogin {
 }
 
 async fn login_password(hub: &Hub, req: Request) -> R {
+    let secure = is_secure(hub, &req);
     let l: PasswordLogin =
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let gate = PASSWORD_GATE.lock().await;
@@ -591,7 +631,7 @@ async fn login_password(hub: &Hub, req: Request) -> R {
             PASSWORD_THROTTLE.succeeded();
             drop(gate);
             hub.store.audit("admin".into(), "login".into(), "password".into()).await;
-            Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub)))
+            Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub, secure)))
         }
         Some(false) => {
             PASSWORD_THROTTLE.failed();
@@ -648,6 +688,8 @@ fn me(hub: &Hub, headers: &HeaderMap) -> Response {
         &json!({
             "authenticated": authed(hub, headers),
             "public_url": hub.cfg.server.public_url,
+            // Where else browsers find this server: its runners' front doors (HTTPS).
+            "origins": hub.front_doors.origins(),
             "version": env!("CARGO_PKG_VERSION"),
             "hostname": crate::config::Config::hostname(),
             "discovery": announced,

@@ -82,6 +82,11 @@ pub enum AgentMsg {
     /// Answer to [`ServerMsg::HarnessHistory`]: JSON `[`[`crate::aisessions::PastSession`]`]`,
     /// `None` when this machine does not look. Appended last: postcard encodes variants by index.
     HarnessHistory { req: u64, json: Option<String> },
+    /// This machine's front door (JSON [`crate::frontdoor::Status`]): how its DNS, HTTPS and
+    /// `.local` listeners and its certificate are doing, and a CSR when it needs a certificate from
+    /// the kiln CA. Sent on every (re)connect and whenever it changes. Appended last: postcard
+    /// encodes variants by index.
+    FrontDoorStatus { json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -95,6 +100,10 @@ pub const CAP_DIRS: u32 = 4;
 /// itself (`Spec::takeover_stop`), then resumes the conversation. Without it, such a session has to
 /// be quit by hand first.
 pub const CAP_TAKEOVER_STOP: u32 = 8;
+/// [`AgentMsg::Build`] capability: the runner runs a front door ([`ServerMsg::FrontDoor`]: DNS for
+/// a domain, HTTPS in front of the server, a `.local` name) and reports it with
+/// [`AgentMsg::FrontDoorStatus`].
+pub const CAP_FRONT_DOOR: u32 = 16;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,6 +204,11 @@ pub enum ServerMsg {
     /// answered by [`AgentMsg::HarnessHistory`]. Appended last: postcard encodes variants by
     /// index.
     HarnessHistory { req: u64, kind: Option<String>, limit: u32 },
+    /// This machine's front door (JSON [`crate::frontdoor::Push`]): its settings, and a
+    /// certificate the kiln CA issued for it or one uploaded for it. Sent when it connects and
+    /// whenever that changes; only to runners that announced [`CAP_FRONT_DOOR`]. Appended last:
+    /// postcard encodes variants by index.
+    FrontDoor { json: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -290,6 +304,36 @@ mod tests {
         assert!(decode::<ServerMsg>(a.get(..a.len() - 1).unwrap_or_default()).is_err());
         assert!(CAP_DIRS.is_power_of_two() && CAP_DIRS & (CAP_UPGRADE | CAP_TAKEOVER) == 0, "CAP_DIRS is a bit of its own");
         assert!(CAP_TAKEOVER_STOP.is_power_of_two() && CAP_TAKEOVER_STOP & (CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS) == 0, "CAP_TAKEOVER_STOP is a bit of its own");
+        Ok(())
+    }
+
+    #[test]
+    fn front_door_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        // ServerMsg::FrontDoor comes after HarnessHistory (variant 20): an older runner skips it.
+        let push = ServerMsg::FrontDoor { json: r#"{"settings":{"domain":"kiln.home"}}"#.into() };
+        let p = encode(&push)?;
+        assert_eq!(decode::<ServerMsg>(&p)?, push);
+        let h = encode(&ServerMsg::HarnessHistory { req: 1, kind: None, limit: 5 })?;
+        assert!(p.first() > h.first(), "ServerMsg::FrontDoor must be appended after HarnessHistory");
+        assert_eq!(h.first(), Some(&20), "ServerMsg::HarnessHistory is variant 20 on the wire");
+        assert_eq!(p.first(), Some(&21), "ServerMsg::FrontDoor is variant 21 on the wire");
+
+        // AgentMsg::FrontDoorStatus comes after HarnessHistory (variant 24): an older server skips it.
+        let status = AgentMsg::FrontDoorStatus { json: r#"{"dns":{"state":"on"}}"#.into() };
+        let s = encode(&status)?;
+        assert_eq!(decode::<AgentMsg>(&s)?, status);
+        let ah = encode(&AgentMsg::HarnessHistory { req: 1, json: None })?;
+        assert!(s.first() > ah.first(), "AgentMsg::FrontDoorStatus must be appended after HarnessHistory");
+        assert_eq!(ah.first(), Some(&24), "AgentMsg::HarnessHistory is variant 24 on the wire");
+        assert_eq!(s.first(), Some(&25), "AgentMsg::FrontDoorStatus is variant 25 on the wire");
+
+        // A cut-off frame is an error, never a panic.
+        assert!(decode::<AgentMsg>(s.get(..s.len() - 1).unwrap_or_default()).is_err());
+        assert!(
+            CAP_FRONT_DOOR.is_power_of_two() && CAP_FRONT_DOOR & (CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP) == 0,
+            "CAP_FRONT_DOOR is a bit of its own"
+        );
+        assert_eq!(CAP_FRONT_DOOR, 16);
         Ok(())
     }
 }

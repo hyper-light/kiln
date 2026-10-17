@@ -79,11 +79,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let (net, net_events) = crate::net::start(crate::net::Spec {
         bind: quic_bind,
         ca_der: pki.ca_der.clone(),
-        leaf,
+        leaf: leaf.clone(),
         server: true,
         dial_deadline: crate::net::DIAL_DEADLINE,
     })?;
+    // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
+    let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    // Runners' front doors: what the UI set, sent to each runner when it connects.
+    hub.front_doors.load(&hub.store).await?;
     // Process restarts by the supervisor count as restarts too (generation 1 = first start).
     crate::metrics::global().supervisor_restarts.add(hub.generation.saturating_sub(1));
 
@@ -139,13 +143,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         let _ = hub.k8s.set(None);
     }
 
-    // HTTP.
+    // HTTP (and HTTPS on the same port with `server.https`).
     {
         let h = hub.clone();
         let sd = shutdown.clone();
         sup::spawn(reg, "http", shutdown.clone(), move || {
             let hub = h.clone();
             let sd = sd.clone();
+            let tls = tls.clone();
             async move {
                 let addr: SocketAddr = hub.cfg.server.http_addr.parse().with_context(|| format!("http_addr {}", hub.cfg.server.http_addr))?;
                 // Bound through std (SO_REUSEADDR: a restart rebinds at once despite TIME_WAIT,
@@ -153,7 +158,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                 let std_listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
                 let listener = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 128)
                     .map_err(|e| anyhow::anyhow!("adopt listener {addr}: {e}"))?;
-                tracing::info!(%addr, url = %hub.cfg.server.public_url, "HTTP listening (hyper-rt)");
+                tracing::info!(%addr, url = %hub.cfg.server.public_url, https = tls.is_some(), "HTTP listening (hyper-rt)");
                 let api = Arc::new(crate::api::Api { hub });
                 loop {
                     let accepted = futures::select_biased! {
@@ -166,8 +171,12 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             // waits, so it can move.
                             let api = api.clone();
                             let remote = stream.peer_addr().ok();
+                            let tls = tls.clone();
                             crate::rt::spawn_spread(async move {
-                                crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), api, remote).await;
+                                match &tls {
+                                    Some(tls) => crate::http::server::serve_tls_or_plain(stream, api, remote, tls).await,
+                                    None => crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), api, remote).await,
+                                }
                             });
                         }
                         Err(e) => {
@@ -219,6 +228,20 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // Lets the close frames go out and in-flight responses finish.
     crate::rt::sleep(Duration::from_millis(300)).await;
     Ok(())
+}
+
+/// The certificate for `server.https`: `server.https_cert` and `server.https_key` when both are
+/// given, else the server's leaf from the kiln CA.
+fn server_tls(cfg: &Config, leaf: &crate::pki::Leaf) -> anyhow::Result<crate::http::tls::ServerTls> {
+    match (&cfg.server.https_cert, &cfg.server.https_key) {
+        (Some(c), Some(k)) => {
+            let cert = std::fs::read_to_string(c).with_context(|| format!("server.https_cert {}", c.display()))?;
+            let key = std::fs::read_to_string(k).with_context(|| format!("server.https_key {}", k.display()))?;
+            crate::http::tls::ServerTls::from_pem(&cert, &key).context("server.https_cert and server.https_key")
+        }
+        (None, None) => crate::http::tls::ServerTls::from_pem(&leaf.cert_pem, &leaf.key_pem).context("the kiln CA's certificate for HTTPS"),
+        _ => anyhow::bail!("server.https_cert and server.https_key go together"),
+    }
 }
 
 /// The local agent shares the process shutdown token.

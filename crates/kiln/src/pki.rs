@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _, SerialNumber,
 };
+use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
 /// The DNS name agents expect in the server certificate (sent as SNI).
@@ -23,6 +24,11 @@ const LEAF_DAYS: i64 = 365;
 pub const EPHEMERAL_DAYS: i64 = 2;
 /// Renew a leaf when it has less than this left.
 const RENEW_DAYS: i64 = 30;
+/// How long a front door's certificate (HTTPS on a runner) lasts: a year, renewed when it has
+/// less than [`RENEW_DAYS`] left.
+pub const FRONT_DOOR_DAYS: i64 = 365;
+/// The longest a TLS server certificate may last for browsers and Apple's platforms.
+pub const MAX_TLS_DAYS: i64 = 398;
 
 pub struct Pki {
     dir: PathBuf,
@@ -86,6 +92,115 @@ fn leaf_params(names: Vec<String>, days: i64) -> anyhow::Result<CertificateParam
         p.distinguished_name.push(DnType::CommonName, n.clone());
     }
     Ok(p)
+}
+
+/// What a certificate says about itself, for status lines and checks. Never holds key material.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CertInfo {
+    /// Its subject's common name (empty when it has none).
+    pub subject: String,
+    /// Its issuer's common name, else the whole issuer name.
+    pub issuer: String,
+    /// Its DNS names and IP addresses (subject alternative names), in order.
+    pub names: Vec<String>,
+    pub not_before: i64,
+    pub not_after: i64,
+    /// SHA-256 of the certificate (DER), hex.
+    pub sha256: String,
+    /// Its extended key usages allow TLS servers (or it lists none, which allows any).
+    pub server_auth: bool,
+}
+
+/// The first certificate of a PEM chain, described.
+pub fn cert_info(pem: &str) -> anyhow::Result<CertInfo> {
+    cert_info_der(&pem_to_der(pem)?)
+}
+
+/// A DER certificate, described.
+pub fn cert_info_der(der: &[u8]) -> anyhow::Result<CertInfo> {
+    use x509_parser::extensions::GeneralName;
+    let (_, cert) = x509_parser::parse_x509_certificate(der).map_err(|e| anyhow::anyhow!("not a certificate: {e}"))?;
+    let common_name = |n: &x509_parser::x509::X509Name<'_>| n.iter_common_name().next().and_then(|cn| cn.as_str().ok()).map(str::to_owned);
+    let mut names = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for n in &san.value.general_names {
+            match n {
+                GeneralName::DNSName(d) => names.push((*d).to_owned()),
+                GeneralName::IPAddress(b) => {
+                    let ip = match b.len() {
+                        4 => <[u8; 4]>::try_from(*b).ok().map(|a| std::net::IpAddr::from(a).to_string()),
+                        16 => <[u8; 16]>::try_from(*b).ok().map(|a| std::net::IpAddr::from(a).to_string()),
+                        _ => None,
+                    };
+                    names.extend(ip);
+                }
+                _ => {}
+            }
+        }
+    }
+    let server_auth = match cert.extended_key_usage() {
+        Ok(Some(eku)) => eku.value.any || eku.value.server_auth,
+        Ok(None) => true,
+        Err(_) => false,
+    };
+    Ok(CertInfo {
+        subject: common_name(cert.subject()).unwrap_or_default(),
+        issuer: common_name(cert.issuer()).unwrap_or_else(|| cert.issuer().to_string()),
+        names,
+        not_before: cert.validity().not_before.timestamp(),
+        not_after: cert.validity().not_after.timestamp(),
+        sha256: crate::util::sha256_hex(der),
+        server_auth,
+    })
+}
+
+/// Whether a certificate naming `names` is valid for the host `host`: an exact name (ASCII
+/// case-insensitive), or a wildcard (`*.kiln.home`) standing for exactly one leftmost label.
+pub fn covers(names: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    names.iter().any(|n| {
+        let n = n.trim_end_matches('.');
+        if n.eq_ignore_ascii_case(host) {
+            return true;
+        }
+        match (n.strip_prefix("*."), host.split_once('.')) {
+            (Some(suffix), Some((label, rest))) => !label.is_empty() && label != "*" && rest.eq_ignore_ascii_case(suffix),
+            _ => false,
+        }
+    })
+}
+
+/// A CSR for a front door's certificate: `names` signed with `key_pem` (the server decides the
+/// names it signs anyway, see [`Pki::sign_front_door`]).
+pub fn front_door_csr(names: &[String], key_pem: &str) -> anyhow::Result<String> {
+    let key = KeyPair::from_pem(key_pem).context("parse the front door's key")?;
+    let mut params = CertificateParams::new(names.to_vec()).context("certificate names")?;
+    params.distinguished_name = DistinguishedName::new();
+    if let Some(n) = names.iter().find(|n| n.parse::<std::net::IpAddr>().is_err()) {
+        params.distinguished_name.push(DnType::CommonName, n.clone());
+    }
+    Ok(params.serialize_request(&key)?.pem()?)
+}
+
+/// A fresh private key (PEM) for a front door's certificate.
+pub fn new_key_pem() -> anyhow::Result<String> {
+    Ok(KeyPair::generate().context("generate a key")?.serialize_pem())
+}
+
+/// Whether `cert_pem`'s first certificate is for the private key `key_pem`.
+pub fn cert_matches_key(cert_pem: &str, key_pem: &str) -> bool {
+    let (Ok(der), Ok(key)) = (pem_to_der(cert_pem), KeyPair::from_pem(key_pem)) else { return false };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(&der) else { return false };
+    key.der_bytes() == cert.public_key().subject_public_key.data.as_ref()
+}
+
+/// Whether the CA certificate `ca_der` signed the certificate `der`.
+pub fn verify_issued(ca_der: &[u8], der: &[u8]) -> bool {
+    let (Ok((_, cert)), Ok((_, ca))) = (x509_parser::parse_x509_certificate(der), x509_parser::parse_x509_certificate(ca_der)) else {
+        return false;
+    };
+    cert.verify_signature(Some(ca.public_key())).is_ok()
 }
 
 /// Make an agent name safe to use as a DNS SAN.
@@ -206,6 +321,47 @@ impl Pki {
         Ok((name, signed.pem()))
     }
 
+    /// Sign a runner's CSR for its front door: a TLS server certificate for exactly `names` (DNS
+    /// names, wildcards such as `*.kiln.home`, and IP addresses), whatever the CSR asked, valid for
+    /// `days` (fewer than [`MAX_TLS_DAYS`]). Its only extended key usage is serverAuth, so it never
+    /// passes as a machine's client certificate, and it may not name [`SERVER_NAME`], the identity
+    /// runners check the server by. Each one gets a random serial number.
+    pub fn sign_front_door(&self, csr_pem: &str, names: &[String], days: i64) -> anyhow::Result<String> {
+        anyhow::ensure!(!names.is_empty(), "a certificate needs at least one name");
+        anyhow::ensure!(names.len() <= 64, "a certificate takes at most 64 names");
+        for n in names {
+            anyhow::ensure!(!n.trim_end_matches('.').eq_ignore_ascii_case(SERVER_NAME), "{SERVER_NAME} is the server's own identity");
+        }
+        // Parsing checks the CSR's own signature (possession of its private key).
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse CSR")?;
+        let mut p = CertificateParams::new(names.to_vec()).context("certificate names")?;
+        let now = OffsetDateTime::now_utc();
+        p.not_before = now - Duration::hours(1);
+        p.not_after = now + Duration::days(days.clamp(1, MAX_TLS_DAYS - 1));
+        p.is_ca = IsCa::ExplicitNoCa;
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        p.use_authority_key_identifier_extension = true;
+        let mut serial: [u8; 16] = rand::random();
+        if let Some(b) = serial.first_mut() {
+            // A positive number, of the same length every time.
+            *b = (*b & 0x7f) | 0x40;
+        }
+        p.serial_number = Some(SerialNumber::from_slice(&serial));
+        p.distinguished_name = DistinguishedName::new();
+        if let Some(n) = names.iter().find(|n| n.parse::<std::net::IpAddr>().is_err()) {
+            p.distinguished_name.push(DnType::CommonName, n.clone());
+        }
+        p.distinguished_name.push(DnType::OrganizationName, "kiln front door");
+        let signed = CertificateSigningRequestParams { params: p, public_key: csr.public_key }.signed_by(&self.issuer).context("sign CSR")?;
+        Ok(signed.pem())
+    }
+
+    /// Whether this CA issued (signed) the DER certificate `der`.
+    pub fn issued(&self, der: &[u8]) -> bool {
+        verify_issued(&self.ca_der, der)
+    }
+
     /// Issue a full leaf (key generated here). Used for the server's own in-process local agent.
     pub fn issue_local(&self, name: &str) -> anyhow::Result<Leaf> {
         let key = KeyPair::generate()?;
@@ -254,6 +410,74 @@ mod tests {
         assert_eq!(again.ca_pem, pki.ca_pem);
         assert_eq!(sanitize_name("Bench Box #1"), "bench-box--1");
         Ok(())
+    }
+
+    #[test]
+    fn front_door_certificates_are_tls_server_certificates_for_exactly_their_names() -> anyhow::Result<()> {
+        use x509_parser::extensions::GeneralName;
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open(dir.path())?;
+        let key = new_key_pem()?;
+        // The CSR asks for more than it gets: the server decides the names.
+        let csr = front_door_csr(&["kiln.home".to_owned(), "evil.example".to_owned()], &key)?;
+        let names: Vec<String> = ["kiln.home", "*.kiln.home", "ci.home", "kiln.local", "192.168.1.77", "fd00::77"].map(str::to_owned).to_vec();
+        let pem = pki.sign_front_door(&csr, &names, FRONT_DOOR_DAYS)?;
+        let der = pem_to_der(&pem)?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // SANs: the DNS names and the IP addresses asked for, nothing else.
+        let san = cert.subject_alternative_name().map_err(|e| anyhow::anyhow!("{e}"))?.ok_or_else(|| anyhow::anyhow!("no SAN"))?;
+        let dns: Vec<&str> = san.value.general_names.iter().filter_map(|n| if let GeneralName::DNSName(d) = n { Some(*d) } else { None }).collect();
+        assert_eq!(dns, ["kiln.home", "*.kiln.home", "ci.home", "kiln.local"]);
+        let ips = san.value.general_names.iter().filter(|n| matches!(n, GeneralName::IPAddress(_))).count();
+        assert_eq!(ips, 2);
+        let info = cert_info(&pem)?;
+        assert_eq!(info.names, names);
+        assert_eq!(info.subject, "kiln.home");
+        assert_eq!(info.issuer, "kiln CA");
+        assert!(info.server_auth);
+
+        // serverAuth only: never a client certificate (which is how runners identify themselves).
+        let eku = cert.extended_key_usage().map_err(|e| anyhow::anyhow!("{e}"))?.ok_or_else(|| anyhow::anyhow!("no EKU"))?;
+        assert!(eku.value.server_auth && !eku.value.client_auth && !eku.value.any);
+        let bc = cert.basic_constraints().map_err(|e| anyhow::anyhow!("{e}"))?.ok_or_else(|| anyhow::anyhow!("no basic constraints"))?;
+        assert!(!bc.value.ca);
+
+        // Validity: under 398 days in all, starting now, so browsers and iOS take it.
+        let (nb, na) = (cert.validity().not_before.timestamp(), cert.validity().not_after.timestamp());
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        assert!(na - nb < MAX_TLS_DAYS * 86_400, "{} days", (na - nb) / 86_400);
+        assert!(na - now > (FRONT_DOOR_DAYS - 1) * 86_400 && nb <= now);
+        assert!(!needs_renewal(&pem));
+        // Asking for longer gets the most browsers allow, no more.
+        let long = cert_info(&pki.sign_front_door(&csr, &names, 5000)?)?;
+        assert!(long.not_after - long.not_before < MAX_TLS_DAYS * 86_400);
+
+        // Signed by this CA, for the CSR's key; each one gets its own serial.
+        assert!(pki.issued(&der));
+        assert!(!Pki::open(tempfile::tempdir()?.path())?.issued(&der));
+        assert!(cert_matches_key(&pem, &key));
+        assert!(!cert_matches_key(&pem, &new_key_pem()?));
+        let again = x509_parser::parse_x509_certificate(&pem_to_der(&pki.sign_front_door(&csr, &names, 30)?)?).map_err(|e| anyhow::anyhow!("{e}"))?.1.raw_serial().to_vec();
+        assert_ne!(again, cert.raw_serial().to_vec());
+
+        // Never the server's identity, never nameless.
+        assert!(pki.sign_front_door(&csr, &["kiln-server".to_owned()], 30).is_err());
+        assert!(pki.sign_front_door(&csr, &[], 30).is_err());
+        assert!(pki.sign_front_door("not a csr", &names, 30).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn wildcards_cover_one_label() {
+        let names = vec!["kiln.home".to_owned(), "*.kiln.home".to_owned()];
+        assert!(covers(&names, "kiln.home"));
+        assert!(covers(&names, "KILN.home."));
+        assert!(covers(&names, "ci.kiln.home"));
+        assert!(!covers(&names, "a.b.kiln.home"));
+        assert!(!covers(&names, "kiln.lan"));
+        assert!(!covers(&names, "*.kiln.home.evil"));
+        assert!(!covers(&[], "kiln.home"));
     }
 
     #[test]

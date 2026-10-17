@@ -223,7 +223,8 @@ impl hyper::rt::Timer for RtTimer {
 /// Time allowed for each address's TCP connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(super) async fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
+/// A TCP connection to `host:port` (a name or an address), trying each address in turn.
+pub(crate) async fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
     let mut addrs = crate::rt::resolve_host(host, port).await?;
     // IPv4 first: a dual-stack name often has an unreachable IPv6 address here.
     addrs.sort_by_key(|a| !a.is_ipv4());

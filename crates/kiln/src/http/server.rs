@@ -32,9 +32,50 @@ pub fn remote_ip(req: &Request) -> Option<std::net::IpAddr> {
     req.extensions().get::<RemoteAddr>().map(|r| r.0.ip())
 }
 
+/// Attached to every request of a connection that came over TLS (the server's own HTTPS).
+#[derive(Clone, Copy, Debug)]
+pub struct Secure;
+
 /// Serve one accepted connection until the client goes away. Errors are logged at debug level:
 /// clients disappearing mid-request are normal.
 pub async fn serve_connection<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    H: Handler,
+{
+    serve_connection_with(io, handler, remote, false).await;
+}
+
+/// How long a new connection may take to say whether it speaks TLS, and to finish the handshake.
+const FIRST_BYTE: std::time::Duration = std::time::Duration::from_secs(30);
+const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Serve a connection in whichever of TLS and plain HTTP it starts with: a TLS handshake begins
+/// with a handshake record (0x16), which no HTTP request does. So `server.https` adds HTTPS
+/// without taking plain HTTP from runners and scripts that use it.
+pub async fn serve_tls_or_plain<H: Handler>(stream: hyper_rt::tcp::TcpStream, handler: Arc<H>, remote: Option<std::net::SocketAddr>, tls: &super::tls::ServerTls) {
+    let mut first = [0u8; 1];
+    let n = match crate::rt::timeout(FIRST_BYTE, stream.read(&mut first)).await {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return,
+    };
+    let head = first.get(..n).unwrap_or_default().to_vec();
+    let is_tls = head.first() == Some(&0x16);
+    let io = super::tls::Prefixed::new(head, super::io::RtFuturesIo::new(stream));
+    if !is_tls {
+        serve_connection_with(super::tls::HyperIo::new(io), handler, remote, false).await;
+        return;
+    }
+    let Ok(config) = tls.config() else { return };
+    match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
+        Ok(Ok(s)) => serve_connection_with(s, handler, remote, true).await,
+        Ok(Err(e)) => tracing::debug!(error = %e, ?remote, "TLS handshake failed"),
+        Err(_) => tracing::debug!(?remote, "TLS handshake timed out"),
+    }
+}
+
+/// [`serve_connection`], saying whether the connection is TLS ([`Secure`] on its requests).
+pub async fn serve_connection_with<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     H: Handler,
@@ -43,6 +84,9 @@ where
         let h = handler.clone();
         if let Some(r) = remote {
             req.extensions_mut().insert(RemoteAddr(r));
+        }
+        if secure {
+            req.extensions_mut().insert(Secure);
         }
         async move { Ok::<_, Infallible>(h.handle(req).await) }
     });
