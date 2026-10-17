@@ -216,7 +216,7 @@ function SessionCard({ s, onTranscript }: { s: AiSession; onTranscript: () => vo
           {tildify(s.cwd) || "—"}
         </span>
         {s.branch && <span className="chip">{s.branch}</span>}
-        {s.name && <span className="chip">{s.name}</span>}
+        {s.name && s.title && <span className="chip">{s.name}</span>}
       </div>
       {s.last_prompt && (
         <p className="mt-3 line-clamp-2 px-4 text-[12.5px] break-words text-[#cdc4e0]">

@@ -75,6 +75,21 @@ fn size(cols: u16, rows: u16) -> PtySize {
     PtySize { rows: rows.clamp(2, 1000), cols: cols.clamp(2, 1000), pixel_width: 0, pixel_height: 0 }
 }
 
+/// Environment Claude Code sets for the programs a session runs.
+const CLAUDE_SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_EFFORT",
+    "CLAUDE_PID",
+];
+
 /// Start `command` (or an interactive login shell) on a new PTY.
 pub fn spawn(
     shell: Option<&str>,
@@ -89,6 +104,12 @@ pub fn spawn(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("KILN_TERMINAL", "1");
+    // A kiln terminal is a session of its own, even when kiln was started from inside a Claude
+    // Code session: drop that session's markers (and its messaging token), or a `claude` run
+    // here believes it is nested and neither saves its transcript nor registers itself.
+    for marker in CLAUDE_SESSION_MARKERS {
+        cmd.env_remove(marker);
+    }
     // Programs started here can rely on it (`exec $SHELL -l` after an agent exits).
     if cfg!(unix) {
         cmd.env("SHELL", &shell);

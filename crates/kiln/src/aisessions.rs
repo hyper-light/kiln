@@ -84,7 +84,8 @@ pub struct AiSession {
     pub started_at: i64,
     /// Unix seconds of the last transcript write (the start when there is none).
     pub last_activity: i64,
-    /// "working" (mid-turn), "waiting" (the turn ended: waiting for the user), or empty.
+    /// "working" (mid-turn), "waiting" (the turn ended: waiting for the user), "starting" (not a
+    /// session yet, e.g. at a first-run prompt), or empty (unknown).
     pub state: String,
     pub last_prompt: String,
     pub last_reply: String,
@@ -295,7 +296,13 @@ impl Scanner {
         let mut found: Vec<(Tool, Proc)> = Vec::new();
         for (pid, p) in self.sys.processes() {
             let Some(tool) = tool_of(p) else { continue };
-            if seen.contains(&pid.as_u32()) || (tool == Tool::Claude && have_records) || !interactive(tool, &args_of(p)) {
+            if seen.contains(&pid.as_u32()) || !interactive(tool, &args_of(p)) {
+                continue;
+            }
+            // Claude Code writes its record once the session starts (after the folder-trust
+            // prompt). Before that, only one inside a kiln terminal is shown: it is the one
+            // someone just launched from here.
+            if tool == Tool::Claude && have_records && terminal_of(&self.sys, *pid, terminals).is_none() {
                 continue;
             }
             // A tool's own helpers and relaunches run under it: report the outermost one.
@@ -306,7 +313,8 @@ impl Scanner {
         }
         // Newest first, so two sessions in one directory each claim their own transcript.
         found.sort_by_key(|(_, p)| std::cmp::Reverse(p.start));
-        let mut taken: HashSet<PathBuf> = HashSet::new();
+        // Transcripts already accounted for are nobody else's.
+        let mut taken: HashSet<PathBuf> = open.values().map(|(_, f): &(Tool, PathBuf)| f.clone()).collect();
         for (tool, p) in found {
             let file = match tool {
                 Tool::Codex => self.codex_file(&p, &taken),
@@ -317,7 +325,11 @@ impl Scanner {
                 taken.insert(f.clone());
             }
             let summary = file.as_deref().and_then(|f| self.summary(tool, f));
-            let s = self.session(tool, &p, file.as_deref(), summary, terminals);
+            let mut s = self.session(tool, &p, file.as_deref(), summary, terminals);
+            // Claude Code without its record has not started a session yet.
+            if tool == Tool::Claude && have_records {
+                s.state = "starting".into();
+            }
             if let Some(f) = file {
                 open.insert(p.pid, (tool, f));
             }
@@ -427,14 +439,21 @@ impl Scanner {
         found
     }
 
-    /// Without a session record: the newest transcript in the process's project directory
-    /// written since it started.
+    /// Without a session record: the newest transcript in the process's project directory that
+    /// was created after it started (other sessions in the same directory write there too).
     fn claude_file_by_cwd(&self, p: &Proc, taken: &HashSet<PathBuf>) -> Option<PathBuf> {
         if p.cwd.is_empty() {
             return None;
         }
         let dir = self.home.join(".claude").join("projects").join(claude_dir_name(&p.cwd));
-        newest_since(&dir, p.start.saturating_sub(60), taken)
+        let mut files = Vec::new();
+        walk_jsonl(&dir, 0, &mut |f| born_since(f, p.start), &mut files);
+        files
+            .into_iter()
+            .filter(|f| !taken.contains(f))
+            .filter_map(|f| Some((std::fs::metadata(&f).ok()?.modified().ok()?, f)))
+            .max_by_key(|(m, _)| *m)
+            .map(|(_, f)| f)
     }
 
     /// A Codex process's rollout: `codex resume <id>` names it; otherwise the newest rollout of
@@ -568,16 +587,10 @@ fn terminal_of(sys: &System, pid: Pid, terminals: &HashMap<u32, String>) -> Opti
     None
 }
 
-/// The newest `*.jsonl` directly in `dir` modified at or after `since` (unix seconds).
-fn newest_since(dir: &Path, since: u64, taken: &HashSet<PathBuf>) -> Option<PathBuf> {
-    let mut files = Vec::new();
-    walk_jsonl(dir, 0, &mut |f| modified_since(f, since), &mut files);
-    files
-        .into_iter()
-        .filter(|f| !taken.contains(f))
-        .filter_map(|f| Some((std::fs::metadata(&f).ok()?.modified().ok()?, f)))
-        .max_by_key(|(m, _)| *m)
-        .map(|(_, f)| f)
+/// Created at or after `since` (unix seconds). Where the filesystem keeps no creation time,
+/// nothing qualifies: an older file could be any session's.
+fn born_since(f: &Path, since: u64) -> bool {
+    std::fs::metadata(f).and_then(|m| m.created()).is_ok_and(|c| u64::try_from(unix_secs(c)).unwrap_or(0) >= since)
 }
 
 fn modified_since(f: &Path, since: u64) -> bool {
