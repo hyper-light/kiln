@@ -140,6 +140,16 @@ pub struct Updates {
     image: Mutex<Option<(Instant, ImageCheck)>>,
     checking_release: AtomicBool,
     checking_image: AtomicBool,
+    /// A push to the release branch: the server's commit may be there now (`in_step_loop`).
+    in_step_wake: crate::rt::Notify,
+}
+
+impl Updates {
+    /// The release branch moved (a push kiln saw): look again at once whether every platform can
+    /// be built from the server's commit, rather than at the next tick.
+    pub fn wake_in_step(&self) {
+        self.in_step_wake.notify();
+    }
 }
 
 /// A short, stable id of a build: the start of its binary's SHA-256.
@@ -385,6 +395,8 @@ pub async fn in_step_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            // Pushed: a commit that wasn't in the repository may be now, so no waiting.
+            () = hub.updates.in_step_wake.notified().fuse() => starts.last = None,
             () = tick.tick().fuse() => {}
         }
         if let Err(e) = keep_in_step(&hub, commit, &mut starts).await {
