@@ -1,12 +1,12 @@
 import * as React from "react";
 import { wsUrl } from "@/api/client";
 import type { TerminalControlFrame, TerminalSessionInfo } from "@/api/types";
-import { createTerminal, ensureFont, safeFit, type KilnTerminal } from "@/components/terminal/xterm-setup";
+import { createTerminal, ensureFont, TERM_FONT, type KilnTerminal } from "@/components/terminal/xterm-setup";
 
 export type SessionState =
   | { kind: "connecting" }
   | { kind: "open" }
-  /** The socket dropped (server restart, network, sleep); the shell keeps running and we reattach. */
+  /** Lost the connection; the shell keeps running and this view reattaches on its own. */
   | { kind: "reconnecting"; attempt: number }
   | { kind: "exited"; code: number | null }
   | { kind: "error"; message: string };
@@ -16,7 +16,6 @@ export interface SessionHandle {
   focus: () => void;
   clear: () => void;
   copySelection: () => Promise<void>;
-  setFontSize: (px: number) => void;
   /** Send bytes to the shell as if typed (on-screen keyboard). */
   send: (bytes: string) => void;
   /** The program's application-cursor mode (arrows encode differently in vim, less, TUIs). */
@@ -24,35 +23,59 @@ export interface SessionHandle {
 }
 
 interface Props {
+  /** Stable id of the tab this view belongs to (passed back to every callback). */
+  tabId: string;
   /** Server session to attach to; null opens a new session on `target`. */
   sessionId: string | null;
   target: string;
+  /** The selected tab of a visible terminal page: the view the user is using right now. */
   active: boolean;
-  /** workspace visible (route) */
-  visible: boolean;
   fontSize: number;
   copyOnSelect: boolean;
   /** Whether tapping the terminal may open the device keyboard (false while the full kiln keyboard is in use). */
   deviceKeyboard: boolean;
-  onState: (s: SessionState) => void;
-  onTitle: (title: string) => void;
+  onState: (tabId: string, s: SessionState) => void;
+  onTitle: (tabId: string, title: string) => void;
   /** The server confirmed which session this view is on (first frame of every attach). */
-  onSession: (info: TerminalSessionInfo) => void;
+  onSession: (tabId: string, info: TerminalSessionInfo) => void;
+  /** The session was ended (from this device or another): this tab should go. */
+  onClosed: (tabId: string) => void;
+  /** A finger scrolled the terminal, or tapped it (the on-screen keyboard folds and returns like a phone's). */
+  onGesture?: (tabId: string, g: "scroll" | "tap") => void;
   onRenderer?: (r: "webgl" | "dom") => void;
+}
+
+interface Size {
+  cols: number;
+  rows: number;
 }
 
 const encoder = new TextEncoder();
 /** Reattach delays: quick at first (server restarts take ~1-2 s), then patient. */
 const BACKOFF_MS = [250, 500, 1000, 1500, 2500, 4000];
+/** Window titles change constantly while AI harnesses work (spinners): report at most this often. */
+const TITLE_EVERY_MS = 250;
+/** While the view's space is changing (keyboard resize, rotation), size changes go out at most this often. */
+const RESIZE_SETTLE_MS = 60;
+/** Smallest font a view shrinks to while showing a session sized by a bigger screen. */
+const MIN_FONT = 6;
+/** Finger travel before a touch counts as a scroll instead of a tap. */
+const TAP_SLOP_PX = 6;
 
 /**
- * One terminal view: xterm.js attached to a server-side session over /api/terminal/ws. The shell
- * lives on the server or a machine, not in this page: when the socket drops the view keeps
- * reattaching by session id and repaints from the server's replay, so a restart or a flaky network
- * costs a moment of "reconnecting", never the shell.
+ * One terminal view: xterm.js attached to a server-side session over /api/terminal/ws.
+ *
+ * Size: a session has one size, shared by every device viewing it, and the device in use sets it —
+ * the selected tab claims its full size when it attaches, when its space changes, and when the user
+ * touches or types in it. Every other view (other devices, hidden tabs) draws at exactly the size
+ * the server announces, shrinking its font to fit, so a program's cursor-addressed redraws land in
+ * the right cells everywhere. Hidden tabs never resize a session and don't render.
+ *
+ * Connection: the shell lives on the server or a machine, not in this page. When the socket drops,
+ * the view keeps reattaching by session id and repaints from the server's replay.
  */
-export const TerminalSession = React.forwardRef<SessionHandle, Props>(function TerminalSession(
-  { sessionId, target, active, visible, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onRenderer },
+const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function TerminalSession(
+  { tabId, sessionId, target, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer },
   ref,
 ) {
   const hostRef = React.useRef<HTMLDivElement>(null);
@@ -60,28 +83,146 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
   const wsRef = React.useRef<WebSocket | null>(null);
   const sessionRef = React.useRef<string | null>(sessionId);
   const [gen, setGen] = React.useState(0);
-  const cbs = React.useRef({ onState, onTitle, onSession, onRenderer, copyOnSelect });
-  cbs.current = { onState, onTitle, onSession, onRenderer, copyOnSelect };
+  // Everything handlers read lives in refs: handlers never go stale and nothing re-renders for them.
+  const live = React.useRef({ tabId, active, fontSize, copyOnSelect, onState, onTitle, onSession, onClosed, onGesture, onRenderer });
+  live.current = { tabId, active, fontSize, copyOnSelect, onState, onTitle, onSession, onClosed, onGesture, onRenderer };
+  /** The session's size as the server last announced it. */
+  const sessionSize = React.useRef<Size | null>(null);
+  /** The size that fills this view at the user's font size (measured on layout changes only). */
+  const desired = React.useRef<Size | null>(null);
+  const pendingSize = React.useRef<Size | null>(null);
+  const sendTimer = React.useRef(0);
 
-  const sendBytes = React.useCallback((data: string | Uint8Array<ArrayBuffer>) => {
-    const ws = wsRef.current;
-    if (ws?.readyState !== WebSocket.OPEN) return;
-    ws.send(typeof data === "string" ? encoder.encode(data) : data);
+  /** Cells that fill the view at the user's font size. Reads layout: only on layout changes. */
+  const measure = React.useCallback((): Size | null => {
+    const k = kRef.current;
+    const host = hostRef.current;
+    if (!k || !host || host.clientWidth < 20 || host.clientHeight < 20) return null;
+    const base = live.current.fontSize;
+    if (k.term.options.fontSize !== base) k.term.options.fontSize = base;
+    const d = k.fit.proposeDimensions();
+    if (!d || !Number.isFinite(d.cols) || !Number.isFinite(d.rows)) return null;
+    desired.current = { cols: Math.max(2, d.cols), rows: Math.max(2, d.rows) };
+    return desired.current;
   }, []);
 
-  /* ---- terminal instance: created once per component ---- */
+  /** Draw at the view's own scale again (it is the one in use, or the session fits it). */
+  const unscale = React.useCallback(() => {
+    const el = kRef.current?.term.element;
+    if (el?.style.transform) el.style.transform = "";
+  }, []);
+
+  /** Send the claimed size, unless the session already has it. */
+  const flushSize = React.useCallback(() => {
+    window.clearTimeout(sendTimer.current);
+    sendTimer.current = 0;
+    const d = pendingSize.current;
+    pendingSize.current = null;
+    const ws = wsRef.current;
+    if (!d || ws?.readyState !== WebSocket.OPEN) return;
+    const cur = sessionSize.current;
+    if (cur && cur.cols === d.cols && cur.rows === d.rows) return;
+    sessionSize.current = d;
+    ws.send(JSON.stringify({ type: "resize", cols: d.cols, rows: d.rows }));
+  }, []);
+
+  /**
+   * This view is the one in use: draw at its full size and make that the session's size.
+   * `remeasure` reads layout (space changed); typing passes false and costs no layout work.
+   * `urgent` sends at once; space changes settle first so a drag doesn't flood the program.
+   */
+  const claim = React.useCallback(
+    (remeasure: boolean, urgent: boolean) => {
+      const k = kRef.current;
+      const d = remeasure ? measure() : desired.current;
+      if (!k || !d) return;
+      const base = live.current.fontSize;
+      if (k.term.options.fontSize !== base) k.term.options.fontSize = base;
+      unscale();
+      if (k.term.cols !== d.cols || k.term.rows !== d.rows) k.term.resize(d.cols, d.rows);
+      const cur = sessionSize.current;
+      if (cur && cur.cols === d.cols && cur.rows === d.rows) {
+        pendingSize.current = null;
+        return;
+      }
+      pendingSize.current = d;
+      if (urgent) flushSize();
+      else if (!sendTimer.current) sendTimer.current = window.setTimeout(flushSize, RESIZE_SETTLE_MS);
+    },
+    [measure, flushSize, unscale],
+  );
+
+  /**
+   * Draw the session at the size the server announced: shrink the font when it is bigger than
+   * this view, and below the smallest font, scale the whole grid down so it is all still in view
+   * (until this device is used, which takes the size back).
+   */
+  const follow = React.useCallback(() => {
+    const k = kRef.current;
+    const want = sessionSize.current;
+    if (!k || !want) return;
+    const fits = measure(); // null while hidden: then only the grid follows
+    let shrinkMore = false;
+    if (fits) {
+      const base = live.current.fontSize;
+      let font = Math.max(MIN_FONT, Math.floor(base * Math.min(1, fits.cols / want.cols, fits.rows / want.rows) * 2) / 2);
+      // Cell sizes round, so check the guess against the real metrics and step down until it fits.
+      for (let i = 0; i < 6; i++) {
+        if (k.term.options.fontSize !== font) k.term.options.fontSize = font;
+        const d = k.fit.proposeDimensions();
+        if (!d || (d.cols >= want.cols && d.rows >= want.rows)) break;
+        if (font <= MIN_FONT) {
+          shrinkMore = true;
+          break;
+        }
+        font = Math.max(MIN_FONT, font - 0.5);
+      }
+    }
+    if (k.term.cols !== want.cols || k.term.rows !== want.rows) k.term.resize(want.cols, want.rows);
+    const el = k.term.element;
+    const host = hostRef.current;
+    const screen = el?.querySelector<HTMLElement>(".xterm-screen");
+    if (shrinkMore && el && host && screen && screen.offsetWidth > 0) {
+      const scale = Math.min(1, host.clientWidth / screen.offsetWidth, host.clientHeight / screen.offsetHeight);
+      el.style.transformOrigin = "0 0";
+      el.style.transform = `scale(${scale.toFixed(4)})`;
+    } else {
+      unscale();
+    }
+  }, [measure, unscale]);
+
+  /** Lay the view out for its role after its space changed. */
+  const layout = React.useCallback(() => {
+    if (live.current.active) claim(true, false);
+    else follow();
+  }, [claim, follow]);
+
+  const sendBytes = React.useCallback(
+    (data: string | Uint8Array<ArrayBuffer>) => {
+      const ws = wsRef.current;
+      if (ws?.readyState !== WebSocket.OPEN) return;
+      // Typing here makes this the device in use (tmux's "latest" sizing): take the size back.
+      if (live.current.active) claim(false, true);
+      ws.send(typeof data === "string" ? encoder.encode(data) : data);
+    },
+    [claim],
+  );
+
+  /* ---- terminal instance: created once per view ---- */
   React.useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
     let disposed = false;
     let k: KilnTerminal | null = null;
     const subs: { dispose(): void }[] = [];
+    let titleTimer = 0;
+    let pendingTitle: string | null = null;
 
     void ensureFont().then(() => {
       if (disposed) return;
-      k = createTerminal(host, { fontSize });
+      k = createTerminal(host, { fontSize: live.current.fontSize });
       kRef.current = k;
-      cbs.current.onRenderer?.(k.renderer());
+      live.current.onRenderer?.(k.renderer());
       const term = k.term;
 
       // Let the browser handle copy/paste chords; everything else goes to the PTY.
@@ -106,76 +247,207 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
           for (let i = 0; i < d.length; i++) buf[i] = d.charCodeAt(i) & 0xff;
           sendBytes(buf);
         }),
-        term.onResize(({ cols, rows }) => {
-          const ws = wsRef.current;
-          if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "resize", cols, rows }));
+        // Coalesced: at most one report per TITLE_EVERY_MS, with the latest title.
+        term.onTitleChange((t) => {
+          pendingTitle = t;
+          if (titleTimer) return;
+          titleTimer = window.setTimeout(() => {
+            titleTimer = 0;
+            if (pendingTitle !== null) live.current.onTitle(live.current.tabId, pendingTitle);
+            pendingTitle = null;
+          }, TITLE_EVERY_MS);
         }),
-        term.onTitleChange((t) => cbs.current.onTitle(t)),
         term.onSelectionChange(() => {
-          if (!cbs.current.copyOnSelect) return;
+          if (!live.current.copyOnSelect) return;
           const sel = term.getSelection();
           if (sel) void navigator.clipboard?.writeText(sel).catch(() => undefined);
         }),
       );
 
-      safeFit(k, host);
-      setGen((g) => g + 1); // kick the connection effect now that the terminal exists
+      // A web font that lands after the first measurement (slow phone link) leaves cells sized for
+      // the fallback font and glyphs overlapping: measure again once it arrives.
+      if (!document.fonts.check(`13px "Geist Mono Variable"`)) {
+        const remeasure = () => {
+          const t = kRef.current?.term;
+          if (!t) return;
+          // A different but equivalent family string makes xterm re-measure its cells.
+          t.options.fontFamily = t.options.fontFamily === TERM_FONT ? `${TERM_FONT}, monospace` : TERM_FONT;
+          requestAnimationFrame(layout);
+        };
+        document.fonts.addEventListener("loadingdone", remeasure, { once: true });
+        subs.push({ dispose: () => document.fonts.removeEventListener("loadingdone", remeasure) });
+      }
+
+      setGen((g) => g + 1); // start the connection now that the terminal exists
     });
 
+    // Space changes (rotation, keyboard shown/resized, window resize): lay out once per frame.
     let raf = 0;
     const ro = new ResizeObserver(() => {
       cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        if (kRef.current) safeFit(kRef.current, host);
-      });
+      raf = requestAnimationFrame(layout);
     });
     ro.observe(host);
 
-    // Touch: a one-finger drag scrolls. It is replayed as wheel events on xterm, which then does
-    // what a wheel does there: scrollback in a shell, wheel reports to programs that track the
-    // mouse, arrow keys in full-screen programs that don't. Short touches stay taps.
+    // Touching the terminal makes this the device in use.
+    const onPointerDown = () => {
+      if (live.current.active) claim(false, true);
+    };
+    host.addEventListener("pointerdown", onPointerDown, { passive: true });
+
+    // Scrolling, by finger and by wheel, handled here in the capture phase (xterm's own handling
+    // moves 3 rows per wheel notch however fast the wheel spins, and its touch gestures would
+    // scroll a second time or turn a swipe into a tap). Shells scroll their scrollback; programs
+    // that track the mouse get wheel input and full-screen programs get arrow keys, as xterm
+    // sends them for a mouse wheel.
+    let carry = 0;
+    const rowHeight = () => {
+      const t = kRef.current?.term;
+      const screen = host.querySelector(".xterm-screen");
+      return t && screen && t.rows > 0 ? Math.max(4, screen.clientHeight / t.rows) : 16;
+    };
+    /** The program gets wheel input (mouse tracking) or arrow keys (full screen) rather than a scroll. */
+    const programScrolls = (t: KilnTerminal["term"]) => t.modes.mouseTrackingMode !== "none" || t.buffer.active.type === "alternate";
+    const scrollRows = (n: number) => {
+      const t = kRef.current?.term;
+      if (!t || n === 0) return;
+      if (programScrolls(t)) {
+        host.querySelector(".xterm-screen")?.dispatchEvent(new WheelEvent("wheel", { deltaY: n, deltaMode: 1, bubbles: true, cancelable: true }));
+      } else {
+        t.scrollLines(n);
+      }
+    };
+    const advance = (px: number) => {
+      carry += px;
+      const h = rowHeight();
+      const rows = Math.trunc(carry / h);
+      if (rows !== 0) {
+        carry -= rows * h;
+        scrollRows(rows);
+      }
+    };
+
+    // Wheel: a trackpad scrolls with the fingers, pixel for pixel (its momentum comes from the
+    // system); a mouse wheel moves 3 rows a notch when turned slowly and up to 15 when spun.
+    let lastNotch = 0;
+    const onWheel = (e: WheelEvent) => {
+      const t = kRef.current?.term;
+      if (!t || e.ctrlKey || e.deltaY === 0 || Math.abs(e.deltaX) > Math.abs(e.deltaY) || programScrolls(t)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const legacy = (e as WheelEvent & { wheelDeltaY?: number }).wheelDeltaY ?? 0;
+      const notch = e.deltaMode === WheelEvent.DOM_DELTA_LINE || (legacy !== 0 && legacy % 120 === 0 && Math.abs(e.deltaY) >= 50);
+      if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+        t.scrollLines(Math.sign(e.deltaY) * t.rows);
+      } else if (notch) {
+        const now = performance.now();
+        const gap = now - lastNotch;
+        lastNotch = now;
+        const perNotch = gap > 160 ? 3 : gap > 90 ? 5 : gap > 45 ? 9 : 15;
+        const notches = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? Math.max(1, Math.round(Math.abs(e.deltaY) / 3)) : Math.max(1, Math.round(Math.abs(legacy) / 120));
+        t.scrollLines(Math.sign(e.deltaY) * perNotch * notches);
+      } else {
+        advance(e.deltaY);
+      }
+    };
+    host.addEventListener("wheel", onWheel, { passive: false, capture: true });
+
+    // Touch: the content follows the finger row for row, then glides on with momentum (iOS-like
+    // deceleration); flicking again while it glides adds to the speed.
+    let startY = 0;
     let lastY: number | null = null;
-    let moved = 0;
+    let lastT = 0;
+    let scrolling = false;
+    let velocity = 0;
+    let glide = 0;
+    let glideV = 0;
+    let boost = 0;
+    const stopGlide = () => {
+      cancelAnimationFrame(glide);
+      glide = 0;
+    };
     const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length !== 1) return;
-      lastY = e.touches[0]?.clientY ?? null;
-      moved = 0;
+      // Catching a glide stops it; its speed carries into a flick the same way.
+      boost = glide ? glideV : 0;
+      stopGlide();
+      scrolling = false;
+      const t = e.touches[0];
+      if (e.touches.length !== 1 || !t) {
+        lastY = null;
+        return;
+      }
+      startY = lastY = t.clientY;
+      lastT = performance.now();
+      carry = 0;
+      velocity = 0;
     };
     const onTouchMove = (e: TouchEvent) => {
       const t = e.touches[0];
       if (lastY === null || !t || e.touches.length !== 1) return;
-      const dy = lastY - t.clientY;
-      moved += Math.abs(dy);
-      if (moved < 8) return;
-      lastY = t.clientY;
+      if (!scrolling && Math.abs(startY - t.clientY) < TAP_SLOP_PX) return;
+      if (!scrolling) {
+        // Reading, not typing: put the keyboards away, as a phone does when a list is dragged.
+        kRef.current?.term.blur();
+        live.current.onGesture?.(live.current.tabId, "scroll");
+      }
+      scrolling = true;
       e.preventDefault();
-      const screen = host.querySelector(".xterm-screen");
-      screen?.dispatchEvent(
-        new WheelEvent("wheel", { deltaY: dy * 2, deltaMode: 0, clientX: t.clientX, clientY: t.clientY, bubbles: true, cancelable: true }),
-      );
+      e.stopPropagation();
+      const dy = lastY - t.clientY;
+      const now = performance.now();
+      velocity = 0.8 * (dy / Math.max(1, now - lastT)) + 0.2 * velocity;
+      lastY = t.clientY;
+      lastT = now;
+      advance(dy);
     };
-    const onTouchEnd = () => {
+    const onTouchEnd = (e: TouchEvent) => {
+      if (scrolling) {
+        e.stopPropagation();
+        // A finger that stopped before lifting doesn't glide.
+        if (performance.now() - lastT < 80 && Math.abs(velocity) > 0.2) {
+          let v = Math.sign(boost) === Math.sign(velocity) ? velocity + boost : velocity; // px per ms
+          let prev = performance.now();
+          const step = (now: number) => {
+            const dt = Math.min(48, now - prev);
+            prev = now;
+            advance(v * dt);
+            v *= Math.pow(0.998, dt);
+            glideV = v;
+            glide = Math.abs(v) > 0.02 ? requestAnimationFrame(step) : 0;
+          };
+          glide = requestAnimationFrame(step);
+        }
+      } else if (lastY !== null && e.type === "touchend") {
+        live.current.onGesture?.(live.current.tabId, "tap");
+      }
+      scrolling = false;
       lastY = null;
     };
-    host.addEventListener("touchstart", onTouchStart, { passive: true });
-    host.addEventListener("touchmove", onTouchMove, { passive: false });
-    host.addEventListener("touchend", onTouchEnd, { passive: true });
-    host.addEventListener("touchcancel", onTouchEnd, { passive: true });
+    host.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
+    host.addEventListener("touchmove", onTouchMove, { passive: false, capture: true });
+    host.addEventListener("touchend", onTouchEnd, { capture: true });
+    host.addEventListener("touchcancel", onTouchEnd, { capture: true });
 
     return () => {
       disposed = true;
       cancelAnimationFrame(raf);
+      stopGlide();
+      window.clearTimeout(titleTimer);
+      window.clearTimeout(sendTimer.current);
       ro.disconnect();
-      host.removeEventListener("touchstart", onTouchStart);
-      host.removeEventListener("touchmove", onTouchMove);
-      host.removeEventListener("touchend", onTouchEnd);
-      host.removeEventListener("touchcancel", onTouchEnd);
+      host.removeEventListener("pointerdown", onPointerDown);
+      host.removeEventListener("wheel", onWheel, { capture: true });
+      host.removeEventListener("touchstart", onTouchStart, { capture: true });
+      host.removeEventListener("touchmove", onTouchMove, { capture: true });
+      host.removeEventListener("touchend", onTouchEnd, { capture: true });
+      host.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       subs.forEach((s) => s.dispose());
       wsRef.current?.close();
       wsRef.current = null;
       k?.dispose();
       kRef.current = null;
     };
+    // Created once; everything it reads changes through refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -185,13 +457,15 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
     if (!ta) return;
     if (deviceKeyboard) ta.removeAttribute("inputmode");
     else ta.setAttribute("inputmode", "none");
+    ta.setAttribute("autocapitalize", "off");
+    ta.setAttribute("autocorrect", "off");
+    ta.setAttribute("spellcheck", "false");
   }, [deviceKeyboard, gen]);
 
   /* ---- websocket: attach, and reattach whenever it drops ---- */
   React.useEffect(() => {
     const k = kRef.current;
-    const host = hostRef.current;
-    if (!k || !host || gen === 0) return;
+    if (!k || gen === 0) return;
     const term = k.term;
     let stopped = false;
     let ended = false;
@@ -204,73 +478,86 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
       window.clearTimeout(timer);
       const delay = fast ? 150 : (BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)] ?? 4000);
       attempt += 1;
-      cbs.current.onState({ kind: "reconnecting", attempt });
+      live.current.onState(live.current.tabId, { kind: "reconnecting", attempt });
       timer = window.setTimeout(connect, delay);
     };
 
     function connect() {
       if (stopped || ended) return;
-      safeFit(k!, host!);
       const params = new URLSearchParams();
       const reattach = sessionRef.current !== null;
       if (sessionRef.current) params.set("session", sessionRef.current);
       else {
+        const d = measure();
         params.set("target", target);
-        params.set("cols", String(Math.max(2, term.cols)));
-        params.set("rows", String(Math.max(1, term.rows)));
+        params.set("cols", String(d?.cols ?? term.cols));
+        params.set("rows", String(d?.rows ?? term.rows));
       }
       const sock = new WebSocket(wsUrl(`/api/terminal/ws?${params}`));
       sock.binaryType = "arraybuffer";
       ws = sock;
       wsRef.current = sock;
-      if (!reattach) cbs.current.onState({ kind: "connecting" });
+      if (!reattach) live.current.onState(live.current.tabId, { kind: "connecting" });
 
       sock.onmessage = (ev) => {
-        if (typeof ev.data === "string") {
-          let msg: TerminalControlFrame;
-          try {
-            msg = JSON.parse(ev.data) as TerminalControlFrame;
-          } catch {
-            term.write(ev.data);
-            return;
-          }
-          switch (msg.type) {
-            case "session": {
-              sessionRef.current = msg.session.id;
-              cbs.current.onSession(msg.session);
-              if (msg.session.title) cbs.current.onTitle(msg.session.title);
-              // The replay that follows repaints the whole session: start from a clean terminal.
-              if (reattach) term.reset();
-              attempt = 0;
-              cbs.current.onState({ kind: "open" });
-              // Our size wins on attach (the replay was rendered for the session's last size).
-              sock.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-              if (active) term.focus();
-              return;
-            }
-            case "missing":
-              // Its machine is reconnecting (or the server just restarted): keep trying.
-              schedule();
-              sock.close();
-              return;
-            case "reconnect":
-              schedule(true);
-              sock.close();
-              return;
-            case "exit":
-              ended = true;
-              cbs.current.onState({ kind: "exited", code: msg.code ?? null });
-              term.write(`\r\n\x1b[2m\x1b[38;2;151;153;159m[process exited${msg.code !== null && msg.code !== undefined ? ` with code ${msg.code}` : ""}]\x1b[0m\r\n`);
-              return;
-            case "error":
-              ended = true;
-              cbs.current.onState({ kind: "error", message: msg.message });
-              term.write(`\r\n\x1b[38;2;209;170;173m[error] ${msg.message}\x1b[0m\r\n`);
-              return;
-          }
+        if (typeof ev.data !== "string") {
+          term.write(new Uint8Array(ev.data as ArrayBuffer));
           return;
         }
-        term.write(new Uint8Array(ev.data as ArrayBuffer));
+        let msg: TerminalControlFrame;
+        try {
+          msg = JSON.parse(ev.data) as TerminalControlFrame;
+        } catch {
+          term.write(ev.data);
+          return;
+        }
+        switch (msg.type) {
+          case "session": {
+            sessionRef.current = msg.session.id;
+            live.current.onSession(live.current.tabId, msg.session);
+            // The replay that follows repaints the session from scratch, at the session's size.
+            if (reattach) term.reset();
+            sessionSize.current = { cols: msg.session.cols, rows: msg.session.rows };
+            follow();
+            attempt = 0;
+            live.current.onState(live.current.tabId, { kind: "open" });
+            if (live.current.active) {
+              // After the replay is drawn: the program then redraws for this view's size.
+              requestAnimationFrame(() => claim(true, true));
+              term.focus();
+            }
+            return;
+          }
+          case "size":
+            // The device in use (maybe this one) set the session's size.
+            sessionSize.current = { cols: msg.cols, rows: msg.rows };
+            follow();
+            return;
+          case "missing":
+            // Its machine is reconnecting (or the server just restarted): keep trying.
+            schedule();
+            sock.close();
+            return;
+          case "reconnect":
+            schedule(true);
+            sock.close();
+            return;
+          case "exit":
+            ended = true;
+            live.current.onState(live.current.tabId, { kind: "exited", code: msg.code ?? null });
+            term.write(`\r\n\x1b[2m\x1b[38;2;151;153;159m[process exited${msg.code !== null && msg.code !== undefined ? ` with code ${msg.code}` : ""}]\x1b[0m\r\n`);
+            return;
+          case "error":
+            ended = true;
+            if (msg.message === "session closed") {
+              // Ended on purpose (here or on another device): the tab goes everywhere.
+              live.current.onClosed(live.current.tabId);
+              return;
+            }
+            live.current.onState(live.current.tabId, { kind: "error", message: msg.message });
+            term.write(`\r\n\x1b[38;2;209;170;173m[error] ${msg.message}\x1b[0m\r\n`);
+            return;
+        }
       };
       sock.onclose = () => {
         if (wsRef.current === sock) wsRef.current = null;
@@ -279,7 +566,8 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
       };
     }
 
-    // Coming back to the page or the network: retry at once instead of waiting out the backoff.
+    // Back to the page or the network: retry at once instead of waiting out the backoff, and
+    // picking the device up again makes it the one in use.
     const kick = () => {
       if (!stopped && !ended && (!ws || ws.readyState === WebSocket.CLOSED)) {
         window.clearTimeout(timer);
@@ -288,7 +576,9 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
       }
     };
     const onVisible = () => {
-      if (document.visibilityState === "visible") kick();
+      if (document.visibilityState !== "visible") return;
+      kick();
+      if (live.current.active) claim(true, true);
     };
     window.addEventListener("online", kick);
     document.addEventListener("visibilitychange", onVisible);
@@ -302,29 +592,25 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
       if (wsRef.current === ws) wsRef.current = null;
       ws?.close();
     };
+    // Reconnects only for a new terminal (gen) or target; the rest is read through refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gen, target]);
 
-  /* ---- visibility/focus: refit when shown ---- */
+  /* ---- becoming the view in use: claim the size, take focus ---- */
   React.useEffect(() => {
-    if (!active || !visible) return;
-    const k = kRef.current;
-    const host = hostRef.current;
-    if (!k || !host) return;
+    if (!active || gen === 0) return;
     const id = requestAnimationFrame(() => {
-      safeFit(k, host);
-      k.term.focus();
+      claim(true, true);
+      kRef.current?.term.focus();
     });
     return () => cancelAnimationFrame(id);
-  }, [active, visible, gen]);
+  }, [active, gen, claim]);
 
   React.useEffect(() => {
-    const k = kRef.current;
-    const host = hostRef.current;
-    if (!k || !host) return;
-    k.term.options.fontSize = fontSize;
-    requestAnimationFrame(() => safeFit(k, host));
-  }, [fontSize]);
+    if (gen === 0) return;
+    const id = requestAnimationFrame(layout);
+    return () => cancelAnimationFrame(id);
+  }, [fontSize, gen, layout]);
 
   React.useImperativeHandle(
     ref,
@@ -337,6 +623,7 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
           k.term.clear();
         }
         sessionRef.current = null;
+        sessionSize.current = null;
         wsRef.current?.close();
         wsRef.current = null;
         setGen((g) => g + 1);
@@ -347,9 +634,6 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
         const s = kRef.current?.term.getSelection();
         if (s) await navigator.clipboard.writeText(s);
       },
-      setFontSize: (px: number) => {
-        if (kRef.current) kRef.current.term.options.fontSize = px;
-      },
       send: (bytes: string) => {
         kRef.current?.term.scrollToBottom();
         sendBytes(bytes);
@@ -359,14 +643,13 @@ export const TerminalSession = React.forwardRef<SessionHandle, Props>(function T
     [sendBytes],
   );
 
+  // Hidden views are display:none, which also pauses xterm's rendering for them.
   return (
-    <div
-      className="term-host"
-      data-terminal
-      style={{ visibility: active ? "visible" : "hidden", zIndex: active ? 1 : 0 }}
-      aria-hidden={!active}
-    >
+    <div className="term-host" data-terminal style={active ? undefined : { display: "none" }} aria-hidden={!active}>
       <div ref={hostRef} className="h-full w-full" />
     </div>
   );
 });
+
+/** Re-renders only when its own props change: callbacks are stable and titles don't flow back in. */
+export const TerminalSession = React.memo(TerminalSessionView);

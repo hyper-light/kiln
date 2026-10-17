@@ -31,6 +31,9 @@ const FANOUT: usize = 1024;
 pub enum Frame {
     Data(Bytes),
     Exit { code: Option<i32>, error: Option<String> },
+    /// The session's size changed. Every view draws at exactly this size, so a program's
+    /// cursor-addressed redraws line up on every device.
+    Size { cols: u16, rows: u16 },
 }
 
 /// What attached clients send.
@@ -232,18 +235,27 @@ impl Session {
         st.last_activity = Instant::now();
     }
 
-    /// Keystrokes or a resize from an attached client.
+    /// Keystrokes or a resize from an attached client. A resize that changes the size is announced
+    /// to every attached client (in order with the output, under the same lock).
     pub fn send(&self, input: Input) {
-        {
+        let input = {
             let mut st = self.state.lock();
             st.last_activity = Instant::now();
-            if let Input::Resize { cols, rows } = input {
-                let (cols, rows) = (cols.clamp(2, 1000), rows.clamp(2, 1000));
-                st.cols = cols;
-                st.rows = rows;
-                st.screen.screen_mut().set_size(rows, cols);
+            match input {
+                Input::Resize { cols, rows } => {
+                    let (cols, rows) = (cols.clamp(2, 1000), rows.clamp(2, 1000));
+                    if (cols, rows) == (st.cols, st.rows) {
+                        return;
+                    }
+                    st.cols = cols;
+                    st.rows = rows;
+                    st.screen.screen_mut().set_size(rows, cols);
+                    self.out.send(Frame::Size { cols, rows });
+                    Input::Resize { cols, rows }
+                }
+                data => data,
             }
-        }
+        };
         if self.input.try_send(input).is_err() {
             tracing::debug!(session = %self.id, "terminal input dropped (session busy or ended)");
         }
@@ -500,6 +512,28 @@ mod tests {
         assert!(a.replay.len() <= BACKLOG_BYTES + 64);
         // After the reset prefix the replay begins with a whole line.
         assert!(a.replay.get(4..).is_some_and(|r| r.starts_with(b"0123")));
+    }
+
+    #[test]
+    fn resizes_are_announced_once_and_clamped() {
+        let (s, input) = Session::new("local".into(), None, 80, 24);
+        let mut a = s.attach();
+        s.send(Input::Resize { cols: 120, rows: 40 });
+        s.send(Input::Resize { cols: 120, rows: 40 }); // unchanged: no frame, nothing to the PTY
+        s.send(Input::Resize { cols: 1, rows: 5000 });
+        let mut sizes = Vec::new();
+        while let Ok(f) = a.live.try_recv() {
+            if let Frame::Size { cols, rows } = f {
+                sizes.push((cols, rows));
+            }
+        }
+        assert_eq!(sizes, vec![(120, 40), (2, 1000)]);
+        assert_eq!((s.info().cols, s.info().rows), (2, 1000));
+        let mut sent = Vec::new();
+        while let Ok(Input::Resize { cols, rows }) = input.try_recv() {
+            sent.push((cols, rows));
+        }
+        assert_eq!(sent, vec![(120, 40), (2, 1000)]);
     }
 
     #[test]
