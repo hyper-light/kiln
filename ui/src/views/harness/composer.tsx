@@ -10,7 +10,7 @@ import { clientId, type Meta, type SendMode, type SessionStore, type State } fro
 import { Button } from "@/components/ui/button";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { useAttachments } from "./controls";
+import type { Attachments } from "./controls";
 
 const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -76,7 +76,7 @@ function QueueRow({ id, text, index, count, store, canNow }: { id: string; text:
   );
 }
 
-export function Composer({ store, state, meta, disabled }: { store: SessionStore; state: State | null; meta: Meta | null; disabled?: boolean }) {
+export function Composer({ store, state, meta, disabled, attachments }: { store: SessionStore; state: State | null; meta: Meta | null; disabled?: boolean; attachments: Attachments }) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
@@ -85,9 +85,9 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
   const running = state?.status === "running" || state?.status === "waiting";
   const modes = MODES.filter((m) => !m.feature || features.includes(m.feature));
   const queue = state?.queue ?? [];
-  const canAttach = features.includes("attachments");
+  const canAttach = attachments.enabled;
   const canOverride = features.includes("turn_overrides");
-  const { files, add, clear, chips } = useAttachments(canAttach);
+  const { files, add, clear, chips } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
 
@@ -275,7 +275,16 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
           )}
           {canAttach && (
             <>
-              <input ref={picker} type="file" multiple hidden onChange={(e) => e.target.files && void add(e.target.files)} />
+              <input
+                ref={picker}
+                type="file"
+                multiple
+                hidden
+                onChange={(e) => {
+                  if (e.target.files) void add(e.target.files);
+                  e.target.value = "";
+                }}
+              />
               <Tip content="Attach files or images">
                 <button type="button" className="hx-icon" aria-label="Attach files" onClick={() => picker.current?.click()}>
                   <Paperclip size={14} />

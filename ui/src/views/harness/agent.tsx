@@ -14,7 +14,7 @@ import { errorMessage, useDocumentTitle, useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { ApprovalCard } from "./approval";
 import { Composer } from "./composer";
-import { SettingsButton, SettingsSheet } from "./controls";
+import { SettingsButton, SettingsSheet, useAttachments } from "./controls";
 import { money, tildify } from "./derive";
 import { Inspector, type InspectorTab } from "./inspector";
 import { HarnessMark, StatusPill } from "./parts";
@@ -68,6 +68,22 @@ export default function AgentPage() {
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [risky, setRisky] = React.useState<string | null>(null);
   const [settings, setSettings] = React.useState(false);
+  const attachments = useAttachments((meta?.features ?? []).includes("attachments"));
+  const [dragging, setDragging] = React.useState(false);
+  const addFiles = attachments.add;
+  // Screenshots pasted anywhere on the page attach to the next message (text pastes are left alone).
+  React.useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const files = e.clipboardData?.files;
+      if (!files?.length || !attachments.enabled) return;
+      const t = e.target as HTMLElement | null;
+      if (t?.closest("input:not(.hx-compose-input), textarea:not(.hx-compose-input)")) return;
+      e.preventDefault();
+      void addFiles(files);
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, [addFiles, attachments.enabled]);
   useDocumentTitle(info ? `${info.name} · Agents` : "Agent");
 
   const cwd = state?.cwd || info?.cwd || "";
@@ -126,13 +142,37 @@ export default function AgentPage() {
             )}
           </div>
         ) : null}
-        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} />
+        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} />
       </div>
     </div>
   );
 
+  const hasFiles = (e: React.DragEvent) => [...e.dataTransfer.types].includes("Files");
   return (
-    <div className="hx-agent">
+    <div
+      className="hx-agent"
+      onDragEnter={(e) => {
+        if (hasFiles(e)) setDragging(true);
+      }}
+      onDragOver={(e) => {
+        if (hasFiles(e)) e.preventDefault();
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target || !e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false);
+      }}
+      onDrop={(e) => {
+        setDragging(false);
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        if (attachments.enabled) void attachments.add(e.dataTransfer.files);
+        else toast.error("This agent can't take attachments", `${info?.kind_name ?? "Its harness"} doesn't accept files through kiln yet.`);
+      }}
+    >
+      {dragging && (
+        <div className="hx-dropzone" aria-hidden="true">
+          <span>{attachments.enabled ? "Drop screenshots or files to attach" : "This agent can't take attachments"}</span>
+        </div>
+      )}
       <header className="hx-agent-head">
         <Link to="/agents" className="hx-back" aria-label="All agents">
           <ArrowLeft size={15} />

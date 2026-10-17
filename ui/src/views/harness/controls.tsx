@@ -188,38 +188,94 @@ export function TurnMenu({ meta, eventId, send }: { meta: Meta | null; eventId: 
   );
 }
 
-/** Files and images to send with a message: pasted, dropped or picked. */
+/** Longest edge an attached image is sent at: plenty for a model to read a screenshot, quick to upload from a phone. */
+const IMAGE_MAX_EDGE = 2560;
+const FILE_MAX_BYTES = 20 * 1024 * 1024;
+
+export interface Attached {
+  name: string;
+  mime: string;
+  data_base64: string;
+  size: number;
+}
+
+const toBase64 = (b: Blob) =>
+  new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ""));
+    r.onerror = () => reject(r.error ?? new Error("read failed"));
+    r.readAsDataURL(b);
+  });
+
+/** An image the model can read: decoded, scaled to IMAGE_MAX_EDGE, and re-encoded when the browser can (HEIC and other formats become JPEG). */
+async function prepareImage(f: File): Promise<Blob> {
+  const native = ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(f.type);
+  let bmp: ImageBitmap;
+  try {
+    bmp = await createImageBitmap(f);
+  } catch {
+    return f; // can't decode here: send as is
+  }
+  const scale = Math.min(1, IMAGE_MAX_EDGE / Math.max(bmp.width, bmp.height));
+  if (scale === 1 && native) {
+    bmp.close();
+    return f;
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bmp.width * scale));
+  canvas.height = Math.max(1, Math.round(bmp.height * scale));
+  canvas.getContext("2d")?.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  bmp.close();
+  const type = f.type === "image/png" || f.type === "image/webp" ? f.type : "image/jpeg";
+  const blob = await new Promise<Blob | null>((r) => canvas.toBlob(r, type, 0.9));
+  return blob ?? f;
+}
+
+const stamp = () => new Date().toTimeString().slice(0, 8).replace(/:/g, "");
+
+/** Files and screenshots to send with a message: pasted, dropped anywhere on the page, or picked (Photos, Camera or Files on a phone). */
 export function useAttachments(enabled: boolean) {
-  const [files, setFiles] = React.useState<{ name: string; mime: string; data_base64: string; size: number }[]>([]);
+  const [files, setFiles] = React.useState<Attached[]>([]);
+  const [busy, setBusy] = React.useState(false);
   const add = React.useCallback(
     async (list: FileList | File[]) => {
       if (!enabled) return;
-      const read = (f: File) =>
-        new Promise<{ name: string; mime: string; data_base64: string; size: number }>((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve({ name: f.name || "pasted", mime: f.type || "application/octet-stream", data_base64: String(r.result).replace(/^data:[^,]*,/, ""), size: f.size });
-          r.onerror = () => reject(r.error ?? new Error("read failed"));
-          r.readAsDataURL(f);
-        });
-      const added = await Promise.all([...list].filter((f) => f.size <= 20 * 1024 * 1024).map(read));
-      setFiles((cur) => [...cur, ...added]);
+      setBusy(true);
+      try {
+        const added: Attached[] = [];
+        for (const f of [...list]) {
+          const blob = f.type.startsWith("image/") ? await prepareImage(f) : f;
+          if (blob.size > FILE_MAX_BYTES) continue;
+          const ext = blob.type === "image/jpeg" ? "jpg" : (blob.type.split("/")[1] ?? "bin");
+          const unnamed = !f.name || f.name === "image.png" || f.name === "image";
+          const name = unnamed ? `screenshot-${stamp()}.${ext}` : blob !== f && blob.type !== f.type ? f.name.replace(/\.[^.]+$/, `.${ext}`) : f.name;
+          added.push({ name, mime: blob.type || "application/octet-stream", data_base64: await toBase64(blob), size: blob.size });
+        }
+        setFiles((cur) => [...cur, ...added]);
+      } finally {
+        setBusy(false);
+      }
     },
     [enabled],
   );
   const remove = (i: number) => setFiles((cur) => cur.filter((_, j) => j !== i));
-  const clear = () => setFiles([]);
-  const chips = files.length ? (
-    <div className="hx-attach">
-      {files.map((f, i) => (
-        <span key={i} className="hx-attach-chip">
-          {f.mime.startsWith("image/") ? <img src={`data:${f.mime};base64,${f.data_base64}`} alt="" /> : null}
-          <span className="hx-trunc">{f.name}</span>
-          <button type="button" aria-label={`Remove ${f.name}`} onClick={() => remove(i)}>
-            <X size={11} />
-          </button>
-        </span>
-      ))}
-    </div>
-  ) : null;
-  return { files, add, clear, chips };
+  const clear = React.useCallback(() => setFiles([]), []);
+  const chips =
+    files.length || busy ? (
+      <div className="hx-attach">
+        {files.map((f, i) => (
+          <span key={i} className="hx-attach-chip">
+            {f.mime.startsWith("image/") ? <img src={`data:${f.mime};base64,${f.data_base64}`} alt="" /> : null}
+            <span className="hx-trunc">{f.name}</span>
+            <button type="button" aria-label={`Remove ${f.name}`} onClick={() => remove(i)}>
+              <X size={11} />
+            </button>
+          </span>
+        ))}
+        {busy && <span className="hx-attach-chip hx-dim">Preparing…</span>}
+      </div>
+    ) : null;
+  return { enabled, files, add, clear, chips };
 }
+
+export type Attachments = ReturnType<typeof useAttachments>;
