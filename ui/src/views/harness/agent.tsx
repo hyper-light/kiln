@@ -12,7 +12,6 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useMediaQuery } from "@/lib/hooks";
-import { ApprovalCard } from "./approval";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
 import { SettingsSheet, useAttachments } from "./controls";
@@ -123,17 +122,9 @@ export default function AgentPage() {
           </button>
         </div>
       )}
-      <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} agentLabel={task ? "Subagent" : info?.kind_name} />
+      <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} agentLabel={task ? "Subagent" : info?.kind_name} agentName={info?.name} onDecide={send} />
       <div className="hx-dock">
         <ActivityLine state={state} agent={id} onOpenTask={openTask} />
-        {approvals.length > 0 && (
-          <div className="hx-dock-approvals">
-            {approvals.length > 1 && <div className="hx-eyebrow px-1">{approvals.length} waiting on you</div>}
-            {approvals.slice(0, 1).map((a) => (
-              <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={send} agentName={info?.name} kind={info?.kind_name} />
-            ))}
-          </div>
-        )}
         {status === "exited" && state?.exit?.error && events.length === 0 ? (
           <div className="hx-startfail" role="alert">
             <b>This agent couldn't start.</b> {state.exit.error}

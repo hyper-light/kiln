@@ -2797,3 +2797,94 @@ textarea.hx-input {
     border-radius: 0;
   }
 }
+
+/* ---------------------------------------------------------------- waiting on you, in the conversation
+   Approvals sit where they were asked, drawn like the agent's own words: no card or shadow, a warm
+   rule at their left (a question's is spectral, in choices.css). */
+.hx-asks {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  margin-top: 6px;
+}
+.hx-asks .hx-approve-actions button {
+  min-height: 30px;
+  height: 30px;
+  padding: 0 14px;
+  gap: 6px;
+  font-size: 12.5px;
+}
+.hx-asks .hx-approve-actions button svg {
+  width: 14px;
+  height: 14px;
+}
+.hx-approval {
+  gap: 8px;
+  padding: 1px 0 2px 14px;
+  border: 0;
+  border-left: 2px solid #8a7b62;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+.hx-approval-danger {
+  border-left-color: #a07a7e;
+  background: none;
+}
+.hx-approval-head {
+  gap: 8px;
+  font-size: 13px;
+}
+.hx-approval-icon,
+.hx-approval-danger .hx-approval-icon {
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  background: none;
+}
+/* Scrolled away from what waits on you: a pill over the conversation's bottom edge. It is sticky and
+   has no height of its own, so nothing moves when it comes or goes. */
+.hx-waiting-anchor {
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  justify-content: center;
+  height: 0;
+  pointer-events: none;
+}
+.hx-waiting {
+  position: absolute;
+  bottom: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid #34323f;
+  border-radius: 999px;
+  background: rgb(11 12 15 / 92%);
+  backdrop-filter: blur(6px);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #cdc6ea;
+  pointer-events: auto;
+  cursor: pointer;
+}
+.hx-waiting > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #cdc6ea;
+  animation: kg-breathe 2.4s ease-in-out infinite alternate;
+}
+:root[data-motion="paused"] .hx-waiting > i {
+  animation-play-state: paused;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hx-waiting > i {
+    animation: none;
+  }
+}

@@ -26,7 +26,7 @@ const VERB: Partial<Record<Approval["tool"], string>> = {
   plan: "start on its plan",
 };
 
-/** A question, answered where it was asked: the stepper inline in the card (never a popup). */
+/** A question, answered where it was asked: in the conversation, drawn like the agent's own words. */
 function Questions({ a, onDecide, agentName, kind }: { a: Approval; onDecide: Decide; agentName?: string; kind?: string }) {
   const [busy, setBusy] = React.useState(false);
   const questions: ChoiceQuestion[] = (a.questions ?? []).map((q) => ({
@@ -40,7 +40,7 @@ function Questions({ a, onDecide, agentName, kind }: { a: Approval; onDecide: De
   }));
   return (
     <Choices
-      layout="inline"
+      layout="flow"
       questions={questions}
       agentName={agentName}
       kind={kind}
