@@ -222,6 +222,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
+        (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
@@ -270,15 +271,44 @@ fn ai_sessions(hub: &Hub) -> Response {
             if let Some(o) = v.as_object_mut() {
                 o.insert("machine".into(), json!(machine));
                 // Attachable only while kiln holds that terminal.
-                if s.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_none()) {
+                let held = s.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_some());
+                if s.terminal.is_some() && !held {
                     o.insert("terminal".into(), serde_json::Value::Null);
                 }
+                o.insert("takeover".into(), json!(s.takeover(held)));
             }
             out.push(v);
         }
     }
     out.sort_by_key(|v| std::cmp::Reverse(v.get("last_activity").and_then(serde_json::Value::as_i64).unwrap_or(0)));
     srv::json(StatusCode::OK, &out)
+}
+
+/// Continue a session found running on a machine as a kiln agent session: the kiln terminal it
+/// runs in is ended, and the harness resumes it there, in the same folder, once its process is
+/// gone (the machine waits for it). One running outside kiln is refused: quit it there first, or
+/// resume an ended one with `POST /api/harness/sessions` and `spec.resume`.
+async fn ai_takeover(hub: &Hub, machine: &str, pid: &str) -> R {
+    use crate::aisessions::TakeOver;
+    let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
+    let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
+    let Some(found) = found else {
+        return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
+    };
+    let held = found.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_some());
+    let spec = match (found.takeover(held), found.takeover_spec(held)) {
+        (TakeOver::Ready, Some(spec)) => spec,
+        (TakeOver::Outside, _) => return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): quit it there first, then continue it"))),
+        (TakeOver::NoId, _) => return Err(err(StatusCode::CONFLICT, "it has no conversation to continue yet")),
+        _ => return Err(err(StatusCode::BAD_REQUEST, format!("kiln cannot run {} as an agent session", found.tool))),
+    };
+    if let Some(t) = found.terminal.as_deref().and_then(|t| hub.terminals.get(t)) {
+        t.close();
+        hub.store.audit("admin".into(), "terminal.close".into(), t.target.clone()).await;
+    }
+    hub.store.audit("admin".into(), "agent.takeover".into(), format!("{} (process {pid}) on {machine}", found.tool)).await;
+    let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &infos))
 }
 
 /// The recent messages of one session, read from its machine.

@@ -25,6 +25,8 @@ browsers watching it.
 | POST | `/api/harness/command` | `{ids, command}`: one command for several sessions |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
+| GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it) and `takeover` |
+| POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); see below |
 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,
 `events {events}` (upserts by id), `stream {id, text}` (text appended to a streaming event),
@@ -32,7 +34,27 @@ Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}
 request), `reset` (the timeline starts over), `closed`.
 
 `Spec`: `kind`, `cwd?`, `model?`, `mode?`, `effort?`, `resume?` (the harness's own session id),
-`resume_at?`, `fork?`, `prompt?`, `name?`, `shell?`, `allow_bypass?`.
+`resume_at?`, `fork?`, `prompt?`, `name?`, `shell?`, `allow_bypass?`, `takeover_pid?` (set by a
+take-over: start only once that process has ended).
+
+### Taking over a found session
+
+A session found running in one of kiln's terminals (a Claude Code or Codex TUI someone started
+there) can be continued as a kiln agent session. `takeover` on each found session says whether:
+
+| `takeover` | meaning | the console |
+|---|---|---|
+| `"ready"` | it runs in a kiln terminal: taking it over ends that terminal and continues the conversation as an agent session | offer it |
+| `"outside"` | it runs outside kiln: it must be quit there first | explain; once it has ended, resume it with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` |
+| `"no_id"` | it has no conversation to continue yet (still starting) | wait |
+| `"unsupported"` | kiln cannot run that harness as an agent session | — |
+
+`POST /api/ai-sessions/:machine/:pid/takeover` (no body): kiln closes the terminal, starts an
+agent session on that machine with the same harness, folder, conversation (its session id) and
+model, and answers with its `Info[]` (status `starting`). The machine starts the harness only once
+the old process has ended (up to 15 s; meanwhile `state.doing` says it is waiting); the session's
+history is loaded from the conversation. Errors: 404 (not found: it may have ended), 409
+(`outside`, `no_id`), 400 (`unsupported`).
 
 ## Commands
 
@@ -141,4 +163,5 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | plugins | ✓ | ✓ | — | — |
 | MCP server and skill named on tool calls | ✓ | unit (MCP) | — | — |
 | inventories known vs loading (`inventory`) | ✓ | ✓ | unit (unsupported) | ? |
-| take over a session found running in a terminal | not yet | not yet | — | — |
+| take over a session found running in a kiln terminal | ✓ | ✓ | — | — |
+| refuse one running outside kiln | ✓ | ✓ | — | — |
