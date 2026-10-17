@@ -369,6 +369,13 @@
 .desktop-nav a[aria-current="page"] .nav-index {
   color: #9a9ca5;
 }
+/* Ten places don't fit beside the right-hand controls below 1440px with their numbers: the
+   numbers go there, and below 1280px the menu takes the whole list. */
+@media (max-width: 1439px) {
+  .desktop-nav a .nav-index {
+    display: none;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* Page intro / section headings                                       */

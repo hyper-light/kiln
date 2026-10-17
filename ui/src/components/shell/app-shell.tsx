@@ -86,7 +86,7 @@ export function AppShell({ me }: { me: Me | null }) {
             >
               <Brand />
             </Link>
-            <nav className="desktop-nav hidden lg:flex" aria-label="Main navigation">
+            <nav className="desktop-nav hidden xl:flex" aria-label="Main navigation">
               {NAV.map((n, i) => (
                 <NavLink key={n.to} to={n.to} end={n.end}>
                   <span className="nav-index" aria-hidden="true">
@@ -122,7 +122,7 @@ export function AppShell({ me }: { me: Me | null }) {
                 </button>
               </Tip>
               <Dialog.Trigger asChild>
-                <Button variant="ghost" size="icon" className="lg:hidden [&_svg]:size-5" aria-label="Open navigation">
+                <Button variant="ghost" size="icon" className="xl:hidden [&_svg]:size-5" aria-label="Open navigation">
                   <Menu aria-hidden="true" />
                 </Button>
               </Dialog.Trigger>
