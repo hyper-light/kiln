@@ -22,7 +22,7 @@ import { AccountCard } from "./account-card";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
-import { changesetOf, editsOf, useSameList } from "./derive";
+import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { AgentHeader } from "./head";
@@ -295,7 +295,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
         else toast.error("This agent can't take attachments", `${info?.kind_name ?? "Its harness"} doesn't accept files through kiln yet.`);
       }}
     >
-      <title>{info ? `${info.name} · Agents · kiln` : "Agent · kiln"}</title>
+      <title>{info ? `${agentLabel(info)} · Agents · kiln` : "Agent · kiln"}</title>
       {dragging && (
         <div className="hx-dropzone" aria-hidden="true">
           <span>{attachments.enabled ? "Drop screenshots or files to attach" : "This agent can't take attachments"}</span>

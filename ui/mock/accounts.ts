@@ -364,6 +364,27 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
 
+  // What New agents asks: each machine's harnesses, its past sessions, and a start.
+  if (p === "/api/harness/kinds" && m === "GET") {
+    const kinds = [
+      { id: "claude", name: "Claude Code", verified: true, available: true },
+      { id: "codex", name: "Codex", verified: true, available: true },
+    ];
+    json(res, 200, { local: kinds, "agent:metal-ryzen-01": kinds, "agent:metal-ryzen-02": kinds, "agent:metal-epyc-01": kinds, "agent:metal-mac-mini": kinds, "agent:metal-pi-04": kinds.slice(1) });
+    return true;
+  }
+  if (p === "/api/harness/history" && m === "GET") {
+    const kind = url.searchParams.get("kind") ?? "claude";
+    json(res, 200, [
+      { kind, id: "past-1", title: "Speed up the log viewer", cwd: "/home/ada/src/kiln", branch: "main", last_activity: now() - 3600 },
+      { kind, id: "past-2", title: "Trim the release notes", cwd: "/home/ada/src/kiln", last_activity: now() - 86_400 },
+    ]);
+    return true;
+  }
+  if (p === "/api/harness/sessions" && m === "POST") {
+    json(res, 200, [demos.get("demo-claude")!.info]);
+    return true;
+  }
   if (p === "/api/harness/sessions" && m === "GET") {
     json(
       res,

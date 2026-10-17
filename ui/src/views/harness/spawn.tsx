@@ -11,11 +11,14 @@ import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec } from "@/api/harness";
 import type { Agent, TerminalSessionInfo } from "@/api/types";
 import { Button } from "@/components/ui/button";
+import { Loadable } from "@/components/ui/loading";
 import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { relativeTime } from "@/lib/format";
+import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { HarnessMark } from "./parts";
 import { tildify } from "./derive";
+import { useListener } from "./dom";
 import { InlinePath } from "./inline-path";
 
 interface ModeChoice {
@@ -96,7 +99,12 @@ function Chip<T extends string | number>({
 function FolderChip({ value, onChange, recent, shellLabel }: { value: string; onChange: (v: string) => void; recent: string[]; shellLabel?: string }) {
   const [open, setOpen] = React.useState(false);
   const [draft, setDraft] = React.useState(value);
-  React.useEffect(() => setDraft(value), [value, open]);
+  // What's typed starts over from the folder whenever the folder changes or the chip opens or closes.
+  const [from, setFrom] = React.useState({ value, open });
+  if (from.value !== value || from.open !== open) {
+    setFrom({ value, open });
+    setDraft(value);
+  }
   if (shellLabel)
     return (
       <span className="sp-chip sp-chip-static" title="Starts where the shell is">
@@ -170,22 +178,6 @@ function FolderChip({ value, onChange, recent, shellLabel }: { value: string; on
 /** Below the prompt: the machine's past conversations with this harness, to pick one up again. */
 function PastSessions({ target, kind, kindName, onPick, busy }: { target: string; kind: string; kindName: string; onPick: (p: PastSession) => void; busy: boolean }) {
   const [open, setOpen] = React.useState(false);
-  const [list, setList] = React.useState<PastSession[] | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
-  const now = useNow();
-  React.useEffect(() => {
-    if (!open || !target) return;
-    let live = true;
-    setList(null);
-    setError(null);
-    harnessApi.history(target, kind).then(
-      (l) => live && setList(l),
-      (e: unknown) => live && setError(e instanceof Error ? e.message : String(e)),
-    );
-    return () => {
-      live = false;
-    };
-  }, [open, target, kind]);
   if (!target) return null;
   return (
     <div className="ps">
@@ -195,90 +187,270 @@ function PastSessions({ target, kind, kindName, onPick, busy }: { target: string
       </button>
       {open && (
         <div className="ps-body">
-          {error ? (
-            <p className="ps-none">{/(502|404|not found)/i.test(error) ? "This machine's runner can't list its past sessions yet — upgrade it in Settings → Updates." : error}</p>
-          ) : !list ? (
-            <p className="ps-none">Looking…</p>
-          ) : list.length === 0 ? (
-            <p className="ps-none">No past {kindName} sessions on this machine.</p>
-          ) : (
-            <ul className="ps-list">
-              {list.map((p) => (
-                <li key={p.id}>
-                  <button type="button" className="ps-row" disabled={busy} onClick={() => onPick(p)}>
-                    <span className="ps-title">{p.title || p.last_prompt || p.id}</span>
-                    <span className="ps-meta">
-                      {tildify(p.cwd)}
-                      {p.branch ? ` · ${p.branch}` : ""} · {relativeTime(p.last_activity, now)}
-                    </span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
+          <Loadable label="Loading past sessions" fallback={<p className="ps-none">Looking…</p>}>
+            <PastList target={target} kind={kind} kindName={kindName} onPick={onPick} busy={busy} />
+          </Loadable>
         </div>
       )}
     </div>
   );
 }
 
+/** The machine's past sessions, once it has said (or said why it can't). */
+function PastList({ target, kind, kindName, onPick, busy }: { target: string; kind: string; kindName: string; onPick: (p: PastSession) => void; busy: boolean }) {
+  const now = useNow();
+  const { list, error } = useSuspenseResource(`harness/history/${target}/${kind}`, () =>
+    harnessApi.history(target, kind).then(
+      (list) => ({ list, error: null }),
+      (e: unknown) => ({ list: [] as PastSession[], error: e instanceof Error ? e.message : String(e) }),
+    ),
+  ).data;
+  return error ? (
+    <p className="ps-none">{/(502|404|not found)/i.test(error) ? "This machine's runner can't list its past sessions yet — upgrade it in Settings → Updates." : error}</p>
+  ) : list.length === 0 ? (
+    <p className="ps-none">No past {kindName} sessions on this machine.</p>
+  ) : (
+    <ul className="ps-list">
+      {list.map((p) => (
+        <li key={p.id}>
+          <button type="button" className="ps-row" disabled={busy} onClick={() => onPick(p)}>
+            <span className="ps-title">{p.title || p.last_prompt || p.id}</span>
+            <span className="ps-meta">
+              {tildify(p.cwd)}
+              {p.branch ? ` · ${p.branch}` : ""} · {relativeTime(p.last_activity, now)}
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
+type Defaults = { target?: string; shell?: string; cwd?: string; kind?: string };
+
+/** What starting agents needs to know: each machine's harnesses, the machines, their shells. */
+interface Machines {
+  byTarget: Record<string, KindInfo[]>;
+  machines: Agent[];
+  shells: TerminalSessionInfo[];
+}
+
+/** Asked all at once. A part that can't be had is empty: no harnesses (the dialog says what to do), no machine names, no shells. */
+const askMachines = (signal: AbortSignal): Promise<Machines> =>
+  Promise.all([
+    harnessApi.kindsAll().catch((): Record<string, KindInfo[]> => ({})),
+    api.agents(signal).then(
+      (a) => a.filter((m) => m.connected && !m.ephemeral),
+      (): Agent[] => [],
+    ),
+    api.terminalSessions(signal).catch((): TerminalSessionInfo[] => []),
+  ]).then(([byTarget, machines, shells]) => ({ byTarget, machines, shells }));
+
+/** What stays from one opening to the next: the message, how many, its options, a start under way. */
+interface Kept {
+  count: number;
+  setCount: (n: number) => void;
+  prompt: string;
+  setPrompt: (p: string) => void;
+  more: boolean;
+  setMore: (m: boolean) => void;
+  name: string;
+  setName: (n: string) => void;
+  model: string;
+  setModel: (m: string) => void;
+  busy: boolean;
+  setBusy: (b: boolean) => void;
+}
+
+/** More: a name, a model and, where the machine has shells open, one to run in. */
+function MoreFields({
+  count,
+  name,
+  onName,
+  model,
+  onModel,
+  shell,
+  onShell,
+  shells,
+}: {
+  count: number;
+  name: string;
+  onName: (v: string) => void;
+  model: string;
+  onModel: (v: string) => void;
+  shell: string;
+  onShell: (v: string) => void;
+  shells: TerminalSessionInfo[];
+}) {
+  return (
+    <div className="sp-more">
+      <label className="sp-field">
+        <span>Name</span>
+        <input className="hx-input" value={name} onChange={(e) => onName(e.target.value)} placeholder={count > 1 ? "fix-tests (numbered)" : "optional"} />
+      </label>
+      <label className="sp-field">
+        <span>Model</span>
+        <input className="hx-input" value={model} onChange={(e) => onModel(e.target.value)} placeholder="the harness's default" spellCheck={false} autoCapitalize="off" />
+      </label>
+      {shells.length > 0 && (
+        <label className="sp-field">
+          <span>Run in</span>
+          <select className="hx-select" value={shell} onChange={(e) => onShell(e.target.value)}>
+            <option value="">A folder</option>
+            {shells.map((s) => (
+              <option key={s.id} value={s.id}>
+                Shell: {s.title || s.id.slice(0, 8)}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+    </div>
+  );
+}
+
+/** Until the machines have said what they have: the note where the chips go, and Start, not startable yet. */
+function Looking({ kept }: { kept: Kept }) {
+  const { count, more, name, setName, model, setModel, busy } = kept;
+  return (
+    <>
+      <div className="sp-note">Looking at your machines…</div>
+      {more && <MoreFields count={count} name={name} onName={setName} model={model} onModel={setModel} shell="" onShell={() => undefined} shells={[]} />}
+      <footer className="sp-foot">
+        <span className="sp-foot-note" />
+        <Button type="submit" disabled>
+          <Rocket /> {busy ? "Starting…" : count > 1 ? `Start ${count} agents` : "Start agent"}
+        </Button>
+      </footer>
+    </>
+  );
+}
+
 export function SpawnDialog({
   open,
   onOpenChange,
+  onOpened,
   onStarted,
   defaults,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
+  /** It has opened (and taken focus). */
+  onOpened?: () => void;
   onStarted: (agents: AgentInfo[]) => void;
   /** Start inside this shell (its machine and folder), or like another agent (Duplicate). */
-  defaults?: { target?: string; shell?: string; cwd?: string; kind?: string };
+  defaults?: Defaults;
 }) {
-  const [machines, setMachines] = React.useState<Agent[]>([]);
-  const [shells, setShells] = React.useState<TerminalSessionInfo[]>([]);
-  const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
   const [kind, setKind] = useLocalStorage("kiln.agents.kind", "claude");
+  const [count, setCount] = React.useState(1);
+  const [prompt, setPrompt] = React.useState("");
+  const [more, setMore] = React.useState(false);
+  const [name, setName] = React.useState("");
+  const [model, setModel] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [form, setForm] = React.useState<HTMLFormElement | null>(null);
+  const promptRef = React.useRef<HTMLTextAreaElement>(null);
+  const kept: Kept = { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, busy, setBusy };
+  return (
+    <D.Root open={open} onOpenChange={onOpenChange}>
+      <D.Portal>
+        <D.Overlay className="overlay" />
+        <D.Content
+          className="sp-sheet"
+          aria-describedby={undefined}
+          onOpenAutoFocus={(e) => {
+            e.preventDefault();
+            promptRef.current?.focus();
+            // Opened like another agent: its harness, as if it had been chosen.
+            if (defaults?.kind) setKind(defaults.kind);
+            onOpened?.();
+          }}
+        >
+          <header className="sp-head">
+            <D.Title className="sp-title">New agents</D.Title>
+            <D.Close asChild>
+              <button type="button" className="sp-close" aria-label="Close">
+                <X size={17} />
+              </button>
+            </D.Close>
+          </header>
+
+          {/* What's below starts it, knowing where: until the machines have said what they have, nothing starts. */}
+          <form ref={setForm} className="sp-body" onSubmit={(e) => e.preventDefault()}>
+            <textarea
+              ref={promptRef}
+              className="sp-prompt"
+              rows={4}
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  e.currentTarget.form?.requestSubmit();
+                }
+              }}
+              placeholder={count > 1 ? `What should these ${count} agents do? (each gets this message)` : "What should it do? (optional — you can tell it later)"}
+              aria-label="First message"
+            />
+            <Loadable label="Loading your machines" fallback={<Looking kept={kept} />}>
+              <Setup kept={kept} remembered={kind} remember={setKind} form={form} defaults={defaults} onStarted={onStarted} onOpenChange={onOpenChange} />
+            </Loadable>
+          </form>
+        </D.Content>
+      </D.Portal>
+    </D.Root>
+  );
+}
+
+/**
+ * The dialog's body once the machines have said what they have: which agent, where, how many, how
+ * careful and how hard it thinks, and Start. It mounts as the dialog opens, so what it holds (the
+ * machine picked, the shell, the folder, a mode that turns checks off, an error) starts over each time.
+ */
+function Setup({
+  kept,
+  remembered,
+  remember,
+  form,
+  defaults,
+  onStarted,
+  onOpenChange,
+}: {
+  kept: Kept;
+  /** The harness chosen last, and how a choice is kept for next time. */
+  remembered: string;
+  remember: (k: string) => void;
+  form: HTMLFormElement | null;
+  defaults?: Defaults;
+  onStarted: (agents: AgentInfo[]) => void;
+  onOpenChange: (o: boolean) => void;
+}) {
+  const { count, setCount, prompt, setPrompt, more, setMore, name, setName, model, setModel, busy, setBusy } = kept;
+  // Each machine's harnesses, the machines and their shells: shown at once when known from before,
+  // read again as it opens.
+  const { byTarget, machines, shells } = useSuspenseResource("harness/spawn", askMachines).data;
+  const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
   const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
   const [effortByKind, setEffortByKind] = useLocalStorage<Record<string, string>>("kiln.agents.efforts", {});
   /** A mode that turns checks off: `armed` waits for "Turn them off", `unchecked` is confirmed (for this start only). */
   const [armed, setArmed] = React.useState("");
   const [unchecked, setUnchecked] = React.useState("");
   const [dirs, setDirs] = useLocalStorage<Record<string, string[]>>("kiln.agents.recentDirs", {});
-  const [byTarget, setByTarget] = React.useState<Record<string, KindInfo[]> | null>(null);
-  const [picked, setPicked] = React.useState<string | null>(null);
-  const [cwd, setCwd] = React.useState("~");
-  const [count, setCount] = React.useState(1);
-  const [prompt, setPrompt] = React.useState("");
-  const [more, setMore] = React.useState(false);
-  const [name, setName] = React.useState("");
-  const [model, setModel] = React.useState("");
-  const [shell, setShell] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  const [picked, setPicked] = React.useState<string | null>(defaults?.target ?? null);
+  const [shell, setShell] = React.useState(defaults?.shell ?? "");
   const [error, setError] = React.useState<string | null>(null);
-  const promptRef = React.useRef<HTMLTextAreaElement>(null);
-
-  React.useEffect(() => {
-    if (!open) return;
-    setError(null);
-    setArmed("");
-    setUnchecked("");
-    setPicked(defaults?.target ?? null);
-    setShell(defaults?.shell ?? "");
-    if (defaults?.kind) setKind(defaults.kind);
-    setByTarget(null);
-    harnessApi.kindsAll().then(setByTarget, () => setByTarget({}));
-    api.agents().then(
-      (a) => setMachines(a.filter((m) => m.connected && !m.ephemeral)),
-      () => undefined,
-    );
-    api.terminalSessions().then(setShells, () => undefined);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  // Opened like another agent: its harness; else the one chosen last.
+  const [preferred, setPreferred] = React.useState(defaults?.kind || remembered);
+  const setKind = (k: string) => {
+    setPreferred(k);
+    remember(k);
+  };
 
   // Every harness any machine has; the machines that have the one you picked.
   const all = React.useMemo(() => {
     const m = new Map<string, KindInfo>();
-    for (const ks of Object.values(byTarget ?? {}))
+    for (const ks of Object.values(byTarget))
       for (const k of ks) {
         const cur = m.get(k.id);
         m.set(k.id, cur ? { ...cur, available: cur.available || k.available, verified: cur.verified || k.verified } : k);
@@ -286,11 +458,9 @@ export function SpawnDialog({
     return [...m.values()].sort((a, b) => Number(b.available) - Number(a.available));
   }, [byTarget]);
   const installed = all.filter((k) => k.available);
-  React.useEffect(() => {
-    if (installed.length && !installed.some((k) => k.id === kind)) setKind(installed[0]?.id ?? "claude");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [all]);
-  const where = Object.entries(byTarget ?? {})
+  // One no machine has gives way to one that some machine has.
+  const kind = installed.length && !installed.some((k) => k.id === preferred) ? (installed[0]?.id ?? "claude") : preferred;
+  const where = Object.entries(byTarget)
     .filter(([, ks]) => ks.some((x) => x.id === kind && x.available))
     .map(([t]) => t);
   const target = [picked, defaults?.target, lastTarget].find((t): t is string => Boolean(t) && where.includes(t ?? "")) ?? where[0] ?? "";
@@ -301,11 +471,14 @@ export function SpawnDialog({
     return m?.hostname && m.hostname !== n ? `${n} (${m.hostname})` : n;
   };
   const recent = dirs[target] ?? [];
-  React.useEffect(() => {
-    if (open && !defaults?.cwd) setCwd(recent[0] ?? "~");
-    else if (open && defaults?.cwd) setCwd(defaults.cwd);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, target]);
+  // The folder: the one it was opened with, else the last one used on the machine; again when the machine changes.
+  const folder = defaults?.cwd || (recent[0] ?? "~");
+  const [cwd, setCwd] = React.useState(folder);
+  const [cwdOn, setCwdOn] = React.useState(target);
+  if (cwdOn !== target) {
+    setCwdOn(target);
+    setCwd(folder);
+  }
 
   const kindInfo = all.find((k) => k.id === kind);
   const modes = modesFor(kindInfo);
@@ -376,10 +549,15 @@ export function SpawnDialog({
       setBusy(false);
     }
   };
+  // Start (or Enter in a field, or ⌘/Ctrl+Enter in the message) submits the form around it.
+  useListener<SubmitEvent>(form, "submit", (e) => {
+    e.preventDefault();
+    if (!busy) void start();
+  });
 
-  const noHarness = byTarget !== null && installed.length === 0;
+  const noHarness = installed.length === 0;
   // Connected machines whose runner never reported its harnesses: too old to run agents (not "not installed").
-  const stale = byTarget === null ? [] : machines.filter((m) => !(`agent:${m.name}` in byTarget));
+  const stale = machines.filter((m) => !(`agent:${m.name}` in byTarget));
   const upgradeHint =
     stale.length > 0 ? (
       <div className="sp-note sp-note-warn">
@@ -389,165 +567,94 @@ export function SpawnDialog({
       </div>
     ) : null;
   return (
-    <D.Root open={open} onOpenChange={onOpenChange}>
-      <D.Portal>
-        <D.Overlay className="overlay" />
-        <D.Content
-          className="sp-sheet"
-          aria-describedby={undefined}
-          onOpenAutoFocus={(e) => {
-            e.preventDefault();
-            promptRef.current?.focus();
-          }}
-        >
-          <header className="sp-head">
-            <D.Title className="sp-title">New agents</D.Title>
-            <D.Close asChild>
-              <button type="button" className="sp-close" aria-label="Close">
-                <X size={17} />
-              </button>
-            </D.Close>
-          </header>
+    <>
+      {noHarness ? (
+        (upgradeHint ?? <div className="sp-note">No connected machine has a coding agent installed. Install Claude Code or Codex on any machine running kiln, then try again.</div>)
+      ) : (
+        <div className="sp-chips">
+          <Chip
+            title="Agent"
+            icon={<HarnessMark kind={kind} size={18} />}
+            label={kindInfo?.name ?? kind}
+            value={kind}
+            onPick={(k) => setKind(k)}
+            options={all.map((k) => ({
+              value: k.id,
+              label: `${k.name}${k.verified ? "" : " · untested"}`,
+              hint: k.available ? undefined : "Not installed on any connected machine",
+              disabled: !k.available,
+            }))}
+          />
+          <Chip
+            title="Machine"
+            icon={<Server size={13} />}
+            label={machineName(target)}
+            value={target}
+            onPick={(t) => {
+              setPicked(t);
+              setShell("");
+            }}
+            options={where.map((t) => ({ value: t, label: machineName(t) }))}
+          />
+          {shell && <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : "this shell"} />}
+          <Chip title="How many" label={`×${count}`} value={count} onPick={(n) => setCount(n)} options={COUNTS.map((n) => ({ value: n, label: n === 1 ? "1 agent" : `${n} agents` }))} />
+          {modes.length > 0 && (
+            <Chip
+              title="Permissions"
+              icon={modeInfo?.dangerous ? <ShieldOff size={13} className="sp-chip-warn" /> : <ShieldCheck size={13} />}
+              label={modeInfo?.label ?? mode}
+              value={mode}
+              onPick={pickMode}
+              options={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
+            />
+          )}
+          {efforts.length > 0 && (
+            <Chip
+              title="Effort"
+              icon={<Gauge size={13} />}
+              label={effortInfo ? `${effortInfo.label} effort` : "Default effort"}
+              value={effort}
+              onPick={(e) => setEffortByKind({ ...effortByKind, [kind]: e })}
+              options={[{ value: "", label: "Default", hint: "The model's own" }, ...efforts.map((e) => ({ value: e.id, label: e.label, hint: e.hint }))]}
+            />
+          )}
+          <button type="button" className={cn("sp-chip", more && "sp-chip-on")} aria-expanded={more} onClick={() => setMore(!more)}>
+            <SlidersHorizontal size={13} />
+            <span className="sp-chip-text">More</span>
+          </button>
+        </div>
+      )}
 
-          <form
-            className="sp-body"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void start();
+      {more && <MoreFields count={count} name={name} onName={setName} model={model} onModel={setModel} shell={shell} onShell={setShell} shells={targetShells} />}
+
+      {!shell && target && <InlinePath target={target} value={cwd} onChange={setCwd} recent={recent} className="sp-path" />}
+      {!noHarness && upgradeHint}
+      {armedInfo ? (
+        <div className="sp-hint sp-hint-warn">
+          {armedInfo.label}: no checks at all.{" "}
+          <button
+            type="button"
+            className="sp-confirm"
+            onClick={() => {
+              setUnchecked(armedInfo.id);
+              setArmed("");
             }}
           >
-            <textarea
-              ref={promptRef}
-              className="sp-prompt"
-              rows={4}
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                  e.preventDefault();
-                  void start();
-                }
-              }}
-              placeholder={count > 1 ? `What should these ${count} agents do? (each gets this message)` : "What should it do? (optional — you can tell it later)"}
-              aria-label="First message"
-            />
+            Turn them off
+          </button>
+        </div>
+      ) : (
+        modeInfo && <div className={cn("sp-hint", modeInfo.dangerous && "sp-hint-warn")}>{modeInfo.hint}.</div>
+      )}
+      {error && <div className="sp-error">{error}</div>}
+      <PastSessions target={target} kind={kind} kindName={kindInfo?.name ?? kind} onPick={(p) => void resume(p)} busy={busy} />
 
-            {noHarness ? (
-              (upgradeHint ?? <div className="sp-note">No connected machine has a coding agent installed. Install Claude Code or Codex on any machine running kiln, then try again.</div>)
-            ) : byTarget === null ? (
-              <div className="sp-note">Looking at your machines…</div>
-            ) : (
-              <div className="sp-chips">
-                <Chip
-                  title="Agent"
-                  icon={<HarnessMark kind={kind} size={18} />}
-                  label={kindInfo?.name ?? kind}
-                  value={kind}
-                  onPick={(k) => setKind(k)}
-                  options={all.map((k) => ({
-                    value: k.id,
-                    label: `${k.name}${k.verified ? "" : " · untested"}`,
-                    hint: k.available ? undefined : "Not installed on any connected machine",
-                    disabled: !k.available,
-                  }))}
-                />
-                <Chip
-                  title="Machine"
-                  icon={<Server size={13} />}
-                  label={machineName(target)}
-                  value={target}
-                  onPick={(t) => {
-                    setPicked(t);
-                    setShell("");
-                  }}
-                  options={where.map((t) => ({ value: t, label: machineName(t) }))}
-                />
-                {shell && <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : "this shell"} />}
-                <Chip title="How many" label={`×${count}`} value={count} onPick={(n) => setCount(n)} options={COUNTS.map((n) => ({ value: n, label: n === 1 ? "1 agent" : `${n} agents` }))} />
-                {modes.length > 0 && (
-                  <Chip
-                    title="Permissions"
-                    icon={modeInfo?.dangerous ? <ShieldOff size={13} className="sp-chip-warn" /> : <ShieldCheck size={13} />}
-                    label={modeInfo?.label ?? mode}
-                    value={mode}
-                    onPick={pickMode}
-                    options={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
-                  />
-                )}
-                {efforts.length > 0 && (
-                  <Chip
-                    title="Effort"
-                    icon={<Gauge size={13} />}
-                    label={effortInfo ? `${effortInfo.label} effort` : "Default effort"}
-                    value={effort}
-                    onPick={(e) => setEffortByKind({ ...effortByKind, [kind]: e })}
-                    options={[{ value: "", label: "Default", hint: "The model's own" }, ...efforts.map((e) => ({ value: e.id, label: e.label, hint: e.hint }))]}
-                  />
-                )}
-                <button type="button" className={cn("sp-chip", more && "sp-chip-on")} aria-expanded={more} onClick={() => setMore(!more)}>
-                  <SlidersHorizontal size={13} />
-                  <span className="sp-chip-text">More</span>
-                </button>
-              </div>
-            )}
-
-            {more && (
-              <div className="sp-more">
-                <label className="sp-field">
-                  <span>Name</span>
-                  <input className="hx-input" value={name} onChange={(e) => setName(e.target.value)} placeholder={count > 1 ? "fix-tests (numbered)" : "optional"} />
-                </label>
-                <label className="sp-field">
-                  <span>Model</span>
-                  <input className="hx-input" value={model} onChange={(e) => setModel(e.target.value)} placeholder="the harness's default" spellCheck={false} autoCapitalize="off" />
-                </label>
-                {targetShells.length > 0 && (
-                  <label className="sp-field">
-                    <span>Run in</span>
-                    <select className="hx-select" value={shell} onChange={(e) => setShell(e.target.value)}>
-                      <option value="">A folder</option>
-                      {targetShells.map((s) => (
-                        <option key={s.id} value={s.id}>
-                          Shell: {s.title || s.id.slice(0, 8)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
-              </div>
-            )}
-
-            {!shell && target && <InlinePath target={target} value={cwd} onChange={setCwd} recent={recent} className="sp-path" />}
-            {!noHarness && upgradeHint}
-            {armedInfo ? (
-              <div className="sp-hint sp-hint-warn">
-                {armedInfo.label}: no checks at all.{" "}
-                <button
-                  type="button"
-                  className="sp-confirm"
-                  onClick={() => {
-                    setUnchecked(armedInfo.id);
-                    setArmed("");
-                  }}
-                >
-                  Turn them off
-                </button>
-              </div>
-            ) : (
-              modeInfo && <div className={cn("sp-hint", modeInfo.dangerous && "sp-hint-warn")}>{modeInfo.hint}.</div>
-            )}
-            {error && <div className="sp-error">{error}</div>}
-            <PastSessions target={target} kind={kind} kindName={kindInfo?.name ?? kind} onPick={(p) => void resume(p)} busy={busy} />
-
-            <footer className="sp-foot">
-              <span className="sp-foot-note">{target ? `${kindInfo?.name ?? kind} on ${machineName(target)}` : ""}</span>
-              <Button type="submit" disabled={busy || !target}>
-                <Rocket /> {busy ? "Starting…" : count > 1 ? `Start ${count} agents` : "Start agent"}
-              </Button>
-            </footer>
-          </form>
-        </D.Content>
-      </D.Portal>
-    </D.Root>
+      <footer className="sp-foot">
+        <span className="sp-foot-note">{target ? `${kindInfo?.name ?? kind} on ${machineName(target)}` : ""}</span>
+        <Button type="submit" disabled={busy || !target}>
+          <Rocket /> {busy ? "Starting…" : count > 1 ? `Start ${count} agents` : "Start agent"}
+        </Button>
+      </footer>
+    </>
   );
 }

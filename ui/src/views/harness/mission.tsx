@@ -209,11 +209,12 @@ export default function Mission() {
   const [spawn, setSpawn] = React.useState(false);
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  // ?new=1 (links from elsewhere) opens New agents; closing it takes that off the address.
-  const spawnOpen = spawn || params.get("new") === "1";
-  const openSpawn = (open: boolean) => {
-    setSpawn(open);
-    if (open || params.get("new") !== "1") return;
+  // ?new=1 (links from elsewhere) opens New agents: open, it stays so by itself, and the link's
+  // mark comes off the address.
+  const fromLink = params.get("new") === "1";
+  const opened = () => {
+    if (!fromLink) return;
+    setSpawn(true);
     const n = new URLSearchParams(params);
     n.delete("new");
     setParams(n, { replace: true });
@@ -235,20 +236,21 @@ export default function Mission() {
             <Button asChild variant="secondary">
               <Link to="/agents/plans">Plans</Link>
             </Button>
-            <Button onClick={() => openSpawn(true)}>
+            <Button onClick={() => setSpawn(true)}>
               New agents <Plus />
             </Button>
           </>
         }
       />
       <Loadable label="Loading agents" fallback={<Loading label="Loading agents" block />}>
-        <Agents onSpawn={() => openSpawn(true)} />
+        <Agents onSpawn={() => setSpawn(true)} />
       </Loadable>
       <SpawnDialog
-        open={spawnOpen}
-        onOpenChange={openSpawn}
+        open={spawn || fromLink}
+        onOpenChange={setSpawn}
+        onOpened={opened}
         onStarted={(started) => {
-          openSpawn(false);
+          setSpawn(false);
           if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
           else invalidate("harness/agents");
         }}
