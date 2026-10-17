@@ -386,7 +386,11 @@ CLI: `kiln cd apps`, `kiln cd app <app> [--tree|--diff|--history]`, `kiln cd syn
 [<commit>] [--stack] [--base <commit>] [--trunk <branch>] [--pr n] [--diff]` (by default the
 branch checked out here, as a stack), `kiln cd cluster add|list|rm`, `kiln cd import`, `kiln cd bench`.
 
-UI: **Deployments**: the fleet as one list (sync and health per app, filtered by environment,
+UI: **Deploy plans** (`/deployments/plans`, linked from Deployments as "Plan a deploy"): choose
+a repository and a branch, a commit or a pull request; each commit, in the order they land, lists
+the apps it changes with its own change, the stack's against trunk, or a sync's steps (one select
+chooses), every object's change as a diff, and why a commit fails. The URL holds what is planned.
+**Deployments**: the fleet as one list (sync and health per app, filtered by environment,
 cluster and project, 100,000 apps scrolling smoothly), an app's resource tree, diffs, history and
 rollback, the environments board, previews by stack, fleets and their rollouts. Each diff's page
 gets a **Deploy** panel with its plan.
@@ -498,7 +502,7 @@ and the network come on top, and are measured separately as they are built.
 | `/api/cd`, `kiln cd` | built |
 | MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; Claude Code sessions kiln starts get it | built |
 | Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI) | built |
-| Plans of a commit, a stack or a pull request: the apps it touches, each diff's own change and the stack's, a sync's steps against what runs, the render and `Prune=false` checks (API, CLI, MCP) | built; the UI's plan panel, kiln's own diffs, the land queue, previews, statuses and comments on pull requests, policy checks: not yet |
+| Plans of a commit, a stack or a pull request: the apps it touches, each diff's own change and the stack's, a sync's steps against what runs, the render and `Prune=false` checks (API, CLI, MCP, and Deployments → Plan a deploy) | built; kiln's own diffs, the land queue, previews, statuses and comments on pull requests, policy checks: not yet |
 | UI: the fleet list (windowed, filtered and sorted on the server, live; the console's filter field with counts per value, namespace included; the fleet's counts; row checkboxes for syncing or refreshing many) and an app's page (revision, last sync, source; the resource tree as a graph or an indented list, a list, pods by owner or node; one filter over every view; an object's summary, manifests, diff, events and logs, followed live; sync of chosen objects, rollback, refresh and hard refresh, take over, stop, delete, each confirmed in place) | built; environments board, previews, fleets, resource actions, the tree over a WebSocket: not yet |
 | Notifications, windows, projects and RBAC, previews | not yet |
 

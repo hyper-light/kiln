@@ -10,7 +10,7 @@ import * as React from "react";
 import { Link, useSearchParams } from "react-router";
 import { Rocket } from "lucide-react";
 
-import { appHref, cdApi, type CdFilters, type CdSort } from "@/api/cd";
+import { appHref, cdApi, plansHref, type CdFilters, type CdSort } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
 import type { CdApp, CdFacets, CdSummary } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -338,7 +338,17 @@ export default function Deployments() {
 
   return (
     <div className="container-console page cd-page">
-      <PageIntro index={3} label="Deployments" title="Deployments." lead="What git says, and what runs: every app's sync and health, live." />
+      <PageIntro
+        index={3}
+        label="Deployments"
+        title="Deployments."
+        lead="What git says, and what runs: every app's sync and health, live."
+        actions={
+          <Button asChild size="sm" variant="secondary">
+            <Link to={plansHref}>Plan a deploy</Link>
+          </Button>
+        }
+      />
       <Summary s={summary.data} />
       <div className="cd-toolbar">
         <FacetBox

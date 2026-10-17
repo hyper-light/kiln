@@ -1148,3 +1148,120 @@ export interface SyncView {
 }
 
 export type SyncKeep = "name" | "copy" | "both";
+
+/** What to plan (`/api/cd/plans`): one commit, a stack (`head`, from where it leaves trunk or
+ * from `base`), or a pull request. */
+export interface CdPlanAsk {
+  repo?: string;
+  commit?: string;
+  head?: string;
+  base?: string;
+  trunk?: string;
+  pr?: number;
+  /** Counts and keys only, no hunks. */
+  brief?: boolean;
+}
+
+/** One object in a plan: how one render differs from another (`change`), or one step of a sync (`step`). */
+export interface CdPlanObject {
+  key: CdResourceKey;
+  change?: "added" | "changed" | "removed";
+  step?: "create" | "update" | "prune" | "hook";
+  phase?: string;
+  wave?: number;
+  /** Where an update differs: `.spec.replicas differs`. */
+  why?: string | null;
+  hook: boolean;
+  added_lines: number;
+  removed_lines: number;
+  /** From before to after, as YAML. Left out when brief, or longer than 2,000 lines. */
+  hunks?: CdHunk[];
+}
+
+/** How one render's objects differ from another's. */
+export interface CdPlanChanges {
+  added: number;
+  changed: number;
+  removed: number;
+  objects: CdPlanObject[];
+}
+
+/** What a sync of a render would do against what runs, step by step in its order. */
+export interface CdPlanSync {
+  create: number;
+  update: number;
+  prune: number;
+  hooks: number;
+  unchanged: number;
+  /** Objects whose live state couldn't be read. */
+  unread: number;
+  /** Gone from git, kept in the cluster: by `Prune=false`, or until a person confirms. */
+  held: { key: CdResourceKey; prune: "false" | "confirm" }[];
+  /** Deployed by another app, which keeps them. */
+  taken: { key: CdResourceKey; app: string }[];
+  steps: CdPlanObject[];
+}
+
+/** One app in one diff's plan. */
+export interface CdPlanApp {
+  app: string;
+  cluster: string;
+  namespace: string;
+  /** Syncs when the change lands. */
+  auto: boolean;
+  auto_prune: boolean;
+  /** Adopted from Argo CD and not taken over: Argo CD deploys it. */
+  shadow: boolean;
+  /** This diff changes it; false when a lower diff did and this one leaves it alone. */
+  touched: boolean;
+  ok: boolean;
+  error: string | null;
+  /** Why the diff fails for it. */
+  problems: string[];
+  notes: string[];
+  /** Against the diff below. */
+  own: CdPlanChanges | null;
+  /** Against trunk. */
+  stack: CdPlanChanges | null;
+  sync: CdPlanSync | null;
+}
+
+/** A commit as people read it. */
+export interface CdPlanCommit {
+  sha: string;
+  author?: string;
+  email?: string;
+  at_ms?: number;
+  subject?: string;
+  body?: string;
+}
+
+/** One diff (commit) of a stack, and the apps it changes. */
+export interface CdPlanDiff {
+  commit: CdPlanCommit;
+  ok: boolean;
+  apps: CdPlanApp[];
+}
+
+/** A plan: what a commit, or every diff of a stack, would deploy. */
+export interface CdPlan {
+  repo: string | null;
+  trunk: { branch: string; commit: string };
+  /** The commit below the bottom diff. */
+  base: string | null;
+  ok: boolean;
+  apps: { affected: number; planned: number; unaffected: number; unplanned: string[] };
+  notes: string[];
+  /** Bottom first. */
+  diffs: CdPlanDiff[];
+}
+
+/** A repository apps deploy from, for choosing what to plan. */
+export interface CdPlanRepo {
+  url: string;
+  urls: string[];
+  apps: number;
+  default_branch: string | null;
+  /** The newest first. */
+  branches: { name: string; commit: string; at_ms: number }[];
+}
