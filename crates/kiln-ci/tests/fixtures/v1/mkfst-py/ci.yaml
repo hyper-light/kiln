@@ -1,0 +1,90 @@
+# kiln translation of .github/workflows/ci.yml: ruff lint + format check, the
+# test matrix (Linux legs, Python 3.11-3.14), then sdist + wheel + twine check.
+#
+# Not reproduced: the macOS test legs (no macOS executors), and publish.yml
+# (PyPI upload with PYPI_API_TOKEN; its `python -m build` is covered by `build`).
+#
+# actions/setup-python stand-in: a uv-managed CPython of the wanted version in a
+# venv seeded with pip, so the install/test commands are the workflow's own.
+name: ci
+
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  manual: true
+
+concurrency: { group: "ci-${{ branch }}", cancel-in-progress: true }
+
+jobs:
+  lint:
+    name: lint
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 15
+    resources: { cpu: "2", memory: 4Gi }
+    steps:
+      - name: Set up Python 3.13
+        run: uv python install 3.13 && uv venv --seed --python 3.13 .venv
+      - name: Install dev dependencies
+        run: |
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,auth]"
+      - name: Ruff lint
+        run: . .venv/bin/activate && ruff check .
+      - name: Ruff format check (touched modules)
+        # Format-check only the modules already brought up to ruff-format
+        # baseline. Legacy modules will be added incrementally as they're touched.
+        run: |
+          . .venv/bin/activate
+          ruff format --check \
+            mkfst/encryption \
+            mkfst/middleware/csrf \
+            mkfst/middleware/cors \
+            mkfst/middleware/auth \
+            mkfst/snowflake \
+            mkfst/connection/tcp/protocols/http_parser.py \
+            tests/
+
+  test:
+    # GHA: fail-fast false -- kiln legs are independent anyway.
+    name: test
+    runs-on: [k8s]
+    toolchain: python
+    matrix:
+      python: ["3.11", "3.12", "3.13", "3.14"]
+    timeout-minutes: 30
+    resources: { cpu: "2", memory: 4Gi }
+    steps:
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }} && uv venv --seed --python ${{ matrix.python }} .venv
+      - name: Install
+        run: |
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,auth]"
+      - name: Run tests
+        run: . .venv/bin/activate && pytest -q --tb=short
+
+  build:
+    name: build
+    needs: [lint, test]
+    runs-on: [k8s]
+    toolchain: python
+    timeout-minutes: 15
+    resources: { cpu: "1", memory: 2Gi }
+    # GHA: upload-artifact `dist` (if-no-files-found: error -- an empty dist/
+    # already fails the twine check).
+    artifacts: ["dist/*"]
+    steps:
+      - name: Set up Python 3.13
+        run: uv python install 3.13 && uv venv --seed --python 3.13 .venv
+      - name: Install build
+        run: |
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+      - name: Build sdist + wheel
+        run: . .venv/bin/activate && python -m build
+      - name: Twine check
+        run: . .venv/bin/activate && python -m twine check dist/*

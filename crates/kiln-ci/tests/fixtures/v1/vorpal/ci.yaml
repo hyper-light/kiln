@@ -1,0 +1,66 @@
+# CI, translated from .github/workflows/ci.yml. Both jobs run in pods. The encoder's GEMM rate moved to
+# bench.yaml (exclusive bare metal); the kernel oracles stay here. The minikube nodes share the host's CPU
+# (AVX2, AVX-512, VNNI), so the oracles exercise every x86 rung. A pod sees every host CPU but is granted
+# only its request, so each job caps cargo's jobs and libtest's threads at that request.
+# Not translated: grammar-audit.yml (opens or updates a GitHub issue through `gh` with a token),
+# publish-python.yml, publish-node.yml and release.yml (PyPI/npm publishing, GitHub Releases, signing key).
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  # workflow_dispatch: a manual run also runs the weights-gated encoder parity (below).
+  manual: true
+concurrency: { group: "ci-${{ branch }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+jobs:
+  # GHA names it "fmt + clippy + test", but there is deliberately no fmt gate (see the workflow's note):
+  # Clippy at -D warnings is the lint gate.
+  test:
+    name: clippy + test
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 75
+    env: { CARGO_BUILD_JOBS: "6", RUST_TEST_THREADS: "6" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # vorpal-py's bindings are behind the off-by-default `python` feature: lint them as the wheel builds them.
+      - name: Clippy (python bindings)
+        run: cargo clippy -p vorpal-py --features python --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  encoder-x86:
+    name: encoder x86 kernels (parity)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 75
+    env: { CARGO_BUILD_JOBS: "6", RUST_TEST_THREADS: "6" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: Runner ISA
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)' || true
+          grep -o -w 'avx2\|fma\|avx512f\|avx512bw\|avx512_vnni\|avx_vnni' /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+      - name: Kernel oracles (every present ISA vs the exact reference and the fixed lanes)
+        run: cargo test --release -p vorpal-ann --lib encoder -- --nocapture
+      # Weights-gated parity on the real encoder (547 MB download): manual runs only, as on GHA.
+      - name: Install the pinned encoder weights (manual runs only)
+        run: |
+          if [ "$KILN_EVENT" != manual ]; then echo "skipped: manual runs only"; exit 0; fi
+          cargo build --release -p vorpal
+          VORPAL_HOME="$TMPDIR/vhome" target/release/vorpal enable semantic-f32
+      - name: Real-encoder parity (throughput / int8 vs the fixed lanes; manual runs only)
+        run: |
+          if [ "$KILN_EVENT" != manual ]; then echo "skipped: manual runs only"; exit 0; fi
+          VORPAL_CODERANK_DIR="$TMPDIR/vhome/models/coderankembed-f32" \
+            cargo test --release -p vorpal-ann --test encoder -- --nocapture --test-threads 1 throughput_path int8_path

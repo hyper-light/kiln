@@ -10,11 +10,15 @@
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`stats`]: bootstrap intervals for benchmarks and experiments (W16, W20).
+//! - [`facts`]: what runners report about themselves (W13).
+//! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
 
 pub mod expr;
+pub mod facts;
 pub mod plan;
 pub mod results;
 pub mod sched;
 pub mod stats;
 pub mod trigger;
 pub mod wf;
+pub mod wire;

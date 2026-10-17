@@ -1,0 +1,47 @@
+# kiln builds itself: lint + test the server in a Kubernetes pod, build the UI in another,
+# and run the transport benchmarks on real hardware.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  manual: true
+concurrency:
+  group: "kiln-${{ branch }}"
+  cancel-in-progress: true
+jobs:
+  rust:
+    name: rust lint + test
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 45
+    steps:
+      - name: toolchain
+        run: rustup component add clippy && cargo --version
+      - name: clippy (no-panic lint wall)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: test
+        run: cargo test --locked
+
+  ui:
+    name: ui typecheck + build
+    runs-on: [k8s]
+    toolchain: node
+    resources: { cpu: "2", memory: 4Gi }
+    steps:
+      - run: npm ci --prefix ui --no-audit --no-fund
+      - run: npm run --prefix ui typecheck
+      - run: npm run --prefix ui build
+
+  release-binary:
+    name: release build (bare metal)
+    needs: [rust, ui]
+    # The server's own Linux machine (as release.yaml): other runners, a Mac among them, are bare
+    # metal too.
+    runs-on: [baremetal, local]
+    if: "branch == 'main'"
+    steps:
+      - run: npm ci --prefix ui --no-audit --no-fund && npm run --prefix ui build
+      - run: cargo build --release --locked -p kiln
+      - run: mkdir -p dist && cp target/release/kiln dist/kiln-$(uname -m)
+    artifacts: [dist/*]

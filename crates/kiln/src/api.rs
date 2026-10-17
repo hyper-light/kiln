@@ -207,6 +207,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["ca.mobileconfig"]) => return Ok(crate::frontdoor::control::ca(&hub, "mobileconfig")),
         _ => {}
     }
+    // CI's open routes: runtime services, job ID tokens, the OIDC issuer (docs/ci.md §2.6).
+    if crate::ci::api::is_open(&s) {
+        return match crate::ci::api::open(&hub, &s, req).await {
+            Some(r) => r.map_err(|(c, m)| err(c, m)),
+            None => Err(err(StatusCode::NOT_FOUND, "not found")),
+        };
+    }
 
     let is_api = s.first() == Some(&"api");
     if !is_api {
@@ -218,6 +225,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let q = srv::query(&req);
     match (&method, s.as_slice()) {
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,

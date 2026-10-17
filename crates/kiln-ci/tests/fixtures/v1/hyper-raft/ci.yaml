@@ -1,0 +1,134 @@
+# kiln's translation of .github/workflows/ci.yml: the same jobs and the same commands, with the
+# same timeouts. GitHub's six runners become the Linux x86_64 leg alone. kiln has no macOS, Windows
+# or ARM agents, so the ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025 and
+# windows-11-arm legs of `gates` and `recursion` stay on GitHub.
+#
+# Every job runs in a fresh pod. A pod sees all of the host's CPUs, whatever it requests. So the
+# Rust jobs hold cargo's build jobs, and the gates hold libtest's test threads, to the pod's CPU
+# request. The pod's memory request is also its limit.
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+concurrency: { group: "ci-${{ branch }}", cancel-in-progress: true }
+jobs:
+  gates:
+    # scripts/gates.sh: contracts, fmt, clippy, then the workspace's tests through
+    # scripts/gate-progress.py. Twice the slowest gates job measured on main (see the workflow).
+    name: gates (linux x86_64)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 124
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "6"
+      RUST_TEST_THREADS: "6"
+    # The progress record, kept whether the gates passed or not: it names the last test of every
+    # failure and timeout.
+    artifacts: ["target/gate-progress.log"]
+    steps:
+      - name: python3 (the contracts and progress scripts)
+        run: command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
+      - name: toolchain (rust-toolchain.toml, pinned exactly)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: gates
+        run: bash scripts/gates.sh
+
+  recursion:
+    # No runtime recursion (CLAUDE.md §1): the call graph of every production unit's opt-level-0
+    # IR, after the script's self-test.
+    name: recursion (linux x86_64)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 19
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: python3
+        run: command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
+      - name: toolchain (rust-toolchain.toml, pinned exactly)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: self-test
+        run: python3 scripts/check-recursion.py --self-test
+      - name: call-graph cycles
+        run: python3 scripts/check-recursion.py --list
+
+  miri:
+    # hyper-sim, then hyper-check's oracles, liveness and witness tests, under Miri (docs/sim.md §9,
+    # §14.8), on the nightly the suite was run on.
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 36
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: nightly with miri
+        run: rustup toolchain install nightly-2026-09-05 --component miri --profile minimal
+      - name: hyper-sim under miri
+        run: cargo +nightly-2026-09-05 miri test -p hyper-sim --locked
+      - name: hyper-check oracles, liveness and witness under miri
+        run: cargo +nightly-2026-09-05 miri test -p hyper-check --locked --test oracles --test liveness --test witness
+
+  model:
+    # The core's TLA+ model (docs/models/README.md), in the script's parts, side by side. TLC runs
+    # in CI only (CLAUDE.md §1), so it stays in pods and off the bare-metal agent. TLA_TOOLS is the
+    # script's default, target/tla. The jar is fetched each run and checked by its SHA-256.
+    name: model
+    runs-on: [k8s]
+    image: eclipse-temurin:21-jdk
+    matrix: { part: [fast, change, small, reconfig, scenario] }
+    resources: { cpu: "4", memory: 2Gi }
+    timeout-minutes: 131
+    env:
+      # GitHub's runner's four vCPUs. A refused configuration runs with one, whatever this says.
+      TLC_WORKERS: "4"
+    steps:
+      - name: curl (the checker's download)
+        run: command -v curl >/dev/null || { apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; }
+      - name: check-model.sh --part ${{ matrix.part }}
+        run: bash scripts/check-model.sh --part ${{ matrix.part }}
+
+  parts:
+    # Every configuration of scripts/check-model.sh is in a part the model job runs.
+    runs-on: [k8s]
+    resources: { cpu: "1", memory: 512Mi }
+    timeout-minutes: 5
+    steps:
+      - name: the model job's parts are the script's
+        run: |
+          diff <(bash scripts/check-model.sh --parts) <(printf '%s\n' change fast reconfig scenario small)
+
+  explore:
+    # hyper-check's exhaustive searches at full scope (docs/sim.md §15.1), and hyper-durable's
+    # simulation at 10,000 seeds a shape. The searches run on four workers, bounded at 4 GiB.
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 69
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - name: toolchain (rust-toolchain.toml, pinned exactly)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: exhaustive
+        run: cargo test --release -p hyper-check --locked --test exhaustive -- --ignored --test-threads 1
+      - name: reconfig
+        run: cargo test --release -p hyper-check --locked --test reconfig -- --ignored --test-threads 1
+      - name: fasttrack
+        run: cargo test --release -p hyper-check --locked --test fasttrack -- --ignored --test-threads 1
+      - name: hyper-durable simulation, 10,000 seeds a shape
+        run: HYPER_DURABLE_SEEDS=10000 cargo test --release -p hyper-durable --locked --test sim -- random_schedules_keep_every_invariant_and_settle

@@ -1,0 +1,32 @@
+# Benchmarks on dedicated hardware: the encoder GEMM rate that ci.yml's encoder-x86 job recorded from the
+# runner's log (docs/wip/BENCHMARKS.md, "Cross-platform encoder"), moved here so the measurement has the
+# machine to itself. It runs when the encoder's code or the build inputs change on main, or by hand.
+name: bench
+on:
+  push:
+    branches: [main]
+    paths: ["crates/ann/**", "crates/mem/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**", ".kiln/bench.yaml"]
+  manual: true
+concurrency: { group: "bench-${{ branch }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  gemm:
+    name: encoder GEMM rate at the 256-surface batch (4690 tokens, median of 3)
+    runs-on: [baremetal, bench]
+    exclusive: true
+    timeout-minutes: 60
+    artifacts: ["bench-results/*"]
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: build (release)
+        run: cargo build --release -p vorpal-ann --example gemm_bench
+      - name: Runner ISA
+        run: |
+          mkdir -p bench-results
+          { lscpu | grep -E 'Model name|^CPU\(s\)' || true
+            grep -o -w 'avx2\|fma\|avx512f\|avx512bw\|avx512_vnni\|avx_vnni' /proc/cpuinfo | sort -u | tr '\n' ' '; echo; } \
+            | tee bench-results/isa.txt
+      - name: GEMM rate at the 256-surface batch (4690 tokens, median of 3)
+        run: cargo run --release -p vorpal-ann --example gemm_bench -- 4690 3 | tee "bench-results/gemm-${{ git.short_sha }}.txt"

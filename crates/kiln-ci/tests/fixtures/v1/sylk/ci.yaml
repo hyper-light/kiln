@@ -1,0 +1,97 @@
+# kiln CI for sylk, translated from .github/workflows/build.yml ("Build & Release").
+#
+#   GitHub                                 kiln
+#   verify linux/amd64: vet + test         vet, test (separate jobs: a vet failure no longer
+#                                          hides the test results)
+#   build linux/amd64 + linux/arm64        release-build (arm64 is cross-compiled; there is
+#                                          no arm64 hardware here)
+#   verify linux/arm64                     skipped: arm64 tests cannot run without arm64 hardware
+#   verify/build macOS + Windows           skipped: no macOS or Windows agents
+#   version (computes the next vX.Y.Z)     skipped: needs git tags; builds use v0.0.0+kiln.<sha>
+#   release (GitHub Release + uploads)     skipped: needs GitHub credentials
+#
+# Submodules: .gitmodules lists vendor/go-llama.cpp and third_party/go-llama.cpp, but no commit
+# has ever recorded a gitlink for either path (`git ls-tree -r HEAD` has no 160000 entries), so
+# there is no pinned SHA to check out. GitHub's checkout never fetched them either. These jobs
+# don't need them. The only importer of go-llama.cpp (core/vectorgraphdb/vamana/embedder/gguf.go)
+# builds only with `-tags gguf`, which neither this file nor the GitHub workflow sets, and the
+# Go module itself comes from the module proxy through go.mod. A future gguf job (Makefile:
+# build-gguf) would clone https://github.com/go-skynet/go-llama.cpp with --recurse-submodules
+# into third_party/go-llama.cpp, check out the commit go.mod pins (6a8041ef6b46 today; update it
+# whenever go.mod bumps the module), and run `make -C third_party/go-llama.cpp libbinding.a`.
+#
+# Job pods see all 32 host CPUs because kiln sets CPU requests but no CPU limit. GOMAXPROCS
+# matches each job's CPU request; otherwise `go test` runs 32 packages at once and can exceed
+# the memory limit.
+name: ci
+on: { push: { branches: [main] }, pull_request: {} }
+concurrency: { group: "ci-${{ branch }}", cancel-in-progress: true }
+env:
+  CGO_ENABLED: "1"
+  BIN_NAME: sylk
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  vet:
+    name: go vet
+    runs-on: [k8s]
+    toolchain: go
+    resources: { cpu: "3", memory: 6Gi }
+    timeout-minutes: 30
+    env: { GOMAXPROCS: "3" }
+    steps:
+      - name: install build deps
+        run: |
+          apt-get update -qq -o Acquire::Retries=3
+          apt-get install -y -qq --no-install-recommends -o Acquire::Retries=3 \
+            build-essential pkg-config libfuse-dev libfuse3-dev
+      - name: go vet ./...
+        run: go version && go vet ./...
+
+  test:
+    name: go test
+    runs-on: [k8s]
+    toolchain: go
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 60
+    env: { GOMAXPROCS: "6" }
+    steps:
+      - name: install build deps
+        run: |
+          apt-get update -qq -o Acquire::Retries=3
+          apt-get install -y -qq --no-install-recommends -o Acquire::Retries=3 \
+            build-essential pkg-config libfuse-dev libfuse3-dev
+      - name: go test ./...
+        run: go version && go test ./...
+
+  # Runs alongside vet and test instead of waiting for them, because nothing is published here.
+  # Add `needs: [vet, test]` if this job ever uploads a release.
+  release-build:
+    name: release build
+    runs-on: [k8s]
+    toolchain: go
+    matrix: { arch: [amd64, arm64] }
+    resources: { cpu: "3", memory: 6Gi }
+    timeout-minutes: 45
+    env:
+      GOMAXPROCS: "3"
+      TARGET_OS: linux
+      TARGET_ARCH: "${{ matrix.arch }}"
+      # Stands in for the next vX.Y.Z tag. Use '+', not '-': rpmbuild rejects '-' in Version.
+      VERSION: "v0.0.0+kiln.${{ git.short_sha }}"
+    artifacts: ["dist/*"]
+    steps:
+      - name: install build + packaging deps
+        run: |
+          pkgs="build-essential pkg-config libfuse-dev libfuse3-dev rpm"
+          # The cgo cross-build for arm64 needs an aarch64 C compiler and libc.
+          if [ "$TARGET_ARCH" = arm64 ]; then
+            pkgs="$pkgs gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
+          fi
+          apt-get update -qq -o Acquire::Retries=3
+          apt-get install -y -qq --no-install-recommends -o Acquire::Retries=3 $pkgs
+      - name: scripts/ci/build-release.sh
+        run: |
+          if [ "$TARGET_ARCH" = arm64 ]; then export CC=aarch64-linux-gnu-gcc; fi
+          bash ./scripts/ci/build-release.sh
+          ls -l dist

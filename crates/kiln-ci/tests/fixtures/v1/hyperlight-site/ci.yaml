@@ -1,0 +1,65 @@
+# kiln CI for hyperlight-site (it has no GitHub workflows): the package.json checks plus both
+# Playwright suites. Each check gets its own pod, so one failure (lint fails today) doesn't hide
+# the others. `npm run format:check` (prettier --check .) also checks this file, so keep it
+# Prettier-formatted.
+#
+# Job pods see all 32 host CPUs because kiln sets CPU requests but no CPU limit. Node tools that
+# size worker pools from os.cpus() need the memory or caps noted below.
+name: ci
+on: { push: { branches: [main] }, pull_request: {} }
+concurrency: { group: "ci-${{ branch }}", cancel-in-progress: true }
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  check:
+    runs-on: [k8s]
+    toolchain: node
+    matrix: { script: [lint, typecheck, "format:check"] }
+    resources: { cpu: "1", memory: 3Gi }
+    timeout-minutes: 15
+    steps:
+      - run: npm ci --no-audit --no-fund
+      - run: npm run ${{ matrix.script }}
+
+  # `node --test` starts one process per test file, up to 31 at a time here, so this job gets
+  # more memory than the other checks.
+  test:
+    runs-on: [k8s]
+    toolchain: node
+    resources: { cpu: "2", memory: 6Gi }
+    timeout-minutes: 15
+    steps:
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+
+  build:
+    runs-on: [k8s]
+    toolchain: node
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 30
+    env:
+      # next build starts os.cpus() - 1 page workers (31 here). Next reads CIRCLE_NODE_TOTAL in
+      # place of the CPU count (next/dist/server/config-shared.js), so this caps it at 3.
+      CIRCLE_NODE_TOTAL: "4"
+    steps:
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+
+  # Both Playwright configs start `npm run dev` on port 3000, so each suite runs in its own pod.
+  # test:e2e covers desktop and mobile Chromium. test:e2e:motion
+  # (playwright.motion.config.ts) adds Firefox, WebKit and mobile WebKit. The image ships
+  # browsers for exactly one Playwright version: keep the tag equal to @playwright/test in
+  # package-lock.json (1.63.0) and bump both together. Traces from failed tests are kept in
+  # test-results/ and uploaded as artifacts.
+  e2e:
+    runs-on: [k8s]
+    toolchain: node
+    image: mcr.microsoft.com/playwright:v1.63.0-noble
+    matrix: { suite: ["test:e2e", "test:e2e:motion"] }
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 45
+    artifacts: [test-results]
+    steps:
+      - run: npm ci --no-audit --no-fund
+      - run: npm run ${{ matrix.suite }}

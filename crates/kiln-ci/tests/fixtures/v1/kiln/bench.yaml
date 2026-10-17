@@ -1,0 +1,29 @@
+# Benchmarks on real hardware. `exclusive: true` makes the bench job the sole occupant of its
+# agent, so nothing else perturbs the measurement; `noise` is independent work that must wait.
+name: bench
+on:
+  push: { branches: [main], paths: ["crates/**"] }
+  manual: true
+jobs:
+  quic-transport:
+    name: QUIC transport bench (hardware)
+    runs-on: [baremetal, bench]
+    exclusive: true
+    timeout-minutes: 30
+    steps:
+      - name: build (release)
+        run: cargo test --release --locked -p kiln --no-run
+      - name: hyper-transport agent⇄server round trips
+        run: |
+          for i in 1 2 3 4 5; do
+            start=$(date +%s.%N)
+            cargo test --release --locked -p kiln net::tests -- --quiet 2>&1 | grep -E "test result"
+            python3 -c "import sys,time; print(f\"run $i: {time.time()-float(sys.argv[1]):.3f} s\")" "$start"
+          done
+      - name: hardware
+        run: nproc && grep -m1 "model name" /proc/cpuinfo && free -h | head -2
+  noise:
+    # The bench's own machine: the point is that it waits for the exclusive bench there.
+    runs-on: [baremetal, bench]
+    steps:
+      - run: echo "independent work; must not overlap the exclusive bench"; sleep 5
