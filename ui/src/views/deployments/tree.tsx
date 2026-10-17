@@ -278,8 +278,7 @@ export function TreeList({
                   <NodeMarks n={n} />
                 </span>
                 <span className="cd-trow-line">
-                  {[n.namespace !== namespace ? n.namespace || "cluster-scoped" : "", nodeLine(n, age(n.created_at, now))].filter(Boolean).join(" · ") ||
-                    n.kind}
+                  {[n.namespace && n.namespace !== namespace ? n.namespace : "", nodeLine(n, age(n.created_at, now))].filter(Boolean).join(" · ") || n.kind}
                 </span>
               </button>
             </li>

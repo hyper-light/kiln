@@ -257,7 +257,6 @@ function Diff({ d }: { d: CdResourceDetail }) {
   return (
     <div className="cd-diffs">
       <p className="cd-meta">What a sync changes: − is what runs, + what it becomes. Fields the cluster fills in itself are left out.</p>
-      {d.diff.why && <p className="cd-why">{d.diff.why}</p>}
       <FileDiffView diff={{ path: objectLabel(d.key), hunks: d.diff.hunks }} label={objectLabel(d.key)} />
     </div>
   );

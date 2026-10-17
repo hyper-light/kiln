@@ -476,16 +476,18 @@
 }
 .cd-viewbar {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr) auto auto;
+  grid-template-columns: 150px minmax(0, 1fr) auto;
   align-items: start;
   gap: 10px;
+}
+.cd-viewbar > .cd-view-select + .cd-view-filter + .cd-view-select {
+  min-width: 190px;
 }
 .cd-view-select {
   min-width: 0;
 }
 .cd-view-opt {
-  min-height: 40px;
-  padding: 0 4px;
+  margin-left: auto;
   white-space: nowrap;
 }
 .cd-viewhead {
@@ -500,19 +502,26 @@
   min-width: 0;
 }
 @container (max-width: 760px) {
+  /* The filter on top; under it the view, and the sort or grouping beside it when there is one. */
   .cd-viewbar {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
   .cd-view-filter {
     grid-column: 1 / -1;
     grid-row: 1;
+  }
+  .cd-viewbar:not(:has(> :nth-child(3))) > .cd-view-select {
+    grid-column: 1 / -1;
+  }
+  .cd-viewbar > .cd-view-select + .cd-view-filter + .cd-view-select {
+    min-width: 0;
   }
 }
 
 /* ---------------------------------------------------------------- kinds and marks */
 .cd-kind {
   display: inline-grid;
-  min-width: 40px;
+  min-width: 46px;
   height: 18px;
   flex: none;
   place-items: center;
@@ -766,7 +775,7 @@ button.cd-gnode:hover {
 .cd-trow-line {
   min-width: 0;
   overflow: hidden;
-  padding-left: 48px;
+  padding-left: 54px;
   color: #8c8f98;
   font-family: var(--font-mono);
   font-size: 10.5px;
@@ -1176,8 +1185,10 @@ button.cd-gnode:hover {
   gap: 8px;
   margin-left: auto;
 }
+/* As tall as what it holds, up to a screenful; then it scrolls, the newest line kept in view. */
 .cd-log {
-  height: min(56dvh, 460px);
+  min-height: 96px;
+  max-height: min(56dvh, 460px);
   margin-top: 10px;
   overflow: auto;
   overscroll-behavior: contain;
