@@ -53,6 +53,21 @@ interface JoinRequest { id; name /* agent name asked for */; hostname; os; arch;
   version; address /* where it came from */; status: "pending"|"approved"|"denied";
   code: string|null /* 6 digits; null until the machine confirmed */; created_at; expires_at;
   agent: string|null /* name given on approval */ }
+// A runner's front door: DNS and HTTPS under a name of your own (front-door.md).
+interface FrontDoorSettings { domain /* any name: "kiln.dev" */; aliases: string[];
+  dns: { enabled; port /* 53 */; mode: "resolver"|"authoritative"; upstream: string[]; addresses: string[] };
+  https: { enabled; port /* 443 */; http_port /* 80; 0: no redirect */; upstream /* "": the runner's --server */ };
+  cert: { mode: "kiln" /* self-signed */ | "custom" /* your own */ }; mdns: { enabled; name /* "kiln": kiln.local */ } }
+interface CertInfo { subject; issuer; names: string[] /* DNS names and IPs */; not_before; not_after;
+  sha256 /* hex, of the DER */; server_auth: boolean }
+interface FrontDoorListener { state: "off"|"on"|"waiting"|"error"; on: string[] /* where it listens */;
+  error: string|null; to: string[] /* HTTPS: upstream; DNS: resolvers */; served; fix: {why, commands: string[]}|null }
+interface FrontDoorView { runner; connected: boolean; supported: boolean|null /* null: not known yet */;
+  settings: FrontDoorSettings; applied: boolean|null /* the runner runs these settings */; status_at: number|null;
+  status: null | { standby: boolean; os; server; addresses: string[]; dns, https, http, mdns: FrontDoorListener;
+    cert: { mode; state; info: CertInfo|null; kiln: boolean /* issued by kiln's root */; missing: string[];
+      error: string|null; renewing: boolean }; fixes: {why, commands: string[]}[] };
+  origins: string[] /* https://kiln.dev … */; ca: { subject; sha256; not_after }|null /* kiln's root */ }
 ```
 
 ## REST
@@ -75,6 +90,13 @@ interface JoinRequest { id; name /* agent name asked for */; hostname; os; arch;
 | DELETE | `/api/agents/:name` | forget agent |
 | POST | `/api/agents/:name/drain` | `{ draining: bool }` |
 | GET | `/api/agents/join` | `{ token, server, quic, command, manual, join, join_manual }` – bare-metal join commands: with the join token (`command`, `manual`), or asking for approval (`join`: `install.sh --join`, `join_manual`: `kiln join --server …`) |
+| GET | `/api/front-doors` | `FrontDoorView[]`: every runner with front-door settings (see [front-door.md](front-door.md)) |
+| GET | `/api/runners/:name/front-door` | `FrontDoorView`; 404 for an unknown runner |
+| PUT | `/api/runners/:name/front-door` | `FrontDoorSettings` → `FrontDoorView`. Checked, stored and pushed to the runner (applied when it next connects if it is offline); 400 with the reason (`Domain: kiln needs a dot, like kiln.dev`); audited `front_door.update` |
+| POST | `/api/runners/:name/front-door/cert` | `{ cert_pem, key_pem }` (≤ 256 KiB) → `{ cert: CertInfo, front_door: FrontDoorView }`: your own certificate, handed to the runner, which keeps it; sets `cert.mode` to `custom`. 400 when it doesn't parse, the key isn't the certificate's, it isn't for TLS servers (no serverAuth) or it has expired; 409 while the runner is offline. The server keeps neither and never sends the key back; audited `front_door.cert` |
+| GET | `/api/runners/:name/front-door/cert` | the certificate chain the runner's HTTPS serves, as it last reported it: `application/x-pem-file`, `attachment; filename="<first name>.pem"`, certificates only (never a key); 404 when it serves none |
+| POST | `/api/runners/:name/front-door/cert/renew` | renew the self-signed certificate now → `FrontDoorView`: the runner makes a new key and asks at once, and serves the old certificate until the new one is in (`status.cert.renewing` meanwhile). 409 for your own certificate, with HTTPS off, or while the runner is offline; audited `front_door.renew` |
+| GET | `/ca.pem`, `/ca.crt`, `/ca.mobileconfig` | **open** · kiln's root (the CA that signs self-signed front-door certificates): PEM, DER, and an Apple configuration profile carrying it as a root |
 | GET | `/api/discovery` | `{ enabled, announce, browse, join_requests, self: {id, name, instance, ca, port, quic, version}, instances: DiscoveredInstance[] }` |
 | POST | `/api/join-requests` | **open** · `{ name, hostname, os, arch, labels?, version?, csr /* PEM */, commitment /* sha256 hex of the secret */ }` → 201 `{ id, nonce /* hex */, ca_pem, expires_in, server, version }`; 400 bad CSR/commitment; 429 + `Retry-After` (≤ 20 waiting, 1 per address per 5 s); 404 when `[discovery] join_requests = false` |
 | GET | `/api/join-requests/:id` | **open** with `Authorization: Bearer <secret>` → `{ id, status, code, expires_in, approval: null \| { name, labels, cert_pem, ca_pem, quic, quic_port } }`. The first poll confirms the request (its code becomes visible to admins). 403 wrong secret, 404 unknown or expired. With admin auth: the `JoinRequest` |
@@ -95,7 +117,8 @@ interface JoinRequest { id; name /* agent name asked for */; hostname; os; arch;
   `{type:"sample", agent: string, sample: HostSample}`, `{type:"queue", queued, running}`,
   `{type:"join_requests"}` (a join request arrived, was confirmed or decided: refetch
   `/api/join-requests`), `{type:"discovery"}` (an instance appeared, changed or left: refetch
-  `/api/discovery`).
+  `/api/discovery`), `{type:"front_door", runner}` (a runner's front-door settings or status
+  changed: refetch `/api/runners/:name/front-door`).
 * `GET /api/jobs/:id/logs/ws?step=N` — server sends the backlog then live output as **binary**
   frames (raw bytes, ANSI). Text frames: `{type:"step", idx, status}`, `{type:"end"}`.
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.
