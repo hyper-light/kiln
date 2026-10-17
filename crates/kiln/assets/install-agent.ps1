@@ -6,8 +6,8 @@
 #   $env:KILN_JOIN_TOKEN = '<join-token>'; irm @@KILN_SERVER@@/install.ps1 | iex
 #
 # Without a token (or with -Join) it asks the server to take this machine instead (`kiln join`):
-# it prints a verification code, an admin approves the machine in the UI (Agents -> Waiting to
-# join) after comparing it, and the agent is installed the same way.
+# it prints a verification code, an admin approves the machine in the UI (Runners -> Add
+# machines) after comparing it, and the agent is installed the same way.
 #
 #   irm @@KILN_SERVER@@/install.ps1 | iex
 #   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Join [-Labels windows] [-Name box1]

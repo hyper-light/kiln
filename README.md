@@ -79,7 +79,7 @@ other computers need no token and no address. With the kiln binary on the new co
 kiln join          # finds the server, asks to join, prints a verification code, waits
 ```
 
-The request shows up in the UI under **Agents → Waiting to join**. Approve it there if the UI shows
+The request shows up in the UI under **Runners → Add machines**. Approve it there if the UI shows
 the same verification code as the terminal. The computer then installs its agent, which starts on
 boot, and appears in the fleet with its terminal, metrics and jobs. `kiln join --server
 http://<server>:7070` skips the search. `--labels`, `--name` and `--slots` work as for
