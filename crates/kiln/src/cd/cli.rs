@@ -100,6 +100,36 @@ enum CdCmd {
     },
     /// Let a rolled-back app follow git again.
     Follow { id: String },
+    /// What a commit, or every diff of a stack, would deploy: for each app it touches, its own
+    /// change, the stack's change against trunk, and the steps a sync would take against what
+    /// runs. Exits non-zero when the plan fails.
+    Plan {
+        /// A commit (hash, branch or tag), or with `--stack` the stack's top; by default the
+        /// branch checked out here, as a stack.
+        commit: Option<String>,
+        /// Plan every commit from where it leaves trunk (or `--base`) up to COMMIT.
+        #[arg(long)]
+        stack: bool,
+        /// The commit below the stack's bottom.
+        #[arg(long)]
+        base: Option<String>,
+        /// The branch it lands on (default: the repository's default branch).
+        #[arg(long)]
+        trunk: Option<String>,
+        /// A pull request, planned as a stack.
+        #[arg(long)]
+        pr: Option<u64>,
+        /// The repository (default: this checkout's origin, when planning its branch).
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        cluster: Option<String>,
+        /// Show each object's change.
+        #[arg(long)]
+        diff: bool,
+    },
     /// Import Argo CD manifests (Applications) from files.
     Import { files: Vec<std::path::PathBuf> },
     /// Clusters.
@@ -184,7 +214,11 @@ struct Api {
 
 impl Api {
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut req = self.client.request(method, &format!("{}/api/cd{path}", self.url)).bearer(&self.token).timeout(Duration::from_secs(60));
+        self.call_for(method, path, body, Duration::from_secs(60)).await
+    }
+
+    async fn call_for(&self, method: Method, path: &str, body: Option<Value>, timeout: Duration) -> Result<Value> {
+        let mut req = self.client.request(method, &format!("{}/api/cd{path}", self.url)).bearer(&self.token).timeout(timeout);
         if let Some(b) = body {
             req = req.json(&b);
         }
@@ -320,6 +354,49 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
             v
         }
         CdCmd::Follow { id } => api.call(Method::Post, &format!("{}/follow", app_path(&id)), None).await?,
+        CdCmd::Plan { commit, stack, base, trunk, pr, repo, project, cluster, diff } => {
+            if commit.as_deref().is_some_and(|c| c.len() > 1 && c.starts_with('D') && c[1..].chars().all(|x| x.is_ascii_digit())) {
+                bail!("plans of kiln's own diffs (D123) come with its review, which isn't built yet: plan the commit or the stack (--stack)");
+            }
+            // By default, the branch checked out here, as a stack, from this checkout's origin.
+            let here = commit.is_none() && pr.is_none();
+            let (head, repo) = match (commit, here) {
+                (Some(c), _) => (Some(c), repo),
+                (None, true) => {
+                    let branch = local_git(&["rev-parse", "--abbrev-ref", "HEAD"]).context("say which commit to plan (not in a git checkout)")?;
+                    let origin = match repo {
+                        Some(r) => Some(r),
+                        None => local_git(&["remote", "get-url", "origin"]).ok(),
+                    };
+                    (Some(branch), origin)
+                }
+                (None, false) => (None, repo),
+            };
+            let as_stack = stack || here;
+            let mut body = json!({"repo": repo, "base": base, "trunk": trunk, "pr": pr, "project": project, "cluster": cluster, "brief": !diff});
+            if let (Some(h), Some(m)) = (head, body.as_object_mut()) {
+                m.insert(if as_stack { "head" } else { "commit" }.into(), json!(h));
+            }
+            if let Some(m) = body.as_object_mut() {
+                m.retain(|_, v| !v.is_null());
+            }
+            let v = api.call_for(Method::Post, "/plans", Some(body), Duration::from_secs(600)).await.map_err(|e| {
+                if here { e.context("planning the branch checked out here (pushed?)") } else { e }
+            })?;
+            if !args.json {
+                print_plan(&v, diff);
+            }
+            if v.get("ok") != Some(&Value::Bool(true)) {
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                }
+                bail!("the plan fails");
+            }
+            if !args.json {
+                return Ok(());
+            }
+            v
+        }
         CdCmd::Refresh { id, hard } => api.call(Method::Post, &format!("{}/refresh?hard={hard}", app_path(&id)), None).await?,
         CdCmd::Delete { id, cascade } => {
             let q = cascade.map(|c| format!("?cascade={c}")).unwrap_or_default();
@@ -360,7 +437,112 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Follows an app until its sync finishes and it is healthy (or the sync fails).
+/// A git command in the current directory, its output trimmed.
+fn local_git(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git").args(args).output().context("running git")?;
+    if !out.status.success() {
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+fn key_text(k: &Value) -> String {
+    let (g, kind, ns, n) = (s(k, "group"), s(k, "kind"), s(k, "namespace"), s(k, "name"));
+    let kind = if g.is_empty() { kind.to_owned() } else { format!("{g}/{kind}") };
+    if ns.is_empty() { format!("{kind} {n}") } else { format!("{kind} {ns}/{n}") }
+}
+
+fn count(v: &Value, k: &str) -> u64 {
+    v.get(k).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn hunks_text(x: &Value) {
+    for h in x.get("hunks").and_then(Value::as_array).into_iter().flatten() {
+        for l in h.get("lines").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            println!("        {l}");
+        }
+    }
+}
+
+/// A plan for a terminal: each diff, the apps it changes, and what a sync of each would do.
+fn print_plan(v: &Value, diff: bool) {
+    let diffs = v.get("diffs").and_then(Value::as_array).cloned().unwrap_or_default();
+    let trunk = v.get("trunk").cloned().unwrap_or(Value::Null);
+    let short = |sha: &str| sha.chars().take(10).collect::<String>();
+    println!(
+        "{} {} on {} ({}){}",
+        if v.get("ok") == Some(&Value::Bool(true)) { "ok:" } else { "FAILS:" },
+        if diffs.len() == 1 { "1 commit".to_owned() } else { format!("{} commits", diffs.len()) },
+        s(&trunk, "branch"),
+        short(s(&trunk, "commit")),
+        v.get("repo").and_then(Value::as_str).map(|r| format!(" in {r}")).unwrap_or_default(),
+    );
+    for d in &diffs {
+        let c = d.get("commit").cloned().unwrap_or(Value::Null);
+        println!("\n{} {}  {}", short(s(&c, "sha")), s(&c, "subject"), s(&c, "author"));
+        let apps = d.get("apps").and_then(Value::as_array).cloned().unwrap_or_default();
+        if apps.is_empty() {
+            println!("  changes no app");
+        }
+        for a in &apps {
+            let ok = a.get("ok") == Some(&Value::Bool(true));
+            let mut how = Vec::new();
+            if a.get("shadow") == Some(&Value::Bool(true)) {
+                how.push("shadowed: Argo CD deploys it");
+            } else if a.get("auto") == Some(&Value::Bool(true)) {
+                how.push(if a.get("auto_prune") == Some(&Value::Bool(true)) { "syncs on landing, prunes" } else { "syncs on landing" });
+            } else {
+                how.push("synced by hand");
+            }
+            let changes = |k: &str| a.get(k).filter(|x| !x.is_null()).map(|x| format!("+{} ~{} -{}", count(x, "added"), count(x, "changed"), count(x, "removed")));
+            let mut line = format!("  {} {}", if ok { "✓" } else { "✗" }, s(a, "app"));
+            if let Some(own) = changes("own") {
+                line.push_str(&format!("  own {own}"));
+            }
+            if let Some(stack) = changes("stack") {
+                line.push_str(&format!("  stack {stack}"));
+            }
+            println!("{line}  ({})", how.join(", "));
+            if let Some(e) = a.get("error").and_then(Value::as_str) {
+                println!("      {e}");
+            }
+            for p in a.get("problems").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                if Some(p) != a.get("error").and_then(Value::as_str) {
+                    println!("      problem: {p}");
+                }
+            }
+            for n in a.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                println!("      note: {n}");
+            }
+            if diff {
+                for o in a.pointer("/own/objects").and_then(Value::as_array).into_iter().flatten() {
+                    println!("      {} {}", s(o, "change"), key_text(o.get("key").unwrap_or(&Value::Null)));
+                    hunks_text(o);
+                }
+            }
+            let sync = a.get("sync").cloned().unwrap_or(Value::Null);
+            if sync.is_null() {
+                continue;
+            }
+            let steps = sync.get("steps").and_then(Value::as_array).cloned().unwrap_or_default();
+            if steps.is_empty() {
+                println!("      a sync changes nothing in {}", s(a, "cluster"));
+            } else {
+                println!("      a sync in {}: create {}, update {}, prune {}, hooks {}", s(a, "cluster"), count(&sync, "create"), count(&sync, "update"), count(&sync, "prune"), count(&sync, "hooks"));
+            }
+            for st in &steps {
+                let why = st.get("why").and_then(Value::as_str).map(|w| format!("  {w}")).unwrap_or_default();
+                println!("        {:<6} {:<8} wave {:<3} {}{why}", s(st, "step"), s(st, "phase"), st.get("wave").and_then(Value::as_i64).unwrap_or(0), key_text(st.get("key").unwrap_or(&Value::Null)));
+            }
+        }
+    }
+    let apps = v.get("apps").cloned().unwrap_or(Value::Null);
+    println!("\n{} apps touched, {} planned; {} following {} untouched.", count(&apps, "affected"), count(&apps, "planned"), count(&apps, "unaffected"), s(&trunk, "branch"));
+    for n in v.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        println!("note: {n}");
+    }
+}
+
 /// The id of an app's current (or last) sync, if it has one.
 async fn op_id(api: &Api, path: &str) -> Option<u64> {
     api.call(Method::Get, path, None).await.ok()?.pointer("/operation/id").and_then(Value::as_u64)

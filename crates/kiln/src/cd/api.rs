@@ -46,8 +46,8 @@ fn from_query(q: &HashMap<String, String>, keys: &[&str]) -> Value {
     for k in keys {
         if let Some(v) = q.get(*k) {
             let x = match *k {
-                "limit" | "max" => v.parse::<u64>().map(Value::from).unwrap_or(Value::Null),
-                "hard" | "dry_run" | "prune" | "out_of_sync" | "fresh" | "previous" => Value::Bool(v == "true" || v == "1"),
+                "limit" | "max" | "max_apps" | "pr" => v.parse::<u64>().map(Value::from).unwrap_or(Value::Null),
+                "hard" | "dry_run" | "prune" | "out_of_sync" | "fresh" | "previous" | "brief" => Value::Bool(v == "true" || v == "1"),
                 "tail_lines" | "since_seconds" => v.parse::<u64>().map(Value::from).unwrap_or(Value::Null),
                 _ => Value::String(v.clone()),
             };
@@ -190,6 +190,14 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             ("cd.apps.rollback".into(), b)
         }
         (&Method::POST, ["apps", p, n, "follow"]) => ("cd.apps.follow".into(), app(p, n)),
+        (&Method::GET, ["plans"]) => {
+            if q.contains_key("diff") {
+                return Err(bad("plans of kiln's own diffs (D123) come with its review, which isn't built yet: plan the commit (commit=) or the stack (head=, base=)"));
+            }
+            let keys = ["repo", "commit", "head", "base", "trunk", "pr", "brief", "max_apps", "project", "cluster", "namespace", "environment", "q"];
+            ("cd.plan".into(), from_query(q, &keys))
+        }
+        (&Method::POST, ["plans"]) => ("cd.plan".into(), json_body(body).await?),
         (&Method::GET, ["clusters"]) => ("cd.clusters.list".into(), json!({})),
         (&Method::POST, ["clusters"]) => ("cd.clusters.add".into(), json_body(body).await?),
         (&Method::DELETE, ["clusters", name]) => ("cd.clusters.remove".into(), json!({"name": name})),

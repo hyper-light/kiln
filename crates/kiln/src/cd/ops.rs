@@ -152,6 +152,21 @@ pub fn ops() -> &'static [Op] {
                 input: app_only, run: diff),
             op!("cd.apps.history", "An app's deployments, newest first.", ro: true, destructive: false,
                 input: app_only, run: history),
+            op!("cd.plan", "What a commit, or every diff of a stack, would deploy before it lands. For each app it touches: its own change (its render against the render of the diff below), the stack's change (against trunk), and the steps a sync would take against what runs, in order: what it creates, what it changes (live and predicted, with hunks), the hooks it runs, what it prunes and what Prune=false keeps. A diff fails when its sources can't be read or rendered, or it drops an object Prune=false keeps. Renders are kept by content, so planning again is cheap.", ro: true, destructive: false,
+                input: || {
+                    let mut p = selector_props();
+                    if let Some(m) = p.as_object_mut() {
+                        m.insert("repo".into(), json!({"type": "string", "description": "The repository, in any spelling of its URL; by default whichever of the apps' repositories has the commit."}));
+                        m.insert("commit".into(), json!({"type": "string", "description": "One commit (hash, branch or tag), planned against its first parent, or `base`."}));
+                        m.insert("head".into(), json!({"type": "string", "description": "A stack's top commit: every commit above `base` up to it is planned, bottom first."}));
+                        m.insert("base".into(), json!({"type": "string", "description": "The commit below the stack's bottom; by default where `head` leaves trunk."}));
+                        m.insert("trunk".into(), json!({"type": "string", "description": "The branch it lands on (only apps that follow it are planned); by default the repository's default branch."}));
+                        m.insert("pr".into(), json!({"type": "integer", "minimum": 1, "description": "A pull request: its head is fetched and planned as a stack."}));
+                        m.insert("brief".into(), json!({"type": "boolean", "description": "Counts and keys only, no hunks."}));
+                        m.insert("max_apps".into(), json!({"type": "integer", "minimum": 1, "maximum": 5000, "default": 200}));
+                    }
+                    obj_schema(p, &[])
+                }, run: plan),
             op!("cd.apps.sync", "Start a sync of an app (optionally only some resources, with pruning, as a dry run, with Argo CD sync options).", ro: false, destructive: true,
                 input: || obj_schema(json!({
                     "app": {"type": "string", "description": APP},
@@ -298,7 +313,7 @@ fn selects_rest(sel: &Value, e: &AppEntry) -> bool {
 }
 
 /// Whether an app matches a selector's fields.
-fn selects(sel: &Value, e: &AppEntry, s: Option<&Summary>) -> bool {
+pub(super) fn selects(sel: &Value, e: &AppEntry, s: Option<&Summary>) -> bool {
     selects_rest(sel, e) && FACETS.iter().zip(facet_values(e, s)).all(|(f, v)| allows(sel, f, v))
 }
 
@@ -717,11 +732,11 @@ async fn diff(cx: Cx, v: Value) -> Out {
     Ok(json!({"diffs": out}))
 }
 
-fn key_json(k: &ResKey) -> Value {
+pub(super) fn key_json(k: &ResKey) -> Value {
     json!({"group": k.group.as_ref(), "kind": k.kind.as_ref(), "namespace": k.namespace.as_ref(), "name": k.name.as_ref()})
 }
 
-fn yaml(v: Option<&Value>) -> String {
+pub(super) fn yaml(v: Option<&Value>) -> String {
     v.map(|v| serde_yaml::to_string(&sorted(v)).unwrap_or_default()).unwrap_or_default()
 }
 
@@ -757,7 +772,7 @@ fn sort_in_place(v: &mut Value, rank: &dyn Fn(&str) -> u8) {
 }
 
 /// An object as people read it: no status, no server bookkeeping.
-fn display(mut v: Value) -> Value {
+pub(super) fn display(mut v: Value) -> Value {
     if let Some(m) = v.as_object_mut() {
         m.remove("status");
     }
@@ -774,7 +789,7 @@ fn display(mut v: Value) -> Value {
 
 /// Masks a Secret's values on both sides of a diff alike: equal values get equal masks and
 /// different ones different masks, so a changed value still shows as changed and no value shows.
-fn mask_secrets(before: &mut Option<Value>, after: &mut Option<Value>) {
+pub(super) fn mask_secrets(before: &mut Option<Value>, after: &mut Option<Value>) {
     let secret = |v: &Value| obj::kind(v) == "Secret" && obj::group(v).is_empty();
     if !before.as_ref().or(after.as_ref()).is_some_and(secret) {
         return;
@@ -832,6 +847,10 @@ async fn history(cx: Cx, v: Value) -> Out {
         out.push(row);
     }
     Ok(json!({"history": out}))
+}
+
+async fn plan(cx: Cx, v: Value) -> Out {
+    super::plans::plan(&cx.cd, super::plans::Ask::from_json(&v)).await
 }
 
 fn sync_request(v: &Value, by: &str) -> Result<SyncRequest, Fail> {

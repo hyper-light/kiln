@@ -314,10 +314,63 @@ impl Mirror {
         }
         Ok(())
     }
+
+    /// Whether the mirror holds a commit.
+    pub fn has(&self, commit: &str) -> bool {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["cat-file", "-e", &format!("{commit}^{{commit}}")]);
+        run(c).is_ok()
+    }
+
+    /// Fetches what the branches and tags don't hold: a commit by its hash, or a refspec
+    /// (`+refs/pull/7/head:refs/kiln/pull/7`).
+    pub fn fetch_one(&self, what: &str) -> Result<()> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["fetch", "--quiet", "--force", "origin", what]);
+        run(c).with_context(|| format!("fetching {what} from {}", self.url)).map(|_| ())
+    }
+
+    /// The remote's default branch, as the mirror's `HEAD` names it.
+    pub fn default_branch(&self) -> Option<String> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        run(c).ok().map(text).filter(|b| !b.is_empty())
+    }
+
+    /// A commit's first parent; `None` for a root commit.
+    pub fn parent(&self, commit: &str) -> Result<Option<String>> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["rev-list", "--parents", "--max-count=1", commit, "--"]);
+        Ok(text(run(c)?).split_whitespace().nth(1).map(str::to_owned))
+    }
+
+    /// The newest commit both histories hold, if they meet.
+    pub fn merge_base(&self, a: &str, b: &str) -> Option<String> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["merge-base", a, b]);
+        run(c).ok().map(text).filter(|s| !s.is_empty())
+    }
+
+    /// A stack: the commits from `base` (left out; `None` for the whole history) up to `head`
+    /// along first parents, oldest first. More than `max` is an error.
+    pub fn stack(&self, base: Option<&str>, head: &str, max: usize) -> Result<Vec<String>> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["rev-list", "--first-parent", &format!("--max-count={}", max + 1), head]);
+        if let Some(b) = base {
+            c.arg(format!("^{b}"));
+        }
+        c.arg("--");
+        let mut out: Vec<String> = text(run(c)?).lines().map(str::to_owned).collect();
+        if out.len() > max {
+            bail!("more than {max} commits lead from {} to {head}", base.unwrap_or("the first commit"));
+        }
+        out.reverse();
+        Ok(out)
+    }
 }
 
 /// Whether `dir` is `path` or one of its parents.
-fn covers(dir: &str, path: &str) -> bool {
+pub fn covers(dir: &str, path: &str) -> bool {
     let d = dir.trim_matches('/');
     d.is_empty() || path == d || path.strip_prefix(d).is_some_and(|rest| rest.starts_with('/'))
 }
@@ -353,6 +406,39 @@ mod tests {
         assert_eq!(c.body, "It timed out on cold starts.");
         assert!(c.at > 1_600_000_000);
         assert!(m.commit("0000000000000000000000000000000000000000").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_stack_is_its_commits_above_where_it_leaves_trunk() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work)?;
+        sh(&work, &["init", "-q", "-b", "main"])?;
+        let commit = |msg: &str| -> Result<String> {
+            std::fs::write(work.join(format!("{msg}.yaml")), "kind: ConfigMap\n")?;
+            sh(&work, &["add", "."])?;
+            sh(&work, &["commit", "-qm", msg])?;
+            sh(&work, &["rev-parse", "HEAD"])
+        };
+        let root = commit("root")?;
+        let trunk = commit("trunk")?;
+        sh(&work, &["checkout", "-qb", "stack"])?;
+        let d1 = commit("d1")?;
+        let d2 = commit("d2")?;
+        sh(&work, &["checkout", "-q", "main"])?;
+        let moved = commit("moved")?;
+        let m = Mirror::open(&tmp.path().join("mirror.git"), work.to_str().unwrap_or(""), Auth::default())?;
+        assert_eq!(m.default_branch().as_deref(), Some("main"));
+        assert!(m.has(&d2) && !m.has("0000000000000000000000000000000000000000"));
+        assert_eq!(m.parent(&d1)?.as_deref(), Some(trunk.as_str()));
+        assert_eq!(m.parent(&root)?, None);
+        let base = m.merge_base(&moved, &d2);
+        assert_eq!(base.as_deref(), Some(trunk.as_str()));
+        assert_eq!(m.stack(base.as_deref(), "stack", 10)?, [d1.clone(), d2.clone()]);
+        assert!(m.stack(base.as_deref(), "stack", 1).is_err());
+        assert_eq!(m.stack(Some(&d2), &d2, 10)?, Vec::<String>::new());
+        assert_eq!(m.stack(None, &trunk, 10)?, [root, trunk]);
         Ok(())
     }
 
