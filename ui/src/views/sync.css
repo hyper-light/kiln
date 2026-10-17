@@ -1,8 +1,31 @@
-/* Synced repos (views/sync.tsx): one column of plain sections, every control in the page's flow. */
+/* Synced folders (views/sync.tsx), a section of the Repositories page: one column of plain sections,
+   every control in the page's flow. */
 
 .sync-page {
   display: grid;
   gap: 20px;
+}
+
+.sync-item {
+  display: grid;
+  gap: 6px;
+}
+.sync-built {
+  justify-self: start;
+  color: #c9c3d8;
+  font-size: 12px;
+}
+.sync-built:hover {
+  color: #ededee;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.sync-none {
+  margin: 0;
+  padding: 18px 4px;
+  color: #8c8f98;
+  font-size: 13px;
 }
 
 .sync-off {
