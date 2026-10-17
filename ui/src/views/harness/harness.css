@@ -2368,3 +2368,17 @@ textarea.hx-input {
     opacity: 0;
   }
 }
+
+.hx-startfail {
+  padding: 12px 14px;
+  border: 1px solid rgb(209 170 173 / 40%);
+  border-radius: 10px;
+  background: rgb(209 170 173 / 7%);
+  font-size: 13px;
+  line-height: 1.5;
+  color: #ecd2d4;
+}
+.hx-startfail b {
+  font-weight: 500;
+  color: #f4e0e1;
+}

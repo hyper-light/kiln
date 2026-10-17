@@ -4,11 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <script>
-      // iPhone/iPad Safari zooms the page into any focused field whose text is under 16px (kiln focuses
-      // the terminal on load). Tell it not to auto-zoom; iOS still lets people pinch to zoom.
+      // Phone browsers zoom the page into a focused field whose text is under 16px (kiln focuses the
+      // terminal on load): every iOS browser (all WebKit), and some Android ones. On touch devices,
+      // tell them not to auto-zoom; iOS still lets people pinch to zoom.
       (function () {
         var ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-        if (!ios) return;
+        var touch = ios || (window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+        if (!touch) return;
         var m = document.querySelector('meta[name="viewport"]');
         if (m) m.setAttribute("content", m.getAttribute("content") + ", maximum-scale=1");
       })();

@@ -300,11 +300,24 @@ impl Session {
     }
 }
 
+/// The folder an agent starts in, as this machine knows it: `~` and `~/…` are the home directory
+/// of the user kiln runs as (people type them; a process can't `chdir("~")`), nothing means home.
+pub fn resolve_cwd(cwd: Option<&str>) -> String {
+    let home = crate::os::home_dir();
+    match cwd.map(str::trim).filter(|c| !c.is_empty()) {
+        None | Some("~") => home.to_string_lossy().into_owned(),
+        Some(c) => match c.strip_prefix("~/").or_else(|| c.strip_prefix("~\\")) {
+            Some(rest) => home.join(rest).to_string_lossy().into_owned(),
+            None => c.to_owned(),
+        },
+    }
+}
+
 /// Start a session; its updates go to `sink`, tagged with its id.
 pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let now = crate::util::now_ms();
-    let cwd = spec.cwd.clone().unwrap_or_else(|| crate::os::home_dir().to_string_lossy().into_owned());
+    let cwd = resolve_cwd(spec.cwd.as_deref());
     let mut core = Core::new();
     core.state.cwd.clone_from(&cwd);
     core.state.model = spec.model.clone().unwrap_or_default();
@@ -663,6 +676,16 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn resolve_cwd_expands_home() {
+        let home = crate::os::home_dir();
+        assert_eq!(super::resolve_cwd(None), home.to_string_lossy());
+        assert_eq!(super::resolve_cwd(Some("~")), home.to_string_lossy());
+        assert_eq!(super::resolve_cwd(Some("  ")), home.to_string_lossy());
+        assert_eq!(super::resolve_cwd(Some("~/Projects/x")), home.join("Projects/x").to_string_lossy());
+        assert_eq!(super::resolve_cwd(Some("/srv/repo")), "/srv/repo");
+    }
     use super::*;
 
     #[test]

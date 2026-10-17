@@ -249,8 +249,8 @@ export function SpawnDialog({
     setError(null);
     const spec: Spec = {
       kind,
-      // In a shell, the agent starts where the shell is.
-      cwd: shell ? undefined : cwd.trim() || undefined,
+      // In a shell, the agent starts where the shell is; "~" (or nothing) is the machine's home.
+      cwd: shell || !cwd.trim() || cwd.trim() === "~" ? undefined : cwd.trim(),
       mode: mode || undefined,
       model: model.trim() || undefined,
       name: name.trim() || undefined,

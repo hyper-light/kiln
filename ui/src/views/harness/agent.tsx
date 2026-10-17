@@ -133,7 +133,19 @@ export default function AgentPage() {
             ))}
           </div>
         )}
-        {status === "exited" ? (
+        {status === "exited" && state?.exit?.error && events.length === 0 ? (
+          <div className="hx-startfail" role="alert">
+            <b>This agent couldn't start.</b> {state.exit.error}
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" variant="secondary" onClick={() => navigate("/agents?new=1")}>
+                Start a new one
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setConfirmStop(true)}>
+                Remove this one
+              </Button>
+            </div>
+          </div>
+        ) : status === "exited" ? (
           <div className="hx-exited">
             <span className="hx-dim">{state?.exit?.error ?? `The agent stopped${state?.exit?.code != null ? ` (exit ${state.exit.code})` : ""}.`} Sending a message picks up where it left off.</span>
             {features.includes("resume") && (

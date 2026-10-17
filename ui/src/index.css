@@ -2119,3 +2119,10 @@ html[data-motion="paused"] .skeleton::after {
     font-size: max(16px, 1em) !important;
   }
 }
+@media (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  textarea,
+  select {
+    font-size: max(16px, 1em) !important;
+  }
+}

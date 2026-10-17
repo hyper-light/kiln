@@ -83,7 +83,7 @@ impl Kind {
             None => crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
         };
         let mut p = Process::new(program);
-        let cwd = spec.cwd.clone().unwrap_or_else(|| crate::os::home_dir().to_string_lossy().into_owned());
+        let cwd = super::session::resolve_cwd(spec.cwd.as_deref());
         if !std::path::Path::new(&cwd).is_dir() {
             anyhow::bail!("{cwd} is not a directory on this machine");
         }
