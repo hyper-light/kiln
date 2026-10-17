@@ -453,7 +453,10 @@ export function FileDiffView({
   label,
   defaultOpen = true,
   layout = "auto",
+  reveal = 0,
 }: {
+  /** Find shows a match in it: it opens (a new number each time one is shown). */
+  reveal?: number;
   diff: FileDiff;
   /** What to call the file (a path relative to the agent's folder). */
   label?: string;
@@ -465,6 +468,11 @@ export function FileDiffView({
   layout?: "auto" | "unified" | "split";
 }) {
   const [open, setOpen] = React.useState(defaultOpen);
+  const [revealed, setRevealed] = React.useState(0);
+  if (reveal && reveal !== revealed) {
+    setRevealed(reveal);
+    setOpen(true);
+  }
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(() => new Set());
   const body = React.useRef<HTMLDivElement>(null);
   const focusTo = React.useRef<string | null>(null);
