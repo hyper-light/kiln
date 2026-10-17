@@ -2458,6 +2458,9 @@ async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
     Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "report": report })))
 }
 
+/// After a snapshot on an agent session's socket: what was resent is complete.
+const SYNCED: &str = r#"{"t":"synced"}"#;
+
 fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
@@ -2470,7 +2473,9 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 }
 
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
-/// viewer sends commands (JSON tagged `type`).
+/// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
+/// (on attach, and again after falling behind): the history resent since its `open` is complete,
+/// so a viewer can swap it in at once instead of clearing what it shows.
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
@@ -2481,6 +2486,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> any
     for f in att.frames {
         tx.send(ws::text(f)).await?;
     }
+    tx.send(ws::text(SYNCED)).await?;
     let mut live = att.live;
     loop {
         futures::select_biased! {
@@ -2491,6 +2497,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> any
                     for f in hub.harness.frames(&id).unwrap_or_default() {
                         tx.send(ws::text(f)).await?;
                     }
+                    tx.send(ws::text(SYNCED)).await?;
                 }
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },

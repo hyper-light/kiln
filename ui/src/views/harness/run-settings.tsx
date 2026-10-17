@@ -16,6 +16,7 @@
 import * as React from "react";
 import type { ControlOption, ModelOption, ModeOption } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { useListener } from "./dom";
 import "./run-settings.css";
 
 type Kind = "mode" | "model" | "effort";
@@ -168,47 +169,49 @@ function families(words: Word[]): Family[] {
 
 /* ------------------------------------------------------------------ a row of words */
 
-/** Keeps a row's underline under its checked word. Once placed it glides from word to word (CSS: transform only). */
-function useGlide(group: React.RefObject<HTMLElement | null>, bar: React.RefObject<HTMLElement | null>, deps: string) {
-  React.useLayoutEffect(() => {
-    const g = group.current;
-    const b = bar.current;
-    if (!g || !b) return;
-    let live = true;
-    const place = () => {
-      if (!live) return;
-      const on = g.querySelector('[aria-checked="true"] > .rs-word-text');
-      if (!on) {
-        b.style.opacity = "0";
-        return;
-      }
-      const a = g.getBoundingClientRect();
-      const r = on.getBoundingClientRect();
-      b.style.opacity = "";
-      b.style.transform = `translate(${r.left - a.left}px, ${r.bottom - a.top + UNDERLINE_GAP}px) scaleX(${r.width / 100})`;
-    };
-    place();
-    // The first placement doesn't glide in from the corner.
-    const frame = b.hasAttribute("data-glide") ? 0 : requestAnimationFrame(() => b.setAttribute("data-glide", ""));
-    const watch = new ResizeObserver(place);
-    watch.observe(g);
-    void document.fonts?.ready.then(place);
-    return () => {
-      live = false;
-      cancelAnimationFrame(frame);
-      watch.disconnect();
-    };
-  }, [group, bar, deps]);
+/**
+ * The ref callback for a row's underline: keeps it under the checked word. It places it when the
+ * row appears, and again whenever the row changes (another word checked, other words) or resizes.
+ * Once placed it glides from word to word (CSS: transform only).
+ */
+function glide(b: HTMLElement | null) {
+  const g = b?.parentElement;
+  if (!b || !g) return;
+  let live = true;
+  const place = () => {
+    if (!live) return;
+    const on = g.querySelector('[aria-checked="true"] > .rs-word-text');
+    if (!on) {
+      b.style.opacity = "0";
+      return;
+    }
+    const a = g.getBoundingClientRect();
+    const r = on.getBoundingClientRect();
+    b.style.opacity = "";
+    b.style.transform = `translate(${r.left - a.left}px, ${r.bottom - a.top + UNDERLINE_GAP}px) scaleX(${r.width / 100})`;
+  };
+  place();
+  // The first placement doesn't glide in from the corner.
+  const frame = b.hasAttribute("data-glide") ? 0 : requestAnimationFrame(() => b.setAttribute("data-glide", ""));
+  const watch = new ResizeObserver(place);
+  watch.observe(g);
+  // Another word checked, or other words: React changes the row, and the underline follows before it's drawn.
+  const changes = new MutationObserver(place);
+  changes.observe(g, { subtree: true, childList: true, characterData: true, attributeFilter: ["aria-checked"] });
+  void document.fonts?.ready.then(place);
+  return () => {
+    live = false;
+    cancelAnimationFrame(frame);
+    watch.disconnect();
+    changes.disconnect();
+  };
 }
 
 /** A few short choices as words: a radiogroup (arrow keys move, Enter or Space picks). */
 function WordRow({ label, words, value, onPick }: { label: string; words: Word[]; value: string; onPick: (w: Word) => void }) {
-  const group = React.useRef<HTMLDivElement>(null);
-  const bar = React.useRef<HTMLElement>(null);
   const [focus, setFocus] = React.useState<string | null>(null);
   // One stop in the tab order: the word with focus, else the current one, else the first.
   const stop = [focus, value, words[0]?.id].find((id) => id != null && words.some((w) => w.id === id));
-  useGlide(group, bar, `${value}\n${words.map((w) => `${w.id}\t${w.text}`).join("\n")}`);
 
   const rove = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const radios = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'));
@@ -224,7 +227,6 @@ function WordRow({ label, words, value, onPick }: { label: string; words: Word[]
 
   return (
     <div
-      ref={group}
       role="radiogroup"
       aria-label={label}
       className="rs-words"
@@ -255,7 +257,7 @@ function WordRow({ label, words, value, onPick }: { label: string; words: Word[]
           )}
         </span>
       ))}
-      <i ref={bar} className="rs-glide" aria-hidden="true" />
+      <i ref={glide} className="rs-glide" aria-hidden="true" />
     </div>
   );
 }
@@ -455,8 +457,6 @@ export function RunSettings({
   const [said, setSaid] = React.useState("");
   const root = React.useRef<HTMLDivElement>(null);
   const values = React.useRef<Partial<Record<Kind, HTMLButtonElement | null>>>({});
-  /** Where focus goes after the next render, when the element that had it goes away. */
-  const refocus = React.useRef<Kind | null>(null);
   const panelId = React.useId();
   const held = hover || keyboard;
 
@@ -472,46 +472,42 @@ export function RunSettings({
   const nextTurn = (k: Kind) => Boolean(running && appliesNextTurn?.[k]);
   const waiting = armed && sets[armed.kind].words.some((w) => w.id === armed.id) ? armed : null;
 
-  // Undo is offered for a few seconds, longer while a keyboard or mouse is on it.
-  React.useEffect(() => {
-    if (!change || held) return;
-    const t = window.setTimeout(() => setChange(null), UNDO_MS);
-    return () => window.clearTimeout(t);
-  }, [change, held]);
+  /** Folds the setting away; focus that was in it goes to its value on the line (which stays). */
+  const fold = React.useCallback((k: Kind) => {
+    if (root.current?.contains(document.activeElement)) values.current[k]?.focus({ preventScroll: true });
+    setOpen(null);
+  }, []);
+
+  // Undo is offered for a few seconds, longer while a keyboard or mouse is on it. The top line shows
+  // the change (and Undo) meanwhile: its timer, set again whenever either changes.
+  const lasting = React.useCallback(
+    (top: HTMLDivElement | null) => {
+      if (!top || !change || held) return;
+      const t = window.setTimeout(() => setChange(null), UNDO_MS);
+      return () => window.clearTimeout(t);
+    },
+    [change, held],
+  );
 
   // The setting folds away a little after a change, unless keyboard focus or a mouse is in it, or
-  // a confirmation is waiting.
-  React.useEffect(() => {
-    if (!open || tick === 0 || held || waiting) return;
-    const t = window.setTimeout(() => {
-      if (root.current?.contains(document.activeElement)) refocus.current = open;
-      setOpen(null);
-    }, FOLD_MS);
-    return () => window.clearTimeout(t);
-  }, [open, tick, held, waiting]);
+  // a confirmation is waiting: the open setting's own timer, set again whenever one of those changes.
+  const folding = React.useCallback(
+    (panel: HTMLDivElement | null) => {
+      if (!panel || !open || tick === 0 || held || waiting) return;
+      const t = window.setTimeout(() => fold(open), FOLD_MS);
+      return () => window.clearTimeout(t);
+    },
+    [open, tick, held, waiting, fold],
+  );
 
   // A waiting confirmation stops waiting when anything other than its track or button is tapped or focused.
-  React.useEffect(() => {
-    if (!waiting) return;
-    const away = (e: Event) => {
-      const keep = [root.current?.querySelector(".rs-confirm-line"), root.current?.querySelector(".rs-track")];
-      if (e.target instanceof Node && keep.some((el) => el?.contains(e.target as Node))) return;
-      setArmed(null);
-    };
-    document.addEventListener("pointerdown", away, true);
-    document.addEventListener("focusin", away, true);
-    return () => {
-      document.removeEventListener("pointerdown", away, true);
-      document.removeEventListener("focusin", away, true);
-    };
-  }, [waiting]);
-
-  React.useLayoutEffect(() => {
-    const to = refocus.current;
-    if (!to) return;
-    refocus.current = null;
-    values.current[to]?.focus({ preventScroll: true });
-  });
+  const away = (e: Event) => {
+    const keep = [root.current?.querySelector(".rs-confirm-line"), root.current?.querySelector(".rs-track")];
+    if (e.target instanceof Node && keep.some((el) => el?.contains(e.target as Node))) return;
+    setArmed(null);
+  };
+  useListener(document, "pointerdown", away, { on: Boolean(waiting), capture: true });
+  useListener(document, "focusin", away, { on: Boolean(waiting), capture: true });
 
   const apply = (k: Kind, to: string) => {
     const pick = sets[k].pick;
@@ -604,8 +600,7 @@ export function RunSettings({
           setArmed(null);
           return;
         }
-        if (root.current?.contains(document.activeElement)) refocus.current = open;
-        setOpen(null);
+        fold(open);
       }}
       onPointerEnter={(e) => {
         if (e.pointerType === "mouse") setHover(true);
@@ -618,7 +613,7 @@ export function RunSettings({
         if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyboard(false);
       }}
     >
-      <div className="rs-top">
+      <div ref={lasting} className="rs-top">
         <p className="rs-line">
           {parts.map((p, i) => (
             <React.Fragment key={p.k}>
@@ -662,7 +657,7 @@ export function RunSettings({
         )}
       </div>
       {open && (
-        <div id={panelId} className="rs-panel" role="group" aria-label={KEY[open]} data-kind={open}>
+        <div ref={folding} id={panelId} className="rs-panel" role="group" aria-label={KEY[open]} data-kind={open}>
           {panel(open)}
         </div>
       )}

@@ -29,7 +29,7 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
         return Err((StatusCode::FORBIDDEN, "this code host serves fetches only".into()));
     }
     let Some(tok) = token::from_headers(req.headers()) else { return Ok(unauthorized()) };
-    let Some(leg) = token::verify(hub, &tok) else { return Ok(unauthorized()) };
+    let Some(leg) = token::verify(hub, &tok).map(|c| c.sub) else { return Ok(unauthorized()) };
     let run = runs::run_of(hub, &leg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.ok_or((StatusCode::UNAUTHORIZED, "the leg is gone".to_owned()))?;
     if !run.repo_name.eq_ignore_ascii_case(&full) {
         return Err((StatusCode::FORBIDDEN, format!("this leg's token reads {} only", run.repo_name)));

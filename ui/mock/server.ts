@@ -19,6 +19,7 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
+import { handleLongSession, setLongEmit } from "./conversation.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -46,7 +47,8 @@ const VERSION = "0.1.0";
 const STARTED = Date.now();
 const HOSTNAME = "kiln-01";
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DIST = join(__dirname, "..", "dist");
+// MOCK_DIST: serve another build (a scratch one, so builds in progress elsewhere don't clash).
+const DIST = process.env.MOCK_DIST ?? join(__dirname, "..", "dist");
 
 const now = () => Math.floor(Date.now() / 1000);
 const rid = (p: string) => `${p}${randomBytes(6).toString("hex")}`;
@@ -455,6 +457,7 @@ function emit(ev: ServerEvent) {
   const msg = JSON.stringify(ev);
   for (const ws of eventClients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
+setLongEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -1594,7 +1597,7 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && handleDemoSession(ws, decodeURIComponent(hm[1]!))) return;
+    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!)))) return;
     ws.close(1008, "no such socket");
   });
 });

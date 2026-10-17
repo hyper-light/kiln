@@ -7,6 +7,7 @@
  * the diff's own width's call (container queries in diff.css), not the viewport's.
  */
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { ChevronRight, ChevronsUpDown, FileDiff as FileDiffIcon, FilePlus2 } from "lucide-react";
 import type { FileDiff, Hunk } from "@/api/harness";
 import { cn } from "@/lib/utils";
@@ -475,7 +476,6 @@ export function FileDiffView({
   }
   const [unfolded, setUnfolded] = React.useState<ReadonlySet<string>>(() => new Set());
   const body = React.useRef<HTMLDivElement>(null);
-  const focusTo = React.useRef<string | null>(null);
   const model = React.useMemo(() => {
     const hunks = diff.hunks.map(hunkOf);
     let last = 1;
@@ -496,16 +496,10 @@ export function FileDiffView({
   const split = layout !== "unified" && !model.only ? (layout === "split" ? "on" : "auto") : undefined;
 
   const unfold = React.useCallback((id: string) => {
-    focusTo.current = id;
-    setUnfolded((u) => new Set(u).add(id));
-  }, []);
-  // The control that opened a fold is gone: keep focus where it was, on the first line it showed.
-  React.useEffect(() => {
-    const id = focusTo.current;
-    if (id === null) return;
-    focusTo.current = null;
+    flushSync(() => setUnfolded((u) => new Set(u).add(id)));
+    // The control that opened a fold is gone: keep focus where it was, on the first line it showed.
     body.current?.querySelector<HTMLElement>(`[data-fold-start="${id}"]`)?.focus({ preventScroll: true });
-  }, [unfolded]);
+  }, []);
 
   const name = label ?? diff.path;
   const cut = name.lastIndexOf("/") + 1;

@@ -13,6 +13,7 @@
  * words, never the layout or the order.
  */
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { ArrowUpRight, Check, ChevronRight, Copy, TriangleAlert, X } from "lucide-react";
 import { accountsApi, type Account, type AccountFlow, type AccountMethod } from "@/api/harness";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -94,6 +95,8 @@ class AccountStore {
     set.add(fn);
     // A sign-in left running while no card showed it is followed again.
     for (const e of Object.values(this.view(target).flows)) this.poll(e.flow);
+    // A card that shows the machine reads its accounts (again: the last read may be old).
+    this.load(target);
     return () => {
       set.delete(fn);
     };
@@ -344,11 +347,20 @@ function liveState(phase: Phase, asks: AccountFlow["asks"], where: string): [str
 
 function CopyButton({ text, label, className }: { text?: string; label: string; className?: string }) {
   const [done, setDone] = React.useState(false);
-  React.useEffect(() => {
-    if (!done) return;
-    const t = window.setTimeout(() => setDone(false), 1500);
-    return () => window.clearTimeout(t);
-  }, [done]);
+  /** The timer that takes "Copied" away (another copy meanwhile doesn't keep it longer). */
+  const undo = React.useRef(0);
+  const copied = (ok: boolean) => {
+    setDone(ok);
+    if (!ok) {
+      window.clearTimeout(undo.current);
+      undo.current = 0;
+    } else if (!undo.current) {
+      undo.current = window.setTimeout(() => {
+        undo.current = 0;
+        setDone(false);
+      }, 1500);
+    }
+  };
   return (
     <button
       type="button"
@@ -357,7 +369,7 @@ function CopyButton({ text, label, className }: { text?: string; label: string; 
       title={done ? "Copied" : label}
       disabled={!text}
       data-away={text ? undefined : ""}
-      onClick={() => text && void copyText(text).then(setDone)}
+      onClick={() => text && void copyText(text).then(copied)}
     >
       {done ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
     </button>
@@ -368,23 +380,35 @@ function CopyButton({ text, label, className }: { text?: string; label: string; 
 function useDetails(lines: string[]) {
   const [open, setOpen] = React.useState(false);
   const id = React.useId();
-  const pre = React.useRef<HTMLPreElement>(null);
-  // The newest output stays in view.
-  React.useLayoutEffect(() => {
-    const el = pre.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [lines.length, open]);
-  // Opened, it's brought into view (over the composer the card's lines scroll within it).
-  React.useEffect(() => {
-    if (open) pre.current?.scrollIntoView({ block: "nearest" });
-  }, [open]);
+  const pre = React.useRef<HTMLPreElement | null>(null);
+  const count = lines.length;
+  // The newest output stays in view: when it opens, and again as more arrives.
+  const follow = React.useCallback(
+    (el: HTMLPreElement | null) => {
+      pre.current = el;
+      void count;
+      if (el) el.scrollTop = el.scrollHeight;
+    },
+    [count],
+  );
   const toggle = (
-    <button type="button" className="ac-more" aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => setOpen(!open)}>
+    <button
+      type="button"
+      className="ac-more"
+      aria-expanded={open}
+      aria-controls={open ? id : undefined}
+      onClick={() => {
+        if (open) return setOpen(false);
+        // Opened, it's brought into view (over the composer the card's lines scroll within it).
+        flushSync(() => setOpen(true));
+        pre.current?.scrollIntoView({ block: "nearest" });
+      }}
+    >
       Details <ChevronRight size={11} aria-hidden="true" />
     </button>
   );
   const body = open ? (
-    <pre ref={pre} id={id} className="ac-lines" tabIndex={0} aria-label="What the sign-in printed">
+    <pre ref={follow} id={id} className="ac-lines" tabIndex={0} aria-label="What the sign-in printed">
       {lines.length ? lines.join("\n") : "Nothing yet."}
     </pre>
   ) : null;
@@ -399,17 +423,22 @@ const LastFocus = React.createContext<React.RefObject<Element | null> | null>(nu
 /**
  * A step that took the place of what had focus in the card (the button that opened it, a field
  * that's done) takes the focus itself, so a keyboard or screen reader carries on from here and not
- * from the top of the page. Focus that was never in the card is left where it is.
+ * from the top of the page. Focus that was never in the card is left where it is. The step's ref:
+ * it looks when the step shows, and again whenever `when` changes.
  */
-function useTakeFocus(ref: React.RefObject<HTMLElement | null>, when: unknown = null) {
+function useTakeFocus(when: unknown = null) {
   const last = React.useContext(LastFocus);
-  React.useEffect(() => {
-    const was = last?.current;
-    if (!was) return;
-    const gone = !was.isConnected || (was instanceof HTMLElement && was.checkVisibility?.({ visibilityProperty: true }) === false);
-    const active = document.activeElement;
-    if (gone && (!active || active === document.body || active === was)) ref.current?.focus({ preventScroll: true });
-  }, [ref, when, last]);
+  return React.useCallback(
+    (el: HTMLElement | null) => {
+      void when;
+      const was = last?.current;
+      if (!el || !was) return;
+      const gone = !was.isConnected || (was instanceof HTMLElement && was.checkVisibility?.({ visibilityProperty: true }) === false);
+      const active = document.activeElement;
+      if (gone && (!active || active === document.body || active === was)) el.focus({ preventScroll: true });
+    },
+    [when, last],
+  );
 }
 
 /** How to sign in, as words (the usual way already picked), then Sign in. */
@@ -419,8 +448,7 @@ function ChoosePanel({ a, target, loading, where, onStart, onCancel }: { a: Acco
   // The way tried last from here comes first (after a failed try, it's the one to try again).
   const [picked, setPicked] = React.useState<string | null>(() => store.lastWay(target, a.kind) ?? null);
   const chosen = offered(picked) ?? defaultMethod(a);
-  const root = React.useRef<HTMLDivElement>(null);
-  useTakeFocus(root);
+  const takeFocus = useTakeFocus();
   // Arrow keys move between the ways, as in any radio group.
   const rove = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const radios = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'));
@@ -434,7 +462,7 @@ function ChoosePanel({ a, target, loading, where, onStart, onCancel }: { a: Acco
     next?.click();
   };
   return (
-    <div ref={root} tabIndex={-1} className="ac-panel" role="group" aria-label={`Sign in to ${a.name}`}>
+    <div ref={takeFocus} tabIndex={-1} className="ac-panel" role="group" aria-label={`Sign in to ${a.name}`}>
       {/* WITH, then the ways: words that wrap under the first of them, never sideways. */}
       <div className="ac-with">
         <span className="ac-key" aria-hidden="true">
@@ -473,10 +501,9 @@ function ChoosePanel({ a, target, loading, where, onStart, onCancel }: { a: Acco
 
 /** Signing out takes a second word: agents there stop working. */
 function ConfirmPanel({ a, where, busy, onConfirm, onKeep }: { a: Account; where: string; busy: boolean; onConfirm: () => void; onKeep: () => void }) {
-  const root = React.useRef<HTMLDivElement>(null);
-  useTakeFocus(root);
+  const takeFocus = useTakeFocus();
   return (
-    <div ref={root} tabIndex={-1} className="ac-panel" role="group" aria-label={`Sign out of ${a.name}`}>
+    <div ref={takeFocus} tabIndex={-1} className="ac-panel" role="group" aria-label={`Sign out of ${a.name}`}>
       <p className="ac-ask">
         Sign out of {a.name} on {where}? Agents there that use it stop working until you sign in again.
       </p>
@@ -519,24 +546,27 @@ function FlowPanel({
   const [code, setCode] = React.useState("");
   const [key, setKey] = React.useState("");
   const [sending, setSending] = React.useState(false);
-  const field = React.useRef<HTMLInputElement>(null);
+  const field = React.useRef<HTMLInputElement | null>(null);
   const fieldId = React.useId();
   const details = useDetails(f.lines);
   const wantsKey = f.action === "login" && asks === "api_key" && phase !== "done" && phase !== "failed";
-  const root = React.useRef<HTMLDivElement>(null);
-  useTakeFocus(root, phase === "done" || phase === "failed" ? phase : "under way");
+  const takeFocus = useTakeFocus(phase === "done" || phase === "failed" ? phase : "under way");
 
-  // Asked for a key right after choosing to give one: the field is ready for it (keyboards and mice only;
-  // a phone's keyboard shouldn't jump up unasked).
-  React.useEffect(() => {
-    if (wantsKey && fine()) field.current?.focus({ preventScroll: true });
-  }, [wantsKey]);
+  // Asked for a key right after choosing to give one: the field is ready for it as it shows (keyboards
+  // and mice only; a phone's keyboard shouldn't jump up unasked).
+  const keyField = React.useCallback(
+    (el: HTMLInputElement | null) => {
+      field.current = el;
+      if (el && wantsKey && fine()) el.focus({ preventScroll: true });
+    },
+    [wantsKey],
+  );
 
   if (phase === "done") {
     const acct = f.account ?? a;
     const plan = acct.plan ? ` · ${planName(acct.plan)}` : "";
     return (
-      <div ref={root} tabIndex={-1} className="ac-panel" role="status">
+      <div ref={takeFocus} tabIndex={-1} className="ac-panel" role="status">
         <p className="ac-done">
           <Check size={13} aria-hidden="true" />
           <span className="ac-done-text">
@@ -564,7 +594,7 @@ function FlowPanel({
     const what = f.action === "logout" ? "Couldn't sign out" : "The sign-in didn't finish";
     const why = f.error ?? (f.state === "cancelled" ? "it was cancelled on the machine" : undefined);
     return (
-      <div ref={root} tabIndex={-1} className="ac-panel" data-tone="fail">
+      <div ref={takeFocus} tabIndex={-1} className="ac-panel" data-tone="fail">
         <p className="ac-fail" role="alert">
           <TriangleAlert size={13} aria-hidden="true" />
           <span>{why ? `${what}: ${why}` : `${what}.`}</span>
@@ -619,7 +649,7 @@ function FlowPanel({
   };
 
   return (
-    <div ref={root} tabIndex={-1} className="ac-panel" data-live="">
+    <div ref={takeFocus} tabIndex={-1} className="ac-panel" data-live="">
       <span className="ac-sr" role="status">
         {liveState(phase, asks, where)[1]}
       </span>
@@ -705,7 +735,7 @@ function FlowPanel({
               </label>
               <div className="ac-fieldrow">
                 <input
-                  ref={field}
+                  ref={keyField}
                   id={fieldId}
                   type="password"
                   className="ac-input ac-mono"
@@ -762,7 +792,6 @@ function AccountRow({
   compact,
   target,
   onOpen,
-  onSaid,
 }: {
   a: Account;
   entry: FlowEntry | undefined;
@@ -773,7 +802,6 @@ function AccountRow({
   compact: boolean;
   target: string;
   onOpen: (what: Open | null) => void;
-  onSaid: (text: string) => void;
 }) {
   const where = whereIn(target);
   const flow = entry?.flow;
@@ -791,13 +819,6 @@ function AccountRow({
     : open === "signout" && a.signed_in === false
       ? "note"
       : open;
-
-  // Said aloud: a sign-out leaves no panel to read.
-  const last = React.useRef(flow?.state);
-  React.useEffect(() => {
-    if (flow?.action === "logout" && last.current === "running" && flow.state === "done") onSaid(`Signed out of ${a.name} on ${where}.`);
-    last.current = flow?.state;
-  }, [flow?.state, flow?.action, a.name, where, onSaid]);
 
   const tone = running ? (phase === "waiting" ? "wait" : "busy") : loading ? "loading" : listError ? "unknown" : a.signed_in === true ? "in" : a.signed_in === false ? "out" : "unknown";
   // While it runs, the line says what it's waiting for: briefly on a phone, whole where there's room.
@@ -930,29 +951,39 @@ export interface AccountCardProps {
 
 export function AccountCard({ target, kind, intent, compact = false, onClose, className }: AccountCardProps) {
   const view = useMachine(target);
-  const root = React.useRef<HTMLElement>(null);
-  // Under a message, the conversation only follows its own new messages: when the card grows (its
-  // ways arrive, a step opens) while you're looking at it, the rest of it is brought into view.
-  React.useEffect(() => {
-    const el = root.current;
-    if (!compact || !el) return;
-    let last = el.offsetHeight;
-    const watch = new ResizeObserver(() => {
-      const grew = el.offsetHeight > last;
-      last = el.offsetHeight;
-      const top = el.getBoundingClientRect().top;
-      if (grew && top >= 0 && top < window.innerHeight) el.scrollIntoView({ block: "nearest" });
-    });
-    watch.observe(el);
-    return () => watch.disconnect();
-  }, [compact]);
-  // Before the first paint: opened to sign in or out (/login, /logout), it shows that, not how the
-  // last one ended.
-  React.useLayoutEffect(() => {
-    store.prune(target);
-    if (intent && !compact) store.forget(target, kind);
-  }, [target, kind, intent, compact]);
-  React.useEffect(() => store.load(target), [target]);
+  const shown = React.useCallback(
+    (el: HTMLElement | null) => {
+      if (!el) return;
+      // As it shows, before it's painted: old outcomes go, and opened to sign in or out (/login,
+      // /logout) it shows that, not how the last one ended.
+      store.prune(target);
+      if (intent && !compact) store.forget(target, kind);
+      // Under a message, the conversation only follows its own new messages: when the card grows (its
+      // ways arrive, a step opens) while you're looking at it, the rest of it is brought into view.
+      if (!compact) return;
+      // Watched from once this commit is through: the conversation keeps its place with an observer
+      // made as it shows (maybe in this same commit), and observers are told in the order they were
+      // made, so this one's "into view" comes after that.
+      let watch: ResizeObserver | null = null;
+      let gone = false;
+      queueMicrotask(() => {
+        if (gone) return;
+        let last = el.offsetHeight;
+        watch = new ResizeObserver(() => {
+          const grew = el.offsetHeight > last;
+          last = el.offsetHeight;
+          const top = el.getBoundingClientRect().top;
+          if (grew && top >= 0 && top < window.innerHeight) el.scrollIntoView({ block: "nearest" });
+        });
+        watch.observe(el);
+      });
+      return () => {
+        gone = true;
+        watch?.disconnect();
+      };
+    },
+    [target, kind, intent, compact],
+  );
   /** What you opened or closed here; until then, what the intent asks for. */
   const [chosen, setOpen] = React.useState<{ kind: string; what: Open } | null | undefined>(undefined);
   const lastFocus = React.useRef<Element | null>(null);
@@ -961,6 +992,18 @@ export function AccountCard({ target, kind, intent, compact = false, onClose, cl
   const listError = view.accounts === null ? view.error : null;
   const rows = React.useMemo(() => rowsOf(view.accounts, kind, compact), [view.accounts, kind, compact]);
   const where = whereIn(target);
+  // Said aloud: a sign-out leaves no panel to read. Noticed as the flows change: a harness shown
+  // here whose sign-out was under way and is now through.
+  const [flowsWere, setFlowsWere] = React.useState(view.flows);
+  if (flowsWere !== view.flows) {
+    setFlowsWere(view.flows);
+    const through = (r: Account) => {
+      const f = view.flows[r.kind]?.flow;
+      return f?.action === "logout" && f.state === "done" && flowsWere[r.kind]?.flow.state === "running";
+    };
+    const out = compact && listError ? undefined : rows.find(through);
+    if (out) setSaid(`Signed out of ${out.name} on ${where}.`);
+  }
   // Under a message, a harness that turns out to be signed in (now) needs no sign-in offered.
   const signedIn = rows.find((r) => r.kind === kind)?.signed_in === true;
   const asked = intent === "logout" ? { kind, what: "signout" as const } : intent === "login" && !(compact && signedIn) ? { kind, what: "signin" as const } : null;
@@ -981,7 +1024,7 @@ export function AccountCard({ target, kind, intent, compact = false, onClose, cl
 
   return (
     <section
-      ref={root}
+      ref={shown}
       className={cn("ac", compact && "ac-compact", className)}
       aria-label={compact ? `${nameOf(kind)} account` : `Accounts on ${where}`}
       onFocus={(e) => {
@@ -1018,7 +1061,6 @@ export function AccountCard({ target, kind, intent, compact = false, onClose, cl
               compact={compact}
               target={target}
               onOpen={(what) => setOpen(what ? { kind: a.kind, what } : null)}
-              onSaid={setSaid}
             />
           ))}
         </ul>
