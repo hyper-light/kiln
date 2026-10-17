@@ -234,10 +234,10 @@ export function costText(usd: number, plan?: string | null): { text: string; tit
   return { text: `≈${m}`, title: "The agent's own estimate at API list prices." };
 }
 
-/** "claude-opus-5-5[1m]" → "Opus 5.5 (1M)"; anything else is shown as it is. */
+/** "claude-opus-5-5[1m]" → "Opus 5.5 (1M)", "claude-sonnet-5" → "Sonnet 5"; anything else is shown as it is. */
 export function modelLabel(id: string): string {
-  const m = id.match(/^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)(?:-\d{8})?(\[1m\])?$/i);
-  if (m) return `${m[1]!.charAt(0).toUpperCase()}${m[1]!.slice(1).toLowerCase()} ${m[2]}.${m[3]}${m[4] ? " (1M)" : ""}`;
+  const m = id.match(/^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i);
+  if (m) return `${m[1]!.charAt(0).toUpperCase()}${m[1]!.slice(1).toLowerCase()} ${m[2]}${m[3] ? `.${m[3]}` : ""}${m[4] ? " (1M)" : ""}`;
   const alias = id.match(/^(opus|sonnet|haiku|fable|default)(\[1m\])?$/i);
   if (alias) return `${alias[1]!.charAt(0).toUpperCase()}${alias[1]!.slice(1).toLowerCase()}${alias[2] ? " (1M)" : ""}`;
   return id;

@@ -1,9 +1,9 @@
-/* How an agent runs, changed where it's shown. Folded: the head's one line (AUTO · OPUS 5.5 · MAX).
-   Open: a row of words per setting right under it, in the composer's mode-word voice (mono caps,
-   muted, the current word bright over the prism underline). They are words, not buttons: no boxes,
-   no fills, but each has 40px of height to tap. The page moves down to make room and nothing covers
-   it. The underline glides between words (transform only), and nothing moves when motion is reduced
-   or paused. Class names keep clear of the old sheet's .rs-* in console.css. */
+/* How an agent runs, changed where it's shown. Folded: the head's one line (ASK · OPUS 5.5 · MAX),
+   each value its own control. Open: just that setting, right under the line — a track for the
+   scales (permissions, effort), the model's families for the model — in the composer's voice
+   (mono caps, muted, the current one bright over the prism hairline). No boxes, no fills, but
+   40px to tap everywhere. The page moves down to make room and nothing covers it; nothing moves
+   when motion is reduced or paused. Class names keep clear of the old sheet's .rs-* in console.css. */
 
 /* ---------------------------------------------------------------- the line */
 .rs-tuner {
@@ -18,115 +18,261 @@
   max-width: 100%;
 }
 .rs-line {
-  position: relative;
   display: flex;
   align-items: center;
   min-width: 0;
   max-width: 100%;
   height: 28px;
   margin: 0;
-  padding: 0;
-  border: 0;
-  background: none;
   color: #c9cbd1;
   font-family: var(--font-mono);
   font-size: 10.5px;
-  font-weight: 400;
   letter-spacing: 0.08em;
   line-height: 28px;
-  text-align: left;
   text-transform: uppercase;
   white-space: nowrap;
 }
-button.rs-line {
+.rs-sep {
+  flex: none;
+  color: #6d7078;
+  white-space: pre;
+}
+.rs-v {
+  position: relative;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-overflow: ellipsis;
+  text-transform: inherit;
+  white-space: nowrap;
+}
+button.rs-v {
+  overflow: visible;
   cursor: pointer;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
+  transition: color 0.15s;
 }
 /* 40px to tap, reaching mostly below the letters, where the head has room. */
-button.rs-line::before {
+button.rs-v::before {
   position: absolute;
-  inset: -4px 0 -8px;
+  inset: -4px -4px -8px;
   content: "";
 }
-button.rs-line:focus-visible {
+/* The open one: bright, over the prism hairline. */
+button.rs-v[aria-expanded="true"] {
+  color: #ededee;
+}
+button.rs-v[aria-expanded="true"]::after {
+  position: absolute;
+  right: 0;
+  bottom: 3px;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
+  content: "";
+}
+button.rs-v:focus-visible {
   border-radius: 3px;
   outline: 2px solid #bab0e3;
   outline-offset: 2px;
 }
-.rs-line-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.rs-sep {
-  color: #6d7078;
-}
 .rs-v[data-empty] {
   color: #8f929b;
 }
-/* Open, the line ends in a quiet minus (tapping it folds too); folded, it ends in nothing. */
-.rs-fold {
-  position: relative;
-  flex: none;
-  margin-left: 4px;
-  padding: 0 6px;
-  color: #8f929b;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  line-height: 28px;
-  cursor: pointer;
-  user-select: none;
-}
-.rs-fold::before {
-  position: absolute;
-  inset: -4px 0 -8px;
-  content: "";
-}
 @media (hover: hover) {
-  button.rs-line:hover .rs-v,
-  .rs-fold:hover {
+  button.rs-v:hover {
     color: #ededee;
   }
 }
 
-/* ---------------------------------------------------------------- rows of words */
+/* ---------------------------------------------------------------- the open setting */
 .rs-panel {
-  padding-bottom: 4px;
+  max-width: 440px;
+  padding: 4px 0 10px;
   animation: rs-fade 0.12s ease-out;
 }
-/* The name sits in a 96px column; when a row's words don't fit beside it they go underneath. */
-.rs-set {
+
+/* Its name, and what it does, above its control. */
+.rs-now {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
+  gap: 2px 10px;
   min-width: 0;
+  margin: 0;
 }
-.rs-key {
-  flex: 0 0 96px;
-  /* Above its words (when they go underneath), the name sits closer to them than to the row before. */
-  margin-bottom: -8px;
-  color: #7b7e88;
+.rs-now-name {
+  flex: none;
+  color: #ededee;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  line-height: 18px;
+  text-transform: uppercase;
+}
+.rs-now[data-tone="warn"] .rs-now-name {
+  color: #d8bb95;
+}
+.rs-now-hint {
+  min-width: 0;
+  color: #8f929b;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+/* A scale: one hairline, a dot per stop, the knob at the choice; 40px tall to tap or slide. */
+.rs-track {
+  position: relative;
+  height: 40px;
+  margin: 0 7px;
+  outline: none;
+  cursor: pointer;
+  touch-action: pan-y;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+.rs-track:focus-visible {
+  border-radius: 6px;
+  box-shadow: 0 0 0 2px #bab0e3;
+}
+.rs-rail {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: #2f3138;
+}
+.rs-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
+  transition: width 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.rs-tick {
+  position: absolute;
+  top: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #3a3c44;
+  transform: translate(-50%, -50%);
+}
+.rs-tick[data-on] {
+  background: #a4b0d6;
+}
+.rs-tick[data-warn] {
+  background: #5a4a38;
+}
+.rs-knob {
+  position: absolute;
+  top: 0;
+  width: 13px;
+  height: 13px;
+  border: 1px solid #ededee;
+  border-radius: 50%;
+  background: #0b0c0e;
+  box-shadow: 0 0 0 4px rgb(11 12 14 / 85%);
+  transform: translate(-50%, -50%);
+  transition: left 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.rs-knob[data-warn] {
+  border-color: #d8bb95;
+}
+.rs-track[data-dragging] .rs-fill,
+.rs-track[data-dragging] .rs-knob {
+  transition: none;
+}
+/* Its two ends, quiet, under the first and last stops. */
+.rs-ends {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -8px 0 0;
+  color: #6d7078;
   font-family: var(--font-mono);
   font-size: 9.5px;
   letter-spacing: 0.1em;
   line-height: 16px;
   text-transform: uppercase;
-  white-space: nowrap;
 }
-.rs-body {
+
+/* A line under a setting: the confirmation a mode without checks waits for, or "from the next turn". */
+.rs-desc {
+  margin: 6px 0 0;
+  color: #8f929b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.rs-desc[data-tone="warn"] {
+  color: #d8bb95;
+}
+.rs-confirm,
+.rs-more {
+  position: relative;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+.rs-confirm::before,
+.rs-more::before {
+  position: absolute;
+  inset: -12px -6px;
+  content: "";
+}
+.rs-confirm {
+  color: #f0d3ad;
+  text-decoration: underline;
+  text-decoration-color: rgb(240 211 173 / 45%);
+  text-underline-offset: 3px;
+}
+.rs-more {
+  color: #a9adb7;
+  font-size: 12px;
+  line-height: 18px;
+  text-decoration: underline;
+  text-decoration-color: rgb(169 173 183 / 35%);
+  text-underline-offset: 3px;
+}
+.rs-confirm:focus-visible,
+.rs-more:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid #bab0e3;
+  outline-offset: 3px;
+}
+@media (hover: hover) {
+  .rs-more:hover {
+    color: #ededee;
+  }
+  .rs-confirm:hover {
+    color: #f6e2c6;
+  }
+}
+
+/* ---------------------------------------------------------------- a few words (model families, versions, this message) */
+.rs-model {
   display: flex;
-  flex: 1 1 auto;
-  flex-wrap: wrap;
-  align-items: baseline;
-  width: max-content;
+  flex-direction: column;
+  gap: 2px;
   min-width: 0;
-  max-width: 100%;
 }
 .rs-words {
   position: relative;
   display: flex;
-  flex: 0 1 auto;
   flex-wrap: wrap;
   align-items: baseline;
   min-width: 0;
@@ -165,10 +311,6 @@ button.rs-line:focus-visible {
 .rs-word[aria-checked="true"] {
   color: #ededee;
 }
-/* A mode that turns checks off, waiting for its second tap. */
-.rs-word[data-armed] {
-  color: #d8bb95;
-}
 @media (hover: hover) {
   .rs-word:hover,
   .rs-undo:hover {
@@ -176,9 +318,6 @@ button.rs-line:focus-visible {
   }
   .rs-word[aria-checked="true"]:hover {
     color: #ededee;
-  }
-  .rs-word[data-armed]:hover {
-    color: #e6cba6;
   }
 }
 .rs-word:focus-visible,
@@ -209,8 +348,35 @@ button.rs-line:focus-visible {
 .rs-glide[data-glide] {
   transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
-/* "· UNDO" at the end of the line, open or folded: the line always has room for it, where a
-   phone-width row often doesn't (it would wrap onto a new line and push the rows under it down). */
+
+/* The composer's row for one message: its name in a 96px column, the words beside it (or under it). */
+.rs-set {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-width: 0;
+}
+.rs-key {
+  flex: 0 0 96px;
+  margin-bottom: -8px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  line-height: 16px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.rs-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  width: max-content;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* "· UNDO" at the end of the line: the line always has room for it. */
 .rs-after {
   display: inline-flex;
   flex: none;
@@ -221,7 +387,6 @@ button.rs-line:focus-visible {
   margin-left: 7px;
   color: #6d7078;
 }
-/* The line's height, reaching below it like the line does. */
 .rs-undo {
   padding: 6px 7px;
 }
@@ -232,22 +397,6 @@ button.rs-line:focus-visible {
   position: absolute;
   inset: -4px 0 -8px;
   content: "";
-}
-/* One line under a row: what the current mode does, the second-tap warning, or "from the next turn". */
-.rs-desc {
-  flex: 1 0 100%;
-  contain: inline-size;
-  margin: -8px 0 6px;
-  color: #8f929b;
-  font-family: var(--font-sans);
-  font-size: 12px;
-  font-weight: 400;
-  letter-spacing: normal;
-  line-height: 1.45;
-  text-transform: none;
-}
-.rs-desc[data-tone="warn"] {
-  color: #d8bb95;
 }
 .rs-sr {
   position: absolute;
@@ -273,8 +422,11 @@ button.rs-line:focus-visible {
     animation: none;
   }
   .rs-glide[data-glide],
+  .rs-fill,
+  .rs-knob,
   .rs-word,
-  .rs-undo {
+  .rs-undo,
+  button.rs-v {
     transition: none;
   }
 }
@@ -284,8 +436,11 @@ button.rs-line:focus-visible {
   animation: none;
 }
 :root[data-motion="paused"] .rs-glide[data-glide],
+:root[data-motion="paused"] .rs-fill,
+:root[data-motion="paused"] .rs-knob,
 :root[data-motion="paused"] .rs-word,
-:root[data-motion="paused"] .rs-undo {
+:root[data-motion="paused"] .rs-undo,
+:root[data-motion="paused"] button.rs-v {
   transition: none;
 }
 
@@ -294,23 +449,37 @@ button.rs-line:focus-visible {
   .rs-sep,
   .rs-dot,
   .rs-key,
-  .rs-fold,
+  .rs-ends,
   .rs-word,
   .rs-undo,
-  .rs-desc {
+  .rs-desc,
+  .rs-now-hint,
+  .rs-more {
     color: #c4c5ce;
   }
-  .rs-word[aria-checked="true"] {
+  .rs-word[aria-checked="true"],
+  button.rs-v[aria-expanded="true"] {
     color: #ffffff;
   }
-  .rs-word[data-armed],
-  .rs-desc[data-tone="warn"] {
+  .rs-rail,
+  .rs-tick {
+    background: #8a8d96;
+  }
+  .rs-desc[data-tone="warn"],
+  .rs-confirm {
     color: #e6cba6;
   }
 }
 @media (forced-colors: active) {
-  .rs-glide {
+  .rs-glide,
+  .rs-fill,
+  button.rs-v[aria-expanded="true"]::after {
     background: Highlight;
+    forced-color-adjust: none;
+  }
+  .rs-rail,
+  .rs-tick {
+    background: CanvasText;
     forced-color-adjust: none;
   }
 }

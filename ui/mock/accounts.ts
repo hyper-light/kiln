@@ -186,6 +186,8 @@ interface Demo {
   events: HEvent[];
   /** What the harness says when it can't reach its account. */
   refusal: string;
+  /** Its effort, for harnesses with effort levels. */
+  effort?: string;
 }
 
 function demo(id: string, kind: string, target: string, title: string, model: string, ask: string, refusal: string): Demo {
@@ -214,11 +216,24 @@ function demo(id: string, kind: string, target: string, title: string, model: st
       { id: "plan", label: "Plan", description: "Reads and plans; changes nothing" },
       { id: "default", label: "Ask", description: "Asks before edits and commands" },
       { id: "acceptEdits", label: "Accept edits", description: "Edits files without asking; asks before commands" },
+      ...(kind === "claude"
+        ? [
+            { id: "auto", label: "Auto", description: "Decides for itself what needs asking" },
+            { id: "bypassPermissions", label: "Don't ask", description: "Runs every command and edit without asking", dangerous: true },
+          ]
+        : []),
     ],
-    models: [{ id: model, label: model }],
+    // What Claude Code lists: its aliases, then pinned versions (the session's own model among them or not).
+    models:
+      kind === "claude"
+        ? ["default", "opus", "fable", "sonnet", "haiku", "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"].map(
+            (id) => ({ id, label: id === "default" ? "Default (recommended)" : id, description: id === "default" ? "Opus 5.5" : undefined }),
+          )
+        : [{ id: model, label: model }],
+    efforts: kind === "claude" ? ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: id === "xhigh" ? "XHigh" : id.charAt(0).toUpperCase() + id.slice(1) })) : undefined,
     commands: COMMANDS,
     agents: [],
-    features: ["interrupt", "set_mode", "steer"],
+    features: kind === "claude" ? ["interrupt", "set_mode", "set_model", "set_effort", "steer"] : ["interrupt", "set_mode", "steer"],
   };
   const events: HEvent[] = [
     { id: `${id}-u1`, seq: 1, at: t, kind: "user", text: ask },
@@ -256,6 +271,7 @@ function stateOf(d: Demo): State {
     cwd: d.info.cwd,
     model: d.info.model,
     mode: d.info.mode,
+    effort: d.effort ?? (d.meta.efforts?.length ? "max" : undefined),
     title: d.info.title,
     approvals: [],
     queue: [],
@@ -277,10 +293,20 @@ export function handleDemoSession(ws: WebSocket, id: string): boolean {
   send({ t: "state", state: stateOf(d) });
   send({ t: "events", events: d.events });
   ws.on("message", (raw) => {
-    let c: { type?: string; text?: string; id?: string };
+    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string };
     try {
       c = JSON.parse(raw.toString()) as typeof c;
     } catch {
+      return;
+    }
+    // How it runs: taken at once, as the real harnesses report back.
+    if (c.type === "set_mode" || c.type === "set_model" || c.type === "set_effort") {
+      if (c.type === "set_mode" && c.mode) d.info.mode = c.mode;
+      if (c.type === "set_model" && c.model) d.info.model = c.model;
+      if (c.type === "set_effort" && c.effort) d.effort = c.effort;
+      setTimeout(() => {
+        if (ws.readyState === ws.OPEN) send({ t: "state", state: stateOf(d) });
+      }, 300);
       return;
     }
     if (c.type !== "send" || !c.text) return;
