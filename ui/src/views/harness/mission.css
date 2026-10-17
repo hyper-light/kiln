@@ -539,20 +539,24 @@ a.ms-why:hover {
 .ms-bc-filter {
   margin-top: 6px;
 }
+/* Read whole: on a phone it wraps rather than being cut short. */
 .ms-bc-summary {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   gap: 6px;
   max-width: 100%;
   padding: 4px 0;
-  overflow: hidden;
   color: #c8cad0;
   font-family: var(--font-mono);
   font-size: 10.5px;
+  line-height: 1.6;
   letter-spacing: 0.08em;
-  text-overflow: ellipsis;
+  text-align: left;
   text-transform: uppercase;
-  white-space: nowrap;
+}
+.ms-bc-summary > svg {
+  flex: none;
+  align-self: center;
 }
 .ms-bc-facets {
   display: flex;
@@ -863,4 +867,87 @@ a.ms-why:hover {
 }
 .ms-left {
   color: #d8bb95;
+}
+
+/* ---------------------------------------------------------------- how the list is shown */
+.ms-tools {
+  margin-bottom: 14px;
+}
+.ms-tools-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  min-width: 0;
+}
+.ms-find {
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 1 240px;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #2b2d32;
+  color: #7b7e88;
+}
+.ms-find:focus-within {
+  border-color: #6d6a80;
+  color: #c8cad0;
+}
+.ms-find input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: #ededee;
+  font-size: 16px;
+  outline: none;
+}
+@media (pointer: fine) {
+  .ms-find input {
+    font-size: 13px;
+  }
+}
+.ms-find button {
+  color: #7b7e88;
+}
+.ms-tools-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.ms-tools-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
+}
+.ms-tools-resort {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #a49ccf;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ms-tools-resort:hover {
+  color: #ededee;
+}
+.ms-tools-count {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.ms-tools-facets {
+  padding-left: 0;
+}
+.ms-tools-dir {
+  color: #ededee;
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+.ms-tools-clear {
+  align-self: flex-start;
 }

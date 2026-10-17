@@ -19,6 +19,7 @@ import { errorMessage, useDocumentTitle, useLocalStorage } from "@/lib/hooks";
 import { plain } from "./derive";
 import { AgentMenu } from "./actions";
 import { MessageMany } from "./broadcast";
+import { DEFAULT_VIEW, isFiltered, ListTools, matches, sortRows, type View } from "./list-tools";
 import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { useSeen } from "./seen";
@@ -203,27 +204,47 @@ export default function Mission() {
     if (ev.type === "ai_sessions") readFound();
   });
 
-  const rows = React.useMemo(
-    () =>
-      (list ?? [])
-        .map((a) => ({ a, stand: standOf(a, seen[a.id]) }))
-        // Newest first by when each started, which never changes: a row keeps its place.
-        .sort((x, y) => y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id)),
-    [list, seen],
-  );
+  const all = React.useMemo(() => (list ?? []).map((a) => ({ a, stand: standOf(a, seen[a.id]) })), [list, seen]);
+  // How the list is shown, kept across visits. Created order never changes by itself; any other
+  // sort is taken when chosen (or asked again), so rows don't reorder while agents update: new
+  // agents come in on top, and the tools offer "Re-sort" once the order has gone stale.
+  const [stored, setView] = useLocalStorage<Partial<View>>("kiln.agents.view", DEFAULT_VIEW);
+  const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored }), [stored]);
+  const [taken, setTaken] = React.useState<string[] | null>(null);
+  const latest = React.useRef(all);
+  React.useEffect(() => {
+    latest.current = all;
+  });
+  const loaded = list !== null;
+  const resort = React.useCallback(() => {
+    setTaken(view.sort === "created" ? null : sortRows(latest.current, view.sort, view.dir).map((r) => r.a.id));
+  }, [view.sort, view.dir]);
+  React.useEffect(resort, [resort, loaded]);
+  const ordered = React.useMemo(() => {
+    if (!taken) return sortRows(all, view.sort, view.dir);
+    const at = new Map(taken.map((id, i) => [id, i]));
+    const since = sortRows(
+      all.filter((r) => !at.has(r.a.id)),
+      "created",
+      "desc",
+    );
+    return [...since, ...all.filter((r) => at.has(r.a.id)).sort((x, y) => (at.get(x.a.id) ?? 0) - (at.get(y.a.id) ?? 0))];
+  }, [all, taken, view.sort, view.dir]);
+  const stale = React.useMemo(() => taken !== null && sortRows(all, view.sort, view.dir).some((r, i) => r.a.id !== ordered[i]?.a.id), [all, taken, ordered, view.sort, view.dir]);
+  const rows = ordered.filter((r) => matches(view, r));
   const live = rows.filter((r) => r.stand !== "ended");
   const ended = rows.filter((r) => r.stand === "ended");
-  const n = (s: Stand) => rows.filter((r) => r.stand === s).length;
-  const machines = [...new Set(live.map((r) => machineName(r.a.target)))];
+  const n = (s: Stand) => all.filter((r) => r.stand === s).length;
+  const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
   // Sessions found on your machines that kiln doesn't run itself (its own agents are rows above).
-  const elsewhere = found.filter((s) => !s.managed_by && !rows.some((r) => r.a.harness_session && r.a.harness_session === s.id));
+  const elsewhere = found.filter((s) => !s.managed_by && !all.some((r) => r.a.harness_session && r.a.harness_session === s.id));
 
   const status = [n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`, n("crashed") && `${n("crashed")} stopped`, n("working") && `${n("working")} working`, n("finished") && `${n("finished")} finished`]
     .filter(Boolean)
     .join(", ");
   const lead = !list
     ? "Every coding agent kiln runs, on every machine."
-    : rows.length === 0
+    : all.length === 0
       ? "Start coding agents on any of your machines and run them all from here."
       : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}.`;
 
@@ -255,11 +276,13 @@ export default function Mission() {
         }
       />
 
+      {all.length > 0 && <ListTools view={view} onView={setView} rows={all} stale={stale} onResort={resort} shown={rows.length} />}
+
       {error && !list ? (
         <ErrorState error={error} onRetry={reload} />
       ) : !list ? (
         <SkeletonRows rows={4} cols={3} />
-      ) : rows.length === 0 ? (
+      ) : all.length === 0 ? (
         <div className="ms-empty">
           <p className="ms-empty-title">No agents yet.</p>
           <p>Claude Code, Codex, or any harness your machines have — one or a dozen. kiln runs them: steer them, answer them, review what they change.</p>
@@ -267,6 +290,13 @@ export default function Mission() {
             New agents <Plus />
           </Button>
         </div>
+      ) : rows.length === 0 ? (
+        <p className="ms-quiet">
+          No agent matches.{" "}
+          <button type="button" className="ms-link" onClick={() => setView({ ...DEFAULT_VIEW, sort: view.sort, dir: view.dir })}>
+            Clear filters
+          </button>
+        </p>
       ) : live.length > 0 ? (
         <ul className="ms-list">
           {live.map(({ a, stand }) => (
@@ -304,6 +334,7 @@ export default function Mission() {
       {(selected.size > 0 || messaging) && (
         <MessageMany
           selected={[...selected]}
+          shown={isFiltered(view) ? rows.map((r) => r.a.id) : undefined}
           agents={list ?? []}
           onClose={() => {
             setSelected(new Set());

@@ -14,7 +14,7 @@ import { errorMessage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { CommandList, matchCommands, parseSlash } from "./palette";
 
-type Who = "selected" | "all" | "filter";
+type Who = "selected" | "shown" | "all" | "filter";
 type Choose = "mode" | "model" | "effort";
 
 interface Filter {
@@ -44,7 +44,7 @@ interface Ask {
 }
 
 /** One facet of the filter: its options as toggles; none chosen means any. */
-function Facet({ label, options, chosen, onChange }: { label: string; options: { id: string; label: string }[]; chosen: string[]; onChange: (next: string[]) => void }) {
+export function Facet({ label, options, chosen, onChange }: { label: string; options: { id: string; label: string }[]; chosen: string[]; onChange: (next: string[]) => void }) {
   return (
     <div className="ms-bc-facet" role="group" aria-label={label}>
       <span className="ms-bc-facet-label">{label}</span>
@@ -60,7 +60,18 @@ function Facet({ label, options, chosen, onChange }: { label: string; options: {
   );
 }
 
-export function MessageMany({ selected, agents, onClose }: { selected: string[]; agents: AgentInfo[]; onClose: () => void }) {
+export function MessageMany({
+  selected,
+  shown,
+  agents,
+  onClose,
+}: {
+  selected: string[];
+  /** The agents Mission control's filters leave, when it is filtered: "message these". */
+  shown?: string[];
+  agents: AgentInfo[];
+  onClose: () => void;
+}) {
   const [who, setWho] = React.useState<Who>(selected.length ? "selected" : "all");
   const [filter, setFilter] = React.useState<Filter>({ machines: [], kinds: [], status: [] });
   const [filterOpen, setFilterOpen] = React.useState(false);
@@ -76,17 +87,18 @@ export function MessageMany({ selected, agents, onClose }: { selected: string[];
 
   // A cleared selection leaves the panel writing to everything, never to nobody.
   React.useEffect(() => {
-    if (who === "selected" && selected.length === 0) setWho("all");
-  }, [who, selected.length]);
+    if ((who === "selected" && selected.length === 0) || (who === "shown" && !shown)) setWho("all");
+  }, [who, selected.length, shown]);
   React.useEffect(() => {
     if (selected.length > 0) setWho("selected");
   }, [selected.length]);
 
   const to: BroadcastTo = React.useMemo(() => {
     if (who === "selected") return { ids: selected };
+    if (who === "shown" && shown) return { ids: shown };
     if (who === "filter" && (filter.machines.length || filter.kinds.length || filter.status.length)) return { machines: filter.machines, kinds: filter.kinds, status: filter.status };
     return { all: true };
-  }, [who, selected, filter]);
+  }, [who, selected, shown, filter]);
   // Who that reaches, by the server's own picking: again as agents come, go or change state.
   const key = JSON.stringify(to);
   const roster = agents.map((a) => `${a.id}:${a.status}`).join(",");
@@ -177,6 +189,11 @@ export function MessageMany({ selected, agents, onClose }: { selected: string[];
         {selected.length > 0 && (
           <button type="button" role="radio" aria-checked={who === "selected"} onClick={() => setWho("selected")}>
             Selected · {selected.length}
+          </button>
+        )}
+        {shown && (
+          <button type="button" role="radio" aria-checked={who === "shown"} onClick={() => setWho("shown")}>
+            Shown · {shown.length}
           </button>
         )}
         <button type="button" role="radio" aria-checked={who === "all"} onClick={() => setWho("all")}>
