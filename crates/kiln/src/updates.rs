@@ -253,6 +253,13 @@ pub fn store(hub: &Hub, target: &str, bytes: &[u8], origin: &str) -> anyhow::Res
     keep(&store_dir(hub), target, bytes, origin, None)
 }
 
+/// Whether a run's binaries become what runners upgrade to: kiln's own release pipeline, built
+/// from a release tag or from the release branch. A manual run on any other branch (trying out a
+/// change) builds, but nothing upgrades to it.
+pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run) -> bool {
+    run.repo_name == u.release_repo && run.pipeline == u.release_pipeline && (run.event == "tag" || run.branch == u.release_branch)
+}
+
 /// What the release pipeline's job left in its artifacts (`dist/kiln-<target>[.exe]`): kept as the
 /// binaries each other platform's runners upgrade to. This server's own platform keeps its own
 /// build, so its runners run what it runs.
@@ -1361,6 +1368,36 @@ mod tests {
             assert_eq!(caps & cap, cap, "capability {cap} is announced");
         }
         Ok(())
+    }
+
+    #[test]
+    fn only_releases_from_a_tag_or_the_release_branch_are_adopted() {
+        let u = crate::config::Updates::default();
+        let run = |pipeline: &str, event: &str, branch: &str| crate::store::Run {
+            id: "r".into(),
+            repo_id: "k".into(),
+            repo_name: "hyper-light/kiln".into(),
+            number: 1,
+            pipeline: pipeline.into(),
+            event: event.into(),
+            branch: branch.into(),
+            sha: "0d21482abcdef".into(),
+            message: String::new(),
+            author: String::new(),
+            status: crate::store::Status::Succeeded,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        assert!(adopts(&u, &run("release", "manual", "main")));
+        assert!(adopts(&u, &run("release", "tag", "v0.2.0")));
+        assert!(!adopts(&u, &run("release", "manual", "try-something")));
+        assert!(!adopts(&u, &run("ci", "push", "main")));
+        let mut other = run("release", "manual", "main");
+        other.repo_name = "hyper-light/focal".into();
+        assert!(!adopts(&u, &other));
     }
 
     #[test]
