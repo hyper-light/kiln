@@ -2777,15 +2777,7 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   margin-left: auto;
 }
 .upd-confirm {
-  display: grid;
-  gap: 8px;
-  max-width: 72ch;
   margin: 10px 0 2px;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-accent);
-  background: var(--color-surface);
-  color: var(--color-secondary);
-  font-size: 13px;
 }
 .upd-confirm p {
   margin: 0;

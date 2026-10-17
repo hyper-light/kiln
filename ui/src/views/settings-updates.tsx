@@ -7,24 +7,30 @@
  */
 import * as React from "react";
 import { Link } from "react-router";
+import { create } from "zustand";
 import { ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";
-import { useConnection, useServerEvents } from "@/api/events";
+import { events, useServerEvents } from "@/api/events";
 import type { KilnBinary, ReleaseBuild, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatesOverview } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { Facts, Panel } from "@/components/ui/misc";
+import { Hold } from "@/components/ui/hold";
+import { Confirm, Facts, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
+import { fuller, mergeJobs, updatesRes, useRes, useUpdateJobs } from "@/lib/data";
 import { formatBytes, relativeTime } from "@/lib/format";
-import { errorMessage, useNow, useResource } from "@/lib/hooks";
+import { errorMessage, useNow } from "@/lib/hooks";
+import { invalidate } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 
 /** A server upgrade in flight: the page reconnects to the new server and says what changed. */
 const PENDING_KEY = "kiln.serverUpgrade";
 /** Finished upgrades stay shown under their runner this long. */
 const RECENT_S = 3600;
+/** How long a server upgrade may take before the page says it didn't change the build. */
+const PATIENCE_MS = 4 * 60_000;
 
-interface Confirm {
+interface Confirming {
   /** Where it is asked: "server", "all", or "runner:<name>". */
   scope: string;
   title: string;
@@ -42,14 +48,9 @@ function holding(i: RunnerInstance) {
   return parts.length ? parts.join(", ") : "nothing";
 }
 
-/** The fuller of two snapshots of one job (events and refetches can cross). */
-function fuller(a: UpdateJob | undefined, b: UpdateJob): UpdateJob {
-  if (!a) return b;
-  const rank = (j: UpdateJob) => (j.state === "running" ? 0 : 1) * 1e6 + j.log.length;
-  return rank(b) >= rank(a) ? b : a;
-}
+type Pending = { from: string; at: number } | null;
 
-function readPending(): { from: string; at: number } | null {
+function readPending(): Pending {
   try {
     const v = sessionStorage.getItem(PENDING_KEY);
     return v ? (JSON.parse(v) as { from: string; at: number }) : null;
@@ -58,82 +59,98 @@ function readPending(): { from: string; at: number } | null {
   }
 }
 
-function writePending(v: { from: string; at: number } | null) {
+/** The server upgrade this tab started and waits for (kept for the tab, across the restart). */
+const usePending = create<{ pending: Pending }>(() => ({ pending: readPending() }));
+
+function setPending(v: Pending) {
   try {
     if (v) sessionStorage.setItem(PENDING_KEY, JSON.stringify(v));
     else sessionStorage.removeItem(PENDING_KEY);
   } catch {
     /* private mode */
   }
+  usePending.setState({ pending: v });
+}
+
+/** Back from the restart (or out of patience): say what the server runs now. */
+async function settlePending() {
+  const p = usePending.getState().pending;
+  if (!p) return;
+  try {
+    const d = await api.updates();
+    if (d.server.build !== p.from) {
+      toast.success("Server upgraded", `build ${p.from} → ${d.server.build}`);
+      setPending(null);
+    } else if (Date.now() - p.at > PATIENCE_MS) {
+      toast({ title: "The server is still on the same build", description: `build ${d.server.build}`, tone: "info" });
+      setPending(null);
+    }
+  } catch {
+    /* still restarting: the next reconnection asks again */
+  }
+}
+events.onReopen(() => void settlePending());
+
+/** Runner events come in bursts: Updates is read again once they settle. */
+let soon: number | null = null;
+function readAgainSoon() {
+  if (soon !== null) window.clearTimeout(soon);
+  soon = window.setTimeout(() => {
+    soon = null;
+    invalidate("updates");
+  }, 350);
+}
+
+function UpdatesFrame({ actions, children }: { actions?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <Panel eyebrow="Maintenance" title="Updates" description="Upgrade kiln and its runners from here. A runner keeps every terminal, agent and job it runs while it is upgraded." actions={actions}>
+      {children}
+    </Panel>
+  );
+}
+
+/** Updates while they load: the panel, its Check, and its space. */
+export function UpdatesHold() {
+  return (
+    <UpdatesFrame
+      actions={
+        <Button variant="ghost" size="sm" disabled aria-label="Check for updates">
+          <RefreshCw /> <span className="max-sm:sr-only">Check</span>
+        </Button>
+      }
+    >
+      <Hold height={420} label="Loading updates" />
+    </UpdatesFrame>
+  );
 }
 
 export function UpdatesPanel() {
-  const res = useResource((s) => api.updates(s), []);
-  const conn = useConnection();
-  const [live, setLive] = React.useState<Record<string, UpdateJob>>({});
-  const [confirm, setConfirm] = React.useState<Confirm | null>(null);
+  const data = useRes(updatesRes).data;
+  const live = useUpdateJobs();
+  const [confirm, setConfirm] = React.useState<Confirming | null>(null);
   const [checking, setChecking] = React.useState(false);
-  const [pending, setPending] = React.useState(readPending);
+  const pending = usePending((s) => s.pending);
   const fileRef = React.useRef<HTMLInputElement>(null);
   const uploadTarget = React.useRef<string>("");
   const [uploading, setUploading] = React.useState<string | null>(null);
 
-  // Refetch on changes, a little coalesced (runner events come in bursts).
-  const timer = React.useRef<number | null>(null);
-  const reload = res.reload;
-  const reloadSoon = React.useCallback(() => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
-    timer.current = window.setTimeout(() => {
-      timer.current = null;
-      reload();
-    }, 350);
-  }, [reload]);
-  React.useEffect(() => () => {
-    if (timer.current !== null) window.clearTimeout(timer.current);
-  }, []);
-
   useServerEvents((ev) => {
-    if (ev.type === "update_job") setLive((prev) => ({ ...prev, [ev.job.id]: fuller(prev[ev.job.id], ev.job) }));
-    else if (ev.type === "updates" || ev.type === "agent") reloadSoon();
+    if (ev.type === "agent") readAgainSoon();
   });
 
-  // Back from a restart: refetch, and say what the server runs now.
-  const wasClosed = React.useRef(false);
-  React.useEffect(() => {
-    if (conn.state === "closed") wasClosed.current = true;
-    if (conn.state === "open" && wasClosed.current) {
-      wasClosed.current = false;
-      reload();
-    }
-  }, [conn.state, reload]);
-  const data = res.data;
-  React.useEffect(() => {
-    if (!pending || !data) return;
-    if (data.server.build !== pending.from) {
-      toast.success("Server upgraded", `build ${pending.from} → ${data.server.build}`);
-      writePending(null);
-      setPending(null);
-    } else if (Date.now() - pending.at > 4 * 60_000) {
-      toast({ title: "The server is still on the same build", description: `build ${data.server.build}`, tone: "info" });
-      writePending(null);
-      setPending(null);
-    }
-  }, [data, pending]);
-
-  const jobs = React.useMemo(() => {
-    const all: Record<string, UpdateJob> = { ...live };
-    for (const j of data?.jobs ?? []) all[j.id] = fuller(all[j.id], j);
-    return Object.values(all).sort((a, b) => b.started_at - a.started_at);
-  }, [data, live]);
+  const jobs = React.useMemo(() => mergeJobs(data, live), [data, live]);
   const nowS = useNow() / 1000;
-  const latest = (kind: UpdateJob["kind"], target: string) =>
-    jobs.find((j) => j.kind === kind && j.target === target && (j.state === "running" || nowS - (j.ended_at ?? j.started_at) < RECENT_S));
+  const latest = (kind: UpdateJob["kind"], target: string) => jobs.find((j) => j.kind === kind && j.target === target && (j.state === "running" || nowS - (j.ended_at ?? j.started_at) < RECENT_S));
+  /** A job just started here: shown at once, before its first event. */
+  const started = (job: UpdateJob) => {
+    useUpdateJobs.setState((m) => ({ ...m, [job.id]: fuller(m[job.id], job) }), true);
+  };
 
   const check = async () => {
     setChecking(true);
     try {
       await api.checkUpdates();
-      reload();
+      invalidate("updates");
     } catch (e) {
       toast.error("Couldn't check for updates", errorMessage(e));
     } finally {
@@ -143,42 +160,37 @@ export function UpdatesPanel() {
 
   const startRunner = async (r: RunnerUpdate) => {
     try {
-      const job = await api.upgradeRunner(r.name);
-      setLive((prev) => ({ ...prev, [job.id]: fuller(prev[job.id], job) }));
+      started(await api.upgradeRunner(r.name));
       toast({ title: `Upgrading ${r.name}`, description: "Its terminals, agents and jobs keep running.", tone: "running" });
     } catch (e) {
       toast.error(`Couldn't upgrade ${r.name}`, errorMessage(e));
     }
-    reloadSoon();
+    readAgainSoon();
   };
 
   const startAll = async () => {
     try {
       const out = await api.upgradeAllRunners();
-      setLive((prev) => {
-        const next = { ...prev };
-        for (const j of out.jobs) next[j.id] = fuller(next[j.id], j);
-        return next;
-      });
+      for (const j of out.jobs) started(j);
       if (out.jobs.length) toast({ title: `Upgrading ${plural(out.jobs.length, "runner")}`, description: "Nothing they run is stopped.", tone: "running" });
       for (const e of out.errors) toast.error("A runner wasn't upgraded", e);
     } catch (e) {
       toast.error("Couldn't upgrade the runners", errorMessage(e));
     }
-    reloadSoon();
+    readAgainSoon();
   };
 
   const startServer = async (s: ServerUpdate, action: "restart" | "replace") => {
     try {
       const job = await api.upgradeServer(action);
-      setLive((prev) => ({ ...prev, [job.id]: fuller(prev[job.id], job) }));
+      started(job);
       if (job.state === "failed") {
         toast.error("The server wasn't upgraded", job.error ?? undefined);
         return;
       }
-      const p = { from: s.build, at: Date.now() };
-      writePending(p);
-      setPending(p);
+      setPending({ from: s.build, at: Date.now() });
+      // A restart that never comes still gets an answer.
+      window.setTimeout(() => void settlePending(), PATIENCE_MS + 1_000);
     } catch (e) {
       toast.error("Couldn't upgrade the server", errorMessage(e));
     }
@@ -194,7 +206,7 @@ export function UpdatesPanel() {
     try {
       const b = await api.uploadBinary(target, file);
       toast.success("Binary uploaded", `build ${b.build} for ${target}`);
-      reload();
+      invalidate("updates");
     } catch (e) {
       toast.error("Upload failed", errorMessage(e));
     } finally {
@@ -202,17 +214,14 @@ export function UpdatesPanel() {
     }
   };
 
-  const outdated = (data?.runners ?? []).filter((r) => r.connected && !r.up_to_date);
+  const outdated = data.runners.filter((r) => r.connected && !r.up_to_date);
   const runningRunners = new Set(jobs.filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
 
   return (
-    <Panel
-      eyebrow="Maintenance"
-      title="Updates"
-      description="Upgrade kiln and its runners from here. A runner keeps every terminal, agent and job it runs while it is upgraded."
+    <UpdatesFrame
       actions={
-        <Button variant="ghost" size="sm" disabled={checking || !data} onClick={() => void check()} aria-label="Check for updates">
-          <RefreshCw className={cn((checking || data?.server.checking) && "animate-spin motion-reduce:animate-none")} /> <span className="max-sm:sr-only">Check</span>
+        <Button variant="ghost" size="sm" disabled={checking} onClick={() => void check()} aria-label="Check for updates">
+          <RefreshCw className={cn((checking || data.server.checking) && "animate-spin motion-reduce:animate-none")} /> <span className="max-sm:sr-only">Check</span>
         </Button>
       }
     >
@@ -228,118 +237,119 @@ export function UpdatesPanel() {
           if (f) void upload(f);
         }}
       />
-      {res.error && !data && <p className="upd-note" data-tone="error">{errorMessage(res.error)}</p>}
-      {!data && !res.error && <p className="upd-note">Loading…</p>}
-      {data && (
-        <div className="upd">
-          <ServerSection
-            s={data.server}
-            job={latest("server", "server")}
-            pending={pending !== null && data.server.build === pending.from}
-            uploading={uploading}
-            onUpload={() => pickUpload(data.server.target)}
-            onAction={(action) =>
-              setConfirm({
-                scope: "server",
-                title: action === "restart" ? "Restart the server onto the new image?" : "Install the new server build?",
-                lead: "What will happen:",
-                plan: <ServerPlan s={data.server} action={action} />,
-                confirmLabel: action === "restart" ? "Restart server" : "Install and restart",
-                run: () => startServer(data.server, action),
-              })
-            }
-          />
-          {confirm?.scope === "server" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
-          <section className="upd-section" aria-labelledby="upd-runners">
-            <div className="upd-section-head">
-              <div className="min-w-0">
-                <h4 id="upd-runners" className="upd-h">
-                  Runners
-                </h4>
-                <p className="upd-sub">
-                  {data.runners.length === 0
-                    ? "No machines have joined yet."
-                    : `${data.runners.filter((r) => r.up_to_date).length} of ${data.runners.length} on the server's build · runners are brought to the build this server runs`}
-                </p>
-              </div>
-              <Button
-                variant="secondary"
-                size="sm"
-                disabled={outdated.length === 0 || outdated.every((r) => runningRunners.has(r.name))}
-                onClick={() =>
+      <div className="upd">
+        <ServerSection
+          s={data.server}
+          job={latest("server", "server")}
+          pending={pending !== null && data.server.build === pending.from}
+          uploading={uploading}
+          onUpload={() => pickUpload(data.server.target)}
+          onAction={(action) =>
+            setConfirm({
+              scope: "server",
+              title: action === "restart" ? "Restart the server onto the new image?" : "Install the new server build?",
+              lead: "What will happen:",
+              plan: <ServerPlan s={data.server} action={action} />,
+              confirmLabel: action === "restart" ? "Restart server" : "Install and restart",
+              run: () => startServer(data.server, action),
+            })
+          }
+        />
+        {confirm?.scope === "server" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
+        <section className="upd-section" aria-labelledby="upd-runners">
+          <div className="upd-section-head">
+            <div className="min-w-0">
+              <h4 id="upd-runners" className="upd-h">
+                Runners
+              </h4>
+              <p className="upd-sub">
+                {data.runners.length === 0
+                  ? "No machines have joined yet."
+                  : `${data.runners.filter((r) => r.up_to_date).length} of ${data.runners.length} on the server's build · runners are brought to the build this server runs`}
+              </p>
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={outdated.length === 0 || outdated.every((r) => runningRunners.has(r.name))}
+              onClick={() =>
+                setConfirm({
+                  scope: "all",
+                  title: `Upgrade ${plural(outdated.length, "runner")}?`,
+                  lead: "What will happen:",
+                  plan: <AllPlan runners={outdated} />,
+                  confirmLabel: "Upgrade all",
+                  run: startAll,
+                })
+              }
+            >
+              Upgrade all{outdated.length ? ` (${outdated.length})` : ""}
+            </Button>
+          </div>
+          {confirm?.scope === "all" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
+          <ul className="upd-runners">
+            {data.runners.map((r) => (
+              <RunnerRow
+                key={r.name}
+                r={r}
+                job={latest("runner", r.name)}
+                uploading={uploading}
+                onUpload={() => r.target && pickUpload(r.target)}
+                plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
+                onUpgrade={() =>
                   setConfirm({
-                    scope: "all",
-                    title: `Upgrade ${plural(outdated.length, "runner")}?`,
+                    scope: `runner:${r.name}`,
+                    title: `Upgrade ${r.name}?`,
                     lead: "What will happen:",
-                    plan: <AllPlan runners={outdated} />,
-                    confirmLabel: "Upgrade all",
-                    run: startAll,
+                    plan: <RunnerPlan r={r} />,
+                    confirmLabel: "Upgrade",
+                    run: () => startRunner(r),
                   })
                 }
-              >
-                Upgrade all{outdated.length ? ` (${outdated.length})` : ""}
-              </Button>
-            </div>
-            {confirm?.scope === "all" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
-            <ul className="upd-runners">
-              {data.runners.map((r) => (
-                <RunnerRow
-                  key={r.name}
-                  r={r}
-                  job={latest("runner", r.name)}
-                  uploading={uploading}
-                  onUpload={() => r.target && pickUpload(r.target)}
-                  plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
-                  onUpgrade={() =>
-                    setConfirm({
-                      scope: `runner:${r.name}`,
-                      title: `Upgrade ${r.name}?`,
-                      lead: "What will happen:",
-                      plan: <RunnerPlan r={r} />,
-                      confirmLabel: "Upgrade",
-                      run: () => startRunner(r),
-                    })
-                  }
-                />
-              ))}
-            </ul>
-          </section>
-          <Binaries data={data} uploading={uploading} onUpload={pickUpload} onRemoved={reload} onBuilt={reloadSoon} />
-        </div>
-      )}
-    </Panel>
+              />
+            ))}
+          </ul>
+        </section>
+        <Binaries data={data} uploading={uploading} onUpload={pickUpload} onRemoved={() => invalidate("updates")} onBuilt={readAgainSoon} />
+      </div>
+    </UpdatesFrame>
   );
 }
 
 /** Confirm an upgrade in place, showing step by step what it will do. */
-function InlinePlan({ confirm, onClose }: { confirm: Confirm; onClose: () => void }) {
+function InlinePlan({ confirm, onClose }: { confirm: Confirming; onClose: () => void }) {
   const [busy, setBusy] = React.useState(false);
   return (
-    <div className="upd-confirm" role="group" aria-label={confirm.title}>
+    <Confirm
+      className="upd-confirm"
+      label={confirm.title}
+      actions={
+        <>
+          <Button
+            size="xs"
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await confirm.run();
+              } finally {
+                setBusy(false);
+                onClose();
+              }
+            }}
+          >
+            {confirm.confirmLabel}
+          </Button>
+          <Button size="xs" variant="ghost" disabled={busy} onClick={onClose}>
+            Cancel
+          </Button>
+        </>
+      }
+    >
       <p className="upd-confirm-title">{confirm.title}</p>
       <p className="upd-sub">{confirm.lead}</p>
       {confirm.plan}
-      <div className="upd-actions">
-        <Button
-          size="xs"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            try {
-              await confirm.run();
-            } finally {
-              setBusy(false);
-              onClose();
-            }
-          }}
-        >
-          {confirm.confirmLabel}
-        </Button>
-        <Button size="xs" variant="ghost" disabled={busy} onClick={onClose}>
-          Cancel
-        </Button>
-      </div>
-    </div>
+    </Confirm>
   );
 }
 
@@ -591,25 +601,33 @@ function jobTitle(j: UpdateJob) {
 function JobLog({ job }: { job: UpdateJob }) {
   const running = job.state === "running";
   const [open, setOpen] = React.useState(running || job.state === "failed");
-  React.useEffect(() => {
+  // An upgrade that starts running opens its log.
+  const [runningSeen, setRunningSeen] = React.useState(running);
+  if (running !== runningSeen) {
+    setRunningSeen(running);
     if (running) setOpen(true);
-  }, [running]);
-  const ref = React.useRef<HTMLPreElement>(null);
-  React.useEffect(() => {
-    const el = ref.current;
-    if (el && open) el.scrollTop = el.scrollHeight;
-  }, [job.log.length, open]);
+  }
+  // Its newest lines stay in view as they come.
+  const follow = React.useCallback(
+    (el: HTMLPreElement | null) => {
+      if (el) el.scrollTop = el.scrollHeight;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [job.log.length],
+  );
   const tone = running ? "running" : job.state === "done" ? "succeeded" : "failed";
   return (
     <div className="upd-job" data-state={job.state}>
       <button type="button" className="upd-job-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
         <StatusDot status={tone} />
         <span className="min-w-0 flex-1 truncate">{jobTitle(job)}</span>
-        <span className="mono upd-dim shrink-0">{running ? "running" : job.state === "done" ? "done" : "failed"} · {relativeTime(job.ended_at ?? job.started_at)}</span>
+        <span className="mono upd-dim shrink-0">
+          {running ? "running" : job.state === "done" ? "done" : "failed"} · {relativeTime(job.ended_at ?? job.started_at)}
+        </span>
         <ChevronDown size={14} className={cn("shrink-0 transition-transform", open && "rotate-180")} />
       </button>
       {open && (
-        <pre ref={ref} className="upd-log" aria-live={running ? "polite" : undefined}>
+        <pre ref={follow} className="upd-log" aria-live={running ? "polite" : undefined}>
           {job.log.join("\n") || "starting…"}
         </pre>
       )}
@@ -673,32 +691,36 @@ function Binaries({
               </Button>
             )}
             {confirm?.target === b.target && (
-              <div className="upd-confirm upd-bin-confirm" role="group" aria-label={`Remove the ${b.target} binary`}>
-                <p>
-                  Remove the {b.target} binary? Build {b.build} is no longer handed to machines of that platform until kiln builds every platform again or one is uploaded.
-                </p>
-                <div className="upd-actions">
-                  <Button
-                    size="xs"
-                    variant="danger"
-                    onClick={async () => {
-                      try {
-                        await api.deleteBinary(b.target);
-                        onRemoved();
-                      } catch (e) {
-                        toast.error("Couldn't remove it", errorMessage(e));
-                      } finally {
-                        setConfirm(null);
-                      }
-                    }}
-                  >
-                    Remove
-                  </Button>
-                  <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
-                    Keep it
-                  </Button>
-                </div>
-              </div>
+              <Confirm
+                className="upd-confirm upd-bin-confirm"
+                label={`Remove the ${b.target} binary`}
+                tone="danger"
+                actions={
+                  <>
+                    <Button
+                      size="xs"
+                      variant="danger"
+                      onClick={async () => {
+                        try {
+                          await api.deleteBinary(b.target);
+                          onRemoved();
+                        } catch (e) {
+                          toast.error("Couldn't remove it", errorMessage(e));
+                        } finally {
+                          setConfirm(null);
+                        }
+                      }}
+                    >
+                      Remove
+                    </Button>
+                    <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
+                      Keep it
+                    </Button>
+                  </>
+                }
+              >
+                <p>Remove the {b.target} binary? Build {b.build} is no longer handed to machines of that platform until kiln builds every platform again or one is uploaded.</p>
+              </Confirm>
             )}
           </li>
         ))}

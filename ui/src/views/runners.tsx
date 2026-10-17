@@ -3,7 +3,7 @@ import { Link, Navigate, useNavigate, useSearchParams } from "react-router";
 import { Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, Job, RunnerInstance, RunnerUpdate, UpdatesOverview } from "@/api/types";
+import type { Agent, Job, RunnerInstance, RunnerUpdate } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
 import { Hold, TableHold } from "@/components/ui/hold";
@@ -12,7 +12,7 @@ import { Confirm, EmptyState, Facts, Meter, PageIntro, SelectField } from "@/com
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
-import { agentsRes, historyRes, lastSamples, useAgentsLive, useMetricsHistory, useRes, warm, type Res } from "@/lib/data";
+import { agentsRes, historyRes, lastSamples, mergeJobs, updatesRes, useAgentsLive, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { usePref } from "@/lib/prefs";
@@ -34,9 +34,6 @@ const FACETS: { id: string; label: string }[] = [
   { id: "labels", label: "Labels" },
   { id: "platform", label: "Platform" },
 ];
-
-/** Settings → Updates: what each runner runs and what it could run. */
-export const updatesRes: Res<UpdatesOverview> = { key: "updates", fetch: (s) => api.updates(s), opts: { pollMs: 20_000, on: ["updates", "update_job"] } };
 
 export function agentStatus(a: Agent) {
   return !a.connected ? "cancelled" : a.draining ? "timed_out" : a.busy > 0 ? "running" : "succeeded";
@@ -558,9 +555,10 @@ function AgentDetails({
  */
 function Upgrades() {
   const data = useRes(updatesRes).data;
+  const live = useUpdateJobs();
   const [asking, setAsking] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
-  const upgrading = new Set(data.jobs.filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
+  const upgrading = new Set(mergeJobs(data, live).filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
   const behind = data.runners.filter((r) => r.connected && !r.up_to_date);
   if (behind.length === 0) return null;
   const ready = behind.filter((r) => r.target_build && !upgrading.has(r.name) && !(r.method === "terminal" && !r.terminal));

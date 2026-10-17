@@ -6,9 +6,10 @@
  *
  * A section that reads several of them `warm`s them all first, so they load at once.
  */
+import { create } from "zustand";
 import { api } from "@/api/client";
-import { useServerEvents } from "@/api/events";
-import type { Agent, HostSample, MetricsHistory, Overview, Repo, Run } from "@/api/types";
+import { events, useServerEvents } from "@/api/events";
+import type { Agent, HostSample, MetricsHistory, Overview, Repo, Run, UpdateJob, UpdatesOverview } from "@/api/types";
 import { preload, useSuspenseResource, type ResourceOptions } from "./resource";
 
 /** What a key loads, and how. */
@@ -95,4 +96,31 @@ export function useRepos() {
 export function lastSamples(h: MetricsHistory, name: string, n: number): HostSample[] {
   const all = h[name] ?? [];
   return all.length > n ? all.slice(-n) : all;
+}
+
+/** Settings → Updates: the server's build, each runner's, the binaries handed out. */
+export const updatesRes: Res<UpdatesOverview> = { key: "updates", fetch: (s) => api.updates(s), opts: { pollMs: 30_000, on: ["updates"] } };
+
+/** The fuller of two snapshots of one job (events and refetches can cross). */
+export function fuller(a: UpdateJob | undefined, b: UpdateJob): UpdateJob {
+  if (!a) return b;
+  const rank = (j: UpdateJob) => (j.state === "running" ? 0 : 1) * 1e6 + j.log.length;
+  return rank(b) >= rank(a) ? b : a;
+}
+
+/**
+ * Upgrades as they go (their output, their end), from `update_job` events: kept outside any page,
+ * so a page opened mid-upgrade shows all of it, and its output doesn't make every page read
+ * Settings → Updates again.
+ */
+export const useUpdateJobs = create<Record<string, UpdateJob>>(() => ({}));
+events.on((ev) => {
+  if (ev.type === "update_job") useUpdateJobs.setState((m) => ({ ...m, [ev.job.id]: fuller(m[ev.job.id], ev.job) }), true);
+});
+
+/** Upgrade jobs: the overview's and the live ones merged, newest first. */
+export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>): UpdateJob[] {
+  const all: Record<string, UpdateJob> = { ...live };
+  for (const j of data.jobs) all[j.id] = fuller(all[j.id], j);
+  return Object.values(all).sort((a, b) => b.started_at - a.started_at);
 }
