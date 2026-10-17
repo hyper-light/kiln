@@ -84,7 +84,14 @@ export function ResourceDetails({
         {node.managed && !node.hook && node.sync && <SyncPair sync={node.sync} />}
         {node.managed ? <span className="cd-meta">managed</span> : <span className="cd-meta">live, owned by the app's objects</span>}
       </div>
-      {(node.message || node.why) && <p className="cd-details-why">{node.why ?? node.message}</p>}
+      {(node.message || node.why) && (
+        <p
+          className="cd-details-why"
+          data-tone={node.why ? "warn" : node.health === "Degraded" || node.health === "Missing" ? "fail" : node.health === "Healthy" ? undefined : "warn"}
+        >
+          {node.why ?? node.message}
+        </p>
+      )}
       <SelectField label="Show" value={current} onChange={(v) => setShow(v as Show)} options={options} className="cd-details-show" />
       <div className="cd-details-body">
         {current === "logs" ? (

@@ -821,8 +821,10 @@ function FlatList({
   details: React.ReactNode;
 }) {
   const sorted = React.useMemo(() => sortNodes(nodes, sort), [nodes, sort]);
+  const inView = sorted.some((n) => n.id === selected);
   return (
     <ul className="cd-llist" aria-label="Objects">
+      {!inView && details ? <li>{details}</li> : null}
       {sorted.map((n) => (
         <li key={n.id}>
           <Row n={n} now={now} selected={selected === n.id} onSelect={onSelect} />
@@ -868,8 +870,11 @@ function PodList({
     }
     return [...m.values()].sort((x, y) => compareText(x.label, y.label)).map((g) => ({ ...g, pods: [...g.pods].sort((x, y) => compareText(x.name, y.name)) }));
   }, [pods, group, byId]);
+  // An owner chosen from a pod's details isn't a pod: its details open on top.
+  const inView = pods.some((p) => p.id === selected);
   return (
     <div className="cd-pods">
+      {!inView && details}
       {groups.map((g) => {
         const bad = g.pods.filter((p) => p.health === "Degraded").length;
         return (

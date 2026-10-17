@@ -223,8 +223,11 @@ export function TreeList({
       else next.add(id);
       return next;
     });
+  // The object chosen isn't a row here (its owner is folded): its details open on top.
+  const inView = rows.some((r) => r.item.type === "node" && r.item.node.id === selected);
   return (
     <ul className="cd-tlist" aria-label="Resource tree">
+      {!inView && details ? <li className="cd-trow-details">{details}</li> : null}
       {rows.map(({ item, depth }) => {
         const guides = <span className="cd-guides" style={{ "--depth": depth } as React.CSSProperties} aria-hidden="true" />;
         if (item.type === "group") {

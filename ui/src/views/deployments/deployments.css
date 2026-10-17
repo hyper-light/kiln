@@ -974,10 +974,16 @@ button.cd-gnode:hover {
 }
 .cd-details-why {
   margin: 8px 0 0;
-  color: #d8c8b0;
+  color: #a1a4ad;
   font-size: 12.5px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+.cd-details-why[data-tone="warn"] {
+  color: #d8c8b0;
+}
+.cd-details-why[data-tone="fail"] {
+  color: #d8b9bb;
 }
 .cd-details-show {
   max-width: 260px;
