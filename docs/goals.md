@@ -31,7 +31,8 @@ stack also pauses when the agent stops, goes away, or doesn't take a goal up.
 A plan runs as goals too: **Run it** (or, in the agent's Plan tab, **Run here**) **as Goals**, each
 step one, after the agent's others (a new agent is started for them when you pick one). A step
 with parts goes as one line: its title, what to do, examples, "Done when:" its acceptance
-criteria and "Tested by:" its testing. The stack shows its title, the rest under it.
+criteria (each a sentence: "p99.9 latency is at most 200 ms") and "Tests:" its tests. The stack
+shows its title, the rest under it.
 
 The server keeps the stacks and drives them, so they go on with no console open and across
 restarts.
