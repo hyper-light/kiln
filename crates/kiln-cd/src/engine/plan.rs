@@ -9,7 +9,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
-use super::{App, Change, Engine, differs, render_of};
+use super::{App, Change, Engine, differs, recombine, render_of};
 use crate::diff::{self, Ignores, LiveView, Verdict};
 use crate::model::PruneMode;
 use crate::obj::{self, GroupKind, ResKey, Str};
@@ -91,6 +91,9 @@ pub struct Plan {
     pub taken: Vec<(ResKey, Str)>,
 }
 
+/// Objects the owner read from a cluster itself, by key: `None`, not there.
+pub type Read = FxHashMap<ResKey, Option<Value>>;
+
 /// One object as the sync planner sees it, with what a sync would make of it.
 struct Candidate {
     key: ResKey,
@@ -106,9 +109,11 @@ impl Engine {
     /// What deploying `objects` would do to an app. `objects` is a render of its sources at some
     /// other commit, as [`super::Input::Rendered`] takes one; `None` plans the render the app
     /// compares against now (its drift). Nothing in the engine changes, and the cluster is as
-    /// last watched. `None` back means there is no such app, or (for its own render) it has
-    /// none yet.
-    pub fn plan(&self, id: &str, objects: Option<Vec<Value>>) -> Option<Plan> {
+    /// last watched. Objects of kinds the engine hasn't listed in the cluster yet are
+    /// [`Plan::unread`], unless `read` has them: what the owner read from the cluster itself
+    /// (`None`, not there). `None` back means there is no such app, or (for its own render) it
+    /// has none yet.
+    pub fn plan(&self, id: &str, objects: Option<Vec<Value>>, read: &Read) -> Option<Plan> {
         let a = *self.app_by_id.get(id)?;
         let app = self.app(a)?;
         let render = match objects {
@@ -165,8 +170,28 @@ impl Engine {
                 plan.taken.push((p.key.clone(), self.app(other).map(|x| x.cfg.id.clone()).unwrap_or_else(|| Str::from(""))));
                 continue;
             }
-            match res.and_then(|r| r.live.as_ref()).and_then(|l| l.blob.decode().ok()) {
-                None if !cl.listed.contains(&p.key.group_kind()) => plan.unread.push(p.key.clone()),
+            let watched = res.and_then(|r| r.live.as_ref()).and_then(|l| l.blob.decode().ok());
+            let live = match watched {
+                Some(live) => Some(live),
+                None if cl.listed.contains(&p.key.group_kind()) => None,
+                None => match read.get(&p.key) {
+                    // Read by the owner: kept as a watch keeps it, and claimed as a watch claims it.
+                    Some(Some(v)) => {
+                        if let Some(other) = self.owner_of(&p.key, v).filter(|o| *o != a) {
+                            plan.taken.push((p.key.clone(), self.app(other).map(|x| x.cfg.id.clone()).unwrap_or_else(|| Str::from(""))));
+                            continue;
+                        }
+                        let keep = |m: &str| app.cfg.ignore.iter().any(|r| r.managers.iter().any(|x| x == m));
+                        Some(recombine(LiveView::keeping(v.clone(), &app.cfg.manager, keep)))
+                    }
+                    Some(None) => None,
+                    None => {
+                        plan.unread.push(p.key.clone());
+                        continue;
+                    }
+                },
+            };
+            match live {
                 None => cands.push(Candidate { key: p.key.clone(), desired: Some(i), live: None, out_of_sync: true, change: create(), why: None }),
                 Some(live) => {
                     let (verdict, change) = compare(app, &p.object, LiveView::new(live.clone(), &app.cfg.manager));

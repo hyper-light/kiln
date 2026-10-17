@@ -33,7 +33,7 @@ use crate::obj::{self, Blob, GroupKind, Interner, ResKey, Scopes, Str};
 use crate::sync::{self, Phase, TaskState};
 
 mod plan;
-pub use plan::{Plan, Planned, Step, StepKind};
+pub use plan::{Plan, Planned, Read, Step, StepKind};
 
 /// The label kiln's watches select on: a hash of the app's id.
 pub const APP_LABEL: &str = "kiln.dev/app";

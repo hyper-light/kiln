@@ -250,6 +250,21 @@ Deployments take part in both.
   100-diff stack is planned in the time its changed apps take to render. The plan is a check
   (`deploy`) that `.kiln/review.yaml` can require. It fails when a render fails, a policy denies
   the change, or it would prune an object marked `Prune=false`.
+
+  What is built plans a commit (against its first parent), a stack (`head`, from where it leaves
+  trunk or from `base`, at most 100 commits) or a pull request (its `refs/pull/<n>/head`, or a
+  GitLab merge request's, fetched). Finding the apps renders nothing: an app's render key is the
+  content address of the paths it reads, so an app is planned only if a commit changes one of
+  them, and only its sources that follow trunk move. Each distinct content is rendered once and
+  kept by key, so planning again renders nothing. The engine then plans each render against what
+  runs, with the sync's own planner: the objects a sync would create, change (live and predicted,
+  with `why` and hunks; Secrets masked), prune, and the hooks it runs, in its order (phases,
+  waves). Objects of kinds the engine hasn't listed yet are read from the cluster for the plan.
+  A diff fails when its sources can't be read or rendered, or when it drops an object that
+  `Prune=false` keeps in the cluster. Its notes say what to know: `Prune=confirm`, an object
+  another app deploys, a kind the cluster doesn't serve. `brief` leaves out the hunks.
+  Plans of kiln's own diffs (`D123`, once its review is built), the land queue's candidates,
+  commit statuses and comments on pull requests, and policy checks are not built yet.
 - **Land.** The land queue's candidate is planned like a diff. A failure ejects it before trunk
   moves.
 - **Previews.** `previews:` makes an app for each stack (by default, at its top diff), for each
@@ -351,7 +366,7 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 | GET | `/api/cd/apps/:app/resources/:key/logs?container=&pod=&tail_lines=&since_seconds=&previous=` | the last lines of a pod's log, or of a workload's pods merged by time; `/logs/ws` follows them over a WebSocket |
 | POST / DELETE | `/api/cd/apps/:app/resources/:key/actions/:action` | resource actions (restart, delete a pod): not yet |
 | POST | `/api/cd/bulk` | `{ selector, action }` over many apps |
-| GET | `/api/cd/plans?commit=\|diff=\|pr=` | a plan |
+| GET / POST | `/api/cd/plans?repo=&commit=\|head=&base=\|pr=&trunk=&brief=` | a plan of a commit, a stack or a pull request (POST takes the same as JSON, with app filters); `diff=` (kiln's own diffs): not yet |
 | GET | `/api/cd/{environments,previews,fleets,windows}` | |
 | GET / POST / PATCH / DELETE | `/api/cd/{clusters,repos,projects}[/:id]` | |
 
@@ -368,7 +383,8 @@ everywhere (`last-applied-configuration` included).
 
 CLI: `kiln cd apps`, `kiln cd app <app> [--tree|--diff|--history]`, `kiln cd sync <app>…
 [--selector] [--prune] [--dry-run] [--wait]`, `kiln cd rollback <app> [n]`, `kiln cd follow <app>`, `kiln cd plan
-[D123|--pr n]`, `kiln cd cluster add|list|rm`, `kiln cd import`, `kiln cd bench`.
+[<commit>] [--stack] [--base <commit>] [--trunk <branch>] [--pr n] [--diff]` (by default the
+branch checked out here, as a stack), `kiln cd cluster add|list|rm`, `kiln cd import`, `kiln cd bench`.
 
 UI: **Deployments**: the fleet as one list (sync and health per app, filtered by environment,
 cluster and project, 100,000 apps scrolling smoothly), an app's resource tree, diffs, history and
@@ -472,7 +488,7 @@ and the network come on top, and are measured separately as they are built.
 
 | Part | State |
 | --- | --- |
-| Engine (`crates/kiln-cd`): health, diff (with predicted results), sync planning (phases, waves, hooks, prunes), controller, retries, self-heal, request budgets, restart safety | built, tested (70 tests), benchmarked to 1M apps |
+| Engine (`crates/kiln-cd`): health, diff (with predicted results), sync planning (phases, waves, hooks, prunes), controller, retries, self-heal, request budgets, restart safety, plans of renders not deployed | built, tested (91 tests), benchmarked to 1M apps |
 | Rendering: directories, Helm (binary), Kustomize (binary), plugins; content-addressed render keys | built; Helm tested on kiln's own charts. Jsonnet and kiln's native Helm and Kustomize engines: not yet |
 | Git: mirrors, revisions, path hashes, extraction, symlinks | built |
 | Durable state on hyper-raft (one voter) | built; replicas across servers: not yet |
@@ -482,8 +498,9 @@ and the network come on top, and are measured separately as they are built.
 | `/api/cd`, `kiln cd` | built |
 | MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; Claude Code sessions kiln starts get it | built |
 | Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI) | built |
+| Plans of a commit, a stack or a pull request: the apps it touches, each diff's own change and the stack's, a sync's steps against what runs, the render and `Prune=false` checks (API, CLI, MCP) | built; the UI's plan panel, kiln's own diffs, the land queue, previews, statuses and comments on pull requests, policy checks: not yet |
 | UI: the fleet list (windowed, filtered and sorted on the server, live; the console's filter field with counts per value, namespace included; the fleet's counts; row checkboxes for syncing or refreshing many) and an app's page (revision, last sync, source; the resource tree as a graph or an indented list, a list, pods by owner or node; one filter over every view; an object's summary, manifests, diff, events and logs, followed live; sync of chosen objects, rollback, refresh and hard refresh, take over, stop, delete, each confirmed in place) | built; environments board, previews, fleets, resource actions, the tree over a WebSocket: not yet |
-| Notifications, windows, projects and RBAC, plans and previews for diffs | not yet |
+| Notifications, windows, projects and RBAC, previews | not yet |
 
 Checked against a live cluster: in shadow mode, kiln agrees with Argo CD on kiln's own app of
 apps (four apps, the same sync, health and resource counts). On a cluster of its own, a kiln app
@@ -491,4 +508,8 @@ synced through its PreSync hook and waves, followed a commit (with a prune), hea
 in 7 s, and was deleted with its objects while the namespace it created stayed. With self-heal
 off, a hand edit survived a restart of kiln untouched (no sync ran), and its diff showed only the
 edited fields. An app shipping two CRDs (one namespaced, one cluster-scoped) and an object of
-each synced in one go.
+each synced in one go. A four-commit stack over three apps (plain manifests and a Helm chart) planned
+in under a tenth of a second from cold: each diff's apps and steps came out in the sync's order
+(the PreSync hook first), a new Secret showed as a create with its value masked, the diff that
+dropped a `Prune=false` ConfigMap failed, a docs-only diff touched no app, and a broken template
+failed with Helm's own error.

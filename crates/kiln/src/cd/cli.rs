@@ -495,6 +495,11 @@ fn print_plan(v: &Value, diff: bool) {
                 how.push("synced by hand");
             }
             let changes = |k: &str| a.get(k).filter(|x| !x.is_null()).map(|x| format!("+{} ~{} -{}", count(x, "added"), count(x, "changed"), count(x, "removed")));
+            // An app a lower diff changed and this one leaves alone: one line.
+            if ok && a.get("touched") == Some(&Value::Bool(false)) {
+                println!("  · {}  unchanged by this diff; stack {}", s(a, "app"), changes("stack").unwrap_or_default());
+                continue;
+            }
             let mut line = format!("  {} {}", if ok { "✓" } else { "✗" }, s(a, "app"));
             if let Some(own) = changes("own") {
                 line.push_str(&format!("  own {own}"));
@@ -537,7 +542,11 @@ fn print_plan(v: &Value, diff: bool) {
         }
     }
     let apps = v.get("apps").cloned().unwrap_or(Value::Null);
-    println!("\n{} apps touched, {} planned; {} following {} untouched.", count(&apps, "affected"), count(&apps, "planned"), count(&apps, "unaffected"), s(&trunk, "branch"));
+    let n = |k: &str| match count(&apps, k) {
+        1 => "1 app".to_owned(),
+        n => format!("{n} apps"),
+    };
+    println!("\n{} touched, {} planned; {} following {} untouched.", n("affected"), count(&apps, "planned"), n("unaffected"), s(&trunk, "branch"));
     for n in v.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
         println!("note: {n}");
     }

@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use kiln_cd::apps::AppDef;
-use kiln_cd::engine::{Plan, Planned, StepKind};
+use kiln_cd::engine::{Plan, Planned, Read, StepKind};
 use kiln_cd::git::Mirror;
 use kiln_cd::model::PruneMode;
-use kiln_cd::obj::{self, Blob, ResKey};
+use kiln_cd::obj::{self, Blob, GroupKind, ResKey};
 use kiln_cd::render::Dep;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -37,6 +37,8 @@ const PARALLEL: usize = 4;
 const MAX_LINES: usize = 2_000;
 /// What kept renders may take, compressed.
 const KEPT_BYTES: usize = 64 << 20;
+/// Objects one app's plan reads from its cluster itself, at most.
+const MAX_READS: usize = 200;
 
 fn bad(msg: impl Into<String>) -> Fail {
     (StatusCode::BAD_REQUEST, msg.into())
@@ -560,12 +562,39 @@ async fn plan_app(cd: Arc<Cd>, st: Arc<Stack>, id: String, def: AppDef, brief: b
         };
         kept.insert(r.key, got);
     }
-    let jobs: Vec<(u64, Vec<Value>)> = kept.iter().filter_map(|(k, v)| Some((*k, v.as_ref().ok()?.objects()))).collect();
-    let app = id.clone();
-    let plans: HashMap<u64, Plan> = cd
-        .query(move |e| jobs.into_iter().filter_map(|(k, objects)| Some((k, e.plan(&app, Some(objects))?))).collect())
-        .await
-        .unwrap_or_default();
+    let mut plans = engine_plans(&cd, &id, &kept, None, Arc::new(Read::default())).await;
+    // Kinds the engine hasn't listed in the cluster (an app's first Secret, say): read the objects
+    // from the cluster now, and plan those renders again with them.
+    let unread: BTreeSet<ResKey> = plans.values().flat_map(|p| p.unread.iter().cloned()).collect();
+    let mut unserved: BTreeSet<ResKey> = BTreeSet::new();
+    if let Some(c) = cluster.as_ref().filter(|_| !unread.is_empty()) {
+        let defined: BTreeSet<GroupKind> = kept.values().filter_map(|k| k.as_ref().ok()).flat_map(|k| crd_kinds(&k.objects())).collect();
+        let mut read = Read::default();
+        let mut gets = Vec::new();
+        for key in unread.iter().take(MAX_READS) {
+            let gk = key.group_kind();
+            if cd.serves(c, &gk, std::time::Duration::ZERO).await {
+                gets.push(key.clone());
+            } else if defined.contains(&gk) {
+                // Its CRD comes with the render: nothing of the kind is there yet.
+                read.insert(key.clone(), None);
+            } else {
+                unserved.insert(key.clone());
+            }
+        }
+        for batch in gets.chunks(8) {
+            let got = futures::future::join_all(batch.iter().map(|k| c.get(k))).await;
+            for (k, r) in batch.iter().zip(got) {
+                if let Ok(v) = r {
+                    read.insert(k.clone(), v);
+                }
+            }
+        }
+        if !read.is_empty() {
+            let again: BTreeSet<u64> = plans.iter().filter(|(_, p)| !p.unread.is_empty()).map(|(k, _)| *k).collect();
+            plans.extend(engine_plans(&cd, &id, &kept, Some(&again), Arc::new(read)).await);
+        }
+    }
     let mut shown: HashMap<u64, Shown> = HashMap::new();
     for (k, mut plan) in plans {
         let mut objects = std::mem::take(&mut plan.objects);
@@ -657,8 +686,14 @@ async fn plan_app(cd: Arc<Cd>, st: Arc<Stack>, id: String, def: AppDef, brief: b
                                 .map(|k| format!("{} leaves git and is pruned only once a person confirms (Prune=confirm)", named(k)))
                                 .collect();
                             notes.extend(cur.plan.taken.iter().map(|(k, other)| format!("{} is deployed by {other}, which keeps it", named(k))));
-                            if !cur.plan.unread.is_empty() {
-                                notes.push(format!("{} objects are of kinds not read from the cluster yet: what a sync does to them isn't known", cur.plan.unread.len()));
+                            let (gone, unknown): (Vec<&ResKey>, Vec<&ResKey>) = cur.plan.unread.iter().partition(|k| unserved.contains(*k));
+                            notes.extend(gone.iter().map(|k| {
+                                format!("{} is of a kind cluster {} doesn't serve, and nothing in the render defines it: a sync of it fails until something installs it", named(k), def.destination.cluster)
+                            }));
+                            match unknown.len() {
+                                0 => {}
+                                1 => notes.push(format!("what a sync does to {} isn't known: it couldn't be read from the cluster", unknown.first().map(|k| named(k)).unwrap_or_default())),
+                                n => notes.push(format!("what a sync does to {n} objects isn't known: they couldn't be read from the cluster")),
                             }
                             if cluster.is_none() {
                                 notes.push(format!("cluster {} isn't connected: the steps are against what kiln last saw", def.destination.cluster));
@@ -677,6 +712,23 @@ async fn plan_app(cd: Arc<Cd>, st: Arc<Stack>, id: String, def: AppDef, brief: b
         out.push(item);
     }
     Ok(out)
+}
+
+/// The engine's plans of an app's renders (those in `only`, or all).
+async fn engine_plans(cd: &Cd, id: &str, kept: &HashMap<u64, Result<Arc<Kept>, String>>, only: Option<&BTreeSet<u64>>, read: Arc<Read>) -> HashMap<u64, Plan> {
+    let jobs: Vec<(u64, Vec<Value>)> =
+        kept.iter().filter(|(k, _)| only.is_none_or(|o| o.contains(k))).filter_map(|(k, v)| Some((*k, v.as_ref().ok()?.objects()))).collect();
+    let app = id.to_owned();
+    cd.query(move |e| jobs.into_iter().filter_map(|(k, objects)| Some((k, e.plan(&app, Some(objects), &read)?))).collect()).await.unwrap_or_default()
+}
+
+/// The kinds a render's CRDs define.
+fn crd_kinds(objects: &[Value]) -> Vec<GroupKind> {
+    objects
+        .iter()
+        .filter(|o| obj::kind(o) == "CustomResourceDefinition" && obj::group(o) == "apiextensions.k8s.io")
+        .filter_map(|o| Some(GroupKind::new(obj::str_at(o, &["spec", "group"])?, obj::str_at(o, &["spec", "names", "kind"])?)))
+        .collect()
 }
 
 /// Plans what `ask` names.
@@ -733,6 +785,10 @@ pub async fn plan(cd: &Arc<Cd>, ask: Ask) -> Result<Value, Fail> {
         })
         .collect();
     let ok = diffs.iter().all(|d| d.get("ok") == Some(&Value::Bool(true)));
+    cd.hub.emit(&json!({
+        "type": "cd_plan", "repo": st.urls.first(), "trunk": st.trunk, "base": st.base, "head": st.commits.last(),
+        "commits": st.commits.len(), "apps": affected.len(), "ok": ok,
+    }));
     Ok(json!({
         "repo": st.urls.first(),
         "trunk": {"branch": st.trunk, "commit": st.trunk_commit},
