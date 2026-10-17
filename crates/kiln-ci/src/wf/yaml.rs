@@ -82,6 +82,20 @@ impl Node {
         matches!(self.kind, Kind::Scalar(Scalar::Null, _))
     }
 
+    /// As JSON (for schema checks).
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::Value as J;
+        match &self.kind {
+            Kind::Scalar(Scalar::Null, _) => J::Null,
+            Kind::Scalar(Scalar::Bool(b), _) => J::Bool(*b),
+            Kind::Scalar(Scalar::Int(i), _) => J::from(*i),
+            Kind::Scalar(Scalar::Float(f), _) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+            Kind::Scalar(Scalar::Str(s), _) => J::String(s.clone()),
+            Kind::Seq(items) => J::Array(items.iter().map(Node::to_json).collect()),
+            Kind::Map(items) => J::Object(items.iter().map(|(k, v)| (k.text().unwrap_or_default(), v.to_json())).collect()),
+        }
+    }
+
     /// A mapping's value for `key`.
     pub fn get(&self, key: &str) -> Option<&Node> {
         self.as_map()?.iter().find(|(k, _)| k.text().as_deref() == Some(key)).map(|(_, v)| v)
@@ -256,6 +270,8 @@ impl MarkedEventReceiver for Builder<'_> {
             }
             Event::MappingEnd => {
                 if let Some(Frame::Map { start, anchor, items, .. }) = self.stack.pop() {
+                    // A block mapping is noticed at its first `:`; it starts at its first key.
+                    let start = items.first().map_or(start, |(k, _)| if k.range.start < start { k.range.start } else { start });
                     self.push(Node { kind: Kind::Map(items), range: Range { start, end: at } }, anchor);
                 }
             }

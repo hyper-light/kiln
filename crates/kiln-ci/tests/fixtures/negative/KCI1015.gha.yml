@@ -1,0 +1,6 @@
+on: push
+permissions: read-some
+jobs:
+  a:
+    runs-on: x
+    steps: [{run: echo}]

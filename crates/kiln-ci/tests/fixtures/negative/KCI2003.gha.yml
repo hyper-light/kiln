@@ -1,0 +1,6 @@
+on: push
+jobs:
+  a:
+    runs-on: x
+    if: github.ref == == 'x'
+    steps: [{run: echo}]

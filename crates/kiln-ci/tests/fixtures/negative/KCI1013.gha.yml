@@ -1,0 +1,5 @@
+on: push
+jobs:
+  9lives:
+    runs-on: x
+    steps: [{run: echo}]

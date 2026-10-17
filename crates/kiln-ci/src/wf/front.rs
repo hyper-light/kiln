@@ -565,6 +565,7 @@ impl Fe<'_> {
                 continue;
             };
             let mut s = Schedule { range: x.range, ..Schedule::default() };
+            let mut cron_range = x.range;
             for (k, v) in map {
                 let key = k.text().unwrap_or_default();
                 let kiln_key = matches!(key.as_str(), "timezone" | "branch" | "inputs" | "jitter" | "skip-if-unchanged" | "catch-up");
@@ -573,7 +574,10 @@ impl Fe<'_> {
                     continue;
                 }
                 match key.as_str() {
-                    "cron" => s.cron = v.text().unwrap_or_default(),
+                    "cron" => {
+                        s.cron = v.text().unwrap_or_default();
+                        cron_range = v.range;
+                    }
                     "timezone" => s.timezone = v.text(),
                     "branch" => s.branch = v.text(),
                     "inputs" => s.inputs = v.as_map().map(|m| m.iter().map(|(a, b)| (a.text().unwrap_or_default(), self.yval(b))).collect()).unwrap_or_default(),
@@ -586,7 +590,7 @@ impl Fe<'_> {
             if s.cron.is_empty() {
                 self.err("KCI1014", "a schedule needs `cron`", x.range, &at);
             } else {
-                self.check_cron(&s.cron.clone(), x.range, &at);
+                self.check_cron(&s.cron.clone(), cron_range, &at);
             }
             out.push(s);
         }

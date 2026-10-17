@@ -1,0 +1,5 @@
+on: [push, pul_request]
+jobs:
+  a:
+    runs-on: x
+    steps: [{run: echo}]

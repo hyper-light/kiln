@@ -1,0 +1,8 @@
+on: push
+jobs:
+  a:
+    runs-on: x
+    strategy:
+      matrix:
+        os: []
+    steps: [{run: echo}]

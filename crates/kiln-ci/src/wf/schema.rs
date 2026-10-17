@@ -38,7 +38,7 @@ fn ty(t: Ty, kind: SchemaKind) -> Value {
         Ty::BoolOrExpr => json!({"anyOf": [{"type": "boolean"}, expr_string()]}),
         Ty::NumOrExpr => json!({"anyOf": [{"type": "number"}, expr_string()]}),
         Ty::StrList => json!({"anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}),
-        Ty::StrMap => json!({"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}}),
+        Ty::StrMap => json!({"type": "object", "additionalProperties": {"type": ["string", "number", "boolean", "null"]}}),
         Ty::Map(keys) => object(keys, kind),
         Ty::StrOrMap(keys) => json!({"anyOf": [{"type": "string"}, object(keys, kind)]}),
         Ty::Any => json!({}),
@@ -143,6 +143,91 @@ fn on(kind: SchemaKind) -> Value {
         {"type": "array", "items": {"type": "string", "enum": names}},
         {"type": "object", "properties": events, "additionalProperties": false}
     ]})
+}
+
+/// Checks `v` against `schema`: the subset of JSON Schema these schemas use (type, properties,
+/// additionalProperties, patternProperties, items, anyOf, enum, pattern, required). Returns the
+/// problems as `path: why`; empty when it conforms.
+pub fn check(schema: &Value, v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    check_at(schema, v, "", &mut out);
+    out
+}
+
+fn type_ok(t: &str, v: &Value) -> bool {
+    match t {
+        "string" => v.is_string(),
+        "boolean" => v.is_boolean(),
+        "number" => v.is_number(),
+        "object" => v.is_object(),
+        "array" => v.is_array(),
+        "null" => v.is_null(),
+        _ => true,
+    }
+}
+
+fn check_at(schema: &Value, v: &Value, path: &str, out: &mut Vec<String>) {
+    let Some(s) = schema.as_object() else { return };
+    if let Some(any) = s.get("anyOf").and_then(Value::as_array) {
+        if !any.iter().any(|alt| check(alt, v).is_empty()) {
+            out.push(format!("{path}: matches none of its allowed forms"));
+        }
+        return;
+    }
+    match s.get("type") {
+        Some(Value::String(t)) if !type_ok(t, v) => {
+            out.push(format!("{path}: expected {t}"));
+            return;
+        }
+        Some(Value::Array(ts)) if !ts.iter().filter_map(Value::as_str).any(|t| type_ok(t, v)) => {
+            out.push(format!("{path}: wrong type"));
+            return;
+        }
+        _ => {}
+    }
+    if let Some(e) = s.get("enum").and_then(Value::as_array)
+        && !e.contains(v)
+    {
+        out.push(format!("{path}: not one of the allowed values"));
+    }
+    if let (Some(p), Some(text)) = (s.get("pattern").and_then(Value::as_str), v.as_str())
+        && regex::Regex::new(p).is_ok_and(|re| !re.is_match(text))
+    {
+        out.push(format!("{path}: doesn't match {p}"));
+    }
+    if let (Some(items), Some(arr)) = (s.get("items"), v.as_array()) {
+        for (i, x) in arr.iter().enumerate() {
+            check_at(items, x, &format!("{path}[{i}]"), out);
+        }
+    }
+    if let Some(obj) = v.as_object() {
+        let props = s.get("properties").and_then(Value::as_object);
+        let pattern_props = s.get("patternProperties").and_then(Value::as_object);
+        for (k, x) in obj {
+            let at = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+            if let Some(ps) = props.and_then(|p| p.get(k)) {
+                check_at(ps, x, &at, out);
+                continue;
+            }
+            let pat = pattern_props.and_then(|pp| pp.iter().find(|(re, _)| regex::Regex::new(re).is_ok_and(|r| r.is_match(k))).map(|(_, ps)| ps));
+            if let Some(ps) = pat {
+                check_at(ps, x, &at, out);
+                continue;
+            }
+            match s.get("additionalProperties") {
+                Some(Value::Bool(false)) => out.push(format!("{at}: not allowed here")),
+                Some(extra @ Value::Object(_)) => check_at(extra, x, &at, out),
+                _ => {}
+            }
+        }
+        if let Some(req) = s.get("required").and_then(Value::as_array) {
+            for r in req.iter().filter_map(Value::as_str) {
+                if !obj.contains_key(r) {
+                    out.push(format!("{path}: needs `{r}`"));
+                }
+            }
+        }
+    }
 }
 
 fn wrap(mut v: Value, title: &str) -> Value {

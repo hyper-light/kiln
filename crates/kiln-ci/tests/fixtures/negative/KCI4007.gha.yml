@@ -1,0 +1,8 @@
+on: push
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - id: db
+        run: start-db
+      - wait: db

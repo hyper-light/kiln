@@ -1,0 +1,7 @@
+on: push
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - {id: s, run: echo}
+      - {id: s, run: echo}

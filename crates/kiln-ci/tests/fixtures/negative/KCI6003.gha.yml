@@ -1,0 +1,8 @@
+on: pull_request_target
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}

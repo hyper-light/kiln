@@ -1,0 +1,6 @@
+on: issues
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - run: echo "${{ github.event.issue.title }}"
