@@ -19,7 +19,7 @@ import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, TerminalSessionInfo } from "@/api/types";
 import { TerminalKeyboard, type KeyboardFold, type KeyboardMode } from "@/components/terminal/keyboard";
-import { presetFor } from "@/components/terminal/presets";
+import { PRESETS, presetFor } from "@/components/terminal/presets";
 import { Button } from "@/components/ui/button";
 import { Optic } from "@/components/ui/misc";
 import { Chips } from "@/components/ui/status";
@@ -38,6 +38,11 @@ interface Tab {
   title: string;
   /** What the session runs (command + window title), used to pick keyboard shortcuts. */
   hints: string;
+  /**
+   * The AI harness last recognized in this tab ("shell" when none yet). It stays while the
+   * program's title changes: a shortcut row that flips under the finger loses presses.
+   */
+  auto: string;
   state: SessionState;
 }
 
@@ -50,6 +55,12 @@ const isTouchDevice = () =>
 function targetLabel(target: string) {
   return target === "local" ? "server" : target.replace(/^agent:/, "");
 }
+
+/** The harness a title shows, or the one seen before when it shows none (titles change as it works). */
+const stickyHarness = (prev: string, hints: string) => {
+  const now = presetFor(hints).id;
+  return now === "shell" ? prev : now;
+};
 
 const tabTitle = (target: string, title: string) => (title ? `${targetLabel(target)} · ${title}` : targetLabel(target));
 
@@ -120,6 +131,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
               target: s.target,
               title: tabTitle(s.target, s.title),
               hints: `${s.command ?? ""} ${s.title}`,
+              auto: presetFor(`${s.command ?? ""} ${s.title}`).id,
               state: { kind: "connecting" },
             }));
           if (added.length === 0) return cur;
@@ -136,9 +148,28 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     if (ev.type === "terminals" && visible) syncSessions();
   });
 
+  /** Which AI harness each terminal session runs, as the machines report it (terminal id → preset id). */
+  const [aiTools, setAiTools] = React.useState<Record<string, string>>({});
+  const loadAiTools = React.useCallback(() => {
+    api
+      .aiSessions()
+      .then((list) => {
+        const next: Record<string, string> = {};
+        for (const s of list) if (s.terminal && PRESETS.some((p) => p.id === s.tool)) next[s.terminal] = s.tool;
+        setAiTools((cur) => (JSON.stringify(cur) === JSON.stringify(next) ? cur : next));
+      })
+      .catch(() => undefined);
+  }, []);
+  React.useEffect(() => {
+    if (visible) loadAiTools();
+  }, [visible, loadAiTools]);
+  useServerEvents((ev) => {
+    if (ev.type === "ai_sessions" && visible) loadAiTools();
+  });
+
   const open = React.useCallback((target: string) => {
     const id = `new-${++tabSeq}`;
-    setTabs((t) => [...t, { id, sessionId: null, target, title: targetLabel(target), hints: "", state: { kind: "connecting" } }]);
+    setTabs((t) => [...t, { id, sessionId: null, target, title: targetLabel(target), hints: "", auto: "shell", state: { kind: "connecting" } }]);
     setActiveId(id);
   }, []);
 
@@ -148,7 +179,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
       const tab = cur.find((t) => t.sessionId === sessionId);
       setActiveId(tab ? tab.id : sessionId);
       if (tab) return cur;
-      return [...cur, { id: sessionId, sessionId, target, title: targetLabel(target), hints: "", state: { kind: "connecting" } }];
+      return [...cur, { id: sessionId, sessionId, target, title: targetLabel(target), hints: "", auto: "shell", state: { kind: "connecting" } }];
     });
   }, []);
 
@@ -159,7 +190,15 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
       const next = cur
         .filter((x) => x !== dup)
         .map((x) =>
-          x.id === tabId ? { ...x, sessionId: info.id, hints: `${info.command ?? ""} ${info.title}`, title: info.title ? tabTitle(info.target, info.title) : x.title } : x,
+          x.id === tabId
+            ? {
+                ...x,
+                sessionId: info.id,
+                hints: `${info.command ?? ""} ${info.title}`,
+                auto: stickyHarness(x.auto, `${info.command ?? ""} ${info.title}`),
+                title: info.title ? tabTitle(info.target, info.title) : x.title,
+              }
+            : x,
         );
       if (dup) {
         handles.current.delete(dup.id);
@@ -191,7 +230,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     setTabs((t) => {
       const tab = t.find((x) => x.id === tabId);
       if (!tab || tab.hints === title) return t;
-      return t.map((x) => (x.id === tabId ? { ...x, title: tabTitle(x.target, title), hints: title } : x));
+      return t.map((x) => (x.id === tabId ? { ...x, title: tabTitle(x.target, title), hints: title, auto: stickyHarness(x.auto, title) } : x));
     });
   }, []);
 
@@ -239,7 +278,10 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
 
   const active = tabs.find((t) => t.id === activeId) ?? null;
   const activeSession = active?.sessionId ?? null;
-  const autoPresetId = React.useMemo(() => presetFor(active?.hints ?? "").id, [active?.hints]);
+  // The program in the session picks the shortcuts: an AI session the machine reports running in
+  // this terminal first, else the harness its titles last showed.
+  const linked = activeSession ? aiTools[activeSession] : undefined;
+  const autoPresetId = linked ?? active?.auto ?? "shell";
 
   // The keyboard's callbacks act on whichever tab is selected when a key is pressed; they stay the
   // same functions so the memoized keyboard never re-renders for them.

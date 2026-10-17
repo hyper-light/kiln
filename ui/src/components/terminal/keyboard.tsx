@@ -52,25 +52,30 @@ const KEY_MAX = 64;
 /** Grip travel before a press counts as a resize drag rather than a tap. */
 const DRAG_SLOP_PX = 4;
 
-/** Press-and-hold repeat for keys like Backspace and the arrows. */
+/** Press-and-hold repeat for keys like Backspace and the arrows, tied to the finger holding it. */
 function useRepeat() {
-  const timers = React.useRef<{ t?: number; i?: number }>({});
-  const stop = React.useCallback(() => {
+  const timers = React.useRef<{ t?: number; i?: number; pointer?: number }>({});
+  /** End the repeat; with a pointer, only when that is the finger holding the key. */
+  const stop = React.useCallback((pointer?: number) => {
+    if (pointer !== undefined && timers.current.pointer !== undefined && pointer !== timers.current.pointer) return;
     window.clearTimeout(timers.current.t);
     window.clearInterval(timers.current.i);
     timers.current = {};
   }, []);
   const start = React.useCallback(
-    (fire: () => void) => {
+    (fire: () => void, pointer?: number) => {
       stop();
       fire();
-      timers.current.t = window.setTimeout(() => {
-        timers.current.i = window.setInterval(fire, 55);
-      }, 380);
+      timers.current = {
+        pointer,
+        t: window.setTimeout(() => {
+          timers.current.i = window.setInterval(fire, 55);
+        }, 380),
+      };
     },
     [stop],
   );
-  React.useEffect(() => stop, [stop]);
+  React.useEffect(() => () => stop(), [stop]);
   return { start, stop };
 }
 
@@ -124,14 +129,53 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
     onPointerDown: (e: React.PointerEvent) => {
       e.preventDefault();
       buzz();
-      if (repeat) start(fn);
+      if (repeat) start(fn, e.pointerId);
       else fn();
     },
-    onPointerUp: stop,
-    onPointerLeave: stop,
-    onPointerCancel: stop,
+    onPointerUp: (e: React.PointerEvent) => stop(e.pointerId),
+    onPointerLeave: (e: React.PointerEvent) => stop(e.pointerId),
+    onPointerCancel: (e: React.PointerEvent) => stop(e.pointerId),
     onContextMenu: (e: React.MouseEvent) => e.preventDefault(),
   });
+
+  /**
+   * A press between keys or at the keyboard's edge goes to the nearest key, as on a phone keyboard:
+   * fingers typing fast land in the gaps, and those presses used to be lost. The finger's own
+   * pointerup reaches the keyboard (not the key), which ends a forwarded key's repeat.
+   */
+  const pressNearest = (e: React.PointerEvent<HTMLDivElement>) => {
+    const target = e.target as Element;
+    if (target.closest("button, .vk-bar, .vk-menu")) return;
+    e.preventDefault(); // focus (and the device keyboard) stay where they are
+    const root = rootRef.current;
+    if (!root) return;
+    let best: HTMLButtonElement | null = null;
+    let bestD = Infinity;
+    for (const key of root.querySelectorAll<HTMLButtonElement>(".vk-row > button")) {
+      const r = key.getBoundingClientRect();
+      if (r.width === 0) continue;
+      const dx = Math.max(r.left - e.clientX, 0, e.clientX - r.right);
+      const dy = Math.max(r.top - e.clientY, 0, e.clientY - r.bottom);
+      const d = dx * dx + dy * dy;
+      if (d < bestD) {
+        bestD = d;
+        best = key;
+      }
+    }
+    best?.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        pointerId: e.pointerId,
+        pointerType: e.pointerType,
+        isPrimary: e.isPrimary,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        button: 0,
+        buttons: 1,
+      }),
+    );
+  };
 
   /**
    * The grip: drag up for bigger keys, down for smaller ones; a tap folds the keyboard away or
@@ -201,7 +245,19 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
   const style = keyHeight ? ({ "--vk-key-h": `${keyHeight}px` } as React.CSSProperties) : undefined;
 
   return (
-    <div ref={rootRef} className="vk" role="group" aria-label="Terminal keyboard" data-mode={mode} data-fold={fold} style={style}>
+    <div
+      ref={rootRef}
+      className="vk"
+      role="group"
+      aria-label="Terminal keyboard"
+      data-mode={mode}
+      data-fold={fold}
+      style={style}
+      onPointerDown={pressNearest}
+      onPointerUp={(e) => stop(e.pointerId)}
+      onPointerCancel={(e) => stop(e.pointerId)}
+      onContextMenu={(e) => e.preventDefault()}
+    >
       {/* Always on screen: resize/fold grip, device-keyboard switch, fold button. */}
       <div className="vk-bar">
         <button
