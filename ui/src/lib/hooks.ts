@@ -34,8 +34,8 @@ export function useNow(): number {
 
 /* ------------------------------------------------------------------ */
 /* useResource: fetch with abort, refetch, optimistic local mutation.  */
-/* Legacy: the agent console's views still use it until they move to   */
-/* useSuspenseResource (lib/resource.ts) like every other page has.    */
+/* Legacy, used by no page now (they read useSuspenseResource,         */
+/* lib/resource.ts); kept until it is deleted on main.                 */
 /* ------------------------------------------------------------------ */
 
 export interface Resource<T> {
@@ -124,16 +124,6 @@ export function useMediaQuery(query: string): boolean {
     () => window.matchMedia(query).matches,
     () => false,
   );
-}
-
-/**
- * Legacy: pages render a `<title>` element (React hoists it into the head). Kept for the agent
- * console's views until they do the same.
- */
-export function useDocumentTitle(title: string) {
-  useEffect(() => {
-    document.title = title ? `${title} · kiln` : "kiln";
-  }, [title]);
 }
 
 /**
