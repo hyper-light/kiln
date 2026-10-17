@@ -117,6 +117,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, now }: { a: 
         <span>
           {machineName(a.target)} · {relativeTime(Math.floor(a.last_activity / 1000), now)}
         </span>
+        {(a.left_behind ?? 0) > 0 && <span className="ms-left">{a.left_behind} left running</span>}
         {(a.files_changed ?? 0) > 0 && (
           <span className="ms-changes">
             {a.files_changed} file{a.files_changed === 1 ? "" : "s"} <b>+{a.lines_added ?? 0}</b> <i>−{a.lines_removed ?? 0}</i>

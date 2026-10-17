@@ -129,6 +129,33 @@ export interface Task {
   duration_ms?: number;
   started: number;
   ended?: number;
+  /** What it is: a shell or monitor the agent left running, a subagent, a workflow, a backgrounded MCP call. */
+  class?: "shell" | "monitor" | "agent" | "workflow" | "mcp";
+  /** What a shell or monitor runs, and where. */
+  command?: string;
+  cwd?: string;
+  /** Where its output is written on the agent's machine (display only; read it with taskOutput). */
+  output?: string;
+  process?: string;
+  exit_code?: number;
+  /** Monitors: how many events it has seen, and the latest. */
+  events?: number;
+  last_event?: string;
+  /** Monitors: whom an event wakes ("agent", or a subagent task's id). */
+  wakes?: string;
+  /** Whether a stop can work. */
+  stoppable?: boolean;
+}
+
+/** A slice of a task's output (`since` → `offset`); `gone` once the harness deleted it. */
+export interface TaskOutput {
+  data?: string;
+  offset?: number;
+  live?: boolean;
+  truncated?: boolean;
+  path?: string;
+  gone?: boolean;
+  error?: string;
 }
 
 export interface Usage {
@@ -248,6 +275,8 @@ export interface State {
   /** The account's plan as the harness reports it ("Max", "Pro", "API key", …) and a stable account id. */
   plan?: string;
   account?: string;
+  /** Shells, monitors and other tasks still running while the agent is idle or ended. */
+  left_behind?: number;
   /** Which of those lists the harness has reported yet (servers that predate it omit this). */
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
 }
@@ -360,6 +389,8 @@ export interface AgentInfo {
   approvals: ApprovalBrief[];
   queued: number;
   tasks_running: number;
+  /** Shells, monitors and other tasks still running while the agent is idle or ended. */
+  left_behind?: number;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -420,6 +451,7 @@ export type Command =
   | { type: "set_mode"; mode: string }
   | { type: "set_model"; model: string }
   | { type: "stop_task"; task: string }
+  | { type: "stop_tasks" }
   | { type: "restart" }
   | { type: "suggest"; client: string; query: string }
   | { type: "snapshot" };
@@ -464,6 +496,9 @@ export const harnessApi = {
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  /** A task's output: its tail, or what came after byte `since`. */
+  taskOutput: (id: string, task: string, since?: number) =>
+    call<TaskOutput>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/tasks/${encodeURIComponent(task)}/output${since !== undefined ? `?since=${since}` : ""}`),
   /** End the terminal a found session runs in and continue its conversation as an agent here. */
   takeover: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
