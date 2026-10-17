@@ -120,7 +120,7 @@ export default function AgentPage() {
           <div className="hx-dock-approvals">
             {approvals.length > 1 && <div className="hx-eyebrow px-1">{approvals.length} waiting on you</div>}
             {approvals.slice(0, 1).map((a) => (
-              <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={send} />
+              <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={send} agentName={info?.name} kind={info?.kind_name} />
             ))}
           </div>
         )}

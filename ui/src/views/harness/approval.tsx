@@ -27,7 +27,7 @@ const VERB: Partial<Record<Approval["tool"], string>> = {
 };
 
 /** A question, answered where it was asked: the stepper inline in the card (never a popup). */
-function Questions({ a, onDecide }: { a: Approval; onDecide: Decide }) {
+function Questions({ a, onDecide, agentName, kind }: { a: Approval; onDecide: Decide; agentName?: string; kind?: string }) {
   const [busy, setBusy] = React.useState(false);
   const questions: ChoiceQuestion[] = (a.questions ?? []).map((q) => ({
     id: q.id,
@@ -42,6 +42,8 @@ function Questions({ a, onDecide }: { a: Approval; onDecide: Decide }) {
     <Choices
       layout="inline"
       questions={questions}
+      agentName={agentName}
+      kind={kind}
       busy={busy}
       canDecline
       onDecline={() => onDecide({ type: "approve", id: a.id, decision: "deny", message: "The user chose not to answer." })}
@@ -57,7 +59,7 @@ function Questions({ a, onDecide }: { a: Approval; onDecide: Decide }) {
 /** Reasons that only restate that it's asking. */
 const GENERIC = /^(this |the )?(command|tool|action|operation|edit)s? (requires?|needs?) (your )?(approval|permission)\.?$/i;
 
-export function ApprovalCard({ a, cwd, onDecide, className }: { a: Approval; cwd: string; onDecide: Decide; className?: string }) {
+export function ApprovalCard({ a, cwd, onDecide, className, agentName, kind }: { a: Approval; cwd: string; onDecide: Decide; className?: string; agentName?: string; kind?: string }) {
   const [denying, setDenying] = React.useState(false);
   const [note, setNote] = React.useState("");
   const noteRef = React.useRef<HTMLTextAreaElement>(null);
@@ -67,6 +69,12 @@ export function ApprovalCard({ a, cwd, onDecide, className }: { a: Approval; cwd
   const isQuestion = (a.questions?.length ?? 0) > 0;
   const isPlan = Boolean(a.plan);
   const stats = diffStats(a.diffs);
+  if (isQuestion)
+    return (
+      <div className={cn("hx-approval-q", className)}>
+        <Questions a={a} onDecide={onDecide} agentName={agentName} kind={kind} />
+      </div>
+    );
 
   return (
     <div className={cn("hx-approval", a.default_to_no && "hx-approval-danger", className)} role="group" aria-label={`Approval: ${a.title}`}>
