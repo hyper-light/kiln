@@ -221,6 +221,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
+        (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
@@ -280,6 +281,16 @@ fn ai_sessions(hub: &Hub) -> Response {
 }
 
 /// The recent messages of one session, read from its machine.
+/// A session running elsewhere, as kiln's normalized view: events, state and changeset.
+async fn ai_view(hub: &Hub, machine: &str, pid: &str) -> R {
+    let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
+    match hub.ai_view(machine, pid).await {
+        Ok(Some(json)) => Ok(srv::response(StatusCode::OK, "application/json", srv::full(json))),
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "no view for that session (not Claude Code, or no transcript)")),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    }
+}
+
 async fn ai_transcript(hub: &Hub, machine: &str, pid: &str) -> R {
     let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
     match hub.ai_transcript(machine, pid).await {
