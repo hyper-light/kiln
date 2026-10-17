@@ -1,6 +1,8 @@
-//! The web UI, embedded into the binary at build time (`ui/dist`). Hashed assets are served as
-//! immutable; every other path falls back to `index.html` for client-side routing. Compressible
-//! files are gzipped once, on first request, and cached in memory.
+//! The web UI's static files, embedded into the binary at build time (`ui/dist/client`: TanStack
+//! Start's client build). Hashed assets are served as immutable. Pages, server functions and server
+//! components come from the UI server (`crate::uiserver`); without it, every page gets the app's
+//! shell (`_shell.html`) and the app runs in the browser. Compressible files are gzipped once, on
+//! first request, and cached in memory.
 //!
 //! Earlier builds' assets are kept on disk (`keep_assets`), so a page loaded before a deploy can
 //! still load the parts it hasn't yet. An asset no build has is a 404, never `index.html`: a
@@ -19,7 +21,7 @@ use parking_lot::Mutex;
 use crate::http::server::{self as srv, Request, Response};
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "../../ui/dist"]
+#[folder = "../../ui/dist/client"]
 #[allow_missing = true]
 struct Assets;
 
@@ -99,20 +101,33 @@ fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {
     Some(out)
 }
 
-pub fn serve(req: &Request) -> Response {
+/// A static file of the UI, if `req` asks for one: this build's, or an earlier build's asset (a page
+/// loaded before a deploy). An asset no build has is a 404, never a page.
+pub fn static_file(req: &Request) -> Option<Response> {
     let path = req.uri().path().trim_start_matches('/');
-    let (data, name): (Bytes, &str) = match Assets::get(path).filter(|_| !path.is_empty()) {
-        Some(f) => (Bytes::from(f.data.into_owned()), path),
-        // An asset of an earlier build (a page loaded before a deploy), else none: never the page.
+    if path.is_empty() || path.starts_with('_') {
+        return None;
+    }
+    let data = match Assets::get(path) {
+        Some(f) => Bytes::from(f.data.into_owned()),
         None if path.starts_with("assets/") => match kept(path) {
-            Some(b) => (Bytes::from(b), path),
-            None => return srv::response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", srv::full("no such asset in any build kiln keeps\n")),
+            Some(b) => Bytes::from(b),
+            None => return Some(srv::response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", srv::full("no such asset in any build kiln keeps\n"))),
         },
-        None => match Assets::get("index.html") {
-            Some(f) => (Bytes::from(f.data.into_owned()), "index.html"),
-            None => return srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(PLACEHOLDER)),
-        },
+        None => return None,
     };
+    Some(respond(req, path, data))
+}
+
+/// The app's shell (any page, rendered in the browser): for when the UI server isn't there.
+pub fn shell(req: &Request) -> Response {
+    match Assets::get("_shell.html") {
+        Some(f) => respond(req, "_shell.html", Bytes::from(f.data.into_owned())),
+        None => srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(PLACEHOLDER)),
+    }
+}
+
+fn respond(req: &Request, name: &str, data: Bytes) -> Response {
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let cache = if name.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     let accepts_gzip = srv::header_str(req, &header::ACCEPT_ENCODING).is_some_and(|v| v.contains("gzip"));

@@ -12,7 +12,7 @@
 #   at load time, so no Apple SDK is needed. If a dependency starts importing a new symbol,
 #   regenerate the stubs with ci/release/regen-macos-stubs.sh. The minimum OS is macOS 11.
 #
-# Expects ui/dist to exist (`npm run --prefix ui build`). Writes dist/kiln-<target>[.exe] and
+# Expects ui/dist/client to exist (`npm run --prefix ui build`). Writes dist/kiln-<target>[.exe] and
 # dist/SHA256SUMS. KILN_DIST, KILN_MACOS_STUBS and KILN_MACOS_LINK_ARGS override the output
 # directory, the stubs and extra macOS link arguments (regen-macos-stubs.sh uses them).
 set -euo pipefail
@@ -23,7 +23,7 @@ all=(x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aa
 targets=("$@")
 [ ${#targets[@]} -gt 0 ] || targets=("${all[@]}")
 
-[ -f ui/dist/index.html ] || { echo "ui/dist is missing: run npm run --prefix ui build first" >&2; exit 1; }
+[ -f ui/dist/client/_shell.html ] || { echo "ui/dist is missing: run npm run --prefix ui build first" >&2; exit 1; }
 
 # zig and cargo-zigbuild, pinned, in a private virtualenv (both are published on PyPI).
 zig_version=0.17.0

@@ -218,7 +218,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     let is_api = s.first() == Some(&"api");
     if !is_api {
-        return Ok(crate::ui::serve(&req));
+        return Ok(crate::uiserver::serve(req).await);
     }
     if !authed(&hub, req.headers()) {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));

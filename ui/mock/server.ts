@@ -5,7 +5,8 @@
  *   npm run mock            # http://127.0.0.1:7070, token printed on start
  *   MOCK_NO_AUTH=1 npm run mock
  *
- * If ../dist exists it is served at / with SPA fallback (like rust-embed in the server).
+ * If ../dist/client exists (the built UI) it is served at /, with the app's shell for every page,
+ * as kiln serves it when its UI server isn't running.
  */
 import http from "node:http";
 import { randomBytes } from "node:crypto";
@@ -45,7 +46,7 @@ const VERSION = "0.1.0";
 const STARTED = Date.now();
 const HOSTNAME = "kiln-01";
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DIST = join(__dirname, "..", "dist");
+const DIST = join(__dirname, "..", "dist", "client");
 
 const now = () => Math.floor(Date.now() / 1000);
 const rid = (p: string) => `${p}${randomBytes(6).toString("hex")}`;
@@ -1174,7 +1175,7 @@ function serveStatic(pathname: string, res: http.ServerResponse) {
   }
   const safe = normalize(pathname).replace(/^(\.\.[/\\])+/, "");
   let file = join(DIST, safe);
-  if (!file.startsWith(DIST) || !existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "index.html");
+  if (!file.startsWith(DIST) || !existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "_shell.html");
   const ext = extname(file);
   res.writeHead(200, {
     "content-type": MIME[ext] ?? "application/octet-stream",
