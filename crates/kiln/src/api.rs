@@ -541,7 +541,13 @@ fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 
-/// Contents a machine's steps name: kept once they hash to their name.
+/// The largest contents a machine sends (a copy leaves out files over 256 MiB unless told otherwise).
+const SYNC_BLOB_MAX: u64 = 1 << 30;
+/// Room the server keeps free on its data volume: contents are refused below it.
+const SYNC_DISK_FLOOR: u64 = 2 << 30;
+
+/// Contents a machine's steps name: kept once they hash to their name. Refused past
+/// [`SYNC_BLOB_MAX`], or while the server's disk has less than [`SYNC_DISK_FLOOR`] free.
 async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     if !sync_token_ok(hub, &req) {
         return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
@@ -553,8 +559,15 @@ async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
     if blobs.has(hash) {
         return Ok(srv::status(StatusCode::OK));
     }
+    let length = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if length.is_some_and(|n| n > SYNC_BLOB_MAX) {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("contents are synced up to {} MiB", SYNC_BLOB_MAX >> 20)));
+    }
+    if blobs.free_bytes().is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+        return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full: sync takes no more contents until there is room"));
+    }
     let tmp = blobs.incoming();
-    let (sink, done) = crate::rt::file_sink(tmp.clone(), 64 << 30)?;
+    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX)?;
     let mut body = req.into_body();
     while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
         if sink.send(chunk).await.is_err() {

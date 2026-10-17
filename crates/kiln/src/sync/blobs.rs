@@ -128,6 +128,11 @@ impl Blobs {
         Ok(true)
     }
 
+    /// Bytes free on the volume the store is on, where the system says.
+    pub fn free_bytes(&self) -> Option<u64> {
+        free_bytes(&self.dir)
+    }
+
     /// Every blob held, and when it was last written.
     pub fn all(&self) -> io::Result<Vec<(String, std::time::SystemTime)>> {
         let mut out = Vec::new();
@@ -156,9 +161,29 @@ impl Blobs {
     }
 }
 
+#[cfg(unix)]
+#[allow(clippy::useless_conversion, reason = "the block counts are u32 on some systems, u64 on others")]
+fn free_bytes(path: &Path) -> Option<u64> {
+    let s = nix::sys::statvfs::statvfs(path).ok()?;
+    Some(u64::from(s.blocks_available()).saturating_mul(u64::from(s.fragment_size())))
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_room_left_is_known_where_the_system_says() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let blobs = Blobs::new(dir.path())?;
+        assert_eq!(blobs.free_bytes().is_some(), cfg!(unix));
+        Ok(())
+    }
 
     #[test]
     fn contents_are_kept_by_their_hash() -> anyhow::Result<()> {
