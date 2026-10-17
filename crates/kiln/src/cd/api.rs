@@ -70,6 +70,7 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, rest: &[&str], q: &HashMap<S
         (&Method::POST, ["ops", name]) => ((*name).to_owned(), json_body(body).await?),
         (&Method::GET, ["summary"]) => ("cd.summary".into(), json!({})),
         (&Method::GET, ["apps"]) => ("cd.apps.list".into(), from_query(q, &["project", "cluster", "environment", "sync", "health", "q", "limit", "cursor"])),
+        (&Method::GET, ["facets"]) => ("cd.apps.facets".into(), from_query(q, &["project", "cluster", "environment", "sync", "health", "q"])),
         (&Method::POST, ["apps"]) => ("cd.apps.create".into(), json!({"definition": json_body(body).await?})),
         (&Method::POST, ["import"]) => {
             let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;

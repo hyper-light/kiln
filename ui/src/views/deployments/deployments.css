@@ -1,12 +1,14 @@
 /* Deployments: the fleet as one list, and one app. Rows have one fixed height, so a list of a
-   hundred thousand apps draws only what is on screen. On phones the filters fold into one line
-   that opens a sheet, and a row's two states stack at its right edge. */
+   hundred thousand apps draws only what is on screen. Every control sits in the page: a name
+   search and a filter box above the list, checkboxes on rows, options beside the buttons they
+   change, and confirmations right under the action they confirm. On phones the same controls
+   take the full width, and a row's two states stack at its right edge. */
 
 .cd-page {
   container-type: inline-size;
 }
 
-/* ---------------------------------------------------------------- filters */
+/* ---------------------------------------------------------------- finding apps */
 .cd-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -14,11 +16,28 @@
   gap: 10px;
 }
 .cd-search {
-  flex: 1 1 260px;
-  max-width: 420px;
+  flex: 1 1 240px;
+  max-width: 360px;
+}
+.cd-filter {
+  flex: 1 1 280px;
+  max-width: 520px;
+}
+@container (max-width: 640px) {
+  .cd-search,
+  .cd-filter {
+    flex-basis: 100%;
+    max-width: none;
+  }
+}
+.cd-list-head {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 4px;
+  margin-top: 14px;
 }
 .cd-count {
-  margin: 18px 0 10px;
   color: #a1a3ab;
   font-family: var(--font-mono);
   font-size: 10px;
@@ -26,111 +45,93 @@
   line-height: 1.8;
   text-transform: uppercase;
 }
-.cd-summary {
-  display: none;
-  max-width: 100%;
+.cd-bulk {
+  display: flex;
   min-width: 0;
-  min-height: 44px;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  color: #c9cbd1;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  gap: 6px 12px;
 }
-.cd-summary > svg {
-  flex: none;
-  color: #8f929b;
-}
-.cd-summary-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.cd-link {
+  color: #c9c3d8;
+  font-size: 12.5px;
   white-space: nowrap;
 }
-.cd-sheet-body {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+.cd-link:hover {
+  color: #ededee;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
-.cd-sheet-body .cd-search {
-  flex: none;
-  max-width: none;
+.cd-notice {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
-@container (max-width: 640px) {
-  .cd-toolbar,
-  .cd-count {
-    display: none;
-  }
-  .cd-summary {
-    display: flex;
-  }
+.cd-notice[data-tone="ok"] {
+  color: #a8c9bc;
+}
+.cd-notice[data-tone="fail"] {
+  color: #d8b9bb;
 }
 
-/* On a phone the filter sheet rises from the bottom edge. */
-@media (max-width: 640px) {
-  .dialog.cd-sheet {
-    top: auto;
-    bottom: 0;
-    left: 0;
-    width: 100%;
-    max-height: 86dvh;
-    padding-bottom: env(safe-area-inset-bottom);
-    transform: none;
-    border-right: 0;
-    border-bottom: 0;
-    border-left: 0;
-    border-radius: 12px 12px 0 0;
-    animation: none;
-  }
+/* A checkbox in its own column, the whole cell its target. */
+.cd-pick {
+  display: grid;
+  width: 28px;
+  height: 100%;
+  min-height: 32px;
+  flex: none;
+  place-items: center;
+  cursor: pointer;
 }
-/* Arrivals play only while motion plays: a paused arrival would hold at its first, invisible frame. */
-@media (max-width: 640px) and (prefers-reduced-motion: no-preference) {
-  :root:not([data-motion="paused"]) .dialog.cd-sheet {
-    animation: cd-sheet-in 0.3s var(--ease);
-  }
-}
-@keyframes cd-sheet-in {
-  from {
-    transform: translateY(24px);
-    opacity: 0;
-  }
+.cd-pick input,
+.cd-opt input {
+  width: 14px;
+  height: 14px;
+  accent-color: #bab0e3;
 }
 
 /* ---------------------------------------------------------------- the fleet */
 .cd-list {
   border-top: 1px solid #2b2d32;
 }
+.cd-item {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  height: 68px;
+  align-items: stretch;
+  border-bottom: 1px solid #25272c;
+  transition: background-color 0.2s;
+}
+.cd-item:hover,
+.cd-item[data-checked] {
+  background: #0c0d0f;
+}
+.cd-item[data-tone="warn"] {
+  box-shadow: inset 2px 0 0 #c6b08e;
+}
+.cd-item[data-tone="fail"] {
+  box-shadow: inset 2px 0 0 #d1aaad;
+}
+.cd-item[data-live] {
+  box-shadow: inset 2px 0 0 #bab0e3;
+}
 .cd-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 0.8fr);
   grid-template-areas: "main states note";
+  min-width: 0;
   align-items: center;
   gap: 0 28px;
-  height: 68px;
-  padding: 0 10px;
+  padding: 0 10px 0 4px;
   overflow: hidden;
-  border-bottom: 1px solid #25272c;
   color: inherit;
   text-decoration: none;
-  transition: background-color 0.2s;
-}
-.cd-row:hover {
-  background: #0c0d0f;
 }
 .cd-row:focus-visible {
   outline: 2px solid #bab0e3;
   outline-offset: -2px;
-}
-.cd-row[data-tone="warn"] {
-  box-shadow: inset 2px 0 0 #c6b08e;
-}
-.cd-row[data-tone="fail"] {
-  box-shadow: inset 2px 0 0 #d1aaad;
-}
-.cd-row[data-live] {
-  box-shadow: inset 2px 0 0 #bab0e3;
 }
 .cd-row-main {
   grid-area: main;
@@ -177,10 +178,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.cd-row[data-tone="fail"] .cd-row-note {
+.cd-item[data-tone="fail"] .cd-row-note {
   color: #d8b9bb;
 }
-.cd-row[data-live] .cd-row-note {
+.cd-item[data-live] .cd-row-note {
   color: #c9c1ec;
 }
 .cd-none {
@@ -202,7 +203,7 @@
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas: "main states";
     gap: 0 14px;
-    padding: 0 6px;
+    padding-right: 6px;
   }
   .cd-row-note {
     display: none;
@@ -279,8 +280,39 @@
 .cd-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-top: 4px;
+}
+.cd-opt {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  color: #c8cad0;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+/* A confirmation, in the page, under what it confirms. */
+.cd-confirm {
+  max-width: 72ch;
+  padding: 12px 14px;
+  border: 1px solid #2b2d32;
+  border-left: 2px solid #c6b08e;
+  border-radius: 6px;
+  background: #0b0c0e;
+  color: #c8cad0;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.cd-confirm p {
+  margin: 0 0 6px;
+}
+.cd-confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-  margin-top: 6px;
+  margin-top: 8px;
 }
 .cd-op {
   display: flex;
@@ -325,52 +357,16 @@
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
-.cd-check {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-height: 32px;
-  margin-top: 10px;
-  color: #c8cad0;
-  font-size: 13px;
-  cursor: pointer;
-}
-.cd-check input {
-  width: 15px;
-  height: 15px;
-  accent-color: #bab0e3;
-}
-
-/* Tabs share the width on phones, so none scrolls out of sight. */
-.cd-tabs {
-  display: flex;
+.cd-show {
+  max-width: 280px;
   margin-top: 28px;
-  border-bottom: 1px solid #25272c;
 }
-.cd-tab {
-  min-height: 44px;
-  padding: 0 16px;
-  color: #a1a4ad;
-  font-size: 13px;
-  white-space: nowrap;
-  box-shadow: inset 0 -2px 0 transparent;
-  transition:
-    color 0.2s,
-    box-shadow 0.2s;
+@container (max-width: 640px) {
+  .cd-show {
+    max-width: none;
+  }
 }
-.cd-tab:hover {
-  color: #ededee;
-}
-.cd-tab[aria-selected="true"] {
-  color: #ededee;
-  box-shadow: inset 0 -2px 0 #bab0e3;
-}
-.cd-tab:focus-visible {
-  outline: 2px solid #bab0e3;
-  outline-offset: -2px;
-}
-/* The tabs' rule tops the lists; everything else keeps a gap below it. */
-.cd-panel > :not(.cd-resources, .cd-history, .cd-empty) {
+.cd-panel {
   margin-top: 14px;
 }
 .cd-empty {
@@ -379,17 +375,11 @@
   color: #8c8f98;
   font-size: 13px;
 }
-@container (max-width: 640px) {
-  .cd-tab {
-    flex: 1 1 0;
-    min-width: 0;
-    padding: 0 6px;
-  }
-}
 
 /* ---------------------------------------------------------------- resources */
 .cd-resources {
   min-width: 0;
+  border-top: 1px solid #2b2d32;
 }
 .cd-res {
   display: grid;
@@ -472,6 +462,7 @@
 }
 .cd-history {
   min-width: 0;
+  border-top: 1px solid #2b2d32;
 }
 .cd-history-row {
   display: grid;
@@ -498,6 +489,10 @@
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
+.cd-history-confirm {
+  grid-column: 1 / -1;
+  margin-top: 8px;
+}
 @container (max-width: 640px) {
   .cd-history-row {
     display: flex;
@@ -516,7 +511,8 @@
     order: 2;
     flex-basis: 100%;
   }
-  .cd-history-msg {
+  .cd-history-msg,
+  .cd-history-confirm {
     order: 3;
     flex-basis: 100%;
   }

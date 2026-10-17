@@ -679,6 +679,17 @@ export interface CdSummary {
   clusters: number;
 }
 
+/** How many apps each filter value would show given the other filters, and how many match all. */
+export interface CdFacets {
+  total: number;
+  facets: {
+    sync: Record<string, number>;
+    health: Record<string, number>;
+    cluster: Record<string, number>;
+    project: Record<string, number>;
+  };
+}
+
 /* ---------------------------- discovery v2 + Add machines ---------------------------- */
 // The fields and types of .claude/contracts/discovery.md. The interfaces named like ones above are
 // merged into them (declaration merging), so this block adds to them without touching them.

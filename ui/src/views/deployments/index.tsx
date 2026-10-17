@@ -1,19 +1,20 @@
 /**
  * Deployments: every app kiln deploys, its sync and health, live. One list however large the
  * fleet: filters run on the server, pages arrive as you scroll, only the rows on screen are
- * drawn, and live updates are merged in once a frame. On phones the filters fold into one line
- * that opens a sheet.
+ * drawn, and live updates are merged in once a frame. Above it, on every screen, a name search
+ * and one filter box (sync, health, cluster and project, each value with how many it would show).
+ * Rows have checkboxes, so a selection, or everything a filter shows, syncs or refreshes at once.
  */
 import * as React from "react";
 import { Link, useSearchParams } from "react-router";
-import { ChevronDown, Rocket } from "lucide-react";
+import { Rocket } from "lucide-react";
 
-import { appHref, cdApi } from "@/api/cd";
+import { appHref, cdApi, type CdFilters } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
-import type { CdApp, CdSummary } from "@/api/types";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
-import { EmptyState, ErrorState, PageIntro, SearchField, SelectField, SkeletonRows } from "@/components/ui/misc";
-import { toast } from "@/components/ui/toast";
+import type { CdApp, CdFacets } from "@/api/types";
+import { Button } from "@/components/ui/button";
+import { FacetSelect, type FacetChoice, type FacetGroup } from "@/components/ui/facet-select";
+import { EmptyState, ErrorState, PageIntro, SearchField, SkeletonRows } from "@/components/ui/misc";
 import { errorMessage, useResource } from "@/lib/hooks";
 import { useWindowedRows } from "@/lib/virtual";
 import { HealthPair, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
@@ -22,62 +23,97 @@ import "./deployments.css";
 const ROW = 68;
 const PAGE = 500;
 
-const SYNC_OPTIONS = [
-  { value: "", label: "Any sync" },
-  { value: "Synced", label: "Synced" },
-  { value: "OutOfSync", label: "Out of sync" },
-  { value: "Unknown", label: "Unknown" },
-];
-const HEALTH_OPTIONS = [
-  { value: "", label: "Any health" },
-  { value: "Healthy", label: "Healthy" },
-  { value: "Progressing", label: "Progressing" },
-  { value: "Degraded", label: "Degraded" },
-  { value: "Missing", label: "Missing" },
-  { value: "Suspended", label: "Suspended" },
-  { value: "Unknown", label: "Unknown" },
-];
+const FACETS = [
+  { id: "sync", label: "Sync" },
+  { id: "health", label: "Health" },
+  { id: "cluster", label: "Cluster" },
+  { id: "project", label: "Project" },
+] as const;
+type FacetId = (typeof FACETS)[number]["id"];
 
-function summaryLine(s: CdSummary | undefined) {
-  if (!s) return "Deployments";
-  const parts = [`${s.apps.toLocaleString()} ${s.apps === 1 ? "app" : "apps"}`];
-  const out = s.sync.OutOfSync ?? 0;
-  if (out) parts.push(`${out.toLocaleString()} out of sync`);
-  for (const h of ["Degraded", "Missing", "Progressing"]) {
-    const n = s.health[h] ?? 0;
-    if (n) parts.push(`${n.toLocaleString()} ${h.toLowerCase()}`);
+const WORDS: Record<string, string> = { OutOfSync: "Out of sync" };
+/** Worst first, as people look for trouble. */
+const ORDER: Partial<Record<FacetId, string[]>> = {
+  sync: ["OutOfSync", "Unknown", "Synced"],
+  health: ["Degraded", "Missing", "Progressing", "Suspended", "Unknown", "Healthy"],
+};
+
+const n = (x: number) => x.toLocaleString();
+
+/** "6 apps · 1 out of sync · 1 degraded", or "2 of 6 apps" when filtered. */
+function countLine(f: CdFacets | undefined, all: number | undefined, filters: CdFilters) {
+  if (!f) return "";
+  const filtered = Object.values(filters).some((v) => (Array.isArray(v) ? v.length > 0 : Boolean(v)));
+  const parts = [filtered && all !== undefined ? `${n(f.total)} of ${n(all)} apps` : `${n(f.total)} ${f.total === 1 ? "app" : "apps"}`];
+  // A facet's counts describe what is shown only while it isn't filtered itself.
+  if (!filters.sync?.length && f.facets.sync.OutOfSync) parts.push(`${n(f.facets.sync.OutOfSync)} out of sync`);
+  if (!filters.health?.length) {
+    for (const h of ["Degraded", "Missing", "Progressing"]) {
+      const c = f.facets.health[h];
+      if (c) parts.push(`${n(c)} ${h.toLowerCase()}`);
+    }
   }
   return parts.join(" · ");
 }
 
+/** Runs `f` over `items`, `limit` at a time; every outcome, in order. */
+async function settleAll<T>(items: string[], limit: number, f: (x: string) => Promise<T>): Promise<PromiseSettledResult<T>[]> {
+  const out: PromiseSettledResult<T>[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      const item = items[i];
+      if (item === undefined) continue;
+      try {
+        out[i] = { status: "fulfilled", value: await f(item) };
+      } catch (reason) {
+        out[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
 export default function Deployments() {
   const [params, setParams] = useSearchParams();
-  const filters = React.useMemo(
-    () => ({
-      sync: params.get("sync") ?? "",
-      health: params.get("health") ?? "",
-      cluster: params.get("cluster") ?? "",
-      q: params.get("q") ?? "",
-    }),
-    [params],
-  );
-  const setFilter = (k: keyof typeof filters, v: string) => {
+  const filters = React.useMemo<CdFilters>(() => {
+    const list = (k: string) => (params.get(k) ?? "").split(",").filter(Boolean);
+    return { sync: list("sync"), health: list("health"), cluster: list("cluster"), project: list("project"), q: params.get("q") ?? "" };
+  }, [params]);
+  const choice: FacetChoice = { sync: filters.sync ?? [], health: filters.health ?? [], cluster: filters.cluster ?? [], project: filters.project ?? [] };
+  const setChoice = (c: FacetChoice) => {
     const next = new URLSearchParams(params);
-    if (v) next.set(k, v);
-    else next.delete(k);
+    for (const f of FACETS) {
+      const v = c[f.id] ?? [];
+      if (v.length) next.set(f.id, v.join(","));
+      else next.delete(f.id);
+    }
     setParams(next, { replace: true });
   };
-  const [query, setQuery] = React.useState(filters.q);
+  const [query, setQuery] = React.useState(filters.q ?? "");
   React.useEffect(() => {
     const t = setTimeout(() => {
-      if (query !== filters.q) setFilter("q", query);
+      if (query === (filters.q ?? "")) return;
+      const next = new URLSearchParams(params);
+      if (query) next.set("q", query);
+      else next.delete("q");
+      setParams(next, { replace: true });
     }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query]);
 
   const summary = useResource((s) => cdApi.summary(s), [], { pollMs: 30_000 });
-  const clusters = useResource((s) => cdApi.clusters(s), [], { pollMs: 60_000 });
+  const facets = useResource((s) => cdApi.facets(filters, s), [filters], { pollMs: 30_000 });
+  const groups: FacetGroup[] = FACETS.map((f) => {
+    const counts = facets.data?.facets[f.id] ?? {};
+    const order = ORDER[f.id];
+    const rank = (v: string) => (order ? order.indexOf(v) + 1 || order.length + 1 : 0);
+    const ids = [...new Set([...Object.keys(counts), ...(choice[f.id] ?? [])])].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    return { id: f.id, label: f.label, values: ids.map((id) => ({ id, label: WORDS[id] ?? id, count: counts[id] ?? 0 })) };
+  });
 
   // The list: pages in id order, kept in a map that live events update in place. `gen` drops
   // pages of a list the filters have since replaced.
@@ -88,6 +124,7 @@ export default function Deployments() {
   const [next, setNext] = React.useState<string | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<Error | null>(null);
+  const [moreError, setMoreError] = React.useState<string | null>(null);
   const loadingMore = React.useRef(false);
   const failedAt = React.useRef(0);
 
@@ -127,12 +164,13 @@ export default function Deployments() {
           apps.current.set(a.app, a);
         }
         setNext(page.next);
+        setMoreError(null);
         setVersion((v) => v + 1);
       })
       .catch((e: unknown) => {
         if (g !== gen.current) return;
         failedAt.current = Date.now();
-        toast({ title: "More apps didn't load", description: errorMessage(e), tone: "failed" });
+        setMoreError(`More apps didn't load: ${errorMessage(e)}`);
       })
       .finally(() => {
         loadingMore.current = false;
@@ -141,7 +179,7 @@ export default function Deployments() {
 
   // Live: statuses arrive in batches; merge them and draw once a frame.
   const frame = React.useRef(0);
-  const reloadSummarySoon = React.useRef<number | null>(null);
+  const countsSoon = React.useRef<number | null>(null);
   useServerEvents((ev) => {
     if (ev.type === "cd_apps") {
       for (const s of ev.apps) {
@@ -154,10 +192,11 @@ export default function Deployments() {
           setVersion((v) => v + 1);
         });
       }
-      if (reloadSummarySoon.current === null) {
-        reloadSummarySoon.current = window.setTimeout(() => {
-          reloadSummarySoon.current = null;
+      if (countsSoon.current === null) {
+        countsSoon.current = window.setTimeout(() => {
+          countsSoon.current = null;
           summary.reload();
+          facets.reload();
         }, 2_000);
       }
     } else if (ev.type === "cd_app_deleted") {
@@ -166,12 +205,13 @@ export default function Deployments() {
         setVersion((v) => v + 1);
       }
       summary.reload();
+      facets.reload();
     }
   });
   React.useEffect(
     () => () => {
       if (frame.current) cancelAnimationFrame(frame.current);
-      if (reloadSummarySoon.current !== null) clearTimeout(reloadSummarySoon.current);
+      if (countsSoon.current !== null) clearTimeout(countsSoon.current);
     },
     [],
   );
@@ -183,42 +223,118 @@ export default function Deployments() {
     if (win.end >= count - 50) loadMore();
   }, [win.end, count, loadMore]);
 
-  const [sheet, setSheet] = React.useState(false);
-  const clusterOptions = [
-    { value: "", label: "Any cluster" },
-    ...(clusters.data?.clusters ?? []).map((c) => ({ value: c.name, label: c.name })),
-  ];
-  const filtered = Object.values(filters).some(Boolean);
-  const line = summaryLine(summary.data);
+  // Selection: some rows, or everything the filters show (which the server acts on, loaded or
+  // not). A new filter starts a new selection.
+  const [selected, setSelected] = React.useState<ReadonlySet<string>>(() => new Set());
+  const [everything, setEverything] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [note, setNote] = React.useState<{ tone: "ok" | "fail"; text: string } | null>(null);
+  React.useEffect(() => {
+    setSelected(new Set());
+    setEverything(false);
+  }, [filters]);
+  const check = React.useCallback((id: string, on: boolean) => {
+    setEverything(false);
+    setSelected((s) => {
+      const next = new Set(s);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+  const selectAll = (on: boolean) => {
+    setEverything(false);
+    setSelected(on ? new Set(order.current) : new Set());
+  };
+  const allLoaded = count > 0 && selected.size >= count && order.current.every((id) => selected.has(id));
+  const total = facets.data?.total;
 
-  const controls = (
-    <>
-      <SearchField label="Search apps" placeholder="Search apps" value={query} onChange={setQuery} className="cd-search" />
-      <SelectField label="Sync" hideLabel value={filters.sync} onChange={(v) => setFilter("sync", v)} options={SYNC_OPTIONS} />
-      <SelectField label="Health" hideLabel value={filters.health} onChange={(v) => setFilter("health", v)} options={HEALTH_OPTIONS} />
-      <SelectField label="Cluster" hideLabel value={filters.cluster} onChange={(v) => setFilter("cluster", v)} options={clusterOptions} />
-    </>
-  );
+  const bulk = async (what: "sync" | "refresh") => {
+    setBusy(true);
+    setNote(null);
+    try {
+      if (everything) {
+        if (what === "sync") {
+          const r = await cdApi.syncMany(filters);
+          setNote({ tone: "ok", text: `Syncing ${n(r.started)} apps.` });
+        } else {
+          const r = await cdApi.refreshMany(filters);
+          setNote({ tone: "ok", text: `Comparing ${n(r.refreshing)} apps again.` });
+        }
+      } else {
+        const ids = [...selected];
+        const results = await settleAll(ids, 8, (id) => (what === "sync" ? cdApi.sync(id, {}) : cdApi.refresh(id, false)));
+        const failed = results.flatMap((r, i) => (r.status === "rejected" ? [`${ids[i] ?? "?"}: ${errorMessage(r.reason)}`] : []));
+        const done = ids.length - failed.length;
+        const verb = what === "sync" ? "Syncing" : "Comparing again";
+        setNote(
+          failed.length
+            ? { tone: "fail", text: `${verb} ${n(done)} of ${n(ids.length)}. ${failed.slice(0, 3).join("; ")}${failed.length > 3 ? "; …" : ""}` }
+            : { tone: "ok", text: `${verb} ${n(done)} ${done === 1 ? "app" : "apps"}.` },
+        );
+      }
+      setSelected(new Set());
+      setEverything(false);
+    } catch (e) {
+      setNote({ tone: "fail", text: errorMessage(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const filtered = Object.values(filters).some((v) => (Array.isArray(v) ? v.length > 0 : Boolean(v)));
+  const some = everything || selected.size > 0;
 
   return (
     <div className="container-console page cd-page">
       <PageIntro index={3} label="Deployments" title="Deployments." lead="What git says, and what runs: every app's sync and health, live." />
-      <div className="cd-toolbar">{controls}</div>
-      <button type="button" className="cd-summary" onClick={() => setSheet(true)} aria-haspopup="dialog">
-        <span className="sr-only">Filter apps: </span>
-        <span className="cd-summary-text">{line}</span>
-        <ChevronDown size={12} aria-hidden="true" />
-      </button>
-      <Dialog open={sheet} onOpenChange={setSheet}>
-        {sheet && (
-          <DialogContent title="Filter apps" eyebrow={line} className="cd-sheet">
-            <div className="cd-sheet-body">{controls}</div>
-          </DialogContent>
+      <div className="cd-toolbar">
+        <SearchField label="Find apps by name" placeholder="Find by name" value={query} onChange={setQuery} className="cd-search" />
+        <FacetSelect label="Filter apps" placeholder="All apps" groups={groups} chosen={choice} onChange={setChoice} className="cd-filter" />
+      </div>
+
+      <div className="cd-list-head">
+        <label className="cd-pick">
+          <input
+            type="checkbox"
+            checked={everything || allLoaded}
+            ref={(el) => {
+              if (el) el.indeterminate = !everything && !allLoaded && selected.size > 0;
+            }}
+            onChange={(e) => selectAll(e.target.checked)}
+            disabled={count === 0}
+            aria-label="Select every app shown"
+          />
+        </label>
+        {some ? (
+          <div className="cd-bulk">
+            <span className="cd-count">{everything && total !== undefined ? `All ${n(total)} matching` : `${n(selected.size)} selected`}</span>
+            {!everything && allLoaded && next && total !== undefined && (
+              <button type="button" className="cd-link" onClick={() => setEverything(true)}>
+                Select all {n(total)} matching
+              </button>
+            )}
+            <Button size="xs" onClick={() => bulk("sync")} disabled={busy}>
+              Sync
+            </Button>
+            <Button size="xs" variant="secondary" onClick={() => bulk("refresh")} disabled={busy}>
+              Refresh
+            </Button>
+            <button type="button" className="cd-link" onClick={() => selectAll(false)}>
+              Clear
+            </button>
+          </div>
+        ) : (
+          <span className="cd-count" aria-live="polite">
+            {countLine(facets.data, summary.data?.apps, filters)}
+          </span>
         )}
-      </Dialog>
-      <p className="cd-count" aria-live="polite">
-        {line}
-      </p>
+      </div>
+      {note && (
+        <p className="cd-notice" data-tone={note.tone} aria-live="polite">
+          {note.text}
+        </p>
+      )}
 
       {error ? (
         <ErrorState error={error} onRetry={() => setParams(new URLSearchParams(params), { replace: true })} />
@@ -240,25 +356,42 @@ export default function Deployments() {
           <div style={{ height: win.start * ROW }} aria-hidden="true" />
           {order.current.slice(win.start, win.end).map((id, i) => {
             const a = apps.current.get(id);
-            return a ? <AppRow key={id} app={a} pos={win.start + i + 1} size={next ? -1 : count} /> : null;
+            return a ? (
+              <AppRow key={id} app={a} pos={win.start + i + 1} size={next ? -1 : count} checked={everything || selected.has(id)} onCheck={check} />
+            ) : null;
           })}
           <div style={{ height: Math.max(0, count - win.end) * ROW }} aria-hidden="true" />
         </div>
       )}
-      {next && !loading && <p className="cd-more">Loading more as you scroll…</p>}
+      {moreError ? <p className="cd-notice" data-tone="fail">{moreError}</p> : next && !loading && <p className="cd-more">Loading more as you scroll…</p>}
     </div>
   );
 }
 
-const AppRow = React.memo(function AppRow({ app, pos, size }: { app: CdApp; pos: number; size: number }) {
+const AppRow = React.memo(function AppRow({
+  app,
+  pos,
+  size,
+  checked,
+  onCheck,
+}: {
+  app: CdApp;
+  pos: number;
+  size: number;
+  checked: boolean;
+  onCheck: (id: string, on: boolean) => void;
+}) {
   const live = running(app.operation);
   const failed = app.operation?.phase === "Failed";
   const note = app.source_error ?? (failed ? app.operation?.message : app.message) ?? "";
   const tone = app.health === "Degraded" || failed || app.source_error ? "fail" : app.sync === "OutOfSync" ? "warn" : undefined;
   const extent = app.out_of_sync ? `${app.out_of_sync} of ${app.resources ?? 0} differ` : app.resources !== undefined ? `${app.resources} resources` : "";
   return (
-    <div role="listitem" aria-posinset={pos} aria-setsize={size}>
-      <Link to={appHref(app.app)} className="cd-row" data-live={live || undefined} data-tone={tone}>
+    <div role="listitem" aria-posinset={pos} aria-setsize={size} className="cd-item" data-checked={checked || undefined} data-live={live || undefined} data-tone={tone}>
+      <label className="cd-pick">
+        <input type="checkbox" checked={checked} onChange={(e) => onCheck(app.app, e.target.checked)} aria-label={`Select ${app.name}`} />
+      </label>
+      <Link to={appHref(app.app)} className="cd-row">
         <span className="cd-row-main">
           <span className="cd-row-name">{app.name}</span>
           <span className="cd-row-meta">

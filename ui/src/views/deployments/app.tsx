@@ -1,7 +1,8 @@
 /**
  * One app: where it deploys, whether it matches git, what runs and what differs, and its
- * deployments. Sync, refresh, take over (for apps adopted from Argo CD), stop and delete are
- * here; each says what it will do before it does it.
+ * deployments. Sync, refresh, rollback, take over (for apps adopted from Argo CD), stop and
+ * delete are here, all in the page: an action that can't be undone first says, in place, what it
+ * will do; what happened shows below the actions. A select chooses what the page lists.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
@@ -11,9 +12,7 @@ import { cdApi } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
 import type { CdAppDetail, CdDeployment, CdResource } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog } from "@/components/ui/dialog";
-import { EmptyState, ErrorState, SkeletonRows } from "@/components/ui/misc";
-import { toast } from "@/components/ui/toast";
+import { EmptyState, ErrorState, SelectField, SkeletonRows } from "@/components/ui/misc";
 import { errorMessage, useResource } from "@/lib/hooks";
 import { useWindowedRows } from "@/lib/virtual";
 import { FileDiffView } from "@/views/harness/diff";
@@ -35,7 +34,9 @@ import "./deployments.css";
 
 const RES_ROW = 56;
 
-type Tab = "resources" | "diff" | "history";
+type Show = "resources" | "diff" | "history";
+type Ask = null | "takeover" | "delete" | "follow";
+type Notice = { tone: "ok" | "fail"; text: string } | null;
 
 /** A fresh page per app, so nothing of one app shows while the next one loads. */
 export default function DeploymentAppRoute() {
@@ -48,15 +49,15 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
   const navigate = useNavigate();
   const app = useResource((s) => cdApi.app(id, s), [id], { pollMs: 10_000 });
   const res = useResource((s) => cdApi.resources(id, s), [id], { pollMs: 10_000 });
-  const [tab, setTab] = React.useState<Tab>("resources");
-  // Bumped when this app's status changes, so the open tab reads it again.
+  const [show, setShow] = React.useState<Show>("resources");
+  // Bumped when this app's status changes, so what is shown is read again.
   const [tick, setTick] = React.useState(0);
-  const [confirm, setConfirm] = React.useState<null | "sync" | "takeover" | "delete" | "follow">(null);
-  const [rollbackTo, setRollbackTo] = React.useState<CdDeployment | null>(null);
+  const [ask, setAsk] = React.useState<Ask>(null);
   const [prune, setPrune] = React.useState(false);
   const [dryRun, setDryRun] = React.useState(false);
   const [orphan, setOrphan] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const [notice, setNotice] = React.useState<Notice>(null);
 
   // Live: this app's status changed, so read it again (at most twice a second).
   const soon = React.useRef<number | null>(null);
@@ -78,15 +79,24 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
     },
     [],
   );
+  // A success says so for a while; a failure stays until the next action.
+  React.useEffect(() => {
+    if (notice?.tone !== "ok") return;
+    const t = setTimeout(() => setNotice(null), 8_000);
+    return () => clearTimeout(t);
+  }, [notice]);
 
   const act = async (done: string, f: () => Promise<unknown>) => {
     setBusy(true);
+    setNotice(null);
     try {
       await f();
-      toast({ title: done, tone: "info" });
+      setNotice({ tone: "ok", text: done });
+      setAsk(null);
       app.reload();
+      setTick((t) => t + 1);
     } catch (e) {
-      toast({ title: "That didn't work", description: errorMessage(e), tone: "failed" });
+      setNotice({ tone: "fail", text: errorMessage(e) });
     } finally {
       setBusy(false);
     }
@@ -108,10 +118,10 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
   const resources = res.data?.resources ?? [];
   const objects = resources.filter((r) => !r.hook).length;
   const differ = resources.filter((r) => !r.hook && r.sync !== "Synced").length;
-  const tabs: [Tab, string][] = [
-    ["resources", objects ? `Resources ${objects}` : "Resources"],
-    ["diff", differ ? `Diff ${differ}` : "Diff"],
-    ["history", "History"],
+  const shows = [
+    { value: "resources", label: objects ? `Resources (${objects})` : "Resources" },
+    { value: "diff", label: differ ? `What differs (${differ})` : "What differs" },
+    { value: "history", label: "History" },
   ];
 
   return (
@@ -147,31 +157,118 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
             )}
             <div className="cd-actions">
               {a.shadow ? (
-                <Button size="sm" onClick={() => setConfirm("takeover")} disabled={busy}>
-                  Take over
+                <Button size="xs" onClick={() => setAsk(ask === "takeover" ? null : "takeover")} aria-expanded={ask === "takeover"} disabled={busy}>
+                  Take over…
                 </Button>
               ) : (
-                <Button size="sm" onClick={() => setConfirm("sync")} disabled={busy || live}>
-                  Sync
-                </Button>
+                <>
+                  <Button
+                    size="xs"
+                    onClick={() => act(dryRun ? "Checking every object against the cluster." : "Syncing.", () => cdApi.sync(id, { prune, dry_run: dryRun }))}
+                    disabled={busy || live}
+                  >
+                    {dryRun ? "Check" : "Sync"}
+                  </Button>
+                  <label className="cd-opt">
+                    <input type="checkbox" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Prune
+                  </label>
+                  <label className="cd-opt">
+                    <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> Dry run
+                  </label>
+                </>
               )}
-              <Button size="sm" variant="secondary" onClick={() => act("Reading git again", () => cdApi.refresh(id, false))} disabled={busy}>
+              <Button size="xs" variant="secondary" onClick={() => act("Reading git again.", () => cdApi.refresh(id, false))} disabled={busy}>
                 <RefreshCw aria-hidden="true" /> Refresh
               </Button>
-              {a.pinned && (
-                <Button size="sm" variant="secondary" onClick={() => setConfirm("follow")} disabled={busy}>
-                  Follow git
-                </Button>
-              )}
               {live && (
-                <Button size="sm" variant="secondary" onClick={() => act("Stopping the sync", () => cdApi.terminate(id))} disabled={busy}>
+                <Button size="xs" variant="secondary" onClick={() => act("Stopping the sync.", () => cdApi.terminate(id))} disabled={busy}>
                   Stop
                 </Button>
               )}
-              <Button size="sm" variant="ghost" onClick={() => setConfirm("delete")} disabled={busy}>
-                Delete
+              {a.pinned && (
+                <Button size="xs" variant="secondary" onClick={() => setAsk(ask === "follow" ? null : "follow")} aria-expanded={ask === "follow"} disabled={busy}>
+                  Follow git…
+                </Button>
+              )}
+              <Button size="xs" variant="ghost" onClick={() => setAsk(ask === "delete" ? null : "delete")} aria-expanded={ask === "delete"} disabled={busy}>
+                Delete…
               </Button>
             </div>
+            {ask && (
+              <div className="cd-confirm" role="group" aria-label="Confirm">
+                {ask === "takeover" && (
+                  <>
+                    <p>
+                      kiln stops shadowing {name} and deploys it from now on. Turn off auto-sync for it in Argo CD first, so the two
+                      don't both apply it. Nothing is recreated.
+                    </p>
+                    <div className="cd-confirm-actions">
+                      <Button size="xs" onClick={() => act(`kiln deploys ${name} now.`, () => cdApi.takeOver(id))} disabled={busy}>
+                        Take over {name}
+                      </Button>
+                      <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </>
+                )}
+                {ask === "follow" && (
+                  <>
+                    <p>
+                      kiln renders what git says now
+                      {a.auto ? " and deploys it: this app syncs automatically." : ". Sync to deploy it."}
+                    </p>
+                    <div className="cd-confirm-actions">
+                      <Button size="xs" onClick={() => act(`${name} follows git again.`, () => cdApi.follow(id))} disabled={busy}>
+                        Follow git
+                      </Button>
+                      <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </>
+                )}
+                {ask === "delete" && (
+                  <>
+                    <p>
+                      {a.shadow
+                        ? "kiln forgets it. Argo CD still deploys it, and nothing in the cluster changes."
+                        : orphan
+                          ? "kiln forgets it; its objects keep running in the cluster."
+                          : `Its objects are deleted from ${placeOf(a)} too, except those marked Delete=false and namespaces it created.`}
+                    </p>
+                    {!a.shadow && (
+                      <label className="cd-opt">
+                        <input type="checkbox" checked={orphan} onChange={(e) => setOrphan(e.target.checked)} /> Leave its objects running
+                      </label>
+                    )}
+                    <div className="cd-confirm-actions">
+                      <Button
+                        size="xs"
+                        variant="danger"
+                        onClick={() =>
+                          act(`Deleting ${name}.`, async () => {
+                            await cdApi.remove(id, a.shadow || orphan ? "orphan" : "foreground");
+                            navigate("/deployments", { replace: true });
+                          })
+                        }
+                        disabled={busy}
+                      >
+                        Delete {name}
+                      </Button>
+                      <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+            {notice && (
+              <p className="cd-notice" data-tone={notice.tone} aria-live="polite">
+                {notice.text}
+              </p>
+            )}
           </>
         ) : (
           <SkeletonRows rows={2} cols={3} />
@@ -189,25 +286,12 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
       {a?.source_error && <p className="cd-warn">kiln can't read its sources: {a.source_error}</p>}
       {a?.message && <p className="cd-warn">{a.message}</p>}
 
-      <div className="cd-tabs" role="tablist" aria-label="App">
-        {tabs.map(([key, label]) => (
-          <button
-            key={key}
-            id={`cd-tab-${key}`}
-            type="button"
-            role="tab"
-            aria-selected={tab === key}
-            aria-controls="cd-tab-panel"
-            className="cd-tab"
-            onClick={() => setTab(key)}
-          >
-            {label}
-          </button>
-        ))}
+      <div className="cd-show">
+        <SelectField label="Show" value={show} onChange={(v) => setShow(v as Show)} options={shows} className="cd-show-select" />
       </div>
 
-      <div id="cd-tab-panel" role="tabpanel" aria-labelledby={`cd-tab-${tab}`} className="cd-panel">
-        {tab === "resources" &&
+      <div className="cd-panel">
+        {show === "resources" &&
           (res.error && !res.data ? (
             <ErrorState error={res.error} onRetry={res.reload} compact />
           ) : !res.data ? (
@@ -217,102 +301,20 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
           ) : (
             <ResourceList list={resources} />
           ))}
-        {tab === "diff" && <DiffTab id={id} tick={tick} />}
-        {tab === "history" && <HistoryTab id={id} tick={tick} onRollback={a && !a.shadow ? setRollbackTo : undefined} />}
+        {show === "diff" && <DiffList id={id} tick={tick} />}
+        {show === "history" && (
+          <HistoryList
+            id={id}
+            tick={tick}
+            busy={busy}
+            onRollback={
+              a && !a.shadow
+                ? (d, prune) => act(`Rolling ${name} back to deployment ${d.id}.`, () => cdApi.rollback(id, { to: d.id, prune }))
+                : undefined
+            }
+          />
+        )}
       </div>
-
-      <ConfirmDialog
-        open={confirm === "sync"}
-        onOpenChange={(o) => !o && setConfirm(null)}
-        title={`Sync ${name}?`}
-        description={
-          <>
-            {dryRun
-              ? "Checks every object against the cluster without changing anything."
-              : `Applies what git says to ${a ? placeOf(a) : "its cluster"}, wave by wave, running its hooks.`}
-            <label className="cd-check">
-              <input type="checkbox" checked={prune} onChange={(e) => setPrune(e.target.checked)} />
-              Also delete what git no longer holds (prune)
-            </label>
-            <label className="cd-check">
-              <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
-              Only check (dry run)
-            </label>
-          </>
-        }
-        confirmLabel={dryRun ? "Check" : "Sync"}
-        onConfirm={() => act(dryRun ? `Checking ${name}` : `Syncing ${name}`, () => cdApi.sync(id, { prune, dry_run: dryRun }))}
-      />
-      <ConfirmDialog
-        open={confirm === "takeover"}
-        onOpenChange={(o) => !o && setConfirm(null)}
-        title={`Take over ${name}?`}
-        description="kiln stops shadowing this app and deploys it from now on. Turn off auto-sync for it in Argo CD first, so the two don't both apply it. Nothing is recreated."
-        confirmLabel="Take over"
-        onConfirm={() => act(`kiln deploys ${name} now`, () => cdApi.takeOver(id))}
-      />
-      <ConfirmDialog
-        open={confirm === "delete"}
-        onOpenChange={(o) => !o && setConfirm(null)}
-        title={`Delete ${name}?`}
-        description={
-          a?.shadow ? (
-            "kiln forgets it. Argo CD still deploys it, and nothing in the cluster changes."
-          ) : (
-            <>
-              {orphan
-                ? "kiln forgets it; its objects keep running in the cluster."
-                : "Its objects are deleted from the cluster too, except those marked Delete=false and namespaces it created."}
-              <label className="cd-check">
-                <input type="checkbox" checked={orphan} onChange={(e) => setOrphan(e.target.checked)} />
-                Leave its objects running
-              </label>
-            </>
-          )
-        }
-        confirmLabel="Delete"
-        danger
-        onConfirm={() =>
-          act(`Deleting ${name}`, async () => {
-            await cdApi.remove(id, a?.shadow || orphan ? "orphan" : "foreground");
-            navigate("/deployments", { replace: true });
-          })
-        }
-      />
-      <ConfirmDialog
-        open={rollbackTo !== null}
-        onOpenChange={(o) => !o && setRollbackTo(null)}
-        title={`Roll ${name} back to deployment ${rollbackTo?.id ?? ""}?`}
-        description={
-          <>
-            kiln renders {rollbackTo?.revision ? shortRev(rollbackTo.revision) : "that deployment"} again and syncs it. The app
-            holds there until git changes it, then follows git again.
-            <label className="cd-check">
-              <input type="checkbox" checked={prune} onChange={(e) => setPrune(e.target.checked)} />
-              Also delete what that deployment didn't have (prune)
-            </label>
-          </>
-        }
-        confirmLabel="Roll back"
-        onConfirm={() =>
-          act(`Rolling ${name} back`, async () => {
-            await cdApi.rollback(id, { to: rollbackTo?.id, prune });
-            setRollbackTo(null);
-          })
-        }
-      />
-      <ConfirmDialog
-        open={confirm === "follow"}
-        onOpenChange={(o) => !o && setConfirm(null)}
-        title="Follow git again?"
-        description={
-          a?.auto
-            ? "kiln renders what git says now and deploys it: this app syncs automatically."
-            : "kiln renders what git says now. Sync to deploy it."
-        }
-        confirmLabel="Follow git"
-        onConfirm={() => act(`${name} follows git again`, () => cdApi.follow(id))}
-      />
     </div>
   );
 }
@@ -340,7 +342,7 @@ function ResourceList({ list }: { list: CdResource[] }) {
   const sorted = React.useMemo(() => sortResources(list), [list]);
   const win = useWindowedRows(ref, sorted.length, RES_ROW);
   return (
-    <div ref={ref} className="cd-resources" role="list">
+    <div ref={ref} className="cd-resources" role="list" aria-label="Resources">
       <div style={{ height: win.start * RES_ROW }} aria-hidden="true" />
       {sorted.slice(win.start, win.end).map((r, i) => (
         <ResourceRow key={objectKey(r)} r={r} pos={win.start + i + 1} size={sorted.length} />
@@ -379,7 +381,7 @@ function ResourceRow({ r, pos, size }: { r: CdResource; pos: number; size: numbe
   );
 }
 
-function DiffTab({ id, tick }: { id: string; tick: number }) {
+function DiffList({ id, tick }: { id: string; tick: number }) {
   const diff = useResource((s) => cdApi.diff(id, s), [id, tick]);
   if (diff.error && !diff.data) return <ErrorState error={diff.error} onRetry={diff.reload} compact />;
   if (!diff.data) return <SkeletonRows rows={4} cols={2} />;
@@ -387,7 +389,7 @@ function DiffTab({ id, tick }: { id: string; tick: number }) {
   if (list.length === 0) return <p className="cd-empty">Nothing differs: the cluster runs what git says.</p>;
   return (
     <div className="cd-diffs">
-      <p className="cd-meta">The cluster on the left, git on the right. Fields the cluster fills in itself are left out.</p>
+      <p className="cd-meta">What a sync changes: − is what runs, + what it becomes. Fields the cluster fills in itself are left out.</p>
       {list.map((d) => (
         <div key={objectKey(d.key)} className="cd-diff">
           {d.why && <p className="cd-why">{d.why}</p>}
@@ -398,8 +400,20 @@ function DiffTab({ id, tick }: { id: string; tick: number }) {
   );
 }
 
-function HistoryTab({ id, tick, onRollback }: { id: string; tick: number; onRollback?: (d: CdDeployment) => void }) {
+function HistoryList({
+  id,
+  tick,
+  busy,
+  onRollback,
+}: {
+  id: string;
+  tick: number;
+  busy: boolean;
+  onRollback?: (d: CdDeployment, prune: boolean) => Promise<void>;
+}) {
   const history = useResource((s) => cdApi.history(id, s), [id, tick]);
+  const [asking, setAsking] = React.useState<number | null>(null);
+  const [prune, setPrune] = React.useState(false);
   if (history.error && !history.data) return <ErrorState error={history.error} onRetry={history.reload} compact />;
   if (!history.data) return <SkeletonRows rows={4} cols={3} />;
   const list = history.data.history;
@@ -409,29 +423,69 @@ function HistoryTab({ id, tick, onRollback }: { id: string; tick: number; onRoll
   const same = (x: CdDeployment, y: CdDeployment | undefined) =>
     !!y && (x.commits?.length && y.commits?.length ? x.commits.join() === y.commits.join() : x.revision === y.revision);
   return (
-    <div className="cd-history" role="list">
-      {list.map((h) => (
-        <div key={`${h.at_ms}-${h.op}`} className="cd-history-row" role="listitem">
-          <StatePair tone={h.succeeded ? "succeeded" : "failed"} word={h.succeeded ? "Deployed" : "Failed"} />
-          <span className="cd-mono">
-            #{h.id} · {shortRev(h.revision) || "no revision"}
-          </span>
-          <span className="cd-history-what">
-            {TRIGGER_WORD[h.trigger] ?? h.trigger}
-            {h.by ? ` by ${h.by}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
-            {h === current ? " · what runs now" : ""}
-          </span>
-          <RelTime ts={Math.floor(h.at_ms / 1000)} className="cd-meta cd-history-at" />
-          {onRollback && h.succeeded && !same(h, current) && h.id > 0 ? (
-            <Button size="xs" variant="ghost" className="cd-history-act" onClick={() => onRollback(h)}>
-              Roll back
-            </Button>
-          ) : (
-            <span className="cd-history-act" aria-hidden="true" />
-          )}
-          {!h.succeeded && h.message && <p className="cd-history-msg">{h.message}</p>}
-        </div>
-      ))}
+    <div className="cd-history" role="list" aria-label="Deployments">
+      {list.map((h) => {
+        const canRollBack = onRollback && h.succeeded && !same(h, current) && h.id > 0;
+        return (
+          <div key={`${h.at_ms}-${h.op}`} className="cd-history-row" role="listitem">
+            <StatePair tone={h.succeeded ? "succeeded" : "failed"} word={h.succeeded ? "Deployed" : "Failed"} />
+            <span className="cd-mono">
+              #{h.id} · {shortRev(h.revision) || "no revision"}
+            </span>
+            <span className="cd-history-what">
+              {TRIGGER_WORD[h.trigger] ?? h.trigger}
+              {h.by ? ` by ${h.by}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
+              {h === current ? " · what runs now" : ""}
+            </span>
+            <RelTime ts={Math.floor(h.at_ms / 1000)} className="cd-meta cd-history-at" />
+            {canRollBack ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                className="cd-history-act"
+                aria-expanded={asking === h.id}
+                onClick={() => {
+                  setAsking(asking === h.id ? null : h.id);
+                  setPrune(false);
+                }}
+              >
+                Roll back…
+              </Button>
+            ) : (
+              <span className="cd-history-act" aria-hidden="true" />
+            )}
+            {!h.succeeded && h.message && <p className="cd-history-msg">{h.message}</p>}
+            {canRollBack && asking === h.id && (
+              <div className="cd-confirm cd-history-confirm" role="group" aria-label={`Roll back to deployment ${h.id}`}>
+                <p>
+                  kiln renders deployment {h.id}
+                  {h.revision ? ` (${shortRev(h.revision)})` : ""} again and syncs it. The app holds there until git changes it, then
+                  follows git again.
+                </p>
+                <label className="cd-opt">
+                  <input type="checkbox" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Also delete what it didn't have
+                  (prune)
+                </label>
+                <div className="cd-confirm-actions">
+                  <Button
+                    size="xs"
+                    onClick={async () => {
+                      await onRollback(h, prune);
+                      setAsking(null);
+                    }}
+                    disabled={busy}
+                  >
+                    Roll back to #{h.id}
+                  </Button>
+                  <Button size="xs" variant="ghost" onClick={() => setAsking(null)}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

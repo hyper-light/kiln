@@ -73,12 +73,12 @@ fn app_only() -> Value {
 
 fn selector_props() -> Value {
     json!({
-        "project": {"type": "string"},
-        "cluster": {"type": "string"},
+        "project": {"type": "string", "description": "A project; several separated by commas."},
+        "cluster": {"type": "string", "description": "A cluster; several separated by commas."},
         "environment": {"type": "string"},
-        "sync": {"type": "string", "enum": ["Synced", "OutOfSync", "Unknown"]},
-        "health": {"type": "string", "enum": ["Healthy", "Progressing", "Degraded", "Suspended", "Missing", "Unknown"]},
-        "q": {"type": "string", "description": "A substring of the app's id."},
+        "sync": {"type": "string", "description": "Synced, OutOfSync or Unknown; several separated by commas."},
+        "health": {"type": "string", "description": "Healthy, Progressing, Degraded, Suspended, Missing or Unknown; several separated by commas."},
+        "q": {"type": "string", "description": "A part of the app's id (any case)."},
         "labels": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Labels the app must have, all of them."}
     })
 }
@@ -105,6 +105,8 @@ pub fn ops() -> &'static [Op] {
                     }
                     obj_schema(p, &[])
                 }, run: list),
+            op!("cd.apps.facets", "How many apps each filter value would show (sync, health, cluster, project), given the other filters chosen, and how many match all of them.", ro: true, destructive: false,
+                input: || obj_schema(selector_props(), &[]), run: facets),
             op!("cd.apps.get", "One app: definition, status, the last sync, source commits, children.", ro: true, destructive: false,
                 input: app_only, run: get),
             op!("cd.apps.resources", "An app's resources, each with sync, health, and why it differs when it does.", ro: true, destructive: false,
@@ -224,16 +226,60 @@ async fn summary(cx: Cx, _: Value) -> Out {
     Ok(json!({"apps": cx.cd.apps.read().len(), "sync": sync, "health": health, "clusters": cx.cd.clusters.read().len()}))
 }
 
+/// The facets apps are filtered and counted by.
+const FACETS: [&str; 4] = ["sync", "health", "cluster", "project"];
+
+/// An app's value for each facet; an app not compared yet is Unknown.
+fn facet_values<'a>(e: &'a AppEntry, s: Option<&Summary>) -> [&'a str; 4] {
+    [s.map_or("Unknown", |s| s.sync.as_str()), s.map_or("Unknown", |s| s.health.as_str()), e.def.destination.cluster.as_str(), e.def.project.as_str()]
+}
+
+/// Whether a selector lets `value` through for `field`: no filter, or one of its values (a list,
+/// or a string of comma-separated values).
+fn allows(sel: &Value, field: &str, value: &str) -> bool {
+    match sel.get(field) {
+        Some(Value::String(s)) => s.is_empty() || s.split(',').any(|x| x.trim() == value),
+        Some(Value::Array(a)) => a.is_empty() || a.iter().any(|x| x.as_str() == Some(value)),
+        _ => true,
+    }
+}
+
+/// Whether an app matches what a selector says besides the facets: its id, environment, labels.
+fn selects_rest(sel: &Value, e: &AppEntry) -> bool {
+    str_in(sel, "q").is_none_or(|needle| e.def.id().to_lowercase().contains(&needle.to_lowercase()))
+        && str_in(sel, "environment").is_none_or(|v| e.def.environment.as_deref() == Some(v))
+        && sel.get("labels").and_then(Value::as_object).is_none_or(|ls| ls.iter().all(|(k, v)| e.def.labels.get(k).map(String::as_str) == v.as_str()))
+}
+
 /// Whether an app matches a selector's fields.
 fn selects(sel: &Value, e: &AppEntry, s: Option<&Summary>) -> bool {
-    let id = e.def.id();
-    str_in(sel, "project").is_none_or(|p| p == e.def.project)
-        && str_in(sel, "cluster").is_none_or(|c| c == e.def.destination.cluster)
-        && str_in(sel, "environment").is_none_or(|v| e.def.environment.as_deref() == Some(v))
-        && str_in(sel, "sync").is_none_or(|v| s.is_some_and(|s| s.sync.as_str() == v))
-        && str_in(sel, "health").is_none_or(|v| s.is_some_and(|s| s.health.as_str() == v))
-        && str_in(sel, "q").is_none_or(|needle| id.contains(needle))
-        && sel.get("labels").and_then(Value::as_object).is_none_or(|ls| ls.iter().all(|(k, v)| e.def.labels.get(k).map(String::as_str) == v.as_str()))
+    selects_rest(sel, e) && FACETS.iter().zip(facet_values(e, s)).all(|(f, v)| allows(sel, f, v))
+}
+
+/// How many apps each facet value would show given the other facets chosen (so a count says
+/// what choosing it does), and how many match everything chosen.
+async fn facets(cx: Cx, sel: Value) -> Out {
+    let apps = cx.cd.apps.read();
+    let statuses = cx.cd.statuses.read();
+    let mut counts: [std::collections::BTreeMap<String, u64>; 4] = Default::default();
+    let mut total = 0u64;
+    for (id, e) in apps.iter() {
+        if !selects_rest(&sel, e) {
+            continue;
+        }
+        let values = facet_values(e, statuses.get(id.as_str()));
+        let pass: Vec<bool> = FACETS.iter().zip(values).map(|(f, v)| allows(&sel, f, v)).collect();
+        if pass.iter().all(|p| *p) {
+            total += 1;
+        }
+        for (i, (count, v)) in counts.iter_mut().zip(values).enumerate() {
+            if pass.iter().enumerate().all(|(j, p)| j == i || *p) {
+                *count.entry(v.to_owned()).or_default() += 1;
+            }
+        }
+    }
+    let [sync, health, cluster, project] = counts;
+    Ok(json!({"total": total, "facets": {"sync": sync, "health": health, "cluster": cluster, "project": project}}))
 }
 
 fn selected(cd: &Cd, sel: &Value, max: usize) -> Vec<String> {
