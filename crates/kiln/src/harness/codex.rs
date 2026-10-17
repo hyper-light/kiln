@@ -122,7 +122,7 @@ fn not_yet(msg: &str) -> Option<&'static str> {
 
 /// Reasoning efforts every Codex reasoning model takes, offered until model/list says which the
 /// model in use has, and for a model it does not list.
-const EFFORTS: &[&str] = &["low", "medium", "high"];
+pub(super) const EFFORTS: &[&str] = &["low", "medium", "high"];
 
 /// An approval request Codex is waiting on.
 #[derive(Debug, Clone)]

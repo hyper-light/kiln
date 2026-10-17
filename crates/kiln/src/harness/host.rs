@@ -201,6 +201,9 @@ impl Host {
         let pids: Vec<u32> = self.sessions.lock().values().filter_map(|s| *s.pid.lock()).collect();
         for pid in pids {
             stop_process(pid);
+            // This image re-executes next and the new one won't wait for it: reaped now.
+            #[cfg(unix)]
+            let _ = crate::os::try_reap(pid);
         }
     }
 

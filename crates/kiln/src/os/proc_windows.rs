@@ -216,6 +216,11 @@ pub async fn terminate_group(running: &mut Running, grace: Duration) {
     let _ = crate::rt::timeout(grace, running.wait()).await;
 }
 
+/// GitHub's cancel sequence has no Windows equivalent for a job object: kill it, then wait.
+pub async fn interrupt_group(running: &mut Running, int_grace: Duration, term_grace: Duration) {
+    terminate_group(running, int_grace + term_grace).await;
+}
+
 /// Kill the process tree rooted at `pid` (`taskkill /T /F`; a PTY step's shell is not in a job,
 /// since ConPTY spawns it). There is no graceful stop on Windows, so `grace` is unused.
 pub async fn terminate_tree(pid: i32, _grace: Duration) {

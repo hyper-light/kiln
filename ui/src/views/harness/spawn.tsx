@@ -1,12 +1,12 @@
 /**
  * Start agents. Written like a message: what it should do comes first; which agent, where, how
- * many and how careful sit in one row of chips underneath; the button to start is always in view.
- * On a phone it's a full-screen sheet.
+ * many, how careful and how hard it thinks sit in one row of chips underneath; the button to start
+ * is always in view. On a phone it's a full-screen sheet.
  */
 import * as React from "react";
 import "./harness.css";
 import { Dialog as D, DropdownMenu, Popover } from "radix-ui";
-import { Check, ChevronDown, Folder, Rocket, Server, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
+import { Check, ChevronDown, Folder, Gauge, Rocket, Server, ShieldCheck, ShieldOff, SlidersHorizontal, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type KindInfo, type PastSession, type Spec } from "@/api/harness";
 import type { Agent, TerminalSessionInfo } from "@/api/types";
@@ -22,9 +22,11 @@ interface ModeChoice {
   id: string;
   label: string;
   hint: string;
+  /** Turns checks off: chosen only with an explicit "Turn them off", and never remembered. */
+  dangerous?: boolean;
 }
 
-/** Each harness's own permission modes (what the machine reports wins). Never the skip-all modes. */
+/** Each harness's own permission modes (what the machine reports wins). */
 const MODES: Record<string, ModeChoice[]> = {
   claude: [
     { id: "default", label: "Ask first", hint: "Asks before commands and edits" },
@@ -37,9 +39,13 @@ const MODES: Record<string, ModeChoice[]> = {
     { id: "read-only", label: "Read only", hint: "Reads and answers; changes nothing" },
   ],
 };
-type KindWithModes = KindInfo & { modes?: { id: string; label: string; description: string; dangerous?: boolean }[]; default_mode?: string };
-const modesFor = (k: KindInfo | undefined): ModeChoice[] =>
-  (k as KindWithModes | undefined)?.modes?.filter((m) => !m.dangerous).map((m) => ({ id: m.id, label: m.label, hint: m.description })) ?? MODES[k?.id ?? ""] ?? [];
+const modesFor = (k: KindInfo | undefined): ModeChoice[] => k?.modes?.map((m) => ({ id: m.id, label: m.label, hint: m.description, dangerous: m.dangerous })) ?? MODES[k?.id ?? ""] ?? [];
+
+/** Each harness's effort levels, lowest first, for runners that don't report them yet. */
+const EFFORTS: Record<string, string[]> = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["low", "medium", "high"] };
+const capital = (v: string) => v.charAt(0).toUpperCase() + v.slice(1);
+const effortsFor = (k: KindInfo | undefined): { id: string; label: string; hint?: string }[] =>
+  k?.efforts?.map((e) => ({ id: e.id, label: e.label || capital(e.id), hint: e.description || undefined })) ?? (EFFORTS[k?.id ?? ""] ?? []).map((id) => ({ id, label: capital(id) }));
 
 const COUNTS = [1, 2, 3, 4, 6, 8, 12];
 
@@ -233,6 +239,10 @@ export function SpawnDialog({
   const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
   const [kind, setKind] = useLocalStorage("kiln.agents.kind", "claude");
   const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
+  const [effortByKind, setEffortByKind] = useLocalStorage<Record<string, string>>("kiln.agents.efforts", {});
+  /** A mode that turns checks off: `armed` waits for "Turn them off", `unchecked` is confirmed (for this start only). */
+  const [armed, setArmed] = React.useState("");
+  const [unchecked, setUnchecked] = React.useState("");
   const [dirs, setDirs] = useLocalStorage<Record<string, string[]>>("kiln.agents.recentDirs", {});
   const [byTarget, setByTarget] = React.useState<Record<string, KindInfo[]> | null>(null);
   const [picked, setPicked] = React.useState<string | null>(null);
@@ -250,6 +260,8 @@ export function SpawnDialog({
   React.useEffect(() => {
     if (!open) return;
     setError(null);
+    setArmed("");
+    setUnchecked("");
     setPicked(defaults?.target ?? null);
     setShell(defaults?.shell ?? "");
     if (defaults?.kind) setKind(defaults.kind);
@@ -297,8 +309,22 @@ export function SpawnDialog({
 
   const kindInfo = all.find((k) => k.id === kind);
   const modes = modesFor(kindInfo);
-  const mode = modes.some((m) => m.id === modeByKind[kind]) ? (modeByKind[kind] ?? "") : ((kindInfo as KindWithModes | undefined)?.default_mode ?? modes[0]?.id ?? "");
+  const safe = (id: string | undefined) => modes.some((m) => m.id === id && !m.dangerous);
+  const mode = modes.some((m) => m.id === unchecked) ? unchecked : safe(modeByKind[kind]) ? (modeByKind[kind] ?? "") : (kindInfo?.default_mode ?? modes.find((m) => !m.dangerous)?.id ?? "");
   const modeInfo = modes.find((m) => m.id === mode);
+  const armedInfo = modes.find((m) => m.id === armed);
+  const pickMode = (id: string) => {
+    setArmed("");
+    if (modes.find((m) => m.id === id)?.dangerous) {
+      if (id !== unchecked) setArmed(id);
+      return;
+    }
+    setUnchecked("");
+    setModeByKind({ ...modeByKind, [kind]: id });
+  };
+  const efforts = effortsFor(kindInfo);
+  const effort = efforts.some((e) => e.id === effortByKind[kind]) ? (effortByKind[kind] ?? "") : "";
+  const effortInfo = efforts.find((e) => e.id === effort);
   const shellInfo = shell ? shells.find((s) => s.id === shell) : undefined;
   const targetShells = shells.filter((s) => s.target === target && !s.exited);
 
@@ -307,7 +333,11 @@ export function SpawnDialog({
     setBusy(true);
     setError(null);
     try {
-      const started = await harnessApi.start(target, { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: mode || undefined, name: (p.title || "").slice(0, 80) || undefined }, 1);
+      const started = await harnessApi.start(
+        target,
+        { kind: p.kind, cwd: p.cwd || undefined, resume: p.id, mode: mode || undefined, effort: effort || undefined, name: (p.title || "").slice(0, 80) || undefined },
+        1,
+      );
       setDirs({ ...dirs, [target]: [p.cwd, ...recent.filter((d) => d !== p.cwd)].slice(0, 8) });
       onStarted(started);
     } catch (e) {
@@ -326,6 +356,7 @@ export function SpawnDialog({
       // In a shell, the agent starts where the shell is; "~" (or nothing) is the machine's home.
       cwd: shell || !cwd.trim() || cwd.trim() === "~" ? undefined : cwd.trim(),
       mode: mode || undefined,
+      effort: effort || undefined,
       model: model.trim() || undefined,
       name: name.trim() || undefined,
       prompt: prompt.trim() || undefined,
@@ -436,10 +467,21 @@ export function SpawnDialog({
                 {modes.length > 0 && (
                   <Chip
                     title="Permissions"
+                    icon={modeInfo?.dangerous ? <ShieldOff size={13} className="sp-chip-warn" /> : <ShieldCheck size={13} />}
                     label={modeInfo?.label ?? mode}
                     value={mode}
-                    onPick={(m) => setModeByKind({ ...modeByKind, [kind]: m })}
+                    onPick={pickMode}
                     options={modes.map((m) => ({ value: m.id, label: m.label, hint: m.hint }))}
+                  />
+                )}
+                {efforts.length > 0 && (
+                  <Chip
+                    title="Effort"
+                    icon={<Gauge size={13} />}
+                    label={effortInfo ? `${effortInfo.label} effort` : "Default effort"}
+                    value={effort}
+                    onPick={(e) => setEffortByKind({ ...effortByKind, [kind]: e })}
+                    options={[{ value: "", label: "Default", hint: "The model's own" }, ...efforts.map((e) => ({ value: e.id, label: e.label, hint: e.hint }))]}
                   />
                 )}
                 <button type="button" className={cn("sp-chip", more && "sp-chip-on")} aria-expanded={more} onClick={() => setMore(!more)}>
@@ -477,7 +519,23 @@ export function SpawnDialog({
 
             {!shell && target && <InlinePath target={target} value={cwd} onChange={setCwd} recent={recent} className="sp-path" />}
             {!noHarness && upgradeHint}
-            {modeInfo && <div className="sp-hint">{modeInfo.hint}.</div>}
+            {armedInfo ? (
+              <div className="sp-hint sp-hint-warn">
+                {armedInfo.label}: no checks at all.{" "}
+                <button
+                  type="button"
+                  className="sp-confirm"
+                  onClick={() => {
+                    setUnchecked(armedInfo.id);
+                    setArmed("");
+                  }}
+                >
+                  Turn them off
+                </button>
+              </div>
+            ) : (
+              modeInfo && <div className={cn("sp-hint", modeInfo.dangerous && "sp-hint-warn")}>{modeInfo.hint}.</div>
+            )}
             {error && <div className="sp-error">{error}</div>}
             <PastSessions target={target} kind={kind} kindName={kindInfo?.name ?? kind} onPick={(p) => void resume(p)} busy={busy} />
 

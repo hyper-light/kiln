@@ -52,6 +52,7 @@ pub fn token_path(cfg: &Config) -> PathBuf {
 }
 
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
+    crate::os::start_reaper();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
@@ -93,6 +94,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // HTTPS on the HTTP port, when asked: the configured certificate, else the kiln CA's.
     let tls = if cfg.server.https { Some(server_tls(&cfg, &leaf)?) } else { None };
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
+    // The CI engine (docs/ci.md), when turned on.
+    crate::ci::dispatch::spawn(hub.clone());
     // Runners' front doors: what the UI set, sent to each runner when it connects.
     hub.front_doors.load(&hub.store).await?;
     // The tailnet's DNS for them: the Tailscale credential given in the UI, the routes kiln set.

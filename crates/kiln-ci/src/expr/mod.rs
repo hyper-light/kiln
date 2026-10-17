@@ -93,6 +93,10 @@ pub struct StatusView {
     pub failed: bool,
     /// The run was cancelled.
     pub cancelled: bool,
+    /// A needed job, transitively, was skipped: `success()` is false and `failure()` is not true
+    /// (GitHub skips a job whose need was skipped unless its `if` lets it run, as `!failure()`
+    /// does). Always false for steps.
+    pub skipped: bool,
 }
 
 /// Supplies contexts lazily (the `github.event` payload can be large).
@@ -481,7 +485,7 @@ pub fn eval(e: &Expr, cx: &dyn Contexts, b: &mut Budget) -> Result<Value, ExprEr
 pub fn eval_if(e: &Expr, cx: &dyn Contexts, b: &mut Budget) -> Result<bool, ExprError> {
     if !e.uses_status_function() {
         let s = cx.status();
-        if s.failed || s.cancelled {
+        if s.failed || s.cancelled || s.skipped {
             return Ok(false);
         }
     }
@@ -495,7 +499,7 @@ pub fn eval_condition(c: &Condition, cx: &dyn Contexts, b: &mut Budget) -> Resul
         Condition::Template(t) => {
             if !c.uses_status_function() {
                 let s = cx.status();
-                if s.failed || s.cancelled {
+                if s.failed || s.cancelled || s.skipped {
                     return Ok(false);
                 }
             }

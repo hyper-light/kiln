@@ -135,7 +135,7 @@ const USAGE_EVERY_MS: i64 = 180_000;
 
 /// The effort levels Claude Code knows (its settings schema), offered until initialize says which
 /// the model in use has, and for a model it does not list.
-const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
@@ -3158,7 +3158,7 @@ pub fn modes(allow_bypass: bool) -> Vec<ModeOption> {
 
 /// Whether Claude Code would let this process skip its checks: as root it refuses to, unless
 /// told it runs in a sandbox (`IS_SANDBOX`).
-fn bypass_possible() -> bool {
+pub(super) fn bypass_possible() -> bool {
     !crate::os::is_root() || std::env::var_os("IS_SANDBOX").is_some()
 }
 

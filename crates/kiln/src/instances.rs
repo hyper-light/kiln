@@ -38,6 +38,8 @@ impl Owned {
                 Some(Self::Agent(session.clone()))
             }
             ServerMsg::Assign(a) => Some(Self::Job(a.job_id.clone())),
+            // The CI engine's assignment carries its leg's id inside its JSON (docs/ci.md §2.5).
+            ServerMsg::AssignV2 { json } => assign_v2_job(json).map(Self::Job),
             ServerMsg::Cancel { job, .. } => Some(Self::Job(job.clone())),
             _ => None,
         }
@@ -45,8 +47,17 @@ impl Owned {
 
     /// Messages that create the thing: whoever they are sent to owns it from then on.
     fn creates(msg: &ServerMsg) -> bool {
-        matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. } | ServerMsg::Assign(_))
+        matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. } | ServerMsg::Assign(_) | ServerMsg::AssignV2 { .. })
     }
+}
+
+/// The leg an `AssignV2` is for.
+fn assign_v2_job(json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Head {
+        job_id: String,
+    }
+    serde_json::from_str::<Head>(json).ok().map(|h| h.job_id)
 }
 
 #[derive(Debug, Clone)]

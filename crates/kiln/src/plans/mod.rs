@@ -4,11 +4,13 @@
 //! step a message waiting in the agent's queue for the turn before it to end. The same operations
 //! serve the console (`/api/plans`), agents (kiln's MCP server: `plans.*`) and code mode.
 
+pub mod criteria;
 pub mod ops;
 
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
+pub use criteria::{Criterion, Op, Test};
 use crate::harness::model::{Command, SendMode};
 use crate::harness::registry::Sent;
 use crate::harness::session::Spec;
@@ -49,7 +51,8 @@ pub struct Plan {
     pub runs: i64,
 }
 
-/// One item of a plan: a piece of the work, with what it's like and what makes it done.
+/// One step of a plan: a piece of the work, what it's like, what makes it done, and how it's
+/// tested.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Item {
@@ -59,42 +62,86 @@ pub struct Item {
     pub description: String,
     /// Examples of what's meant.
     pub examples: String,
-    /// When it's done.
-    pub acceptance: String,
-    /// How it's tested: examples, scenarios, criteria.
-    pub testing: String,
+    /// When it's done: criteria, each in words or a measure.
+    #[serde(deserialize_with = "criteria::criteria_list")]
+    pub acceptance: Vec<Criterion>,
+    /// How it's tested: scenarios, each with what it passes by.
+    #[serde(deserialize_with = "criteria::test_list")]
+    pub testing: Vec<Test>,
 }
 
+/// Criteria and tests a step has at the most.
+const CRITERIA: usize = 50;
+
 impl Item {
-    /// The item as markdown: its title, then each part it has under its name.
+    /// The step as text for an agent: its title, what to do, examples, then its acceptance
+    /// criteria and tests, a sentence each.
     pub fn text(&self) -> String {
         let mut out = self.title.trim().to_owned();
-        for (name, v) in [("", &self.description), ("Examples", &self.examples), ("Acceptance criteria", &self.acceptance), ("Testing", &self.testing)] {
-            let v = v.trim();
-            if v.is_empty() {
-                continue;
+        let (d, e) = (self.description.trim(), self.examples.trim());
+        if !d.is_empty() {
+            out.push_str(&format!("\n\n{d}"));
+        }
+        if !e.is_empty() {
+            out.push_str(&format!("\n\nExamples:\n{e}"));
+        }
+        if !self.acceptance.is_empty() {
+            out.push_str("\n\nAcceptance criteria:");
+            for c in &self.acceptance {
+                out.push_str(&format!("\n- {}", c.sentence()));
             }
-            out.push_str("\n\n");
-            if !name.is_empty() {
-                out.push_str(&format!("{name}:\n"));
+        }
+        if !self.testing.is_empty() {
+            out.push_str("\n\nTests:");
+            for t in &self.testing {
+                out.push_str(&format!("\n- {}", t.sentence()));
             }
-            out.push_str(v);
         }
         out
     }
 
-    /// The item as a goal: one line, what it is and what makes it done (its harness's /goal
+    /// The step as a goal: one line, what it is and what makes it done (its harness's /goal
     /// checks the condition, and takes it as what to work toward).
     pub fn goal(&self) -> String {
+        let join = |v: Vec<String>| v.join("; ");
         let parts = [
             self.title.trim().to_owned(),
             self.description.trim().to_owned(),
             if self.examples.trim().is_empty() { String::new() } else { format!("Examples: {}", self.examples.trim()) },
-            if self.acceptance.trim().is_empty() { String::new() } else { format!("Done when: {}", self.acceptance.trim()) },
-            if self.testing.trim().is_empty() { String::new() } else { format!("Tested by: {}", self.testing.trim()) },
+            if self.acceptance.is_empty() { String::new() } else { format!("Done when: {}", join(self.acceptance.iter().map(Criterion::sentence).collect())) },
+            if self.testing.is_empty() { String::new() } else { format!("Tests: {}", join(self.testing.iter().map(Test::sentence).collect())) },
         ];
         let line = parts.iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join(" — ").split_whitespace().collect::<Vec<_>>().join(" ");
         if line.chars().count() > 1990 { format!("{}…", line.chars().take(1990).collect::<String>()) } else { line }
+    }
+
+    /// What's wrong with it, if anything (`n`: its number).
+    fn problem(&self, n: usize) -> Option<String> {
+        if self.title.trim().is_empty() {
+            return Some(format!("step {n} needs a title"));
+        }
+        if self.title.chars().count() > TITLE {
+            return Some(format!("step {n}'s title is {TITLE} characters at the most"));
+        }
+        if self.acceptance.len() > CRITERIA || self.testing.len() > CRITERIA || self.testing.iter().any(|t| t.criteria.len() > CRITERIA) {
+            return Some(format!("step {n} has {CRITERIA} criteria and {CRITERIA} tests at the most"));
+        }
+        let size = self.description.len() + self.examples.len() + serde_json::to_string(&self.acceptance).map_or(0, |s| s.len()) + serde_json::to_string(&self.testing).map_or(0, |s| s.len());
+        if size > FIELD * 4 {
+            return Some(format!("step {n} is {} KiB at the most", (FIELD * 4) >> 10));
+        }
+        if let Some(p) = self.acceptance.iter().find_map(Criterion::problem) {
+            return Some(format!("step {n}: {p}"));
+        }
+        for (i, t) in self.testing.iter().enumerate() {
+            if t.scenario.trim().is_empty() && t.criteria.is_empty() {
+                return Some(format!("step {n}, test {}: say its scenario", i + 1));
+            }
+            if let Some(p) = t.criteria.iter().find_map(Criterion::problem) {
+                return Some(format!("step {n}, test {}: {p}", i + 1));
+            }
+        }
+        None
     }
 }
 
@@ -278,10 +325,22 @@ pub fn markdown(p: &Plan) -> String {
             out.push_str("\n\n");
         }
         out.push_str(&format!("## {}. {}", i + 1, it.title.trim()));
-        for (name, v) in [("", &it.description), ("Examples", &it.examples), ("Acceptance criteria", &it.acceptance), ("Testing", &it.testing)] {
+        for (name, v) in [("", &it.description), ("Examples", &it.examples)] {
             let v = v.trim();
             if !v.is_empty() {
                 out.push_str(&if name.is_empty() { format!("\n\n{v}") } else { format!("\n\n**{name}**\n\n{v}") });
+            }
+        }
+        if !it.acceptance.is_empty() {
+            out.push_str("\n\n**Acceptance criteria**\n");
+            for c in &it.acceptance {
+                out.push_str(&format!("\n- {}", c.sentence()));
+            }
+        }
+        if !it.testing.is_empty() {
+            out.push_str("\n\n**Tests**\n");
+            for t in &it.testing {
+                out.push_str(&format!("\n- {}", t.sentence()));
             }
         }
     }
@@ -339,16 +398,8 @@ fn check(title: &str, body: &str, items: &[Item]) -> R<()> {
     if items.len() > ITEMS {
         return Err(Error::Bad(format!("a plan has {ITEMS} steps at the most")));
     }
-    for (i, it) in items.iter().enumerate() {
-        if it.title.trim().is_empty() {
-            return Err(Error::Bad(format!("step {} needs a title", i + 1)));
-        }
-        if it.title.chars().count() > TITLE {
-            return Err(Error::Bad(format!("step {}'s title is {TITLE} characters at the most", i + 1)));
-        }
-        if [&it.description, &it.examples, &it.acceptance, &it.testing].iter().any(|f| f.len() > FIELD) {
-            return Err(Error::Bad(format!("each part of step {} is {} KiB at the most", i + 1, FIELD >> 10)));
-        }
+    if let Some(p) = items.iter().enumerate().find_map(|(i, it)| it.problem(i + 1)) {
+        return Err(Error::Bad(p));
     }
     Ok(())
 }
@@ -684,18 +735,30 @@ mod tests {
 
     #[test]
     fn items_read_as_markdown_as_steps_and_as_goals() {
-        let it = Item { title: "Split the scanner".into(), description: "Move number scanning\ninto its own fn.".into(), examples: "0x1F, 1e9".into(), acceptance: "scan_number exists; lexer tests pass".into(), testing: "hex, octal and exponent cases".into() };
+        let le = Criterion::Quantitative { target: "scan time".into(), op: Op::Le, value: "2".into(), value2: String::new(), unit: "ms".into(), baseline: String::new(), measured: String::new() };
+        let it = Item {
+            title: "Split the scanner".into(),
+            description: "Move number scanning\ninto its own fn.".into(),
+            examples: "0x1F, 1e9".into(),
+            acceptance: vec![Criterion::Qualitative { text: "scan_number exists".into() }, le],
+            testing: vec![Test { scenario: "hex literals".into(), criteria: vec![Criterion::Qualitative { text: "0x1F reads as 31".into() }] }],
+        };
         let p = Plan { id: "p".into(), title: "Lexer".into(), body: "Why: the scanner grew.".into(), items: vec![it.clone(), Item { title: "Ship it".into(), ..Item::default() }], tags: vec![], source: None, share: None, version: 1, created_at: 0, updated_at: 0, steps: vec![], runs: 0 };
         let md = markdown(&p);
         assert!(md.starts_with("Why: the scanner grew.\n\n## 1. Split the scanner\n\nMove number scanning"), "{md}");
-        assert!(md.contains("**Acceptance criteria**\n\nscan_number exists") && md.contains("## 2. Ship it"), "{md}");
+        assert!(md.contains("**Acceptance criteria**\n\n- scan_number exists\n- scan time is at most 2 ms") && md.contains("**Tests**\n\n- hex literals — passes when 0x1F reads as 31") && md.contains("## 2. Ship it"), "{md}");
         assert!(message(&p).contains("# Lexer\n\nWhy: the scanner grew."));
-        assert!(it.text().starts_with("Split the scanner\n\nMove number scanning") && it.text().contains("Testing:\nhex, octal"));
-        assert_eq!(it.goal(), "Split the scanner — Move number scanning into its own fn. — Examples: 0x1F, 1e9 — Done when: scan_number exists; lexer tests pass — Tested by: hex, octal and exponent cases");
+        assert!(it.text().starts_with("Split the scanner\n\nMove number scanning") && it.text().contains("Acceptance criteria:\n- scan_number exists\n- scan time is at most 2 ms\n\nTests:\n- hex literals"), "{}", it.text());
+        assert_eq!(
+            it.goal(),
+            "Split the scanner — Move number scanning into its own fn. — Examples: 0x1F, 1e9 — Done when: scan_number exists; scan time is at most 2 ms — Tests: hex literals — passes when 0x1F reads as 31"
+        );
         assert!(Item { title: "x".repeat(50), description: "y ".repeat(2000), ..Item::default() }.goal().chars().count() <= 1991);
         assert!(check("T", "", &[Item { title: "a".into(), ..Item::default() }]).is_ok());
         assert!(check("T", "", &[]).is_err());
         assert!(check("T", "", &[Item::default()]).is_err());
+        let bad = Item { title: "a".into(), acceptance: vec![Criterion::Quantitative { target: "x".into(), op: Op::Le, value: "soon".into(), value2: String::new(), unit: String::new(), baseline: String::new(), measured: String::new() }], ..Item::default() };
+        assert!(matches!(check("T", "", &[bad]), Err(Error::Bad(m)) if m.starts_with("step 1: x's threshold is a number")));
         assert_eq!(title_for("", &[Item { title: "First thing".into(), ..Item::default() }]), "First thing");
     }
 

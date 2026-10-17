@@ -9,6 +9,7 @@
 //! - [`plan`]: a run's graph, matrices, reusable workflows, outputs (W04).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`results`]: test reports and flaky classification (W16).
+//! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
 //! - [`stats`]: bootstrap intervals for benchmarks and experiments (W16, W20).
 //! - [`facts`]: what runners report about themselves (W13).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
@@ -17,6 +18,7 @@ pub mod expr;
 pub mod facts;
 pub mod plan;
 pub mod results;
+pub mod runner;
 pub mod sched;
 pub mod stats;
 pub mod trigger;

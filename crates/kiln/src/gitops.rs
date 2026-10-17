@@ -158,6 +158,17 @@ pub async fn load_pipelines(
     repo: &Repo,
     sha: &str,
 ) -> anyhow::Result<Vec<(String, Result<Pipeline, String>)>> {
+    load_pipelines_opt(hub, repo, sha, true).await
+}
+
+/// [`load_pipelines`], with or without the auto-detected pipeline when there is none (the CI
+/// engine's GitHub workflows take its place, docs/ci.md W02-R02).
+async fn load_pipelines_opt(
+    hub: &Hub,
+    repo: &Repo,
+    sha: &str,
+    auto: bool,
+) -> anyhow::Result<Vec<(String, Result<Pipeline, String>)>> {
     let path = ensure_commit(hub, repo, sha).await?;
     let p = path.to_string_lossy().to_string();
     let listing = run_git(hub, &["-C", &p, "ls-tree", "--name-only", sha, ".kiln/"], LS_REMOTE_TIMEOUT)
@@ -172,7 +183,7 @@ pub async fn load_pipelines(
         let parsed = pipeline::parse(&String::from_utf8_lossy(&src)).map_err(|e| e.to_string());
         out.push((file.to_owned(), parsed));
     }
-    if out.is_empty() && hub.cfg.gitops.auto_pipelines {
+    if out.is_empty() && auto && hub.cfg.gitops.auto_pipelines {
         let root = run_git(hub, &["-C", &p, "ls-tree", "--name-only", sha], LS_REMOTE_TIMEOUT).await?;
         let files: Vec<String> = String::from_utf8_lossy(&root).lines().map(str::to_owned).collect();
         if let Some(yaml) = crate::autodetect::pipeline_for(&files) {
@@ -182,7 +193,7 @@ pub async fn load_pipelines(
     Ok(out)
 }
 
-async fn commit_info(hub: &Hub, repo: &Repo, sha: &str) -> (String, String) {
+pub(crate) async fn commit_info(hub: &Hub, repo: &Repo, sha: &str) -> (String, String) {
     let p = mirror_path(hub, &repo.name).to_string_lossy().to_string();
     match run_git(hub, &["-C", &p, "log", "-1", "--format=%an%x00%B", sha], LS_REMOTE_TIMEOUT).await {
         Ok(o) => {
@@ -194,7 +205,7 @@ async fn commit_info(hub: &Hub, repo: &Repo, sha: &str) -> (String, String) {
     }
 }
 
-async fn changed_files(hub: &Hub, repo: &Repo, old: &str, new: &str) -> Option<Vec<String>> {
+pub(crate) async fn changed_files(hub: &Hub, repo: &Repo, old: &str, new: &str) -> Option<Vec<String>> {
     let p = mirror_path(hub, &repo.name).to_string_lossy().to_string();
     let o = run_git(hub, &["-C", &p, "diff", "--name-only", old, new], LS_REMOTE_TIMEOUT).await.ok()?;
     Some(String::from_utf8_lossy(&o).lines().map(str::to_owned).collect())
@@ -212,7 +223,15 @@ pub struct Trigger {
 
 /// Turn a trigger into runs: one per matching pipeline file.
 pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<Run>> {
-    let pipelines = load_pipelines(hub, repo, &t.sha).await?;
+    // The CI engine's GitHub workflows (docs/ci.md W03), when it is on; v1 keeps `.kiln/`.
+    let github = match crate::ci::events::on_trigger(hub, repo, &t).await {
+        Ok(ran) => ran,
+        Err(e) => {
+            tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "the CI engine could not read the commit's workflows");
+            false
+        }
+    };
+    let pipelines = load_pipelines_opt(hub, repo, &t.sha, !github).await?;
     if pipelines.is_empty() {
         return Ok(vec![]);
     }

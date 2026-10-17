@@ -529,20 +529,22 @@ impl Store {
         .await
     }
 
-    /// Jobs waiting for an agent, oldest first.
+    /// v1 jobs waiting for an agent, oldest first (legs of the CI engine, with a `job_id`, are its
+    /// dispatcher's, docs/ci.md §2.4).
     pub async fn queued_jobs(&self, limit: u32) -> anyhow::Result<Vec<Job>> {
         self.call(move |c| {
             let mut st = c.prepare(&format!(
-                "{JOB_SELECT} WHERE status = 'queued' ORDER BY queued_at, rowid LIMIT ?1"
+                "{JOB_SELECT} WHERE status = 'queued' AND job_id IS NULL ORDER BY queued_at, rowid LIMIT ?1"
             ))?;
             Ok(st.query_map([limit], row_job)?.collect::<Result<Vec<_>, _>>()?)
         })
         .await
     }
 
+    /// v1 jobs running (the CI engine's legs are its dispatcher's).
     pub async fn running_jobs(&self) -> anyhow::Result<Vec<Job>> {
         self.call(|c| {
-            let mut st = c.prepare(&format!("{JOB_SELECT} WHERE status = 'running'"))?;
+            let mut st = c.prepare(&format!("{JOB_SELECT} WHERE status = 'running' AND job_id IS NULL"))?;
             Ok(st.query_map([], row_job)?.collect::<Result<Vec<_>, _>>()?)
         })
         .await
