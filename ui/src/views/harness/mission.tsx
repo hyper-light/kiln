@@ -1,6 +1,7 @@
 /**
- * Mission control: one list of your agents, the ones that need you first. Each row says in one line
- * what that agent is doing — or what it wants, or what it finished — and you answer it right there.
+ * Mission control: one list of your agents, newest first, each keeping its place: a row says in one
+ * line what that agent is doing — or what it wants, or what it finished — and you answer it right
+ * there. Nothing moves as agents update; only their words and marks change.
  */
 import * as React from "react";
 import "./harness.css";
@@ -18,25 +19,26 @@ import { errorMessage, useDocumentTitle, useLocalStorage, useNow } from "@/lib/h
 import { relativeTime } from "@/lib/format";
 import { plain } from "./derive";
 import { AgentMenu } from "./actions";
-import { FoundSessions } from "./found";
+import { byStart, FoundSessions, sessionKey } from "./found";
 import { machineName } from "./parts";
 import { useSeen } from "./seen";
 import { SpawnDialog } from "./spawn";
 import { useAgents } from "./use-agents";
 
-/** Where an agent stands, in the order you'd want to deal with them. */
-type Stand = "needs" | "crashed" | "working" | "finished" | "ready" | "ended";
-const RANK: Record<Stand, number> = { needs: 0, crashed: 1, working: 2, finished: 3, ready: 4, ended: 5 };
+/** Where an agent stands. */
+type Stand = "needs" | "crashed" | "working" | "finished" | "ready" | "offline" | "ended";
 
 function standOf(a: AgentInfo, seen: number | undefined): Stand {
   if (a.approvals.length > 0 || a.status === "waiting") return "needs";
   if (a.status === "exited" && a.exit?.error) return "crashed";
   if (a.status === "running" || a.status === "starting") return "working";
   if (a.status === "idle") return a.last_activity > (seen ?? 0) + 1500 ? "finished" : "ready";
+  // Its machine is reconnecting (a runner or server restart): it stays where it is.
+  if (a.status === "disconnected") return "offline";
   return "ended";
 }
 
-const WORD: Record<Stand, string> = { needs: "Needs you", crashed: "Stopped", working: "Working", finished: "Finished", ready: "Ready", ended: "Ended" };
+const WORD: Record<Stand, string> = { needs: "Needs you", crashed: "Stopped", working: "Working", finished: "Finished", ready: "Ready", offline: "Offline", ended: "Ended" };
 
 /** The one line that matters for this agent right now. */
 function lineOf(a: AgentInfo, stand: Stand): string {
@@ -57,8 +59,10 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
     case "ready":
       return a.goal || a.title || "No task yet";
+    case "offline":
+      return "Its machine is offline";
     case "ended":
-      return a.status === "disconnected" ? "Its machine is offline" : a.goal || a.title || "Ended";
+      return a.goal || a.title || "Ended";
   }
 }
 
@@ -116,14 +120,16 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, now }: { a: 
       </button>
       <span className="ms-meta">
         <span>
-          {machineName(a.target)} · {relativeTime(Math.floor(a.last_activity / 1000), now)}
+          {machineName(a.target)} · <span className="ms-time">{relativeTime(Math.floor(a.last_activity / 1000), now)}</span>
         </span>
-        {(a.left_behind ?? 0) > 0 && <span className="ms-left">{a.left_behind} left running</span>}
-        {(a.files_changed ?? 0) > 0 && (
-          <span className="ms-changes">
-            {a.files_changed} file{a.files_changed === 1 ? "" : "s"} <b>+{a.lines_added ?? 0}</b> <i>−{a.lines_removed ?? 0}</i>
-          </span>
-        )}
+        <span className="ms-meta-2">
+          {(a.files_changed ?? 0) > 0 && (
+            <span className="ms-changes">
+              {a.files_changed} file{a.files_changed === 1 ? "" : "s"} <b>+{a.lines_added ?? 0}</b> <i>−{a.lines_removed ?? 0}</i>
+            </span>
+          )}
+          {(a.left_behind ?? 0) > 0 && <span className="ms-left">{a.left_behind} left running</span>}
+        </span>
       </span>
       <span className="ms-actions">
         {stand === "needs" && ap && <Decide a={a} ap={ap} />}
@@ -221,9 +227,17 @@ export default function Mission() {
   }, [params, setParams]);
 
   // Sessions found on your machines: told when they change, and re-read now and then for their
-  // state and last activity.
+  // state and last activity. A scan can miss a session for a moment, so a row goes only once two
+  // reads in a row miss it, rather than blinking out and back.
+  const kept = React.useRef(new Map<string, { s: AiSession; missed: number }>());
   const readFound = React.useCallback(() => {
-    api.aiSessions().then(setFound, () => undefined);
+    api.aiSessions().then((list) => {
+      const m = kept.current;
+      const here = new Set(list.map(sessionKey));
+      for (const s of list) m.set(sessionKey(s), { s, missed: 0 });
+      for (const [k, v] of m) if (!here.has(k) && ++v.missed >= 2) m.delete(k);
+      setFound([...m.values()].map((v) => v.s).sort(byStart));
+    }, () => undefined);
     api.aiSilent().then((r) => setQuiet(r.machines), () => undefined);
   }, []);
   React.useEffect(() => {
@@ -239,7 +253,8 @@ export default function Mission() {
     () =>
       (list ?? [])
         .map((a) => ({ a, stand: standOf(a, seen[a.id]) }))
-        .sort((x, y) => RANK[x.stand] - RANK[y.stand] || (x.stand === "needs" ? (x.a.approvals[0]?.at ?? 0) - (y.a.approvals[0]?.at ?? 0) : y.a.last_activity - x.a.last_activity)),
+        // Newest first by when each started, which never changes: a row keeps its place.
+        .sort((x, y) => y.a.created_at - x.a.created_at || x.a.id.localeCompare(y.a.id)),
     [list, seen],
   );
   const live = rows.filter((r) => r.stand !== "ended");
@@ -303,7 +318,8 @@ export default function Mission() {
         <p className="ms-quiet">Nothing running. Start something new, or pick up an ended agent below.</p>
       )}
 
-      <FoundSessions sessions={elsewhere} quiet={quiet} now={now} />
+      {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
+      {list && <FoundSessions sessions={elsewhere} quiet={quiet} now={now} />}
 
       {ended.length > 0 && (
         <section className="ms-ended">

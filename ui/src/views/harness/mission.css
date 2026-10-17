@@ -43,7 +43,7 @@
 .ms-row {
   position: relative;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto auto;
+  grid-template-columns: 22px minmax(0, 1fr) 168px 300px;
   grid-template-areas: "check main meta actions";
   align-items: center;
   gap: 0 20px;
@@ -98,7 +98,7 @@
   color: #ededee;
   font-size: 18px;
   font-weight: 400;
-  line-height: 1.3;
+  line-height: 24px;
   letter-spacing: -0.02em;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -108,12 +108,14 @@
 }
 .ms-line {
   display: flex;
+  height: 20px;
   min-width: 0;
   align-items: baseline;
   gap: 12px;
 }
 .ms-word {
   display: inline-flex;
+  min-width: 86px;
   flex: none;
   align-items: center;
   gap: 7px;
@@ -135,7 +137,7 @@
   overflow: hidden;
   color: #97999f;
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 20px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -177,12 +179,16 @@
 .ms-row[data-stand="ready"] .ms-word > i {
   background: #6f8f84;
 }
+.ms-row[data-stand="offline"] .ms-name {
+  color: #a1a4ad;
+}
+/* Left-aligned: a time or count that grows extends to the right and moves nothing before it. */
 .ms-meta {
   grid-area: meta;
   display: flex;
   min-width: 0;
   flex-direction: column;
-  align-items: flex-end;
+  align-items: flex-start;
   gap: 5px;
   color: #7b7e88;
   font-family: var(--font-mono);
@@ -192,7 +198,20 @@
 .ms-meta > span {
   max-width: 100%;
   overflow: hidden;
+  line-height: 16px;
   text-overflow: ellipsis;
+}
+/* The meta's second line is always there, empty or not. */
+.ms-meta-2 {
+  display: flex;
+  min-height: 16px;
+  gap: 10px;
+}
+/* "now" to "59m ago" in one width, so nothing after it moves as it counts. */
+.ms-time {
+  display: inline-block;
+  min-width: 7ch;
+  font-variant-numeric: tabular-nums;
 }
 .ms-changes b {
   color: #a8c9bc;
@@ -264,13 +283,6 @@
 .ms-found {
   margin-top: 28px;
 }
-.ms-fold-note {
-  color: #a49ccf;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-}
 /* The tool's mark stands where an agent row has its checkbox. */
 .ms-mark {
   grid-area: check;
@@ -280,12 +292,57 @@
 .ms-tool {
   display: none;
 }
-.ms-reason {
+/* Only its controls act: the words are to read. */
+.ms-found-row .ms-main:hover .ms-name {
+  color: #ededee;
+}
+/* Take over and Fork always, then the transcript, set apart; a line for why not, always kept. */
+.ms-found-row .ms-actions {
+  display: grid;
+  grid-template-areas:
+    "buttons read"
+    "why why";
+  grid-template-columns: auto auto;
+  align-items: center;
+  justify-content: end;
+  gap: 4px 14px;
+}
+.ms-buttons {
+  grid-area: buttons;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ms-read {
+  grid-area: read;
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 4px;
+  padding-left: 14px;
+  border-left: 1px solid #2b2d32;
+  color: #a1a4ad;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+.ms-read:hover,
+.ms-read[aria-expanded="true"] {
+  color: #ededee;
+}
+.ms-why {
+  grid-area: why;
+  min-height: 16px;
+  overflow: hidden;
   color: #8f939e;
-  font-size: 12px;
+  font-size: 11.5px;
+  line-height: 16px;
+  text-align: right;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-a.ms-reason:hover {
+a.ms-why:hover {
   color: #ededee;
   text-decoration: underline;
 }
@@ -490,17 +547,17 @@ a.ms-reason:hover {
   }
   .ms-name {
     font-size: 16px;
-    white-space: normal;
+    line-height: 22px;
   }
+  /* Stretched: one line of text is cut to the row's width, never wider. */
   .ms-line {
+    height: auto;
     flex-direction: column;
+    align-items: stretch;
     gap: 5px;
   }
-  .ms-text {
-    display: -webkit-box;
-    white-space: normal;
-    -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
+  .ms-word {
+    min-width: 0;
   }
   .ms-mark {
     display: none;
@@ -508,7 +565,7 @@ a.ms-reason:hover {
   .ms-tool {
     display: inline;
   }
-  /* A found session's two actions need the row's width: where it runs, then what to do. */
+  /* A found session: what it is, where it runs, then what to do with it. */
   .ms-found-row {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
@@ -516,20 +573,29 @@ a.ms-reason:hover {
       "meta"
       "actions";
   }
-  .ms-found-row .ms-meta {
-    justify-content: flex-start;
-  }
   .ms-found-row .ms-actions {
-    justify-content: flex-start;
+    grid-template-columns: minmax(0, 1fr) auto;
+    justify-content: stretch;
   }
-  .ms-found-row .ms-go {
-    margin-left: auto;
+  .ms-why {
+    text-align: left;
   }
   .ms-meta {
     flex-direction: row;
     align-items: center;
     gap: 10px;
     font-size: 10px;
+  }
+  .ms-meta-2:empty {
+    display: none;
+  }
+  /* Where and when stay whole; changes and what's left running give way. */
+  .ms-meta > span:first-child {
+    flex: none;
+  }
+  .ms-meta-2 {
+    min-width: 0;
+    overflow: hidden;
   }
   /* The row's arrow opens it; one less word beside Allow and Deny. */
   .ms-actions .ms-link {

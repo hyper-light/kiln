@@ -473,6 +473,8 @@ export interface AiSession {
   takeover?: "ready" | "stop" | "outside" | "no_id" | "unsupported" | "upgrade";
   /** The kiln agent that runs this session, when kiln started it itself. */
   managed_by?: string;
+  /** A copy of its conversation can be continued as an agent, leaving it running. Older servers omit it. */
+  fork?: boolean;
   /** Its transcript can be opened. */
   transcript: boolean;
 }

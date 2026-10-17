@@ -1,7 +1,9 @@
 /**
  * Coding sessions running on your machines that kiln didn't start: Claude Code, Codex or Gemini in
- * a terminal. They sit in Mission control's list with the same rows: open one to watch its
- * transcript right there, open its terminal, or take it over as an agent kiln runs.
+ * a terminal. They sit in Mission control's list with the same rows, in the order they started, and
+ * nothing in a row moves as it updates. Each offers the same two things: take it over (it ends
+ * where it runs and continues here) or fork it (a copy continues here; it keeps running); and its
+ * transcript, to read in place.
  */
 import * as React from "react";
 import { Link, Navigate, useLocation, useNavigate, useSearchParams } from "react-router";
@@ -22,6 +24,9 @@ const toolLabel = (tool: string) => TOOL[tool] ?? tool;
 export const sessionKey = (s: AiSession) => `${s.machine}:${s.pid}`;
 const terminalLink = (s: AiSession) => `/terminal?session=${encodeURIComponent(s.terminal ?? "")}&target=${encodeURIComponent(`agent:${s.machine}`)}`;
 
+/** Newest first, by when each started: a row keeps its place for as long as it runs. */
+export const byStart = (a: AiSession, b: AiSession) => b.started_at - a.started_at || a.pid - b.pid;
+
 /** Mission control's stands, as far as a session seen from outside can tell. */
 type Stand = "working" | "finished" | "ready";
 const standOf = (s: AiSession): Stand => (s.state === "working" ? "working" : s.state === "waiting" ? "finished" : "ready");
@@ -33,26 +38,21 @@ function lineOf(s: AiSession, stand: Stand): string {
   return s.last_prompt ? `› ${s.last_prompt}` : tildify(s.cwd);
 }
 
-/** Take over, confirmed in the row: what happens to the session where it runs now, then go. */
-function TakeOver({ s, confirming, onConfirming }: { s: AiSession; confirming: boolean; onConfirming: (on: boolean) => void }) {
+/** Whether it can be taken over and forked from here, and if not, why (one line). */
+function abilities(s: AiSession): { take: boolean; fork: boolean; why: string; update: boolean } {
   const t = s.takeover;
-  if (t === "ready" || t === "stop")
-    return confirming ? null : (
-      <Button size="xs" onClick={() => onConfirming(true)}>
-        Take over
-      </Button>
-    );
-  if (t === "upgrade")
-    return (
-      <Link to="/settings" className="ms-reason">
-        Update {s.machine} to take over
-      </Link>
-    );
-  if (t === "outside") return <span className="ms-reason">Quit it there to take over</span>;
-  if (t === "no_id") return <span className="ms-reason">Starting…</span>;
-  return null;
+  const take = t === "ready" || t === "stop";
+  const fork = s.fork === true;
+  if (take && fork) return { take, fork, why: "", update: false };
+  if (t === "no_id") return { take, fork, why: "Starting: nothing to continue yet", update: false };
+  if (t === "upgrade") return { take, fork, why: `Update ${s.machine} to take over${fork ? "" : " or fork"}`, update: true };
+  if (t === "outside") return { take, fork, why: "Quit it there to take it over", update: false };
+  if (t === "unsupported") return { take, fork, why: "kiln can't continue this tool's sessions", update: false };
+  if (take && !fork && s.fork === false) return { take, fork, why: `Update ${s.machine} to fork`, update: true };
+  return { take, fork, why: "", update: false };
 }
 
+/** Take over, confirmed in the row: what happens to it where it runs now, then go. */
 function Confirm({ s, onCancel }: { s: AiSession; onCancel: () => void }) {
   const navigate = useNavigate();
   const [busy, setBusy] = React.useState(false);
@@ -74,7 +74,7 @@ function Confirm({ s, onCancel }: { s: AiSession; onCancel: () => void }) {
       </p>
       <span className="ms-confirm-actions">
         <Button size="xs" disabled={busy} onClick={go}>
-          {busy ? "Taking over…" : "Take over"}
+          Take over
         </Button>
         <Button size="xs" variant="ghost" disabled={busy} onClick={onCancel}>
           Cancel
@@ -84,8 +84,8 @@ function Confirm({ s, onCancel }: { s: AiSession; onCancel: () => void }) {
   );
 }
 
-/** Its transcript, read live in the row (refetched whenever the machine reports activity). */
-function Watch({ s }: { s: AiSession }) {
+/** Its transcript, read in the row (refetched whenever the machine reports activity). */
+function Transcript({ s }: { s: AiSession }) {
   const [entries, setEntries] = React.useState<AiTranscriptEntry[] | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
   const log = React.useRef<HTMLDivElement>(null);
@@ -140,22 +140,38 @@ function Watch({ s }: { s: AiSession }) {
   );
 }
 
-function Row({ s, now, focused }: { s: AiSession; now: number; focused: boolean }) {
-  const [watching, setWatching] = React.useState(focused);
+const Row = React.memo(function Row({ s, now, focused }: { s: AiSession; now: number; focused: boolean }) {
+  const navigate = useNavigate();
+  const [reading, setReading] = React.useState(focused);
   const [confirming, setConfirming] = React.useState(false);
+  const [forking, setForking] = React.useState(false);
   const ref = React.useRef<HTMLLIElement>(null);
   React.useEffect(() => {
     if (focused) ref.current?.scrollIntoView({ block: "center" });
   }, [focused]);
   const stand = standOf(s);
   const title = s.title || s.name || toolLabel(s.tool);
+  const can = abilities(s);
+  const fork = async () => {
+    setForking(true);
+    try {
+      const [a] = await harnessApi.fork(s.machine, s.pid);
+      if (a) navigate(`/agents/${a.id}`);
+    } catch (e) {
+      toast.error("Couldn't fork it", errorMessage(e));
+    } finally {
+      setForking(false);
+    }
+  };
   return (
     <li ref={ref} className="ms-row ms-found-row" data-stand={stand}>
       <span className="ms-mark" title={toolLabel(s.tool)}>
         <HarnessMark kind={s.tool} size={16} />
       </span>
-      <button type="button" className="ms-main" aria-expanded={watching} onClick={() => setWatching(!watching)}>
-        <span className="ms-name">{title}</span>
+      <div className="ms-main">
+        <span className="ms-name" title={title}>
+          {title}
+        </span>
         <span className="ms-line">
           <span className="ms-word">
             <i aria-hidden="true" />
@@ -163,32 +179,47 @@ function Row({ s, now, focused }: { s: AiSession; now: number; focused: boolean 
           </span>
           <span className="ms-text">{lineOf(s, stand)}</span>
         </span>
-      </button>
+      </div>
       <span className="ms-meta">
         <span>
           <span className="ms-tool">{toolLabel(s.tool)} · </span>
-          {s.machine} · {relativeTime(s.last_activity, now)}
+          {s.machine} · <span className="ms-time">{relativeTime(s.last_activity, now)}</span>
         </span>
         <span title={s.cwd}>{s.terminal ? tildify(s.cwd) : "outside kiln"}</span>
       </span>
       <span className="ms-actions">
-        <TakeOver s={s} confirming={confirming} onConfirming={setConfirming} />
-        {s.terminal && (
-          <Button size="xs" variant="secondary" asChild>
-            <Link to={terminalLink(s)}>
-              <SquareTerminal /> Terminal
-            </Link>
+        <span className="ms-buttons">
+          <Button size="xs" disabled={!can.take || confirming} title={can.take ? undefined : can.why} onClick={() => setConfirming(true)}>
+            Take over
           </Button>
-        )}
-        <button type="button" className="ms-go" aria-expanded={watching} aria-label={watching ? `Close ${title}` : `Watch ${title}`} onClick={() => setWatching(!watching)}>
-          <ChevronRight size={16} className={cn("ms-chev", watching && "rotate-90")} />
+          <Button size="xs" variant="secondary" disabled={!can.fork || forking} title={can.fork ? "Continue a copy here; it keeps running" : can.why} onClick={fork}>
+            Fork
+          </Button>
+          {s.terminal && (
+            <Button size="xs" variant="ghost" asChild>
+              <Link to={terminalLink(s)} aria-label="Open its terminal" title="Open its terminal">
+                <SquareTerminal />
+              </Link>
+            </Button>
+          )}
+        </span>
+        <button type="button" className="ms-read" aria-expanded={reading} onClick={() => setReading(!reading)}>
+          Transcript
+          <ChevronRight size={13} className={cn("ms-chev", reading && "rotate-90")} aria-hidden="true" />
         </button>
+        {can.update ? (
+          <Link to="/settings" className="ms-why">
+            {can.why}
+          </Link>
+        ) : (
+          <span className="ms-why">{can.why}</span>
+        )}
       </span>
       {confirming && <Confirm s={s} onCancel={() => setConfirming(false)} />}
-      {watching && <Watch s={s} />}
+      {reading && <Transcript s={s} />}
     </li>
   );
-}
+});
 
 /** Mission control's section of found sessions; folds like Ended. */
 export function FoundSessions({ sessions, quiet, now }: { sessions: AiSession[]; quiet: string[]; now: number }) {
@@ -202,7 +233,6 @@ export function FoundSessions({ sessions, quiet, now }: { sessions: AiSession[];
     if (hash === "#found" && !focus) ref.current?.scrollIntoView({ block: "start" });
   }, [hash, focus]);
   if (sessions.length === 0 && quiet.length === 0) return null;
-  const working = sessions.filter((s) => s.state === "working").length;
   return (
     <section ref={ref} id="found" className="ms-found">
       <div className="ms-fold">
@@ -210,7 +240,6 @@ export function FoundSessions({ sessions, quiet, now }: { sessions: AiSession[];
           <ChevronRight size={13} className="ms-chev" aria-hidden="true" />
           Also on your machines · {sessions.length}
         </button>
-        {working > 0 && <span className="ms-fold-note">{working} working</span>}
       </div>
       {shown && (
         <>

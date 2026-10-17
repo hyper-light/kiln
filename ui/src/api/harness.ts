@@ -550,6 +550,8 @@ export const harnessApi = {
   /** `stop`: it runs outside kiln, so it is stopped on its machine first. */
   takeover: (machine: string, pid: number, opts?: { stop?: boolean }) =>
     call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`, opts?.stop ? { stop: true } : undefined),
+  /** Continue a copy of a found session's conversation as an agent; the session keeps running. */
+  fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** A command without opening the session's socket (inbox answers). */
