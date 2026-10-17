@@ -19,7 +19,7 @@ export type StepGroup = "explore" | "edit" | "shell" | "web" | "agent" | "plan" 
 export type Item =
   | Step
   | { type: "note"; key: string; event: Extract<HEvent, { kind: "assistant" }> }
-  | { type: "thought"; key: string; event: Extract<HEvent, { kind: "thinking" }> }
+  | { type: "thought"; key: string; event: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }
   | { type: "notice"; key: string; event: Extract<HEvent, { kind: "notice" }> };
 
 export interface Turn {
@@ -51,8 +51,12 @@ const GROUP: Record<ToolKind, StepGroup> = {
 /** Kinds where consecutive calls read as one step. */
 const MERGES: Partial<Record<StepGroup, boolean>> = { explore: true, edit: true, shell: true, web: true, tool: true, plan: true };
 
-/** The main thread's timeline as turns of steps. Subagent events (`parent` set) stay with their task. */
-export function turnsOf(events: HEvent[], parent?: string): Turn[] {
+/**
+ * The main thread's timeline as turns of steps. Subagent events (`parent` set) stay with their task.
+ * `openLast`: the last turn is still going, so it has no answer yet (its latest note stays where it
+ * is instead of jumping to the answer slot and back as the turn goes on).
+ */
+export function turnsOf(events: HEvent[], parent?: string, openLast = false): Turn[] {
   const turns: Turn[] = [];
   let cur: Turn | null = null;
   const open = (prompt: Turn["prompt"], at: number, key: string) => {
@@ -77,13 +81,17 @@ export function turnsOf(events: HEvent[], parent?: string): Turn[] {
     } else if (e.kind === "assistant") {
       t.items.push({ type: "note", key: e.id, event: e });
     } else if (e.kind === "thinking") {
-      t.items.push({ type: "thought", key: e.id, event: e });
+      // A run of thoughts is one row.
+      const last = t.items.at(-1);
+      if (last && last.type === "thought" && !last.event.streaming && !e.redacted) last.more = [...(last.more ?? []), e];
+      else t.items.push({ type: "thought", key: e.id, event: e });
     } else {
       t.items.push({ type: "notice", key: e.id, event: e });
     }
   }
-  // The last assistant note of a turn, if nothing but thoughts follow it, is the turn's answer.
-  for (const t of turns) {
+  // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
+  for (const [ti, t] of turns.entries()) {
+    if (openLast && ti === turns.length - 1) break;
     for (let i = t.items.length - 1; i >= 0; i--) {
       const it = t.items[i];
       if (!it || it.type === "thought" || it.type === "notice") continue;

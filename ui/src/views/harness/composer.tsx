@@ -5,7 +5,7 @@
  * on every device until they go out.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, type Meta, type SendMode, type SessionStore, type State } from "@/api/harness";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -19,7 +19,7 @@ const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] =
 
 const fine = () => typeof window !== "undefined" && window.matchMedia?.("(pointer: fine)").matches;
 
-function QueueRow({ id, text, index, count, store, canNow }: { id: string; text: string; index: number; count: number; store: SessionStore; canNow: boolean }) {
+function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: string; text: string; index: number; count: number; store: SessionStore; canNow: boolean; canSteer: boolean }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(text);
   React.useEffect(() => setDraft(text), [text]);
@@ -60,6 +60,13 @@ function QueueRow({ id, text, index, count, store, canNow }: { id: string; text:
         <button type="button" className="hx-icon" aria-label="Move down" disabled={index === count - 1} onClick={() => store.send({ type: "queue_move", id, index: index + 1 })}>
           <ArrowDown size={12} />
         </button>
+        {canSteer && (
+          <Tip content="Steer it into the running turn now — no interrupt">
+            <button type="button" className="hx-icon" aria-label="Steer now" onClick={() => store.send({ type: "queue_steer", id })}>
+              <Navigation size={12} />
+            </button>
+          </Tip>
+        )}
         {canNow && (
           <Tip content="Stop the current turn and send this now">
             <button type="button" className="hx-icon" aria-label="Send now" onClick={() => store.send({ type: "queue_send_now", id })}>
@@ -75,7 +82,22 @@ function QueueRow({ id, text, index, count, store, canNow }: { id: string; text:
   );
 }
 
-export function Composer({ store, state, meta, disabled, attachments }: { store: SessionStore; state: State | null; meta: Meta | null; disabled?: boolean; attachments: Attachments }) {
+export function Composer({
+  store,
+  state,
+  meta,
+  disabled,
+  attachments,
+  toMain,
+}: {
+  store: SessionStore;
+  state: State | null;
+  meta: Meta | null;
+  disabled?: boolean;
+  attachments: Attachments;
+  /** Shown over a subagent's thread: what's typed here goes to the main agent. */
+  toMain?: boolean;
+}) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
@@ -198,7 +220,7 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
           </div>
           <ol>
             {queue.map((q, i) => (
-              <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={features.includes("send_now")} />
+              <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={features.includes("send_now")} canSteer={features.includes("queue_steer")} />
             ))}
           </ol>
         </div>
@@ -250,13 +272,15 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
           placeholder={
             disabled
               ? "Not connected"
-              : running
-                ? mode === "steer"
-                  ? "Steer it — it reads this at its next step"
-                  : mode === "now"
-                    ? "Stop and say…"
-                    : "Queue a message for when it finishes"
-                : "Tell the agent what to do"
+              : toMain
+                ? "Message the main agent"
+                : running
+                  ? mode === "steer"
+                    ? "Steer it — it reads this at its next step"
+                    : mode === "now"
+                      ? "Stop and say…"
+                      : "Queue a message for when it finishes"
+                  : "Tell the agent what to do"
           }
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
@@ -349,7 +373,14 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
               </button>
             </Tip>
           )}
-          <button type="button" className="cp-send" data-mode={running ? mode : "send"} onClick={submit} disabled={(!text.trim() && files.length === 0) || disabled || pending > 0} aria-label={sendLabel}>
+          <button
+            type="button"
+            className="cp-send"
+            data-mode={running ? mode : "send"}
+            onClick={submit}
+            disabled={(!text.trim() && files.length === 0) || disabled || pending > 0}
+            aria-label={sendLabel}
+          >
             {running && mode === "queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}
             <span className="cp-label">{sendLabel}</span>
           </button>

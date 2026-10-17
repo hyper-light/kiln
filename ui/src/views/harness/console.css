@@ -910,3 +910,28 @@
     transition: none;
   }
 }
+
+/* ---------------------------------------------------------------- a subagent's thread before its first event */
+.hx-sub-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 2px;
+}
+.hx-sub-what {
+  margin: 0;
+  color: #ededee;
+  font-size: 15px;
+}
+.hx-sub-prompt {
+  padding-left: 12px;
+  border-left: 2px solid #2b2d32;
+  color: #a1a4ad;
+  font-size: 13px;
+}
+.hx-thought-n {
+  margin-left: 8px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}

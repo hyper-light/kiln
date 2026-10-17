@@ -284,15 +284,20 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
 
 /* ------------------------------------------------------------------ items & turns */
 
-function Thought({ e }: { e: Extract<HEvent, { kind: "thinking" }> }) {
+function Thought({ e, more = [] }: { e: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }) {
   const [open, setOpen] = React.useState(false);
   if (e.redacted) return null;
+  const all = [e, ...more].filter((x) => !x.redacted);
+  const live = all.some((x) => x.streaming);
   return (
     <div className="hx-thought">
-      <ThinkingHead live={Boolean(e.streaming)} open={open} onToggle={() => setOpen(!open)} />
+      <ThinkingHead live={live} open={open} onToggle={() => setOpen(!open)} />
+      {all.length > 1 && !open && <span className="hx-thought-n">{all.length} thoughts</span>}
       {open && (
-        <ThinkingBody live={Boolean(e.streaming)}>
-          <Prose text={e.text} className="hx-thought-text" />
+        <ThinkingBody live={live}>
+          {all.map((x) => (
+            <Prose key={x.id} text={x.text} className="hx-thought-text" />
+          ))}
         </ThinkingBody>
       )}
     </div>
@@ -347,7 +352,7 @@ function ItemView({ item, cwd, tasks, onOpenTask }: { item: Item; cwd: string; t
     case "note":
       return <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} />;
     case "thought":
-      return <Thought e={item.event} />;
+      return <Thought e={item.event} more={item.more} />;
     case "notice":
       return <Notice e={item.event} />;
   }
@@ -434,7 +439,9 @@ export function Timeline({
   onCommand?: (c: Command) => void;
   footer?: React.ReactNode;
 }) {
-  const turns = React.useMemo(() => turnsOf(events, parent), [events, parent]);
+  const task = parent ? state?.tasks.find((t) => t.tool_id === parent) : undefined;
+  const going = parent ? task?.status === "running" || task?.status === "pending" : state?.status === "running" || state?.status === "waiting" || state?.status === "starting";
+  const turns = React.useMemo(() => turnsOf(events, parent, going), [events, parent, going]);
   const ref = React.useRef<HTMLDivElement>(null);
   const pinned = React.useRef(true);
   const onScroll = () => {
@@ -453,7 +460,16 @@ export function Timeline({
     <Asking.Provider value={asking}>
       <div ref={ref} className="hx-timeline" onScroll={onScroll}>
         {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
-        {turns.length === 0 && <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>}
+        {turns.length === 0 &&
+          (parent ? (
+            <div className="hx-sub-empty">
+              <p className="hx-sub-what">{task?.description || "Subagent"}</p>
+              {task?.prompt && <Prose text={task.prompt} className="hx-sub-prompt" />}
+              {going ? <PrismLabel live>Starting</PrismLabel> : <p className="hx-dim text-[12px]">Nothing from this subagent has reached kiln.</p>}
+            </div>
+          ) : (
+            <div className="hx-empty">Nothing yet. Tell the agent what to do.</div>
+          ))}
         {turns.map((t, i) => (
           <TurnView
             key={t.key}

@@ -146,7 +146,7 @@ export default function AgentPage() {
             )}
           </div>
         ) : null}
-        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} />
+        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} />
       </div>
     </div>
   );
