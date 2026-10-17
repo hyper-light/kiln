@@ -72,17 +72,6 @@ function InboxRow({ agent, a }: { agent: AgentInfo; a: ApprovalBrief }) {
 
 const AgentCard = React.memo(function AgentCard({ a, selected, onSelect, now }: { a: AgentInfo; selected: boolean; onSelect: (id: string, on: boolean) => void; now: number }) {
   const navigate = useNavigate();
-  const [msg, setMsg] = React.useState("");
-  const send = async () => {
-    const text = msg.trim();
-    if (!text) return;
-    try {
-      await harnessApi.command(a.id, { type: "send", id: clientId(), text, mode: "queue" });
-      setMsg("");
-    } catch (e) {
-      toast.error(`Couldn't reach ${a.name}`, errorMessage(e));
-    }
-  };
   const total = a.todos_total ?? 0;
   const done = a.todos_done ?? 0;
   const waiting = a.approvals.length;
@@ -150,24 +139,6 @@ const AgentCard = React.memo(function AgentCard({ a, selected, onSelect, now }: 
         <span className="ml-auto">{relativeTime(Math.floor(a.last_activity / 1000), now)}</span>
       </div>
 
-      <div className="hx-card-say">
-        <input
-          className="hx-input"
-          value={msg}
-          onChange={(e) => setMsg(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-          placeholder={a.status === "running" ? "Queue a message…" : "Tell it…"}
-          aria-label={`Message ${a.name}`}
-        />
-        <button type="button" className="hx-icon" aria-label="Send" disabled={!msg.trim()} onClick={() => void send()}>
-          <Send size={13} />
-        </button>
-      </div>
     </article>
   );
 });
