@@ -46,7 +46,8 @@ interface Entry {
   opts: ResourceOptions;
   snap: Snap;
   promise: Promise<void> | null;
-  ctl: AbortController | null;
+  /** Asked to refresh while a load was on its way: load once more after it. */
+  again: boolean;
   /** Out of date while not shown: refreshed when it's shown again. */
   stale: boolean;
   listeners: Set<() => void>;
@@ -67,7 +68,7 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       opts,
       snap: { data: undefined, has: false, error: undefined, failed: false, refreshing: false },
       promise: null,
-      ctl: null,
+      again: false,
       stale: false,
       listeners: new Set(),
       poll: null,
@@ -92,29 +93,33 @@ function set(e: Entry, patch: Partial<Snap>) {
   e.listeners.forEach((l) => l());
 }
 
+/**
+ * Loads `e`. One load at a time per key: a refresh asked for while one is on its way makes one more
+ * load after it (however many were asked for), so a key whose events come faster than its fetch
+ * still refreshes, instead of each refresh cancelling the last.
+ */
 function load(e: Entry): Promise<void> {
-  e.ctl?.abort();
-  const ctl = new AbortController();
-  e.ctl = ctl;
+  if (e.promise) {
+    e.again = true;
+    return e.promise;
+  }
   e.stale = false;
+  e.again = false;
   const p = e
-    .fetcher(ctl.signal)
+    .fetcher(new AbortController().signal)
     .then(
-      (data) => {
-        if (e.ctl === ctl) set(e, { data, has: true, error: undefined, failed: false, refreshing: false });
-      },
+      (data) => set(e, { data, has: true, error: undefined, failed: false, refreshing: false }),
       (error: unknown) => {
-        if (e.ctl !== ctl) return;
-        if (error instanceof DOMException && error.name === "AbortError") set(e, { refreshing: false });
         // A refresh that failed leaves the data that's shown; a first load that failed says so.
-        else if (e.snap.has) set(e, { refreshing: false });
+        if (e.snap.has) set(e, { refreshing: false });
         else set(e, { error, failed: true, refreshing: false });
       },
     )
     .finally(() => {
-      if (e.ctl === ctl) {
-        e.ctl = null;
-        e.promise = null;
+      e.promise = null;
+      if (e.again) {
+        e.again = false;
+        refresh(e);
       }
     });
   e.promise = p;
