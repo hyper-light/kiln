@@ -208,7 +208,7 @@ export const machineDirs = (target: string, path: string, signal?: AbortSignal) 
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
-import type { CertInfo, FrontDoorSettings, FrontDoorView } from "./types";
+import type { CertInfo, FrontDoorSettings, FrontDoorView, TailscaleView } from "./types";
 
 export const frontDoorApi = {
   /** Every runner with front-door settings. */
@@ -218,6 +218,14 @@ export const frontDoorApi = {
   /** A certificate chain and its key for the runner (which keeps them; the key is never sent back). */
   uploadCert: (runner: string, cert_pem: string, key_pem: string) =>
     post<{ cert: CertInfo; front_door: FrontDoorView }>(`/api/runners/${enc(runner)}/front-door/cert`, { cert_pem, key_pem }),
+};
+
+/** The tailnet's split DNS for the front doors (one Tailscale credential for the server). */
+export const tailscaleApi = {
+  get: (signal?: AbortSignal) => get<TailscaleView>("/api/tailscale", signal),
+  /** An OAuth client secret (with its ID when it doesn't carry it) or an API access token; tried first. */
+  connect: (secret: string, client_id: string) => request<TailscaleView>("PUT", "/api/tailscale", { secret, client_id }),
+  forget: () => del<TailscaleView>("/api/tailscale"),
 };
 
 /** Build a ws:// or wss:// URL for a same-origin path. */

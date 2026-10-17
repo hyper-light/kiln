@@ -355,7 +355,9 @@ export type ServerEvent =
   /** An upgrade moved on (new output, or it finished). */
   | { type: "update_job"; job: UpdateJob }
   /** A runner's front door changed (settings, or what the runner reported): refetch it. */
-  | { type: "front_door"; runner: string };
+  | { type: "front_door"; runner: string }
+  /** The tailnet's DNS for the front doors changed (credential, sync): refetch GET /api/tailscale. */
+  | { type: "tailscale" };
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
@@ -371,6 +373,8 @@ export interface FrontDoorSettings {
   https: { enabled: boolean; port: number; http_port: number; upstream: string };
   cert: { mode: CertMode };
   mdns: { enabled: boolean; name: string };
+  /** The front door on the tailnet (Tailscale). Absent while off. */
+  tailscale?: { enabled: boolean };
 }
 
 export type FrontDoorState = "off" | "on" | "waiting" | "error";
@@ -419,6 +423,61 @@ export interface FrontDoorStatus {
   want: string[];
   asked: number;
   fixes: FrontDoorFix[];
+  /** The front door on the tailnet, while `tailscale.enabled`. */
+  tailscale?: TailnetStatus | null;
+}
+
+/** What the tailnet's split DNS says for one of the front door's names, as the runner sees it. */
+export interface TailnetRoute {
+  name: string;
+  /** The route deciding it (the name, or a domain above it); null: none. */
+  domain: string | null;
+  to: string[];
+  exit_node: boolean;
+  /** It goes to this runner. */
+  here: boolean;
+}
+
+/** The front door on the tailnet (`status.tailscale`). */
+export interface TailnetStatus {
+  state: FrontDoorState;
+  error: string | null;
+  fix: FrontDoorFix | null;
+  /** The runner's MagicDNS name. */
+  name: string;
+  tailnet: string;
+  addresses: string[];
+  /** Where the tailnet's DNS for the names should go (its DNS answers there on port 53). */
+  nameserver: string | null;
+  magic_dns: boolean;
+  accept_dns: boolean | null;
+  routes: TailnetRoute[];
+  /** The domain, asked of Tailscale's resolver (100.100.100.100) from the runner. */
+  resolved: { name: string; answers: string[]; error: string | null } | null;
+  health: string[];
+  version: string;
+}
+
+/** `GET /api/tailscale`: the tailnet's split DNS for the front doors. */
+export interface TailscaleView {
+  configured: boolean;
+  kind: "oauth" | "token" | null;
+  /** The OAuth client's ID, or the token's first characters. */
+  id: string | null;
+  /** "configuration": routes are used with exit nodes too; "split-dns": they can't be. */
+  mode: "configuration" | "split-dns" | null;
+  exit_nodes: boolean | null;
+  /** Name → the addresses the tailnet should send it to. */
+  want: Record<string, string[]>;
+  /** Names whose runner has not said where it listens yet: left as they are. */
+  pending: string[];
+  owned: Record<string, string[]>;
+  synced_at: number | null;
+  ok: boolean;
+  error: string | null;
+  /** The tailnet's routes for kiln's names, as of `synced_at`. */
+  routes: Record<string, { addr: string; exit_node: boolean }[]>;
+  replaced: Record<string, string[]>;
 }
 
 export interface FrontDoorView {

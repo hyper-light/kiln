@@ -18,6 +18,7 @@ import { errorMessage, useLocalStorage, useResource } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/views/terminal/clipboard";
 import { RelTime } from "@/views/shared";
+import { TailnetDetails, tailnetLine } from "./tailnet";
 import "./front-door.css";
 
 /* ------------------------------------------------------------------ the section */
@@ -97,6 +98,7 @@ interface Draft {
   certMode: CertMode;
   mdnsEnabled: boolean;
   mdnsName: string;
+  tailscale: boolean;
 }
 
 const list = (v: string[]) => v.join(", ");
@@ -122,6 +124,7 @@ function draftOf(s: FrontDoorSettings): Draft {
     certMode: s.cert.mode,
     mdnsEnabled: s.mdns.enabled,
     mdnsName: s.mdns.name,
+    tailscale: Boolean(s.tailscale?.enabled),
   };
 }
 
@@ -142,6 +145,7 @@ function settingsOf(d: Draft): FrontDoorSettings | string {
     https: { enabled: d.httpsEnabled, port: httpsPort as number, http_port: httpPort as number, upstream: d.httpsUpstream.trim() },
     cert: { mode: d.certMode },
     mdns: { enabled: d.mdnsEnabled, name: d.mdnsName.trim() },
+    tailscale: { enabled: d.tailscale },
   };
 }
 
@@ -198,6 +202,7 @@ function FrontDoorPanel({ runner, onSaved }: { runner: string; onSaved: () => vo
         >
           <NamesGroup d={d} set={set} />
           <DnsGroup d={d} set={set} v={v} />
+          <TailnetGroup d={d} set={set} v={v} />
           <HttpsGroup d={d} set={set} v={v} onUploaded={(next) => view.setData(() => next)} />
           <LocalGroup d={d} set={set} />
           <div className="fd-actions">
@@ -260,6 +265,7 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
   if (!v || !s || !st || !v.connected || v.supported === false) {
     const lines = [offline("DNS", dnsOn, names), offline("HTTPS", httpsOn, names)];
     if (httpOn) lines.push(offline("HTTP", true, "plain HTTP redirects to HTTPS"));
+    lines.push(offline("Tailnet", Boolean(s?.tailscale?.enabled), "this runner on your tailnet"));
     lines.push(offline(".local", localOn, `${s?.mdns.name ?? "kiln"}.local`));
     return lines;
   }
@@ -320,6 +326,7 @@ function linesOf(v: FrontDoorView | undefined): Line[] {
     else if (x.state === "waiting") lines.push({ name: "HTTP", state: "waiting", text: "waits for HTTPS", detail: "plain http:// redirects to https:// once HTTPS is up" });
     else lines.push(failed("HTTP", x, "not listening"));
   }
+  lines.push(tailnetLine(s, st));
   const m = st.mdns;
   if (!localOn) lines.push({ name: ".local", state: "off", text: "off", muted: true });
   else if (standby(".local", m)) lines.push(standby(".local", m) as Line);
@@ -473,6 +480,18 @@ function DnsGroup({ d, set, v }: GroupProps & { v: FrontDoorView }) {
           </p>
         </>
       )}
+    </fieldset>
+  );
+}
+
+function TailnetGroup({ d, set, v }: GroupProps & { v: FrontDoorView }) {
+  return (
+    <fieldset className="fd-group">
+      <legend className="fd-key">Tailnet</legend>
+      <Toggle checked={d.tailscale} onChange={(tailscale) => set({ tailscale })} label="On the tailnet">
+        Serve these names on your tailnet too (Tailscale), to every device on it
+      </Toggle>
+      {d.tailscale && <TailnetDetails settings={v.settings} status={v.status} dnsOn={d.dnsEnabled && v.settings.dns.enabled} />}
     </fieldset>
   );
 }
