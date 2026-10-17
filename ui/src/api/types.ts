@@ -31,6 +31,8 @@ export interface Me {
   hostname: string;
   /** Where the server says it is reachable from other devices. */
   public_url?: string;
+  /** Its runners' front doors (`https://kiln.home`, …). */
+  origins?: string[];
 }
 
 export interface Repo {
@@ -352,10 +354,151 @@ export type ServerEvent =
   | { type: "updates" }
   /** An upgrade moved on (new output, or it finished). */
   | { type: "update_job"; job: UpdateJob }
+  /** A runner's front door changed (settings, or what the runner reported): refetch it. */
+  | { type: "front_door"; runner: string }
+  /** The tailnet's DNS for the front doors changed (credential, sync): refetch GET /api/tailscale. */
+  | { type: "tailscale" }
   /** Apps' statuses changed (batched, at most every 300 ms). */
   | { type: "cd_apps"; apps: CdStatus[] }
   /** An app was deleted. */
   | { type: "cd_app_deleted"; app: string };
+
+/* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
+
+export type DnsMode = "resolver" | "authoritative";
+/** `kiln`: self-signed, from kiln's own root (made, installed and renewed by kiln). `custom`: your own. */
+export type CertMode = "kiln" | "custom";
+
+/** A runner's front door, as set in the UI (`PUT /api/runners/:name/front-door`). */
+export interface FrontDoorSettings {
+  domain: string;
+  aliases: string[];
+  dns: { enabled: boolean; port: number; mode: DnsMode; upstream: string[]; addresses: string[] };
+  /** `http_port` 0: no plain-HTTP redirect. `upstream` "": the runner's own server URL. */
+  https: { enabled: boolean; port: number; http_port: number; upstream: string };
+  cert: { mode: CertMode };
+  mdns: { enabled: boolean; name: string };
+  /** The front door on the tailnet (Tailscale). Absent while off. */
+  tailscale?: { enabled: boolean };
+}
+
+export type FrontDoorState = "off" | "on" | "waiting" | "error";
+
+export interface FrontDoorListener {
+  state: FrontDoorState;
+  /** `192.168.1.77:53`, `[::]:443`, `kiln.local`. */
+  on: string[];
+  error: string | null;
+  /** HTTPS: where it forwards; DNS: its upstream resolvers. */
+  to: string[];
+  served: number;
+  /** The one-time setup that fixes its error (also among the status's `fixes`). */
+  fix: FrontDoorFix | null;
+}
+
+export interface CertInfo {
+  subject: string;
+  issuer: string;
+  names: string[];
+  not_before: number;
+  not_after: number;
+  sha256: string;
+  server_auth: boolean;
+}
+
+export interface FrontDoorFix {
+  why: string;
+  commands: string[];
+}
+
+/** What the runner reports. */
+export interface FrontDoorStatus {
+  /** Fingerprint of the settings it applied. */
+  settings: string;
+  standby: boolean;
+  os: string;
+  /** The runner's own server URL (HTTPS forwards there by default). */
+  server: string;
+  addresses: string[];
+  dns: FrontDoorListener;
+  https: FrontDoorListener;
+  http: FrontDoorListener;
+  mdns: FrontDoorListener;
+  /** `renewing`: a new self-signed certificate was asked for (renew now) and is not in yet. */
+  cert: { mode: CertMode; state: FrontDoorState; info: CertInfo | null; kiln: boolean; missing: string[]; error: string | null; renewing: boolean };
+  want: string[];
+  asked: number;
+  fixes: FrontDoorFix[];
+  /** The front door on the tailnet, while `tailscale.enabled`. */
+  tailscale?: TailnetStatus | null;
+}
+
+/** What the tailnet's split DNS says for one of the front door's names, as the runner sees it. */
+export interface TailnetRoute {
+  name: string;
+  /** The route deciding it (the name, or a domain above it); null: none. */
+  domain: string | null;
+  to: string[];
+  exit_node: boolean;
+  /** It goes to this runner. */
+  here: boolean;
+}
+
+/** The front door on the tailnet (`status.tailscale`). */
+export interface TailnetStatus {
+  state: FrontDoorState;
+  error: string | null;
+  fix: FrontDoorFix | null;
+  /** The runner's MagicDNS name. */
+  name: string;
+  tailnet: string;
+  addresses: string[];
+  /** Where the tailnet's DNS for the names should go (its DNS answers there on port 53). */
+  nameserver: string | null;
+  magic_dns: boolean;
+  accept_dns: boolean | null;
+  routes: TailnetRoute[];
+  /** The domain, asked of Tailscale's resolver (100.100.100.100) from the runner. */
+  resolved: { name: string; answers: string[]; error: string | null } | null;
+  health: string[];
+  version: string;
+}
+
+/** `GET /api/tailscale`: the tailnet's split DNS for the front doors. */
+export interface TailscaleView {
+  configured: boolean;
+  kind: "oauth" | "token" | null;
+  /** The OAuth client's ID, or the token's first characters. */
+  id: string | null;
+  /** "configuration": routes are used with exit nodes too; "split-dns": they can't be. */
+  mode: "configuration" | "split-dns" | null;
+  exit_nodes: boolean | null;
+  /** Name → the addresses the tailnet should send it to. */
+  want: Record<string, string[]>;
+  /** Names whose runner has not said where it listens yet: left as they are. */
+  pending: string[];
+  owned: Record<string, string[]>;
+  synced_at: number | null;
+  ok: boolean;
+  error: string | null;
+  /** The tailnet's routes for kiln's names, as of `synced_at`. */
+  routes: Record<string, { addr: string; exit_node: boolean }[]>;
+  replaced: Record<string, string[]>;
+}
+
+export interface FrontDoorView {
+  runner: string;
+  connected: boolean;
+  /** null while the runner is offline (unknown). */
+  supported: boolean | null;
+  settings: FrontDoorSettings;
+  /** The runner applied these settings; null before it reported. */
+  applied: boolean | null;
+  status: FrontDoorStatus | null;
+  status_at: number | null;
+  origins: string[];
+  ca: { subject: string; sha256: string; not_after: number } | null;
+}
 
 /* ---------------------------- updates (Settings → Updates) ---------------------------- */
 
@@ -533,6 +676,23 @@ export interface CdOperation {
   trigger: "manual" | "rollback" | "promotion" | "auto" | "self-heal";
   attempt: number;
   message: string;
+  /** Who started it, when a person or agent did. */
+  by?: string | null;
+  /** ms since the epoch. */
+  started_ms?: number;
+  /** ms since the epoch, once it finished. */
+  finished_ms?: number | null;
+}
+
+/** A commit as people read it. */
+export interface CdCommit {
+  sha: string;
+  author: string;
+  email: string;
+  /** ms since the epoch. */
+  at_ms: number;
+  subject: string;
+  body: string;
 }
 
 /** An app's status, as `cd_apps` events carry it. */
@@ -599,6 +759,121 @@ export interface CdAppDetail extends CdApp {
   commits: (string | null)[];
   /** Apps it renders (app of apps), by id. */
   children: string[];
+  /** Who wrote the revision it is at, when, and what it says. */
+  revision_info: CdCommit | null;
+}
+
+/** A label and value people read on a node (`Ready` · `2/2`). */
+export interface CdInfo {
+  name: string;
+  value: string;
+}
+
+/** One container of a pod, or of a workload's pod template. */
+export interface CdContainer {
+  name: string;
+  image: string;
+  init: boolean;
+  ready: boolean | null;
+  restarts: number | null;
+  state: "running" | "waiting" | "terminated" | null;
+  reason: string | null;
+  /** Why its previous run ended, when it restarted. */
+  last: string | null;
+}
+
+/** One node of an app's resource tree: an object the app manages, or a live object they own. */
+export interface CdNode extends CdResourceKey {
+  /** Unique in the tree: the uid, or the key of an object not in the cluster. */
+  id: string;
+  uid: string | null;
+  version: string;
+  /** Owners' uids, among the tree's nodes. */
+  parents: string[];
+  managed: boolean;
+  health: CdHealth | null;
+  message: string | null;
+  sync: CdSync | "Hook" | null;
+  hook: boolean;
+  missing: boolean;
+  requires_pruning: boolean;
+  why: string | null;
+  created_at: string | null;
+  info: CdInfo[];
+  /** A pod's state in kubectl's words. */
+  status: string | null;
+  ready: string | null;
+  restarts: number | null;
+  images: string[];
+  containers: CdContainer[];
+  /** The node a pod runs on. */
+  node: string | null;
+}
+
+export interface CdTree {
+  app: string;
+  cluster: string;
+  namespace: string;
+  nodes: CdNode[];
+  truncated: boolean;
+  /** What couldn't be read. */
+  errors: string[];
+  at_ms: number;
+}
+
+export interface CdCondition {
+  type: string;
+  status: string;
+  reason: string;
+  message: string;
+  last: string | null;
+}
+
+/** One object of an app's tree in depth. */
+export interface CdResourceDetail {
+  key: CdResourceKey;
+  managed: boolean;
+  node: CdNode | null;
+  /** The live object as YAML, null when it isn't in the cluster. */
+  live: string | null;
+  /** What kiln applies, for managed objects. */
+  desired: string | null;
+  diff: CdDiff | null;
+  labels: Record<string, string>;
+  annotations: Record<string, string>;
+  conditions: CdCondition[];
+  finalizers: string[];
+  /** Nearest first. */
+  owners: (CdResourceKey & { id: string; uid: string | null })[];
+  errors: string[];
+}
+
+export interface CdEvent {
+  type: "Normal" | "Warning" | string;
+  reason: string;
+  message: string;
+  count: number;
+  first: string;
+  last: string;
+  source: string;
+  object: { kind: string | null; name: string | null };
+}
+
+export interface CdLogLine {
+  pod: string;
+  /** RFC 3339, or "" when the line had none. */
+  ts: string;
+  text: string;
+}
+
+export interface CdLogs {
+  pods: string[];
+  /** Pods past the few read. */
+  more_pods: number;
+  container: string | null;
+  containers: string[];
+  lines: CdLogLine[];
+  errors: string[];
 }
 
 export interface CdResourceKey {
@@ -658,6 +933,8 @@ export interface CdDeployment {
   pruned: number;
   /** ms since the epoch. */
   at_ms: number;
+  /** What the deployed commit says. */
+  commit?: CdCommit;
 }
 
 export interface CdCluster {
@@ -687,6 +964,7 @@ export interface CdFacets {
     health: Record<string, number>;
     cluster: Record<string, number>;
     project: Record<string, number>;
+    namespace: Record<string, number>;
   };
 }
 
@@ -801,3 +1079,59 @@ export interface DirListing {
   /** Why it can't be listed: "no such folder", "not a folder", "permission denied", ... */
   error?: string;
 }
+
+/* ------------------------------------------------------------ repo sync (docs/sync.md) */
+
+export interface SyncSkipped {
+  path: string;
+  why: string;
+}
+
+/** How a copy is doing, as its machine last said. */
+export interface SyncCopyStatus {
+  applied: number;
+  behind: number;
+  unsent: number;
+  waiting: number;
+  conflicts: number;
+  skipped: SyncSkipped[];
+  error: string | null;
+  at: number;
+}
+
+export type SyncCopyState = "in step" | "catching up" | "fetching" | "sending" | "starting" | "offline" | "error";
+
+export interface SyncCopy {
+  member: number;
+  machine: string;
+  path: string;
+  added: number;
+  state: SyncCopyState;
+  status: SyncCopyStatus | null;
+}
+
+export interface SyncConflict {
+  /** The conflict copy. */
+  path: string;
+  /** The path it stands beside. */
+  beside: string;
+}
+
+export interface SyncRepo {
+  id: string;
+  name: string;
+  created: number;
+  exclude: string[];
+  files: number;
+  index: number;
+  conflicts: SyncConflict[];
+  copies: SyncCopy[];
+  error: string | null;
+}
+
+export interface SyncView {
+  repos: SyncRepo[];
+  error: string | null;
+}
+
+export type SyncKeep = "name" | "copy" | "both";

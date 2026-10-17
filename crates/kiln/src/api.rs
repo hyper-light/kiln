@@ -102,12 +102,31 @@ fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
     cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", &c))
 }
 
-fn session_cookie(hub: &Hub) -> String {
-    let secure = if hub.cfg.server.public_url.starts_with("https") { "; Secure" } else { "" };
+/// The cookie a sign-in sets; `Secure` when the browser reached kiln over HTTPS.
+fn session_cookie(hub: &Hub, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}",
         signed_expiring(hub, "session", SESSION_TTL)
     )
+}
+
+/// A `Host` header without its port (IPv6 literals keep their brackets).
+fn host_only(h: &str) -> &str {
+    let h = h.trim();
+    if h.starts_with('[') {
+        return h.split_inclusive(']').next().unwrap_or(h);
+    }
+    h.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(h, |(n, _)| n)
+}
+
+/// Whether the browser reached this server over HTTPS: the server's own TLS (`server.https`),
+/// a runner's front door (the request is for a name one of them serves, see `crate::frontdoor`),
+/// or a public URL that says https (TLS ends in front of kiln).
+fn is_secure(hub: &Hub, req: &Request) -> bool {
+    hub.cfg.server.public_url.starts_with("https")
+        || req.extensions().get::<srv::Secure>().is_some()
+        || srv::header_str(req, &header::HOST).is_some_and(|h| hub.front_doors.serves(host_only(h)))
 }
 
 // ------------------------------------------------------------------ router
@@ -167,6 +186,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return put_artifacts(&hub, &id, req).await;
         }
         (&Method::POST, ["api", "hooks", "github"]) => return github_hook(&hub, req).await,
+        (&Method::GET | &Method::HEAD, ["api", "sync", "blobs", hash]) => {
+            let hash = (*hash).to_owned();
+            return sync_blob_get(&hub, &hash, &req);
+        }
+        (&Method::PUT, ["api", "sync", "blobs", hash]) => {
+            let hash = (*hash).to_owned();
+            return sync_blob_put(&hub, &hash, req).await;
+        }
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
@@ -174,6 +201,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
         (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
         (&Method::GET, ["install.ps1"]) => return Ok(install_powershell(&hub)),
+        // kiln's CA for devices (it is public): PEM, DER, and an Apple configuration profile.
+        (&Method::GET, ["ca.pem"]) => return Ok(crate::frontdoor::control::ca(&hub, "pem")),
+        (&Method::GET, ["ca.crt"]) => return Ok(crate::frontdoor::control::ca(&hub, "crt")),
+        (&Method::GET, ["ca.mobileconfig"]) => return Ok(crate::frontdoor::control::ca(&hub, "mobileconfig")),
         _ => {}
     }
 
@@ -186,7 +217,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     }
     let q = srv::query(&req);
     match (&method, s.as_slice()) {
-        (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, &method, rest, &q, req.into_body()).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
@@ -242,6 +273,21 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let name = (*name).to_owned();
             drain_agent(&hub, &name, req).await
         }
+        (&Method::GET, ["api", "front-doors"]) => front_door(crate::frontdoor::control::list(&hub).await),
+        (&Method::GET, ["api", "runners", name, "front-door"]) => front_door(crate::frontdoor::control::get(&hub, name).await),
+        (&Method::PUT, ["api", "runners", name, "front-door"]) => {
+            let name = (*name).to_owned();
+            front_door(crate::frontdoor::control::put(&hub, &name, req).await)
+        }
+        (&Method::POST, ["api", "runners", name, "front-door", "cert"]) => {
+            let name = (*name).to_owned();
+            front_door(crate::frontdoor::control::upload(&hub, &name, req).await)
+        }
+        (&Method::GET, ["api", "runners", name, "front-door", "cert"]) => front_door(crate::frontdoor::control::download(&hub, name).await),
+        (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(crate::frontdoor::control::renew(&hub, name).await),
+        (&Method::GET, ["api", "tailscale"]) => front_door(crate::frontdoor::tailnet::get(&hub).await),
+        (&Method::PUT, ["api", "tailscale"]) => front_door(crate::frontdoor::tailnet::put(&hub, req).await),
+        (&Method::DELETE, ["api", "tailscale"]) => front_door(crate::frontdoor::tailnet::delete(&hub).await),
         (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
@@ -251,6 +297,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid, &q, req).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => ai_fork(&hub, machine, pid).await,
+        (&Method::GET, ["api", "sync"]) => Ok(srv::json(StatusCode::OK, &hub.sync.view())),
+        (&Method::POST, ["api", "sync"]) => sync_create(&hub, req).await,
+        (&Method::DELETE, ["api", "sync", id]) => sync_ask(&hub, "sync.delete", id, crate::sync::server::Ask::Delete { repo: (*id).to_owned() }).await,
+        (&Method::POST, ["api", "sync", id, "copies"]) => sync_add_copy(&hub, id, req).await,
+        (&Method::DELETE, ["api", "sync", id, "copies", member]) => {
+            let member: u64 = member.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad member"))?;
+            sync_ask(&hub, "sync.copy.remove", id, crate::sync::server::Ask::RemoveCopy { repo: (*id).to_owned(), member }).await
+        }
+        (&Method::POST, ["api", "sync", id, "conflicts", "resolve"]) => sync_resolve(&hub, id, req).await,
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -312,6 +367,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
+}
+
+/// A front-door handler's answer as the API's.
+fn front_door(a: crate::frontdoor::control::Answer) -> R {
+    a.map_err(|(code, msg)| err(code, msg))
 }
 
 // ------------------------------------------------------------------ AI sessions
@@ -500,6 +560,143 @@ async fn accounts_input(id: &str, req: Request) -> R {
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
+// ------------------------------------------------------------------ repo sync
+
+/// Whether a blob request carries the token of the machine it names (`?machine=`), or an admin's.
+fn sync_token_ok(hub: &Hub, req: &Request) -> bool {
+    let q = srv::query(req);
+    let machine = q.get("machine").map_or("", String::as_str);
+    (!machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(machine).as_bytes())))
+        || authed(hub, req.headers())
+}
+
+/// One of the contents synced repos name (`HEAD`: whether the server has it).
+fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
+    if !sync_token_ok(hub, req) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
+    }
+    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
+    let path = blobs.path(hash).filter(|p| p.is_file()).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    if req.method() == Method::HEAD {
+        return Ok(srv::status(StatusCode::OK));
+    }
+    let body = crate::rt::file_source(path).map_err(|_| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+}
+
+/// The largest contents a machine sends (a copy leaves out files over 256 MiB unless told otherwise).
+const SYNC_BLOB_MAX: u64 = 1 << 30;
+/// Room the server keeps free on its data volume: contents are refused below it.
+const SYNC_DISK_FLOOR: u64 = 2 << 30;
+
+/// Contents a machine's steps name: kept once they hash to their name. Refused past
+/// [`SYNC_BLOB_MAX`], or while the server's disk has less than [`SYNC_DISK_FLOOR`] free.
+async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
+    if !sync_token_ok(hub, &req) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
+    }
+    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
+    if !crate::sync::blobs::valid_hash(hash) {
+        return Err(err(StatusCode::BAD_REQUEST, "not a SHA-256"));
+    }
+    if blobs.has(hash) {
+        return Ok(srv::status(StatusCode::OK));
+    }
+    let length = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if length.is_some_and(|n| n > SYNC_BLOB_MAX) {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("contents are synced up to {} MiB", SYNC_BLOB_MAX >> 20)));
+    }
+    if blobs.free_bytes().is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+        return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full: sync takes no more contents until there is room"));
+    }
+    let tmp = blobs.incoming();
+    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BLOB_MAX)?;
+    let mut body = req.into_body();
+    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+        if sink.send(chunk).await.is_err() {
+            break;
+        }
+    }
+    drop(sink);
+    if let Err(e) = done.await {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+    }
+    let store = blobs.clone();
+    let name = hash.to_owned();
+    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    match kept {
+        Ok(true) => Ok(srv::status(StatusCode::CREATED)),
+        Ok(false) => Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name")),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct SyncCopyAsk {
+    machine: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct SyncCreateAsk {
+    name: String,
+    #[serde(default)]
+    copies: Vec<SyncCopyAsk>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+/// Machines kiln knows.
+async fn known_machine(hub: &Hub, machine: &str) -> Result<(), ApiError> {
+    if hub.agent_list().await.iter().any(|a| a.name == machine) {
+        Ok(())
+    } else {
+        Err(err(StatusCode::BAD_REQUEST, format!("no machine named {machine}")))
+    }
+}
+
+async fn sync_create(hub: &Hub, req: Request) -> R {
+    let a: SyncCreateAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    for c in &a.copies {
+        known_machine(hub, &c.machine).await?;
+    }
+    let what = format!("{} ({} copies)", a.name, a.copies.len());
+    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude };
+    let id = hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), "sync.create".into(), what).await;
+    Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "id": id })))
+}
+
+async fn sync_add_copy(hub: &Hub, id: &str, req: Request) -> R {
+    let a: SyncCopyAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    known_machine(hub, &a.machine).await?;
+    let what = format!("{id}: {}:{}", a.machine, a.path);
+    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), "sync.copy.add".into(), what).await;
+    Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "member": member.parse::<u64>().unwrap_or(0) })))
+}
+
+#[derive(Deserialize)]
+struct SyncResolveAsk {
+    path: String,
+    keep: crate::sync::server::Keep,
+}
+
+async fn sync_resolve(hub: &Hub, id: &str, req: Request) -> R {
+    let a: SyncResolveAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let what = format!("{id}: {} ({:?})", a.path, a.keep);
+    hub.sync.ask(crate::sync::server::Ask::Resolve { repo: id.to_owned(), path: a.path, keep: a.keep }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), "sync.resolve".into(), what).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+async fn sync_ask(hub: &Hub, action: &str, id: &str, ask: crate::sync::server::Ask) -> R {
+    hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), action.to_owned(), id.to_owned()).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 // ------------------------------------------------------------------ voice
 
 /// Speech to text for the console's microphone where the browser can't do it itself: the body is
@@ -553,10 +750,11 @@ struct Login {
 }
 
 async fn login(hub: &Hub, req: Request) -> R {
+    let secure = is_secure(hub, &req);
     let l: Login = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     if crate::util::ct_eq(l.token.trim().as_bytes(), hub.admin_token.as_bytes()) {
         hub.store.audit("admin".into(), "login".into(), "token".into()).await;
-        Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub)))
+        Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub, secure)))
     } else {
         crate::rt::sleep(Duration::from_millis(500)).await;
         Err(err(StatusCode::UNAUTHORIZED, "invalid token"))
@@ -572,7 +770,7 @@ fn otp(hub: &Hub, req: &Request) -> Response {
             hub_store.audit("admin".into(), "login".into(), "one-time link".into()).await;
         });
         let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/");
-        srv::with_header(r, header::SET_COOKIE, &session_cookie(hub))
+        srv::with_header(r, header::SET_COOKIE, &session_cookie(hub, is_secure(hub, req)))
     } else {
         // Back to the login page, which explains what went wrong and offers the other methods.
         srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, &format!("/?signin={}", otp_problem(hub, code)))
@@ -605,6 +803,7 @@ struct PasswordLogin {
 }
 
 async fn login_password(hub: &Hub, req: Request) -> R {
+    let secure = is_secure(hub, &req);
     let l: PasswordLogin =
         srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let gate = PASSWORD_GATE.lock().await;
@@ -625,7 +824,7 @@ async fn login_password(hub: &Hub, req: Request) -> R {
             PASSWORD_THROTTLE.succeeded();
             drop(gate);
             hub.store.audit("admin".into(), "login".into(), "password".into()).await;
-            Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub)))
+            Ok(srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &session_cookie(hub, secure)))
         }
         Some(false) => {
             PASSWORD_THROTTLE.failed();
@@ -682,6 +881,8 @@ fn me(hub: &Hub, headers: &HeaderMap) -> Response {
         &json!({
             "authenticated": authed(hub, headers),
             "public_url": hub.cfg.server.public_url,
+            // Where else browsers find this server: its runners' front doors (HTTPS).
+            "origins": hub.front_doors.origins(),
             "version": env!("CARGO_PKG_VERSION"),
             "hostname": crate::config::Config::hostname(),
             "discovery": announced,

@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -191,6 +191,16 @@ enum Ev {
     Term(String, PtyOut),
     Up(Up),
     Harness(String, crate::harness::core::Update),
+    /// The front door's status changed.
+    FrontDoor,
+}
+
+/// Completes when the front door (if this runner has one) reports something new.
+async fn front_door_changed(fd: Option<&crate::frontdoor::runner::Handle>) {
+    match fd {
+        Some(h) => h.changed().await,
+        None => futures::future::pending().await,
+    }
 }
 
 async fn sleep_until_opt(t: Option<Instant>) {
@@ -231,11 +241,34 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("server QUIC address unknown (pass --quic)"))?;
     // HTTP(S) to the server (source archives, artifacts): public roots plus kiln's own CA.
     let http = Arc::new(Client::new(Roots::WebPkiPlusDer(ca.clone()), None)?);
+    // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
+    // from the settings it stored at once, and keeps running while the server is away.
+    let front_door = (!o.ephemeral).then(|| {
+        crate::frontdoor::runner::start(
+            crate::frontdoor::runner::Ctx { dir: o.state_dir.join("front-door"), server_url: o.server_url.clone(), ca_der: ca.clone() },
+            &shutdown,
+        )
+    });
+    // What the server last heard of it on this connection.
+    let mut front_door_sent: Option<String> = None;
     let (net, events) = net::start(net::Spec { bind: "0.0.0.0:0".parse()?, ca_der: ca, leaf, server: false, dial_deadline: net::DIAL_DEADLINE })?;
     // UDP to the QUIC address, or the HTTP tunnel when UDP gets no answer (see `crate::tunnel`).
     let mut paths = crate::tunnel::Paths::new(&o.server_url, &quic_addr);
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
+    // Repo sync: the copies of synced repos this machine holds (none in a job pod).
+    let sync = (!o.ephemeral).then(|| {
+        let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone());
+        let up = up_tx.clone();
+        crate::rt::spawn(async move {
+            while let Ok(m) = said.recv().await {
+                if up.send(Up::Sync(m)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        sync
+    });
     let uplink = Uplink(up_tx);
     let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
@@ -329,6 +362,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
+            () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
         };
         match ev {
             Ev::Shutdown => {
@@ -392,6 +426,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // and dial directly; the tunnel stays open until that connection is up.
                 if paths.tick(connected, Instant::now()) {
                     connected = false;
+                    if let Some(s) = &sync {
+                        s.connected(false);
+                    }
                     dialing_since = None;
                     redial = Some(Instant::now());
                 }
@@ -419,9 +456,20 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 connected = true;
+                if let Some(s) = &sync {
+                    s.connected(true);
+                }
                 while let Some((lane, kind, data)) = buffer.pop_front() {
                     buffered = buffered.saturating_sub(data.len());
                     net.send(SERVER_PEER, lane, kind, data).await;
+                }
+                // How the front door does, after everything older (an older server skips it).
+                front_door_sent = None;
+                if let Some(json) = front_door.as_ref().and_then(crate::frontdoor::runner::Handle::latest)
+                    && let Ok(b) = proto::encode(&AgentMsg::FrontDoorStatus { json: json.clone() })
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    front_door_sent = Some(json);
                 }
             }
             Ev::Net(Some(NetEvent::Closed { reason, .. } | NetEvent::Unreachable { reason, .. })) => {
@@ -436,6 +484,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     at_once = paths.dial_failed(now);
                 }
                 connected = false;
+                if let Some(s) = &sync {
+                    s.connected(false);
+                }
                 dialing_since = None;
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
@@ -490,6 +541,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             anyhow::bail!("refused: {reason}");
                         }
                         connected = false;
+                        if let Some(s) = &sync {
+                            s.connected(false);
+                        }
                         net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                         redial = Some(Instant::now() + Duration::from_secs(60));
                     }
@@ -727,6 +781,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
+                    ServerMsg::Sync { json, raft } => {
+                        if let Some(s) = &sync {
+                            s.heard(&json, raft);
+                        }
+                    }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
                         let up = uplink.0.clone();
@@ -735,6 +794,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::DirList { req, json })).await;
                         });
                     }
+                    ServerMsg::FrontDoor { json } => {
+                        // Settings (and certificates) are never logged: an upload carries a key.
+                        if let Some(fd) = &front_door {
+                            fd.push(json);
+                        }
+                    }
+                }
+            }
+            Ev::FrontDoor => {
+                if connected
+                    && let Some(json) = front_door.as_ref().and_then(crate::frontdoor::runner::Handle::latest)
+                    && front_door_sent.as_deref() != Some(json.as_str())
+                    && let Ok(b) = proto::encode(&AgentMsg::FrontDoorStatus { json: json.clone() })
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    front_door_sent = Some(json);
                 }
             }
             Ev::Term(session, out) => {
@@ -757,11 +832,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
                     Up::Log(c) => (LANE_LOGS, Kind::Log, proto::encode(c)),
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
+                    Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term {
+                } else if kind != Kind::Term && lane != LANE_SYNC {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.

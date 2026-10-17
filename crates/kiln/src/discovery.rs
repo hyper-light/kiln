@@ -334,6 +334,21 @@ fn reply(a: &Advert, answer: Kinds, ttl: u32, cache_flush: bool, v4: &[Ipv4Addr]
     }
 }
 
+/// A response with A and AAAA records for host names: each `(name, qtype)` gets the addresses its
+/// type asks for (ANY: both).
+fn host_reply(asked: &[(&Name, u16)], ttl: u32, cache_flush: bool, v4: &[Ipv4Addr], v6: &[Ipv6Addr]) -> Message {
+    let mut answers = Vec::new();
+    for (name, qtype) in asked {
+        if matches!(*qtype, dns::TYPE_A | dns::TYPE_ANY) {
+            answers.extend(v4.iter().map(|ip| Record::new((*name).clone(), ttl, cache_flush, RData::A(*ip))));
+        }
+        if matches!(*qtype, dns::TYPE_AAAA | dns::TYPE_ANY) {
+            answers.extend(v6.iter().map(|ip| Record::new((*name).clone(), ttl, cache_flush, RData::Aaaa(*ip))));
+        }
+    }
+    Message { id: 0, flags: dns::FLAG_RESPONSE | dns::FLAG_AUTHORITATIVE, answers, ..Message::default() }
+}
+
 /// What a query asks of `a` (after known-answer suppression, RFC 6762 §7.1), and whether any of
 /// those questions wants a unicast reply.
 fn wanted(a: &Advert, q: &Message) -> (Kinds, bool) {
@@ -969,6 +984,9 @@ pub struct Options {
     pub answer_from: AnswerFrom,
     /// Where the engine reports how it runs.
     pub health: Arc<Mutex<status::Health>>,
+    /// More host names it answers A and AAAA for with this machine's addresses (a front door's
+    /// `<name>.local`): unique records, answered at once and announced with the advert.
+    pub hosts: Arc<Mutex<Vec<Name>>>,
 }
 
 impl Options {
@@ -983,6 +1001,7 @@ impl Options {
             changed: Arc::new(Notify::new()),
             answer_from: AnswerFrom::parse(&["private".to_owned()]).0,
             health: Arc::default(),
+            hosts: Arc::default(),
         }
     }
 }
@@ -1235,9 +1254,60 @@ impl Engine {
 
     /// Announce our records (`ttl` 0: say goodbye).
     fn announce(&mut self, ttl: u32, now: Instant) {
-        let Some(advert) = self.advert() else { return };
-        self.multicast(None, now, false, |v4, v6| reply(&advert, Kinds::ALL, ttl, true, v4, v6));
+        if let Some(advert) = self.advert() {
+            self.multicast(None, now, false, |v4, v6| reply(&advert, Kinds::ALL, ttl, true, v4, v6));
+        }
+        let hosts = self.opts.hosts.lock().clone();
+        if !hosts.is_empty() {
+            let all: Vec<(&Name, u16)> = hosts.iter().map(|h| (h, dns::TYPE_ANY)).collect();
+            self.multicast(None, now, false, |v4, v6| host_reply(&all, ttl, true, v4, v6));
+        }
         self.announced = ttl > 0;
+    }
+
+    /// Whether there is anything to announce.
+    fn announces(&self) -> bool {
+        self.opts.advert.is_some() || !self.opts.hosts.lock().is_empty()
+    }
+
+    /// Questions for the extra host names (a front door's `<name>.local`): unique records,
+    /// answered at once (RFC 6762 §6) on the interface asked, by unicast to legacy and QU
+    /// questions.
+    fn answer_hosts(&mut self, q: &Message, from: SocketAddr, now: Instant) {
+        let hosts = self.opts.hosts.lock().clone();
+        if hosts.is_empty() {
+            return;
+        }
+        let asked: Vec<(&Name, u16)> = q
+            .questions
+            .iter()
+            .filter_map(|qq| {
+                let host = hosts.iter().find(|h| **h == qq.name)?;
+                matches!(qq.qtype, dns::TYPE_A | dns::TYPE_AAAA | dns::TYPE_ANY).then_some((host, qq.qtype))
+            })
+            .collect();
+        if asked.is_empty() || !self.may_answer(from) {
+            return;
+        }
+        let iface = self.iface_for(from).cloned();
+        let (v4, v6) = iface.as_ref().map_or_else(|| self.all_addrs(), |i| self.addrs(i));
+        let unicast = q.questions.iter().any(|qq| qq.unicast);
+        if from.port() != MDNS_PORT {
+            let mut m = host_reply(&asked, LEGACY_TTL, false, &v4, &v6);
+            if m.answers.is_empty() {
+                return;
+            }
+            m.id = q.id;
+            m.questions = q.questions.clone();
+            self.send(&m, from, None);
+        } else if unicast {
+            let m = host_reply(&asked, TTL, true, &v4, &v6);
+            if !m.answers.is_empty() {
+                self.send(&m, from, None);
+            }
+        } else {
+            self.multicast(iface.map(|i| i.index), now, false, |v4, v6| host_reply(&asked, TTL, true, v4, v6));
+        }
     }
 
     /// Ask for `_kiln._tcp.local.`, listing the instances already known.
@@ -1298,10 +1368,11 @@ impl Engine {
             return changed;
         }
         // A standard query (opcode 0) about us, from where we answer?
-        let Some(advert) = self.advert() else { return false };
         if msg.flags & dns::OPCODE_MASK != 0 {
             return false;
         }
+        self.answer_hosts(&msg, from, now);
+        let Some(advert) = self.advert() else { return false };
         let (kinds, unicast) = wanted(&advert, &msg);
         if !kinds.any() {
             return false;
@@ -1342,7 +1413,7 @@ impl Engine {
             Tick,
         }
         let start = Instant::now();
-        let mut next_announce = self.opts.advert.is_some().then_some(start);
+        let mut next_announce = self.announces().then_some(start);
         let mut announcements = 0u32;
         let mut next_query = self.opts.browse.then_some(start);
         let mut queries = 0u32;
@@ -1383,7 +1454,7 @@ impl Engine {
             match ev {
                 Ev::Stop => return Ok(()),
                 Ev::Changed => {
-                    next_announce = self.opts.advert.is_some().then_some(now);
+                    next_announce = self.announces().then_some(now);
                     announcements = 0;
                 }
                 Ev::Packet(Ok((n, from)), v6) => {
@@ -1423,7 +1494,7 @@ impl Engine {
                 self.flush_pending(now);
             }
             if next_ifaces <= now {
-                if self.refresh_interfaces() && self.opts.advert.is_some() {
+                if self.refresh_interfaces() && self.announces() {
                     next_announce = Some(now);
                 }
                 next_ifaces = now + INTERFACES_EVERY;
@@ -1611,6 +1682,7 @@ impl Discovery {
             changed: Arc::clone(&self.changed),
             answer_from: AnswerFrom::parse(&self.settings.answer_from).0,
             health: Arc::clone(&self.health),
+            hosts: Arc::default(),
         }
     }
 
@@ -2146,6 +2218,42 @@ mod tests {
             stop.cancel();
             let finished = crate::rt::timeout(Duration::from_secs(5), served).await;
             assert!(matches!(finished, Ok(Ok(Ok(())))));
+            Ok(())
+        })
+    }
+
+    /// A front door's `.local` name: answered with this machine's addresses, with or without an
+    /// advert of its own.
+    #[test]
+    fn extra_host_names_are_answered() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let opts = Options { port: 0, multicast: false, browse: false, ..Options::browse_only() };
+            opts.hosts.lock().push(Name::parse("kiln.local"));
+            let mut engine = Engine::open(opts, Arc::new(Table::default()))?;
+            engine.ifaces = vec![Iface { name: "lan".into(), index: 2, v4: vec![(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(255, 255, 255, 0))], v6: vec![] }];
+            assert!(engine.announces());
+            let port = engine.local_addr().map(|s| s.port()).ok_or_else(|| anyhow::anyhow!("no port"))?;
+            let (stop, served) = serve(engine);
+            let client = hyper_rt::udp::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let to = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let mut buf = vec![0u8; dns::MAX_MESSAGE];
+            for (name, answered) in [("KILN.local", true), ("other.local", false), ("kiln.local", true)] {
+                let mut q = query(Name::parse(name), dns::TYPE_A, false);
+                q.id = 9;
+                client.send_to_writable(&q.encode()?, to).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let got = crate::rt::timeout(Duration::from_millis(if answered { 5000 } else { 300 }), client.recv_from(&mut buf)).await;
+                match got {
+                    Ok(Ok((n, _))) => {
+                        assert!(answered, "{name} is not ours");
+                        let m = Message::decode(buf.get(..n).unwrap_or_default())?;
+                        assert_eq!(m.id, 9);
+                        assert_eq!(m.answers.iter().map(|r| r.data.clone()).collect::<Vec<_>>(), [RData::A(Ipv4Addr::new(10, 9, 9, 1))]);
+                    }
+                    _ => assert!(!answered, "{name} got no answer"),
+                }
+            }
+            stop.cancel();
+            let _ = crate::rt::timeout(Duration::from_secs(5), served).await;
             Ok(())
         })
     }

@@ -32,6 +32,12 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_LIMIT: usize = 256 << 20;
 /// Kept-alive connections a cluster's pool holds.
 const POOL: usize = 32;
+/// What most requests ask for.
+const JSON: &str = "application/json";
+/// Lists of objects' metadata alone.
+const METADATA: &str = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json";
+/// Logs are text.
+const ANY: &str = "*/*";
 
 /// One cluster's API server.
 pub struct Cluster {
@@ -157,7 +163,7 @@ impl Cluster {
         }
     }
 
-    fn build(&self, method: &Method, path: &str, ctype: Option<&str>, body: Option<&Bytes>, auth: Option<&str>) -> Result<http::Request<Body>> {
+    fn build(&self, method: &Method, path: &str, ctype: Option<&str>, body: Option<&Bytes>, auth: Option<&str>, accept: &str) -> Result<http::Request<Body>> {
         let authority = if (self.https && self.port == 443) || (!self.https && self.port == 80) {
             self.host.clone()
         } else {
@@ -168,7 +174,7 @@ impl Cluster {
             .uri(format!("{}{path}", self.prefix))
             .header(header::HOST, authority)
             .header(header::USER_AGENT, "kiln")
-            .header(header::ACCEPT, "application/json");
+            .header(header::ACCEPT, accept);
         if let Some(a) = auth {
             b = b.header(header::AUTHORIZATION, HeaderValue::from_str(a)?);
         }
@@ -183,20 +189,29 @@ impl Cluster {
 
     /// One request; the whole answer.
     pub async fn request(&self, method: Method, path: &str, ctype: Option<&str>, body: Option<Bytes>) -> Result<(u16, Bytes)> {
+        self.request_as(method, path, ctype, body, JSON).await
+    }
+
+    /// One request asking for `accept`; the whole answer.
+    pub async fn request_as(&self, method: Method, path: &str, ctype: Option<&str>, body: Option<Bytes>, accept: &str) -> Result<(u16, Bytes)> {
         let auth = self.authorization().await?;
         let fut = async {
-            // A kept-alive connection may have closed since: try the next, then a new one.
-            for _ in 0..3 {
+            // A kept-alive connection may have closed since: try the next, then a new one. One the
+            // API server closed while idle is dropped without costing an attempt, so a pool of
+            // stale connections can't fail a request that never reached the server.
+            let mut attempts = 0;
+            while attempts < 3 {
                 let pooled = self.pool.lock().pop();
                 let mut sender = match pooled {
                     Some(s) if !s.is_closed() => s,
                     Some(_) => continue,
                     None => self.connect().await?,
                 };
+                attempts += 1;
                 if sender.ready().await.is_err() {
                     continue;
                 }
-                let req = self.build(&method, path, ctype, body.as_ref(), auth.as_deref())?;
+                let req = self.build(&method, path, ctype, body.as_ref(), auth.as_deref(), accept)?;
                 let resp = match sender.send_request(req).await {
                     Ok(r) => r,
                     Err(e) if e.is_canceled() || e.is_closed() => continue,
@@ -224,9 +239,14 @@ impl Cluster {
 
     /// A long-lived request (a watch) on a connection of its own.
     pub async fn stream(&self, path: &str) -> Result<http::Response<Incoming>> {
+        self.stream_as(path, JSON).await
+    }
+
+    /// A long-lived request asking for `accept` (a log that follows) on a connection of its own.
+    pub async fn stream_as(&self, path: &str, accept: &str) -> Result<http::Response<Incoming>> {
         let auth = self.authorization().await?;
         let mut sender = crate::rt::timeout(TIMEOUT, self.connect()).await.map_err(|_| anyhow::anyhow!("connecting timed out"))??;
-        let req = self.build(&Method::GET, path, None, None, auth.as_deref())?;
+        let req = self.build(&Method::GET, path, None, None, auth.as_deref(), accept)?;
         let resp = crate::rt::timeout(TIMEOUT, sender.send_request(req)).await.map_err(|_| anyhow::anyhow!("no answer"))??;
         Ok(resp)
     }
@@ -234,7 +254,7 @@ impl Cluster {
     async fn get_json(&self, path: &str, accept_aggregated: bool) -> Result<Value> {
         let auth = self.authorization().await?;
         let mut sender = self.connect().await?;
-        let mut req = self.build(&Method::GET, path, None, None, auth.as_deref())?;
+        let mut req = self.build(&Method::GET, path, None, None, auth.as_deref(), JSON)?;
         if accept_aggregated {
             req.headers_mut().insert(
                 header::ACCEPT,
@@ -365,6 +385,77 @@ impl Cluster {
                 return Ok((out, rv));
             }
         }
+    }
+
+    /// The objects of a kind in one namespace (every namespace when `None`, or when the kind is
+    /// cluster-scoped) matching `selector`, as [`Cluster::list`] gives them. With `metadata_only`,
+    /// the API server sends each object's metadata alone (a `PartialObjectMetadataList`): what a
+    /// tree needs of kinds whose bodies are large or secret.
+    pub async fn list_in(&self, gk: &GroupKind, namespace: Option<&str>, selector: Option<&str>, metadata_only: bool) -> Result<Vec<Value>> {
+        let r = self.resource(&gk.group, &gk.kind)?;
+        let api_version = if r.group.is_empty() { r.version.clone() } else { format!("{}/{}", r.group, r.version) };
+        let accept = if metadata_only { METADATA } else { JSON };
+        let mut out = Vec::new();
+        let mut cont = String::new();
+        loop {
+            let mut q = String::from("limit=500");
+            if let Some(s) = selector {
+                q.push_str(&format!("&labelSelector={}", k::enc(s)));
+            }
+            if !cont.is_empty() {
+                q.push_str(&format!("&continue={}", k::enc(&cont)));
+            }
+            let path = format!("{}?{q}", k::collection_path(&r, namespace));
+            let (status, bytes) = self.request_as(Method::GET, &path, None, None, accept).await?;
+            if !(200..300).contains(&status) {
+                bail!("listing {gk}{}: {}", namespace.map(|n| format!(" in {n}")).unwrap_or_default(), k::status_message(status, &bytes));
+            }
+            let mut doc: Value = serde_json::from_slice(&bytes)?;
+            cont = obj::str_at(&doc, &["metadata", "continue"]).unwrap_or("").to_owned();
+            if let Some(Value::Array(items)) = doc.get_mut("items").map(Value::take) {
+                for mut item in items {
+                    if let Some(m) = item.as_object_mut() {
+                        m.insert("apiVersion".into(), Value::String(api_version.clone()));
+                        m.insert("kind".into(), Value::String(gk.kind.to_string()));
+                    }
+                    out.push(item);
+                }
+            }
+            if cont.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Whether the cluster serves a kind, by discovery.
+    pub fn serves(&self, group: &str, kind: &str) -> bool {
+        self.discovery.read().get(group, kind).is_some()
+    }
+
+    /// A GET whose answer is JSON, or why not.
+    pub async fn get_path(&self, path: &str) -> Result<Value> {
+        let (status, bytes) = self.request(Method::GET, path, None, None).await?;
+        if !(200..300).contains(&status) {
+            bail!("{}", k::status_message(status, &bytes));
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// A pod's log (`query` as the log endpoint takes it: `container`, `tailLines`, `sinceSeconds`,
+    /// `timestamps`, `previous`, `limitBytes`).
+    pub async fn pod_log(&self, namespace: &str, pod: &str, query: &str) -> Result<Bytes> {
+        let path = format!("/api/v1/namespaces/{}/pods/{}/log?{query}", k::enc(namespace), k::enc(pod));
+        let (status, bytes) = self.request_as(Method::GET, &path, None, None, ANY).await?;
+        if !(200..300).contains(&status) {
+            bail!("{}", k::status_message(status, &bytes));
+        }
+        Ok(bytes)
+    }
+
+    /// A pod's log as it is written (`follow=true` is added to `query`), on a connection of its own.
+    pub async fn follow_log(&self, namespace: &str, pod: &str, query: &str) -> Result<http::Response<Incoming>> {
+        let path = format!("/api/v1/namespaces/{}/pods/{}/log?follow=true&{query}", k::enc(namespace), k::enc(pod));
+        self.stream_as(&path, ANY).await
     }
 
     /// The watch request's path for a kind from `rv`.

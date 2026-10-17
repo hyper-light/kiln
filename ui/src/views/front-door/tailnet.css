@@ -1,0 +1,76 @@
+/* Runners → Domain & HTTPS → Tailnet (tailnet.tsx), in the section's voice (front-door.css): the
+   names as rows with a state dot and where the tailnet sends them, then the two ways to make it
+   "this runner" side by side on wide screens and stacked on phones. Values to type into
+   Tailscale's console are code with a copy button; long ones wrap, nothing scrolls sideways. */
+
+.tn {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.tn-routes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.tn-route {
+  display: grid;
+  grid-template-columns: 12px auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+  min-height: 30px;
+  padding: 5px 0;
+  border-bottom: 1px solid #1d1f24;
+}
+.tn-name {
+  white-space: nowrap;
+}
+.tn-to {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fd-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tn-route[data-state="on"] .tn-to {
+  color: #b9d6ca;
+}
+.tn-setup {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px 28px;
+}
+@container fd (min-width: 860px) {
+  .tn-setup {
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  }
+}
+.tn-way {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.tn-steps {
+  line-height: 2;
+}
+.tn-value {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  padding: 0 2px 0 7px;
+  border: 1px solid #262933;
+  border-radius: 5px;
+  background: #0d0f13;
+  vertical-align: middle;
+}
+.tn-value > code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.tn-value > .fd-copy {
+  flex: none;
+}

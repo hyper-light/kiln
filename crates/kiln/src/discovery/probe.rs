@@ -485,21 +485,6 @@ pub fn start_scan(d: &Arc<Discovery>, cidrs: Option<Vec<String>>, on_change: Arc
 
 // ------------------------------------------------------------------------------ sources
 
-/// The `tailscale` command, where it usually is.
-fn tailscale_command() -> Option<std::path::PathBuf> {
-    if let Some(p) = crate::os::which("tailscale") {
-        return Some(p);
-    }
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
-        &["/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
-    } else if cfg!(windows) {
-        &[r"C:\Program Files\Tailscale\tailscale.exe"]
-    } else {
-        &[]
-    };
-    candidates.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
-}
-
 /// The online peers' first IPv4 Tailscale address (else their first one) in `tailscale status
 /// --json` output.
 pub fn tailscale_peers(status: &serde_json::Value) -> Vec<IpAddr> {
@@ -525,7 +510,7 @@ pub fn tailscale_peers(status: &serde_json::Value) -> Vec<IpAddr> {
 
 /// Ask `tailscale status --json` for the peers.
 async fn ask_tailscale() -> Result<Vec<IpAddr>, String> {
-    let exe = tailscale_command().ok_or_else(|| "Tailscale is not installed".to_owned())?;
+    let exe = crate::tailscale::command().ok_or_else(|| "Tailscale is not installed".to_owned())?;
     let run = crate::rt::blocking(move || std::process::Command::new(exe).args(["status", "--json"]).stdin(std::process::Stdio::null()).output());
     let output = crate::rt::timeout(Duration::from_secs(10), run)
         .await

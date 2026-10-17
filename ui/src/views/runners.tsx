@@ -15,6 +15,7 @@ import { Tip } from "@/components/ui/tooltip";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
 import { errorMessage, useDocumentTitle, useLocalStorage, useResource } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+import { FrontDoorSection } from "./front-door/front-door";
 import { HostCharts } from "./host-charts";
 import { useJoinData } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
@@ -102,7 +103,7 @@ export default function Runners() {
   return (
     <div className="container-console page">
       <PageIntro
-        index={5}
+        index={6}
         label="Runners"
         title="Fleet"
         lead={
@@ -239,6 +240,8 @@ export default function Runners() {
           </table>
         </div>
       )}
+
+      {agents.data && all.length > 0 && <FrontDoorSection agents={all} index="02" />}
 
       <AgentDrawer agent={selAgent} onClose={() => openAgent(null)} onDrain={drain} onForget={(a) => setForget(a)} />
       {forget && (

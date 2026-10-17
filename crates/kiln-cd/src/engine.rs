@@ -374,6 +374,12 @@ pub struct OpStatus {
     pub attempt: u32,
     /// What it says now.
     pub message: String,
+    /// Who started it, when a person or agent did.
+    pub by: Option<String>,
+    /// When it started (the engine's clock, ms).
+    pub started_ms: u64,
+    /// When it finished, once it has.
+    pub finished_ms: Option<u64>,
 }
 
 /// A durable event.
@@ -536,6 +542,8 @@ struct Counts {
 
 struct Op {
     id: u64,
+    /// When it started.
+    started_ms: u64,
     trigger: Trigger,
     by: Option<String>,
     revision: Option<Str>,
@@ -2005,6 +2013,7 @@ impl Engine {
         let op_content = app.content;
         let mut op = Op {
             id,
+            started_ms: now,
             trigger,
             by: request.by.clone(),
             revision: revision.clone(),
@@ -2511,6 +2520,7 @@ impl Engine {
             let request = app.op.as_ref().map(|o| o.request.clone()).unwrap_or_default();
             let trigger = app.op.as_ref().map(|o| o.trigger).unwrap_or(Trigger::Manual);
             let id = app.op.as_ref().map(|o| o.id).unwrap_or(0);
+            let (by, started_ms) = app.op.as_ref().map(|o| (o.by.clone(), o.started_ms)).unwrap_or((None, now));
             self.drop_requests(a);
             if let Some(app) = self.app_mut(a) {
                 app.op = None;
@@ -2520,6 +2530,9 @@ impl Engine {
                     trigger,
                     attempt,
                     message: format!("{message} (retrying in {} s, attempt {} of {})", wait / 1000, attempt + 1, r.limit + 1),
+                    by,
+                    started_ms,
+                    finished_ms: Some(now),
                 });
                 app.retry = Some(PendingRetry { request, trigger, attempt: attempt + 1, at_ms: now + wait });
             }
@@ -2563,6 +2576,9 @@ impl Engine {
             trigger: op.trigger,
             attempt: op.attempt,
             message: message.clone(),
+            by: op.by.clone(),
+            started_ms: op.started_ms,
+            finished_ms: Some(now),
         });
         let record = Record::Finished {
             app: app.cfg.id.clone(),
@@ -2770,7 +2786,16 @@ fn dry_run_miss_expected(op: &Op, task: usize, error: &str) -> bool {
 }
 
 fn op_status(op: &Op) -> OpStatus {
-    OpStatus { id: op.id, phase: op.phase, trigger: op.trigger, attempt: op.attempt, message: op.message.clone() }
+    OpStatus {
+        id: op.id,
+        phase: op.phase,
+        trigger: op.trigger,
+        attempt: op.attempt,
+        message: op.message.clone(),
+        by: op.by.clone(),
+        started_ms: op.started_ms,
+        finished_ms: None,
+    }
 }
 
 /// What a resource last added to its app's counts.

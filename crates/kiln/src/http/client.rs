@@ -21,6 +21,8 @@ pub enum Method {
     Put,
     Patch,
     Delete,
+    /// Whether something is there, without its body.
+    Head,
 }
 
 impl Method {
@@ -31,6 +33,7 @@ impl Method {
             Self::Put => http::Method::PUT,
             Self::Patch => http::Method::PATCH,
             Self::Delete => http::Method::DELETE,
+            Self::Head => http::Method::HEAD,
         }
     }
 }

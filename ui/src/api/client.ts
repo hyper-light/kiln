@@ -8,6 +8,7 @@ import type {
   Job,
   JoinInfo,
   JoinRequest,
+  KilnBinary,
   Me,
   MetricsHistory,
   NewRepo,
@@ -15,11 +16,12 @@ import type {
   Repo,
   Run,
   RunDetail,
+  SyncKeep,
+  SyncView,
   SystemInfo,
   TerminalSessionInfo,
   UpdateJob,
   UpdatesOverview,
-  KilnBinary,
 } from "./types";
 
 export class ApiError extends Error {
@@ -139,6 +141,13 @@ export const api = {
   overview: (signal?: AbortSignal) => get<Overview>("/api/overview", signal),
 
   repos: (signal?: AbortSignal) => get<Repo[]>("/api/repos", signal),
+  sync: (signal?: AbortSignal) => get<SyncView>("/api/sync", signal),
+  syncCreate: (body: { name: string; copies: { machine: string; path: string }[]; exclude: string[] }) =>
+    post<{ id: string }>("/api/sync", body),
+  syncAddCopy: (id: string, copy: { machine: string; path: string }) => post<{ member: number }>(`/api/sync/${enc(id)}/copies`, copy),
+  syncRemoveCopy: (id: string, member: number) => del<void>(`/api/sync/${enc(id)}/copies/${member}`),
+  syncDelete: (id: string) => del<void>(`/api/sync/${enc(id)}`),
+  syncResolve: (id: string, path: string, keep: SyncKeep) => post<void>(`/api/sync/${enc(id)}/conflicts/resolve`, { path, keep }),
   addRepo: (repo: NewRepo) => post<Repo>("/api/repos", repo),
   deleteRepo: (id: string) => del<void>(`/api/repos/${enc(id)}`),
   pollRepo: (id: string) => post<void>(`/api/repos/${enc(id)}/poll`),
@@ -210,6 +219,32 @@ export const api = {
  */
 export const machineDirs = (target: string, path: string, signal?: AbortSignal) =>
   get<DirListing>(`/api/machines/${enc(target)}/dirs${qs({ path })}`, signal);
+
+/* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
+
+import type { CertInfo, FrontDoorSettings, FrontDoorView, TailscaleView } from "./types";
+
+export const frontDoorApi = {
+  /** Every runner with front-door settings. */
+  list: (signal?: AbortSignal) => get<FrontDoorView[]>("/api/front-doors", signal),
+  get: (runner: string, signal?: AbortSignal) => get<FrontDoorView>(`/api/runners/${enc(runner)}/front-door`, signal),
+  save: (runner: string, settings: FrontDoorSettings) => request<FrontDoorView>("PUT", `/api/runners/${enc(runner)}/front-door`, settings),
+  /** A certificate chain and its key for the runner (which keeps them; the key is never sent back). */
+  uploadCert: (runner: string, cert_pem: string, key_pem: string) =>
+    post<{ cert: CertInfo; front_door: FrontDoorView }>(`/api/runners/${enc(runner)}/front-door/cert`, { cert_pem, key_pem }),
+  /** A new key and self-signed certificate now (409 for your own certificate, or with HTTPS off). */
+  renewCert: (runner: string) => post<FrontDoorView>(`/api/runners/${enc(runner)}/front-door/cert/renew`, {}),
+  /** The certificate chain the runner serves, as a PEM download (certificates only, never the key). */
+  certUrl: (runner: string) => `/api/runners/${enc(runner)}/front-door/cert`,
+};
+
+/** The tailnet's split DNS for the front doors (one Tailscale credential for the server). */
+export const tailscaleApi = {
+  get: (signal?: AbortSignal) => get<TailscaleView>("/api/tailscale", signal),
+  /** An OAuth client secret (with its ID when it doesn't carry it) or an API access token; tried first. */
+  connect: (secret: string, client_id: string) => request<TailscaleView>("PUT", "/api/tailscale", { secret, client_id }),
+  forget: () => del<TailscaleView>("/api/tailscale"),
+};
 
 /** Build a ws:// or wss:// URL for a same-origin path. */
 export function wsUrl(path: string): string {

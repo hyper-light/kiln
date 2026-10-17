@@ -1,8 +1,14 @@
 /**
- * One app: where it deploys, whether it matches git, what runs and what differs, and its
- * deployments. Sync, refresh, rollback, take over (for apps adopted from Argo CD), stop and
- * delete are here, all in the page: an action that can't be undone first says, in place, what it
- * will do; what happened shows below the actions. A select chooses what the page lists.
+ * One app: everything Argo CD's application view does, in kiln's words. The head says how it
+ * stands (sync, health), what it runs (the revision, its message, author and time), how its last
+ * sync went, and where it comes from and goes to; its actions (sync, refresh, diff, history and
+ * rollback, delete) open in the page, under them, and what can't be undone asks there first.
+ *
+ * Below, its objects and every live object they own, as a tree (a graph on wide screens, an
+ * indented list on phones), a sortable list, or its pods by node or owner, chosen with a select.
+ * One filter field (kind, health, sync, namespace, and names as you type) applies to every view;
+ * in the tree a match keeps its owners in view. Choosing an object opens it in the page: under
+ * the graph on wide screens, under its row everywhere else.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
@@ -10,18 +16,23 @@ import { RefreshCw, Rocket } from "lucide-react";
 
 import { cdApi } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
-import type { CdAppDetail, CdDeployment, CdResource } from "@/api/types";
+import type { CdAppDetail, CdDeployment, CdNode, CdResource } from "@/api/types";
 import { Button } from "@/components/ui/button";
+import { FacetBox, type Chosen } from "@/components/ui/facet-box";
 import { EmptyState, ErrorState, SelectField, SkeletonRows } from "@/components/ui/misc";
-import { errorMessage, useResource } from "@/lib/hooks";
-import { useWindowedRows } from "@/lib/virtual";
+import { errorMessage, useLocalStorage, useMediaQuery, useNow, useResource } from "@/lib/hooks";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
+import { ResourceDetails } from "./details";
+import { age, compareNodes, compareText, facetsOf, forest, isFiltered, keep, kindRank, troubled, type GroupItem } from "./model";
 import {
   HealthPair,
+  KindBadge,
+  NodeMarks,
   StatePair,
   SyncPair,
   TRIGGER_WORD,
+  nodeLine,
   objectKey,
   objectLabel,
   opTone,
@@ -30,13 +41,34 @@ import {
   running,
   shortRev,
 } from "./parts";
+import { TreeGraph, TreeList, graphFits } from "./tree";
 import "./deployments.css";
 
-const RES_ROW = 56;
-
-type Show = "resources" | "diff" | "history";
-type Ask = null | "takeover" | "delete" | "follow";
+type View = "tree" | "list" | "pods";
+type Ask = null | "sync" | "diff" | "history" | "takeover" | "delete" | "follow";
 type Notice = { tone: "ok" | "fail"; text: string } | null;
+type ListSort = "kind" | "name" | "namespace" | "health" | "sync" | "age";
+type PodGroup = "owner" | "node";
+
+const VIEWS = [
+  { value: "tree", label: "Tree" },
+  { value: "list", label: "List" },
+  { value: "pods", label: "Pods" },
+];
+const SORTS = [
+  { value: "kind", label: "Kind" },
+  { value: "name", label: "Name" },
+  { value: "namespace", label: "Namespace" },
+  { value: "health", label: "Health, worst first" },
+  { value: "sync", label: "Sync, out of sync first" },
+  { value: "age", label: "Age, newest first" },
+];
+const GROUPS = [
+  { value: "owner", label: "Owner" },
+  { value: "node", label: "Node" },
+];
+const HEALTH_RANK: Record<string, number> = { Degraded: 0, Missing: 1, Progressing: 2, Suspended: 3, Unknown: 4, Healthy: 5 };
+const SYNC_RANK: Record<string, number> = { OutOfSync: 0, Unknown: 1, Synced: 2, Hook: 3 };
 
 /** A fresh page per app, so nothing of one app shows while the next one loads. */
 export default function DeploymentAppRoute() {
@@ -44,17 +76,61 @@ export default function DeploymentAppRoute() {
   return <DeploymentApp key={`${project}/${name}`} project={project} name={name} />;
 }
 
+/** The app's objects as the engine knows them, for when its cluster can't be read. */
+function managedOnly(list: CdResource[]): CdNode[] {
+  return list.map((r) => ({
+    id: `${r.group}/${r.kind}:${r.namespace}/${r.name}`,
+    uid: null,
+    group: r.group,
+    version: "",
+    kind: r.kind,
+    namespace: r.namespace,
+    name: r.name,
+    parents: [],
+    managed: true,
+    health: r.health,
+    message: r.message,
+    sync: r.sync,
+    hook: r.hook,
+    missing: r.missing,
+    requires_pruning: r.requires_pruning,
+    why: r.why,
+    created_at: null,
+    info: [],
+    status: null,
+    ready: null,
+    restarts: null,
+    images: [],
+    containers: [],
+    node: null,
+  }));
+}
+
+/** The width an element has, kept as it changes. */
+function useWidth(ref: React.RefObject<HTMLElement | null>) {
+  const [w, setW] = React.useState(0);
+  React.useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setW(el.clientWidth);
+    const ro = new ResizeObserver(() => setW(el.clientWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref]);
+  return w;
+}
+
 function DeploymentApp({ project, name }: { project: string; name: string }) {
   const id = `${project}/${name}`;
   const navigate = useNavigate();
-  const app = useResource((s) => cdApi.app(id, s), [id], { pollMs: 10_000 });
-  const res = useResource((s) => cdApi.resources(id, s), [id], { pollMs: 10_000 });
-  const [show, setShow] = React.useState<Show>("resources");
   // Bumped when this app's status changes, so what is shown is read again.
   const [tick, setTick] = React.useState(0);
+  const app = useResource((s) => cdApi.app(id, s), [id], { pollMs: 10_000 });
+  const tree = useResource((s) => cdApi.tree(id, s), [id, tick], { pollMs: 5_000 });
+  const treeFailed = !!tree.error && !tree.data;
+  const fallback = useResource((s) => (treeFailed ? cdApi.resources(id, s) : Promise.resolve(null)), [id, tick, treeFailed]);
+  const history = useResource((s) => cdApi.history(id, s), [id, tick]);
   const [ask, setAsk] = React.useState<Ask>(null);
-  const [prune, setPrune] = React.useState(false);
-  const [dryRun, setDryRun] = React.useState(false);
   const [orphan, setOrphan] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState<Notice>(null);
@@ -66,7 +142,6 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
       soon.current = window.setTimeout(() => {
         soon.current = null;
         app.reload();
-        res.reload();
         setTick((t) => t + 1);
       }, 500);
     } else if (ev.type === "cd_app_deleted" && ev.app === id) {
@@ -86,13 +161,13 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
     return () => clearTimeout(t);
   }, [notice]);
 
-  const act = async (done: string, f: () => Promise<unknown>) => {
+  const act = async (done: string, f: () => Promise<unknown>, keepOpen = false) => {
     setBusy(true);
     setNotice(null);
     try {
       await f();
       setNotice({ tone: "ok", text: done });
-      setAsk(null);
+      if (!keepOpen) setAsk(null);
       app.reload();
       setTick((t) => t + 1);
     } catch (e) {
@@ -101,6 +176,7 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
       setBusy(false);
     }
   };
+  const toggle = (a: Exclude<Ask, null>) => setAsk(ask === a ? null : a);
 
   if (app.error && !app.data) {
     return (
@@ -115,14 +191,10 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
   const a = app.data;
   const op = a?.operation ?? null;
   const live = running(op);
-  const resources = res.data?.resources ?? [];
-  const objects = resources.filter((r) => !r.hook).length;
-  const differ = resources.filter((r) => !r.hook && r.sync !== "Synced").length;
-  const shows = [
-    { value: "resources", label: objects ? `Resources (${objects})` : "Resources" },
-    { value: "diff", label: differ ? `What differs (${differ})` : "What differs" },
-    { value: "history", label: "History" },
-  ];
+  const nodes: CdNode[] = tree.data?.nodes ?? (fallback.data ? managedOnly(fallback.data.resources) : []);
+  const managed = nodes.filter((n) => n.managed);
+  const childCount = nodes.length - managed.length;
+  const last = history.data?.history[0];
 
   return (
     <div className="container-console page cd-page">
@@ -139,9 +211,28 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
             <div className="cd-state">
               <SyncPair sync={a.sync} />
               <HealthPair health={a.health} />
-              <span className="cd-meta">{[placeOf(a), shortRev(a.revision)].filter(Boolean).join(" · ")}</span>
+              <span className="cd-meta">
+                {[placeOf(a), `${managed.length || a.resources || 0} objects`, childCount ? `${childCount} live children` : ""].filter(Boolean).join(" · ")}
+              </span>
             </div>
-            <p className="cd-from">{fromLine(a)}</p>
+            <dl className="cd-lines">
+              <div className="cd-lines-rev">
+                <dt>Revision</dt>
+                <dd>
+                  <RevisionLine a={a} />
+                </dd>
+              </div>
+              <div>
+                <dt>{live ? "Now" : "Last sync"}</dt>
+                <dd>
+                  <OpLine a={a} last={last} />
+                </dd>
+              </div>
+              <div className="cd-lines-from">
+                <dt>From</dt>
+                <dd>{fromLine(a)}</dd>
+              </div>
+            </dl>
             {a.shadow && (
               <p className="cd-note">
                 Shadowed from Argo CD: kiln compares it and never writes to it. Take it over to deploy it with kiln.
@@ -157,28 +248,31 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
             )}
             <div className="cd-actions">
               {a.shadow ? (
-                <Button size="xs" onClick={() => setAsk(ask === "takeover" ? null : "takeover")} aria-expanded={ask === "takeover"} disabled={busy}>
+                <Button size="xs" onClick={() => toggle("takeover")} aria-expanded={ask === "takeover"} disabled={busy}>
                   Take over…
                 </Button>
               ) : (
-                <>
-                  <Button
-                    size="xs"
-                    onClick={() => act(dryRun ? "Checking every object against the cluster." : "Syncing.", () => cdApi.sync(id, { prune, dry_run: dryRun }))}
-                    disabled={busy || live}
-                  >
-                    {dryRun ? "Check" : "Sync"}
-                  </Button>
-                  <label className="cd-opt">
-                    <input type="checkbox" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Prune
-                  </label>
-                  <label className="cd-opt">
-                    <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> Dry run
-                  </label>
-                </>
+                <Button size="xs" onClick={() => toggle("sync")} aria-expanded={ask === "sync"} disabled={busy || live}>
+                  Sync…
+                </Button>
               )}
-              <Button size="xs" variant="secondary" onClick={() => act("Reading git again.", () => cdApi.refresh(id, false))} disabled={busy}>
+              <Button size="xs" variant="secondary" onClick={() => act("Comparing it with git again.", () => cdApi.refresh(id, false))} disabled={busy}>
                 <RefreshCw aria-hidden="true" /> Refresh
+              </Button>
+              <Button
+                size="xs"
+                variant="secondary"
+                onClick={() => act("Rendering it from git again, then comparing.", () => cdApi.refresh(id, true))}
+                disabled={busy}
+                title="Render the app from git again, not only compare"
+              >
+                Hard refresh
+              </Button>
+              <Button size="xs" variant="secondary" onClick={() => toggle("diff")} aria-expanded={ask === "diff"}>
+                Diff{a.out_of_sync ? ` (${a.out_of_sync})` : ""}
+              </Button>
+              <Button size="xs" variant="secondary" onClick={() => toggle("history")} aria-expanded={ask === "history"}>
+                History
               </Button>
               {live && (
                 <Button size="xs" variant="secondary" onClick={() => act("Stopping the sync.", () => cdApi.terminate(id))} disabled={busy}>
@@ -186,82 +280,88 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
                 </Button>
               )}
               {a.pinned && (
-                <Button size="xs" variant="secondary" onClick={() => setAsk(ask === "follow" ? null : "follow")} aria-expanded={ask === "follow"} disabled={busy}>
+                <Button size="xs" variant="secondary" onClick={() => toggle("follow")} aria-expanded={ask === "follow"} disabled={busy}>
                   Follow git…
                 </Button>
               )}
-              <Button size="xs" variant="ghost" onClick={() => setAsk(ask === "delete" ? null : "delete")} aria-expanded={ask === "delete"} disabled={busy}>
+              <Button size="xs" variant="ghost" onClick={() => toggle("delete")} aria-expanded={ask === "delete"} disabled={busy}>
                 Delete…
               </Button>
             </div>
-            {ask && (
+            {ask === "sync" && !a.shadow && (
+              <SyncPanel
+                a={a}
+                managed={managed}
+                busy={busy}
+                onCancel={() => setAsk(null)}
+                onSync={(body, done) => act(done, () => cdApi.sync(id, body))}
+              />
+            )}
+            {ask === "takeover" && (
               <div className="cd-confirm" role="group" aria-label="Confirm">
-                {ask === "takeover" && (
-                  <>
-                    <p>
-                      kiln stops shadowing {name} and deploys it from now on. Turn off auto-sync for it in Argo CD first, so the two
-                      don't both apply it. Nothing is recreated.
-                    </p>
-                    <div className="cd-confirm-actions">
-                      <Button size="xs" onClick={() => act(`kiln deploys ${name} now.`, () => cdApi.takeOver(id))} disabled={busy}>
-                        Take over {name}
-                      </Button>
-                      <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
-                        Cancel
-                      </Button>
-                    </div>
-                  </>
+                <p>
+                  kiln stops shadowing {name} and deploys it from now on. Turn off auto-sync for it in Argo CD first, so the two don't
+                  both apply it. Nothing is recreated.
+                </p>
+                <div className="cd-confirm-actions">
+                  <Button size="xs" onClick={() => act(`kiln deploys ${name} now.`, () => cdApi.takeOver(id))} disabled={busy}>
+                    Take over {name}
+                  </Button>
+                  <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+            {ask === "follow" && (
+              <div className="cd-confirm" role="group" aria-label="Confirm">
+                <p>
+                  kiln renders what git says now
+                  {a.auto ? " and deploys it: this app syncs automatically." : ". Sync to deploy it."}
+                </p>
+                <div className="cd-confirm-actions">
+                  <Button size="xs" onClick={() => act(`${name} follows git again.`, () => cdApi.follow(id))} disabled={busy}>
+                    Follow git
+                  </Button>
+                  <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+            {ask === "delete" && (
+              <div className="cd-confirm" role="group" aria-label="Confirm">
+                <p>
+                  {a.shadow
+                    ? "kiln forgets it. Argo CD still deploys it, and nothing in the cluster changes."
+                    : orphan
+                      ? "kiln forgets it; its objects keep running in the cluster."
+                      : `Its objects are deleted from ${placeOf(a)} too, except those marked Delete=false and namespaces it created.`}
+                </p>
+                {!a.shadow && (
+                  <label className="cd-opt">
+                    <input type="checkbox" className="check" checked={orphan} onChange={(e) => setOrphan(e.target.checked)} /> Leave its objects
+                    running
+                  </label>
                 )}
-                {ask === "follow" && (
-                  <>
-                    <p>
-                      kiln renders what git says now
-                      {a.auto ? " and deploys it: this app syncs automatically." : ". Sync to deploy it."}
-                    </p>
-                    <div className="cd-confirm-actions">
-                      <Button size="xs" onClick={() => act(`${name} follows git again.`, () => cdApi.follow(id))} disabled={busy}>
-                        Follow git
-                      </Button>
-                      <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
-                        Cancel
-                      </Button>
-                    </div>
-                  </>
-                )}
-                {ask === "delete" && (
-                  <>
-                    <p>
-                      {a.shadow
-                        ? "kiln forgets it. Argo CD still deploys it, and nothing in the cluster changes."
-                        : orphan
-                          ? "kiln forgets it; its objects keep running in the cluster."
-                          : `Its objects are deleted from ${placeOf(a)} too, except those marked Delete=false and namespaces it created.`}
-                    </p>
-                    {!a.shadow && (
-                      <label className="cd-opt">
-                        <input type="checkbox" checked={orphan} onChange={(e) => setOrphan(e.target.checked)} /> Leave its objects running
-                      </label>
-                    )}
-                    <div className="cd-confirm-actions">
-                      <Button
-                        size="xs"
-                        variant="danger"
-                        onClick={() =>
-                          act(`Deleting ${name}.`, async () => {
-                            await cdApi.remove(id, a.shadow || orphan ? "orphan" : "foreground");
-                            navigate("/deployments", { replace: true });
-                          })
-                        }
-                        disabled={busy}
-                      >
-                        Delete {name}
-                      </Button>
-                      <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
-                        Cancel
-                      </Button>
-                    </div>
-                  </>
-                )}
+                <div className="cd-confirm-actions">
+                  <Button
+                    size="xs"
+                    variant="danger"
+                    onClick={() =>
+                      act(`Deleting ${name}.`, async () => {
+                        await cdApi.remove(id, a.shadow || orphan ? "orphan" : "foreground");
+                        navigate("/deployments", { replace: true });
+                      })
+                    }
+                    disabled={busy}
+                  >
+                    Delete {name}
+                  </Button>
+                  <Button size="xs" variant="ghost" onClick={() => setAsk(null)}>
+                    Cancel
+                  </Button>
+                </div>
               </div>
             )}
             {notice && (
@@ -271,55 +371,118 @@ function DeploymentApp({ project, name }: { project: string; name: string }) {
             )}
           </>
         ) : (
-          <SkeletonRows rows={2} cols={3} />
+          <SkeletonRows rows={3} cols={3} />
         )}
       </header>
 
-      {op && (
-        <section className="cd-op" data-tone={opTone(op)} aria-live="polite">
-          <span className="cd-op-label">{live ? "Now" : "Last sync"}</span>
-          <StatePair tone={opTone(op)} word={opWords(op)} />
-          {op.message && <span className="cd-op-msg">{op.message}</span>}
-          {op.attempt > 1 && <span className="cd-meta">attempt {op.attempt}</span>}
-        </section>
-      )}
       {a?.source_error && <p className="cd-warn">kiln can't read its sources: {a.source_error}</p>}
       {a?.message && <p className="cd-warn">{a.message}</p>}
 
-      <div className="cd-show">
-        <SelectField label="Show" value={show} onChange={(v) => setShow(v as Show)} options={shows} className="cd-show-select" />
-      </div>
-
-      <div className="cd-panel">
-        {show === "resources" &&
-          (res.error && !res.data ? (
-            <ErrorState error={res.error} onRetry={res.reload} compact />
-          ) : !res.data ? (
-            <SkeletonRows rows={6} cols={3} />
-          ) : resources.length === 0 ? (
-            <p className="cd-empty">This app renders no resources.</p>
-          ) : (
-            <ResourceList list={resources} />
-          ))}
-        {show === "diff" && <DiffList id={id} tick={tick} />}
-        {show === "history" && (
+      {ask === "diff" && (
+        <section className="cd-panel-flow" aria-label="What differs">
+          <h2 className="cd-flow-title">What differs</h2>
+          <DiffList id={id} tick={tick} />
+        </section>
+      )}
+      {ask === "history" && (
+        <section className="cd-panel-flow" aria-label="History">
+          <h2 className="cd-flow-title">History</h2>
           <HistoryList
-            id={id}
-            tick={tick}
+            list={history.data?.history}
+            error={history.error}
+            reload={history.reload}
             busy={busy}
             onRollback={
-              a && !a.shadow
-                ? (d, prune) => act(`Rolling ${name} back to deployment ${d.id}.`, () => cdApi.rollback(id, { to: d.id, prune }))
-                : undefined
+              a && !a.shadow ? (d, prune) => act(`Rolling ${name} back to deployment ${d.id}.`, () => cdApi.rollback(id, { to: d.id, prune }), true) : undefined
             }
           />
-        )}
-      </div>
+        </section>
+      )}
+
+      <Resources
+        appId={id}
+        appMark={{ name, health: a?.health ?? "Unknown", sync: a?.sync ?? "Unknown" }}
+        namespace={a?.namespace ?? ""}
+        nodes={nodes}
+        loading={!tree.data && !fallback.data && !tree.error}
+        treeError={tree.error && !tree.data ? errorMessage(tree.error) : null}
+        errors={tree.data?.errors ?? []}
+        truncated={tree.data?.truncated ?? false}
+        tick={tick}
+      />
     </div>
   );
 }
 
-/** Where an app comes from and how it syncs, in one line. */
+/** The revision: its commit, what it says, who wrote it and when. */
+function RevisionLine({ a }: { a: CdAppDetail }) {
+  const c = a.revision_info;
+  if (!a.revision) return <span className="cd-dim">Not rendered yet</span>;
+  return (
+    <>
+      <span className="cd-mono" title={a.revision}>
+        {shortRev(a.revision)}
+      </span>
+      {c ? (
+        <>
+          <span className="cd-line-text" title={c.body ? `${c.subject}\n\n${c.body}` : c.subject}>
+            {c.subject}
+          </span>
+          <span className="cd-dim cd-line-by">
+            {c.author} · <RelTime ts={Math.floor(c.at_ms / 1000)} />
+          </span>
+        </>
+      ) : null}
+    </>
+  );
+}
+
+/** The sync under way, or the last one: its result, when, by whom, and what it said. */
+function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined }) {
+  const op = a.operation;
+  if (op) {
+    const at = op.finished_ms ?? op.started_ms;
+    const by = op.by ?? (op.trigger !== "manual" ? (TRIGGER_WORD[op.trigger] ?? op.trigger).toLowerCase() : null);
+    return (
+      <>
+        <StatePair tone={opTone(op)} word={opWords(op)} />
+        {at ? (
+          <span className="cd-dim">
+            {running(op) ? "started " : ""}
+            <RelTime ts={Math.floor(at / 1000)} />
+            {by ? ` by ${by}` : ""}
+            {op.attempt > 1 ? ` · attempt ${op.attempt}` : ""}
+          </span>
+        ) : null}
+        {op.message && (
+          <span className="cd-line-text" title={op.message}>
+            {op.message}
+          </span>
+        )}
+      </>
+    );
+  }
+  if (last) {
+    return (
+      <>
+        <StatePair tone={last.succeeded ? "succeeded" : "failed"} word={last.succeeded ? "Deployed" : "Failed"} />
+        <span className="cd-dim">
+          <RelTime ts={Math.floor(last.at_ms / 1000)} />
+          {last.by ? ` by ${last.by}` : ` · ${(TRIGGER_WORD[last.trigger] ?? last.trigger).toLowerCase()}`}
+          {` · ${last.applied} applied`}
+        </span>
+        {last.message && (
+          <span className="cd-line-text" title={last.message}>
+            {last.message}
+          </span>
+        )}
+      </>
+    );
+  }
+  return <span className="cd-dim">Never synced</span>;
+}
+
+/** Where an app comes from, where it goes, and how it syncs, in one line. */
 function fromLine(a: CdAppDetail) {
   const src = a.definition?.sources?.[0];
   const where = src ? [src.chart ? `${src.repo} ${src.chart}` : src.repo, src.path].filter(Boolean).join(" · ") : "";
@@ -327,59 +490,407 @@ function fromLine(a: CdAppDetail) {
   const more = (a.definition?.sources?.length ?? 0) > 1 ? ` (+${(a.definition?.sources?.length ?? 1) - 1} more)` : "";
   const sync = a.definition?.sync;
   const how = sync?.auto ? ["Auto-sync", sync.prune && "prune", sync.self_heal && "self-heal"].filter(Boolean).join(", ") : "Synced by hand";
-  return [where && `From ${where}${at}${more}`, how].filter(Boolean).join(" · ");
+  return [where && `${where}${at}${more} → ${a.cluster} / ${a.namespace || "default"}`, how].filter(Boolean).join(" · ");
 }
 
-/** What differs first, then what is unhealthy, then the rest by kind and name; hooks last. */
-function sortResources(list: CdResource[]) {
-  const rank = (r: CdResource) => (r.hook ? 3 : r.sync !== "Synced" ? 0 : r.health && r.health !== "Healthy" ? 1 : 2);
-  return [...list].sort((x, y) => rank(x) - rank(y) || x.kind.localeCompare(y.kind) || x.name.localeCompare(y.name));
-}
-
-/** The app's objects, windowed: an app of ten thousand objects draws what fits on screen. */
-function ResourceList({ list }: { list: CdResource[] }) {
-  const ref = React.useRef<HTMLDivElement>(null);
-  const sorted = React.useMemo(() => sortResources(list), [list]);
-  const win = useWindowedRows(ref, sorted.length, RES_ROW);
+/**
+ * Sync, asked in place: prune, dry run, and optionally only some of the app's objects, chosen
+ * from a list (what differs first).
+ */
+function SyncPanel({
+  a,
+  managed,
+  busy,
+  onSync,
+  onCancel,
+}: {
+  a: CdAppDetail;
+  managed: CdNode[];
+  busy: boolean;
+  onSync: (body: { prune: boolean; dry_run: boolean; resources?: { group: string; kind: string; namespace: string; name: string }[] }, done: string) => void;
+  onCancel: () => void;
+}) {
+  const [prune, setPrune] = React.useState(false);
+  const [dryRun, setDryRun] = React.useState(false);
+  const [some, setSome] = React.useState(false);
+  const list = React.useMemo(
+    () => managed.filter((n) => !n.hook).sort((x, y) => Number(y.sync === "OutOfSync") - Number(x.sync === "OutOfSync") || compareNodes(x, y)),
+    [managed],
+  );
+  const [picked, setPicked] = React.useState<ReadonlySet<string>>(() => new Set(list.filter((n) => n.sync === "OutOfSync").map((n) => n.id)));
+  const prunable = list.filter((n) => n.requires_pruning).length;
+  const pick = (ids: string[]) => setPicked(new Set(ids));
+  const chosen = list.filter((n) => picked.has(n.id));
+  const go = () => {
+    const resources = some ? chosen.map((n) => ({ group: n.group, kind: n.kind, namespace: n.namespace, name: n.name })) : undefined;
+    const what = some ? `${chosen.length} of its objects` : "it";
+    onSync({ prune, dry_run: dryRun, resources }, dryRun ? `Checking ${what} against the cluster.` : `Syncing ${what}.`);
+  };
   return (
-    <div ref={ref} className="cd-resources" role="list" aria-label="Resources">
-      <div style={{ height: win.start * RES_ROW }} aria-hidden="true" />
-      {sorted.slice(win.start, win.end).map((r, i) => (
-        <ResourceRow key={objectKey(r)} r={r} pos={win.start + i + 1} size={sorted.length} />
-      ))}
-      <div style={{ height: (sorted.length - win.end) * RES_ROW }} aria-hidden="true" />
+    <div className="cd-confirm cd-sync" role="group" aria-label="Sync">
+      <p>
+        Apply what git holds{a.revision ? ` at ${shortRev(a.revision)}` : ""} to {placeOf(a)}
+        {a.out_of_sync ? `: ${a.out_of_sync} object${a.out_of_sync === 1 ? "" : "s"} differ.` : ". Nothing differs now."}
+      </p>
+      <label className="cd-opt">
+        <input type="checkbox" className="check" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Prune: delete what git no longer holds
+        {prunable ? ` (${prunable})` : ""}
+      </label>
+      <label className="cd-opt">
+        <input type="checkbox" className="check" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> Dry run: check every object with
+        the cluster, change nothing
+      </label>
+      <label className="cd-opt">
+        <input type="checkbox" className="check" checked={some} onChange={(e) => setSome(e.target.checked)} /> Only the objects chosen below
+      </label>
+      {some && (
+        <div className="cd-pickset">
+          <div className="cd-pickset-bar">
+            <span className="cd-meta">
+              {chosen.length} of {list.length} chosen
+            </span>
+            <button type="button" className="cd-link" onClick={() => pick(list.map((n) => n.id))}>
+              All
+            </button>
+            <button type="button" className="cd-link" onClick={() => pick(list.filter((n) => n.sync === "OutOfSync").map((n) => n.id))}>
+              What differs
+            </button>
+            <button type="button" className="cd-link" onClick={() => pick([])}>
+              None
+            </button>
+          </div>
+          <ul className="cd-picklist">
+            {list.map((n) => (
+              <li key={n.id}>
+                <label className="cd-pickrow">
+                  <input
+                    type="checkbox"
+                    className="check"
+                    checked={picked.has(n.id)}
+                    onChange={(e) => {
+                      const next = new Set(picked);
+                      if (e.target.checked) next.add(n.id);
+                      else next.delete(n.id);
+                      setPicked(next);
+                    }}
+                  />
+                  <KindBadge kind={n.kind} group={n.group} />
+                  <span className="cd-pickrow-name">{n.namespace ? `${n.namespace}/${n.name}` : n.name}</span>
+                  <NodeMarks n={n} />
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      <div className="cd-confirm-actions">
+        <Button size="xs" onClick={go} disabled={busy || (some && chosen.length === 0)}>
+          {dryRun ? "Check" : some ? `Sync ${chosen.length}` : "Sync"}
+        </Button>
+        <Button size="xs" variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
     </div>
   );
 }
 
-function ResourceRow({ r, pos, size }: { r: CdResource; pos: number; size: number }) {
-  const note = r.why ?? r.message ?? (r.requires_pruning ? "Not in git any more: a sync with prune deletes it" : r.missing ? "Not in the cluster yet" : "");
+/* ------------------------------------------------------------------ resources */
+
+function Resources({
+  appId,
+  appMark,
+  namespace,
+  nodes,
+  loading,
+  treeError,
+  errors,
+  truncated,
+  tick,
+}: {
+  appId: string;
+  appMark: { name: string; health: string; sync: string };
+  namespace: string;
+  nodes: CdNode[];
+  loading: boolean;
+  treeError: string | null;
+  errors: string[];
+  truncated: boolean;
+  tick: number;
+}) {
+  const now = useNow();
+  const wide = useMediaQuery("(min-width: 1024px)");
+  const [stored, setStored] = useLocalStorage<{ view?: View; sort?: ListSort; group?: PodGroup; children?: boolean }>("kiln.cd.app.view", {});
+  const view: View = stored.view ?? "tree";
+  const sort: ListSort = stored.sort ?? "kind";
+  const group: PodGroup = stored.group ?? "owner";
+  const children = stored.children ?? true;
+  const set = (patch: Partial<typeof stored>) => setStored({ ...stored, ...patch });
+  const [q, setQ] = React.useState("");
+  const [chosen, setChosen] = React.useState<Chosen>({});
+  const [selected, setSelected] = React.useState<string | null>(null);
+  const [open, setOpen] = React.useState<ReadonlySet<string>>(() => new Set());
+  const box = React.useRef<HTMLDivElement>(null);
+  const width = useWidth(box);
+
+  // What the view is over: the pods for Pods; for the others, children unless left out.
+  const base = React.useMemo(
+    () => (view === "pods" ? nodes.filter((n) => n.kind === "Pod" && n.group === "") : children ? nodes : nodes.filter((n) => n.managed)),
+    [nodes, view, children],
+  );
+  const facets = React.useMemo(() => facetsOf(base, q, chosen), [base, q, chosen]);
+  const filtered = isFiltered(q, chosen);
+  const { shown, matched } = React.useMemo(() => keep(base, q, chosen, view === "tree"), [base, q, chosen, view]);
+  const byId = React.useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
+  const sel = selected ? (byId.get(selected) ?? null) : null;
+  const roots = React.useMemo(() => forest(base, shown, matched, open, selected), [base, shown, matched, open, selected]);
+  const graph = view === "tree" && wide && graphFits(roots, width);
+
+  const onGroup = (g: GroupItem) =>
+    setOpen((o) => {
+      const next = new Set(o);
+      if (next.has(g.id)) next.delete(g.id);
+      else next.add(g.id);
+      return next;
+    });
+  const choose = (n: CdNode) => setSelected(selected === n.id ? null : n.id);
+  const details = sel ? (
+    <ResourceDetails key={sel.id} appId={appId} node={sel} tick={tick} onClose={() => setSelected(null)} onSelect={(id) => setSelected(id)} />
+  ) : selected ? (
+    <p className="cd-empty">
+      That object is gone from the cluster.{" "}
+      <button type="button" className="cd-link" onClick={() => setSelected(null)}>
+        Close
+      </button>
+    </p>
+  ) : null;
+
+  const counts = [
+    filtered ? `${matched.size} of ${base.length} shown` : `${base.length} ${view === "pods" ? (base.length === 1 ? "pod" : "pods") : base.length === 1 ? "object" : "objects"}`,
+    ...(!filtered
+      ? [
+          base.filter((n) => n.managed && !n.hook && n.sync === "OutOfSync").length && `${base.filter((n) => n.managed && !n.hook && n.sync === "OutOfSync").length} out of sync`,
+          base.filter((n) => n.health === "Degraded").length && `${base.filter((n) => n.health === "Degraded").length} degraded`,
+          base.filter((n) => n.health === "Progressing").length && `${base.filter((n) => n.health === "Progressing").length} progressing`,
+          base.filter((n) => n.health === "Missing").length && `${base.filter((n) => n.health === "Missing").length} missing`,
+        ]
+      : []),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
   return (
-    <div
-      className="cd-res"
-      role="listitem"
-      aria-posinset={pos}
-      aria-setsize={size}
-      data-tone={r.health === "Degraded" ? "fail" : !r.hook && r.sync === "OutOfSync" ? "warn" : undefined}
-    >
-      <div className="cd-res-main">
-        <span className="cd-res-name">{r.name}</span>
-        <span className="cd-res-kind">
-          {r.kind}
-          {r.namespace ? ` · ${r.namespace}` : ""}
-          {r.hook ? " · hook" : ""}
+    <section className="cd-resources-section" aria-label="Resources">
+      <div className="cd-viewbar">
+        <SelectField label="View" hideLabel value={view} onChange={(v) => set({ view: v as View })} options={VIEWS} className="cd-view-select" />
+        <FacetBox
+          className="cd-view-filter"
+          label="Filter objects"
+          placeholder="Filter by name, kind, health, sync, namespace…"
+          query={q}
+          onQuery={setQ}
+          facets={facets}
+          chosen={chosen}
+          onChosen={setChosen}
+        />
+        {view === "list" && <SelectField label="Sort by" hideLabel value={sort} onChange={(v) => set({ sort: v as ListSort })} options={SORTS} className="cd-view-select" />}
+        {view === "pods" && <SelectField label="Group by" hideLabel value={group} onChange={(v) => set({ group: v as PodGroup })} options={GROUPS} className="cd-view-select" />}
+        {view !== "pods" && (
+          <label className="cd-opt cd-view-opt" title="The live objects the app's objects own: ReplicaSets, Pods, Jobs, EndpointSlices…">
+            <input type="checkbox" className="check" checked={children} onChange={(e) => set({ children: e.target.checked })} /> Live children
+          </label>
+        )}
+      </div>
+      <div className="cd-viewhead">
+        <span className="cd-count" aria-live="polite">
+          {counts}
         </span>
+        {filtered && (
+          <button
+            type="button"
+            className="cd-link"
+            onClick={() => {
+              setQ("");
+              setChosen({});
+            }}
+          >
+            Clear the filter
+          </button>
+        )}
       </div>
-      <div className="cd-res-why" title={note}>
+      {treeError && (
+        <p className="cd-warn">
+          The cluster couldn't be read ({treeError}); showing the objects kiln compares, without what they own.
+        </p>
+      )}
+      {errors.length > 0 && <p className="cd-warn">Not everything could be read: {errors.slice(0, 3).join("; ")}</p>}
+      {truncated && <p className="cd-warn">The tree is cut at 5,000 objects.</p>}
+
+      <div ref={box} className="cd-view">
+        {loading ? (
+          <SkeletonRows rows={6} cols={3} />
+        ) : base.length === 0 ? (
+          <p className="cd-empty">{view === "pods" ? "It runs no pods." : "This app renders no resources."}</p>
+        ) : matched.size === 0 ? (
+          <p className="cd-empty">
+            Nothing matches.{" "}
+            <button
+              type="button"
+              className="cd-link"
+              onClick={() => {
+                setQ("");
+                setChosen({});
+              }}
+            >
+              Clear the filter
+            </button>
+          </p>
+        ) : view === "tree" ? (
+          graph ? (
+            <>
+              <TreeGraph roots={roots} app={appMark} width={width} selected={selected} onSelect={choose} onGroup={onGroup} />
+              {details && <div className="cd-graph-details">{details}</div>}
+            </>
+          ) : (
+            <TreeList roots={roots} namespace={namespace} selected={selected} onSelect={choose} onGroup={onGroup} details={details} />
+          )
+        ) : view === "list" ? (
+          <FlatList nodes={base.filter((n) => matched.has(n.id))} sort={sort} now={now} selected={selected} onSelect={choose} details={details} />
+        ) : (
+          <PodList pods={base.filter((n) => matched.has(n.id))} group={group} byId={byId} now={now} selected={selected} onSelect={choose} details={details} />
+        )}
+      </div>
+    </section>
+  );
+}
+
+function sortNodes(list: CdNode[], sort: ListSort): CdNode[] {
+  const by: Record<ListSort, (x: CdNode, y: CdNode) => number> = {
+    kind: compareNodes,
+    name: (x, y) => compareText(x.name, y.name),
+    namespace: (x, y) => compareText(x.namespace, y.namespace),
+    health: (x, y) => (HEALTH_RANK[x.health ?? ""] ?? 6) - (HEALTH_RANK[y.health ?? ""] ?? 6),
+    sync: (x, y) => (x.managed ? (SYNC_RANK[x.sync ?? ""] ?? 4) : 5) - (y.managed ? (SYNC_RANK[y.sync ?? ""] ?? 4) : 5),
+    age: (x, y) => (Date.parse(y.created_at ?? "") || 0) - (Date.parse(x.created_at ?? "") || 0),
+  };
+  return [...list].sort((x, y) => by[sort](x, y) || kindRank(x.kind) - kindRank(y.kind) || compareText(x.name, y.name));
+}
+
+/** One object in a list: its kind, name, place, marks, what it says, its age. */
+function Row({ n, now, selected, onSelect }: { n: CdNode; now: number; selected: boolean; onSelect: (n: CdNode) => void }) {
+  const note = n.why ?? (n.health && n.health !== "Healthy" ? n.message : null) ?? nodeLine(n, "");
+  return (
+    <button
+      type="button"
+      className="cd-lrow"
+      data-selected={selected || undefined}
+      data-tone={troubled(n) ? (n.health === "Degraded" || n.health === "Missing" ? "fail" : "warn") : undefined}
+      aria-expanded={selected}
+      onClick={() => onSelect(n)}
+    >
+      <KindBadge kind={n.kind} group={n.group} />
+      <span className="cd-lrow-main">
+        <span className="cd-lrow-name">{n.name}</span>
+        <span className="cd-lrow-sub">{[n.namespace || "cluster", n.managed ? "" : "live"].filter(Boolean).join(" · ")}</span>
+      </span>
+      <span className="cd-lrow-marks">
+        <NodeMarks n={n} />
+      </span>
+      <span className="cd-lrow-note" title={note || undefined}>
         {note}
-      </div>
-      <div className="cd-row-states">
-        {!r.hook && <SyncPair sync={r.sync} />}
-        <HealthPair health={r.health} />
-      </div>
+      </span>
+      <span className="cd-lrow-age">{age(n.created_at, now)}</span>
+    </button>
+  );
+}
+
+function FlatList({
+  nodes,
+  sort,
+  now,
+  selected,
+  onSelect,
+  details,
+}: {
+  nodes: CdNode[];
+  sort: ListSort;
+  now: number;
+  selected: string | null;
+  onSelect: (n: CdNode) => void;
+  details: React.ReactNode;
+}) {
+  const sorted = React.useMemo(() => sortNodes(nodes, sort), [nodes, sort]);
+  return (
+    <ul className="cd-llist" aria-label="Objects">
+      {sorted.map((n) => (
+        <li key={n.id}>
+          <Row n={n} now={now} selected={selected === n.id} onSelect={onSelect} />
+          {selected === n.id && details}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** Pods, grouped by the node they run on or by what owns them. */
+function PodList({
+  pods,
+  group,
+  byId,
+  now,
+  selected,
+  onSelect,
+  details,
+}: {
+  pods: CdNode[];
+  group: PodGroup;
+  byId: Map<string, CdNode>;
+  now: number;
+  selected: string | null;
+  onSelect: (n: CdNode) => void;
+  details: React.ReactNode;
+}) {
+  const groups = React.useMemo(() => {
+    const m = new Map<string, { label: string; owner: CdNode | null; pods: CdNode[] }>();
+    for (const p of pods) {
+      const owner = p.parents.map((u) => byId.get(u)).find(Boolean) ?? null;
+      const key = group === "node" ? (p.node ?? "") : (owner?.id ?? "");
+      const label = group === "node" ? (p.node ?? "Not scheduled") : owner ? `${owner.kind} ${owner.name}` : "No owner";
+      const g = m.get(key);
+      if (g) g.pods.push(p);
+      else m.set(key, { label, owner: group === "owner" ? owner : null, pods: [p] });
+    }
+    return [...m.values()].sort((x, y) => compareText(x.label, y.label)).map((g) => ({ ...g, pods: [...g.pods].sort((x, y) => compareText(x.name, y.name)) }));
+  }, [pods, group, byId]);
+  return (
+    <div className="cd-pods">
+      {groups.map((g) => {
+        const bad = g.pods.filter((p) => p.health === "Degraded").length;
+        return (
+          <section key={g.label} className="cd-podgroup" aria-label={g.label}>
+            <h3 className="cd-podgroup-head">
+              <span className="cd-podgroup-name">{g.label}</span>
+              <span className="cd-dim">
+                {g.pods.length} {g.pods.length === 1 ? "pod" : "pods"}
+                {bad ? ` · ${bad} degraded` : ""}
+              </span>
+            </h3>
+            <ul className="cd-llist">
+              {g.pods.map((p) => (
+                <li key={p.id}>
+                  <Row n={p} now={now} selected={selected === p.id} onSelect={onSelect} />
+                  {selected === p.id && details}
+                </li>
+              ))}
+            </ul>
+          </section>
+        );
+      })}
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ diff and history */
 
 function DiffList({ id, tick }: { id: string; tick: number }) {
   const diff = useResource((s) => cdApi.diff(id, s), [id, tick]);
@@ -401,22 +912,22 @@ function DiffList({ id, tick }: { id: string; tick: number }) {
 }
 
 function HistoryList({
-  id,
-  tick,
+  list,
+  error,
+  reload,
   busy,
   onRollback,
 }: {
-  id: string;
-  tick: number;
+  list: CdDeployment[] | undefined;
+  error: Error | null;
+  reload: () => void;
   busy: boolean;
   onRollback?: (d: CdDeployment, prune: boolean) => Promise<void>;
 }) {
-  const history = useResource((s) => cdApi.history(id, s), [id, tick]);
   const [asking, setAsking] = React.useState<number | null>(null);
   const [prune, setPrune] = React.useState(false);
-  if (history.error && !history.data) return <ErrorState error={history.error} onRetry={history.reload} compact />;
-  if (!history.data) return <SkeletonRows rows={4} cols={3} />;
-  const list = history.data.history;
+  if (error && !list) return <ErrorState error={error} onRetry={reload} compact />;
+  if (!list) return <SkeletonRows rows={4} cols={3} />;
   if (list.length === 0) return <p className="cd-empty">No deployments yet.</p>;
   // What runs now is the newest that succeeded; any other success can be gone back to.
   const current = list.find((h) => h.succeeded);
@@ -433,9 +944,12 @@ function HistoryList({
               #{h.id} · {shortRev(h.revision) || "no revision"}
             </span>
             <span className="cd-history-what">
-              {TRIGGER_WORD[h.trigger] ?? h.trigger}
-              {h.by ? ` by ${h.by}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
-              {h === current ? " · what runs now" : ""}
+              {h.commit?.subject ? <span className="cd-history-subject">{h.commit.subject}</span> : null}
+              <span>
+                {TRIGGER_WORD[h.trigger] ?? h.trigger}
+                {h.by ? ` by ${h.by}` : ""} · {h.applied} applied{h.pruned ? ` · ${h.pruned} pruned` : ""}
+                {h === current ? " · what runs now" : ""}
+              </span>
             </span>
             <RelTime ts={Math.floor(h.at_ms / 1000)} className="cd-meta cd-history-at" />
             {canRollBack ? (
@@ -463,8 +977,8 @@ function HistoryList({
                   follows git again.
                 </p>
                 <label className="cd-opt">
-                  <input type="checkbox" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Also delete what it didn't have
-                  (prune)
+                  <input type="checkbox" className="check" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Also delete what it didn't
+                  have (prune)
                 </label>
                 <div className="cd-confirm-actions">
                   <Button

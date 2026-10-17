@@ -905,6 +905,45 @@ impl Store {
         .await
     }
 
+    // ---------------------------------------------------------------- key/value
+
+    /// The value stored under `key`.
+    pub async fn kv_get(&self, key: String) -> anyhow::Result<Option<String>> {
+        self.call(move |c| {
+            let v = c.query_row("SELECT v FROM kv WHERE k = ?1", [key], |r| r.get::<_, String>(0)).optional()?;
+            Ok(v)
+        })
+        .await
+    }
+
+    /// Store `value` under `key` (replacing what was there).
+    pub async fn kv_set(&self, key: String, value: String) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute("INSERT INTO kv (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v", params![key, value])?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn kv_delete(&self, key: String) -> anyhow::Result<()> {
+        self.call(move |c| {
+            c.execute("DELETE FROM kv WHERE k = ?1", [key])?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every key starting with `prefix`, with its value, in key order.
+    pub async fn kv_prefix(&self, prefix: String) -> anyhow::Result<Vec<(String, String)>> {
+        self.call(move |c| {
+            // `prefix` matched literally: substr instead of LIKE, whose `%` and `_` are wildcards.
+            let mut st = c.prepare("SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1 ORDER BY k")?;
+            let rows = st.query_map([prefix], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
     // ---------------------------------------------------------------- misc
 
     pub async fn audit(&self, actor: String, action: String, detail: String) {
@@ -1146,6 +1185,27 @@ mod tests {
             let moved = s.upsert_repo(at("https://github.com/hyper-light/kiln.git")).await?;
             anyhow::ensure!(moved.id == repo.id, "a moved repository keeps its id (and its runs)");
             anyhow::ensure!(s.refs(repo.id.clone()).await?.is_empty(), "refs from the old remote survived the move");
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn key_values_are_kept_and_listed_by_prefix() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let s = Store::in_memory()?;
+            assert_eq!(s.kv_get("front_door/box".into()).await?, None);
+            s.kv_set("front_door/box".into(), "{}".into()).await?;
+            s.kv_set("front_door/box".into(), r#"{"domain":"kiln.home"}"#.into()).await?;
+            s.kv_set("front_door/a_b".into(), "1".into()).await?;
+            s.kv_set("front_doorX".into(), "no".into()).await?;
+            assert_eq!(s.kv_get("front_door/box".into()).await?.as_deref(), Some(r#"{"domain":"kiln.home"}"#));
+            let all = s.kv_prefix("front_door/".into()).await?;
+            assert_eq!(all.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["front_door/a_b", "front_door/box"]);
+            // `_` and `%` in a prefix are plain characters.
+            assert_eq!(s.kv_prefix("front_door/a_".into()).await?.len(), 1);
+            assert!(s.kv_prefix("front_door/a%".into()).await?.is_empty());
+            s.kv_delete("front_door/box".into()).await?;
+            assert_eq!(s.kv_get("front_door/box".into()).await?, None);
             anyhow::Ok(())
         })
     }

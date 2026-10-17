@@ -1305,12 +1305,27 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
 
 /// What a runner announces after Hello ([`AgentMsg::Build`]).
 pub fn runner_build() -> AgentMsg {
-    AgentMsg::Build { build: own_build(), caps: CAP_UPGRADE | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP }
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS }
 }
+
+/// Everything this build's runner can do ([`AgentMsg::Build`]).
+pub const RUNNER_CAPS: u32 =
+    CAP_UPGRADE | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP | crate::proto::CAP_SYNC | crate::proto::CAP_FRONT_DOOR;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runners_announce_every_capability_they_have() -> anyhow::Result<()> {
+        use crate::proto::{CAP_DIRS, CAP_FRONT_DOOR, CAP_TAKEOVER, CAP_TAKEOVER_STOP};
+        let AgentMsg::Build { caps, build } = runner_build() else { anyhow::bail!("runner_build is not a Build") };
+        assert!(!build.is_empty());
+        for cap in [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_FRONT_DOOR] {
+            assert_eq!(caps & cap, cap, "capability {cap} is announced");
+        }
+        Ok(())
+    }
 
     #[test]
     fn versions_compare_semantically() {
