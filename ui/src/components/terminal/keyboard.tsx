@@ -1,6 +1,7 @@
 import * as React from "react";
 import { ChevronDown, ChevronUp, Keyboard as KeyboardIcon, Smartphone } from "lucide-react";
-import { useLocalStorage, useScrollEdges } from "@/lib/hooks";
+import { useScrollEdges } from "@/lib/hooks";
+import { usePref } from "@/lib/prefs";
 import { cn } from "@/lib/utils";
 import { charKey, namedKey, strokeBytes, type Mods, type NamedKey } from "./keys";
 import { PRESETS, presetFor } from "./presets";
@@ -79,7 +80,6 @@ function useRepeat() {
     },
     [stop],
   );
-  React.useEffect(() => () => stop(), [stop]);
   return { start, stop };
 }
 
@@ -100,12 +100,24 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
   const shortcutEdges = useScrollEdges<HTMLDivElement>();
   const extraEdges = useScrollEdges<HTMLDivElement>();
   // Per device: how tall the keys are (null: the default for the screen).
-  const [keyHeight, setKeyHeight] = useLocalStorage<number | null>("kiln.term.keyboardKeyHeight", null);
+  const [keyHeight, setKeyHeight] = usePref<number | null>("kiln.term.keyboardKeyHeight", null);
   const open = fold === "open";
   /** Fold away when open; otherwise bring every row back. */
   const toggleFold = () => onFold(open ? "closed" : "open");
-  const rootRef = React.useRef<HTMLDivElement>(null);
+  const rootRef = React.useRef<HTMLDivElement | null>(null);
   const { start, stop } = useRepeat();
+  // A key held as the keyboard goes stops repeating with it.
+  const root = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      rootRef.current = el;
+      if (!el) return;
+      return () => {
+        stop();
+        rootRef.current = null;
+      };
+    },
+    [stop],
+  );
   const preset = presetFor("", presetId ?? autoPresetId);
   const autoName = presetFor("", autoPresetId).name;
 
@@ -252,7 +264,7 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
 
   return (
     <div
-      ref={rootRef}
+      ref={root}
       className="vk"
       role="group"
       aria-label="Terminal keyboard"

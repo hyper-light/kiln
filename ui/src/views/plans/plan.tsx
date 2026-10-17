@@ -5,14 +5,14 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { harnessApi, type AgentInfo, type KindInfo } from "@/api/harness";
+import { harnessApi, type KindInfo } from "@/api/harness";
 import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
 import { Confirm, CopyButton, SelectField, TextField } from "@/components/ui/misc";
 import { useAuth } from "@/lib/auth";
-import { useRes, warm, type Res } from "@/lib/data";
+import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
@@ -27,8 +27,6 @@ const tagList = (s: string) =>
     .map((t) => t.trim())
     .filter(Boolean);
 
-/** The agents kiln runs, as their events change them. */
-const sessionsRes: Res<AgentInfo[]> = { key: "harness/sessions", fetch: () => harnessApi.list(), opts: { on: ["harness", "harness_closed"] } };
 /** The harnesses each machine offers. */
 const kindsRes: Res<Record<string, KindInfo[]>> = { key: "harness/kinds", fetch: () => harnessApi.kindsAll(), opts: { pollMs: 60_000 } };
 
@@ -75,7 +73,7 @@ function PlanEditor({ id }: { id: string }) {
   const navigate = useNavigate();
   const res = useRes(planRes(id));
   const plan = res.data;
-  if (plan) warm(sessionsRes, kindsRes);
+  if (plan) warm(harnessSessionsRes, kindsRes);
 
   const [base, setBase] = React.useState<Base | null>(() => (plan ? baseOf(plan) : null));
   const [title, setTitle] = React.useState(base?.title ?? "");
@@ -240,8 +238,8 @@ function RunHold() {
 
 /** Run the plan on an agent. */
 function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: () => void }) {
-  warm(sessionsRes, kindsRes);
-  const agents = useRes(sessionsRes).data;
+  warm(harnessSessionsRes, kindsRes);
+  const agents = useRes(harnessSessionsRes).data;
   const kinds = useRes(kindsRes).data;
   const [where, setWhere] = React.useState("new");
   const [target, setTarget] = React.useState("local");
@@ -429,7 +427,7 @@ function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => v
 
 function Runs({ plan }: { plan: Plan }) {
   const runs = useSuspenseResource(`plans/${plan.id}/runs@${plan.runs}`, (s) => plansApi.runs(plan.id, s)).data;
-  const agents = useRes(sessionsRes).data;
+  const agents = useRes(harnessSessionsRes).data;
   if (runs.length === 0) return null;
   const nameOf = (session: string) => agents.find((a) => a.id === session)?.name ?? `agent ${session.slice(-6)}`;
   return (

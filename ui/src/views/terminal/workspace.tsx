@@ -1,17 +1,19 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { Link, useLocation, useNavigate } from "react-router";
+import { Link, Navigate, useLocation, useNavigate } from "react-router";
 import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Eye, Keyboard, Maximize2, Minimize2, Minus, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
-import { useServerEvents } from "@/api/events";
-import type { Agent, AiSession, TerminalSessionInfo } from "@/api/types";
+import type { AiSession, TerminalSessionInfo } from "@/api/types";
 import { TerminalKeyboard, type KeyboardFold, type KeyboardMode } from "@/components/terminal/keyboard";
 import { PRESETS, presetFor } from "@/components/terminal/presets";
 import { Button } from "@/components/ui/button";
-import { Optic } from "@/components/ui/misc";
+import { Confirm, Optic } from "@/components/ui/misc";
 import { Chips } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
-import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
+import { agentsRes, aiSessionsRes, harnessSessionsRes, terminalSessionsRes, useAgentsLive, useRes, warm } from "@/lib/data";
+import { errorMessage, useMediaQuery } from "@/lib/hooks";
+import { usePref } from "@/lib/prefs";
+import { invalidate } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { NameField } from "@/components/ui/name-field";
 import { toast } from "@/components/ui/toast";
@@ -19,7 +21,7 @@ import { HarnessMark } from "@/views/harness/parts";
 import { SpawnHereButton } from "@/views/harness/spawn-here";
 import { SpawnDialog } from "@/views/harness/spawn";
 import { DesktopNew, MobileBar } from "./switcher";
-import { PasteDialog, SelectTextDialog } from "./clipboard";
+import { PastePanel, SelectTextPanel } from "./clipboard";
 import { TerminalSession, type SessionHandle, type SessionState } from "./session";
 
 interface Tab {
@@ -96,15 +98,14 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     api.renameTerminalSession(tab.sessionId, name).catch((e: unknown) => toast.error("Couldn't rename the terminal", errorMessage(e)));
   };
   const [activeId, setActiveId] = React.useState<string | null>(null);
-  const [kbVisible, setKbVisible] = useLocalStorage("kiln.term.keyboard", isTouchDevice());
-  const [kbMode, setKbMode] = useLocalStorage<KeyboardMode>("kiln.term.keyboardMode", isTouchDevice() ? "full" : "keys");
-  const [presets, setPresets] = useLocalStorage<Record<string, string>>("kiln.term.presets", {});
+  const [kbVisible, setKbVisible] = usePref("kiln.term.keyboard", isTouchDevice());
+  const [kbMode, setKbMode] = usePref<KeyboardMode>("kiln.term.keyboardMode", isTouchDevice() ? "full" : "keys");
+  const [presets, setPresets] = usePref<Record<string, string>>("kiln.term.presets", {});
   // Folded away on purpose (kept per device), or shrunk for the moment while reading.
-  const [kbClosed, setKbClosed] = useLocalStorage("kiln.term.keyboardClosed", false);
+  const [kbClosed, setKbClosed] = usePref("kiln.term.keyboardClosed", false);
   const [kbShrunk, setKbShrunk] = React.useState(false);
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [fontSize, setFontSize] = useLocalStorage("kiln.term.fontSize", 13);
-  const [copyOnSelect, setCopyOnSelect] = useLocalStorage("kiln.term.copyOnSelect", false);
+  const [fontSize, setFontSize] = usePref("kiln.term.fontSize", 13);
+  const [copyOnSelect, setCopyOnSelect] = usePref("kiln.term.copyOnSelect", false);
   const [renderer, setRenderer] = React.useState<"webgl" | "dom" | null>(null);
   const [full, setFull] = React.useState(false);
   const handles = React.useRef(new Map<string, SessionHandle>());
@@ -112,92 +113,54 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   const refs = React.useRef(new Map<string, (h: SessionHandle | null) => void>());
   const activeRef = React.useRef(activeId);
   activeRef.current = activeId;
-  const panelRef = React.useRef<HTMLDivElement>(null);
+  const panelRef = React.useRef<HTMLDivElement | null>(null);
   const location = useLocation();
   const navigate = useNavigate();
 
-  React.useEffect(() => {
-    if (visible) document.title = "Terminal · kiln";
-  }, [visible]);
+  warm(agentsRes, terminalSessionsRes, aiSessionsRes, harnessSessionsRes);
+  const agents = useAgentsLive().data;
 
-  const loadAgents = React.useCallback(() => {
-    api
-      .agents()
-      .then(setAgents)
-      .catch(() => undefined);
-  }, []);
-  React.useEffect(() => {
-    if (visible) loadAgents();
-  }, [visible, loadAgents]);
-  useServerEvents((ev) => {
-    if (ev.type === "agent")
-      setAgents((list) => {
-        const i = list.findIndex((a) => a.name === ev.agent.name);
-        if (i === -1) return [...list, ev.agent];
-        const copy = list.slice();
-        copy[i] = ev.agent;
-        return copy;
-      });
-  });
-
-  /** Tabs for sessions the server has that this device isn't showing yet (opened elsewhere). */
-  const syncSessions = React.useCallback(() => {
-    api
-      .terminalSessions()
-      .then((list) => {
-        setTabs((cur) => {
-          const known = new Set(cur.map((t) => t.sessionId).filter(Boolean));
-          const added: Tab[] = list
-            .filter((s) => !s.exited && !known.has(s.id))
-            .map((s) => ({
-              id: s.id,
-              sessionId: s.id,
-              target: s.target,
-              name: s.name ?? undefined,
-              wtitle: s.title,
-              title: tabTitle(s.target, s.name || s.title),
-              hints: `${s.command ?? ""} ${s.title}`,
-              auto: presetFor(`${s.command ?? ""} ${s.title}`).id,
-              state: { kind: "connecting" },
-            }));
-          if (added.length === 0) return cur;
-          setActiveId((a) => a ?? added[0]?.id ?? null);
-          return [...cur, ...added];
-        });
-      })
-      .catch(() => undefined);
-  }, []);
-  React.useEffect(() => {
-    if (visible) syncSessions();
-  }, [visible, syncSessions]);
-  useServerEvents((ev) => {
-    if (ev.type === "terminals" && visible) syncSessions();
-  });
+  /** Sessions this device dropped: not brought back by a listing that still has them. */
+  const dropped = React.useRef(new Set<string>());
+  // Tabs for sessions the server has that this device isn't showing yet (opened elsewhere), as
+  // each new listing of them arrives.
+  const sessions = useRes(terminalSessionsRes).data;
+  const [listed, setListed] = React.useState<TerminalSessionInfo[] | null>(null);
+  if (sessions !== listed) {
+    setListed(sessions);
+    const known = new Set(tabs.map((t) => t.sessionId).filter(Boolean));
+    const added: Tab[] = sessions
+      .filter((s) => !s.exited && !known.has(s.id) && !dropped.current.has(s.id))
+      .map((s) => ({
+        id: s.id,
+        sessionId: s.id,
+        target: s.target,
+        name: s.name ?? undefined,
+        wtitle: s.title,
+        title: tabTitle(s.target, s.name || s.title),
+        hints: `${s.command ?? ""} ${s.title}`,
+        auto: presetFor(`${s.command ?? ""} ${s.title}`).id,
+        state: { kind: "connecting" },
+      }));
+    if (added.length) {
+      setTabs([...tabs, ...added]);
+      if (activeId === null) setActiveId(added[0]?.id ?? null);
+    }
+  }
 
   /** The AI session each terminal session runs, as the machines report it (terminal id → session). */
-  const [aiHere, setAiHere] = React.useState<Record<string, AiSession>>({});
-  const loadAiTools = React.useCallback(() => {
-    api
-      .aiSessions()
-      .then((list) => {
-        const next: Record<string, AiSession> = {};
-        for (const s of list) if (s.terminal && !next[s.terminal]) next[s.terminal] = s;
-        setAiHere((cur) => (JSON.stringify(cur) === JSON.stringify(next) ? cur : next));
-      })
-      .catch(() => undefined);
-  }, []);
+  const aiList = useRes(aiSessionsRes).data;
+  const aiHere = React.useMemo(() => {
+    const next: Record<string, AiSession> = {};
+    for (const s of aiList) if (s.terminal && !next[s.terminal]) next[s.terminal] = s;
+    return next;
+  }, [aiList]);
   /** Which AI harness each terminal session runs (terminal id → preset id). */
   const aiTools = React.useMemo(() => {
     const out: Record<string, string> = {};
     for (const [term, s] of Object.entries(aiHere)) if (PRESETS.some((p) => p.id === s.tool)) out[term] = s.tool;
     return out;
   }, [aiHere]);
-  React.useEffect(() => {
-    if (visible) loadAiTools();
-  }, [visible, loadAiTools]);
-  useServerEvents((ev) => {
-    if (ev.type === "ai_sessions" && visible) loadAiTools();
-  });
 
   const open = React.useCallback((target: string) => {
     const id = `new-${++tabSeq}`;
@@ -206,14 +169,12 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   }, []);
 
   /** Bring up an existing session's tab, adding one if this device has none yet. */
-  const show = React.useCallback((sessionId: string, target: string) => {
-    setTabs((cur) => {
-      const tab = cur.find((t) => t.sessionId === sessionId);
-      setActiveId(tab ? tab.id : sessionId);
-      if (tab) return cur;
-      return [...cur, { id: sessionId, sessionId, target, title: targetLabel(target), hints: "", auto: "shell", state: { kind: "connecting" } }];
-    });
-  }, []);
+  const show = (sessionId: string, target: string) => {
+    const tab = tabs.find((t) => t.sessionId === sessionId);
+    setActiveId(tab ? tab.id : sessionId);
+    dropped.current.delete(sessionId);
+    if (!tab) setTabs((cur) => (cur.some((t) => t.sessionId === sessionId) ? cur : [...cur, { id: sessionId, sessionId, target, title: targetLabel(target), hints: "", auto: "shell", state: { kind: "connecting" } }]));
+  };
 
   /** The server named this tab's session: remember it, and drop any duplicate view of it. */
   const onSession = React.useCallback((tabId: string, info: TerminalSessionInfo) => {
@@ -250,6 +211,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     setTabs((t) => {
       const idx = t.findIndex((x) => x.id === id);
       if (idx === -1) return t;
+      const sid = t[idx]?.sessionId;
+      if (sid) dropped.current.add(sid);
       const next = t.filter((x) => x.id !== id);
       setActiveId((cur) => (cur === id ? (next[Math.max(0, idx - 1)]?.id ?? null) : cur));
       return next;
@@ -280,36 +243,38 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     return fn;
   };
 
-  /** Close a tab. A running session is ended (its shell stops on every device). */
+  /** A running session asked to end (in place, under the tabs): its shell stops on every device. */
+  const [ending, setEnding] = React.useState<string | null>(null);
+  /** Close a tab. A running session is ended, once that's confirmed. */
   const close = React.useCallback(
     (id: string) => {
       const tab = tabs.find((x) => x.id === id);
       if (!tab) return;
       const running = tab.sessionId && tab.state.kind !== "exited" && tab.state.kind !== "error";
-      if (running && tab.sessionId) {
-        if (!window.confirm("End this session? Its shell stops on every device.")) return;
-        void api.closeTerminalSession(tab.sessionId).catch(() => undefined);
-      }
-      dropTab(id);
+      if (running) setEnding(id);
+      else dropTab(id);
     },
     [tabs, dropTab],
   );
+  const endSession = (id: string) => {
+    const tab = tabs.find((x) => x.id === id);
+    if (tab?.sessionId) void api.closeTerminalSession(tab.sessionId).catch(() => undefined);
+    setEnding(null);
+    dropTab(id);
+  };
 
   // Deep links: ?open=<target> starts a session (command palette, runner cards); ?session=<id>
-  // attaches to one (Agents).
-  React.useEffect(() => {
-    if (!visible) return;
-    const params = new URLSearchParams(location.search);
-    const target = params.get("open");
-    const session = params.get("session");
-    if (target) {
-      open(target);
-      navigate("/terminal", { replace: true });
-    } else if (session) {
-      show(session, params.get("target") ?? "");
-      navigate("/terminal", { replace: true });
-    }
-  }, [visible, location.search, open, show, navigate]);
+  // attaches to one (Agents). Each link is followed once, then the address goes back to /terminal.
+  const params = new URLSearchParams(location.search);
+  const linkTarget = params.get("open");
+  const linkSession = params.get("session");
+  const link = visible && (linkTarget || linkSession) ? `${location.key}:${location.search}` : null;
+  const [followed, setFollowed] = React.useState<string | null>(null);
+  if (link && link !== followed) {
+    setFollowed(link);
+    if (linkTarget) open(linkTarget);
+    else if (linkSession) show(linkSession, params.get("target") ?? "");
+  }
 
   const active = tabs.find((t) => t.id === activeId) ?? null;
   const activeSession = active?.sessionId ?? null;
@@ -401,6 +366,18 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   const targets = ["local", ...connected.map((a) => `agent:${a.name}`)];
   const switcherTabs = tabs.map((t) => ({ id: t.id, title: t.title, name: t.name, target: t.target, state: t.state.kind }));
 
+  // The panel goes full screen (and comes back) by the browser's own events too (Escape).
+  const panel = React.useCallback((el: HTMLDivElement | null) => {
+    panelRef.current = el;
+    if (!el) return;
+    const onFs = () => setFull(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", onFs);
+    return () => {
+      document.removeEventListener("fullscreenchange", onFs);
+      panelRef.current = null;
+    };
+  }, []);
+
   const toggleFull = async () => {
     const el = panelRef.current;
     if (!el) return;
@@ -416,14 +393,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
       setFull((f) => !f);
     }
   };
-  React.useEffect(() => {
-    const onFs = () => setFull(Boolean(document.fullscreenElement));
-    document.addEventListener("fullscreenchange", onFs);
-    return () => document.removeEventListener("fullscreenchange", onFs);
-  }, []);
-
   const targetMenu = (trigger: React.ReactNode) => (
-    <DropdownMenu.Root onOpenChange={(o) => o && loadAgents()}>
+    <DropdownMenu.Root onOpenChange={(o) => o && invalidate("agents")}>
       <DropdownMenu.Trigger asChild>{trigger}</DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content className="popover w-72" sideOffset={6} align="start">
@@ -448,7 +419,9 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   );
 
   return (
-    <div ref={panelRef} className="flex min-h-0 flex-1 flex-col bg-[#08090a]" style={{ height: full ? "100dvh" : "calc(100dvh - var(--header-h) - 1px)" }}>
+    <div ref={panel} className="flex min-h-0 flex-1 flex-col bg-[#08090a]" style={{ height: full ? "100dvh" : "calc(100dvh - var(--header-h) - 1px)" }}>
+      {visible && <title>Terminal · kiln</title>}
+      {link && <Navigate to="/terminal" replace />}
       {narrow && (
         <MobileBar
           tabs={switcherTabs}
@@ -612,16 +585,48 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
         </div>
       </div>
 
-      <SelectTextDialog open={selectText !== null} onOpenChange={(o) => !o && setSelectText(null)} text={selectText ?? ""} onClosed={focusActive} />
-      <PasteDialog
-        open={pasteBox}
-        onOpenChange={setPasteBox}
-        onPaste={(text) => {
-          const id = activeRef.current;
-          if (id) handles.current.get(id)?.pasteText(text);
-        }}
-        onClosed={focusActive}
-      />
+      {/* Asked and answered in the page's flow, between the tabs and the terminal. */}
+      {ending && (
+        <div className="term-band">
+          <Confirm
+            label="End this session"
+            tone="danger"
+            actions={
+              <>
+                <Button size="xs" variant="danger" onClick={() => endSession(ending)}>
+                  End session
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => setEnding(null)}>
+                  Cancel
+                </Button>
+              </>
+            }
+          >
+            <p>End this session? Its shell stops on every device.</p>
+          </Confirm>
+        </div>
+      )}
+      {selectText !== null && (
+        <SelectTextPanel
+          text={selectText}
+          onClose={() => {
+            setSelectText(null);
+            focusActive();
+          }}
+        />
+      )}
+      {pasteBox && (
+        <PastePanel
+          onPaste={(text) => {
+            const id = activeRef.current;
+            if (id) handles.current.get(id)?.pasteText(text);
+          }}
+          onClose={() => {
+            setPasteBox(false);
+            focusActive();
+          }}
+        />
+      )}
       <SpawnDialog
         open={spawn !== null}
         onOpenChange={(o) => !o && setSpawn(null)}

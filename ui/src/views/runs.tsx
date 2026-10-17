@@ -87,7 +87,7 @@ function RunsBody() {
 
   const [olderState, setOlder] = React.useState<Older>({ key, runs: [], hasMore: null, loading: false, error: null });
   // Another repository's list starts without the older pages of the last one.
-  const older = olderState.key === key ? olderState : { key, runs: [], hasMore: null, loading: false, error: null };
+  const older = React.useMemo<Older>(() => (olderState.key === key ? olderState : { key, runs: [], hasMore: null, loading: false, error: null }), [olderState, key]);
   const runs = React.useMemo(() => {
     const seen = new Set(first.data.map((r) => r.id));
     return [...first.data, ...older.runs.filter((r) => !seen.has(r.id))];

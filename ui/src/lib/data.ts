@@ -9,7 +9,8 @@
 import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import type { Agent, HostSample, MetricsHistory, Overview, Repo, Run, UpdateJob, UpdatesOverview } from "@/api/types";
+import { harnessApi, type AgentInfo } from "@/api/harness";
+import type { Agent, AiSession, HostSample, MetricsHistory, Overview, Repo, Run, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
 import { preload, useSuspenseResource, type ResourceOptions } from "./resource";
 
 /** What a key loads, and how. */
@@ -124,3 +125,12 @@ export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>
   for (const j of data.jobs) all[j.id] = fuller(all[j.id], j);
   return Object.values(all).sort((a, b) => b.started_at - a.started_at);
 }
+
+/** The agents kiln runs (an older server without them: none), as their events change them. */
+export const harnessSessionsRes: Res<AgentInfo[]> = { key: "harness/sessions", fetch: () => harnessApi.list().catch(() => []), opts: { on: ["harness", "harness_closed"] } };
+
+/** The terminal sessions the server keeps (any device can attach to them). */
+export const terminalSessionsRes: Res<TerminalSessionInfo[]> = { key: "terminal/sessions", fetch: (s) => api.terminalSessions(s).catch(() => []), opts: { on: ["terminals"] } };
+
+/** The AI sessions the machines report (in kiln's terminals or not). */
+export const aiSessionsRes: Res<AiSession[]> = { key: "ai-sessions", fetch: (s) => api.aiSessions(s).catch(() => []), opts: { on: ["ai_sessions"] } };
