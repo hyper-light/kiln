@@ -1,13 +1,15 @@
 # kiln HTTP / WebSocket API (browser + CLI)
 
-Agents do **not** use this API except for `POST /api/agents/enroll` and the join requests of
-`kiln join`; they speak QUIC (see `docs/protocol.md`). All JSON. Timestamps are unix seconds unless
+Agents do **not** use this API except for `POST /api/agents/enroll`, the join requests of
+`kiln join` and, when UDP to the QUIC port gets no answer, the tunnel `GET /api/agents/tunnel`;
+they speak QUIC (see `docs/protocol.md`). All JSON. Timestamps are unix seconds unless
 the field ends in `_ms`.
 
 ## Auth
 
-Every `/api/*` route except `/api/auth/*`, `/api/agents/enroll`, `POST /api/join-requests`,
-`GET /api/join-requests/:id` (which takes the join secret instead) and `/api/hooks/*` requires
+Every `/api/*` route except `/api/auth/*`, `/api/agents/enroll`, `/api/agents/tunnel` (the QUIC
+mutual TLS inside it authenticates), `POST /api/join-requests`, `GET /api/join-requests/:id` (which
+takes the join secret instead) and `/api/hooks/*` requires
 either the `kiln_session` cookie or `Authorization: Bearer <admin token>`. 401 → UI shows the login
 screen.
 
@@ -36,7 +38,8 @@ interface HostSample { ts_ms; cpu_pct; cpus; load1; mem_total; mem_used; disk_to
   net_rx; net_tx; procs }
 interface Agent { name; labels: string[]; slots; hostname; os; arch; version; ephemeral: boolean;
   connected: boolean; last_seen; enrolled_at; running: string[] /* job ids */; busy: number;
-  draining: boolean; sample: HostSample|null }
+  draining: boolean; sample: HostSample|null;
+  transport?: "direct"|"tunnel" /* while connected: UDP to the QUIC port, or the HTTP tunnel */ }
 interface Child { name; state: "starting"|"running"|"restarting"|"stopped"|"finished"; restarts;
   last_error: string|null; since_unix }
 // A kiln instance heard on the local network (multicast DNS, see architecture.md).
@@ -98,3 +101,11 @@ interface JoinRequest { id; name /* agent name asked for */; hostname; os; arch;
 * `GET /api/terminal/ws?target=local|agent:<name>&cols=120&rows=40` — full PTY.
   Client → server: **binary** = keystrokes, text `{type:"resize", cols, rows}`.
   Server → client: **binary** = PTY output, text `{type:"exit", code}` / `{type:"error", message}`.
+* `GET /api/agents/tunnel` — **open**; an agent's QUIC datagrams when UDP to the QUIC port gets no
+  answer (see architecture.md, *Agent transport*). Each **binary** message is one UDP datagram of at
+  most 1500 bytes, both ways: the server relays it to its own QUIC listener from a loopback socket
+  of this tunnel's, and the listener's datagrams back. Client → server text `bind <64 hex digits>`:
+  the TLS exporter value (label `EXPORTER-kiln-transport-binding`, empty context, 32 bytes) of the
+  QUIC connection the tunnel carries, which makes that agent's `transport` `"tunnel"`. 400 without a
+  WebSocket upgrade, 429 past 60 new tunnels a minute from one address, 503 with 256 open. Closed
+  after 10 minutes without a datagram, on either side's close, and on a message over the bound.
