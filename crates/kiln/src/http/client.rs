@@ -103,6 +103,15 @@ impl Client {
     pub fn put(&self, url: &str) -> RequestBuilder<'_> {
         self.request(Method::Put, url)
     }
+
+    /// Open a WebSocket (`ws(s)://`, or `http(s)://` for the same) trusting this client's roots;
+    /// see [`super::ws::connect`].
+    pub async fn websocket(&self, url: &str, max_message: usize) -> anyhow::Result<super::ws::ClientSocket> {
+        match crate::rt::timeout(DEFAULT_TIMEOUT, super::ws::connect(&self.tls, url, max_message)).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("WebSocket to {url} timed out after {DEFAULT_TIMEOUT:?}"),
+        }
+    }
 }
 
 enum Payload {
