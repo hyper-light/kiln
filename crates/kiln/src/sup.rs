@@ -144,3 +144,108 @@ where
         }
     })
 }
+
+/// Panics injected on purpose: kiln's code never panics (clippy denies every way to), so these are
+/// what a bug in a dependency, or one that slipped through, would raise. Each must stay where it
+/// happened: the subsystem restarts, the task ends, the connection drops; the process goes on.
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// A real panic, as a bug would raise it.
+    #[allow(clippy::panic)]
+    fn injected(what: &str) -> anyhow::Result<()> {
+        panic!("injected: {what}")
+    }
+
+    #[test]
+    fn a_subsystem_that_panics_is_restarted_and_its_siblings_run_on() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let reg = Registry::default();
+            let stop = Shutdown::new();
+            // A sibling that just keeps working.
+            let ticks = Arc::new(AtomicU32::new(0));
+            let (t, s) = (Arc::clone(&ticks), stop.clone());
+            spawn(&reg, "steady", stop.clone(), move || {
+                let (t, s) = (Arc::clone(&t), s.clone());
+                async move {
+                    while s.sleep(Duration::from_millis(10)).await {
+                        t.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                }
+            });
+            // A subsystem with a bug: its first two starts panic, the third finishes.
+            let starts = Arc::new(AtomicU32::new(0));
+            let st = Arc::clone(&starts);
+            let flaky = spawn(&reg, "flaky", stop.clone(), move || {
+                let n = st.fetch_add(1, Ordering::SeqCst);
+                async move { if n < 2 { injected("a bug in a subsystem") } else { Ok(()) } }
+            });
+            let _ = flaky.await;
+            let before = ticks.load(Ordering::SeqCst);
+            crate::rt::sleep(Duration::from_millis(100)).await;
+            let after = ticks.load(Ordering::SeqCst);
+            stop.cancel();
+            let snap = reg.snapshot();
+            let f = snap.iter().find(|c| c.name == "flaky").ok_or_else(|| anyhow::anyhow!("flaky was never registered"))?;
+            anyhow::ensure!(f.restarts == 2 && f.state == "finished", "{f:?}");
+            anyhow::ensure!(f.last_error.as_deref().is_some_and(|e| e.contains("panic: injected: a bug in a subsystem")), "{f:?}");
+            anyhow::ensure!(starts.load(Ordering::SeqCst) == 3, "started {} times", starts.load(Ordering::SeqCst));
+            anyhow::ensure!(after > before, "the sibling stopped working ({before} -> {after})");
+            anyhow::Ok(())
+        })
+    }
+
+    #[test]
+    fn a_task_that_panics_is_contained_and_counted() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let caught = crate::metrics::global().panics_caught.get();
+            let task = spawn_guarded("doomed", async { injected("a bug in one task") });
+            anyhow::ensure!(task.await.is_ok(), "the guard should have ended the task, not lost it");
+            anyhow::ensure!(crate::metrics::global().panics_caught.get() > caught, "the panic was not counted");
+            // The runtime goes on running other work.
+            let answer = crate::rt::spawn(async { 41 + 1 }).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::ensure!(answer == 42);
+            anyhow::Ok(())
+        })
+    }
+
+    /// Panics on `/boom`; answers "ok" otherwise.
+    struct Boom;
+
+    impl crate::http::server::Handler for Boom {
+        async fn handle(self: Arc<Self>, req: crate::http::server::Request) -> crate::http::server::Response {
+            if req.uri().path() == "/boom" {
+                let _ = injected("a bug in one request");
+            }
+            crate::http::server::text(::http::StatusCode::OK, "ok")
+        }
+    }
+
+    #[test]
+    fn a_request_that_panics_ends_only_its_own_connection() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let addr = tcp.local_addr()?;
+            let tcp = hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(tcp), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let handler = Arc::new(Boom);
+            crate::rt::spawn(async move {
+                while let Ok(stream) = tcp.accept().await {
+                    let (h, remote) = (Arc::clone(&handler), stream.peer_addr().ok());
+                    crate::rt::spawn(crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), h, remote));
+                }
+            });
+            let client = crate::http::client::Client::public()?;
+            let boom = client.get(&format!("http://{addr}/boom")).send().await;
+            anyhow::ensure!(boom.is_err(), "the panicking request should have lost its connection");
+            for _ in 0..3 {
+                let ok = client.get(&format!("http://{addr}/ok")).send().await?;
+                anyhow::ensure!(ok.status() == 200, "status {} after a request panicked", ok.status());
+            }
+            anyhow::Ok(())
+        })
+    }
+}
