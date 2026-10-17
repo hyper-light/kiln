@@ -51,6 +51,9 @@ pub struct Info {
     pub command: Option<String>,
     /// The window title the program set (OSC 0/2), if any.
     pub title: String,
+    /// The name a person gave it, if any (shown over the title).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub created_at: i64,
     pub attached: usize,
     pub cols: u16,
@@ -155,6 +158,7 @@ impl Session {
             target: self.target.clone(),
             command: self.command.clone(),
             title: st.screen.callbacks().title.clone(),
+            name: None,
             created_at: self.created_at,
             attached: st.attached,
             cols: st.cols,
@@ -270,7 +274,14 @@ impl Session {
 /// Every terminal session on this server.
 pub struct Sessions {
     map: Mutex<HashMap<String, Arc<Session>>>,
+    /// Names people gave sessions, by session id: kept in `names_file`, so they outlive this
+    /// server's restarts and a machine's reconnects (its sessions come back under their ids).
+    names: Mutex<HashMap<String, String>>,
+    names_file: Mutex<Option<std::path::PathBuf>>,
 }
+
+/// The longest name a terminal session takes.
+const MAX_NAME: usize = 80;
 
 impl Default for Sessions {
     fn default() -> Self {
@@ -280,7 +291,46 @@ impl Default for Sessions {
 
 impl Sessions {
     pub fn new() -> Self {
-        Self { map: Mutex::new(HashMap::new()) }
+        Self { map: Mutex::new(HashMap::new()), names: Mutex::new(HashMap::new()), names_file: Mutex::new(None) }
+    }
+
+    /// Keeps sessions' names in `file` (read now, written as they change).
+    pub fn keep_names_in(&self, file: std::path::PathBuf) {
+        if let Ok(raw) = std::fs::read(&file) {
+            match serde_json::from_slice::<HashMap<String, String>>(&raw) {
+                Ok(names) => *self.names.lock() = names,
+                Err(e) => tracing::warn!(file = %file.display(), error = %e, "unreadable terminal names; starting without them"),
+            }
+        }
+        *self.names_file.lock() = Some(file);
+    }
+
+    /// Names a session ("" takes its name away, back to its window title). False when there is
+    /// no such session.
+    pub fn rename(&self, id: &str, name: &str) -> bool {
+        if self.get(id).is_none() {
+            return false;
+        }
+        let name: String = name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
+        {
+            let mut names = self.names.lock();
+            if name.is_empty() {
+                names.remove(id);
+            } else {
+                names.insert(id.to_owned(), name);
+            }
+        }
+        self.save_names();
+        true
+    }
+
+    fn save_names(&self) {
+        let Some(file) = self.names_file.lock().clone() else { return };
+        let Ok(json) = serde_json::to_vec_pretty(&*self.names.lock()) else { return };
+        let tmp = file.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &file)) {
+            tracing::warn!(file = %file.display(), error = %e, "could not keep terminal names");
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
@@ -288,7 +338,17 @@ impl Sessions {
     }
 
     pub fn list(&self) -> Vec<Info> {
-        let mut v: Vec<Info> = self.map.lock().values().map(|s| s.info()).collect();
+        let names = self.names.lock().clone();
+        let mut v: Vec<Info> = self
+            .map
+            .lock()
+            .values()
+            .map(|s| {
+                let mut i = s.info();
+                i.name = names.get(&i.id).cloned();
+                i
+            })
+            .collect();
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         v
     }
@@ -305,6 +365,14 @@ impl Sessions {
 
     pub fn remove(&self, id: &str) {
         self.map.lock().remove(id);
+        self.forget_name(id);
+    }
+
+    fn forget_name(&self, id: &str) {
+        let had = self.names.lock().remove(id).is_some();
+        if had {
+            self.save_names();
+        }
     }
 
     fn insert(&self, s: &Arc<Session>) {
@@ -325,6 +393,7 @@ impl Sessions {
                 Some(gone) if attached == 0 || gone > EXITED_LINGER * 10 => {
                     if gone > EXITED_LINGER || attached == 0 {
                         self.map.lock().remove(&s.id);
+                        self.forget_name(&s.id);
                         changed = true;
                     }
                 }
@@ -492,6 +561,32 @@ fn run_agent(hub: &Arc<Hub>, machine: String, s: Arc<Session>, input: async_chan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_outlives_restarts_and_goes_with_its_session() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("terminal-names.json");
+        let reg = Sessions::new();
+        reg.keep_names_in(file.clone());
+        reg.insert(&Session::detached("t1".into(), "local".into(), None, 80, 24));
+        assert!(!reg.rename("nope", "x"), "no such session");
+        assert!(reg.rename("t1", "  builds\u{7}  "));
+        assert_eq!(reg.list().first().and_then(|i| i.name.clone()).as_deref(), Some("builds"));
+        // Another server reads it back when the session comes back under its id.
+        let again = Sessions::new();
+        again.keep_names_in(file.clone());
+        again.insert(&Session::detached("t1".into(), "local".into(), None, 80, 24));
+        assert_eq!(again.list().first().and_then(|i| i.name.clone()).as_deref(), Some("builds"));
+        // Emptied, it shows its title again; the session gone, so is its name.
+        assert!(again.rename("t1", ""));
+        assert_eq!(again.list().first().and_then(|i| i.name.clone()), None);
+        assert!(again.rename("t1", "deploys"));
+        again.remove("t1");
+        let third = Sessions::new();
+        third.keep_names_in(file);
+        assert!(third.names.lock().is_empty());
+        Ok(())
+    }
 
     fn feed(s: &Session, b: &[u8]) {
         s.output(b);

@@ -10,19 +10,47 @@ export interface PlanSource {
   agent?: string | null;
 }
 
-/** One item of a plan: a piece of the work, with what it's like and what makes it done. */
+/** How a measure compares with its threshold (crates/kiln/src/plans/criteria.rs `Op`). */
+export type CriterionOp = "lt" | "le" | "eq" | "ne" | "ge" | "gt" | "between" | "within" | "rises_at_least" | "falls_at_least" | "rises_at_most" | "falls_at_most";
+
+/** A criterion: in words, or a measure against a threshold. */
+export type Criterion =
+  | { kind: "qualitative"; text: string }
+  | {
+      kind: "quantitative";
+      /** What's measured ("p99.9 latency"). */
+      target: string;
+      op: CriterionOp;
+      /** The threshold (a number; for rises/falls a percentage). */
+      value: string;
+      /** between: the upper bound; within: the tolerance. */
+      value2?: string;
+      unit?: string;
+      /** rises/falls: compared with what. */
+      baseline?: string;
+      /** How it's measured. */
+      measured?: string;
+    };
+
+/** A test: a scenario, and the criteria it passes by. */
+export interface PlanTest {
+  scenario: string;
+  criteria: Criterion[];
+}
+
+/** One step of a plan: a piece of the work, what it's like, what makes it done, how it's tested. */
 export interface PlanItem {
   title: string;
   /** What to do (markdown). */
   description: string;
   examples: string;
   /** When it's done. */
-  acceptance: string;
-  /** How it's tested: examples, scenarios, criteria. */
-  testing: string;
+  acceptance: Criterion[];
+  /** How it's tested. */
+  testing: PlanTest[];
 }
 
-export const emptyItem = (): PlanItem => ({ title: "", description: "", examples: "", acceptance: "", testing: "" });
+export const emptyItem = (): PlanItem => ({ title: "", description: "", examples: "", acceptance: [], testing: [] });
 
 export interface Plan {
   id: string;

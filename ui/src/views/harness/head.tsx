@@ -7,12 +7,12 @@ import * as React from "react";
 import { Link, useNavigate } from "react-router";
 import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
-import { costText, modelLabel, tildify } from "./derive";
+import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
 import { RoundButton } from "./figure/figure";
 import { LimitBadge, UsagePanel } from "./limits";
 import { machineName, StateWord } from "./parts";
 import { RunSettings } from "./run-settings";
-import type { useAgentActions } from "./actions";
+import { NameField, type useAgentActions } from "./actions";
 import "./console.css";
 
 export function AgentHeader({
@@ -70,8 +70,9 @@ export function AgentHeader({
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [usage]);
-  // The kind already names an agent that has no name of its own.
-  const named = Boolean(info && info.name.trim().toLowerCase() !== info.kind_name.trim().toLowerCase());
+  // The kind is said beside a label that isn't the kind's own name.
+  const label = info ? agentLabel(info) : "Agent";
+  const named = Boolean(info && label.toLowerCase() !== info.kind_name.trim().toLowerCase());
 
   return (
     <header className="ag-head">
@@ -90,7 +91,15 @@ export function AgentHeader({
             )}
             {info && <span>{machineName(info.target)}</span>}
           </p>
-          <h1 className="ag-title">{info?.name ?? "Agent"}</h1>
+          {actions.renaming && info ? (
+            <NameField value={hasOwnName(info) ? info.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ag-title-field" label="Agent name" />
+          ) : (
+            <h1 className="ag-title">
+              <button type="button" className="ag-title-btn" onClick={actions.startRenaming} disabled={!info} title="Rename">
+                {label}
+              </button>
+            </h1>
+          )}
           <div className="ag-state">
             <StateWord a={{ status, approvals }} />
             {status === "running" && activity && <span className="ag-activity">{activity}</span>}

@@ -241,12 +241,17 @@ pub struct KindInfo {
     pub name: String,
     pub verified: bool,
     pub available: bool,
-    /// Its permission modes (the ones that skip every check are left out). ACP agents announce
-    /// theirs per session, so theirs are empty here.
+    /// Its permission modes, those that skip every check marked `dangerous` (a choice that takes
+    /// a confirmation, never a default). ACP agents announce theirs per session, so theirs are
+    /// empty here.
     #[serde(default)]
     pub modes: Vec<super::model::ModeOption>,
     #[serde(default)]
     pub default_mode: String,
+    /// The effort levels it takes, lowest first (empty: none, or announced per session). Starting
+    /// without one leaves the model's own default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<super::model::ControlOption>,
     /// kiln runs it as a structured session; false: it runs in a kiln terminal (`program`).
     #[serde(default = "yes")]
     pub structured: bool,
@@ -259,14 +264,40 @@ fn yes() -> bool {
     true
 }
 
+/// "xhigh" → "Xhigh", as the adapters name their levels.
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
 impl Kind {
     /// Its permission modes, and the one a new session starts in.
     pub fn modes(&self) -> (Vec<super::model::ModeOption>, &'static str) {
         match self.protocol {
-            Protocol::ClaudeStreamJson => (super::claude::modes(false), "default"),
-            Protocol::CodexAppServer => (super::codex::modes(false), "auto"),
+            Protocol::ClaudeStreamJson => {
+                let mut m = super::claude::modes(true);
+                // As root (outside a sandbox) Claude Code refuses to skip its checks.
+                if !super::claude::bypass_possible() {
+                    m.retain(|x| !x.dangerous);
+                }
+                (m, "default")
+            }
+            Protocol::CodexAppServer => (super::codex::modes(true), "auto"),
             Protocol::Acp(_) | Protocol::Terminal => (Vec::new(), ""),
         }
+    }
+
+    /// The effort levels a new session can start at, before the harness says which its model has.
+    pub fn efforts(&self) -> Vec<super::model::ControlOption> {
+        let levels: &[&str] = match self.protocol {
+            Protocol::ClaudeStreamJson => super::claude::EFFORTS,
+            Protocol::CodexAppServer => super::codex::EFFORTS,
+            Protocol::Acp(_) | Protocol::Terminal => &[],
+        };
+        levels
+            .iter()
+            .map(|e| super::model::ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false })
+            .collect()
     }
 }
 
@@ -282,6 +313,7 @@ pub fn offered() -> Vec<KindInfo> {
                 available: k.available(),
                 modes,
                 default_mode: default_mode.to_owned(),
+                efforts: k.efforts(),
                 structured: k.structured(),
                 program: k.program.to_owned(),
             }
