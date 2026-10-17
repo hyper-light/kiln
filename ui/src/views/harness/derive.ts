@@ -105,6 +105,38 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
   return turns;
 }
 
+const sameList = <T>(a: readonly T[] | undefined, b: readonly T[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b?.[i]);
+
+/** Whether two items show the same events (the session keeps an event's object while it doesn't change). */
+function sameItem(a: Item, b: Item): boolean {
+  if (a.type !== b.type || a.key !== b.key) return false;
+  if (a.type === "step") return b.type === "step" && a.group === b.group && sameList(a.calls, b.calls);
+  if (a.type === "thought") return b.type === "thought" && a.event === b.event && sameList(a.more, b.more);
+  return "event" in b && a.event === b.event;
+}
+
+/**
+ * `next` with every turn and item that shows what it showed before kept as the object it was
+ * (`kept`: the last turns, by key; updated here), so a conversation that grows renders only what
+ * changed.
+ */
+export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
+  const out = next.map((t) => {
+    const was = kept.get(t.key);
+    if (!was) return t;
+    const before = new Map(was.items.map((it) => [it.key, it]));
+    const items = t.items.map((it) => {
+      const b = before.get(it.key);
+      return b && sameItem(b, it) ? b : it;
+    });
+    const same = was.prompt === t.prompt && was.outcome === t.outcome && was.started === t.started && was.ended === t.ended && sameList(was.items, items);
+    return same ? was : { ...t, items };
+  });
+  kept.clear();
+  for (const t of out) kept.set(t.key, t);
+  return out;
+}
+
 export function diffStats(diffs: FileDiff[] | undefined): { add: number; del: number } {
   let add = 0;
   let del = 0;

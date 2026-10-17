@@ -38,7 +38,7 @@ interface Clock {
 const clocks = new Map<number, Clock>();
 
 function clockOf(ms: number): Clock {
-  let c = clocks.get(ms);
+  const c = clocks.get(ms);
   if (c) return c;
   const clock: Clock = {
     now: Date.now(),

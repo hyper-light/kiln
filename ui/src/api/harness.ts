@@ -5,6 +5,7 @@
  */
 import * as React from "react";
 import { wsUrl } from "@/api/client";
+import { events } from "@/api/events";
 import type { TerminalSessionInfo } from "./types";
 
 /* ------------------------------------------------------------------ model */
@@ -591,7 +592,9 @@ export type Update =
   | { t: "events"; events: HEvent[] }
   | { t: "stream"; id: string; text: string }
   | { t: "reply"; client: string; value: unknown }
-  | { t: "reset" };
+  | { t: "reset" }
+  /** The snapshot sent since "open" is complete (the server's socket says so; a machine resending its sessions doesn't). */
+  | { t: "synced" };
 
 /* ------------------------------------------------------------------ REST */
 
@@ -689,43 +692,153 @@ export interface Snapshot {
   /** The changeset, file by file (null until the server sends one). */
   changes: FileChange[] | null;
   error: string | null;
-  /** Bumped on every change (cheap memo key). */
-  version: number;
+  /** The first snapshot is in: until then there's nothing to show but a loader. */
+  ready: boolean;
 }
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, version: 0 };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
+/** A snapshot that doesn't end with the server's "synced" (a machine sending its sessions again) is complete once its frames pause this long… */
+const QUIET_MS = 300;
+/** …or this long while none of its events came yet (a big first batch takes a while on a slow link). */
+const QUIET_FIRST_MS = 1500;
+/** What's shown is never held longer than this while a snapshot comes. */
+const HOLD_MS = 5000;
+/** A session the server doesn't know (yet) is tried this many times before it's taken as ended… */
+const UNKNOWN_TRIES = 4;
+/** …or, when it was here before (the server restarted and its machine isn't back yet), for this long. */
+const UNKNOWN_KNOWN_MS = 60_000;
+/** An ended session is looked for again this often, in case it was only away. */
+const ENDED_RETRY_MS = 10_000;
+/** A conversation left stays live this long: back in a moment, there's nothing to catch up on. */
+const LINGER_MS = 30_000;
+/** Conversations kept in memory once left (the latest ones). */
+const KEEP = 8;
+
+/** Whether two values parsed from JSON are equal. */
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const c = b as unknown[];
+    if (a.length !== c.length) return false;
+    for (let i = 0; i < a.length; i++) if (!same(a[i], c[i])) return false;
+    return true;
+  }
+  const x = a as Record<string, unknown>;
+  const y = b as Record<string, unknown>;
+  const keys = Object.keys(x);
+  if (keys.length !== Object.keys(y).length) return false;
+  for (const k of keys) if (!Object.hasOwn(y, k) || !same(x[k], y[k])) return false;
+  return true;
+}
+
+/** What was there when it's equal to what came (so what shows it doesn't render again). */
+const keep = <T>(was: T, now: T): T => (same(was, now) ? was : now);
+
+const withState = (info: AgentInfo | null, s: State): AgentInfo | null => (info ? { ...info, status: s.status, title: s.title, model: s.model, mode: s.mode } : null);
+
+/** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
+interface Incoming {
+  info: AgentInfo | null;
+  meta: Meta | null;
+  state: State | null;
+  changes: FileChange[] | null;
+  byId: Map<string, HEvent>;
+  /** Some of its events came. */
+  events: boolean;
+  /** It ends with the server's "synced". */
+  told: boolean;
+}
 
 /**
  * One agent session, live: a websocket that receives the session's snapshot and then its updates,
- * and sends commands. Batches updates to one notification per animation frame, so a streaming
- * reply re-renders at most once a frame however fast it arrives.
+ * and sends commands.
+ * - A snapshot (on connect, after a reconnect, when its machine came back) is gathered while what's
+ *   shown stays, and swapped in at once when it's complete; what didn't change keeps its objects,
+ *   so nothing re-renders for it and nothing moves.
+ * - Updates are batched to one notification per animation frame, so a streaming reply re-renders
+ *   at most once a frame however fast it arrives.
+ * - It reconnects by itself, at once when the server's event stream says the server or the
+ *   session is back. A session the server doesn't know right now (it restarted and the session's
+ *   machine hasn't reconnected yet) is tried again rather than taken as ended.
+ * - Left, it stays live a while (coming back shows it as it is, at once), then closes and keeps
+ *   what it had for the next visit.
  */
 export class SessionStore {
   private snap: Snapshot = EMPTY;
   private byId = new Map<string, HEvent>();
-  private order: HEvent[] | null = [];
+  /** Where each event is in `snap.events`. */
+  private pos = new Map<string, number>();
+  /** Since the last notification: events replaced, new ones, a new snapshot. */
+  private touched = new Set<string>();
+  private grew = false;
+  private reorder = false;
+  private incoming: Incoming | null = null;
   private listeners = new Set<() => void>();
   private ws: WebSocket | null = null;
-  private stopped = false;
+  private wsAt = 0;
+  /** Frames on this connection so far. */
+  private frames = 0;
+  /** Something shows it (or will in a moment): the socket stays up. */
+  private wanted = false;
+  private unhook: (() => void)[] = [];
+  /** This connection has said "open": a "closed" before it means the server doesn't know the session now. */
+  private opened = false;
+  /** It was here before. */
+  private known = false;
+  /** The server said it ended. */
+  private ended = false;
+  private misses = 0;
+  private missingSince = 0;
+  /** The last snapshot ended with "synced": the next ones will too. */
+  private tells = false;
   private attempt = 0;
   private timer = 0;
+  private quiet = 0;
+  private hold = 0;
+  private linger = 0;
   private raf = 0;
   private dirty = false;
+  /** When nothing showed it any more. */
+  idleSince = 0;
   private replies = new Map<string, (v: unknown) => void>();
+  private waiting: { promise: Promise<void>; resolve: () => void } | null = null;
 
   constructor(readonly id: string) {}
 
   subscribe = (fn: () => void) => {
     this.listeners.add(fn);
-    if (this.listeners.size === 1) this.connect();
+    window.clearTimeout(this.linger);
+    this.want();
     return () => {
       this.listeners.delete(fn);
-      if (this.listeners.size === 0) this.close();
+      if (this.listeners.size === 0) this.leave();
     };
   };
 
   get = () => this.snap;
+
+  /** Resolves once the first snapshot is in (what Suspense waits on); connects if nothing has yet. */
+  ready(): Promise<void> {
+    if (this.snap.ready) return Promise.resolve();
+    this.want();
+    // Nothing shows it yet: it closes again unless something does soon.
+    if (this.listeners.size === 0) this.leave();
+    if (!this.waiting) {
+      let resolve = () => {};
+      const promise = new Promise<void>((r) => (resolve = r));
+      this.waiting = { promise, resolve };
+    }
+    return this.waiting.promise;
+  }
+
+  /** Nothing shows it and nothing will: it can be dropped. */
+  idle = () => !this.wanted && this.listeners.size === 0;
+
+  /** Connect now rather than at the next try (the tab is shown again, the network is back). */
+  wake = () => this.kick(false);
 
   /** Send a command; false when the session isn't connected. */
   send = (c: Command): boolean => {
@@ -753,87 +866,312 @@ export class SessionStore {
       }
     });
 
+  private want() {
+    if (this.wanted) return;
+    this.wanted = true;
+    this.unhook = [
+      // The server restarted, or the network came back: this socket may be gone too without having said so.
+      events.onReopen(() => this.kick(true)),
+      // The session is on the server again (its machine came back): no need to wait for the next try.
+      events.on((ev) => {
+        if (ev.type === "harness" && ev.info.id === this.id) this.kick(false);
+      }),
+    ];
+    this.connect();
+  }
+
+  /** Nothing shows it any more: it stays live a while, then closes. */
+  private leave() {
+    window.clearTimeout(this.linger);
+    this.linger = window.setTimeout(() => {
+      if (this.listeners.size === 0) this.close();
+    }, LINGER_MS);
+  }
+
+  private close() {
+    this.wanted = false;
+    this.unhook.forEach((f) => f());
+    this.unhook = [];
+    window.clearTimeout(this.timer);
+    window.clearTimeout(this.quiet);
+    window.clearTimeout(this.hold);
+    // A snapshot half in is dropped: the next connection sends it again.
+    this.incoming = null;
+    cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    this.flush();
+    const ws = this.ws;
+    this.ws = null;
+    ws?.close();
+    this.idleSince = Date.now();
+    // Whatever still waits for its first snapshot renders again (and connects again if it's still shown).
+    this.settle();
+    prune();
+  }
+
   private connect() {
-    this.stopped = false;
-    const ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws`));
+    window.clearTimeout(this.timer);
+    this.timer = 0;
+    if (!this.wanted) return;
+    const old = this.ws;
+    this.ws = null;
+    old?.close();
+    this.opened = false;
+    this.frames = 0;
+    this.incoming = null;
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws`));
+    } catch {
+      this.retry();
+      return;
+    }
     this.ws = ws;
-    ws.onopen = () => {
-      this.attempt = 0;
-      this.patch({ conn: "open" });
-    };
+    this.wsAt = Date.now();
     ws.onmessage = (ev) => {
-      if (typeof ev.data !== "string") return;
+      if (this.ws !== ws || typeof ev.data !== "string") return;
       let u: Update;
       try {
         u = JSON.parse(ev.data) as Update;
       } catch {
         return;
       }
+      this.frames += 1;
       this.apply(u);
     };
     ws.onclose = () => {
-      if (this.ws === ws) this.ws = null;
-      if (this.stopped || this.snap.conn === "gone") return;
-      this.patch({ conn: "reconnecting" });
-      const delay = BACKOFF[Math.min(this.attempt, BACKOFF.length - 1)] ?? 4000;
-      this.attempt += 1;
-      this.timer = window.setTimeout(() => this.connect(), delay);
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.lost();
     };
   }
 
-  private close() {
-    this.stopped = true;
+  /** The socket closed: try again (rarely once it has ended, in case it was only away). */
+  private lost() {
+    if (!this.wanted) return;
+    window.clearTimeout(this.quiet);
+    window.clearTimeout(this.hold);
+    this.incoming = null;
+    if (this.ended) {
+      this.retry(ENDED_RETRY_MS);
+      return;
+    }
+    if (this.snap.conn === "open") this.patch({ conn: "reconnecting" });
+    this.retry();
+  }
+
+  private retry(ms?: number) {
     window.clearTimeout(this.timer);
-    cancelAnimationFrame(this.raf);
-    this.ws?.close();
-    this.ws = null;
+    const delay = ms ?? BACKOFF[Math.min(this.attempt, BACKOFF.length - 1)] ?? 4000;
+    this.attempt += 1;
+    this.timer = window.setTimeout(() => this.connect(), delay);
+  }
+
+  /** Connect now. `fresh`: even over a socket that looks open (it may have died without saying so). */
+  private kick(fresh: boolean) {
+    if (!this.wanted) return;
+    const ws = this.ws;
+    if (ws && ws.readyState === WebSocket.CONNECTING) return;
+    if (ws && ws.readyState === WebSocket.OPEN && (!fresh || Date.now() - this.wsAt < 2000)) return;
+    this.attempt = 0;
+    this.connect();
   }
 
   private apply(u: Update) {
     switch (u.t) {
-      case "open":
-        // Always first, and again after the server resynced: the timeline starts over.
-        this.byId.clear();
-        this.order = [];
-        this.snap = { ...this.snap, info: u.info, error: null };
-        break;
-      case "changes":
-        this.snap = { ...this.snap, changes: u.files };
-        break;
-      case "error":
-        this.snap = { ...this.snap, error: u.error };
-        break;
-      case "closed":
-        this.snap = { ...this.snap, conn: "gone" };
-        break;
-      case "state":
-        this.snap = { ...this.snap, state: u.state, info: this.snap.info ? { ...this.snap.info, status: u.state.status, title: u.state.title, model: u.state.model, mode: u.state.mode } : null };
-        break;
-      case "meta":
-        this.snap = { ...this.snap, meta: u.meta };
-        break;
-      case "reset":
-        this.byId.clear();
-        this.order = [];
-        break;
-      case "events":
-        for (const e of u.events) this.byId.set(e.id, e);
-        this.order = null;
-        break;
-      case "stream": {
-        const e = this.byId.get(u.id);
-        if (e && (e.kind === "assistant" || e.kind === "thinking")) this.byId.set(u.id, { ...e, text: e.text + u.text });
-        this.order = null;
-        break;
-      }
       case "reply": {
         const r = this.replies.get(u.client);
         this.replies.delete(u.client);
         r?.(u.value);
         return;
       }
+      case "error":
+        this.patch({ error: u.error });
+        return;
+      case "open":
+        this.opened = true;
+        this.ended = false;
+        this.misses = 0;
+        this.attempt = 0;
+        this.begin(u.info, this.tells && this.frames === 1);
+        if (this.snap.ready && this.snap.conn !== "open") this.patch({ conn: "open" });
+        return;
+      case "synced":
+        this.tells = true;
+        this.commit();
+        return;
+      case "closed":
+        if (!this.opened) {
+          this.unknown();
+          return;
+        }
+        this.commit();
+        this.ended = true;
+        this.patch({ conn: "gone", ready: true });
+        this.settle();
+        return;
     }
+    const inc = this.incoming;
+    if (inc) {
+      // A snapshot holds nothing after its events but more events: anything else is live, so it's complete.
+      if (u.t !== "stream" && !(inc.events && u.t !== "events")) {
+        this.gather(inc, u);
+        return;
+      }
+      this.commit();
+    }
+    this.take(u);
     this.schedule();
+  }
+
+  private begin(info: AgentInfo | null, told: boolean) {
+    window.clearTimeout(this.hold);
+    this.incoming = { info, meta: this.snap.meta, state: this.snap.state, changes: null, byId: new Map(), events: false, told };
+    this.hold = window.setTimeout(() => this.commit(), HOLD_MS);
+    this.wait();
+  }
+
+  private gather(inc: Incoming, u: Update) {
+    switch (u.t) {
+      case "reset":
+        inc.byId.clear();
+        break;
+      case "meta":
+        inc.meta = u.meta;
+        break;
+      case "state":
+        inc.state = u.state;
+        inc.info = withState(inc.info, u.state);
+        break;
+      case "changes":
+        inc.changes = u.files;
+        break;
+      case "events":
+        inc.events = true;
+        for (const e of u.events) inc.byId.set(e.id, e);
+        break;
+    }
+    this.wait();
+  }
+
+  /** Without "synced", the snapshot is taken as complete once its frames pause. */
+  private wait() {
+    window.clearTimeout(this.quiet);
+    const inc = this.incoming;
+    if (!inc || inc.told) return;
+    this.quiet = window.setTimeout(() => this.commit(), inc.events ? QUIET_MS : QUIET_FIRST_MS);
+  }
+
+  /** The snapshot is complete: it replaces what's shown in one change. */
+  private commit() {
+    const inc = this.incoming;
+    if (!inc) return;
+    this.incoming = null;
+    window.clearTimeout(this.quiet);
+    window.clearTimeout(this.hold);
+    const byId = new Map<string, HEvent>();
+    for (const [id, e] of inc.byId) {
+      const was = this.byId.get(id);
+      byId.set(id, was && same(was, e) ? was : e);
+    }
+    this.byId = byId;
+    this.reorder = true;
+    const s = this.snap;
+    this.snap = {
+      ...s,
+      conn: "open",
+      info: keep(s.info, inc.info),
+      meta: keep(s.meta, inc.meta),
+      state: keep(s.state, inc.state),
+      changes: keep(s.changes, inc.changes),
+      error: null,
+      ready: true,
+    };
+    // Ready only with its events in order, so the first render has them all.
+    this.snap = { ...this.snap, events: this.ordered() };
+    this.known = true;
+    this.settle();
+    this.schedule();
+  }
+
+  /** The server doesn't know the session right now: it restarted and the session's machine isn't back yet, or the session ended. */
+  private unknown() {
+    // Ended already: it stays so (and is looked for now and then).
+    if (this.ended) return;
+    this.misses += 1;
+    if (this.misses === 1) this.missingSince = Date.now();
+    const away = this.known ? Date.now() - this.missingSince < UNKNOWN_KNOWN_MS : this.misses < UNKNOWN_TRIES;
+    if (away) {
+      // Most likely back in a moment: what's shown stays (or the loader does), and it's tried again.
+      if (this.snap.ready && this.snap.conn !== "reconnecting") this.patch({ conn: "reconnecting" });
+      return;
+    }
+    // Taken as ended; still looked for now and then.
+    this.ended = true;
+    this.patch({ conn: "gone", ready: true });
+    this.settle();
+  }
+
+  private take(u: Update) {
+    switch (u.t) {
+      case "changes":
+        this.snap = { ...this.snap, changes: u.files };
+        break;
+      case "state":
+        this.snap = { ...this.snap, state: u.state, info: withState(this.snap.info, u.state) };
+        break;
+      case "meta":
+        this.snap = { ...this.snap, meta: u.meta };
+        break;
+      case "events":
+        for (const e of u.events) {
+          if (this.byId.has(e.id)) this.touched.add(e.id);
+          else this.grew = true;
+          this.byId.set(e.id, e);
+        }
+        break;
+      case "stream": {
+        const e = this.byId.get(u.id);
+        if (e && (e.kind === "assistant" || e.kind === "thinking")) {
+          this.byId.set(u.id, { ...e, text: e.text + u.text });
+          this.touched.add(u.id);
+        }
+        break;
+      }
+      case "reset":
+        // Only ever the start of a snapshot (after "open"); taken as one all the same.
+        this.begin(this.snap.info, false);
+        break;
+    }
+  }
+
+  private settle() {
+    const w = this.waiting;
+    this.waiting = null;
+    w?.resolve();
+  }
+
+  /** The events in timeline order: the same array while they are, and the same objects. */
+  private ordered(): HEvent[] {
+    const was = this.snap.events;
+    if (this.reorder || this.grew) {
+      const next = [...this.byId.values()].sort((a, b) => a.seq - b.seq);
+      this.reorder = false;
+      this.grew = false;
+      this.touched.clear();
+      const out = next.length === was.length && next.every((e, i) => e === was[i]) ? was : next;
+      this.pos = new Map(out.map((e, i) => [e.id, i]));
+      return out;
+    }
+    if (this.touched.size === 0) return was;
+    const next = was.slice();
+    for (const id of this.touched) {
+      const i = this.pos.get(id);
+      const e = this.byId.get(id);
+      if (i !== undefined && e) next[i] = e;
+    }
+    this.touched.clear();
+    return next;
   }
 
   private patch(p: Partial<Snapshot>) {
@@ -846,16 +1184,27 @@ export class SessionStore {
     if (this.raf) return;
     this.raf = requestAnimationFrame(() => {
       this.raf = 0;
-      if (!this.dirty) return;
-      this.dirty = false;
-      if (this.order === null) this.order = [...this.byId.values()].sort((a, b) => a.seq - b.seq);
-      this.snap = { ...this.snap, events: this.order, version: this.snap.version + 1 };
-      this.listeners.forEach((l) => l());
+      this.flush();
     });
+  }
+
+  private flush() {
+    if (!this.dirty) return;
+    this.dirty = false;
+    const events = this.ordered();
+    if (events !== this.snap.events) this.snap = { ...this.snap, events };
+    this.listeners.forEach((l) => l());
   }
 }
 
 const stores = new Map<string, SessionStore>();
+
+/** Drops the conversations left longest ago beyond the few kept. */
+function prune() {
+  const idle = [...stores.values()].filter((s) => s.idle()).sort((a, b) => b.idleSince - a.idleSince);
+  for (const s of idle.slice(KEEP)) stores.delete(s.id);
+}
+
 export function sessionStore(id: string): SessionStore {
   let s = stores.get(id);
   if (!s) {
@@ -865,11 +1214,31 @@ export function sessionStore(id: string): SessionStore {
   return s;
 }
 
-/** A live agent session: its snapshot, re-rendered at most once per frame. */
-export function useAgentSession(id: string): [Snapshot, SessionStore] {
-  const store = React.useMemo(() => sessionStore(id), [id]);
-  const snap = React.useSyncExternalStore(store.subscribe, store.get, store.get);
-  return [snap, store];
+// Back at once when the tab is shown again or the network returns, not at the next try.
+if (typeof window !== "undefined") {
+  const wake = () => stores.forEach((s) => s.wake());
+  window.addEventListener("online", wake);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) wake();
+  });
+}
+
+/**
+ * A part of an agent's live session; re-renders only when that part changes. `pick` returns a part
+ * as it is (`s => s.state`) or a plain value (`s => s.state?.status`), never a new object.
+ */
+export function useSession<T>(store: SessionStore, pick: (s: Snapshot) => T): T {
+  return React.useSyncExternalStore(
+    store.subscribe,
+    () => pick(store.get()),
+    () => pick(store.get()),
+  );
+}
+
+/** Waits (Suspense) until the session's first snapshot is in. */
+export function useSessionReady(store: SessionStore) {
+  const ready = useSession(store, (s) => s.ready);
+  if (!ready) React.use(store.ready());
 }
 
 /* ------------------------------------------------------------------ accounts */
