@@ -53,11 +53,58 @@ pub struct Host {
     file: Option<PathBuf>,
     dirty: AtomicBool,
     me: Weak<Host>,
+    /// Where files attached to messages are kept, one directory per session.
+    files_dir: PathBuf,
+    /// Files received (whole), by file id.
+    received: Mutex<HashMap<String, PathBuf>>,
 }
+
+/// Largest file a message can carry.
+pub const ATTACHMENT_MAX: u64 = 25 << 20;
 
 impl Host {
     pub fn new(sink: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
-        Arc::new_cyclic(|me| Self { sessions: Mutex::new(HashMap::new()), sink, limits, file, dirty: AtomicBool::new(false), me: me.clone() })
+        let files_dir = file.as_ref().and_then(|f| f.parent()).map_or_else(
+            || std::env::temp_dir().join(format!("kiln-attachments-{}", crate::os::uid())),
+            |d| d.join("attachments"),
+        );
+        Arc::new_cyclic(|me| Self {
+            sessions: Mutex::new(HashMap::new()),
+            sink,
+            limits,
+            file,
+            dirty: AtomicBool::new(false),
+            me: me.clone(),
+            files_dir,
+            received: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// A piece of a file attached to a message for `session` (blocking; small writes).
+    pub fn receive(&self, session: &str, file: &str, offset: u64, data: &[u8], done: bool) -> anyhow::Result<()> {
+        use std::io::{Seek as _, Write as _};
+        let safe = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && !s.is_empty() && s.len() <= 64;
+        if !safe(session) || !safe(file) {
+            anyhow::bail!("bad file or session id");
+        }
+        if offset.saturating_add(data.len() as u64) > ATTACHMENT_MAX {
+            anyhow::bail!("attachment too large");
+        }
+        let dir = self.files_dir.join(session).join("incoming");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(file);
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(offset == 0).open(&path)?;
+        f.seek(std::io::SeekFrom::Start(offset))?;
+        f.write_all(data)?;
+        if done {
+            self.received.lock().insert(file.to_owned(), path);
+        }
+        Ok(())
+    }
+
+    /// A received file, once (its id is spent).
+    fn take_file(&self, file: &str) -> Option<PathBuf> {
+        self.received.lock().remove(file)
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
@@ -108,7 +155,21 @@ impl Host {
                 h.mark_dirty();
             }
         });
-        let s = session::start(id.clone(), spec, self.sink.clone(), on_change)?;
+        let me = self.me.clone();
+        let me2 = self.me.clone();
+        let files = session::Files {
+            dir: self.files_dir.join(&id),
+            take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
+            // A branch: another session on this machine.
+            spawn: Arc::new(move |spec: Spec| {
+                if let Some(h) = me2.upgrade()
+                    && let Err(e) = h.open(None, spec)
+                {
+                    tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session");
+                }
+            }),
+        };
+        let s = session::start(id.clone(), spec, self.sink.clone(), on_change, files)?;
         self.sessions.lock().insert(id, Arc::clone(&s));
         self.mark_dirty();
         Ok(s)
@@ -123,6 +184,11 @@ impl Host {
         let found = s.is_some();
         if let Some(s) = s {
             s.close();
+            // Its attachments go with it.
+            let dir = self.files_dir.join(id);
+            crate::rt::spawn(async move {
+                let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
+            });
         }
         self.mark_dirty();
         found

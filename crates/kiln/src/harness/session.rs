@@ -45,6 +45,15 @@ pub struct Spec {
     /// Run this executable instead of the harness's usual one (a custom install, tests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<String>,
+    /// The effort / reasoning level to start with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// With `resume`: continue only up to this point of that session (a message or turn id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_at: Option<String>,
+    /// With `resume`: a new session that branches off it, leaving it as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fork: bool,
 }
 
 /// A pending approval, as lists show it.
@@ -167,6 +176,70 @@ impl Info {
 /// Where a session's updates go (the server's registry, or the uplink to it).
 pub type Sink = async_channel::Sender<(String, Update)>;
 
+/// What a session needs from the machine that holds it: where it keeps the files attached to
+/// its messages, how it collects ones that arrived separately (uploaded, or sent in pieces from
+/// the server), and how it starts another session (a branch).
+#[derive(Clone)]
+pub struct Files {
+    pub dir: std::path::PathBuf,
+    pub take: Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
+    pub spawn: Arc<dyn Fn(Spec) + Send + Sync>,
+}
+
+/// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
+/// images keep (or get) their bytes inline for harnesses that take them that way. Blocking.
+fn store_attachments(files: &Files, msg: &str, list: Vec<super::model::Attachment>) -> Vec<super::model::Attachment> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut out = Vec::new();
+    if std::fs::create_dir_all(&files.dir).is_err() {
+        return out;
+    }
+    let tag: String = msg.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
+    for (i, mut a) in list.into_iter().enumerate() {
+        let name: String = a.name.chars().map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' }).take(80).collect();
+        let name = if name.trim_matches('.').is_empty() { format!("file-{i}") } else { name };
+        let path = files.dir.join(format!("{tag}-{i}-{name}"));
+        let wrote = match a.file_id.as_deref().and_then(|f| (files.take)(f)) {
+            Some(src) => std::fs::rename(&src, &path).or_else(|_| std::fs::copy(&src, &path).map(|_| ())).is_ok(),
+            None => match b64.decode(a.data_base64.as_bytes()) {
+                Ok(bytes) if !bytes.is_empty() && bytes.len() as u64 <= super::host::ATTACHMENT_MAX => std::fs::write(&path, &bytes).is_ok(),
+                _ => false,
+            },
+        };
+        if !wrote {
+            tracing::warn!(attachment = %a.name, "could not store an attachment; it is left out");
+            continue;
+        }
+        if a.is_image() {
+            if a.data_base64.is_empty()
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                a.data_base64 = b64.encode(bytes);
+            }
+        } else {
+            a.data_base64.clear();
+        }
+        a.file_id = None;
+        a.path = Some(path.to_string_lossy().into_owned());
+        out.push(a);
+    }
+    out
+}
+
+/// A command as the adapter should see it (attachments stored first).
+async fn prepare(files: &Files, c: Command) -> Command {
+    match c {
+        Command::Send { id, text, mode, attachments, overrides } if !attachments.is_empty() => {
+            let files = files.clone();
+            let msg = id.clone();
+            let stored = crate::rt::blocking(move || store_attachments(&files, &msg, attachments)).await.unwrap_or_default();
+            Command::Send { id, text, mode, attachments: stored, overrides }
+        }
+        other => other,
+    }
+}
+
 enum Ctl {
     Cmd(Command),
     Close,
@@ -209,16 +282,26 @@ impl Session {
     /// What resuming this session takes: its spec with the harness's session id to continue.
     pub fn resume_spec(&self) -> Spec {
         let mut s = self.spec.lock().clone();
-        if let Some(h) = self.core.lock().state.harness_session.clone() {
+        let core = self.core.lock();
+        if let Some(h) = core.state.harness_session.clone() {
             s.resume = Some(h);
         }
+        // Where it is now, not where it started: its own session, settings as last chosen.
         s.prompt = None;
+        s.resume_at = None;
+        s.fork = false;
+        if !core.state.effort.is_empty() {
+            s.effort = Some(core.state.effort.clone());
+        }
+        if !core.state.mode.is_empty() {
+            s.mode = Some(core.state.mode.clone());
+        }
         s
     }
 }
 
 /// Start a session; its updates go to `sink`, tagged with its id.
-pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>) -> anyhow::Result<Arc<Session>> {
+pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) -> anyhow::Result<Arc<Session>> {
     let kind = Kind::get(&spec.kind).ok_or_else(|| anyhow::anyhow!("unknown harness {:?}", spec.kind))?;
     let now = crate::util::now_ms();
     let cwd = spec.cwd.clone().unwrap_or_else(|| crate::os::home_dir().to_string_lossy().into_owned());
@@ -272,7 +355,7 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
         let id = run.id.clone();
-        if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change)).catch_unwind().await {
+        if let Err(p) = std::panic::AssertUnwindSafe(drive(Arc::clone(&run), kind, ctl_rx, sink.clone(), on_change, files)).catch_unwind().await {
             tracing::error!(session = %id, panic = %crate::sup::panic_message(p.as_ref()), "agent session task panicked");
         }
     });
@@ -320,14 +403,14 @@ enum Ev {
 }
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
-async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>) {
+async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) {
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
     let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
     // A resumed Claude Code session starts from its transcript (its history), not empty.
     if kind.protocol == super::kinds::Protocol::ClaudeStreamJson {
-        let (resume, env) = {
+        let (resume, env, upto) = {
             let sp = s.spec.lock();
-            (sp.resume.clone(), sp.env.clone())
+            (sp.resume.clone(), sp.env.clone(), sp.resume_at.clone())
         };
         let empty = s.core.lock().events().next().is_none();
         if let Some(r) = resume.filter(|_| empty) {
@@ -335,7 +418,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             match crate::rt::blocking(move || super::transcript::history(&env, &r)).await {
                 Ok(Some(lines)) => {
                     let mut core = s.core.lock();
-                    super::transcript::load(&mut core, &lines);
+                    super::transcript::load_upto(&mut core, &lines, upto.as_deref());
                     tracing::info!(id = %s.id, %session, events = core.events().count(), "agent session history loaded from its transcript");
                 }
                 _ => tracing::info!(id = %s.id, %session, "no transcript found for the resumed agent session"),
@@ -350,8 +433,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut crashes: Vec<Instant> = Vec::new();
     // A message that arrived while the process was down, sent once it is back.
     let mut carry: Vec<Command> = Vec::new();
+    // A rewind: the harness starts again, continuing its session from this point.
+    let mut rewind_to: Option<Option<String>> = None;
     loop {
-        let spec = if first { s.spec.lock().clone() } else { s.resume_spec() };
+        let mut spec = if first { s.spec.lock().clone() } else { s.resume_spec() };
+        if let Some(at) = rewind_to.take() {
+            spec.resume_at = at;
+        }
         let mut adapter = kind.adapter(&spec);
         let started = Instant::now();
         let spawned = kind.launch(&spec).and_then(crate::proc::spawn_duplex);
@@ -368,7 +456,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     core.touch_state();
                     adapter.start(&mut core);
                     if first && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
-                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default() });
+                        adapter.command(&mut core, Command::Send { id: crate::util::new_id(), text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None });
                     }
                     for c in carry.drain(..) {
                         adapter.command(&mut core, c);
@@ -447,6 +535,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Ctl(Some(Ctl::Cmd(c))) => {
+                            let c = prepare(&files, c).await;
                             let mut core = s.core.lock();
                             adapter.command(&mut core, c);
                         }
@@ -485,6 +574,25 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     jobs = flush(&s, &sink, Some(&p.stdin)).await;
+                    let effects = std::mem::take(&mut s.core.lock().effects);
+                    for e in effects {
+                        match e {
+                            super::core::Effect::Branch { resume, resume_at } => {
+                                let mut b = s.resume_spec();
+                                b.resume = Some(resume);
+                                b.resume_at = resume_at;
+                                b.fork = true;
+                                b.name = Some(format!("{} (branch)", s.info().name));
+                                (files.spawn)(b);
+                            }
+                            super::core::Effect::Restart { resume_at } => rewind_to = Some(resume_at),
+                        }
+                    }
+                    if rewind_to.is_some() {
+                        p.terminate(Duration::from_secs(2));
+                        let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        break;
+                    }
                     let (session, queue) = {
                         let core = s.core.lock();
                         (core.state.harness_session.clone(), core.state.queue.len())
@@ -496,6 +604,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                 }
                 *s.pid.lock() = None;
+                if rewind_to.is_some() {
+                    first = false;
+                    continue;
+                }
                 let tail = String::from_utf8_lossy(&stderr_tail).trim().to_owned();
                 if !tail.is_empty() && code != Some(0) {
                     error = Some(super::model::clip_middle(&tail, 2000).0);
@@ -529,7 +641,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                 }
                 Ok(Ctl::Cmd(c @ Command::Send { .. })) => {
-                    carry.push(c);
+                    carry.push(prepare(&files, c).await);
                     break;
                 }
                 Ok(Ctl::Cmd(c)) => {

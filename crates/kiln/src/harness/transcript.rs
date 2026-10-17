@@ -54,7 +54,7 @@ fn tail_lines(path: &Path, bytes: u64) -> Option<Vec<String>> {
 
 /// The conversation's records, oldest first: the parent chain back from the newest message
 /// (across compactions), so records other processes interleaved are left out.
-fn branch(records: Vec<Value>, started: Option<i64>) -> Vec<Value> {
+fn branch(records: Vec<Value>, started: Option<i64>, upto: Option<&str>) -> Vec<Value> {
     let keep: HashSet<String> = {
         let msgs: Vec<&Value> = records.iter().filter(|r| r.get("uuid").and_then(Value::as_str).is_some()).collect();
         let by_id: HashMap<&str, &Value> = msgs.iter().filter_map(|r| Some((r.get("uuid")?.as_str()?, *r))).collect();
@@ -70,9 +70,10 @@ fn branch(records: Vec<Value>, started: Option<i64>) -> Vec<Value> {
             }
             first.into_iter().filter(|(_, ts)| *ts >= t - 5).min_by_key(|(_, ts)| *ts).map(|(l, _)| l)
         });
-        let head = match lane {
-            Some(l) => msgs.iter().rev().filter(is_msg).find(|r| r.get("session_id").and_then(Value::as_str) == Some(l)),
-            None => msgs.iter().rev().find(is_msg),
+        let head = match (upto, lane) {
+            (Some(u), _) => msgs.iter().find(|r| r.get("uuid").and_then(Value::as_str) == Some(u)),
+            (None, Some(l)) => msgs.iter().rev().filter(is_msg).find(|r| r.get("session_id").and_then(Value::as_str) == Some(l)),
+            (None, None) => msgs.iter().rev().find(is_msg),
         };
         let Some(last) = head else { return Vec::new() };
         let mut keep: HashSet<String> = HashSet::new();
@@ -135,16 +136,25 @@ pub fn load(core: &mut Core, lines: &[String]) {
     load_for(core, lines, None);
 }
 
+/// [`load`], only up to (and including) the entry `upto` (a branch taken from that point).
+pub fn load_upto(core: &mut Core, lines: &[String], upto: Option<&str>) {
+    load_with(core, lines, None, upto);
+}
+
 /// [`load`], for the conversation of the process started at `started` (unix seconds), when
 /// several processes write to one transcript.
 pub fn load_for(core: &mut Core, lines: &[String], started: Option<i64>) {
+    load_with(core, lines, started, None);
+}
+
+fn load_with(core: &mut Core, lines: &[String], started: Option<i64>, upto: Option<&str>) {
     let records: Vec<Value> = lines.iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
     // The title Claude Code gave the session, if any.
     if let Some(t) = records.iter().rev().find_map(|r| (r.get("type").and_then(Value::as_str) == Some("ai-title")).then(|| r.get("aiTitle").and_then(Value::as_str)).flatten()) {
         core.state.title = t.to_owned();
     }
     let mut adapter = Claude::new(false);
-    for r in branch(records, started) {
+    for r in branch(records, started, upto) {
         if let Some(v) = as_stream(&r) {
             adapter.line(core, &v.to_string());
         }

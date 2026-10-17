@@ -41,6 +41,9 @@ pub enum Body {
         /// "human", "system" (task notifications, reminders) ...
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// Names of the files attached to it (images are counted in `images` too).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
     },
     Assistant {
         text: String,
@@ -287,6 +290,16 @@ pub struct QueueItem {
     pub id: String,
     pub text: String,
     pub at: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<Overrides>,
+}
+
+/// What the timeline shows of a message's attachments: (images, file names).
+pub fn attachment_summary(list: &[Attachment]) -> (u32, Vec<String>) {
+    let images = u32::try_from(list.iter().filter(|a| a.is_image()).count()).unwrap_or(u32::MAX);
+    (images, list.iter().map(|a| a.name.clone()).collect())
 }
 
 /// How a message should reach a busy agent.
@@ -392,6 +405,99 @@ pub struct SlashCommand {
     pub hint: String,
 }
 
+/// A control the harness offers (a setting or an action), described so the UI can render it
+/// without knowing the harness. Live values are in [`State::control_values`]; changes and
+/// actions come back as [`Command::Control`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Control {
+    pub id: String,
+    /// Where it belongs: "Model", "Permissions", "Thinking", "Subagents", "Context", "MCP",
+    /// "Session", "Output", "Hooks".
+    pub group: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    pub kind: ControlKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ControlOption>,
+    /// The initial value (the live one is in `State::control_values`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    /// Ask before doing it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dangerous: bool,
+    /// Can also be set for a single message (`Command::Send::overrides`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub per_turn: bool,
+    /// Only while the session has this feature (see `Meta::features`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+    /// "session": a session setting or action. "turn": an action on one prompt (rewind to it,
+    /// branch from it): sent with `value: {"event": <the prompt's event id>}`.
+    #[serde(default)]
+    pub scope: ControlScope,
+    /// An action that takes text (compact instructions, ...): its placeholder. Absent: no text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlKind {
+    Select,
+    Toggle,
+    Action,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlScope {
+    #[default]
+    Session,
+    Turn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dangerous: bool,
+}
+
+/// A file sent with a message: inline (`data_base64`), or uploaded first
+/// (`POST /api/harness/files`, then `file_id`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    /// Where it was written on the agent's machine (set there; never taken from a client).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl Attachment {
+    pub fn is_image(&self) -> bool {
+        matches!(self.mime.as_str(), "image/png" | "image/jpeg" | "image/gif" | "image/webp")
+    }
+}
+
+/// Settings for one message only, where the harness can.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Overrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
 /// Everything about a session that is not the timeline. Small; sent whole on change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct State {
@@ -447,6 +553,12 @@ pub struct State {
     /// Events dropped from the front of the timeline to bound memory.
     #[serde(default)]
     pub dropped: u64,
+    /// The effort / reasoning level in use, where the harness has one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
+    /// The live value of each control (`Meta::controls`), by id.
+    #[serde(default)]
+    pub control_values: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -470,9 +582,30 @@ pub struct Meta {
     #[serde(default)]
     pub agents: Vec<String>,
     /// Features this adapter drives for this harness: "steer", "send_now", "queue_cancel",
-    /// "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume".
+    /// "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions",
+    /// "resume", "attachments", "images", "overrides".
     #[serde(default)]
     pub features: Vec<String>,
+    /// Effort / reasoning levels the harness offers (empty: none).
+    #[serde(default)]
+    pub efforts: Vec<ControlOption>,
+    /// Every other control the harness offers.
+    #[serde(default)]
+    pub controls: Vec<Control>,
+    /// The hooks configured for the harness, read-only.
+    #[serde(default)]
+    pub hooks: Vec<HookInfo>,
+}
+
+/// A hook the harness runs on an event (read-only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HookInfo {
+    pub event: String,
+    #[serde(default)]
+    pub matcher: String,
+    pub command: String,
+    #[serde(default)]
+    pub source: String,
 }
 
 /// A command from a person (any device) to a session.
@@ -485,6 +618,10 @@ pub enum Command {
         text: String,
         #[serde(default)]
         mode: SendMode,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overrides: Option<Overrides>,
     },
     QueueEdit {
         id: String,
@@ -521,6 +658,15 @@ pub enum Command {
     },
     SetModel {
         model: String,
+    },
+    SetEffort {
+        effort: String,
+    },
+    /// Set a control's value, or run an action (its argument, if any, in `value`).
+    Control {
+        id: String,
+        #[serde(default)]
+        value: Option<serde_json::Value>,
     },
     StopTask {
         task: String,
@@ -605,7 +751,11 @@ mod tests {
         let back: Event = serde_json::from_value(v)?;
         assert_eq!(back, e);
         let c: Command = serde_json::from_str(r#"{"type":"send","id":"m1","text":"go","mode":"steer"}"#)?;
-        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer });
+        assert_eq!(c, Command::Send { id: "m1".into(), text: "go".into(), mode: SendMode::Steer, attachments: vec![], overrides: None });
+        let c: Command = serde_json::from_str(r#"{"type":"control","id":"compact","value":"keep the API notes"}"#)?;
+        assert_eq!(c, Command::Control { id: "compact".into(), value: Some(serde_json::json!("keep the API notes")) });
+        let c: Command = serde_json::from_str(r#"{"type":"send","id":"m2","text":"see","attachments":[{"name":"a.png","mime":"image/png","data_base64":"iVBO"}],"overrides":{"effort":"high"}}"#)?;
+        assert!(matches!(c, Command::Send { ref attachments, ref overrides, .. } if attachments.len() == 1 && attachments.first().is_some_and(Attachment::is_image) && overrides.as_ref().and_then(|o| o.effort.as_deref()) == Some("high")));
         let c: Command = serde_json::from_str(r#"{"type":"interrupt"}"#)?;
         assert_eq!(c, Command::Interrupt);
         Ok(())

@@ -140,7 +140,7 @@ pub fn handle(host: &Host, req: Request) -> Value {
         Request::Send { id, text, mode } => {
             let ids = pick(&Some(id), &None);
             let Some(target) = ids.first() else { return json!({"ok": false, "error": "no such agent"}) };
-            let ok = host.command(target, Command::Send { id: crate::util::new_id(), text, mode });
+            let ok = host.command(target, Command::Send { id: crate::util::new_id(), text, mode, attachments: Vec::new(), overrides: None });
             json!({"ok": ok})
         }
     }
