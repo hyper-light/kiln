@@ -571,8 +571,9 @@ impl Dispatch {
                 // The code host: kiln's mirror, which the leg's token reads (W14), at the
                 // server's root (`actions/checkout` keeps only the origin).
                 facade_url: "/".into(),
-                api_url: "/_kiln/api".into(),
-                graphql_url: "/_kiln/api/graphql".into(),
+                // GitHub's API as GHES serves it (W14-R11).
+                api_url: "/api/v3".into(),
+                graphql_url: "/api/graphql".into(),
                 github_token: token,
                 cache_mode: Some(cache_mode.as_str().into()),
             },
