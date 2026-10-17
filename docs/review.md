@@ -1,5 +1,8 @@
 # Stacked diffs, review and landing
 
+> **Superseded by [ci.md](ci.md), W14** (2026-10-17), which adapts this draft: change requests beside
+> stacked diffs, merge strategies chosen at land time, the GitHub facade and App. Kept for history.
+
 > **Draft spec.** None of this is built yet. It describes how kiln hosts code, reviews it as
 > stacks of small diffs, tests every version, and lands it, with all policy kept in git.
 

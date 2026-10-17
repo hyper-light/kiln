@@ -110,5 +110,5 @@ the `kiln-external` service (UDP 7071 + TCP 7070).
 | `crates/kiln` | The binary: `server`, `agent`, `supervise`, `install`, `join`, `login`, `validate`, … |
 | `ui/` | React + Tailwind dashboard in the hyperlight-site design language, embedded at build time |
 | `deploy/` | Dockerfile support, Helm chart, ArgoCD apps, Grafana dashboards, alert rules, cluster scripts |
-| `docs/` | [architecture](docs/architecture.md), [API](docs/api.md), [pipelines](docs/pipelines.md) |
+| `docs/` | [architecture](docs/architecture.md), [API](docs/api.md), [pipelines](docs/pipelines.md), [CI spec](docs/ci.md) (GitHub Actions compatible CI, in progress) |
 | `.kiln/ci.yaml` | kiln's own pipeline |

@@ -1,5 +1,8 @@
 # Writing pipelines
 
+> **Superseded for CI by [ci.md](ci.md)** (2026-10-17), which specifies GitHub Actions compatible CI and
+> kiln's dialect as its superset; this file still describes v1 `.kiln/*.yaml` files, which keep working.
+
 > **Draft: pipelines v2.** Everything marked ✦ is specified here but not built yet. Every v1
 > file stays valid: v2 only adds keys, and v1 conditions keep their meaning.
 

@@ -1,5 +1,8 @@
 # Access: people, agents, tokens and the API
 
+> **Superseded for CI by [ci.md](ci.md), W10** (2026-10-17), which adapts this draft and adds the OIDC
+> issuer. Kept for history.
+
 > **Draft spec.** None of this is built yet. Today kiln has one admin token (the root
 > credential), password sign-in that yields UI sessions, one-time sign-in links, and per-job tokens.
 > All of that keeps working; everything here is added alongside it.
