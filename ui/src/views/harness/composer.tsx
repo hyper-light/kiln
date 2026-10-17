@@ -82,7 +82,22 @@ function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: str
   );
 }
 
-export function Composer({ store, state, meta, disabled, attachments }: { store: SessionStore; state: State | null; meta: Meta | null; disabled?: boolean; attachments: Attachments }) {
+export function Composer({
+  store,
+  state,
+  meta,
+  disabled,
+  attachments,
+  toMain,
+}: {
+  store: SessionStore;
+  state: State | null;
+  meta: Meta | null;
+  disabled?: boolean;
+  attachments: Attachments;
+  /** Shown over a subagent's thread: what's typed here goes to the main agent. */
+  toMain?: boolean;
+}) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
@@ -257,13 +272,15 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
           placeholder={
             disabled
               ? "Not connected"
-              : running
-                ? mode === "steer"
-                  ? "Steer it — it reads this at its next step"
-                  : mode === "now"
-                    ? "Stop and say…"
-                    : "Queue a message for when it finishes"
-                : "Tell the agent what to do"
+              : toMain
+                ? "Message the main agent"
+                : running
+                  ? mode === "steer"
+                    ? "Steer it — it reads this at its next step"
+                    : mode === "now"
+                      ? "Stop and say…"
+                      : "Queue a message for when it finishes"
+                  : "Tell the agent what to do"
           }
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
@@ -356,7 +373,14 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
               </button>
             </Tip>
           )}
-          <button type="button" className="cp-send" data-mode={running ? mode : "send"} onClick={submit} disabled={(!text.trim() && files.length === 0) || disabled || pending > 0} aria-label={sendLabel}>
+          <button
+            type="button"
+            className="cp-send"
+            data-mode={running ? mode : "send"}
+            onClick={submit}
+            disabled={(!text.trim() && files.length === 0) || disabled || pending > 0}
+            aria-label={sendLabel}
+          >
             {running && mode === "queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}
             <span className="cp-label">{sendLabel}</span>
           </button>
