@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -48,6 +48,9 @@ pub struct Opts {
     /// A runner process beside the machine's usual one (`kiln install --agent --upgrade`): its
     /// own certificate and files under `<state>/instances/<id>` (see `crate::upgrade`).
     pub instance: Option<String>,
+    /// Reach (`crate::reach`): None leaves it off (the server's own in-process agent); otherwise
+    /// whether this runner takes commands from other runners (it can always send them).
+    pub reach: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -273,6 +276,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         sync
     });
+    // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
+    let reach = o.reach.filter(|_| !o.ephemeral).and_then(|accept| match crate::reach::node::start(crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)) {
+        Ok((handle, said)) => {
+            let up = up_tx.clone();
+            crate::rt::spawn(async move {
+                while let Ok(m) = said.recv().await {
+                    if up.send(Up::Reach(m)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            match crate::reach::local::serve(handle.clone(), name.clone(), crate::reach::local::path(&name, &own_dir)) {
+                Ok(p) => crate::reach::local::set_socket(p.to_string_lossy().into_owned()),
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine"),
+            }
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "reach is off on this runner");
+            None
+        }
+    });
     let uplink = Uplink(up_tx);
     let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
@@ -433,6 +458,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if let Some(s) = &sync {
                         s.connected(false);
                     }
+                    if let Some(r) = &reach {
+                        r.feed(crate::reach::node::In::Server(false)).await;
+                    }
                     dialing_since = None;
                     redial = Some(Instant::now());
                 }
@@ -462,6 +490,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // The kiln it runs, so the server knows its commit (`crate::fleet`).
                 if !o.ephemeral
                     && let Ok(b) = proto::encode(&crate::updates::runner_facts())
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
+                // Its reach identity, after Hello (an older server skips it).
+                if let Some(r) = &reach
+                    && let Ok(b) = proto::encode(&r.hello())
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
@@ -496,6 +530,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 connected = false;
                 if let Some(s) = &sync {
                     s.connected(false);
+                }
+                if let Some(r) = &reach {
+                    r.feed(crate::reach::node::In::Server(false)).await;
                 }
                 dialing_since = None;
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
@@ -544,6 +581,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
+                        // The server knows this runner now: reach may relay (its links resume).
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Server(true)).await;
+                        }
                     }
                     ServerMsg::Refused { reason } => {
                         tracing::error!(%reason, "server refused this agent");
@@ -553,6 +594,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         connected = false;
                         if let Some(s) = &sync {
                             s.connected(false);
+                        }
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Server(false)).await;
                         }
                         net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                         redial = Some(Instant::now() + Duration::from_secs(60));
@@ -646,6 +690,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         // `kiln spawn` in this terminal reaches this agent's sessions.
                         let mut env = vec![("KILN_TERM_SESSION", session.clone())];
+                        if let Some(sock) = crate::reach::local::socket() {
+                            env.push(("KILN_REACH_SOCK", sock.to_owned()));
+                        }
                         if let Some(sock) = &harness_sock {
                             env.push(("KILN_HARNESS_SOCK", sock.clone()));
                         }
@@ -801,7 +848,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
-                    ServerMsg::Reach { .. } | ServerMsg::ReachAnswer { .. } => {}
+                    ServerMsg::Reach { from, link, open, data, close } => {
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Frame { from, link, open, data, close }).await;
+                        }
+                    }
+                    ServerMsg::ReachAnswer { req, json } => {
+                        if let Some(r) = &reach {
+                            r.feed(crate::reach::node::In::Answer { req, json }).await;
+                        }
+                    }
                     ServerMsg::Sync { json, raft } => {
                         if let Some(s) = &sync {
                             s.heard(&json, raft);
@@ -911,11 +967,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Log(c) => (LANE_LOGS, Kind::Log, proto::encode(c)),
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
+                    Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term && lane != LANE_SYNC {
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.

@@ -72,6 +72,17 @@ pub enum Ev {
     Forgot(bool),
 }
 
+static SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// This runner's reach socket, once it serves one: agents it starts get it as `KILN_REACH_SOCK`.
+pub fn set_socket(path: String) {
+    let _ = SOCKET.set(path);
+}
+
+pub fn socket() -> Option<&'static str> {
+    SOCKET.get().map(String::as_str)
+}
+
 /// Where this process's reach socket lives: beside the harness socket, named alike.
 pub fn path(name: &str, home: &Path) -> PathBuf {
     let h = crate::harness::socket::path(name, home);

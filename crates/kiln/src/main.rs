@@ -99,6 +99,13 @@ enum Cmd {
     Spawn(kiln::harness::cli::SpawnArgs),
     /// List, stop, interrupt or message this kiln shell's agents.
     Agents(kiln::harness::cli::AgentsArgs),
+    /// Run a command on another runner (`--on linux/amd64`, `--on <name>`): this repo is synced over
+    /// first, output streams back, and the exit code is the command's.
+    Run(kiln::reach::cli::RunArgs),
+    /// The runners commands can run on, best first for what you need (`kiln runners linux`).
+    Runners(kiln::reach::cli::RunnersArgs),
+    /// Reach between runners: this runner's identity and pinned keys.
+    Reach(kiln::reach::cli::ReachArgs),
     /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
     Cd(kiln::cd::cli::CdArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
@@ -168,6 +175,9 @@ struct AgentArgs {
     job: Option<String>,
     #[arg(long)]
     no_terminal: bool,
+    /// Take no commands from other runners (reach); this runner can still send them.
+    #[arg(long, env = "KILN_NO_REACH")]
+    no_reach: bool,
     #[arg(long, env = "KILN_SHELL")]
     shell: Option<String>,
 }
@@ -247,6 +257,8 @@ fn main() -> ExitCode {
     });
     match kiln::rt::block_on(real_main(cli)) {
         Ok(()) => ExitCode::SUCCESS,
+        // `kiln run`: the command's own exit status, nothing more to say.
+        Err(ref e) if let Some(kiln::reach::cli::ExitWith(code)) = e.downcast_ref::<kiln::reach::cli::ExitWith>() => ExitCode::from(*code),
         Err(e) => {
             tracing::error!("{e:#}");
             ExitCode::FAILURE
@@ -330,6 +342,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 shell: a.shell,
                 credentials: None,
                 instance: a.instance,
+                // Commands from other runners are a terminal's worth of access: not without one.
+                reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
             };
             let result = run_agent(opts, shutdown).await;
             if let Some(ann) = announcer {
@@ -492,6 +506,12 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Spawn(a) => kiln::harness::cli::spawn(a),
         Cmd::Agents(a) => kiln::harness::cli::agents(a),
+        Cmd::Run(a) => {
+            shutdown_on_signals(shutdown.clone());
+            kiln::reach::cli::run(a, shutdown).await
+        }
+        Cmd::Runners(a) => kiln::reach::cli::runners(a),
+        Cmd::Reach(a) => kiln::reach::cli::reach(a),
         Cmd::Cd(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             kiln::cd::cli::run(a, &cfg).await

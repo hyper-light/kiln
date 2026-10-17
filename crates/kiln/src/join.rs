@@ -999,6 +999,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             shell: None,
             credentials: None,
             instance: None,
+            reach: Some(true),
         }));
     }
     crate::install::install(crate::install::InstallArgs {

@@ -148,6 +148,8 @@ pub struct Hub {
     pub tailnet: crate::frontdoor::tailnet::TailnetDns,
     /// Repo sync: every synced repo's group, led from here (`crate::sync`).
     pub sync: crate::sync::server::Sync,
+    /// Reach: the links between runners this server relays, and their identities (`crate::reach`).
+    pub reach: Mutex<crate::reach::relay::Relay>,
 }
 
 impl Hub {
@@ -206,6 +208,7 @@ impl Hub {
             front_doors: crate::frontdoor::control::FrontDoors::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
+            reach: Mutex::new(crate::reach::relay::Relay::default()),
         })
     }
 
@@ -516,12 +519,53 @@ impl Hub {
             self.net.command(crate::net::Out::Disconnect { peer: p }).await;
         }
         self.net.command(crate::net::Out::Revoke { name: agent.to_owned() }).await;
+        self.reach.lock().forget(agent);
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
         self.tailnet.wake.notify();
         self.update_slot_gauges();
         Ok(())
+    }
+
+    // ------------------------------------------------------------ reach
+
+    /// Reach's directory (`crate::reach::directory`): every runner that is not a job pod — what it
+    /// is, how busy it is, its harnesses, its reach identity and whether it takes links.
+    pub fn reach_directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
+        let kinds = self.harness.kinds();
+        let relay = self.reach.lock();
+        let agents = self.agents.lock();
+        let mut out: Vec<crate::reach::directory::RunnerInfo> = agents
+            .values()
+            .filter(|a| !a.ephemeral)
+            .map(|a| {
+                let ann = relay.announced(&a.name);
+                let s = a.sample.as_ref();
+                crate::reach::directory::RunnerInfo {
+                    name: a.name.clone(),
+                    hostname: a.hostname.clone(),
+                    os: a.os.clone(),
+                    arch: a.arch.clone(),
+                    labels: a.labels.clone(),
+                    connected: a.connected,
+                    reach: a.connected && ann.is_some_and(|x| x.accept),
+                    fingerprint: ann.map(|x| x.fingerprint.clone()),
+                    cpus: s.map_or(0, |s| s.cpus),
+                    cpu_pct: s.map_or(0.0, |s| s.cpu_pct),
+                    load1: s.map_or(0.0, |s| s.load1),
+                    mem_total: s.map_or(0, |s| s.mem_total),
+                    mem_used: s.map_or(0, |s| s.mem_used),
+                    slots: a.slots,
+                    busy: a.busy,
+                    draining: a.draining,
+                    harnesses: kinds.get(&format!("agent:{}", a.name)).map(|ks| ks.iter().filter(|k| k.available).map(|k| k.id.clone()).collect()).unwrap_or_default(),
+                    via: a.transport.map(|t| t.to_string()).unwrap_or_default(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     // ------------------------------------------------------------ network
@@ -546,6 +590,13 @@ impl Hub {
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
                 self.tunnels.closed(peer);
+                // Its reach links end; the runners at their other ends hear so (and resume later).
+                let closes = self.reach.lock().lost(peer, "disconnected from the kiln server");
+                for (p, m) in closes {
+                    if let Ok(b) = proto::encode(&m) {
+                        self.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
+                    }
+                }
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
                 let lost = self.instances.lock().lost(peer);
@@ -799,7 +850,42 @@ impl Hub {
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable runner facts"),
             },
-            AgentMsg::Reach { .. } | AgentMsg::ReachHello { .. } | AgentMsg::ReachAsk { .. } => {}
+            AgentMsg::ReachHello { json } => {
+                let pod = self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral);
+                match serde_json::from_str::<crate::reach::relay::Announce>(&json) {
+                    Ok(a) if !pod => self.reach.lock().announce(&agent, a),
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable reach announcement"),
+                }
+            }
+            AgentMsg::Reach { to, link, open, data, close } => {
+                // Job pods neither send nor receive reach links.
+                if self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral) {
+                    return Ok(());
+                }
+                let out = {
+                    let (agents, instances) = (&self.agents, &self.instances);
+                    self.reach.lock().forward(&agent, peer, crate::reach::relay::Frame { to, link, open, data, close }, |n| {
+                        if agents.lock().get(n).is_none_or(|a| a.ephemeral || !a.connected) {
+                            return None;
+                        }
+                        instances.lock().newest_with(n, proto::CAP_REACH)
+                    })
+                };
+                for (p, m) in out {
+                    if let Ok(b) = proto::encode(&m) {
+                        self.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
+                    }
+                }
+            }
+            AgentMsg::ReachAsk { req, json } => {
+                let op = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v.get("op").and_then(serde_json::Value::as_str).map(str::to_owned));
+                let answer = match op.as_deref() {
+                    Some("directory") => serde_json::json!({ "runners": self.reach_directory() }),
+                    _ => serde_json::json!({ "error": "unknown reach question" }),
+                };
+                self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+            }
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {

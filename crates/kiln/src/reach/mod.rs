@@ -2,6 +2,7 @@
 //! runner — a Linux build from a Mac, a test on the machine with the GPU — over an end-to-end
 //! encrypted link the server only relays.
 
+pub mod cli;
 pub mod directory;
 pub mod e2e;
 pub mod local;

@@ -149,8 +149,12 @@ impl Kind {
 /// The session's environment over the machine's: what its shell had (minus the shell's own
 /// terminal plumbing), without what a Claude Code session sets for its children.
 fn set_env(p: &mut Process, spec: &Spec) {
+    // `kiln run` in the agent's shell reaches other runners through this machine's runner.
+    if let Some(sock) = crate::reach::local::socket() {
+        p.env("KILN_REACH_SOCK", sock);
+    }
     for (k, v) in &spec.env {
-        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "TERM" | "COLUMNS" | "LINES") {
+        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "KILN_REACH_SOCK" | "TERM" | "COLUMNS" | "LINES") {
             p.env(k, v);
         }
     }

@@ -234,6 +234,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             shell: cfg.terminal.shell.clone(),
             credentials: Some(creds),
             instance: None,
+            reach: None,
         };
         sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), shutdown_child()));
     }
