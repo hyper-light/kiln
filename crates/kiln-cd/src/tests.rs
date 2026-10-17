@@ -1,0 +1,285 @@
+//! The engine end to end, against simulated clusters: syncs, waves, hooks, prunes, self-heal,
+//! retries, shared renders and request budgets, each watched happening.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use rustc_hash::FxHashMap;
+use serde_json::{Value, json};
+
+use crate::engine::{Config, Engine, Input, OpPhase, Record, SyncRequest};
+use crate::harness::Harness;
+use crate::model::{AppConfig, Health, Retry, Sync, SyncPolicy};
+use crate::obj::{self, ResKey};
+use crate::sim;
+
+type Git = Rc<RefCell<FxHashMap<String, Vec<Value>>>>;
+
+fn deployment(name: &str, image: &str, annotations: Value) -> Value {
+    json!({"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": name, "annotations": annotations},
+        "spec": {"replicas": 2, "selector": {"matchLabels": {"app": name}}, "template": {"metadata": {"labels": {"app": name}},
+            "spec": {"containers": [{"name": "app", "image": image, "ports": [{"containerPort": 8080}]}]}}}})
+}
+
+fn config_map(name: &str, data: &str, annotations: Value) -> Value {
+    json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "annotations": annotations}, "data": {"v": data}})
+}
+
+fn service(name: &str) -> Value {
+    json!({"apiVersion": "v1", "kind": "Service", "metadata": {"name": name}, "spec": {"selector": {"app": name}, "ports": [{"port": 80}]}})
+}
+
+fn job(name: &str, hook: &str) -> Value {
+    json!({"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": name, "annotations": {"argocd.argoproj.io/hook": hook}},
+        "spec": {"template": {"spec": {"restartPolicy": "Never", "containers": [{"name": "j", "image": "busybox"}]}}}})
+}
+
+/// A harness whose renders read "git": revision → objects.
+fn harness(cfg: Config) -> (Harness, Git) {
+    let git: Git = Rc::new(RefCell::new(FxHashMap::default()));
+    let g = git.clone();
+    let renderer = Box::new(move |_app: &str, rev: &str, _key: u64| {
+        g.borrow().get(rev).cloned().ok_or_else(|| format!("no revision {rev}"))
+    });
+    let mut h = Harness::new(Engine::new(cfg), renderer);
+    h.add_cluster(sim::Cluster::new("dev"), None);
+    (h, git)
+}
+
+fn fast() -> Config {
+    Config { wave_delay_ms: 0, ..Config::default() }
+}
+
+fn auto(id: &str) -> AppConfig {
+    let mut a = AppConfig::new(id, "dev", "web");
+    a.sync = SyncPolicy { auto: true, prune: true, self_heal: true, ..SyncPolicy::default() };
+    a
+}
+
+fn deploy(h: &mut Harness, git: &Git, app: &str, rev: &str, objects: Vec<Value>) {
+    git.borrow_mut().insert(rev.to_owned(), objects);
+    let key = obj::hash_bytes(rev.as_bytes());
+    h.input(Input::Inputs { app: app.into(), revision: rev.into(), key });
+}
+
+fn status<'a>(h: &'a Harness, app: &str) -> Option<&'a crate::engine::Summary> {
+    h.statuses.get(app)
+}
+
+fn settled(h: &Harness, app: &str) -> bool {
+    status(h, app).is_some_and(|s| {
+        s.sync == Sync::Synced && s.health == Health::Healthy && s.operation.as_ref().is_some_and(|o| o.phase == OpPhase::Succeeded)
+    })
+}
+
+#[test]
+fn an_automatic_app_deploys_and_turns_healthy() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({})), deployment("web", "web:1", json!({})), service("web")]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let finished: Vec<bool> = h.records.iter().filter_map(|r| match r { Record::Finished { succeeded, .. } => Some(*succeeded), _ => None }).collect();
+    assert_eq!(finished, [true]);
+    // The API server's defaults (imagePullPolicy, protocols, clusterIP) are not drift.
+    assert_eq!(status(&h, "web").map(|s| (s.resources, s.out_of_sync)), Some((3, 0)));
+    let dep = ResKey::new("apps", "Deployment", "web", "web");
+    let live = h.clusters.get("dev").and_then(|c| c.get(&dep)).cloned().unwrap_or_default();
+    assert_eq!(obj::label(&live, crate::engine::APP_LABEL), Some(crate::engine::app_label("web").as_str()));
+}
+
+#[test]
+fn drift_is_healed_only_with_self_heal() {
+    for heal in [true, false] {
+        let (mut h, git) = harness(fast());
+        let mut a = auto("web");
+        a.sync.self_heal = heal;
+        h.input(Input::UpsertApp(a));
+        deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+        assert!(h.run_until(60_000, |h| settled(h, "web")));
+        let key = ResKey::new("apps", "Deployment", "web", "web");
+        h.edit("dev", &key, |v| {
+            if let Some(c) = v.pointer_mut("/spec/template/spec/containers/0").and_then(Value::as_object_mut) {
+                c.insert("image".into(), json!("evil:1"));
+            }
+        });
+        h.run_for(60_000);
+        let heals = h.records.iter().filter(|r| matches!(r, Record::Started { trigger: crate::engine::Trigger::SelfHeal, .. })).count();
+        assert_eq!(heals, usize::from(heal));
+        let live_image = h
+            .clusters
+            .get("dev")
+            .and_then(|c| c.get(&key))
+            .and_then(|v| v.pointer("/spec/template/spec/containers/0/image").and_then(Value::as_str).map(str::to_owned));
+        if heal {
+            assert_eq!(live_image.as_deref(), Some("web:1"));
+            assert_eq!(status(&h, "web").map(|s| s.sync), Some(Sync::Synced));
+        } else {
+            assert_eq!(live_image.as_deref(), Some("evil:1"));
+            assert_eq!(status(&h, "web").map(|s| s.sync), Some(Sync::OutOfSync));
+        }
+    }
+}
+
+#[test]
+fn a_wave_starts_only_when_the_one_before_is_healthy() {
+    let (mut h, git) = harness(fast());
+    if let Some(c) = h.clusters.get_mut("dev") {
+        c.rollout_ms = 10_000;
+    }
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![
+        deployment("db", "db:1", json!({"argocd.argoproj.io/sync-wave": "0"})),
+        config_map("after-db", "1", json!({"argocd.argoproj.io/sync-wave": "1"})),
+    ]);
+    let cm = ResKey::new("", "ConfigMap", "web", "after-db");
+    h.run_for(5_000);
+    assert!(h.clusters.get("dev").and_then(|c| c.get(&cm)).is_none(), "wave 1 ran before wave 0 was healthy");
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    assert!(h.clusters.get("dev").and_then(|c| c.get(&cm)).is_some());
+}
+
+#[test]
+fn a_failing_pre_sync_hook_fails_the_sync_and_runs_sync_fail_hooks() {
+    let (mut h, git) = harness(fast());
+    if let Some(c) = h.clusters.get_mut("dev") {
+        c.failing_jobs.insert("migrate".into());
+    }
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![job("migrate", "PreSync"), job("page-someone", "SyncFail"), deployment("web", "web:1", json!({}))]);
+    let failed = |h: &Harness| h.records.iter().any(|r| matches!(r, Record::Finished { succeeded: false, .. }));
+    assert!(h.run_until(60_000, failed));
+    let dep = ResKey::new("apps", "Deployment", "web", "web");
+    let page = ResKey::new("batch", "Job", "web", "page-someone");
+    let c = h.clusters.get("dev");
+    assert!(c.and_then(|c| c.get(&dep)).is_none(), "the Deployment was applied after its PreSync hook failed");
+    assert!(c.and_then(|c| c.get(&page)).is_some(), "the SyncFail hook didn't run");
+    assert_eq!(status(&h, "web").and_then(|s| s.operation.as_ref().map(|o| o.phase)), Some(OpPhase::Failed));
+}
+
+#[test]
+fn hooks_run_in_their_phase_and_succeed() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![job("migrate", "PreSync"), deployment("web", "web:1", json!({})), job("smoke", "PostSync")]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let c = h.clusters.get("dev");
+    assert!(c.and_then(|c| c.get(&ResKey::new("batch", "Job", "web", "smoke"))).is_some());
+    // Hooks don't count as the app's resources.
+    assert_eq!(status(&h, "web").map(|s| s.resources), Some(1));
+}
+
+#[test]
+fn objects_git_drops_are_pruned() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("a", "1", json!({})), config_map("b", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    deploy(&mut h, &git, "web", "r2", vec![config_map("a", "1", json!({}))]);
+    let b = ResKey::new("", "ConfigMap", "web", "b");
+    assert!(h.run_until(60_000, |h| h.clusters.get("dev").and_then(|c| c.get(&b)).is_none() && settled(h, "web")));
+    assert_eq!(status(&h, "web").map(|s| s.resources), Some(1));
+}
+
+#[test]
+fn a_failed_automatic_sync_is_not_repeated_until_git_moves() {
+    let (mut h, git) = harness(fast());
+    if let Some(c) = h.clusters.get_mut("dev") {
+        c.fail_names.insert("web".into());
+    }
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    h.run_for(120_000);
+    let attempts = |h: &Harness| h.records.iter().filter(|r| matches!(r, Record::Started { .. })).count();
+    assert_eq!(attempts(&h), 1);
+    if let Some(c) = h.clusters.get_mut("dev") {
+        c.fail_names.clear();
+    }
+    deploy(&mut h, &git, "web", "r2", vec![deployment("web", "web:2", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    assert_eq!(attempts(&h), 2);
+}
+
+#[test]
+fn failed_syncs_retry_with_backoff_up_to_the_limit() {
+    let (mut h, git) = harness(fast());
+    if let Some(c) = h.clusters.get_mut("dev") {
+        c.fail_names.insert("web".into());
+    }
+    let mut a = auto("web");
+    a.sync.retry = Some(Retry { limit: 2, backoff_ms: 1_000, factor: 2, max_ms: 60_000 });
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    h.run_for(1_500);
+    let starts = |h: &Harness| h.records.iter().filter(|r| matches!(r, Record::Started { .. })).count();
+    assert_eq!(starts(&h), 2, "the first retry comes after 1 s");
+    h.run_for(60_000);
+    assert_eq!(starts(&h), 3, "two retries, then it stops");
+    assert_eq!(h.records.iter().filter(|r| matches!(r, Record::Finished { succeeded: false, .. })).count(), 1);
+}
+
+#[test]
+fn apps_with_the_same_inputs_share_one_render() {
+    let renders = Rc::new(RefCell::new(0u32));
+    let r = renders.clone();
+    let renderer = Box::new(move |_app: &str, _rev: &str, _key: u64| {
+        *r.borrow_mut() += 1;
+        Ok(vec![config_map("shared", "1", json!({}))])
+    });
+    let mut h = Harness::new(Engine::new(fast()), renderer);
+    for c in ["a", "b", "c"] {
+        h.add_cluster(sim::Cluster::new(c), None);
+        let mut app = AppConfig::new(&format!("web-{c}"), c, "web");
+        app.sync.auto = true;
+        h.input(Input::UpsertApp(app));
+        h.input(Input::Inputs { app: format!("web-{c}").into(), revision: "r1".into(), key: 7 });
+    }
+    assert!(h.run_until(60_000, Harness::all_settled));
+    assert_eq!(*renders.borrow(), 1);
+}
+
+#[test]
+fn status_only_events_cost_no_comparison() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    let before = h.engine.stats();
+    let key = ResKey::new("apps", "Deployment", "web", "web");
+    for i in 0..100 {
+        h.touch("dev", &key, |s| {
+            s.insert("readyReplicas".into(), json!(2));
+            s.insert("probe".into(), json!(i));
+        });
+        h.run_for(10);
+    }
+    let after = h.engine.stats();
+    assert_eq!(after.comparisons, before.comparisons);
+    assert_eq!(after.live_unchanged - before.live_unchanged, 100);
+}
+
+#[test]
+fn a_cluster_budget_paces_requests() {
+    let (mut h, git) = harness(Config { dry_run_first: false, ..fast() });
+    h.input(Input::UpsertCluster { name: "dev".into(), qps: Some(10.0), inflight: None });
+    h.input(Input::UpsertApp(auto("web")));
+    let objects: Vec<Value> = (0..100).map(|i| config_map(&format!("c{i}"), "1", json!({}))).collect();
+    deploy(&mut h, &git, "web", "r1", objects);
+    let start = h.now;
+    assert!(h.run_until(120_000, |h| settled(h, "web")));
+    // 100 applies at 10 a second, after a burst of 20: about 8 s.
+    assert!(h.now - start >= 7_000, "took {} ms", h.now - start);
+}
+
+#[test]
+fn a_manual_sync_applies_and_a_dry_run_changes_nothing() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(AppConfig::new("web", "dev", "web")));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    h.run_for(1_000);
+    assert_eq!(status(&h, "web").map(|s| s.sync), Some(Sync::OutOfSync));
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest { dry_run: true, ..SyncRequest::default() } });
+    h.run_for(1_000);
+    assert_eq!(h.clusters.get("dev").map(sim::Cluster::len), Some(0));
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
+    assert!(h.run_until(10_000, |h| settled(h, "web")));
+}
