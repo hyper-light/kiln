@@ -26,6 +26,10 @@ interface Props {
   onMode: (m: KeyboardMode) => void;
   fold: KeyboardFold;
   onFold: (f: "open" | "closed") => void;
+  /** Paste the clipboard into the session. */
+  onPaste?: () => void;
+  /** Copy the selection, or open the session as selectable text. */
+  onCopy?: () => void;
 }
 
 const ROWS: Record<Layer, string[][]> = {
@@ -87,7 +91,7 @@ const buzz = () => {
   }
 };
 
-function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode, onMode, fold, onFold }: Props) {
+function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode, onMode, fold, onFold, onPaste, onCopy }: Props) {
   const [ctrl, setCtrl] = React.useState<Latch>("off");
   const [alt, setAlt] = React.useState<Latch>("off");
   const [shift, setShift] = React.useState<Latch>("off");
@@ -344,6 +348,16 @@ function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode,
           {/* Keys a phone keyboard lacks. */}
           {open && (
             <div className="vk-row vk-scroll">
+              {onPaste && (
+                <button type="button" className="vk-key" aria-label="Paste" {...press(onPaste)}>
+                  Paste
+                </button>
+              )}
+              {onCopy && (
+                <button type="button" className="vk-key" aria-label="Copy" {...press(onCopy)}>
+                  Copy
+                </button>
+              )}
               {navKey("Esc", "Escape")}
               {navKey("Tab", "Tab")}
               {latchKey("Ctrl", ctrl, setCtrl)}

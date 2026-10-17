@@ -15,6 +15,7 @@ export function DialogContent({
   className,
   variant = "dialog",
   onOpenAutoFocus,
+  onCloseAutoFocus,
 }: {
   title: React.ReactNode;
   eyebrow?: React.ReactNode;
@@ -23,6 +24,7 @@ export function DialogContent({
   className?: string;
   variant?: "dialog" | "drawer";
   onOpenAutoFocus?: (e: Event) => void;
+  onCloseAutoFocus?: (e: Event) => void;
 }) {
   return (
     <D.Portal>
@@ -30,6 +32,7 @@ export function DialogContent({
       <D.Content
         className={cn(variant === "drawer" ? "drawer" : "dialog", className)}
         onOpenAutoFocus={onOpenAutoFocus}
+        onCloseAutoFocus={onCloseAutoFocus}
         aria-describedby={description ? undefined : undefined}
       >
         <div className="flex items-start justify-between gap-4 px-6 pt-5 pb-1">

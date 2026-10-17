@@ -2,6 +2,7 @@ import * as React from "react";
 import { wsUrl } from "@/api/client";
 import type { TerminalControlFrame, TerminalSessionInfo } from "@/api/types";
 import { createTerminal, ensureFont, TERM_FONT, type KilnTerminal } from "@/components/terminal/xterm-setup";
+import { copyText, readClipboard } from "./clipboard";
 
 export type SessionState =
   | { kind: "connecting" }
@@ -15,7 +16,14 @@ export interface SessionHandle {
   reconnect: () => void;
   focus: () => void;
   clear: () => void;
-  copySelection: () => Promise<void>;
+  /** Copy the selection; false when nothing is selected. */
+  copySelection: () => Promise<boolean>;
+  /** Paste the clipboard into the session; false when the browser won't hand it over. */
+  paste: () => Promise<boolean>;
+  /** Paste this text (bracketed when the program asks for it). */
+  pasteText: (text: string) => void;
+  /** The session's text: the scrollback and the screen. */
+  text: () => string;
   /** Send bytes to the shell as if typed (on-screen keyboard). */
   send: (bytes: string) => void;
   /** The program's application-cursor mode (arrows encode differently in vim, less, TUIs). */
@@ -226,17 +234,23 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
       const term = k.term;
 
       // Let the browser handle copy/paste chords; everything else goes to the PTY.
+      // Copy and paste like a desktop terminal. The selection is xterm's own (not the page's), so
+      // copying is done here, and works over plain HTTP too. Ctrl+C with nothing selected still
+      // interrupts; Ctrl+V still reaches the program (vim's block select); Cmd+V and Ctrl+Shift+V
+      // paste through the browser's paste event.
       term.attachCustomKeyEventHandler((e) => {
         if (e.type !== "keydown") return true;
+        const key = e.key.toLowerCase();
         const mod = e.ctrlKey || e.metaKey;
-        if (mod && e.shiftKey && (e.key === "C" || e.key === "c")) {
+        if (mod && key === "c" && (e.shiftKey || e.metaKey || term.hasSelection())) {
           const sel = term.getSelection();
-          if (sel) void navigator.clipboard?.writeText(sel).catch(() => undefined);
-          e.preventDefault();
-          return false;
+          if (sel) void copyText(sel);
+          if (sel || e.metaKey || e.shiftKey) {
+            e.preventDefault();
+            return false;
+          }
         }
-        if (mod && e.shiftKey && (e.key === "V" || e.key === "v")) return false; // native paste event
-        if (e.metaKey && (e.key === "c" || e.key === "v") && term.hasSelection()) return false;
+        if ((e.metaKey && key === "v") || (e.ctrlKey && e.shiftKey && key === "v")) return false;
         return true;
       });
 
@@ -260,7 +274,7 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
         term.onSelectionChange(() => {
           if (!live.current.copyOnSelect) return;
           const sel = term.getSelection();
-          if (sel) void navigator.clipboard?.writeText(sel).catch(() => undefined);
+          if (sel) void copyText(sel);
         }),
       );
 
@@ -632,7 +646,34 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
       clear: () => kRef.current?.term.clear(),
       copySelection: async () => {
         const s = kRef.current?.term.getSelection();
-        if (s) await navigator.clipboard.writeText(s);
+        return s ? copyText(s) : false;
+      },
+      paste: async () => {
+        const t = await readClipboard();
+        if (t === null) return false;
+        if (t) {
+          kRef.current?.term.scrollToBottom();
+          kRef.current?.term.paste(t);
+        }
+        return true;
+      },
+      pasteText: (text: string) => {
+        kRef.current?.term.scrollToBottom();
+        kRef.current?.term.paste(text);
+      },
+      text: () => {
+        const b = kRef.current?.term.buffer.active;
+        if (!b) return "";
+        const lines: string[] = [];
+        for (let i = 0; i < b.length; i++) {
+          const line = b.getLine(i);
+          if (!line) continue;
+          // Wrapped rows join the row before them: one logical line.
+          if (line.isWrapped && lines.length) lines[lines.length - 1] += line.translateToString(true);
+          else lines.push(line.translateToString(true));
+        }
+        while (lines.length && !lines[lines.length - 1]?.trim()) lines.pop();
+        return lines.join("\n");
       },
       send: (bytes: string) => {
         kRef.current?.term.scrollToBottom();

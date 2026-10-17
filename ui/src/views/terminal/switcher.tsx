@@ -170,11 +170,18 @@ export function MobileBar({
     <div className="sw-bar">
       <button type="button" className="sw-current-btn" onClick={() => setSheet(true)} aria-label="Switch session">
         {current ? <i className="dot" data-status={dot(current.state)} aria-hidden="true" /> : null}
-        <span className="sw-title">{current ? current.title : "No session"}</span>
-        <span className="sw-count">
-          {tabs.length ? `${idx + 1}/${tabs.length}` : "0"}
-          {waiting > 0 && <span className="sw-badge">{waiting}</span>}
+        <span className="sw-label">
+          <span className="sw-title">{current ? current.title.replace(/^[^·]*·\s*/, "") || current.title : "No session"}</span>
+          <span className="sw-meta">
+            {current ? targetName(current.target) : "tap to start one"}
+            {tabs.length > 0 && ` · ${idx + 1} of ${tabs.length}`}
+          </span>
         </span>
+        {waiting > 0 && (
+          <span className="sw-badge" title={`${waiting} agent${waiting === 1 ? "" : "s"} waiting on you`}>
+            {waiting}
+          </span>
+        )}
         <ChevronDown size={14} />
       </button>
       <NewMenu

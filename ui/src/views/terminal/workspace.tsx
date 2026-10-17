@@ -1,7 +1,7 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { useLocation, useNavigate } from "react-router";
-import { ChevronDown, ClipboardCopy, Eraser, Keyboard, Maximize2, Minimize2, Minus, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
+import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Keyboard, Maximize2, Minimize2, Minus, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, TerminalSessionInfo } from "@/api/types";
@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
 import { SpawnHereButton } from "@/views/harness/spawn-here";
 import { SpawnDialog } from "@/views/harness/spawn";
 import { DesktopNew, MobileBar } from "./switcher";
+import { PasteDialog, SelectTextDialog } from "./clipboard";
 import { TerminalSession, type SessionHandle, type SessionState } from "./session";
 
 interface Tab {
@@ -331,6 +332,28 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   // Phones: one pinned bar (current session, a switcher, new terminal/agents) instead of tabs that scroll off screen.
   const narrow = useMediaQuery("(max-width: 639px)");
   const [spawn, setSpawn] = React.useState<{ target?: string; shell?: string } | null>(null);
+  // Copy and paste: the selection or a plain-text view of the session; the clipboard, or a box to paste into.
+  const [selectText, setSelectText] = React.useState<string | null>(null);
+  const [pasteBox, setPasteBox] = React.useState(false);
+  const focusActive = React.useCallback(() => {
+    const id = activeRef.current;
+    if (id) handles.current.get(id)?.focus();
+  }, []);
+  // After a button, keys go back to the terminal (an Enter must not press the button again).
+  const copyFromActive = React.useCallback(async () => {
+    const id = activeRef.current;
+    const h = id ? handles.current.get(id) : undefined;
+    if (!h) return;
+    if (await h.copySelection()) h.focus();
+    else setSelectText(h.text());
+  }, []);
+  const pasteIntoActive = React.useCallback(async () => {
+    const id = activeRef.current;
+    const h = id ? handles.current.get(id) : undefined;
+    if (!h) return;
+    if (await h.paste()) h.focus();
+    else setPasteBox(true);
+  }, []);
   const targets = ["local", ...connected.map((a) => `agent:${a.name}`)];
   const switcherTabs = tabs.map((t) => ({ id: t.id, title: t.title, target: t.target, state: t.state.kind }));
 
@@ -394,6 +417,9 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
           kbVisible={kbVisible}
           onToggleKb={() => setKbVisible(!kbVisible)}
           more={[
+            { label: "Copy", disabled: !active, onSelect: () => void copyFromActive() },
+            { label: "Paste", disabled: !active, onSelect: () => void pasteIntoActive() },
+            { label: "Select text", disabled: !active, onSelect: () => active && setSelectText(handles.current.get(active.id)?.text() ?? "") },
             { label: "Start agents in this shell", onSelect: () => active && setSpawn({ target: active.target, shell: active.sessionId ?? undefined }), disabled: !active?.sessionId },
             { label: "Larger text", onSelect: () => setFontSize(Math.min(24, fontSize + 1)) },
             { label: "Smaller text", onSelect: () => setFontSize(Math.max(9, fontSize - 1)) },
@@ -486,6 +512,16 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
               <ClipboardCopy size={14} />
             </button>
           </Tip>
+          <Tip content="Copy (⌘C / Ctrl+C with text selected)">
+            <button className="icon-btn" data-variant="bare" data-size="sm" aria-label="Copy" disabled={!active} onClick={() => void copyFromActive()}>
+              <Copy size={14} />
+            </button>
+          </Tip>
+          <Tip content="Paste (⌘V / Ctrl+Shift+V)">
+            <button className="icon-btn" data-variant="bare" data-size="sm" aria-label="Paste" disabled={!active} onClick={() => void pasteIntoActive()}>
+              <ClipboardPaste size={14} />
+            </button>
+          </Tip>
           <Tip content="Clear scrollback">
             <button
               className="icon-btn hidden sm:inline-grid"
@@ -511,6 +547,16 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
         </div>
       </div>
 
+      <SelectTextDialog open={selectText !== null} onOpenChange={(o) => !o && setSelectText(null)} text={selectText ?? ""} onClosed={focusActive} />
+      <PasteDialog
+        open={pasteBox}
+        onOpenChange={setPasteBox}
+        onPaste={(text) => {
+          const id = activeRef.current;
+          if (id) handles.current.get(id)?.pasteText(text);
+        }}
+        onClosed={focusActive}
+      />
       <SpawnDialog
         open={spawn !== null}
         onOpenChange={(o) => !o && setSpawn(null)}
@@ -618,6 +664,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
           onMode={kbOnMode}
           fold={kbFold}
           onFold={kbOnFold}
+          onPaste={pasteIntoActive}
+          onCopy={copyFromActive}
         />
       )}
     </div>

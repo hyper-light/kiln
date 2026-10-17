@@ -1878,7 +1878,7 @@ html[data-motion="paused"] .skeleton::after {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  height: 36px;
+  height: 38px;
   padding: 0 10px;
   border: 1px solid #23252b;
   border-radius: 10px;
@@ -1886,13 +1886,27 @@ html[data-motion="paused"] .skeleton::after {
   color: #e4e5e8;
   font-size: 13px;
 }
-.sw-current-btn .sw-title {
+.sw-label {
+  display: flex;
   flex: 1;
+  flex-direction: column;
   min-width: 0;
-  overflow: hidden;
   text-align: left;
+  line-height: 1.15;
+}
+.sw-current-btn .sw-title {
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 13px;
+}
+.sw-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: #8f939e;
 }
 .sw-count {
   display: inline-flex;
@@ -2055,4 +2069,53 @@ html[data-motion="paused"] .skeleton::after {
   color: #111214;
   font-size: 12.5px;
   font-weight: 500;
+}
+
+/* Terminal copy and paste dialogs */
+.clip-text {
+  display: block;
+  width: 100%;
+  height: min(52vh, 460px);
+  padding: 10px 12px;
+  border: 1px solid #262930;
+  border-radius: 10px;
+  background: #08090b;
+  color: #d9dbe0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+  resize: vertical;
+  outline: none;
+}
+.clip-paste {
+  height: 160px;
+  white-space: pre-wrap;
+}
+.clip-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.clip-note {
+  margin-right: auto;
+  font-size: 12px;
+  color: #a1a4ad;
+}
+
+/* iOS zooms the page into a focused field whose text is under 16px. The terminal's input is
+   invisible, so its size costs nothing; other fields get 16px on iOS. */
+.xterm .xterm-helper-textarea {
+  font-size: 16px !important;
+}
+@supports (-webkit-touch-callout: none) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  textarea,
+  select {
+    font-size: max(16px, 1em) !important;
+  }
 }
