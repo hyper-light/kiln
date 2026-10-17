@@ -35,6 +35,7 @@ pub mod proto;
 pub mod rt;
 pub mod server;
 pub mod store;
+pub mod sync;
 pub mod sup;
 pub mod supervise;
 pub mod terminal;
