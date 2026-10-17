@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+hyper-raft = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-durable = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-log = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+parking_lot = "0.12.5"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 glob = "0.3.4"
@@ -16,6 +21,8 @@ serde_json = "1.0.154"
 serde_yaml = "0.9.34"
 tar = "0.4.46"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+futures = "0.3.34"
+tracing = "0.1.44"
 
 [dependencies.mimalloc]
 version = "0.1"

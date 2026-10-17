@@ -16,6 +16,7 @@
 //! - [`diff`]: comparing desired and live objects by field ownership.
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
 //! - [`engine`]: the controller.
+//! - [`state`] and [`store`]: what is kept durably, replicated by hyper-raft on hyper-log.
 //! - [`sim`] and [`harness`]: simulated clusters, and the engine driven against them on a
 //!   simulated clock (tests and `kiln cd bench`).
 
@@ -30,6 +31,8 @@ pub mod model;
 pub mod obj;
 pub mod render;
 pub mod sim;
+pub mod state;
+pub mod store;
 pub mod sync;
 
 #[cfg(test)]

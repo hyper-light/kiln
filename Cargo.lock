@@ -1064,12 +1064,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-block"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "hyper-rt",
+ "libc",
+ "rustix",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hyper-datagram"
 version = "0.1.0"
 source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
 dependencies = [
  "aws-lc-rs",
  "crc32c",
+]
+
+[[package]]
+name = "hyper-durable"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "hyper-block",
+ "hyper-liveness",
+ "hyper-log",
+ "hyper-raft",
+ "hyper-timing",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hyper-liveness"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "hyper-timing",
+]
+
+[[package]]
+name = "hyper-log"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "crc32c",
+ "getrandom 0.4.3",
+ "hyper-block",
+ "hyper-seal",
+ "hyper-timing",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1093,6 +1141,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-raft"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "crc32c",
+ "hyper-timing",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "hyper-rt"
 version = "0.1.0"
 source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
@@ -1113,6 +1171,18 @@ dependencies = [
  "hyper-datagram",
  "hyper-rt",
  "hyper-transport",
+]
+
+[[package]]
+name = "hyper-seal"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "aws-lc-rs",
+ "getrandom 0.4.3",
+ "rustix",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1313,15 +1383,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
+ "futures",
  "glob",
+ "hyper-block",
+ "hyper-durable",
+ "hyper-log",
+ "hyper-raft",
  "lz4_flex",
  "mimalloc",
+ "parking_lot",
  "rustc-hash",
  "serde",
  "serde_json",
  "serde_yaml",
  "tar",
  "tempfile",
+ "tracing",
  "xxhash-rust",
 ]
 
