@@ -16,6 +16,7 @@ pub mod harness;
 pub mod host;
 pub mod hub;
 pub mod install;
+pub mod instances;
 pub mod join;
 pub mod k8s;
 pub mod logs;
@@ -35,6 +36,7 @@ pub mod supervise;
 pub mod terminal;
 pub mod termsess;
 pub mod ui;
+pub mod upgrade;
 pub mod util;
 
 /// Process-wide shutdown signal, set once by `main`.

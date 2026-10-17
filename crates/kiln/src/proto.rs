@@ -59,6 +59,21 @@ pub enum AgentMsg {
     /// Answer to [`ServerMsg::AiView`]: the session's normalized view (JSON: events, state,
     /// changes), `None` when there is none. Appended last: postcard encodes variants by index.
     AiView { req: u64, json: Option<String> },
+    /// Which runner process of its machine this connection is, sent before [`Hello`]. A machine
+    /// runs two while one replaces the other without a restart (the old one keeps its terminals
+    /// until they end); runners from before this never send it and count as "legacy".
+    /// Appended last: postcard encodes variants by index (an older server skips the frame).
+    Instance(InstanceHello),
+}
+
+/// See [`AgentMsg::Instance`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstanceHello {
+    /// `main` for a machine's usual runner; a uuid for one set up beside it.
+    pub id: String,
+    /// When this instance was set up (unix seconds; 0 for `main`). The newest gets new work.
+    pub created_at: i64,
+    pub pid: u32,
 }
 
 /// A terminal session kept by an agent.
@@ -129,6 +144,10 @@ pub enum ServerMsg {
     /// are not): written at `offset`; `done` on the last piece. The message refers to it by `file`.
     /// Appended last: postcard encodes variants by index.
     HarnessFile { session: String, file: String, offset: u64, data: Vec<u8>, done: bool },
+    /// Sent to a machine's newest runner process: the older one, `instance` ("legacy" for one
+    /// that never announced itself), has nothing left to run (no terminals, agent sessions or
+    /// jobs) and can be stopped. Appended last: postcard encodes variants by index.
+    Retire { instance: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -182,6 +201,19 @@ mod tests {
         let b = encode(&m)?;
         assert_eq!(decode::<AgentMsg>(&b)?, m);
         assert!(decode::<AgentMsg>(&[0xff, 0xff, 0xff]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn appended_variants_keep_their_indexes() -> anyhow::Result<()> {
+        // Older peers decode by variant index: the new ones must come after every existing one.
+        let i = encode(&AgentMsg::Instance(InstanceHello { id: "main".into(), created_at: 0, pid: 7 }))?;
+        let h = encode(&AgentMsg::HarnessInventory { json: String::new() })?;
+        assert!(i.first() > h.first(), "Instance must be appended after HarnessInventory");
+        let r = encode(&ServerMsg::Retire { instance: "legacy".into() })?;
+        let c = encode(&ServerMsg::HarnessClose { session: String::new() })?;
+        assert!(r.first() > c.first(), "Retire must be appended after HarnessClose");
+        assert_eq!(decode::<ServerMsg>(&r)?, ServerMsg::Retire { instance: "legacy".into() });
         Ok(())
     }
 }

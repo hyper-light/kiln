@@ -355,6 +355,27 @@ impl Registry {
         }
     }
 
+    /// One runner process of a machine went away while another of the machine stays connected
+    /// (see `crate::instances`): the sessions it held keep running there and come back with it.
+    pub fn sessions_lost(&self, hub: &Hub, ids: &[String]) {
+        let mut infos = Vec::new();
+        {
+            let mut g = self.mirrors.lock();
+            for id in ids {
+                let Some(m) = g.get_mut(id) else { continue };
+                m.info.status = Status::Disconnected;
+                if let Some(o) = m.state.as_object_mut() {
+                    o.insert("status".into(), json!("disconnected"));
+                }
+                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+                infos.push(m.info.clone());
+            }
+        }
+        for info in infos {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
+    }
+
     /// Join a session's stream. None when there is no such session.
     pub fn attach(&self, id: &str) -> Option<Attachment> {
         let g = self.mirrors.lock();

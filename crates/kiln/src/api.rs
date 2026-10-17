@@ -146,6 +146,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
         (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
         (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
+        (&Method::POST, ["api", "agents", "instance"]) => return enroll_instance(&hub, req).await,
         (&Method::POST, ["api", "join-requests"]) => return create_join(&hub, req).await,
         (&Method::GET, ["api", "join-requests", id]) => {
             let id = (*id).to_owned();
@@ -815,6 +816,33 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         tracing::info!(agent = %name, "agent enrolled");
     }
     Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
+}
+
+/// `POST /api/agents/instance`: a certificate for a second runner process of a machine that is
+/// already enrolled, so a new runner can work beside the old one (which keeps its terminals until
+/// they end) instead of replacing it. Needs no token: the request carries the machine's current
+/// certificate and a CSR signed with that certificate's key ([`crate::pki::Pki::sign_instance`]).
+async fn enroll_instance(hub: &Hub, req: Request) -> R {
+    let r: crate::agent::InstanceRequest =
+        srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let (name, cert) = match hub.pki.sign_instance(&r.cert_pem, &r.csr) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::rt::sleep(Duration::from_millis(500)).await;
+            return Err(err(StatusCode::FORBIDDEN, format!("{e:#}")));
+        }
+    };
+    // Only machines this server still knows: a forgotten (revoked) one must enroll again.
+    let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
+    if !known {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
+    }
+    hub.store.audit(name.clone(), "agent.instance".into(), String::new()).await;
+    tracing::info!(agent = %name, "issued a certificate for a second runner process");
+    Ok(srv::json(
+        StatusCode::OK,
+        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name },
+    ))
 }
 
 /// The target triple this binary was built for (`build.rs`).

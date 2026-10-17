@@ -998,6 +998,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             terminal: true,
             shell: None,
             credentials: None,
+            instance: None,
         }));
     }
     crate::install::install(crate::install::InstallArgs {
@@ -1012,6 +1013,8 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         name: Some(joined.name.clone()),
         labels: joined.labels,
         slots: a.slots,
+        upgrade: false,
+        service: "kiln-agent".to_owned(),
     })
     .await?;
     say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}. It starts on boot.", joined.name, joined.server));

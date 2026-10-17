@@ -69,6 +69,15 @@ pub struct InstallArgs {
     pub labels: Vec<String>,
     #[arg(long)]
     pub slots: Option<u32>,
+    /// Agent: start this version beside the installed agent instead of restarting it. The old
+    /// runner keeps its terminals, agent sessions and jobs until they end, then retires itself;
+    /// everything new goes to this one. Needs no token or password (the machine proves itself
+    /// with its own certificate). Safe to re-run.
+    #[arg(long, requires = "agent")]
+    pub upgrade: bool,
+    /// Agent: the installed agent's service (unit, launchd label or task name) for --upgrade.
+    #[arg(long, default_value = "kiln-agent")]
+    pub service: String,
 }
 
 fn is_root() -> bool {
@@ -169,6 +178,10 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if a.agent && a.upgrade {
+        eprintln_header("Upgrading the kiln agent beside the running one");
+        return crate::upgrade::install_alongside(&a.service, &|m| say(m)).await;
+    }
     let system = a.system || is_root();
     let bin = bin_path(system);
     eprintln_header(if a.agent { "Installing kiln agent" } else { "Installing kiln server" });
@@ -201,7 +214,7 @@ pub async fn install(a: InstallArgs) -> anyhow::Result<()> {
 
     let mut sup_args = vec!["supervise".to_owned(), "--".to_owned()];
     sup_args.extend(args);
-    let boot = Install { system, unit, bin: &bin, args: &sup_args, config: &config_path, state_dir: &state_dir };
+    let boot = Install { system, unit, bin: &bin, args: &sup_args, config: &config_path, state_dir: &state_dir, env: None };
     let started_by_boot = setup_boot(a.boot, &boot)?;
 
     if !a.no_start && !started_by_boot {
@@ -252,6 +265,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         terminal: true,
         shell: None,
         credentials: None,
+        instance: None,
     };
     crate::agent::enroll_only(&opts).await?;
     say(format!("enrolled    as {} with {server}", crate::pki::sanitize_name(&name)));
@@ -275,6 +289,19 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
+/// Install and start one more service — a runner beside an existing one — with the platform's
+/// usual boot integration for `unit`, leaving every other service alone.
+pub fn start_service(system: bool, unit: &str, bin: &Path, args: &[String], state_dir: &Path, env: &[String]) -> anyhow::Result<()> {
+    let config = crate::config::default_config_path();
+    let i = Install { system, unit, bin, args, config: &config, state_dir, env: (!env.is_empty()).then_some(env) };
+    if !setup_boot(Boot::Auto, &i)? {
+        let mut cmd = Command::new(bin);
+        cmd.arg("supervise").arg("--detach").args(args.iter().skip(1));
+        run(&mut cmd)?;
+    }
+    Ok(())
+}
+
 /// What is being installed, for the boot integrations.
 struct Install<'a> {
     /// System-wide (root): a systemd system unit or a LaunchDaemon.
@@ -287,6 +314,9 @@ struct Install<'a> {
     config: &'a Path,
     /// The supervisor's state directory (its `kiln.log` lives there).
     state_dir: &'a Path,
+    /// The service's environment (`KEY=value`), when it must match another service's exactly
+    /// (a runner set up beside an existing one); else kiln's config path and this shell's PATH.
+    env: Option<&'a [String]>,
 }
 
 impl Install<'_> {
@@ -318,16 +348,22 @@ fn setup_boot(boot: Boot, i: &Install<'_>) -> anyhow::Result<bool> {
     );
     match boot {
         Boot::Systemd => {
+            let env = match i.env {
+                Some(list) => list.iter().map(|kv| format!("Environment=\"{}\"\n", kv.replace('"', "").replace('%', "%%"))).collect::<String>(),
+                None => format!(
+                    "Environment=KILN_CONFIG={cfg}\n\
+                     # The installing user's PATH, so jobs find the same toolchains (nvm, cargo, uv, go).\n\
+                     Environment=\"PATH={path}\"\n",
+                    cfg = config.display(),
+                    path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
+                ),
+            };
             let body = format!(
                 "[Unit]\nDescription=kiln {unit} (self-supervising CI/CD job server)\nAfter=network-online.target\nWants=network-online.target\n\n\
-                 [Service]\nType=simple\nEnvironment=KILN_CONFIG={cfg}\n\
-                 # The installing user's PATH, so jobs find the same toolchains (nvm, cargo, uv, go).\n\
-                 Environment=\"PATH={path}\"\nExecStart={exec}\n\
+                 [Service]\nType=simple\n{env}ExecStart={exec}\n\
                  # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
                  Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\n\
                  [Install]\nWantedBy={target}\n",
-                cfg = config.display(),
-                path = std::env::var("PATH").unwrap_or_default().replace('%', "%%").replace('"', ""),
                 target = if system { "multi-user.target" } else { "default.target" },
             );
             let (path, user_flag): (PathBuf, &[&str]) = if system {
@@ -713,6 +749,7 @@ mod tests {
             args: &args,
             config: Path::new("/Users/me/.config/kiln/kiln.toml"),
             state_dir: Path::new("/Users/me/.local/share/kiln/agent"),
+            env: None,
         };
         let plist = launchd_body(&i, Path::new("/tmp/kiln.log"));
         assert!(plist.contains("<string>io.github.hyper-light.kiln-agent</string>"));

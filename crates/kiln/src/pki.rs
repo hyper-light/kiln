@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData as _,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -181,6 +181,31 @@ impl Pki {
         Ok(signed.pem())
     }
 
+    /// One more certificate for a machine that is already enrolled: for a second runner process
+    /// beside its first one (upgrades that keep the first one's terminals alive until they end).
+    /// The proof is the machine's current certificate — issued by this CA and still valid — plus a
+    /// CSR for that same key, whose signature shows the requester holds the private key. Returns
+    /// the machine's name and the new certificate.
+    pub fn sign_instance(&self, cert_pem: &str, csr_pem: &str) -> anyhow::Result<(String, String)> {
+        let der = pem_to_der(cert_pem)?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow::anyhow!("parse certificate: {e}"))?;
+        let (_, ca) = x509_parser::parse_x509_certificate(&self.ca_der).map_err(|e| anyhow::anyhow!("parse CA: {e}"))?;
+        cert.verify_signature(Some(ca.public_key())).map_err(|_| anyhow::anyhow!("that certificate was not issued by this server"))?;
+        anyhow::ensure!(cert.validity().is_valid(), "that certificate has expired");
+        let name = cert_dns_name(&der).ok_or_else(|| anyhow::anyhow!("that certificate names no machine"))?;
+        anyhow::ensure!(name != SERVER_NAME, "that is the server's certificate");
+        // Parsing checks the CSR's own signature (possession of its private key).
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse CSR")?;
+        anyhow::ensure!(
+            csr.public_key.der_bytes() == cert.public_key().subject_public_key.data.as_ref(),
+            "the CSR is for a different key than the certificate"
+        );
+        let signed = CertificateSigningRequestParams { params: leaf_params(vec![name.clone()], LEAF_DAYS)?, public_key: csr.public_key }
+            .signed_by(&self.issuer)
+            .context("sign CSR")?;
+        Ok((name, signed.pem()))
+    }
+
     /// Issue a full leaf (key generated here). Used for the server's own in-process local agent.
     pub fn issue_local(&self, name: &str) -> anyhow::Result<Leaf> {
         let key = KeyPair::generate()?;
@@ -195,6 +220,14 @@ pub fn make_csr(name: &str) -> anyhow::Result<(String, String)> {
     let params = CertificateParams::new(vec![sanitize_name(name)])?;
     let csr = params.serialize_request(&key)?;
     Ok((csr.pem()?, key.serialize_pem()))
+}
+
+/// A CSR for `name` signed with an existing key: how a second runner process of an enrolled
+/// machine asks for its own certificate (see [`Pki::sign_instance`]).
+pub fn make_csr_with_key(name: &str, key_pem: &str) -> anyhow::Result<String> {
+    let key = KeyPair::from_pem(key_pem).context("parse the machine's key")?;
+    let params = CertificateParams::new(vec![sanitize_name(name)])?;
+    Ok(params.serialize_request(&key)?.pem()?)
 }
 
 /// Does this leaf need renewing?
@@ -220,6 +253,36 @@ mod tests {
         let again = Pki::open(dir.path())?;
         assert_eq!(again.ca_pem, pki.ca_pem);
         assert_eq!(sanitize_name("Bench Box #1"), "bench-box--1");
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_certificate_needs_the_machines_own_key_and_certificate() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open(dir.path())?;
+        let (csr, key) = make_csr("bench")?;
+        let cert = pki.sign_csr(&csr, "bench", 30)?;
+
+        // Same key, same machine: a distinct certificate for the same name.
+        let again = make_csr_with_key("bench", &key)?;
+        let (name, second) = pki.sign_instance(&cert, &again)?;
+        assert_eq!(name, "bench");
+        assert_ne!(pem_to_der(&second)?, pem_to_der(&cert)?, "a second runner needs its own certificate (peer id)");
+        assert_eq!(leaf_name(&Leaf { cert_pem: second, key_pem: key.clone() }).as_deref(), Some("bench"));
+
+        // Another key: refused, even with a valid certificate.
+        let (other_csr, _other_key) = make_csr("bench")?;
+        assert!(pki.sign_instance(&cert, &other_csr).is_err());
+
+        // A certificate from another CA: refused.
+        let foreign = Pki::open(tempfile::tempdir()?.path())?;
+        let foreign_cert = foreign.sign_csr(&csr, "bench", 30)?;
+        assert!(pki.sign_instance(&foreign_cert, &again).is_err());
+
+        // The server's own certificate is never a machine's.
+        let server = pki.server_leaf(&[])?;
+        let server_csr = make_csr_with_key(SERVER_NAME, &server.key_pem)?;
+        assert!(pki.sign_instance(&server.cert_pem, &server_csr).is_err());
         Ok(())
     }
 }

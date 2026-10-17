@@ -26,6 +26,8 @@ use crate::store::{AgentRow, Job, Status, Store};
 
 /// How long a persistent agent may be gone before its jobs are requeued.
 const AGENT_GRACE: Duration = Duration::from_secs(45);
+/// How often the newest runner process is reminded that an older one can be retired.
+const RETIRE_REPEAT: Duration = Duration::from_secs(60);
 /// Host samples kept per agent for the UI charts (1 h at 5 s).
 const HISTORY: usize = 720;
 /// How long an agent that declined a job is not offered that job again.
@@ -69,6 +71,10 @@ pub struct AgentLive {
     pub exclusive: bool,
     #[serde(skip)]
     pub lost_at: Option<Instant>,
+    /// The machine's runner processes, while it has more than one (a runner replaced without a
+    /// restart: the old one keeps its terminals until they end). See `crate::instances`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<crate::instances::InstanceView>,
 }
 
 /// Output from a remote (agent) terminal session, routed to its websocket.
@@ -122,6 +128,11 @@ pub struct Hub {
     pub discovery: Arc<crate::discovery::Discovery>,
     /// Machines asking to join as agents (`kiln join`), waiting for an admin.
     pub joins: crate::join::Requests,
+    /// Each machine's runner processes and what each one holds (see `crate::instances`).
+    pub instances: Mutex<crate::instances::Instances>,
+    /// Runner processes that went away while their machine stayed connected through another
+    /// one, with when and the jobs they held (requeued if they do not come back in time).
+    lost_instances: Mutex<HashMap<PeerId, (String, Instant, Vec<String>)>>,
 }
 
 impl Hub {
@@ -171,6 +182,8 @@ impl Hub {
             declined: Mutex::new(HashMap::new()),
             discovery,
             joins: crate::join::Requests::default(),
+            instances: Mutex::new(crate::instances::Instances::default()),
+            lost_instances: Mutex::new(HashMap::new()),
         })
     }
 
@@ -266,9 +279,13 @@ impl Hub {
                     dedicated_job: None,
                     exclusive: false,
                     lost_at: None,
+                    instances: vec![],
                 },
             })
             .collect();
+        for a in &mut out {
+            a.instances = self.instance_views(&a.name);
+        }
         for (name, l) in &live {
             if !out.iter().any(|a| &a.name == name) {
                 out.push(l.clone());
@@ -320,17 +337,33 @@ impl Hub {
         }
     }
 
+    /// Send to a machine. While it runs more than one runner process (see `crate::instances`),
+    /// a message about something one of them holds (a terminal, an agent session, a job) goes to
+    /// that one, anything new to the newest, and Drain to all of them.
     pub async fn send_to_agent(&self, agent: &str, lane: u32, msg: &ServerMsg) -> bool {
-        let peer = self.agents.lock().get(agent).and_then(|a| a.peer);
-        let Some(peer) = peer else { return false };
+        let mut peers: Vec<PeerId> = {
+            let mut inst = self.instances.lock();
+            if matches!(msg, ServerMsg::Drain) { inst.of(agent) } else { inst.route(agent, msg).into_iter().collect() }
+        };
+        if peers.is_empty() {
+            peers.extend(self.agents.lock().get(agent).and_then(|a| a.peer));
+        }
+        if peers.is_empty() {
+            return false;
+        }
         let kind = if lane == LANE_TERM { Kind::Term } else { Kind::Control };
-        match proto::encode(msg) {
-            Ok(b) => self.net.send(peer, lane, kind, b).await,
+        let b = match proto::encode(msg) {
+            Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, "encode failed");
-                false
+                return false;
             }
+        };
+        let mut sent = false;
+        for p in peers {
+            sent |= self.net.send(p, lane, kind, b.clone()).await;
         }
+        sent
     }
 
     async fn send_peer(&self, peer: PeerId, msg: &ServerMsg) {
@@ -352,8 +385,11 @@ impl Hub {
     }
 
     pub async fn forget_agent(&self, agent: &str) -> anyhow::Result<()> {
-        let peer = self.agents.lock().remove(agent).and_then(|a| a.peer);
-        if let Some(p) = peer {
+        let mut peers: Vec<PeerId> = self.agents.lock().remove(agent).and_then(|a| a.peer).into_iter().collect();
+        peers.extend(self.instances.lock().of(agent));
+        peers.sort_unstable();
+        peers.dedup();
+        for p in peers {
             self.net.command(crate::net::Out::Disconnect { peer: p }).await;
         }
         self.net.command(crate::net::Out::Revoke { name: agent.to_owned() }).await;
@@ -385,8 +421,13 @@ impl Hub {
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
+                let lost = self.instances.lock().lost(peer);
                 if let Some(name) = name {
-                    self.agent_lost(&name, &reason).await;
+                    if self.instances.lock().of(&name).is_empty() {
+                        self.agent_lost(&name, &reason).await;
+                    } else {
+                        self.instance_lost(&name, peer, lost.map(|(_, owned)| owned).unwrap_or_default(), &reason).await;
+                    }
                 }
             }
             NetEvent::Frame { peer, kind: Kind::Log, data, .. } => {
@@ -490,6 +531,11 @@ impl Hub {
         if let AgentMsg::Hello(h) = msg {
             return self.on_hello(peer, h).await;
         }
+        // Says which runner process of its machine this is; precedes Hello.
+        if let AgentMsg::Instance(ih) = msg {
+            self.instances.lock().announce(peer, ih);
+            return Ok(());
+        }
         let Some(agent) = self.agent_of(peer) else {
             anyhow::bail!("message from peer {peer} before hello");
         };
@@ -498,7 +544,7 @@ impl Hub {
             a.last_seen = now;
         }
         match msg {
-            AgentMsg::Hello(_) => {}
+            AgentMsg::Hello(_) | AgentMsg::Instance(_) => {}
             AgentMsg::Heartbeat { .. } | AgentMsg::JobStarted { .. } => {}
             AgentMsg::Sample(s) => {
                 if let Some(a) = self.agents.lock().get_mut(&agent) {
@@ -544,10 +590,18 @@ impl Hub {
                 }
             }
             AgentMsg::TermList { sessions } => {
+                {
+                    let mut inst = self.instances.lock();
+                    for info in &sessions {
+                        inst.own(crate::instances::Owned::Terminal(info.session.clone()), peer);
+                    }
+                }
                 for info in &sessions {
                     crate::termsess::adopt_agent(self, &agent, info);
                 }
             }
+            // One report per machine: its newest runner process's.
+            AgentMsg::AiSessions { .. } if self.instances.lock().newest(&agent).is_some_and(|n| n != peer) => {}
             AgentMsg::AiSessions { json } => match serde_json::from_str::<Vec<crate::aisessions::AiSession>>(&json) {
                 Ok(sessions) => {
                     let old = self.ai_sessions.lock().insert(agent.clone(), sessions.clone());
@@ -568,11 +622,46 @@ impl Hub {
                 }
             }
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
-                Ok(u) => self.harness.ingest(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u),
+                Ok(u) => {
+                    let closed = matches!(u, crate::harness::core::Update::Closed);
+                    {
+                        let mut inst = self.instances.lock();
+                        let what = crate::instances::Owned::Agent(session.clone());
+                        if closed {
+                            inst.disown(&what);
+                        } else if inst.owner(&what) != Some(peer) {
+                            inst.own(what, peer);
+                        }
+                    }
+                    self.harness.ingest(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u);
+                    if closed {
+                        self.check_retire().await;
+                    }
+                }
                 Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session update"),
             },
             AgentMsg::HarnessInventory { json } => match serde_json::from_str::<crate::harness::host::Inventory>(&json) {
-                Ok(inv) => self.harness.inventory(self, &agent, inv),
+                Ok(mut inv) => {
+                    // This process's sessions are its own; another process of the machine keeps
+                    // the ones it holds (the registry forgets sessions a report leaves out).
+                    let others: Vec<String> = {
+                        let mut inst = self.instances.lock();
+                        for id in &inv.sessions {
+                            inst.own(crate::instances::Owned::Agent(id.clone()), peer);
+                        }
+                        inst.of(&agent)
+                            .into_iter()
+                            .filter(|p| *p != peer)
+                            .flat_map(|p| inst.owned_by(p))
+                            .filter_map(|o| match o {
+                                crate::instances::Owned::Agent(id) => Some(id),
+                                _ => None,
+                            })
+                            .collect()
+                    };
+                    inv.sessions.extend(others);
+                    self.harness.inventory(self, &agent, inv);
+                }
                 Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session inventory"),
             },
             AgentMsg::TermReplay { session, data } => {
@@ -588,6 +677,8 @@ impl Hub {
                 if let Some(tx) = tx {
                     let _ = tx.send(TermOut::Exit { code, error }).await;
                 }
+                self.instances.lock().disown(&crate::instances::Owned::Terminal(session));
+                self.check_retire().await;
             }
         }
         Ok(())
@@ -608,13 +699,21 @@ impl Hub {
             refuse(format!("hello name {name} does not match certificate {cert_name:?}")).await;
             return Ok(());
         }
-        // A newer session for the same agent replaces the old one.
-        let old_peer = self.agents.lock().get(&name).and_then(|a| a.peer).filter(|p| *p != peer);
-        if let Some(p) = old_peer {
-            self.peers.lock().remove(&p);
-            self.net.command(crate::net::Out::Disconnect { peer: p }).await;
-        }
         let now = crate::util::now_unix();
+        // A machine may connect more than one runner process (a new one beside an old one that
+        // keeps its terminals, see `crate::instances`). The same process on a new connection
+        // replaces its stale one.
+        let joined = self.instances.lock().join(peer, &name, h.clone(), now);
+        for p in &joined.stale {
+            self.peers.lock().remove(p);
+            self.lost_instances.lock().remove(p);
+            self.net.command(crate::net::Out::Disconnect { peer: *p }).await;
+        }
+        self.lost_instances.lock().remove(&peer);
+        let others: Vec<PeerId> = self.instances.lock().of(&name).into_iter().filter(|p| *p != peer).collect();
+        let held_by_other = |job: &str| {
+            self.instances.lock().owner(&crate::instances::Owned::Job(job.to_owned())).is_some_and(|o| o != peer && others.contains(&o))
+        };
         // Reconcile what the agent says it runs with what we think it runs.
         let db_running: Vec<Job> = self
             .store
@@ -627,6 +726,8 @@ impl Hub {
         for j in &db_running {
             if h.running.contains(&j.id) {
                 keep.push(j.id.clone());
+            } else if held_by_other(&j.id) {
+                // Another runner process of this machine runs it.
             } else {
                 self.store
                     .requeue_job(j.id.clone(), format!("agent {name} restarted without the job"))
@@ -673,19 +774,38 @@ impl Hub {
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
             lost_at: None,
+            instances: Vec::new(),
         };
-        let draining = self.agents.lock().get(&name).is_some_and(|a| a.draining);
-        let live = AgentLive { draining, ..live };
+        let prev = self.agents.lock().get(&name).cloned();
+        let draining = prev.as_ref().is_some_and(|a| a.draining);
+        {
+            let mut inst = self.instances.lock();
+            for j in &live.running {
+                inst.own(crate::instances::Owned::Job(j.clone()), peer);
+            }
+        }
+        // The machine as a whole: its newest process describes it; its jobs are every process's.
+        let mut running = live.running.clone();
+        for j in prev.iter().flat_map(|a| a.running.iter()) {
+            if !running.contains(j) && held_by_other(j) {
+                running.push(j.clone());
+            }
+        }
+        let busy = u32::try_from(running.len()).unwrap_or(u32::MAX);
+        let live = match prev {
+            Some(prev) if !joined.newest => AgentLive { connected: true, last_seen: now, running, busy, lost_at: None, ..prev },
+            _ => AgentLive { draining, running, busy, ..live },
+        };
         self.store
             .upsert_agent(AgentRow {
                 name: name.clone(),
-                labels: h.labels,
+                labels: live.labels.clone(),
                 slots: live.slots,
-                hostname: h.hostname,
-                os: h.os,
-                arch: h.arch,
-                version: h.version,
-                ephemeral: h.ephemeral,
+                hostname: live.hostname.clone(),
+                os: live.os.clone(),
+                arch: live.arch.clone(),
+                version: live.version.clone(),
+                ephemeral: live.ephemeral,
                 connected: true,
                 last_seen: now,
                 enrolled_at: now,
@@ -706,13 +826,121 @@ impl Hub {
         )
         .await;
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
+        // Older processes of this machine take no new jobs; what they run, they keep.
+        for p in &joined.drain {
+            tracing::info!(agent = %name, peer = p, "a newer runner process of this machine connected; the older one keeps what it runs and takes nothing new");
+            self.send_peer(*p, &ServerMsg::Drain).await;
+        }
         self.update_slot_gauges();
         self.emit_agent(&live);
         self.wake.notify();
+        self.check_retire().await;
         Ok(())
     }
 
+    /// One runner process of a machine went away while another keeps the machine connected (see
+    /// `crate::instances`): what it held comes back when it reconnects, like a machine's.
+    async fn instance_lost(&self, name: &str, peer: PeerId, owned: Vec<crate::instances::Owned>, reason: &str) {
+        use crate::instances::Owned;
+        tracing::info!(agent = name, peer, reason, "a runner process of this machine disconnected; another keeps it connected");
+        let (mut agents, mut jobs) = (Vec::new(), Vec::new());
+        for o in owned {
+            match o {
+                Owned::Terminal(s) => {
+                    if let Some(tx) = self.terms.lock().remove(&format!("{name}/{s}")) {
+                        let _ = tx.try_send(TermOut::Gone);
+                    }
+                }
+                Owned::Agent(id) => agents.push(id),
+                Owned::Job(j) => jobs.push(j),
+            }
+        }
+        if !agents.is_empty() {
+            self.harness.sessions_lost(self, &agents);
+        }
+        if !jobs.is_empty() {
+            self.lost_instances.lock().insert(peer, (name.to_owned(), Instant::now(), jobs));
+        }
+        // The newest process (maybe another one now) describes the machine.
+        let newest = {
+            let inst = self.instances.lock();
+            inst.newest(name).and_then(|p| inst.get(p).map(|i| (p, i.hello.clone())))
+        };
+        let snapshot = {
+            let mut g = self.agents.lock();
+            let Some(a) = g.get_mut(name) else { return };
+            if let Some((p, h)) = newest {
+                a.peer = Some(p);
+                a.labels = h.labels;
+                a.slots = h.slots.max(1);
+                a.hostname = h.hostname;
+                a.os = h.os;
+                a.arch = h.arch;
+                a.version = h.version;
+                a.terminal = h.terminal;
+            }
+            a.clone()
+        };
+        self.emit_agent(&snapshot);
+        self.emit_terminals();
+        self.update_slot_gauges();
+        self.check_retire().await;
+    }
+
+    /// A machine's runner processes, while it has more than one, with what each holds.
+    fn instance_views(&self, name: &str) -> Vec<crate::instances::InstanceView> {
+        use crate::instances::Owned;
+        if self.instances.lock().of(name).len() < 2 {
+            return Vec::new();
+        }
+        let target = format!("agent:{name}");
+        let terms: Vec<Owned> = self.terminals.list().into_iter().filter(|t| t.target == target && !t.exited).map(|t| Owned::Terminal(t.id)).collect();
+        let agents: Vec<Owned> = self.harness.list().into_iter().filter(|i| i.target == target).map(|i| Owned::Agent(i.id)).collect();
+        let jobs: Vec<Owned> = self.agents.lock().get(name).map(|a| a.running.iter().cloned().map(Owned::Job).collect()).unwrap_or_default();
+        let inst = self.instances.lock();
+        inst.views(name, |p| {
+            let held = |v: &[Owned]| v.iter().filter(|o| inst.owner(o) == Some(p)).count();
+            (held(&terms), held(&agents), held(&jobs))
+        })
+    }
+
+    /// A machine's newest runner process retires the older ones once they hold nothing: no live
+    /// terminal, agent session or job of the machine is held by any process but the newest.
+    /// Anything whose holder is unknown counts as held by the older ones, so nothing is retired
+    /// early (and the newest checks the old process itself before stopping it).
+    async fn check_retire(&self) {
+        use crate::instances::Owned;
+        let crowded = self.instances.lock().crowded();
+        if crowded.is_empty() {
+            return;
+        }
+        let mut sends = Vec::new();
+        for (name, peer) in crowded {
+            let target = format!("agent:{name}");
+            let mut held: Vec<Owned> =
+                self.terminals.list().into_iter().filter(|t| t.target == target && !t.exited).map(|t| Owned::Terminal(t.id)).collect();
+            held.extend(self.harness.list().into_iter().filter(|i| i.target == target).map(|i| Owned::Agent(i.id)));
+            held.extend(self.agents.lock().get(&name).into_iter().flat_map(|a| a.running.iter().cloned().map(Owned::Job)));
+            let mut inst = self.instances.lock();
+            let Some(newest) = inst.newest(&name) else { continue };
+            if peer == newest || held.iter().any(|o| inst.owner(o) != Some(newest)) {
+                continue;
+            }
+            let Some(i) = inst.get_mut(peer) else { continue };
+            if i.retire_sent.is_some_and(|t| t.elapsed() < RETIRE_REPEAT) {
+                continue;
+            }
+            i.retire_sent = Some(Instant::now());
+            sends.push((name, newest, i.label()));
+        }
+        for (name, newest, instance) in sends {
+            tracing::info!(agent = %name, %instance, "an older runner process of this machine holds nothing any more; asking the newest to retire it");
+            self.send_peer(newest, &ServerMsg::Retire { instance }).await;
+        }
+    }
+
     fn release_slot(&self, agent: &str, job: &str) {
+        self.instances.lock().disown(&crate::instances::Owned::Job(job.to_owned()));
         let mut g = self.agents.lock();
         if let Some(a) = g.get_mut(agent) {
             a.running.retain(|j| j != job);
@@ -756,6 +984,7 @@ impl Hub {
         }
         self.update_slot_gauges();
         self.wake.notify();
+        self.check_retire().await;
         Ok(())
     }
 
@@ -1069,6 +1298,27 @@ impl Hub {
     }
 
     async fn check_lost_agents(&self) {
+        // Jobs of a runner process that went away while its machine stayed connected through
+        // another one, and did not come back in time.
+        let expired: Vec<(String, Vec<String>)> = {
+            let mut g = self.lost_instances.lock();
+            let peers: Vec<PeerId> = g.iter().filter(|(_, (_, t, _))| t.elapsed() > AGENT_GRACE).map(|(p, _)| *p).collect();
+            peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
+        };
+        for (name, jobs) in expired {
+            for j in jobs {
+                let still = self.agents.lock().get(&name).is_some_and(|a| a.running.contains(&j));
+                if !still {
+                    continue;
+                }
+                self.release_slot(&name, &j);
+                match self.store.requeue_job(j.clone(), format!("runner process did not reconnect ({name})")).await {
+                    Ok(_) => self.emit_job(&j).await,
+                    Err(e) => tracing::error!(error = %e, job = %j, "requeue failed"),
+                }
+            }
+        }
+        self.check_retire().await;
         let lost: Vec<String> = self
             .agents
             .lock()

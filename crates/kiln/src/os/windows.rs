@@ -123,3 +123,8 @@ pub fn pid_alive(_pid: u32) -> bool {
 pub fn try_reap(_pid: u32) -> io::Result<Option<(Option<i32>, String)>> {
     Err(io::Error::other("unsupported on Windows"))
 }
+
+/// How many PTY masters process `pid` holds open: not something Windows can tell from outside.
+pub fn pty_masters(_pid: u32) -> Option<usize> {
+    None
+}
