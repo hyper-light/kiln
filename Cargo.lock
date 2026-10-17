@@ -1499,6 +1499,8 @@ dependencies = [
 name = "kiln-ci"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
+ "base64 0.23.1",
  "jiff",
  "proptest",
  "regex",
