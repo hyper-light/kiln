@@ -159,19 +159,6 @@
   font-size: 12px;
 }
 
-.sync-confirm {
-  max-width: 72ch;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-accent);
-  background: var(--color-surface);
-  color: var(--color-secondary);
-  font-size: 13px;
-}
-
-.sync-confirm p {
-  margin: 0 0 8px;
-}
-
 .sync-conflicts {
   display: grid;
   gap: 4px;

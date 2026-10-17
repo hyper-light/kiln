@@ -9,14 +9,17 @@ import * as React from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 import { AlertTriangle, ArrowUpRight, FolderSync, GitBranch, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "@/api/client";
-import { useServerEvents } from "@/api/events";
-import type { Agent, Repo, Run, SyncRepo } from "@/api/types";
+import type { Repo, Run, SyncRepo, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { EmptyState, ErrorState, PageIntro, SearchField, SectionHeading, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
+import { RowsHold, TableHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { Confirm, EmptyState, ErrorState, PageIntro, SearchField, SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
+import { agentsRes, recentRunsRes, reposRes, useRecentRuns, useRepos, useRes, warm, type Res } from "@/lib/data";
 import { formatDuration } from "@/lib/format";
-import { errorMessage, useDocumentTitle, useResource } from "@/lib/hooks";
+import { errorMessage } from "@/lib/hooks";
+import { invalidate } from "@/lib/resource";
 import { RelTime } from "./shared";
 import { SyncedRepos } from "./sync";
 
@@ -29,68 +32,86 @@ const SHOWS = [
   { value: "synced", label: "Synced to machines" },
 ];
 
+/** Folders kept the same on several machines; read often, they move by the second. */
+export const syncRes: Res<SyncView> = { key: "sync", fetch: (s) => api.sync(s), opts: { pollMs: 3_000 } };
+
 /** The synced folder that is a built repository's other half: same name, or same last part. */
 function syncedFor(r: Repo, synced: Map<string, SyncRepo>) {
   const name = r.name.toLowerCase();
   return synced.get(name) ?? synced.get(name.split("/").pop() ?? name);
 }
 
-export default function Repos() {
-  useDocumentTitle("Repositories");
+/** The page's toggles, in the URL: what shows, and which form is open (`?add=1`, `?sync=1`). */
+function useRepoParams() {
   const [params, setParams] = useSearchParams();
-  const repos = useResource((s) => api.repos(s), [], { pollMs: 30_000 });
-  const lastRuns = useResource((s) => api.runs({ limit: 200 }, s), []);
-  const sync = useResource((s) => api.sync(s), [], { pollMs: 3_000 });
-  const agents = useResource((s) => api.agents(s), [], { pollMs: 30_000 });
-  const machines = React.useMemo(() => (agents.data ?? []).map((a: Agent) => a.name).sort(), [agents.data]);
-  const [q, setQ] = React.useState("");
   const show = (["all", "built", "synced"].includes(params.get("show") ?? "") ? params.get("show") : "all") as Show;
-  const [adding, setAdding] = React.useState(params.get("add") === "1");
-  const [syncing, setSyncing] = React.useState(params.get("sync") === "1");
-  const [open, setOpen] = React.useState<{ id: string; what: "run" | "delete" } | null>(null);
-  const [polling, setPolling] = React.useState<Set<string>>(new Set());
-  const [notice, setNotice] = React.useState<Notice>(null);
-
-  const setShow = (v: Show) => {
+  const set = (k: string, v: string | null) => {
     const n = new URLSearchParams(params);
-    if (v === "all") n.delete("show");
-    else n.set("show", v);
+    if (v) n.set(k, v);
+    else n.delete(k);
     setParams(n, { replace: true });
   };
-  // Deep links (the palette's "Add repository", "Sync a folder") open their form once.
-  React.useEffect(() => {
-    if (params.get("add") === "1" || params.get("sync") === "1") {
-      if (params.get("add") === "1") setAdding(true);
-      if (params.get("sync") === "1") setSyncing(true);
-      const n = new URLSearchParams(params);
-      n.delete("add");
-      n.delete("sync");
-      setParams(n, { replace: true });
-    }
-  }, [params, setParams]);
-  // A success says so for a while; a failure stays until the next action.
-  React.useEffect(() => {
-    if (notice?.tone !== "ok") return;
-    const t = setTimeout(() => setNotice(null), 8_000);
-    return () => clearTimeout(t);
-  }, [notice]);
+  return { show, adding: params.get("add") === "1", syncing: params.get("sync") === "1", set };
+}
 
-  useServerEvents((ev) => {
-    if (ev.type === "run") lastRuns.setData((l) => (l ? [ev.run, ...l.filter((r) => r.id !== ev.run.id)] : l));
-  });
+export default function Repos() {
+  const { adding, syncing, set } = useRepoParams();
+  return (
+    <div className="container-console page">
+      <title>Repositories · kiln</title>
+      <PageIntro
+        index={4}
+        label="Repositories"
+        title="Repositories"
+        lead="The code kiln works with: repositories it builds, polled with conditional requests so idle ones cost nothing against GitHub's rate limit (pipelines live in .kiln/*.yaml), and folders it keeps the same on several machines."
+        actions={
+          <>
+            <Button size="sm" onClick={() => set("add", "1")} disabled={adding}>
+              <Plus /> Add repository
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => set("sync", "1")} disabled={syncing}>
+              <FolderSync /> Sync a folder
+            </Button>
+          </>
+        }
+      />
+      <Loadable label="the repositories" fallback={<ReposHold />}>
+        <ReposBody />
+      </Loadable>
+    </div>
+  );
+}
+
+function ReposBody() {
+  const { show, adding, syncing, set } = useRepoParams();
+  warm(reposRes, recentRunsRes(200), syncRes, agentsRes);
+  const repos = useRepos();
+  const lastRuns = useRecentRuns(200).data;
+  const sync = useRes(syncRes);
+  const agents = useRes(agentsRes).data;
+  const machines = React.useMemo(() => agents.map((a) => a.name).sort(), [agents]);
+  const [q, setQ] = React.useState("");
+  const [open, setOpen] = React.useState<{ id: string; what: "run" | "delete" } | null>(null);
+  const [polling, setPolling] = React.useState<Set<string>>(new Set());
+  const [notice, setNoticeState] = React.useState<Notice>(null);
+  // A success says so for a while; a failure stays until the next action.
+  const setNotice = (n: Notice) => {
+    setNoticeState(n);
+    if (n?.tone === "ok") window.setTimeout(() => setNoticeState((cur) => (cur === n ? null : cur)), 8_000);
+  };
 
   const latestByRepo = React.useMemo(() => {
     const m = new Map<string, Run>();
-    for (const r of lastRuns.data ?? []) {
+    for (const r of lastRuns) {
       const cur = m.get(r.repo_id);
       if (!cur || r.created_at > cur.created_at) m.set(r.repo_id, r);
     }
     return m;
-  }, [lastRuns.data]);
-  const syncedByName = React.useMemo(() => new Map((sync.data?.repos ?? []).map((s) => [s.name.toLowerCase(), s])), [sync.data]);
+  }, [lastRuns]);
+  const syncedByName = React.useMemo(() => new Map(sync.data.repos.map((s) => [s.name.toLowerCase(), s])), [sync.data]);
   const builtByName = React.useMemo(() => {
     const m = new Map<string, Repo>();
-    for (const r of repos.data ?? []) {
+    for (const r of repos.data) {
       const s = syncedFor(r, syncedByName);
       if (s) m.set(s.name.toLowerCase(), r);
     }
@@ -103,7 +124,7 @@ export default function Repos() {
     try {
       await api.pollRepo(r.id);
       setNotice({ tone: "ok", text: `Polling ${r.name}.` });
-      window.setTimeout(repos.reload, 1500);
+      window.setTimeout(() => invalidate("repos"), 1500);
     } catch (e) {
       setNotice({ tone: "fail", text: `Polling ${r.name} failed: ${errorMessage(e)}` });
     } finally {
@@ -116,70 +137,41 @@ export default function Repos() {
   };
 
   const toSynced = (s: SyncRepo) => {
-    if (show === "built") setShow("all");
+    if (show === "built") set("show", null);
     requestAnimationFrame(() => document.getElementById(`sync-${s.id}`)?.scrollIntoView({ block: "start" }));
   };
 
   const needle = q.trim().toLowerCase();
-  const list = (repos.data ?? []).filter((r) => r.name.toLowerCase().includes(needle));
+  const list = repos.data.filter((r) => r.name.toLowerCase().includes(needle));
 
   return (
-    <div className="container-console page">
-      <PageIntro
-        index={4}
-        label="Repositories"
-        title="Repositories"
-        lead="The code kiln works with: repositories it builds, polled with conditional requests so idle ones cost nothing against GitHub's rate limit (pipelines live in .kiln/*.yaml), and folders it keeps the same on several machines."
-        actions={
-          <>
-            <Button size="sm" onClick={() => setAdding(true)} disabled={adding}>
-              <Plus /> Add repository
-            </Button>
-            <Button size="sm" variant="secondary" onClick={() => setSyncing(true)} disabled={syncing}>
-              <FolderSync /> Sync a folder
-            </Button>
-          </>
-        }
-      />
-
-      <div className="mb-5 flex flex-wrap items-end gap-3">
-        <SearchField className="w-full sm:w-72" label="Find a repository" placeholder="Find a repository…" value={q} onChange={setQ} />
-        <SelectField label="Show" hideLabel value={show} onChange={(v) => setShow(v as Show)} options={SHOWS} className="w-full sm:w-56" />
-        <span className="label sm:ml-auto">
-          {repos.data ? `${list.length} built` : ""}
-          {repos.data && sync.data ? " · " : ""}
-          {sync.data ? `${sync.data.repos.length} synced` : ""}
-        </span>
-      </div>
+    <>
+      <ReposToolbar q={q} onQ={setQ} show={show} onShow={(v) => set("show", v === "all" ? null : v)} counts={`${list.length} built · ${sync.data.repos.length} synced`} />
       {notice && (
-        <p role="status" className={`mb-4 text-[12.5px] ${notice.tone === "ok" ? "text-[#a8c9bc]" : "text-[#d8b9bb]"}`}>
+        <p role="status" className="notice" data-tone={notice.tone}>
           {notice.text}
         </p>
       )}
       {adding && (
         <AddRepoForm
           onAdded={(r) => {
-            repos.setData((l) => [...(l ?? []), r]);
-            setAdding(false);
+            repos.setData((l) => [...l, r]);
+            set("add", null);
             setNotice({ tone: "ok", text: `${r.name} added; its first poll is on its way.` });
           }}
-          onCancel={() => setAdding(false)}
+          onCancel={() => set("add", null)}
         />
       )}
 
       {show !== "synced" && (
         <section className="mb-12" aria-labelledby="repos-built">
           <SectionHeading label="Built by kiln" title={<span id="repos-built">Repositories kiln builds</span>} />
-          {repos.error && !repos.data ? (
-            <ErrorState error={repos.error} onRetry={repos.reload} />
-          ) : !repos.data ? (
-            <SkeletonRows rows={6} cols={5} />
-          ) : repos.data.length === 0 ? (
+          {repos.data.length === 0 ? (
             <EmptyState
               icon={<GitBranch size={24} />}
               title="No repositories yet."
               action={
-                <Button size="sm" variant="secondary" onClick={() => setAdding(true)}>
+                <Button size="sm" variant="secondary" onClick={() => set("add", "1")}>
                   <Plus /> Add your first repository
                 </Button>
               }
@@ -191,18 +183,7 @@ export default function Repos() {
           ) : (
             <div className="table-wrap">
               <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Repository</th>
-                    <th className="hidden md:table-cell">Branches</th>
-                    <th className="hidden lg:table-cell">Latest run</th>
-                    <th className="num hidden sm:table-cell">Interval</th>
-                    <th className="num hidden sm:table-cell">Last poll</th>
-                    <th className="w-0 text-right">
-                      <span className="sr-only">Actions</span>
-                    </th>
-                  </tr>
-                </thead>
+                <ReposHead />
                 <tbody>
                   {list.map((r) => {
                     const latest = latestByRepo.get(r.id);
@@ -232,7 +213,15 @@ export default function Repos() {
                           </td>
                           <td className="hidden md:table-cell">
                             <span className="inline-flex flex-wrap gap-1">
-                              {r.branches.length ? r.branches.slice(0, 4).map((b) => <span key={b} className="chip">{b}</span>) : <span className="cell-dim">default</span>}
+                              {r.branches.length ? (
+                                r.branches.slice(0, 4).map((b) => (
+                                  <span key={b} className="chip">
+                                    {b}
+                                  </span>
+                                ))
+                              ) : (
+                                <span className="cell-dim">default</span>
+                              )}
                               {r.branches.length > 4 && <span className="chip">+{r.branches.length - 4}</span>}
                             </span>
                           </td>
@@ -256,7 +245,7 @@ export default function Repos() {
                             <div className="inline-flex items-center gap-0.5">
                               <Tip content="Poll now">
                                 <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Poll ${r.name} now`} disabled={polling.has(r.id)} onClick={() => poll(r)}>
-                                  <RefreshCw size={14} className={polling.has(r.id) ? "animate-spin" : undefined} />
+                                  <RefreshCw size={14} className={polling.has(r.id) ? "animate-spin motion-reduce:animate-none" : undefined} />
                                 </button>
                               </Tip>
                               <Tip content="Start a run">
@@ -301,7 +290,7 @@ export default function Repos() {
                                   repo={r}
                                   onCancel={() => setOpen(null)}
                                   onDeleted={() => {
-                                    repos.setData((l) => l?.filter((x) => x.id !== r.id));
+                                    repos.setData((l) => l.filter((x) => x.id !== r.id));
                                     setOpen(null);
                                     setNotice({ tone: "ok", text: `${r.name} deleted.` });
                                   }}
@@ -322,15 +311,12 @@ export default function Repos() {
 
       {show !== "built" && (
         <section aria-labelledby="repos-synced">
-          <SectionHeading label="Synced to machines" title={<span id="repos-synced">Folders kept the same on several machines</span>} />
-          <p className="mb-4 max-w-[68ch] text-[12.5px] leading-relaxed text-[#9a9ca5]">
-            A change on one machine reaches the others within seconds; when two machines change one file, both versions are kept.
-          </p>
+          <SyncedHeading />
           <SyncedRepos
             view={sync}
             machines={machines}
             adding={syncing}
-            onAdding={setSyncing}
+            onAdding={(on) => set("sync", on ? "1" : null)}
             q={q}
             builtBy={(name) => {
               const r = builtByName.get(name.toLowerCase());
@@ -339,7 +325,68 @@ export default function Repos() {
           />
         </section>
       )}
+    </>
+  );
+}
+
+function ReposToolbar({ q, onQ, show, onShow, counts }: { q: string; onQ: (v: string) => void; show: Show; onShow: (v: Show) => void; counts: string }) {
+  return (
+    <div className="mb-5 flex flex-wrap items-end gap-3">
+      <SearchField className="w-full sm:w-72" label="Find a repository" placeholder="Find a repository…" value={q} onChange={onQ} />
+      <SelectField label="Show" hideLabel value={show} onChange={(v) => onShow(v as Show)} options={SHOWS} className="w-full sm:w-56" />
+      <span className="label tabular-nums sm:ml-auto">{counts}</span>
     </div>
+  );
+}
+
+function ReposHead() {
+  return (
+    <thead>
+      <tr>
+        <th>Repository</th>
+        <th className="hidden md:table-cell">Branches</th>
+        <th className="hidden lg:table-cell">Latest run</th>
+        <th className="num hidden sm:table-cell">Interval</th>
+        <th className="num hidden sm:table-cell">Last poll</th>
+        <th className="w-0 text-right">
+          <span className="sr-only">Actions</span>
+        </th>
+      </tr>
+    </thead>
+  );
+}
+
+function SyncedHeading() {
+  return (
+    <>
+      <SectionHeading label="Synced to machines" title={<span id="repos-synced">Folders kept the same on several machines</span>} />
+      <p className="mb-4 max-w-[68ch] text-[12.5px] leading-relaxed text-[#9a9ca5]">
+        A change on one machine reaches the others within seconds; when two machines change one file, both versions are kept.
+      </p>
+    </>
+  );
+}
+
+/** The page while it loads: its toolbar, the table's head and rows' space, the synced folders' frame. */
+function ReposHold() {
+  const { show } = useRepoParams();
+  const noop = () => undefined;
+  return (
+    <>
+      <ReposToolbar q="" onQ={noop} show={show} onShow={noop} counts={"\u00a0"} />
+      {show !== "synced" && (
+        <section className="mb-12">
+          <SectionHeading label="Built by kiln" title="Repositories kiln builds" />
+          <TableHold head={<ReposHead />} rows={6} rowHeight={45} label="Loading the repositories" />
+        </section>
+      )}
+      {show !== "built" && (
+        <section>
+          <SyncedHeading />
+          <RowsHold rows={3} rowHeight={72} />
+        </section>
+      )}
+    </>
   );
 }
 
@@ -460,33 +507,40 @@ function DeleteRepo({ repo, onCancel, onDeleted }: { repo: Repo; onCancel: () =>
   const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
   return (
-    <div role="group" aria-label={`Delete ${repo.name}`} className="max-w-[640px] space-y-3 py-2">
-      <p className="text-[12.5px] text-[#c8cad0]">kiln stops polling {repo.name}. Its runs and logs are removed with it; its synced copies, if any, keep syncing.</p>
-      {err && <ErrorState error={err} compact />}
-      <div className="flex gap-2">
-        <Button
-          size="sm"
-          variant="danger"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            setErr(null);
-            try {
-              await api.deleteRepo(repo.id);
-              onDeleted();
-            } catch (e) {
-              setErr(errorMessage(e));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          Delete {repo.name}
-        </Button>
-        <Button size="sm" variant="ghost" onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
+    <div className="py-2">
+      <Confirm
+        label={`Delete ${repo.name}`}
+        tone="danger"
+        actions={
+          <>
+            <Button
+              size="sm"
+              variant="danger"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                setErr(null);
+                try {
+                  await api.deleteRepo(repo.id);
+                  onDeleted();
+                } catch (e) {
+                  setErr(errorMessage(e));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              Delete {repo.name}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={onCancel}>
+              Cancel
+            </Button>
+          </>
+        }
+      >
+        <p>kiln stops polling {repo.name}. Its runs and logs are removed with it; its synced copies, if any, keep syncing.</p>
+        {err && <ErrorState error={err} compact />}
+      </Confirm>
     </div>
   );
 }

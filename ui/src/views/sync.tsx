@@ -3,9 +3,10 @@ import { Link } from "react-router";
 import { api } from "@/api/client";
 import type { SyncConflict, SyncCopy, SyncKeep, SyncRepo, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { EmptyState, ErrorState, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
+import { Confirm, EmptyState, SelectField, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
-import { errorMessage, type Resource } from "@/lib/hooks";
+import { errorMessage } from "@/lib/hooks";
+import type { SuspenseResource } from "@/lib/resource";
 import "./sync.css";
 
 /** A copy's state as a status dot shows it. */
@@ -33,7 +34,7 @@ export function SyncedRepos({
   q,
   builtBy,
 }: {
-  view: Resource<SyncView>;
+  view: SuspenseResource<SyncView>;
   machines: string[];
   adding: boolean;
   onAdding: (on: boolean) => void;
@@ -42,11 +43,11 @@ export function SyncedRepos({
   builtBy?: (name: string) => { name: string; href: string } | undefined;
 }) {
   const needle = q.trim().toLowerCase();
-  const repos = (view.data?.repos ?? []).filter((r) => !needle || r.name.toLowerCase().includes(needle));
+  const repos = view.data.repos.filter((r) => !needle || r.name.toLowerCase().includes(needle));
 
   return (
     <div className="sync-page">
-      {view.data?.error && <p className="sync-off">{view.data.error}</p>}
+      {view.data.error && <p className="sync-off">{view.data.error}</p>}
       {adding && (
         <NewRepo
           machines={machines}
@@ -57,11 +58,7 @@ export function SyncedRepos({
           onCancel={() => onAdding(false)}
         />
       )}
-      {view.error && !view.data ? (
-        <ErrorState error={view.error} onRetry={view.reload} />
-      ) : !view.data ? (
-        <SkeletonRows rows={3} cols={3} />
-      ) : repos.length === 0 && !adding ? (
+      {repos.length === 0 && !adding ? (
         needle ? (
           <p className="sync-none">No synced folder matches.</p>
         ) : (
@@ -246,17 +243,22 @@ function RepoBlock({ repo, machines, onChange }: { repo: SyncRepo; machines: str
       {repo.error && <p className="sync-error">{repo.error}</p>}
       {error && <p className="sync-error">{error}</p>}
       {stopping && (
-        <div className="sync-confirm" role="group" aria-label={`Stop syncing ${repo.name}`}>
+        <Confirm
+          label={`Stop syncing ${repo.name}`}
+          tone="danger"
+          actions={
+            <>
+              <Button size="xs" variant="danger" onClick={() => void act(() => api.syncDelete(repo.id))}>
+                Stop syncing
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setStopping(false)}>
+                Keep syncing
+              </Button>
+            </>
+          }
+        >
           <p>Stop syncing {repo.name}? Every copy keeps its files where they are.</p>
-          <div className="sync-actions">
-            <Button size="xs" variant="danger" onClick={() => void act(() => api.syncDelete(repo.id))}>
-              Stop syncing
-            </Button>
-            <Button size="xs" variant="ghost" onClick={() => setStopping(false)}>
-              Keep syncing
-            </Button>
-          </div>
-        </div>
+        </Confirm>
       )}
       <ul className="sync-copies-list">
         {repo.copies.map((c) => (
@@ -328,19 +330,24 @@ function CopyRow({ copy, onRemove }: { copy: SyncCopy; onRemove: () => Promise<b
         </details>
       )}
       {removing && (
-        <div className="sync-confirm" role="group" aria-label={`Remove the copy on ${copy.machine}`}>
+        <Confirm
+          label={`Remove the copy on ${copy.machine}`}
+          tone="danger"
+          actions={
+            <>
+              <Button size="xs" variant="danger" onClick={() => void onRemove().then((ok) => ok || setRemoving(false))}>
+                Remove copy
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
+                Keep it
+              </Button>
+            </>
+          }
+        >
           <p>
             Stop syncing the copy on {copy.machine}? Its files stay in <code>{copy.path}</code>.
           </p>
-          <div className="sync-actions">
-            <Button size="xs" variant="danger" onClick={() => void onRemove().then((ok) => ok || setRemoving(false))}>
-              Remove copy
-            </Button>
-            <Button size="xs" variant="ghost" onClick={() => setRemoving(false)}>
-              Keep it
-            </Button>
-          </div>
-        </div>
+        </Confirm>
       )}
     </li>
   );

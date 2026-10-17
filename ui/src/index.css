@@ -1268,6 +1268,19 @@
   max-width: 420px;
   line-height: 1.7;
 }
+/* What an action did, said once on its page: quiet when it went well, warm when it didn't. */
+.notice {
+  margin: 0 0 16px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.notice[data-tone="ok"] {
+  color: var(--color-ok);
+}
+.notice[data-tone="fail"] {
+  color: #d8b9bb;
+}
 /* A question asked in place (misc.tsx Confirm): every page's confirmations look alike. */
 .confirm {
   display: grid;
