@@ -22,6 +22,7 @@ export const NAV = [
   { to: "/", label: "Overview", end: true },
   { to: "/runs", label: "Runs" },
   { to: "/repos", label: "Repos" },
+  { to: "/runners", label: "Runners" },
   { to: "/agents", label: "Agents" },
   { to: "/terminal", label: "Terminal" },
   { to: "/telemetry", label: "Metrics" },

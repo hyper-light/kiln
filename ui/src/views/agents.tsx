@@ -1,525 +1,497 @@
 import * as React from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
-import { DropdownMenu, Switch } from "radix-ui";
-import { LayoutGrid, List, MoreHorizontal, Plus, Server, SquareTerminal, Trash2 } from "lucide-react";
+import { Bot, FileText, Plus, SquareTerminal } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, HostSample, Job, JoinInfo } from "@/api/types";
+import type { Agent, AiSession, AiTranscriptEntry } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
-import { CopyButton, EmptyState, ErrorState, Facts, Meter, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
-import { Chips, StatusDot } from "@/components/ui/status";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { EmptyState, ErrorState, Facts, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
+import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
-import { toast } from "@/components/ui/toast";
-import { Tip } from "@/components/ui/tooltip";
-import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
+import { absoluteTime } from "@/lib/format";
 import { errorMessage, useDocumentTitle, useLocalStorage, useResource } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
-import { HostCharts } from "./host-charts";
-import { OnThisNetwork, WaitingToJoin, useJoinData } from "./agents-join";
-import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct, upsert } from "./shared";
+import { RelTime } from "./shared";
 
-type Filter = "all" | "connected" | "baremetal" | "k8s" | "draining";
+type Filter = "all" | "kiln" | "elsewhere";
 
-export function agentStatus(a: Agent) {
-  return !a.connected ? "cancelled" : a.draining ? "timed_out" : a.busy > 0 ? "running" : "succeeded";
-}
-export function agentStateLabel(a: Agent) {
-  return !a.connected ? "offline" : a.draining ? "draining" : a.busy > 0 ? "busy" : "idle";
+interface Tool {
+  id: string;
+  label: string;
+  /** The program a new session runs. */
+  command: string;
 }
 
+const CLAUDE: Tool = { id: "claude", label: "Claude Code", command: "claude" };
+const TOOLS: Tool[] = [CLAUDE, { id: "codex", label: "Codex", command: "codex" }, { id: "gemini", label: "Gemini CLI", command: "gemini" }];
+
+const toolLabel = (tool: string) => TOOLS.find((t) => t.id === tool)?.label ?? tool;
+const sessionKey = (s: AiSession) => `${s.machine}:${s.pid}`;
+const dotStatus = (s: AiSession) => (s.state === "working" ? "running" : s.state === "waiting" ? "timed_out" : "skipped");
+const stateLabel = (s: AiSession) => (s.state === "working" ? "working" : s.state === "waiting" ? "waiting for you" : "running");
+const terminalLink = (s: AiSession) =>
+  `/terminal?session=${encodeURIComponent(s.terminal ?? "")}&target=${encodeURIComponent(`agent:${s.machine}`)}`;
+
+/** A home directory as "~". */
+function tildify(path: string) {
+  return path.replace(/^\/(?:home|Users)\/[^/]+(?=\/|$)/, "~");
+}
+
+/** What a new agent's terminal runs: the tool in its folder, then a login shell once it exits. */
+function launchCommand(command: string, dir: string, windows: boolean) {
+  if (windows) return command;
+  const d = dir.trim() || "~";
+  const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const cd = d === "~" ? "cd ~" : d.startsWith("~/") ? `cd ~/${quote(d.slice(2))}` : `cd ${quote(d)}`;
+  return `${cd} && ${command}; exec $SHELL -l`;
+}
+
+/** Call `fn` at most once per `ms`, trailing. */
+function useThrottled(fn: () => void, ms: number) {
+  const latest = React.useRef(fn);
+  const timer = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    latest.current = fn;
+  });
+  React.useEffect(
+    () => () => {
+      if (timer.current !== null) window.clearTimeout(timer.current);
+    },
+    [],
+  );
+  return React.useCallback(() => {
+    if (timer.current !== null) return;
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      latest.current();
+    }, ms);
+  }, [ms]);
+}
+
+/** Live AI coding sessions across machines: kiln-hosted ones to drive, others to watch. */
 export default function Agents() {
   useDocumentTitle("Agents");
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  const agents = useResource((s) => api.agents(s), [], { pollMs: 30_000 });
-  const [history, setHistory] = React.useState<Record<string, HostSample[]>>({});
-  const [view, setView] = useLocalStorage<"table" | "cards">("kiln.agents.view", "table");
+  const sessions = useResource((s) => api.aiSessions(s), [], { pollMs: 20_000 });
+  const silent = useResource((s) => api.aiSilent(s), [], { pollMs: 30_000 });
   const [filter, setFilter] = React.useState<Filter>("all");
   const [q, setQ] = React.useState("");
-  const [joinOpen, setJoinOpen] = React.useState(params.get("join") === "1");
-  const [forget, setForget] = React.useState<Agent | null>(null);
-  const selected = params.get("agent");
-  const { requests: joinRequests, discovery } = useJoinData();
+  const [newOpen, setNewOpen] = React.useState(params.get("new") === "1");
+  const selected = params.get("session");
 
+  // Links from before CI machines were called runners.
   React.useEffect(() => {
-    if (params.get("join") === "1") {
-      setJoinOpen(true);
+    if (params.has("agent") || params.has("join")) navigate(`/runners?${params.toString()}`, { replace: true });
+  }, [params, navigate]);
+  React.useEffect(() => {
+    if (params.get("new") === "1") {
+      setNewOpen(true);
       const n = new URLSearchParams(params);
-      n.delete("join");
+      n.delete("new");
       setParams(n, { replace: true });
     }
   }, [params, setParams]);
 
-  React.useEffect(() => {
-    const ctl = new AbortController();
-    api
-      .metricsHistory(undefined, ctl.signal)
-      .then((h) => setHistory(Object.fromEntries(Object.entries(h).map(([k, v]) => [k, v.slice(-120)]))))
-      .catch(() => undefined);
-    return () => ctl.abort();
-  }, []);
-
+  const reload = useThrottled(sessions.reload, 1000);
+  const reloadSilent = useThrottled(silent.reload, 2000);
   useServerEvents((ev) => {
-    if (ev.type === "agent") agents.setData((l) => upsert(l, ev.agent, (a) => a.name, false));
-    if (ev.type === "sample" && ev.agent !== "server") {
-      agents.setData((l) => l?.map((a) => (a.name === ev.agent ? { ...a, sample: ev.sample } : a)));
-      setHistory((h) => ({ ...h, [ev.agent]: [...(h[ev.agent] ?? []), ev.sample].slice(-120) }));
-    }
+    if (ev.type === "ai_sessions" || (ev.type === "agent" && !ev.agent.connected)) reload();
+    if (ev.type === "ai_sessions" || ev.type === "agent") reloadSilent();
   });
+  const quiet = silent.data?.machines ?? [];
 
-  const drain = async (a: Agent, draining: boolean) => {
-    agents.setData((l) => l?.map((x) => (x.name === a.name ? { ...x, draining } : x)));
-    try {
-      await api.drainAgent(a.name, draining);
-      toast({ title: draining ? `Draining ${a.name}` : `${a.name} accepting jobs`, tone: "info" });
-    } catch (e) {
-      agents.setData((l) => l?.map((x) => (x.name === a.name ? { ...x, draining: !draining } : x)));
-      toast.error("Drain failed", errorMessage(e));
-    }
-  };
-
-  const all = agents.data ?? [];
+  const all = sessions.data ?? [];
   const counts: Record<Filter, number> = {
     all: all.length,
-    connected: all.filter((a) => a.connected).length,
-    baremetal: all.filter((a) => !a.ephemeral).length,
-    k8s: all.filter((a) => a.ephemeral).length,
-    draining: all.filter((a) => a.draining).length,
+    kiln: all.filter((s) => s.terminal).length,
+    elsewhere: all.filter((s) => !s.terminal).length,
   };
   const ql = q.trim().toLowerCase();
   const list = all
-    .filter((a) =>
-      filter === "connected" ? a.connected : filter === "baremetal" ? !a.ephemeral : filter === "k8s" ? a.ephemeral : filter === "draining" ? a.draining : true,
-    )
-    .filter((a) => !ql || `${a.name} ${a.hostname} ${a.labels.join(" ")}`.toLowerCase().includes(ql))
-    .sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
+    .filter((s) => (filter === "kiln" ? Boolean(s.terminal) : filter === "elsewhere" ? !s.terminal : true))
+    .filter((s) => !ql || `${s.title} ${s.name} ${s.cwd} ${s.branch} ${s.machine} ${toolLabel(s.tool)} ${s.last_prompt}`.toLowerCase().includes(ql));
+  const working = all.filter((s) => s.state === "working").length;
+  const waiting = all.filter((s) => s.state === "waiting").length;
+  const open = all.find((s) => sessionKey(s) === selected) ?? null;
 
-  const slots = all.filter((a) => a.connected).reduce((s, a) => s + a.slots, 0);
-  const busy = all.filter((a) => a.connected).reduce((s, a) => s + a.busy, 0);
-  const selAgent = all.find((a) => a.name === selected) ?? null;
-
-  const openAgent = (name: string | null) => {
+  const select = (s: AiSession | null) => {
     const n = new URLSearchParams(params);
-    if (name) n.set("agent", name);
-    else n.delete("agent");
+    if (s) n.set("session", sessionKey(s));
+    else n.delete("session");
     setParams(n, { replace: true });
   };
 
   return (
     <div className="container-console page">
       <PageIntro
-        index={4}
+        index={5}
         label="Agents"
-        title="Fleet"
+        title="Live sessions"
         lead={
-          agents.data ? (
-            <>
-              {counts.connected} of {counts.all} agents connected · {busy}/{slots} slots busy. Bare-metal agents are long-lived daemons; Kubernetes agents are ephemeral pods launched per job.
-            </>
-          ) : (
-            "Bare-metal agents are long-lived daemons; Kubernetes agents are ephemeral pods launched per job."
-          )
+          <>
+            {sessions.data ? `${all.length} running · ${working} working · ${waiting} waiting for you. ` : ""}
+            Claude Code, Codex and Gemini sessions on your machines. Ones started in kiln can be driven from any device; ones started elsewhere show a
+            live, read-only transcript.
+          </>
         }
         actions={
-          <Button onClick={() => setJoinOpen(true)}>
-            <Plus /> Add bare-metal agent
+          <Button onClick={() => setNewOpen(true)}>
+            <Plus /> New agent
           </Button>
         }
       />
 
-      <WaitingToJoin requests={joinRequests.data ?? []} onDecided={joinRequests.reload} />
-
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <Segmented
-          label="Filter agents"
+          label="Filter sessions"
           value={filter}
           onChange={setFilter}
           options={[
             { value: "all", label: "All", count: counts.all },
-            { value: "connected", label: "Connected", count: counts.connected },
-            { value: "baremetal", label: "Bare metal", count: counts.baremetal },
-            { value: "k8s", label: "Pods", count: counts.k8s },
-            { value: "draining", label: "Draining", count: counts.draining },
+            { value: "kiln", label: "In kiln", count: counts.kiln },
+            { value: "elsewhere", label: "Elsewhere", count: counts.elsewhere },
           ]}
         />
-        <div className="ml-auto flex w-full items-center gap-2 sm:w-auto">
-          <SearchField className="min-w-0 flex-1 sm:w-56" label="Search agents" placeholder="Name, host, label…" value={q} onChange={setQ} />
-          <Segmented
-            label="Layout"
-            value={view}
-            onChange={setView}
-            options={[
-              { value: "table", label: <List size={14} aria-label="Table" /> },
-              { value: "cards", label: <LayoutGrid size={14} aria-label="Cards" /> },
-            ]}
-          />
-        </div>
+        <SearchField className="ml-auto w-full min-w-0 sm:w-64" label="Search sessions" placeholder="Title, folder, machine…" value={q} onChange={setQ} />
       </div>
+      {quiet.length > 0 && (
+        <p className="mb-5 text-[12px] leading-relaxed text-[#8f939e]">
+          Not reporting sessions: <span className="font-mono text-[#c8cad0]">{quiet.join(", ")}</span>. {quiet.length === 1 ? "It runs" : "They run"} an older
+          kiln; {quiet.length === 1 ? "its" : "their"} sessions show up here once {quiet.length === 1 ? "it is" : "they are"} updated.
+        </p>
+      )}
 
-      {agents.error && !agents.data ? (
-        <ErrorState error={agents.error} onRetry={agents.reload} />
-      ) : !agents.data ? (
-        <SkeletonRows rows={6} />
+      {sessions.error && !sessions.data ? (
+        <ErrorState error={sessions.error} onRetry={sessions.reload} />
+      ) : !sessions.data ? (
+        <SkeletonRows rows={4} />
       ) : all.length === 0 ? (
         <EmptyState
-          icon={<Server size={24} />}
-          title="No agents have enrolled."
+          icon={<Bot size={24} />}
+          title="No AI sessions are running."
           action={
-            <Button variant="secondary" onClick={() => setJoinOpen(true)}>
-              <Plus /> Add bare-metal agent
+            <Button variant="secondary" onClick={() => setNewOpen(true)}>
+              <Plus /> New agent
             </Button>
           }
         >
-          Run the join command on a machine to enroll it, or configure Kubernetes in the server config to launch pod agents on demand.
+          Start Claude Code, Codex or Gemini here and drive it from any device. Sessions you start in your own terminals on a machine with a kiln runner
+          show up here too.
         </EmptyState>
       ) : list.length === 0 ? (
-        <EmptyState title="No agents match." action={<Button variant="secondary" onClick={() => { setFilter("all"); setQ(""); }}>Clear filters</Button>} />
-      ) : view === "cards" ? (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-          {list.map((a) => (
-            <AgentMiniCard key={a.name} agent={a} history={history[a.name] ?? []} onOpen={() => openAgent(a.name)} />
+        <EmptyState
+          title="No sessions match."
+          action={
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setFilter("all");
+                setQ("");
+              }}
+            >
+              Clear filters
+            </Button>
+          }
+        />
+      ) : (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 2xl:grid-cols-3">
+          {list.map((s) => (
+            <SessionCard key={sessionKey(s)} s={s} onTranscript={() => select(s)} />
           ))}
         </div>
-      ) : (
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th className="w-6" aria-label="State" />
-                <th>Agent</th>
-                <th className="hidden md:table-cell">Labels</th>
-                <th className="hidden lg:table-cell">Kind</th>
-                <th>Slots</th>
-                <th className="num hidden sm:table-cell">CPU</th>
-                <th className="num hidden lg:table-cell">Mem</th>
-                <th className="num hidden xl:table-cell">Disk</th>
-                <th className="num hidden xl:table-cell">Load</th>
-                <th className="hidden md:table-cell">Drain</th>
-                <th className="w-0">
-                  <span className="sr-only">Actions</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {list.map((a) => {
-                const s = a.sample;
-                return (
-                  <tr key={a.name} data-href tabIndex={0} onClick={(e) => !(e.target as HTMLElement).closest("button,a,[role=switch]") && openAgent(a.name)} onKeyDown={(e) => e.key === "Enter" && openAgent(a.name)}>
-                    <td>
-                      <StatusDot status={agentStatus(a)} title={agentStateLabel(a)} />
-                    </td>
-                    <td className="max-w-[260px]">
-                      <div className="truncate text-[#e4e5e7]">{a.name}</div>
-                      <div className="truncate font-mono text-[10px] text-[#7b7e88]">
-                        {a.connected ? `${a.hostname} · ${a.os}/${a.arch} · v${a.version}` : <>last seen <RelTime ts={a.last_seen} /></>}
-                      </div>
-                    </td>
-                    <td className="hidden md:table-cell">
-                      <Chips labels={a.labels} max={4} />
-                    </td>
-                    <td className="hidden lg:table-cell">
-                      <span className="font-mono text-[10px] text-[#a1a4ad]">{a.ephemeral ? "pod · ephemeral" : "persistent"}</span>
-                    </td>
-                    <td className="min-w-[90px]">
-                      <div className="font-mono text-[11px] text-[#c8cad0] tabular-nums">
-                        {a.busy}/{a.slots}
-                        {a.running.length > 0 && <span className="ml-1.5 text-[#7b7e88]">· {a.running.length} job{a.running.length > 1 ? "s" : ""}</span>}
-                      </div>
-                      <div className="mt-1 w-20">
-                        <Meter value={a.busy} max={Math.max(1, a.slots)} label="Slots busy" />
-                      </div>
-                    </td>
-                    <td className="num cell-mono hidden sm:table-cell">{s ? formatPct(s.cpu_pct) : "—"}</td>
-                    <td className="num cell-mono hidden lg:table-cell">{s ? formatPct(memPct(s)) : "—"}</td>
-                    <td className="num cell-mono hidden xl:table-cell">{s ? formatPct(diskPct(s)) : "—"}</td>
-                    <td className="num cell-mono hidden xl:table-cell">{s ? s.load1.toFixed(2) : "—"}</td>
-                    <td className="hidden md:table-cell">
-                      <DrainSwitch agent={a} onChange={(v) => drain(a, v)} />
-                    </td>
-                    <td className="text-right whitespace-nowrap">
-                      <AgentActions agent={a} onForget={() => setForget(a)} onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)} />
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
       )}
 
-      <OnThisNetwork discovery={discovery.data} error={discovery.error} onRetry={discovery.reload} />
-
-      <JoinDialog open={joinOpen} onOpenChange={setJoinOpen} />
-      <AgentDrawer agent={selAgent} onClose={() => openAgent(null)} onDrain={drain} onForget={(a) => setForget(a)} />
-      {forget && (
-        <ConfirmDialog
-          open
-          onOpenChange={(o) => !o && setForget(null)}
-          title={`Forget ${forget.name}?`}
-          description={forget.connected ? "The agent is connected; it will be disconnected and must re-enroll to come back." : "Removes the agent and its enrollment. It must re-enroll to come back."}
-          confirmLabel="Forget agent"
-          danger
-          onConfirm={async () => {
-            try {
-              await api.forgetAgent(forget.name);
-              agents.setData((l) => l?.filter((x) => x.name !== forget.name));
-              if (selected === forget.name) openAgent(null);
-              toast({ title: `${forget.name} forgotten`, tone: "info" });
-            } catch (e) {
-              toast.error("Forget failed", errorMessage(e));
-            }
-          }}
-        />
-      )}
+      <NewAgentDialog open={newOpen} onOpenChange={setNewOpen} />
+      <TranscriptDrawer session={open} onClose={() => select(null)} />
     </div>
   );
 }
 
-function DrainSwitch({ agent, onChange }: { agent: Agent; onChange: (v: boolean) => void }) {
+function SessionCard({ s, onTranscript }: { s: AiSession; onTranscript: () => void }) {
   return (
-    <label className="inline-flex min-h-8 cursor-pointer items-center gap-2">
-      <Switch.Root
-        checked={agent.draining}
-        onCheckedChange={onChange}
-        disabled={!agent.connected}
-        aria-label={`Drain ${agent.name}`}
-        className="relative h-[18px] w-8 shrink-0 rounded-full border border-white/15 bg-white/[0.04] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#08090a] disabled:opacity-40 data-[state=checked]:border-[#cbb69a]/50 data-[state=checked]:bg-[#cbb69a]/20"
-      >
-        <Switch.Thumb className="block size-3 translate-x-[2px] rounded-full bg-[#a1a4ad] transition-transform duration-200 data-[state=checked]:translate-x-[15px] data-[state=checked]:bg-[#e3d2b8]" />
-      </Switch.Root>
-      <span className={cn("font-mono text-[10px]", agent.draining ? "text-[#cbb69a]" : "text-[#7b7e88]")}>{agent.draining ? "draining" : "off"}</span>
-    </label>
+    <article className="card flex min-w-0 flex-col" data-live={s.state === "working" ? "true" : undefined}>
+      <div className="flex min-w-0 items-center gap-2.5 px-4 pt-4">
+        <StatusDot status={dotStatus(s)} title={stateLabel(s)} />
+        <span className="shrink-0 font-mono text-[10px] tracking-[0.06em] text-[#a1a4ad] uppercase">{toolLabel(s.tool)}</span>
+        <span className="min-w-0 truncate font-mono text-[10px] text-[#7b7e88]">· {s.machine}</span>
+        <span className="ml-auto shrink-0 font-mono text-[10px] text-[#7b7e88]">
+          <RelTime ts={s.last_activity} />
+        </span>
+      </div>
+      <h3 className="mt-2 line-clamp-2 px-4 text-[15px] font-[480] tracking-[-0.3px] break-words text-[#e4e5e7]">{s.title || s.name || toolLabel(s.tool)}</h3>
+      <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 font-mono text-[10.5px] text-[#8f939e]">
+        <span className="max-w-full min-w-0 truncate" title={s.cwd}>
+          {tildify(s.cwd) || "—"}
+        </span>
+        {s.branch && <span className="chip">{s.branch}</span>}
+        {s.name && s.title && <span className="chip">{s.name}</span>}
+      </div>
+      {s.last_prompt && (
+        <p className="mt-3 line-clamp-2 px-4 text-[12.5px] break-words text-[#cdc4e0]">
+          <span className="text-[#6d7078] select-none">› </span>
+          {s.last_prompt}
+        </p>
+      )}
+      {s.last_reply && <p className="mt-1.5 line-clamp-3 px-4 text-[12.5px] leading-relaxed break-words text-[#a1a4ad]">{s.last_reply}</p>}
+      <div className="mt-auto flex flex-wrap items-center gap-2 px-4 pt-4 pb-4">
+        {s.terminal ? (
+          <Button asChild size="sm">
+            <Link to={terminalLink(s)}>
+              <SquareTerminal /> Open terminal
+            </Link>
+          </Button>
+        ) : (
+          <span className="font-mono text-[10px] text-[#7b7e88]">started outside kiln · watch only</span>
+        )}
+        {s.transcript && (
+          <Button variant="ghost" size="sm" onClick={onTranscript}>
+            <FileText /> Transcript
+          </Button>
+        )}
+        <span className={cn("ml-auto font-mono text-[10px]", s.state === "waiting" ? "text-[#cbb69a]" : "text-[#7b7e88]")}>{stateLabel(s)}</span>
+      </div>
+    </article>
   );
 }
 
-function AgentActions({ agent, onForget, onTerminal }: { agent: Agent; onForget: () => void; onTerminal: () => void }) {
-  return (
-    <div className="inline-flex items-center">
-      <Tip content={agent.connected ? "Open terminal" : "Agent offline"}>
-        <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Open terminal on ${agent.name}`} disabled={!agent.connected} onClick={onTerminal}>
-          <SquareTerminal size={14} />
-        </button>
-      </Tip>
-      <DropdownMenu.Root>
-        <DropdownMenu.Trigger asChild>
-          <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`More actions for ${agent.name}`}>
-            <MoreHorizontal size={15} />
-          </button>
-        </DropdownMenu.Trigger>
-        <DropdownMenu.Portal>
-          <DropdownMenu.Content className="popover" align="end" sideOffset={4}>
-            <DropdownMenu.Item className="menu-item" data-danger onSelect={onForget}>
-              <Trash2 size={14} /> Forget agent…
-            </DropdownMenu.Item>
-          </DropdownMenu.Content>
-        </DropdownMenu.Portal>
-      </DropdownMenu.Root>
-    </div>
-  );
-}
-
-type JoinPlatform = "linux" | "macos" | "windows";
-
-const JOIN_BOOT: Record<JoinPlatform, string> = {
-  linux: "starts the agent on boot (systemd, cron @reboot, or XDG autostart)",
-  macos: "starts the agent at login with launchd",
-  windows: "starts the agent at logon with a per-user scheduled task (no admin rights needed)",
-};
-
-function JoinDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
-  const [info, setInfo] = React.useState<JoinInfo | null>(null);
+function TranscriptDrawer({ session, onClose }: { session: AiSession | null; onClose: () => void }) {
+  const [entries, setEntries] = React.useState<AiTranscriptEntry[] | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
-  const [platform, setPlatform] = useLocalStorage<JoinPlatform>("kiln.agents.join-platform", "linux");
-  const command = !info ? "" : platform === "windows" ? (info.windows ?? info.command) : platform === "macos" ? (info.macos ?? info.command) : info.command;
-  const prompt = platform === "windows" ? "PS> " : "$ ";
+  const scroller = React.useRef<HTMLDivElement>(null);
+  const atBottom = React.useRef(true);
+  const machine = session?.machine;
+  const pid = session?.pid;
+  const activity = session?.last_activity;
+
   React.useEffect(() => {
-    if (!open) return;
-    setInfo(null);
+    setEntries(null);
     setErr(null);
+    atBottom.current = true;
+  }, [machine, pid]);
+
+  // Refetched whenever the machine reports new activity in this session.
+  React.useEffect(() => {
+    if (!machine || pid === undefined) return;
     const ctl = new AbortController();
     api
-      .join(ctl.signal)
-      .then(setInfo)
+      .aiTranscript(machine, pid, ctl.signal)
+      .then((e) => {
+        setEntries(e);
+        setErr(null);
+      })
       .catch((e) => !ctl.signal.aborted && setErr(errorMessage(e)));
     return () => ctl.abort();
-  }, [open]);
+  }, [machine, pid, activity]);
+
+  // Follow new messages unless the reader scrolled up.
+  React.useLayoutEffect(() => {
+    const el = scroller.current;
+    if (el && atBottom.current) el.scrollTop = el.scrollHeight;
+  }, [entries]);
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        title="Add a bare-metal agent"
-        eyebrow="Agents / Join"
-        description={`Run this on the machine you want to enroll. It installs kiln, enrolls over QUIC + mTLS, and ${JOIN_BOOT[platform]}.`}
-        className="!w-[min(680px,calc(100vw-24px))]"
-      >
-        {err ? (
-          <ErrorState error={err} />
-        ) : !info ? (
-          <Skeleton className="h-24 w-full" />
-        ) : (
-          <div className="space-y-4">
-            <Segmented
-              label="Platform"
-              value={platform}
-              onChange={setPlatform}
-              options={[
-                { value: "linux", label: "Linux" },
-                { value: "macos", label: "macOS" },
-                { value: "windows", label: "Windows" },
+    <Dialog open={Boolean(session)} onOpenChange={(o) => !o && onClose()}>
+      {session && (
+        <DialogContent
+          variant="drawer"
+          title={session.title || session.name || toolLabel(session.tool)}
+          eyebrow={`${toolLabel(session.tool)} · ${session.machine} · ${stateLabel(session)}`}
+          description={tildify(session.cwd)}
+        >
+          <div className="flex flex-wrap gap-2">
+            {session.terminal ? (
+              <Button asChild size="sm">
+                <Link to={terminalLink(session)}>
+                  <SquareTerminal /> Open terminal
+                </Link>
+              </Button>
+            ) : (
+              <p className="text-[12px] leading-relaxed text-[#8f939e]">Started outside kiln, so it can be watched here but not typed into.</p>
+            )}
+          </div>
+          <div className="mt-5">
+            <Facts
+              items={[
+                { label: "Model", value: session.model || "—" },
+                { label: "Branch", value: session.branch || "—" },
+                { label: "Started", value: absoluteTime(session.started_at) },
+                { label: "Last activity", value: <RelTime ts={session.last_activity} /> },
+                { label: "Process", value: `pid ${session.pid}` },
+                ...(session.id ? [{ label: "Session", value: <span className="break-all">{session.id}</span> }] : []),
               ]}
             />
-            <div className="relative">
-              <pre className="overflow-x-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 pr-4 font-mono text-[12px] leading-relaxed whitespace-pre-wrap break-all text-[#cdc4e0]">
-                <span className="text-[#6d7078] select-none">{prompt}</span>
-                {command}
-              </pre>
-            </div>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <Facts
-                className="min-w-0 flex-1"
-                items={[
-                  { label: "Server", value: info.server },
-                  { label: "Token", value: `${info.token.slice(0, 6)}…${info.token.slice(-4)}` },
-                ]}
-              />
-              <CopyButton text={command} label="Copy command" />
-            </div>
-            <p className="text-[11.5px] leading-relaxed text-[#8f939e]">
-              The agent shows up here as soon as it connects. Give it labels like <span className="chip">bench</span> or <span className="chip">gpu</span> to target it with{" "}
-              <code className="font-mono text-[#cdc4e0]">runs-on</code>.
-            </p>
-            {info.join && (
-              <div className="space-y-2 border-t border-[#222428] pt-4">
-                <div className="label">Without a token: ask to join</div>
-                <pre className="overflow-x-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[12px] leading-relaxed whitespace-pre-wrap break-all text-[#cdc4e0]">
-                  <span className="text-[#6d7078] select-none">$ </span>
-                  {info.join}
-                </pre>
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-[#8f939e]">
-                    The machine shows a verification code and appears under Waiting to join; approve it when the codes match. With kiln already
-                    installed, run <code className="font-mono text-[#cdc4e0]">kiln join</code> instead.
-                  </p>
-                  <CopyButton text={info.join} label="Copy command" />
-                </div>
+          </div>
+          <div className="mt-6">
+            <div className="label mb-2">Transcript</div>
+            {err ? (
+              <ErrorState error={err} compact />
+            ) : !entries ? (
+              <Skeleton className="h-64 w-full" />
+            ) : entries.length === 0 ? (
+              <p className="text-[12.5px] text-[#8f939e]">Nothing said yet.</p>
+            ) : (
+              <div
+                ref={scroller}
+                className="max-h-[62dvh] space-y-2 overflow-y-auto overscroll-contain pr-1"
+                onScroll={(e) => {
+                  const el = e.currentTarget;
+                  atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+                }}
+              >
+                {entries.map((e, i) => (
+                  <EntryView key={i} e={e} />
+                ))}
               </div>
             )}
           </div>
-        )}
-      </DialogContent>
+        </DialogContent>
+      )}
     </Dialog>
   );
 }
 
-function AgentDrawer({
-  agent,
-  onClose,
-  onDrain,
-  onForget,
-}: {
-  agent: Agent | null;
-  onClose: () => void;
-  onDrain: (a: Agent, v: boolean) => void;
-  onForget: (a: Agent) => void;
-}) {
-  const [samples, setSamples] = React.useState<HostSample[] | null>(null);
+function EntryView({ e }: { e: AiTranscriptEntry }) {
+  if (e.role === "tool") {
+    return (
+      <div className="truncate font-mono text-[11px] text-[#8c8f98]" title={e.text}>
+        <span className="text-[#6d7078]">⏵ </span>
+        {e.text}
+      </div>
+    );
+  }
+  const user = e.role === "user";
+  return (
+    <div
+      className={cn(
+        "rounded-md text-[12.5px] leading-relaxed break-words whitespace-pre-wrap",
+        user ? "border border-[#2b2e39] bg-[#101217] px-3 py-2 text-[#e4e5e7]" : "px-1 py-1 text-[#c8cad0]",
+      )}
+    >
+      {user && <div className="label mb-1">Prompt</div>}
+      {e.text}
+    </div>
+  );
+}
+
+function NewAgentDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
+  const navigate = useNavigate();
+  const [machines, setMachines] = React.useState<Agent[] | null>(null);
+  const [machine, setMachine] = useLocalStorage<string>("kiln.agents.new.machine", "");
+  const [toolId, setToolId] = useLocalStorage<string>("kiln.agents.new.tool", CLAUDE.id);
+  const [dirs, setDirs] = useLocalStorage<Record<string, string>>("kiln.agents.new.dirs", {});
+  const [busy, setBusy] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
-  const [jobs, setJobs] = React.useState<Job[]>([]);
-  const name = agent?.name;
-  const running = agent?.running.join(",") ?? "";
 
   React.useEffect(() => {
-    if (!name) return;
-    setSamples(null);
+    if (!open) return;
     setErr(null);
     const ctl = new AbortController();
     api
-      .metricsHistory(name, ctl.signal)
-      .then((h) => setSamples(h[name] ?? []))
+      .agents(ctl.signal)
+      .then((l) => setMachines(l.filter((a) => a.connected && !a.ephemeral)))
       .catch((e) => !ctl.signal.aborted && setErr(errorMessage(e)));
     return () => ctl.abort();
-  }, [name]);
+  }, [open]);
 
-  React.useEffect(() => {
-    if (!running) {
-      setJobs([]);
-      return;
+  const target = machines?.find((m) => m.name === machine) ?? machines?.[0] ?? null;
+  const tool = TOOLS.find((t) => t.id === toolId) ?? CLAUDE;
+  const windows = target?.os === "windows";
+  const dir = target ? (dirs[target.name] ?? "~") : "~";
+
+  const start = async () => {
+    if (!target) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const info = await api.createTerminalSession({ target: `agent:${target.name}`, cmd: launchCommand(tool.command, dir, windows) });
+      onOpenChange(false);
+      navigate(`/terminal?session=${encodeURIComponent(info.id)}&target=${encodeURIComponent(info.target)}`);
+    } catch (e) {
+      setErr(errorMessage(e));
+    } finally {
+      setBusy(false);
     }
-    const ctl = new AbortController();
-    Promise.all(running.split(",").map((id) => api.job(id, ctl.signal).catch(() => null)))
-      .then((js) => setJobs(js.filter((j): j is Job => j !== null)))
-      .catch(() => undefined);
-    return () => ctl.abort();
-  }, [running]);
+  };
 
-  useServerEvents((ev) => {
-    if (ev.type === "sample" && ev.agent === name) setSamples((s) => (s ? [...s, ev.sample].slice(-720) : s));
-  });
-
-  const s = agent?.sample;
   return (
-    <Dialog open={Boolean(agent)} onOpenChange={(o) => !o && onClose()}>
-      {agent && (
-        <DialogContent variant="drawer" title={agent.name} eyebrow={`Agent · ${agentStateLabel(agent)}`} description={`${agent.hostname} · ${agent.os}/${agent.arch} · kiln v${agent.version}`}>
-          <div className="flex flex-wrap items-center gap-2">
-            <Chips labels={agent.labels} max={12} />
-          </div>
-          <div className="mt-5 flex flex-wrap gap-2">
-            <Button asChild variant="secondary" size="sm" aria-disabled={!agent.connected}>
-              <Link to={`/terminal?open=${encodeURIComponent(`agent:${agent.name}`)}`}>
-                <SquareTerminal /> Open terminal
-              </Link>
-            </Button>
-            <Button variant="ghost" size="sm" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
-              {agent.draining ? "Resume scheduling" : "Drain"}
-            </Button>
-            <Button variant="ghost" size="sm" className="text-[#d1aaad]" onClick={() => onForget(agent)}>
-              <Trash2 /> Forget
-            </Button>
-          </div>
-
-          <div className="mt-6">
-            <Facts
-              items={[
-                { label: "Kind", value: agent.ephemeral ? "pod (ephemeral)" : "persistent" },
-                { label: "Slots", value: `${agent.busy} / ${agent.slots} busy` },
-                { label: "Connected", value: agent.connected ? "yes" : "no", tone: agent.connected ? "pass" : "fail" },
-                { label: "Last seen", value: <RelTime ts={agent.last_seen} /> },
-                { label: "Enrolled", value: absoluteTime(agent.enrolled_at) },
-                { label: "CPU", value: s ? `${formatPct(s.cpu_pct, 1)} · ${s.cpus} cores` : "—" },
-                { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
-                { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
-              ]}
-            />
-          </div>
-
-          <div className="mt-8">
-            <div className="label mb-2">Running jobs</div>
-            {agent.running.length === 0 ? (
-              <p className="text-[12.5px] text-[#8f939e]">Idle.</p>
-            ) : (
-              <div className="row-list">
-                {jobs.map((j) => (
-                  <Link key={j.id} to={`/runs/${j.run_id}/jobs/${j.id}`} className="flex min-h-11 items-center gap-3 px-1 text-[12.5px] hover:bg-[#101114]">
-                    <StatusDot status={j.status} />
-                    <span className="min-w-0 flex-1 truncate">{j.display}</span>
-                    <span className="font-mono text-[10px] text-[#8c8f98]">
-                      <LiveDuration start={j.started_at} end={j.finished_at} />
-                    </span>
-                  </Link>
-                ))}
-                {jobs.length === 0 && agent.running.map((id) => <div key={id} className="py-2 font-mono text-[11px] text-[#8c8f98]">{id}</div>)}
-              </div>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        title="New agent"
+        eyebrow="Agents / New"
+        description="Runs in a persistent kiln terminal: it keeps going when you close the tab or lose the connection, and any device can pick it up again."
+        className="!w-[min(560px,calc(100vw-24px))]"
+      >
+        {machines === null && !err ? (
+          <Skeleton className="h-40 w-full" />
+        ) : machines !== null && machines.length === 0 ? (
+          <p className="text-[12.5px] leading-relaxed text-[#8f939e]">
+            No runner is connected. Agents run on runners;{" "}
+            <Link to="/runners?join=1" className="text-link" onClick={() => onOpenChange(false)}>
+              add one
+            </Link>{" "}
+            first.
+          </p>
+        ) : (
+          <form
+            className="space-y-5"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void start();
+            }}
+          >
+            <div>
+              <span className="field-label label">Agent</span>
+              <Segmented label="Agent" value={tool.id} onChange={setToolId} options={TOOLS.map((t) => ({ value: t.id, label: t.label }))} />
+            </div>
+            <label className="block">
+              <span className="field-label label">Machine</span>
+              <span className="field">
+                <select
+                  className="min-h-[38px] w-full min-w-0 bg-transparent pr-3 text-[12.5px] text-[#e3e4e9] outline-none"
+                  value={target?.name ?? ""}
+                  onChange={(e) => setMachine(e.target.value)}
+                >
+                  {(machines ?? []).map((m) => (
+                    <option key={m.name} value={m.name} className="bg-[#101217]">
+                      {m.name} · {m.hostname} · {m.os}/{m.arch}
+                    </option>
+                  ))}
+                </select>
+              </span>
+            </label>
+            {!windows && (
+              <label className="block">
+                <span className="field-label label">Folder</span>
+                <span className="field">
+                  <input
+                    value={dir}
+                    onChange={(e) => target && setDirs({ ...dirs, [target.name]: e.target.value })}
+                    placeholder="~ or /path/to/project"
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    className="font-mono"
+                  />
+                </span>
+                <span className="mt-1.5 block text-[11.5px] leading-relaxed text-[#8f939e]">
+                  Where {tool.label} works. When it exits, the terminal stays open there.
+                </span>
+              </label>
             )}
-          </div>
-
-          <div className="mt-8">
-            <div className="label mb-3">Last hour · 5 s resolution</div>
-            {err ? <ErrorState error={err} compact /> : !samples ? <Skeleton className="h-64 w-full" /> : samples.length < 2 ? <p className="text-[12.5px] text-[#8f939e]">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={1} />}
-          </div>
-        </DialogContent>
-      )}
+            {err && <ErrorState error={err} compact />}
+            <div className="flex justify-end gap-2">
+              <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={busy || !target}>
+                <Bot /> {busy ? "Starting…" : `Start ${tool.label}`}
+              </Button>
+            </div>
+          </form>
+        )}
+      </DialogContent>
     </Dialog>
   );
 }

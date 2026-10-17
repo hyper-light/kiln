@@ -54,16 +54,14 @@ argon2 = "0.6"
 rpassword = "7"
 vt100 = "0.16.2"
 socket2 = { version = "0.6.5", features = ["all"] }
+# Process tables everywhere (AI sessions); host and process metrics where there is no procfs.
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }
 
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net"] }
 rustix = { version = "1.1", features = ["process", "termios"] }
 filedescriptor = "0.8"
-
-# Host and process metrics where there is no procfs (macOS, Windows).
-[target.'cfg(not(target_os = "linux"))'.dependencies]
-sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }
 
 # Windows: process trees as job objects.
 [target.'cfg(windows)'.dependencies]

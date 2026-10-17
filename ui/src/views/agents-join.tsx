@@ -53,7 +53,7 @@ export function WaitingToJoin({
       />
       <p className="mb-4 max-w-[640px] text-[12.5px] leading-relaxed text-[#9a9da6]">
         Approve a machine only if the verification code below matches the one <code className="font-mono text-[#cdc4e0]">kiln join</code> shows on
-        it. Approval gives it a certificate from this server; it then connects as an agent.
+        it. Approval gives it a certificate from this server; it then connects as a runner.
       </p>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 2xl:grid-cols-3">
         {pending.map((r) => (
@@ -74,7 +74,7 @@ function JoinRequestCard({ request: r, onDecided }: { request: JoinRequest; onDe
     try {
       if (what === "approve") {
         const res = await api.approveJoin(r.id);
-        toast.success(`${res.name} approved`, "It connects as an agent in a moment.");
+        toast.success(`${res.name} approved`, "It connects as a runner in a moment.");
       } else {
         await api.denyJoin(r.id);
         toast({ title: `${r.name} denied`, tone: "info" });
@@ -193,7 +193,7 @@ function NearbyCard({ instance: i }: { instance: DiscoveredInstance }) {
         </pre>
       </div>
       <div className="card-footer">
-        <span className="min-w-0 truncate font-mono text-[9px] text-[#7b7e88]">{i.url ?? (i.role === "agent" ? "agent · not enrolled here" : "")}</span>
+        <span className="min-w-0 truncate font-mono text-[9px] text-[#7b7e88]">{i.url ?? (i.role === "agent" ? "runner · not enrolled here" : "")}</span>
         <CopyButton text={i.join_command} label="Copy command" />
       </div>
     </article>

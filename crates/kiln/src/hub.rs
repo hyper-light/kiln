@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hyper_transport::PeerId;
@@ -94,6 +95,11 @@ pub struct Hub {
     pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
     /// Every terminal session, local and on machines.
     pub terminals: crate::termsess::Sessions,
+    /// The AI coding sessions each connected machine last reported.
+    pub ai_sessions: Mutex<HashMap<String, Vec<crate::aisessions::AiSession>>>,
+    /// Transcript requests waiting for their machine's answer, by request number.
+    ai_requests: Mutex<HashMap<u64, futures::channel::oneshot::Sender<Option<String>>>>,
+    ai_seq: AtomicU64,
     pub history: Mutex<HashMap<String, VecDeque<HostSample>>>,
     pub wake: Notify,
     pub launching: Mutex<HashMap<String, Launch>>,
@@ -143,6 +149,9 @@ impl Hub {
             events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
             terminals: crate::termsess::Sessions::new(),
+            ai_sessions: Mutex::new(HashMap::new()),
+            ai_requests: Mutex::new(HashMap::new()),
+            ai_seq: AtomicU64::new(1),
             history: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             launching: Mutex::new(HashMap::new()),
@@ -279,6 +288,25 @@ impl Hub {
         m.agent_slots_busy.set(busy);
     }
 
+    /// The recent messages of the AI session running as `pid` on a machine, as JSON (`None`: it
+    /// has no transcript).
+    pub async fn ai_transcript(&self, machine: &str, pid: u32) -> anyhow::Result<Option<String>> {
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        if !self.send_to_agent(machine, LANE_TERM, &ServerMsg::AiTranscript { req, pid }).await {
+            self.ai_requests.lock().remove(&req);
+            anyhow::bail!("machine {machine} is not connected");
+        }
+        let answer = crate::rt::timeout(Duration::from_secs(10), rx).await;
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Ok(Ok(json)) => Ok(json),
+            Ok(Err(_)) => anyhow::bail!("{machine} did not answer"),
+            Err(_) => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
     pub async fn send_to_agent(&self, agent: &str, lane: u32, msg: &ServerMsg) -> bool {
         let peer = self.agents.lock().get(agent).and_then(|a| a.peer);
         let Some(peer) = peer else { return false };
@@ -398,6 +426,9 @@ impl Hub {
             }
         }
         metrics::agent_samples().write().remove(name);
+        if self.ai_sessions.lock().remove(name).is_some() {
+            self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": name }));
+        }
         self.update_slot_gauges();
         self.emit_agent(&snapshot);
         // Connections drop transiently (network blips, server restarts): every agent, pods
@@ -500,6 +531,20 @@ impl Hub {
             AgentMsg::TermList { sessions } => {
                 for info in &sessions {
                     crate::termsess::adopt_agent(self, &agent, info);
+                }
+            }
+            AgentMsg::AiSessions { json } => match serde_json::from_str::<Vec<crate::aisessions::AiSession>>(&json) {
+                Ok(sessions) => {
+                    let old = self.ai_sessions.lock().insert(agent.clone(), sessions.clone());
+                    if old.as_ref() != Some(&sessions) {
+                        self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": agent }));
+                    }
+                }
+                Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable AI session report"),
+            },
+            AgentMsg::AiTranscript { req, json } => {
+                if let Some(tx) = self.ai_requests.lock().remove(&req) {
+                    let _ = tx.send(json);
                 }
             }
             AgentMsg::TermReplay { session, data } => {

@@ -20,6 +20,8 @@ export default function Overview() {
   const ov = useResource((s) => api.overview(s), [], { pollMs: 30_000 });
   const runs = useResource((s) => api.runs({ limit: 14 }, s), []);
   const agents = useResource((s) => api.agents(s), [], { pollMs: 60_000 });
+  // Job pods are runners too, but they are listed under their jobs.
+  const runners = (agents.data ?? []).filter((a) => !a.ephemeral);
   const [history, setHistory] = React.useState<Record<string, HostSample[]>>({});
 
   React.useEffect(() => {
@@ -104,7 +106,7 @@ export default function Overview() {
           label="Slots busy"
           value={d ? `${busySlots}` : undefined}
           unit={d ? `/ ${totalSlots}` : undefined}
-          foot={d ? `${d.agents.connected}/${d.agents.total} agents connected` : undefined}
+          foot={d ? `${d.agents.connected}/${d.agents.total} runners connected` : undefined}
         />
       </section>
 
@@ -182,9 +184,9 @@ export default function Overview() {
         <SectionHeading
           index="02"
           label="Fleet"
-          title="Agents"
+          title="Runners"
           aside={
-            <Link to="/agents" className="text-link">
+            <Link to="/runners" className="text-link">
               Manage fleet <ArrowUpRight size={15} />
             </Link>
           }
@@ -197,17 +199,17 @@ export default function Overview() {
               <Skeleton key={i} className="h-[190px]" />
             ))}
           </div>
-        ) : agents.data.length === 0 ? (
-          <EmptyState icon={<Server size={24} />} title="No agents yet." action={<Link to="/agents?join=1" className="text-link">Add a bare-metal agent <ArrowUpRight size={15} /></Link>}>
-            Jobs run on agents. Join a bare-metal machine, or let kiln launch pods on Kubernetes.
+        ) : runners.length === 0 ? (
+          <EmptyState icon={<Server size={24} />} title="No runners yet." action={<Link to="/runners?join=1" className="text-link">Add a runner <ArrowUpRight size={15} /></Link>}>
+            Jobs run on runners. Join a machine, or let kiln launch pods on Kubernetes.
           </EmptyState>
         ) : (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-            {[...agents.data]
+            {[...runners]
               .sort((a, b) => Number(b.connected) - Number(a.connected) || b.busy - a.busy || a.name.localeCompare(b.name))
               .slice(0, 8)
               .map((a) => (
-                <AgentMiniCard key={a.name} agent={a} history={history[a.name] ?? []} onOpen={() => navigate(`/agents?agent=${encodeURIComponent(a.name)}`)} />
+                <AgentMiniCard key={a.name} agent={a} history={history[a.name] ?? []} onOpen={() => navigate(`/runners?agent=${encodeURIComponent(a.name)}`)} />
               ))}
           </div>
         )}

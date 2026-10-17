@@ -315,9 +315,45 @@ export type ServerEvent =
   /** Join requests changed: refetch GET /api/join-requests. */
   | { type: "join_requests" }
   /** The discovery table changed: refetch GET /api/discovery. */
-  | { type: "discovery" };
+  | { type: "discovery" }
+  /** A machine's AI sessions changed: refetch GET /api/ai-sessions. */
+  | { type: "ai_sessions"; machine: string };
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
+
+/** A live AI coding session (Claude Code, Codex, Gemini CLI) on a machine. */
+export interface AiSession {
+  /** The runner it was found on. */
+  machine: string;
+  tool: "claude" | "codex" | "gemini" | string;
+  /** The tool's own session id ("" when it has none). */
+  id: string;
+  pid: number;
+  /** The session's name, where the tool gives it one. */
+  name: string;
+  title: string;
+  cwd: string;
+  branch: string;
+  model: string;
+  started_at: number;
+  last_activity: number;
+  /** "working" (mid-turn), "waiting" (its turn ended), or "" (unknown). */
+  state: string;
+  last_prompt: string;
+  last_reply: string;
+  /** The kiln terminal session it runs in: attach to drive it. Null when started outside kiln. */
+  terminal: string | null;
+  /** Its transcript can be opened. */
+  transcript: boolean;
+}
+
+/** One message of a transcript. */
+export interface AiTranscriptEntry {
+  role: "user" | "assistant" | "tool" | string;
+  text: string;
+  /** RFC 3339, or "". */
+  at: string;
+}
 
 /** A terminal session kept by the server (any device can attach to it). */
 export interface TerminalSessionInfo {
