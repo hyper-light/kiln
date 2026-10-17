@@ -19,8 +19,11 @@ use crate::hub::Hub;
 
 /// Open routes; `None` when the path is not CI's.
 pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<Response, Fail>> {
-    let _ = (hub, &req);
     match seg {
+        // W14: the code host legs fetch from.
+        ["_kiln", "git", rest @ ..] => Some(super::facade::git(hub, rest, req).await),
+        // W07: the run's pinned actions, for its legs.
+        ["_kiln", "actions", rest @ ..] => Some(super::actions::tarball(hub, rest, &req).await),
         ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] => Some(Err((StatusCode::NOT_FOUND, "not found".into()))),
         _ => None,
     }

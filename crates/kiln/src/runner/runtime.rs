@@ -33,6 +33,39 @@ pub struct Leg {
     pub runner_name: String,
     pub up: Uplink,
     pub cancel: Shutdown,
+    /// For actions and Node runtimes.
+    pub http: std::sync::Arc<crate::http::client::Client>,
+}
+
+/// What a step runs: a script under a shell, or a program (an action's `node main.js`).
+enum Run<'a> {
+    Script { script: &'a str, shell: Option<&'a str> },
+    Program { prog: String, args: Vec<String> },
+}
+
+/// What a process left: how it ended, its outputs and its saved state (`$GITHUB_STATE`).
+struct Ran {
+    end: End,
+    outputs: BTreeMap<String, String>,
+    state: Vec<(String, String)>,
+}
+
+/// An action's post step, run after the main steps in reverse order (W06-R11).
+struct Post {
+    name: String,
+    node: PathBuf,
+    script: PathBuf,
+    env: BTreeMap<String, String>,
+    cond: Option<Tpl>,
+    wd: PathBuf,
+    uses: String,
+}
+
+/// Where an action is, once fetched.
+struct Located {
+    dir: PathBuf,
+    repo: String,
+    git_ref: String,
 }
 
 /// GitHub's cancel sequence (W05-R18).
@@ -151,6 +184,9 @@ struct State {
     /// Process groups the steps started, all ended when the leg does (GitHub keeps a step's
     /// background processes alive until the job ends).
     groups: Vec<i32>,
+    posts: Vec<Post>,
+    /// The index the next pre or post step gets (after the job's own steps).
+    next_idx: u32,
 }
 
 impl State {
@@ -403,6 +439,10 @@ impl Leg {
             m.insert("job".into(), serde_json::json!(a.leg.job_id.rsplit('/').next().unwrap_or_default()));
             m.insert("event_path".into(), serde_json::json!(layout.temp.join("_github_workflow").join("event.json").to_string_lossy()));
             m.insert("action".into(), serde_json::json!(""));
+            // The server, as this runner reaches it.
+            m.insert("server_url".into(), serde_json::json!(a.runtime.facade_url));
+            m.insert("api_url".into(), serde_json::json!(a.runtime.api_url));
+            m.insert("graphql_url".into(), serde_json::json!(a.runtime.graphql_url));
         }
         let mut st = State {
             dialect,
@@ -419,6 +459,8 @@ impl Leg {
             step_debug,
             allow_unsecure: false,
             groups: Vec::new(),
+            posts: Vec::new(),
+            next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -441,12 +483,13 @@ impl Leg {
         st.allow_unsecure = st.env.get("ACTIONS_ALLOW_UNSECURE_COMMANDS").is_some_and(|v| v == "true");
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
         let mut timed_out = false;
+        self.pre_steps(&mut st, deadline).await;
         for (idx, step) in a.steps.iter().enumerate() {
             let idx = u32::try_from(idx).unwrap_or(u32::MAX);
             if self.cancel.is_cancelled() {
                 st.cancelled = true;
             }
-            let end = self.step(&mut st, idx, step, deadline).await;
+            let end = self.step(&mut st, idx, step, deadline, false).await;
             if end == Some(End::TimedOut) && Instant::now() >= deadline {
                 timed_out = true;
                 st.failed = true;
@@ -454,6 +497,7 @@ impl Leg {
             }
         }
         self.job_outputs(&st).await;
+        self.post_steps(&mut st, deadline).await;
         // The leg's processes end with it (GitHub's "Cleaning up orphan processes").
         for g in &st.groups {
             crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={}", a.job_id));
@@ -471,7 +515,8 @@ impl Leg {
 
     /// One step (W06-R04): `if`, name, env, working directory, shell, timeout,
     /// continue-on-error, run, environment files, outcome and conclusion.
-    async fn step(&self, st: &mut State, idx: u32, step: &Step, job_deadline: Instant) -> Option<End> {
+    /// `nested`: a composite action's step, which reports into its caller's step.
+    async fn step(&self, st: &mut State, idx: u32, step: &Step, job_deadline: Instant, nested: bool) -> Option<End> {
         let id = step.id.clone();
         // Without a `name`, GitHub titles a step from its evaluated script's first line.
         let fallback_name = match (&step.run, &step.uses) {
@@ -491,19 +536,21 @@ impl Leg {
         let run = match st.condition(step.cond.as_ref()) {
             Ok(r) => r,
             Err(e) => {
-                self.start(idx, &name, kind, step.uses.clone()).await;
+                self.begin(nested, idx, &name, kind, step.uses.clone()).await;
                 self.note(idx, &format!("Error: {e}")).await;
                 st.failed = true;
-                self.finish(st, idx, id, Conclusion::Failure, Conclusion::Failure, None, BTreeMap::new()).await;
+                self.finish(st, idx, id, Conclusion::Failure, Conclusion::Failure, None, BTreeMap::new(), nested).await;
                 return None;
             }
         };
         if !run {
-            self.start(idx, &name, kind, step.uses.clone()).await;
-            self.finish(st, idx, id, Conclusion::Skipped, Conclusion::Skipped, None, BTreeMap::new()).await;
+            if !nested {
+                self.begin(nested, idx, &name, kind, step.uses.clone()).await;
+            }
+            self.finish(st, idx, id, Conclusion::Skipped, Conclusion::Skipped, None, BTreeMap::new(), nested).await;
             return None;
         }
-        self.start(idx, &name, kind, step.uses.clone()).await;
+        self.begin(nested, idx, &name, kind, step.uses.clone()).await;
         let continue_on_error = match &step.continue_on_error {
             Some(v) => st.value(v, Site::StepContinueOnError, "continue-on-error").map(|v| v.truthy()).unwrap_or(false),
             None => false,
@@ -542,31 +589,34 @@ impl Leg {
                 Some(t) => Some(st.render(t, Site::StepRun, "run")?),
                 None => None,
             };
-            Ok((env, wd, shell, timeout, script))
+            let mut with = BTreeMap::new();
+            for (k, v) in &step.with {
+                with.insert(k.clone(), st.value(v, Site::StepWith, &format!("with.{k}"))?.coerce_string());
+            }
+            Ok((env, wd, shell, timeout, script, with))
         })();
-        let (env, wd, shell, timeout, script) = match prepared {
+        let (env, wd, shell, timeout, script, with) = match prepared {
             Ok(x) => x,
             Err(e) => {
                 self.note(idx, &format!("Error: {}", fail(e))).await;
                 let c = if continue_on_error { Conclusion::Success } else { Conclusion::Failure };
                 st.failed |= c == Conclusion::Failure;
-                self.finish(st, idx, id, Conclusion::Failure, c, None, BTreeMap::new()).await;
+                self.finish(st, idx, id, Conclusion::Failure, c, None, BTreeMap::new(), nested).await;
                 return None;
             }
-        };
-        let Some(script) = script else {
-            self.note(idx, "Error: `uses:` steps arrive with actions support (docs/ci.md W07); this runner can't run them yet").await;
-            let c = if continue_on_error { Conclusion::Success } else { Conclusion::Failure };
-            st.failed |= c == Conclusion::Failure;
-            self.finish(st, idx, id, Conclusion::Failure, c, None, BTreeMap::new()).await;
-            return None;
         };
         let deadline = match timeout {
             Some(t) => job_deadline.min(Instant::now() + t),
             None => job_deadline,
         };
-        let (end, outputs) = match self.exec(st, idx, &script, shell.as_deref(), &wd, env, deadline).await {
-            Ok(r) => r,
+        let ran = match (&script, &step.uses) {
+            (Some(script), _) => self.exec(st, idx, Run::Script { script, shell: shell.as_deref() }, &wd, env, deadline).await,
+            (None, Some(uses)) => Box::pin(self.action(st, idx, step, uses, with, &wd, env, deadline)).await,
+            (None, None) if step.is_control() => Err(anyhow::anyhow!("background steps (`background`, `wait`, `parallel`, docs/ci.md W06-R17) can't run on this runner yet")),
+            (None, None) => Err(anyhow::anyhow!("the step runs neither a script nor an action")),
+        };
+        let (end, outputs) = match ran {
+            Ok(r) => (r.end, r.outputs),
             Err(e) => {
                 self.note(idx, &format!("Error: {e:#}")).await;
                 (End::Exit(None), BTreeMap::new())
@@ -595,8 +645,17 @@ impl Leg {
         if conclusion == Conclusion::Failure {
             st.failed = true;
         }
-        self.finish(st, idx, id, outcome, conclusion, exit_code, outputs).await;
+        self.finish(st, idx, id, outcome, conclusion, exit_code, outputs, nested).await;
         Some(end)
+    }
+
+    /// A step begins: its own row, or a header in its composite caller's log.
+    async fn begin(&self, nested: bool, idx: u32, name: &str, kind: &str, action: Option<String>) {
+        if nested {
+            self.note(idx, name).await;
+        } else {
+            self.start(idx, name, kind, action).await;
+        }
     }
 
     async fn start(&self, idx: u32, name: &str, kind: &str, action: Option<String>) {
@@ -604,9 +663,11 @@ impl Leg {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn finish(&self, st: &mut State, idx: u32, id: Option<String>, outcome: Conclusion, conclusion: Conclusion, exit_code: Option<i32>, outputs: BTreeMap<String, String>) {
-        let masked: BTreeMap<String, String> = outputs.iter().map(|(k, v)| (k.clone(), st.masker.mask(v))).collect();
-        self.event(&JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, outputs: masked }).await;
+    async fn finish(&self, st: &mut State, idx: u32, id: Option<String>, outcome: Conclusion, conclusion: Conclusion, exit_code: Option<i32>, outputs: BTreeMap<String, String>, nested: bool) {
+        if !nested {
+            let masked: BTreeMap<String, String> = outputs.iter().map(|(k, v)| (k.clone(), st.masker.mask(v))).collect();
+            self.event(&JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, outputs: masked }).await;
+        }
         st.steps.push(Done { id, outputs, outcome: Some(outcome), conclusion: Some(conclusion) });
     }
 
@@ -614,12 +675,16 @@ impl Leg {
         self.event(&JobEventV2::Annotation { idx, level: level.to_owned(), message: message.to_owned(), title: None, file: None, line: None, end_line: None, col: None, end_col: None, log_offset: 0 }).await;
     }
 
-    /// Runs a script and processes what it prints and writes (W06-R05 to W06-R08).
-    #[allow(clippy::too_many_arguments)]
-    async fn exec(&self, st: &mut State, idx: u32, script: &str, shell: Option<&str>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<(End, BTreeMap<String, String>)> {
-        let (ext, body) = script_file(shell, script);
+    /// Runs a script or a program and processes what it prints and writes (W06-R05 to W06-R08).
+    async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
         let id = crate::util::new_id();
-        let file = st.layout.temp.join(format!("{id}{ext}"));
+        let (file, body, shell) = match &what {
+            Run::Script { script, shell } => {
+                let (ext, body) = script_file(*shell, script);
+                (Some(st.layout.temp.join(format!("{id}{ext}"))), body, *shell)
+            }
+            Run::Program { .. } => (None, String::new(), None),
+        };
         let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV"]
             .iter()
             .map(|k| (*k, st.layout.commands.join(format!("{}_{id}", k.to_ascii_lowercase()))))
@@ -627,7 +692,9 @@ impl Leg {
         {
             let (file, body, paths, wd) = (file.clone(), body.clone(), files.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>(), wd.to_path_buf());
             crate::rt::blocking(move || -> std::io::Result<()> {
-                std::fs::write(&file, body)?;
+                if let Some(f) = &file {
+                    std::fs::write(f, body)?;
+                }
                 for p in paths {
                     std::fs::write(p, b"")?;
                 }
@@ -648,7 +715,11 @@ impl Leg {
         let sep = if cfg!(windows) { ';' } else { ':' };
         let base_path = std::env::var("PATH").unwrap_or_default();
         env.insert("PATH".into(), st.path.apply(env.get("PATH").map_or(base_path.as_str(), String::as_str), sep));
-        let (prog, args) = shell_command(shell, &file).map_err(|e| anyhow::anyhow!(e))?;
+        let (prog, args) = match (what, &file) {
+            (Run::Script { .. }, Some(f)) => shell_command(shell, f).map_err(|e| anyhow::anyhow!(e))?,
+            (Run::Program { prog, args }, _) => (prog, args),
+            (Run::Script { .. }, None) => anyhow::bail!("no script"),
+        };
         let mut cmd = Command::new(&prog);
         cmd.args(&args).current_dir(wd).envs(&env);
         let mut running = crate::proc::spawn_group(cmd)?;
@@ -711,7 +782,7 @@ impl Leg {
         let get = |k: &str| files.iter().find(|(x, _)| *x == k).map(|(_, p)| p.clone()).unwrap_or_default();
         let (envf, outf, pathf, statef, sumf, jsonf, runf) = (get("GITHUB_ENV"), get("GITHUB_OUTPUT"), get("GITHUB_PATH"), get("GITHUB_STATE"), get("GITHUB_STEP_SUMMARY"), get("KILN_OUTPUT_JSON"), get("KILN_RUN_ENV"));
         let texts = crate::rt::blocking(move || (read(&envf), read(&outf), read(&pathf), read(&statef), read(&sumf), read(&jsonf), read(&runf))).await?;
-        let (env_t, out_t, path_t, _state_t, sum_t, _json_t, _run_t) = texts;
+        let (env_t, out_t, path_t, state_t, sum_t, _json_t, _run_t) = texts;
         let mut outputs = set_output;
         let mut failed_files = false;
         match envfiles::env(&env_t) {
@@ -741,10 +812,13 @@ impl Leg {
                 Err(e) => self.annotate(idx, "warning", &e).await,
             }
         }
-        let _ = crate::rt::blocking(move || std::fs::remove_file(file)).await;
+        if let Some(f) = file {
+            let _ = crate::rt::blocking(move || std::fs::remove_file(f)).await;
+        }
+        let state = envfiles::pairs(&state_t).unwrap_or_default();
         let end = end.unwrap_or(End::Exit(None));
         let end = if failed_files && end == End::Exit(Some(0)) { End::Exit(Some(1)) } else { end };
-        Ok((end, outputs))
+        Ok(Ran { end, outputs, state })
     }
 
     /// Output from the step: whole lines go through the command processor; text is masked and
@@ -856,6 +930,355 @@ impl Leg {
     }
 }
 
+/// GitHub's input variable: `INPUT_<NAME>`, upper-cased, spaces as `_` (hyphens kept).
+fn input_var(name: &str) -> String {
+    format!("INPUT_{}", name.replace(' ', "_").to_uppercase())
+}
+
+/// The action's `GITHUB_ACTION` when its step has no `id`: `__owner_repo`, as GitHub names it.
+fn action_name(uses: &str) -> String {
+    let base = uses.split('@').next().unwrap_or(uses);
+    format!("__{}", base.trim_start_matches("./").replace(['/', '.', '-'], "_"))
+}
+
+/// Reads an action's metadata (`action.yml` or `action.yaml`, W02-R10).
+fn load_action(dir: &Path) -> anyhow::Result<kiln_ci::wf::Action> {
+    let file = ["action.yml", "action.yaml"].iter().map(|n| dir.join(n)).find(|p| p.exists()).ok_or_else(|| anyhow::anyhow!("no action.yml in {}", dir.display()))?;
+    let src = std::fs::read_to_string(&file)?;
+    let (a, d) = kiln_ci::wf::parse_action(&src);
+    if let Some(e) = d.iter().find(|x| x.is_error()) {
+        anyhow::bail!("{}", e.render(&file.to_string_lossy()));
+    }
+    a.ok_or_else(|| anyhow::anyhow!("{} is not an action's metadata", file.display()))
+}
+
+/// One Node runtime download at a time (they share `<work>/_externals`).
+static NODE_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
+static ACTION_LOCK: async_lock::Mutex<()> = async_lock::Mutex::new(());
+
+impl Leg {
+    /// Where an action is: in the workspace (`./`), or fetched at its pinned commit.
+    async fn locate(&self, uses: &str) -> anyhow::Result<Located> {
+        if let Some(rel) = uses.strip_prefix("./") {
+            let dir = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo).workspace.join(rel);
+            return Ok(Located { dir, repo: String::new(), git_ref: String::new() });
+        }
+        if uses.starts_with("docker://") {
+            anyhow::bail!("`{uses}`: Docker actions run with Docker executors (docs/ci.md W13); this runner can't run them yet");
+        }
+        if uses.starts_with("$/") {
+            anyhow::bail!("`{uses}`: actions of the running commit (`$/`) arrive with docs/ci.md W07-R01's mirror reads");
+        }
+        let r = self.a.actions.get(uses).ok_or_else(|| anyhow::anyhow!("`{uses}` was not resolved when the run started"))?;
+        let root = self.fetch_action(r).await?;
+        let dir = if r.path.is_empty() { root } else { root.join(&r.path) };
+        let git_ref = uses.rsplit_once('@').map(|(_, r)| r.to_owned()).unwrap_or_default();
+        Ok(Located { dir, repo: r.repo.clone(), git_ref })
+    }
+
+    /// An action's code at its commit, kept under `<work>/_actions/<owner>/<repo>/<sha>`.
+    async fn fetch_action(&self, r: &kiln_ci::wire::ActionRef) -> anyhow::Result<PathBuf> {
+        let dir = self.work_dir.join("_actions").join(r.repo.replace("..", "_")).join(&r.sha);
+        let done = dir.join(".kiln-complete");
+        if done.exists() {
+            return Ok(dir);
+        }
+        let _g = ACTION_LOCK.lock().await;
+        if done.exists() {
+            return Ok(dir);
+        }
+        let mut resp = self.http.get(&r.url).bearer(&self.a.runtime.runtime_token).timeout(Duration::from_secs(300)).send().await?;
+        if !resp.is_success() {
+            anyhow::bail!("downloading {}@{}: HTTP {}", r.repo, r.sha, resp.status());
+        }
+        let mut bytes = Vec::new();
+        while let Some(c) = resp.chunk().await? {
+            bytes.extend_from_slice(&c);
+            anyhow::ensure!(bytes.len() < 1 << 30, "the action is over 1 GiB");
+        }
+        let d = dir.clone();
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d)?;
+            tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice())).unpack(&d)?;
+            std::fs::write(d.join(".kiln-complete"), b"")?;
+            Ok(())
+        })
+        .await??;
+        Ok(dir)
+    }
+
+    /// A Node runtime for `using` (W07-R05): `node24` on Node 24; `node20`, `node16` and
+    /// `node12` on Node 20, as GitHub forces. Official builds from nodejs.org, checked against
+    /// their `SHASUMS256.txt`, kept in `<work>/_externals`.
+    async fn node(&self, using: &str) -> anyhow::Result<PathBuf> {
+        let major = if using == "node24" { 24 } else { 20 };
+        let dir = self.work_dir.join("_externals").join(format!("node{major}"));
+        let bin = if cfg!(windows) { dir.join("node.exe") } else { dir.join("bin").join("node") };
+        if bin.exists() {
+            return Ok(bin);
+        }
+        let _g = NODE_LOCK.lock().await;
+        if bin.exists() {
+            return Ok(bin);
+        }
+        let os = match std::env::consts::OS {
+            "linux" => "linux",
+            "macos" => "darwin",
+            other => anyhow::bail!("no Node {major} build for {other} here yet"),
+        };
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            "arm" => "armv7l",
+            other => anyhow::bail!("no Node {major} build for {other}"),
+        };
+        let base = format!("https://nodejs.org/dist/latest-v{major}.x");
+        let sums = self.http.get(&format!("{base}/SHASUMS256.txt")).timeout(Duration::from_secs(60)).send().await?.bytes(1 << 20).await?;
+        let sums = String::from_utf8_lossy(&sums).to_string();
+        let suffix = format!("-{os}-{arch}.tar.gz");
+        let (sha, file) = sums
+            .lines()
+            .filter_map(|l| l.split_once("  "))
+            .find(|(_, f)| f.starts_with("node-v") && f.ends_with(&suffix))
+            .map(|(h, f)| (h.trim().to_owned(), f.trim().to_owned()))
+            .ok_or_else(|| anyhow::anyhow!("nodejs.org lists no {suffix} build of Node {major}"))?;
+        let mut resp = self.http.get(&format!("{base}/{file}")).timeout(Duration::from_secs(600)).send().await?;
+        anyhow::ensure!(resp.is_success(), "downloading {file}: HTTP {}", resp.status());
+        let mut bytes = Vec::new();
+        while let Some(c) = resp.chunk().await? {
+            bytes.extend_from_slice(&c);
+        }
+        let got = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&bytes))
+        };
+        anyhow::ensure!(got == sha, "{file}: SHA-256 {got}, SHASUMS256.txt says {sha}");
+        let d = dir.clone();
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            let tmp = d.with_extension("partial");
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp)?;
+            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()));
+            for entry in ar.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.into_owned();
+                // Strip `node-vX.Y.Z-os-arch/`.
+                let rest: PathBuf = path.components().skip(1).collect();
+                if rest.as_os_str().is_empty() {
+                    continue;
+                }
+                entry.unpack(tmp.join(rest))?;
+            }
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::rename(&tmp, &d)?;
+            Ok(())
+        })
+        .await??;
+        Ok(bin)
+    }
+
+    /// An action's inputs (W07-R05): `with`, else the default, evaluated as an expression; inputs
+    /// the action doesn't declare are passed on with GitHub's warning.
+    async fn inputs(&self, st: &State, idx: u32, action: &kiln_ci::wf::Action, with: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for i in &action.inputs {
+            let given = with.iter().find(|(k, _)| k.eq_ignore_ascii_case(&i.name)).map(|(_, v)| v.clone());
+            let v = match given {
+                Some(v) => v,
+                None => match &i.default {
+                    Some(t) => st.render(t, Site::StepWith, &format!("inputs.{}", i.name)).unwrap_or_else(|_| t.src.clone()),
+                    None => String::new(),
+                },
+            };
+            out.insert(i.name.clone(), v);
+        }
+        let unexpected: Vec<&String> = with.keys().filter(|k| !action.inputs.iter().any(|i| i.name.eq_ignore_ascii_case(k))).collect();
+        if !unexpected.is_empty() {
+            let valid: Vec<String> = action.inputs.iter().map(|i| format!("'{}'", i.name)).collect();
+            let names: Vec<String> = unexpected.iter().map(|k| format!("'{k}'")).collect();
+            self.annotate(idx, "warning", &format!("Unexpected input(s) {}, valid inputs are [{}]", names.join(", "), valid.join(", "))).await;
+            for k in unexpected {
+                out.insert(k.clone(), with.get(k).cloned().unwrap_or_default());
+            }
+        }
+        out
+    }
+
+    /// A `uses:` step (W07): JavaScript, composite (Docker with W13).
+    #[allow(clippy::too_many_arguments)]
+    async fn action(&self, st: &mut State, idx: u32, step: &Step, uses: &str, with: BTreeMap<String, String>, wd: &Path, env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
+        let loc = self.locate(uses).await?;
+        let dir = loc.dir.clone();
+        let action = crate::rt::blocking(move || load_action(&dir)).await??;
+        let inputs = self.inputs(st, idx, &action, &with).await;
+        let mut aenv = env;
+        for (k, v) in &inputs {
+            aenv.insert(input_var(k), v.clone());
+        }
+        aenv.insert("GITHUB_ACTION".into(), step.id.clone().unwrap_or_else(|| action_name(uses)));
+        aenv.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
+        aenv.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
+        aenv.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
+        for (k, t) in &action.runs.env {
+            aenv.insert(k.clone(), st.render(t, Site::StepEnv, &format!("runs.env.{k}")).unwrap_or_else(|_| t.src.clone()));
+        }
+        match action.runs.using.as_str() {
+            "node12" | "node16" | "node20" | "node24" => {
+                let node = self.node(&action.runs.using).await?;
+                let main = action.runs.main.as_deref().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.main`"))?;
+                let script = loc.dir.join(main);
+                let ran = self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![script.to_string_lossy().to_string()] }, wd, aenv.clone(), deadline).await?;
+                if let Some(post) = &action.runs.post {
+                    let mut penv = aenv;
+                    for (k, v) in &ran.state {
+                        penv.insert(format!("STATE_{k}"), v.clone());
+                    }
+                    let name = action.name.clone().unwrap_or_else(|| uses.to_owned());
+                    st.posts.push(Post { name: format!("Post {name}"), node, script: loc.dir.join(post), env: penv, cond: action.runs.post_if.clone(), wd: wd.to_path_buf(), uses: uses.to_owned() });
+                }
+                Ok(ran)
+            }
+            "composite" => Box::pin(self.composite(st, idx, &action, &loc, &inputs, aenv, deadline)).await,
+            "docker" => anyhow::bail!("`{uses}` is a Docker action: those run with Docker executors (docs/ci.md W13), which this runner doesn't have yet"),
+            other => anyhow::bail!("`runs.using: {other}` is no kind of action this runner knows"),
+        }
+    }
+
+    /// A composite action (W07-R07): its steps run in this leg, with their own `inputs` and
+    /// `steps` contexts and `github.action_path`; its outputs map its steps' outputs.
+    #[allow(clippy::too_many_arguments)]
+    async fn composite(&self, st: &mut State, idx: u32, action: &kiln_ci::wf::Action, loc: &Located, inputs: &BTreeMap<String, String>, env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
+        let saved_steps = std::mem::take(&mut st.steps);
+        let saved_base = st.base.clone();
+        let saved_github = st.github.clone();
+        let saved_failed = st.failed;
+        let job_env = std::mem::replace(&mut st.env, env.clone());
+        st.base.retain(|(k, _)| *k != "inputs");
+        st.base.push(("inputs", str_map(inputs)));
+        if let Value::Object(m) = &st.github {
+            let mut members: Vec<(String, Value)> = m.0.iter().filter(|(k, _)| &**k != "action_path").map(|(k, v)| (k.to_string(), v.clone())).collect();
+            members.push(("action_path".to_owned(), Value::str(&loc.dir.to_string_lossy())));
+            st.github = Value::object(members);
+        }
+        st.failed = false;
+        let mut end = End::Exit(Some(0));
+        for s in &action.runs.steps {
+            if let Some(e @ (End::Cancelled | End::TimedOut)) = Box::pin(self.step(st, idx, s, deadline, true)).await {
+                end = e;
+            }
+        }
+        if st.failed && end == End::Exit(Some(0)) {
+            end = End::Exit(Some(1));
+        }
+        let mut outputs = BTreeMap::new();
+        for o in &action.outputs {
+            if let Some(v) = &o.value {
+                match st.render(v, Site::StepRun, &format!("outputs.{}", o.name)) {
+                    Ok(x) => {
+                        outputs.insert(o.name.clone(), x);
+                    }
+                    Err(e) => self.annotate(idx, "warning", &e).await,
+                }
+            }
+        }
+        // `$GITHUB_ENV` written inside reaches the job's later steps, as on GitHub.
+        let mut merged = job_env;
+        for (k, v) in &st.env {
+            if env.get(k) != Some(v) {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        st.env = merged;
+        st.steps = saved_steps;
+        st.base = saved_base;
+        st.github = saved_github;
+        st.failed = saved_failed;
+        Ok(Ran { end, outputs, state: Vec::new() })
+    }
+
+    /// Pre steps (W06-R11): every remote JavaScript action's `pre`, before the job's steps, in
+    /// step order, under `pre-if` (default `always()`).
+    async fn pre_steps(&self, st: &mut State, deadline: Instant) {
+        for step in &self.a.steps {
+            let Some(uses) = &step.uses else { continue };
+            if uses.starts_with("./") || uses.starts_with("docker://") || !self.a.actions.contains_key(uses) {
+                continue;
+            }
+            let Ok(loc) = self.locate(uses).await else { continue };
+            let dir = loc.dir.clone();
+            let Ok(Ok(action)) = crate::rt::blocking(move || load_action(&dir)).await else { continue };
+            let Some(pre) = &action.runs.pre else { continue };
+            if !action.runs.using.starts_with("node") {
+                continue;
+            }
+            let run = match &action.runs.pre_if {
+                Some(t) => st.condition(Some(t)).unwrap_or(false),
+                None => true,
+            };
+            let idx = st.next_idx;
+            st.next_idx += 1;
+            let name = format!("Pre {}", action.name.clone().unwrap_or_else(|| uses.clone()));
+            self.start(idx, &name, "pre", Some(uses.clone())).await;
+            if !run {
+                self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Skipped, conclusion: Conclusion::Skipped, exit_code: None, outputs: BTreeMap::new() }).await;
+                continue;
+            }
+            let with: BTreeMap<String, String> = step.with.iter().filter_map(|(k, v)| st.value(v, Site::StepWith, k).ok().map(|x| (k.clone(), x.coerce_string()))).collect();
+            let inputs = self.inputs(st, idx, &action, &with).await;
+            let mut env = st.env.clone();
+            for (k, v) in &inputs {
+                env.insert(input_var(k), v.clone());
+            }
+            env.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
+            env.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
+            env.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
+            let r = match self.node(&action.runs.using).await {
+                Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &st.layout.workspace.clone(), env, deadline).await,
+                Err(e) => Err(e),
+            };
+            let ok = matches!(r, Ok(Ran { end: End::Exit(Some(0)), .. }));
+            if let Err(e) = &r {
+                self.note(idx, &format!("Error: {e:#}")).await;
+            }
+            if !ok {
+                st.failed = true;
+            }
+            let c = if ok { Conclusion::Success } else { Conclusion::Failure };
+            self.event(&JobEventV2::StepFinished { idx, outcome: c, conclusion: c, exit_code: None, outputs: BTreeMap::new() }).await;
+        }
+    }
+
+    /// Post steps (W06-R11): in reverse order of the actions that ran, under `post-if` (default
+    /// `always()`), with the `STATE_*` their main step saved.
+    async fn post_steps(&self, st: &mut State, deadline: Instant) {
+        let posts = std::mem::take(&mut st.posts);
+        for p in posts.into_iter().rev() {
+            let run = match &p.cond {
+                Some(t) => st.condition(Some(t)).unwrap_or(false),
+                None => true,
+            };
+            let idx = st.next_idx;
+            st.next_idx += 1;
+            self.start(idx, &p.name, "post", Some(p.uses.clone())).await;
+            if !run {
+                self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Skipped, conclusion: Conclusion::Skipped, exit_code: None, outputs: BTreeMap::new() }).await;
+                continue;
+            }
+            let r = self.exec(st, idx, Run::Program { prog: p.node.to_string_lossy().to_string(), args: vec![p.script.to_string_lossy().to_string()] }, &p.wd, p.env, deadline).await;
+            let ok = matches!(r, Ok(Ran { end: End::Exit(Some(0)), .. }));
+            if let Err(e) = &r {
+                self.note(idx, &format!("Error: {e:#}")).await;
+            }
+            if !ok {
+                st.failed = true;
+            }
+            let c = if ok { Conclusion::Success } else { Conclusion::Failure };
+            self.event(&JobEventV2::StepFinished { idx, outcome: c, conclusion: c, exit_code: None, outputs: BTreeMap::new() }).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,7 +1303,7 @@ mod tests {
             ..AssignmentV2::default()
         };
         let (tx, rx) = async_channel::unbounded();
-        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new() };
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
         let result = crate::rt::block_on(async move { Ok(leg.run().await) })?;
         let (mut logs, mut events) = (BTreeMap::<u32, String>::new(), Vec::new());
         while let Ok(m) = rx.try_recv() {
@@ -945,6 +1368,43 @@ jobs:
         assert!(events.iter().any(|e| matches!(e, JobEventV2::Annotation { level, message, file, .. } if level == "warning" && message == "careful" && file.as_deref() == Some("a.rs"))));
         assert!(events.iter().any(|e| matches!(e, JobEventV2::Summary { markdown, .. } if markdown.contains("## Summary"))));
         assert!(events.iter().any(|e| matches!(e, JobEventV2::JobOutputs { outputs, .. } if outputs.get("x").map(String::as_str) == Some("1"))));
+        Ok(())
+    }
+
+    /// W07-R07: a local composite action: inputs with defaults, outputs from its steps,
+    /// `$GITHUB_ENV` reaching the job's later steps, its steps in the caller's log.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_composite_action() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        // Written by a step, base64-encoded: a `run:` step's own `${{ }}` are interpolated before
+        // it runs (as on GitHub), and these belong to the action.
+        let action = r#"name: Greet
+inputs:
+  who: { description: who, required: true }
+  greeting: { description: how, default: "hello ${{ github.event_name }}" }
+outputs:
+  said: { description: what, value: "${{ steps.say.outputs.said }}" }
+runs:
+  using: composite
+  steps:
+    - id: say
+      shell: bash
+      run: |
+        echo "${{ inputs.greeting }}, ${{ inputs.who }}"
+        echo "said=${{ inputs.greeting }}, ${{ inputs.who }}" >> "$GITHUB_OUTPUT"
+        echo "GREETED=yes" >> "$GITHUB_ENV"
+"#;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(action);
+        let wf = format!(
+            "on: push\njobs:\n  t:\n    runs-on: x\n    steps:\n      - run: mkdir -p .github/actions/greet && echo {b64} | base64 -d > .github/actions/greet/action.yml\n      - id: greet\n        uses: ./.github/actions/greet\n        with:\n          who: kiln\n      - run: echo \"it said '${{{{ steps.greet.outputs.said }}}}' and GREETED=$GREETED\"\n"
+        );
+        let wf = wf.as_str();
+        let (r, logs, events) = run_leg(wf, &[])?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&1).is_some_and(|l| l.contains("hello push, kiln")), "{logs:?}");
+        assert_eq!(finished(&events, 1).map(|f| f.2.get("said").cloned()), Some(Some("hello push, kiln".into())));
+        assert!(logs.get(&2).is_some_and(|l| l.contains("it said 'hello push, kiln' and GREETED=yes")), "{logs:?}");
         Ok(())
     }
 

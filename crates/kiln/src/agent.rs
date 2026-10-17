@@ -836,7 +836,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let cancel = Shutdown::new();
                         jobs.insert(id.clone(), Running { cancel: cancel.clone() });
                         tracing::info!(job = %id, leg = %a.leg.name, "running leg");
-                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel };
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone() };
                         let done = done_tx.clone();
                         crate::rt::spawn(async move {
                             let result = leg.run().await;

@@ -33,14 +33,19 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     for l in running {
         match (&l.workflow, l.has_errors()) {
             (Some(w), false) => match kiln_ci::trigger::matches(w, &event) {
-                Ok(()) => hub.ci.send(Msg::Start(Box::new(Start {
-                    repo: repo.clone(),
-                    event: event.clone(),
-                    path: l.path.clone(),
-                    workflow: Arc::new(w.clone()),
-                    message: message.clone(),
-                    author: author.clone(),
-                }))),
+                Ok(()) => match super::actions::resolve(hub, w).await {
+                    // Every action the run may reach, pinned now (W07-R02).
+                    Ok(actions) => hub.ci.send(Msg::Start(Box::new(Start {
+                        repo: repo.clone(),
+                        event: event.clone(),
+                        path: l.path.clone(),
+                        workflow: Arc::new(w.clone()),
+                        message: message.clone(),
+                        author: author.clone(),
+                        actions,
+                    }))),
+                    Err(e) => fail_run(hub, repo, &event, l, &message, &author, e).await?,
+                },
                 Err(why) => tracing::debug!(workflow = %l.path, %why, "workflow not run"),
             },
             _ => startup_failure(hub, repo, &event, l, &message, &author).await?,
@@ -139,6 +144,11 @@ async fn commits(hub: &Hub, mirror: &str, before: Option<&str>, after: &str) -> 
 async fn startup_failure(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: &str, author: &str) -> anyhow::Result<()> {
     let lines: Vec<String> = l.diagnostics.iter().filter(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{}:{}:{}: {} {}", l.path, d.range.start.line, d.range.start.col, d.code, d.message)).collect();
     let error = if lines.is_empty() { format!("{} could not be read", l.path) } else { lines.join("\n") };
+    fail_run(hub, repo, e, l, message, author, error).await
+}
+
+/// A run that fails before any job, saying why.
+async fn fail_run(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: &str, author: &str, error: String) -> anyhow::Result<()> {
     let id = crate::util::new_id();
     let n = super::runs::NewRun {
         id: id.clone(),

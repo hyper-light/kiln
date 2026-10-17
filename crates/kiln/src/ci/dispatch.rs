@@ -35,6 +35,8 @@ pub struct Start {
     /// The commit's message and author, for the run list.
     pub message: String,
     pub author: String,
+    /// The run's remote actions, resolved when it started (W07-R02).
+    pub actions: std::collections::BTreeMap<String, wire::ActionRef>,
 }
 
 /// What the dispatcher hears.
@@ -99,6 +101,7 @@ struct RunSt {
     github: serde_json::Value,
     vars: serde_json::Value,
     trusted: bool,
+    actions: std::collections::BTreeMap<String, wire::ActionRef>,
     /// The plan's leg keys, to leg ids.
     keys: HashMap<String, String>,
     /// Actions waiting for the run's concurrency group to let it start.
@@ -282,7 +285,7 @@ impl Dispatch {
         let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
         let github = self.github_context(&s, number, rowid, &name);
         let input = RunInput { github: github.clone(), inputs: s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null), vars: serde_json::json!({}), changed: s.event.changed.clone().map(Arc::new), trusted };
-        self.save_input(&id, &input).await?;
+        self.save_input(&id, &input, &s.actions).await?;
         let files = self.files.get(&s.event.sha).cloned().unwrap_or_default();
         let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files });
         let (plan, actions) = match started {
@@ -295,7 +298,7 @@ impl Dispatch {
         };
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-        self.runs.insert(id.clone(), RunSt { plan, repo: s.repo, event: s.event, wf: s.workflow, github, vars: serde_json::json!({}), trusted, keys: HashMap::new(), held: Some(actions), seq: 0 });
+        self.runs.insert(id.clone(), RunSt { plan, repo: s.repo, event: s.event, wf: s.workflow, github, vars: serde_json::json!({}), trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0 });
         self.hub.ci.runs.lock().insert(id.clone());
         self.hub.emit_run(&id).await;
         let cmds = self.sched.handle(Input::RunQueued { run: id, group, supersede: None }, now_ms());
@@ -307,16 +310,17 @@ impl Dispatch {
         Settings { default_runs_on: vec!["k8s".into()], ..Settings::default() }
     }
 
-    async fn save_input(&self, run: &str, input: &RunInput) -> anyhow::Result<()> {
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted }).to_string();
+    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>) -> anyhow::Result<()> {
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
 
     /// The `github` context (W03-R07, W06-R03), with GitHub's URLs for repositories hosted there.
     fn github_context(&self, s: &Start, number: i64, rowid: i64, name: &str) -> serde_json::Value {
-        let on_github = s.repo.clone_url.contains("github.com");
-        let server_url = if on_github { "https://github.com".to_owned() } else { self.hub.cfg.server.public_url.trim_end_matches('/').to_owned() };
+        // The code host is kiln's facade; each runner sees it at its own address of the server.
+        let base = self.hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+        let server_url = format!("{base}/_kiln/git");
         let repo = kiln_ci::trigger::context::Repo { full_name: s.repo.name.clone(), id: 0, owner_id: 0, default_branch: String::new(), private: false, server_url };
         let run = kiln_ci::trigger::context::RunFacts {
             run_id: u64::try_from(rowid).unwrap_or(0),
@@ -325,8 +329,8 @@ impl Dispatch {
             workflow: name.to_owned(),
             workflow_ref: format!("{}/{}@{}", s.repo.name, s.path, s.event.git_ref),
             workflow_sha: s.event.sha.clone(),
-            api_url: if on_github { "https://api.github.com".into() } else { String::new() },
-            graphql_url: if on_github { "https://api.github.com/graphql".into() } else { String::new() },
+            api_url: format!("{base}/_kiln/api"),
+            graphql_url: format!("{base}/_kiln/api/graphql"),
             retention_days: 90,
             actor_id: 0,
             triggering_actor: String::new(),
@@ -519,14 +523,13 @@ impl Dispatch {
         let spec = &l.spec;
         let wf = &spec.workflow;
         let job = spec.def();
-        let token = crate::api::job_token(&self.hub.admin_token, leg);
+        let token = super::token::leg_token(&self.hub, leg);
         let mut secrets: Vec<wire::Secret> = Vec::new();
         if r.trusted {
             secrets.extend(self.hub.ci_secrets().into_iter().map(|(name, value)| wire::Secret { name, value }));
         }
         secrets.push(wire::Secret { name: "GITHUB_TOKEN".into(), value: token.clone() });
         let num = |k: &str| spec.strategy.get(k).and_then(serde_json::Value::as_f64).map_or(0, |v| v as u32);
-        let on_github = r.repo.clone_url.contains("github.com");
         let mut env_from = spec.env_from.clone();
         env_from.extend(spec.run_env.iter().map(|(k, v)| (format!("KILN_RUN_{k}"), v.clone())));
         AssignmentV2 {
@@ -560,13 +563,14 @@ impl Dispatch {
                 cache_url: "/_kiln/cache/".into(),
                 id_token_url: None,
                 id_token_request_token: None,
-                facade_url: if on_github { "https://github.com".into() } else { self.hub.cfg.server.public_url.clone() },
-                api_url: if on_github { "https://api.github.com".into() } else { String::new() },
-                graphql_url: if on_github { "https://api.github.com/graphql".into() } else { String::new() },
+                // The code host: kiln's mirror, which the leg's token reads (W14).
+                facade_url: "/_kiln/git".into(),
+                api_url: "/_kiln/api".into(),
+                graphql_url: "/_kiln/api/graphql".into(),
                 github_token: token,
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
-            actions: Default::default(),
+            actions: r.actions.clone(),
             debug: wire::Debug::default(),
             limits: wire::Limits::default(),
         }
@@ -742,7 +746,8 @@ impl Dispatch {
         })
         .await?;
         let event = Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() };
-        let mut st = RunSt { plan, repo: repo.clone(), event, wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, keys: HashMap::new(), held: None, seq };
+        let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
+        let mut st = RunSt { plan, repo: repo.clone(), event, wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
