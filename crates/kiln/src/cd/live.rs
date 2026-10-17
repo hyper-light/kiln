@@ -38,6 +38,14 @@ pub const MAX_LOG_PODS: usize = 8;
 const LOG_BYTES: usize = 2 << 20;
 /// Longest log line kept; longer ones are cut.
 const LINE_MAX: usize = 16 << 10;
+/// Most requests one tree has in flight at once, so reading it never floods a cluster.
+const IN_FLIGHT: usize = 8;
+
+/// Runs `futs` at most [`IN_FLIGHT`] at a time; their results in any order. (Made into a list
+/// first, as `join_all` does, so no iterator's closure is held across an await.)
+fn bounded<T, F: std::future::Future<Output = T>>(futs: Vec<F>) -> impl std::future::Future<Output = Vec<T>> {
+    futures::stream::iter(futs).buffer_unordered(IN_FLIGHT).collect()
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ListKey {
@@ -267,7 +275,7 @@ impl Live {
             let (c, sel) = (&cluster, sel.as_deref());
             async move { ((gk.clone(), ns.clone()), self.list(c, gk.clone(), ns, sel, metadata).await) }
         });
-        let own: Vec<((GroupKind, String), Listed)> = futures::future::join_all(own).await;
+        let own: Vec<((GroupKind, String), Listed)> = bounded(own.collect()).await;
         let mut found: HashMap<ResKey, Value> = HashMap::new();
         for ((gk, ns), listed) in &own {
             match listed.as_ref() {
@@ -287,10 +295,15 @@ impl Live {
             .map(|(r, _)| r.key.clone())
             .take(MAX_GETS)
             .collect();
-        let gets = futures::future::join_all(stray.iter().map(|k| {
-            let c = &cluster;
-            async move { (k.clone(), c.get(k).await) }
-        }))
+        let gets = bounded(
+            stray
+                .iter()
+                .map(|k| {
+                    let c = &cluster;
+                    async move { (k.clone(), c.get(k).await) }
+                })
+                .collect(),
+        )
         .await;
         for (k, got) in gets {
             match got {
@@ -333,7 +346,7 @@ impl Live {
             async move { self.list(c, GroupKind::new(g, k), ns, None, false).await }
         });
         let mut listed: Vec<Value> = Vec::new();
-        for l in futures::future::join_all(lists).await {
+        for l in bounded(lists.collect()).await {
             match l.as_ref() {
                 Ok(items) => listed.extend(items.iter().cloned()),
                 Err(e) => errors.push(e.clone()),
