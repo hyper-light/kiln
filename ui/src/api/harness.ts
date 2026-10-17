@@ -324,6 +324,8 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 
 export const harnessApi = {
   kinds: (target: string) => call<KindInfo[]>("GET", `/api/harness/kinds?target=${encodeURIComponent(target)}`),
+  /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
+  kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),

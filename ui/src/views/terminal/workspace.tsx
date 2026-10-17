@@ -25,6 +25,7 @@ import { Chips } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
 import { useLocalStorage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+import { SpawnHereButton } from "@/views/harness/spawn-here";
 import { TerminalSession, type SessionHandle, type SessionState } from "./session";
 
 interface Tab {
@@ -287,6 +288,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
               {renderer}
             </span>
           )}
+          {active && <SpawnHereButton target={active.target} shell={active.sessionId} />}
           <Tip content={kbVisible ? "Hide keyboard" : "Show keyboard"}>
             <button
               className={cn("icon-btn", kbVisible && "!text-[#d8d0f2]")}

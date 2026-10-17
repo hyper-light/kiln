@@ -50,11 +50,13 @@ export function SpawnDialog({
 }) {
   const [machines, setMachines] = React.useState<Agent[]>([]);
   const [shells, setShells] = React.useState<TerminalSessionInfo[]>([]);
-  const [target, setTarget] = useLocalStorage("kiln.agents.target", "local");
+  const [lastTarget, setLastTarget] = useLocalStorage("kiln.agents.target", "");
   const [kind, setKind] = useLocalStorage("kiln.agents.kind", "claude");
   const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
   const [cwd, setCwd] = useLocalStorage("kiln.agents.cwd", "~");
-  const [kinds, setKinds] = React.useState<KindInfo[] | null>(null);
+  /** Every machine's harnesses (null while loading). */
+  const [byTarget, setByTarget] = React.useState<Record<string, KindInfo[]> | null>(null);
+  const [picked, setPicked] = React.useState<string | null>(null);
   const [count, setCount] = React.useState(1);
   const [name, setName] = React.useState("");
   const [model, setModel] = React.useState("");
@@ -66,9 +68,11 @@ export function SpawnDialog({
   React.useEffect(() => {
     if (!open) return;
     setError(null);
-    if (defaults?.target) setTarget(defaults.target);
+    setPicked(defaults?.target ?? null);
     if (defaults?.cwd) setCwd(defaults.cwd);
     setShell(defaults?.shell ?? "");
+    setByTarget(null);
+    harnessApi.kindsAll().then(setByTarget, () => setByTarget({}));
     api.agents().then(
       (a) => setMachines(a.filter((m) => m.connected && !m.ephemeral)),
       () => undefined,
@@ -77,27 +81,39 @@ export function SpawnDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  // Harnesses: every one any machine has. Machines: every one that has the chosen harness.
+  const all = React.useMemo(() => {
+    const m = new Map<string, KindInfo>();
+    for (const ks of Object.values(byTarget ?? {}))
+      for (const k of ks) {
+        const cur = m.get(k.id);
+        m.set(k.id, cur ? { ...cur, available: cur.available || k.available, verified: cur.verified || k.verified } : k);
+      }
+    return [...m.values()].sort((a, b) => Number(b.available) - Number(a.available));
+  }, [byTarget]);
+  const hosts = (k: string) =>
+    Object.entries(byTarget ?? {})
+      .filter(([, ks]) => ks.some((x) => x.id === k && x.available))
+      .map(([t]) => t);
   React.useEffect(() => {
-    if (!open) return;
-    let live = true;
-    setKinds(null);
-    harnessApi.kinds(target).then(
-      (k) => live && setKinds(k),
-      () => live && setKinds([]),
-    );
-    return () => {
-      live = false;
-    };
-  }, [open, target]);
-
-  const usable = (kinds ?? []).filter((k) => k.available);
-  React.useEffect(() => {
-    if (kinds && usable.length && !usable.some((k) => k.id === kind)) setKind(usable[0]?.id ?? "claude");
+    if (all.length && !all.some((k) => k.id === kind && k.available)) {
+      const first = all.find((k) => k.available);
+      if (first) setKind(first.id);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kinds]);
+  }, [all]);
+  const where = hosts(kind);
+  // The machine: the one you picked, else the shell's, else the last one used, else the first that has it.
+  const target = [picked, defaults?.target, lastTarget].find((t): t is string => Boolean(t) && where.includes(t ?? "")) ?? where[0] ?? "";
+  const machineName = (t: string) => {
+    if (t === "local") return "kiln server";
+    const n = t.replace(/^agent:/, "");
+    const m = machines.find((x) => x.name === n);
+    return m?.hostname && m.hostname !== n ? `${n} (${m.hostname})` : n;
+  };
 
   const targetShells = shells.filter((s) => s.target === target && !s.exited);
-  const kindInfo = (kinds ?? []).find((k) => k.id === kind);
+  const kindInfo = all.find((k) => k.id === kind);
   const modes = modesFor(kindInfo);
   const mode = modes.some((m) => m.id === modeByKind[kind]) ? (modeByKind[kind] ?? "") : (modes[0]?.id ?? "");
   const setMode = (m: string) => setModeByKind({ ...modeByKind, [kind]: m });
@@ -116,6 +132,7 @@ export function SpawnDialog({
     };
     try {
       const started = await harnessApi.start(target, spec, count);
+      setLastTarget(target);
       onStarted(started);
       setPrompt("");
       setName("");
@@ -132,24 +149,13 @@ export function SpawnDialog({
       <DialogContent title="New agents" eyebrow="Agents" description="Start any harness a machine has, one or a dozen at a time. kiln runs them and is their whole front end.">
         <div className="hx-form">
           <div className="hx-field">
-            <span className="hx-eyebrow">Machine</span>
-            <select className="hx-select" value={target} onChange={(e) => setTarget(e.target.value)}>
-              <option value="local">server</option>
-              {machines.map((m) => (
-                <option key={m.name} value={`agent:${m.name}`}>
-                  {m.name}
-                  {m.hostname && m.hostname !== m.name ? ` (${m.hostname})` : ""}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="hx-field">
-            <span className="hx-eyebrow">Harness</span>
+            <span className="hx-eyebrow">Agent</span>
             <div className="hx-kinds">
-              {kinds === null && <span className="hx-dim text-[12px]">Looking…</span>}
-              {kinds?.length === 0 && <span className="hx-dim text-[12px]">No harness found on this machine.</span>}
-              {(kinds ?? []).map((k) => (
+              {byTarget === null && <span className="hx-dim text-[12px]">Looking at your machines…</span>}
+              {byTarget !== null && all.length === 0 && (
+                <span className="hx-dim text-[12px]">No connected machine has a coding agent installed. Install Claude Code or Codex on any machine running kiln, then try again.</span>
+              )}
+              {all.map((k) => (
                 <button
                   key={k.id}
                   type="button"
@@ -157,7 +163,7 @@ export function SpawnDialog({
                   aria-pressed={kind === k.id}
                   disabled={!k.available}
                   onClick={() => setKind(k.id)}
-                  title={k.available ? undefined : "Not installed on this machine"}
+                  title={k.available ? undefined : "Not installed on any connected machine"}
                 >
                   <HarnessMark kind={k.id} name={k.name} size={20} />
                   <span>{k.name}</span>
@@ -166,6 +172,20 @@ export function SpawnDialog({
               ))}
             </div>
           </div>
+
+          {where.length > 0 && (
+            <div className="hx-field">
+              <span className="hx-eyebrow">Machine</span>
+              <select className="hx-select" value={target} onChange={(e) => setPicked(e.target.value)}>
+                {where.map((t) => (
+                  <option key={t} value={t}>
+                    {machineName(t)}
+                  </option>
+                ))}
+              </select>
+              {where.length < Object.keys(byTarget ?? {}).length && <span className="hx-dim text-[11px]">Only machines with {kindInfo?.name ?? "it"} installed are listed.</span>}
+            </div>
+          )}
 
           <div className="hx-row2">
             <div className="hx-field">
@@ -236,7 +256,7 @@ export function SpawnDialog({
             <Button variant="ghost" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
-            <Button onClick={start} disabled={busy || !usable.some((k) => k.id === kind)} className={cn(busy && "opacity-70")}>
+            <Button onClick={start} disabled={busy || !target} className={cn(busy && "opacity-70")}>
               <Rocket /> {count > 1 ? `Start ${count} agents` : "Start agent"}
             </Button>
           </div>
