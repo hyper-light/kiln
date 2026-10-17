@@ -13,6 +13,7 @@ import { diffStats, relPath, tildify } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
 import { answersToClaude, Choices, type ChoiceQuestion } from "./choices";
 import { Prose, ToolIcon } from "./parts";
+import { SavePlan } from "@/views/plans/save";
 
 export type Decide = (c: Extract<Command, { type: "approve" }>) => void;
 
@@ -106,6 +107,7 @@ export function ApprovalCard({ a, cwd, onDecide, className, agentName, kind }: {
         </div>
       )}
       {isPlan && <Prose text={a.plan ?? ""} className="hx-plan-text" />}
+      {isPlan && <SavePlan body={a.plan ?? ""} />}
 
       {!isQuestion && a.cwd && a.cwd !== cwd && <div className="hx-approval-where">in {tildify(a.cwd)}</div>}
 

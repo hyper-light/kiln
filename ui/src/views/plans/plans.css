@@ -1,0 +1,344 @@
+/* Plans (views/plans): plain sections in the page's flow; standard fields, selects, checkboxes. */
+
+.plans-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px 12px;
+  margin-bottom: 18px;
+}
+.plans-filter {
+  min-width: 0;
+  flex: 1 1 320px;
+}
+.plans-sort {
+  flex: 0 0 180px;
+}
+.plans-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--color-line);
+}
+.plans-row {
+  display: grid;
+  gap: 4px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.plans-row-title {
+  color: var(--color-bright);
+  font-size: 15px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.plans-row-title:hover {
+  color: var(--color-link);
+}
+.plans-row-meta,
+.plan-crumbs,
+.plan-dim {
+  color: var(--color-meta);
+  font-size: 12.5px;
+}
+.plans-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.plans-tag {
+  padding: 1px 8px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 999px;
+  color: var(--color-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.plan-page {
+  display: grid;
+  gap: 14px;
+}
+.plan-crumbs a {
+  color: var(--color-link);
+}
+.plan-title-field input {
+  font-size: 17px;
+}
+.plan-edit {
+  display: grid;
+  gap: 14px;
+}
+@media (min-width: 1024px) {
+  .plan-edit[data-preview="true"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+.plan-text {
+  display: grid;
+  gap: 6px;
+}
+.plan-body {
+  width: 100%;
+  min-height: 320px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 8px;
+  background: var(--color-surface);
+  color: var(--color-foreground);
+  font-family: var(--font-mono);
+  font-size: 16px;
+  line-height: 1.55;
+  resize: vertical;
+}
+@media (min-width: 640px) {
+  .plan-body {
+    font-size: 13px;
+  }
+}
+.plan-body:focus {
+  outline: none;
+  border-color: var(--color-focus);
+}
+.plan-preview {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 2px;
+  overflow-wrap: anywhere;
+}
+.plan-steps-label {
+  margin-top: 8px;
+}
+.plan-steps {
+  margin: 0;
+  padding-left: 22px;
+  list-style: decimal;
+  color: var(--color-secondary);
+  font-size: 13px;
+}
+.plan-steps li::marker {
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.plan-steps li + li {
+  margin-top: 4px;
+}
+.plan-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+.plan-check input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-accent);
+}
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.plan-error {
+  color: var(--color-fail);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.plan-ok {
+  color: var(--color-ok);
+  font-size: 12.5px;
+}
+.plan-ok a {
+  color: var(--color-link);
+}
+.plan-section {
+  display: grid;
+  gap: 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-line);
+}
+.plan-h {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 15px;
+  font-weight: 500;
+}
+.plan-run-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+@media (min-width: 900px) {
+  .plan-run-fields {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    align-items: end;
+  }
+}
+.plan-link {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.plan-link code {
+  min-width: 0;
+  color: var(--color-slate);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.plan-rows {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.plan-rows > li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.plan-rows > li:last-child {
+  border-bottom: 0;
+}
+.plan-row-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  min-height: 32px;
+}
+.plan-row-main {
+  min-width: 0;
+  color: var(--color-foreground);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+a.plan-row-main:hover {
+  color: var(--color-link);
+}
+.plan-version-body {
+  margin: 6px 0 4px;
+  padding-left: 12px;
+  border-left: 2px solid var(--color-line-strong);
+}
+.plan-confirm {
+  display: grid;
+  gap: 8px;
+  max-width: 72ch;
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-accent);
+  background: var(--color-surface);
+  color: var(--color-secondary);
+  font-size: 13px;
+}
+.plan-confirm p {
+  margin: 0;
+}
+.plan-delete {
+  justify-self: start;
+  color: var(--color-fail);
+}
+
+/* "Save plan" in a conversation. */
+.plan-save {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--color-meta);
+  font-size: 12.5px;
+}
+.plan-save a {
+  color: var(--color-link);
+}
+.plan-save-btn {
+  min-height: 30px;
+  padding: 2px 12px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.plan-save-btn:hover:not(:disabled) {
+  border-color: var(--color-line-hover);
+  color: var(--color-foreground);
+}
+.plan-save-err {
+  color: var(--color-fail);
+}
+
+/* A shared plan, outside the console. */
+.plan-shared {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 32px 20px 64px;
+}
+.plan-shared-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 28px;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.plan-shared h1 {
+  margin: 0 0 6px;
+  color: var(--color-bright);
+  font-size: 28px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plans-page *,
+  .plan-page * {
+    transition: none !important;
+  }
+}
+.plan-shared .plan-shared-meta {
+  margin: 0 0 22px;
+}
+.plan-shared-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 32px;
+  padding-top: 20px;
+  border-top: 1px solid var(--color-line);
+}
+.plan-here {
+  display: grid;
+  gap: 10px;
+}
+.plan-here .plan-actions {
+  margin-top: 2px;
+}
+.plan-here-open {
+  color: var(--color-secondary);
+  font-size: 13px;
+}
+.plan-here-open:hover {
+  color: var(--color-bright);
+}
+.plan-share-base {
+  max-width: 420px;
+}
+.plan-reach {
+  max-width: 72ch;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}

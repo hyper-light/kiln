@@ -25,7 +25,7 @@ use crate::hub::Hub;
 pub type Fail = (StatusCode, String);
 /// An operation's answer.
 pub type Out = Result<Value, Fail>;
-type Fut = Pin<Box<dyn Future<Output = Out> + Send>>;
+pub(crate) type Fut = Pin<Box<dyn Future<Output = Out> + Send>>;
 
 /// Who calls, and the services an operation works with.
 #[derive(Clone)]
@@ -50,7 +50,7 @@ pub struct Op {
     pub destructive: bool,
     /// Its input's JSON Schema.
     pub input: fn() -> Value,
-    run: fn(Cx, Value) -> Fut,
+    pub(crate) run: fn(Cx, Value) -> Fut,
 }
 
 fn bad(msg: impl Into<String>) -> Fail {
@@ -216,6 +216,10 @@ pub fn ops() -> &'static [Op] {
             op!("cd.repos.remove", "Remove a repository's credentials.", ro: false, destructive: true,
                 input: || obj_schema(json!({"url": {"type": "string"}}), &["url"]), run: remove_repo),
         ]
+        .into_iter()
+        // Plans share the one table (crates/kiln/src/plans/ops.rs).
+        .chain(crate::plans::ops::list_ops())
+        .collect()
     })
 }
 
