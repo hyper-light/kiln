@@ -473,8 +473,12 @@ impl Leg {
     /// continue-on-error, run, environment files, outcome and conclusion.
     async fn step(&self, st: &mut State, idx: u32, step: &Step, job_deadline: Instant) -> Option<End> {
         let id = step.id.clone();
+        // Without a `name`, GitHub titles a step from its evaluated script's first line.
         let fallback_name = match (&step.run, &step.uses) {
-            (Some(r), _) => format!("Run {}", r.src.lines().next().unwrap_or_default().trim()),
+            (Some(r), _) => {
+                let script = st.render(r, Site::StepRun, "run").unwrap_or_else(|_| r.src.clone());
+                format!("Run {}", script.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim())
+            }
             (None, Some(u)) => format!("Run {u}"),
             _ => "Step".to_owned(),
         };
