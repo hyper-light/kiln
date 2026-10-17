@@ -169,7 +169,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 
 | WS | Title | Depends on | Status | Progress |
 | --- | --- | --- | --- | --- |
-| W01 | Expressions | none | ready | |
+| W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | ready | |
 | W03 | Triggers and events | W02 | blocked (W02) | |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | blocked (W02) | |
@@ -627,8 +627,8 @@ keys), so both sides agree on every value.
 - **W01-R01 Lexer.** Tokens: `( ) [ ] . , ! < <= > >= == != && || *`, identifiers
   (`[A-Za-z_][A-Za-z0-9_-]*`: hyphens are allowed, as in `steps.my-step.outputs`), numbers in any
   form GitHub accepts (integers, decimals, exponents, `0x` hex, a leading `-`), single-quoted
-  strings with `''` as the escaped quote, and the keywords `true`, `false`, `null` (plus `NaN` and
-  `Infinity` if, and only if, GitHub's lexer has them: the oracle of W01-AC01 decides).
+  strings with `''` as the escaped quote, and the keywords `true`, `false`, `null`, `NaN` and
+  `Infinity` (the last two are numbers; none is a keyword right after a `.`).
 - **W01-R02 Grammar and precedence**, highest first: grouping `( )`, index `[ ]`, property `.`,
   `!`, `< <= > >=`, `== !=`, `&&`, `||`. Function calls are `identifier(args)`; names are
   case-insensitive. Object filters: `a.*.b` and `a[*]`.
@@ -650,9 +650,10 @@ keys), so both sides agree on every value.
   substitution, `{{` and `}}` escapes, an out-of-range index is an error), `join(array, sep=',')`
   (a non-array is cast to a string), `toJSON(v)` (pretty-printed with two spaces, as GitHub
   prints it), `fromJSON(s)` (an error on invalid JSON), `hashFiles(patterns…)` (runner only;
-  W01-R09), and the status functions `success()`, `always()`, `cancelled()`, `failure()`. Any
-  function GitHub has added since this spec (for example a `case` function) is implemented to
-  GitHub's semantics, decided by the oracle.
+  W01-R09), `case(pred, value, …, default)` (an odd number of at least three arguments; each
+  predicate must be a boolean), and the status functions `success()`, `always()`, `cancelled()`,
+  `failure()`. Any function GitHub adds later is implemented to GitHub's semantics, decided by the
+  oracle.
 - **W01-R07 Strings from values** (interpolation): `null`→`""`, booleans→`true`/`false`, numbers
   as GitHub formats them (integers without a fraction, otherwise the shortest round-trip form),
   arrays→`Array`, objects→`Object`.
@@ -676,8 +677,10 @@ keys), so both sides agree on every value.
   with wildcards where filters or computed indexes are used. W02 uses it to check context
   availability (Appendix B), W09 to send a leg only the secrets it references, W04 to find
   dependencies, W08 to compute reuse keys.
-- **W01-R13 Bounds.** Expression text ≤ 64 KiB, nesting depth ≤ 64, at most 100,000 evaluation
-  steps and 1 MiB of result per evaluation. Exceeding a bound is an error naming it.
+- **W01-R13 Bounds.** GitHub's: expression text ≤ 21,000 characters (UTF-16 code units), nesting
+  depth ≤ 50, and 1 MiB of memory created per evaluation ("The maximum allowed memory size was
+  exceeded"). kiln's: at most 100,000 evaluation steps and 1 MiB of result. Exceeding a bound is an
+  error naming it.
 - **W01-R14 kiln dialect additions** (refused in the GHA dialect with `KCI5001`):
   - double-quoted strings (v1 files use them);
   - the v1 bare names `event`, `branch`, `repo`, `sha` (aliases of `github.event_name`,
@@ -687,9 +690,10 @@ keys), so both sides agree on every value.
     `runner.facts` (W13);
   - functions `changed(glob, …)` (whether the trigger changed matching files; W03-R12),
     `matches(s, regex)` (RE2 syntax, linear time), `coalesce(a, b, …)` (the first non-empty
-    value), `case(cond, value, …, default)` (unless GitHub ships a function of that name, whose
-    semantics then win), `split(s, sep)`, `replace(s, from, to)`, `lower(s)`, `upper(s)`,
+    value), `split(s, sep)`, `replace(s, from, to)`, `lower(s)`, `upper(s)`,
     `trim(s)`, `fromYAML(s)`, `toYAML(v)`.
+
+  (`case` is GitHub's own, available in both dialects; see W01-R06.)
 
   **Note:** v1 compared strings case-sensitively. Under W01-R04 they compare case-insensitively.
   No v1 condition in the corpus (W01-AC09) changes its result.
@@ -767,7 +771,13 @@ cached by `(dialect, source)` in the planner and the runner.
 | W01-S07 | `toJSON(matrix)` with `{os: linux}` | `"{\n  \"os\": \"linux\"\n}"` |
 | W01-S08 | kiln: `changed('crates/**') && branch == 'main'` on a push touching `crates/a.rs` to main | `true` |
 
-**Progress.** Not started.
+**Progress.** Done (2026-10-17). `crates/kiln-ci/src/expr/` (value, parser, eval, files) and
+`crates/kiln/src/runner/hashfiles.rs`. All of GitHub's 1,020 expression test vectors pass, including
+the five its TypeScript implementation skips (kiln follows the C# runner: absolute error positions,
+the memory bound); the v1 corpus gives identical results for 16,992 templated strings and 40
+conditions; 3.2 million evaluations per second (`cargo bench -p kiln-ci --bench expr`). Per-key
+context and function limits are `ParseOptions` (for W02's Appendix B checks); `Condition` reads an
+`if:` the way GitHub does; `eval_value` keeps a single expression's type.
 
 ### W02 Workflow model, dialects and validation
 

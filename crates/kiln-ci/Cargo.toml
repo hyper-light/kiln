@@ -16,5 +16,9 @@ sha2 = "0.11.1"
 [dev-dependencies]
 proptest = "1"
 
+[[bench]]
+name = "expr"
+harness = false
+
 [lints]
 workspace = true

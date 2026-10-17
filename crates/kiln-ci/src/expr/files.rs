@@ -17,9 +17,11 @@ pub trait FileSource {
     /// The workspace's absolute path, without a trailing separator (patterns that start with it
     /// are made relative).
     fn root(&self) -> String;
-    /// Every regular file under the workspace, as relative paths with `/` separators, following
-    /// symbolic links that stay inside the workspace (and only those).
-    fn files(&self) -> Result<Vec<String>, ExprError>;
+    /// Every regular file below the given relative directories (`""` is the whole workspace), as
+    /// relative paths with `/` separators, following symbolic links that stay inside the
+    /// workspace (and only those). The directories are the patterns' literal prefixes, so a
+    /// pattern like `crates/*/Cargo.toml` never walks `node_modules`.
+    fn files(&self, under: &[String]) -> Result<Vec<String>, ExprError>;
     /// The SHA-256 of a file's contents.
     fn digest(&self, path: &str) -> Result<[u8; 32], ExprError>;
 }
@@ -44,8 +46,9 @@ pub fn hash_files(src: &dyn FileSource, patterns: &[String], case_insensitive: b
     if pats.iter().all(|(neg, _)| *neg) {
         return Ok(String::new());
     }
-    let mut files = src.files()?;
+    let mut files = src.files(&search_roots(&pats))?;
     files.sort();
+    files.dedup();
     let mut outer = Sha256::new();
     let mut count = 0usize;
     for f in &files {
@@ -65,6 +68,26 @@ pub fn hash_files(src: &dyn FileSource, patterns: &[String], case_insensitive: b
         return Ok(String::new());
     }
     Ok(hex(&outer.finalize()))
+}
+
+/// Where to look: the literal leading segments of each inclusion pattern, without the ones
+/// inside another (`""` when a pattern starts with a wildcard).
+fn search_roots(pats: &[(bool, Vec<String>)]) -> Vec<String> {
+    let mut roots: Vec<String> = pats
+        .iter()
+        .filter(|(neg, _)| !neg)
+        .map(|(_, segs)| {
+            let lit: Vec<&str> = segs.iter().take_while(|s| !s.contains(['*', '?', '[', '\\'])).map(String::as_str).collect();
+            // A pattern without wildcards may name a file: search its parent.
+            let n = if lit.len() == segs.len() { lit.len().saturating_sub(1) } else { lit.len() };
+            lit.get(..n).map(|l| l.join("/")).unwrap_or_default()
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let all = roots.clone();
+    roots.retain(|r| !all.iter().any(|o| o != r && (o.is_empty() || r.starts_with(&format!("{o}/")))));
+    roots
 }
 
 fn hex(b: &[u8]) -> String {
@@ -224,8 +247,8 @@ mod tests {
         fn root(&self) -> String {
             "/w/repo".into()
         }
-        fn files(&self) -> Result<Vec<String>, ExprError> {
-            Ok(self.0.iter().map(|(p, _)| (*p).to_owned()).collect())
+        fn files(&self, under: &[String]) -> Result<Vec<String>, ExprError> {
+            Ok(self.0.iter().map(|(p, _)| (*p).to_owned()).filter(|p| under.iter().any(|u| u.is_empty() || p.starts_with(&format!("{u}/")))).collect())
         }
         fn digest(&self, path: &str) -> Result<[u8; 32], ExprError> {
             let body = self.0.iter().find(|(p, _)| *p == path).map(|(_, b)| *b).unwrap_or_default();
@@ -267,6 +290,14 @@ mod tests {
         assert_eq!(hash_files(&t, &["/w/repo/Cargo.lock".into()], false)?, hash_files(&t, &["./Cargo.lock".into()], false)?);
         assert_eq!(hash_files(&t, &["!Cargo.lock".into()], false)?, "");
         Ok(())
+    }
+
+    #[test]
+    fn searches_only_literal_prefixes() {
+        let pats = |ps: &[&str]| ps.iter().map(|p| (p.starts_with('!'), segments(p.trim_start_matches('!')))).collect::<Vec<_>>();
+        assert_eq!(search_roots(&pats(&["crates/*/Cargo.toml", "crates/a/x", "!docs/**"])), vec!["crates".to_owned()]);
+        assert_eq!(search_roots(&pats(&["**/x", "crates/y"])), vec![String::new()]);
+        assert_eq!(search_roots(&pats(&["Cargo.lock"])), vec![String::new()]);
     }
 
     #[test]
