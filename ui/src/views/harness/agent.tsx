@@ -167,7 +167,8 @@ export default function AgentPage() {
     else if (view === "model" || view === "effort" || view === "permissions") openSetting(view === "model" ? "Model" : view === "effort" ? "Effort" : "Permissions");
     else if (view === "terminal") openBeside({ what: "shell" });
     else if (view === "screen") openBeside({ what: "screen" });
-    else if (view === "tasks" || view === "goals") showPlan();
+    else if (view === "goals") showPlan();
+    else if (view === "tasks") showTools();
     else if (view === "changes") {
       setTab("changes");
       setPhoneTab("changes");
@@ -313,7 +314,7 @@ export default function AgentPage() {
         actions={actions}
         send={send}
         onUsage={showTools}
-        onBackground={showPlan}
+        onBackground={showTools}
         onSettings={() => setSettings(true)}
         onFind={openFind}
       />
