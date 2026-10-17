@@ -7,16 +7,18 @@ import {
   Bot,
   Box,
   CornerDownLeft,
+  Cpu,
+  FolderSync,
   GitBranch,
   LayoutGrid,
+  ListTree,
   LogOut,
   Play,
+  Rocket,
   Search,
   Server,
   Settings,
   SquareTerminal,
-  Cpu,
-  ListTree,
 } from "lucide-react";
 import { api } from "@/api/client";
 import type { Agent, Repo, Run } from "@/api/types";
@@ -115,7 +117,9 @@ export function CommandPalette() {
     const pages: Item[] = [
       { id: "p-overview", group: "Pages", label: "Overview", icon: <LayoutGrid size={15} />, run: () => go("/") },
       { id: "p-runs", group: "Pages", label: "Runs", icon: <Activity size={15} />, run: () => go("/runs") },
+      { id: "p-deployments", group: "Pages", label: "Deployments", hint: "sync and health", icon: <Rocket size={15} />, run: () => go("/deployments") },
       { id: "p-repos", group: "Pages", label: "Repositories", icon: <GitBranch size={15} />, run: () => go("/repos") },
+      { id: "p-sync", group: "Pages", label: "Sync", hint: "folders kept the same on several machines", icon: <FolderSync size={15} />, run: () => go("/sync") },
       { id: "p-runners", group: "Pages", label: "Runners", icon: <Server size={15} />, run: () => go("/runners") },
       { id: "p-agents", group: "Pages", label: "Agents", hint: "AI sessions", icon: <Bot size={15} />, run: () => go("/agents") },
       { id: "p-term", group: "Pages", label: "Terminal", icon: <SquareTerminal size={15} />, run: () => go("/terminal") },

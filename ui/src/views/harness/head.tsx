@@ -4,7 +4,7 @@
  * as one line of words that opens in place to change them (no popups). Settings live in ⋯.
  */
 import { Link, useNavigate } from "react-router";
-import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, SquareTerminal } from "lucide-react";
+import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
 import { costText, modelLabel, tildify } from "./derive";
 import { RoundButton } from "./figure/figure";
@@ -26,7 +26,10 @@ export function AgentHeader({
   onUsage,
   onSettings,
   onBackground,
+  onFind,
 }: {
+  /** Find in the conversation. */
+  onFind?: () => void;
   info: AgentInfo | null;
   state: State | null;
   meta: Meta | null;
@@ -103,6 +106,11 @@ export function AgentHeader({
           {status === "exited" && features.includes("resume") && (
             <RoundButton label="Restart" onClick={() => send({ type: "restart" })}>
               <RotateCcw size={15} aria-hidden="true" />
+            </RoundButton>
+          )}
+          {onFind && (
+            <RoundButton label="Find in the conversation (Ctrl F)" onClick={onFind}>
+              <Search size={15} aria-hidden="true" />
             </RoundButton>
           )}
           {openShell && (

@@ -557,6 +557,69 @@ textarea.hx-input {
   color: var(--color-secondary);
 }
 
+/* Find in the conversation: a bar over it, in its flow like the crumbs; the matches are painted in
+   place (CSS Custom Highlights), the one shown brighter. */
+.hx-find {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 46px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid #1d1f23;
+  background: #0b0c0e;
+}
+.hx-find-icon {
+  flex: none;
+  color: #7b7e88;
+}
+.hx-find input {
+  min-width: 0;
+  flex: 1;
+  height: 36px;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: var(--color-foreground);
+  font-size: 13.5px;
+  outline: none;
+}
+.hx-find input::placeholder {
+  color: var(--color-faint);
+}
+.hx-find:focus-within {
+  border-bottom-color: #4a4560;
+}
+.hx-find-where {
+  flex: none;
+  margin-right: 4px;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.hx-find-partial {
+  color: #6d7078;
+}
+@media (max-width: 560px) {
+  .hx-find-partial {
+    display: none;
+  }
+}
+::highlight(kiln-find) {
+  background-color: rgb(198 176 142 / 26%);
+  color: inherit;
+}
+::highlight(kiln-find-now) {
+  background-color: #c6b08e;
+  color: #08090a;
+}
+[data-find-here] {
+  border-radius: 4px;
+  outline: 1px solid #c6b08e;
+  outline-offset: 3px;
+}
+
 /* ------------------------------------------------------------ timeline */
 
 .hx-timeline {

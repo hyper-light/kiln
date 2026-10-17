@@ -8,7 +8,8 @@
 # Stages:
 #   ui     – Vite build of ui/ → ui/dist (embedded into the binary by rust-embed)
 #   build  – static musl kiln binary (cargo registry + target dir are BuildKit cache mounts)
-#   final  – alpine with git/bash/ssh (the server shells out to git; the terminal needs a shell)
+#   final  – alpine with git/bash/ssh (the server shells out to git; the terminal needs a shell),
+#            and helm and kustomize, which render apps for Deployments (docs/cd.md)
 
 ARG NODE_IMAGE=node:24-alpine
 ARG RUST_IMAGE=rust:1-alpine
@@ -56,7 +57,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ------------------------------------------------------------------------- final
 FROM ${RUNTIME_IMAGE}
 RUN set -eux; \
-    apk add --no-cache git bash openssh-client ca-certificates tzdata curl less ncurses-terminfo-base; \
+    apk add --no-cache git bash openssh-client ca-certificates tzdata curl less ncurses-terminfo-base helm kustomize; \
     addgroup -S -g 10001 kiln; \
     adduser -S -D -H -u 10001 -G kiln -h /var/lib/kiln -s /bin/bash kiln; \
     mkdir -p /etc/kiln /var/lib/kiln /cache; \

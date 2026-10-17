@@ -158,6 +158,13 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     // Open routes (their own auth, if any).
     match (&method, s.as_slice()) {
+        (&Method::POST, ["api", "mcp"]) => {
+            let actor = crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers()));
+            return match actor {
+                Some(actor) => crate::mcp::http(&hub, actor, req.into_body()).await.map_err(|(c, m)| err(c, m)),
+                None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
+            };
+        }
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
         (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req)),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
@@ -179,6 +186,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return put_artifacts(&hub, &id, req).await;
         }
         (&Method::POST, ["api", "hooks", "github"]) => return github_hook(&hub, req).await,
+        (&Method::GET | &Method::HEAD, ["api", "sync", "blobs", hash]) => {
+            let hash = (*hash).to_owned();
+            return sync_blob_get(&hub, &hash, &req);
+        }
+        (&Method::PUT, ["api", "sync", "blobs", hash]) => {
+            let hash = (*hash).to_owned();
+            return sync_blob_put(&hub, &hash, req).await;
+        }
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
@@ -202,6 +217,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     }
     let q = srv::query(&req);
     match (&method, s.as_slice()) {
+        (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, &method, rest, &q, req.into_body()).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
@@ -279,6 +295,19 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid, &q, req).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => ai_fork(&hub, machine, pid).await,
+        (&Method::GET, ["api", "sync"]) => Ok(srv::json(StatusCode::OK, &hub.sync.view())),
+        (&Method::POST, ["api", "sync"]) => sync_create(&hub, req).await,
+        (&Method::DELETE, ["api", "sync", id]) => sync_ask(&hub, "sync.delete", id, crate::sync::server::Ask::Delete { repo: (*id).to_owned() }).await,
+        (&Method::POST, ["api", "sync", id, "copies"]) => sync_add_copy(&hub, id, req).await,
+        (&Method::DELETE, ["api", "sync", id, "copies", member]) => {
+            let member: u64 = member.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad member"))?;
+            sync_ask(&hub, "sync.copy.remove", id, crate::sync::server::Ask::RemoveCopy { repo: (*id).to_owned(), member }).await
+        }
+        (&Method::POST, ["api", "sync", id, "conflicts", "resolve"]) => sync_resolve(&hub, id, req).await,
+        (&Method::GET, ["api", "voice"]) => {
+            Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
+        }
+        (&Method::POST, ["api", "voice", "transcribe"]) => voice_transcribe(&hub, &q, req).await,
         (&Method::GET, ["api", "accounts"]) => accounts_status(&hub, &q).await,
         (&Method::POST, ["api", "accounts", "login"]) => accounts_login(&hub, req).await,
         (&Method::POST, ["api", "accounts", "logout"]) => accounts_logout(&hub, req).await,
@@ -527,6 +556,152 @@ async fn accounts_input(id: &str, req: Request) -> R {
     let a: AccountInput = srv::body_json(req.into_body(), 16 * 1024).await.map_err(|_| err(StatusCode::BAD_REQUEST, "expected {\"text\": \"…\"}"))?;
     crate::accounts::input(id, &a.text).map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+// ------------------------------------------------------------------ repo sync
+
+/// Whether a blob request carries the token of the machine it names (`?machine=`), or an admin's.
+fn sync_token_ok(hub: &Hub, req: &Request) -> bool {
+    let q = srv::query(req);
+    let machine = q.get("machine").map_or("", String::as_str);
+    (!machine.is_empty() && bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(machine).as_bytes())))
+        || authed(hub, req.headers())
+}
+
+/// One of the contents synced repos name (`HEAD`: whether the server has it).
+fn sync_blob_get(hub: &Hub, hash: &str, req: &Request) -> R {
+    if !sync_token_ok(hub, req) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
+    }
+    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
+    let path = blobs.path(hash).filter(|p| p.is_file()).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    if req.method() == Method::HEAD {
+        return Ok(srv::status(StatusCode::OK));
+    }
+    let body = crate::rt::file_source(path).map_err(|_| err(StatusCode::NOT_FOUND, "no such blob"))?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+}
+
+/// Contents a machine's steps name: kept once they hash to their name.
+async fn sync_blob_put(hub: &Hub, hash: &str, req: Request) -> R {
+    if !sync_token_ok(hub, &req) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad sync token"));
+    }
+    let blobs = hub.sync.blobs().ok_or_else(|| err(StatusCode::SERVICE_UNAVAILABLE, "sync is off"))?;
+    if !crate::sync::blobs::valid_hash(hash) {
+        return Err(err(StatusCode::BAD_REQUEST, "not a SHA-256"));
+    }
+    if blobs.has(hash) {
+        return Ok(srv::status(StatusCode::OK));
+    }
+    let tmp = blobs.incoming();
+    let (sink, done) = crate::rt::file_sink(tmp.clone(), 64 << 30)?;
+    let mut body = req.into_body();
+    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+        if sink.send(chunk).await.is_err() {
+            break;
+        }
+    }
+    drop(sink);
+    if let Err(e) = done.await {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+    }
+    let store = blobs.clone();
+    let name = hash.to_owned();
+    let kept = crate::rt::blocking(move || store.adopt(&tmp, &name)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    match kept {
+        Ok(true) => Ok(srv::status(StatusCode::CREATED)),
+        Ok(false) => Err(err(StatusCode::BAD_REQUEST, "the contents don't hash to that name")),
+        Err(e) => Err(err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct SyncCopyAsk {
+    machine: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct SyncCreateAsk {
+    name: String,
+    #[serde(default)]
+    copies: Vec<SyncCopyAsk>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+/// Machines kiln knows.
+async fn known_machine(hub: &Hub, machine: &str) -> Result<(), ApiError> {
+    if hub.agent_list().await.iter().any(|a| a.name == machine) {
+        Ok(())
+    } else {
+        Err(err(StatusCode::BAD_REQUEST, format!("no machine named {machine}")))
+    }
+}
+
+async fn sync_create(hub: &Hub, req: Request) -> R {
+    let a: SyncCreateAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    for c in &a.copies {
+        known_machine(hub, &c.machine).await?;
+    }
+    let what = format!("{} ({} copies)", a.name, a.copies.len());
+    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude };
+    let id = hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), "sync.create".into(), what).await;
+    Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "id": id })))
+}
+
+async fn sync_add_copy(hub: &Hub, id: &str, req: Request) -> R {
+    let a: SyncCopyAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    known_machine(hub, &a.machine).await?;
+    let what = format!("{id}: {}:{}", a.machine, a.path);
+    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), "sync.copy.add".into(), what).await;
+    Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "member": member.parse::<u64>().unwrap_or(0) })))
+}
+
+#[derive(Deserialize)]
+struct SyncResolveAsk {
+    path: String,
+    keep: crate::sync::server::Keep,
+}
+
+async fn sync_resolve(hub: &Hub, id: &str, req: Request) -> R {
+    let a: SyncResolveAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let what = format!("{id}: {} ({:?})", a.path, a.keep);
+    hub.sync.ask(crate::sync::server::Ask::Resolve { repo: id.to_owned(), path: a.path, keep: a.keep }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), "sync.resolve".into(), what).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+async fn sync_ask(hub: &Hub, action: &str, id: &str, ask: crate::sync::server::Ask) -> R {
+    hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), action.to_owned(), id.to_owned()).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+// ------------------------------------------------------------------ voice
+
+/// Speech to text for the console's microphone where the browser can't do it itself: the body is
+/// the recording (`audio/*`, as `MediaRecorder` made it), `?lang=` overrides `[voice] language`;
+/// answers `{text}`.
+async fn voice_transcribe(hub: &Hub, q: &HashMap<String, String>, req: Request) -> R {
+    if !hub.cfg.voice.enabled() {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, "voice transcription isn't set up on this server: set [voice] transcribe_url to a speech-to-text service (docs/voice.md)"));
+    }
+    let kind = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+    if !kind.starts_with("audio/") {
+        return Err(err(StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("expected a recording (audio/*), not {kind:?}")));
+    }
+    let max = crate::voice::MAX_AUDIO;
+    let audio = srv::body_bytes(req.into_body(), max).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("a recording is up to {} MiB ({e:#})", max >> 20)))?;
+    if audio.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "the recording is empty"));
+    }
+    let text = crate::voice::transcribe(&hub.cfg.voice, &audio, &kind, q.get("lang").map(String::as_str)).await.map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({ "text": text })))
 }
 
 /// The recent messages of one session, read from its machine.

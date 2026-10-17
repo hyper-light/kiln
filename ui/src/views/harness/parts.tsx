@@ -192,9 +192,9 @@ const MARKDOWN: Components = {
 
 /** The agent's prose: GitHub-flavored markdown (tables, lists, task lists, quotes, code), drawn the
  *  console's way. Text only: HTML in it is never injected. */
-export const Prose = React.memo(function Prose({ text, className }: { text: string; className?: string }) {
+export const Prose = React.memo(function Prose({ text, className, ev }: { text: string; className?: string; /** The event it says (for find). */ ev?: string }) {
   return (
-    <div className={cn("hx-prose", className)}>
+    <div className={cn("hx-prose", className)} data-ev={ev}>
       <Markdown remarkPlugins={REMARK} rehypePlugins={REHYPE} components={MARKDOWN}>
         {text}
       </Markdown>

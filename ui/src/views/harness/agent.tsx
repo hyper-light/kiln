@@ -17,6 +17,7 @@ import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
 import { SettingsSheet, useAttachments } from "./controls";
 import { changesetOf } from "./derive";
+import { FindBar, findIn, type FindNow } from "./find";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { useMarkSeen } from "./seen";
@@ -41,6 +42,30 @@ export default function AgentPage() {
   const [account, setAccount] = React.useState<"login" | "logout" | null>(null);
   // /login and /logout open the account in the conversation, below what was said: brought into view once.
   const showAccount = React.useCallback((el: HTMLDivElement | null) => el?.scrollIntoView({ block: "nearest", behavior: "smooth" }), []);
+  // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown.
+  const [findOpen, setFindOpen] = React.useState(false);
+  const [findQ, setFindQ] = React.useState("");
+  const [findAt, setFindAt] = React.useState<FindNow | null>(null);
+  const findInput = React.useRef<HTMLInputElement>(null);
+  const openFind = React.useCallback(() => {
+    setFindOpen(true);
+    setPhoneTab("work");
+    requestAnimationFrame(() => {
+      findInput.current?.focus();
+      findInput.current?.select();
+    });
+  }, []);
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== "f") return;
+      // Asked again from the find bar: the browser's own find.
+      if (document.activeElement === findInput.current) return;
+      e.preventDefault();
+      openFind();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openFind]);
   const attachments = useAttachments((meta?.features ?? []).includes("attachments") ? "any" : (meta?.features ?? []).includes("images") ? "images" : "none");
   const [dragging, setDragging] = React.useState(false);
   const addFiles = attachments.add;
@@ -84,6 +109,29 @@ export default function AgentPage() {
     setPhoneTab("work");
   };
   const taskInfo = task ? state?.tasks.find((t) => t.tool_id === task) : null;
+
+  // The matches, in the thread shown; a new search starts at the newest, and the one shown stays
+  // shown as the conversation grows.
+  const q = React.useDeferredValue(findQ);
+  const matches = React.useMemo(() => (findOpen ? findIn(events, task ?? undefined, q) : []), [findOpen, events, task, q]);
+  const [searched, setSearched] = React.useState("");
+  if (findOpen && q !== searched) {
+    setSearched(q);
+    const newest = matches.at(-1);
+    setFindAt(newest ? { id: newest, n: (findAt?.n ?? 0) + 1 } : null);
+  }
+  const findIndex = findAt ? matches.indexOf(findAt.id) : -1;
+  const stepFind = (by: -1 | 1) => {
+    if (matches.length === 0) return;
+    const next = findIndex < 0 ? (by < 0 ? matches.length - 1 : 0) : (findIndex + by + matches.length) % matches.length;
+    setFindAt({ id: matches[next] ?? "", n: (findAt?.n ?? 0) + 1 });
+  };
+  const closeFind = () => {
+    setFindOpen(false);
+    setFindAt(null);
+    setSearched("");
+    document.querySelector<HTMLTextAreaElement>(".hx-compose-input")?.focus();
+  };
   const showTools = () => {
     setTab("tools");
     setPhoneTab("tools");
@@ -116,6 +164,18 @@ export default function AgentPage() {
 
   const work = (
     <div className="hx-main">
+      {findOpen && (
+        <FindBar
+          q={findQ}
+          onQ={setFindQ}
+          index={findIndex < 0 ? Math.max(0, matches.length - 1) : findIndex}
+          total={matches.length}
+          onStep={stepFind}
+          onClose={closeFind}
+          partial={state?.dropped ? events.length : undefined}
+          inputRef={findInput}
+        />
+      )}
       {task && (
         <div className="hx-crumbs">
           <button type="button" className="hx-link" onClick={() => setTask(null)}>
@@ -142,6 +202,7 @@ export default function AgentPage() {
         target={info?.target}
         kind={info?.kind}
         accountOpen={account !== null}
+        find={findOpen ? { q, now: findAt } : undefined}
         footer={
           account && info ? (
             <div ref={showAccount} className="hx-signin">
@@ -227,6 +288,7 @@ export default function AgentPage() {
         onUsage={showTools}
         onBackground={showPlan}
         onSettings={() => setSettings(true)}
+        onFind={openFind}
       />
 
       {conn === "gone" ? (

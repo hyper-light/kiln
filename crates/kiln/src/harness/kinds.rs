@@ -93,6 +93,12 @@ impl Kind {
             Protocol::ClaudeStreamJson => {
                 let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
                 p.args(super::claude::args(spec, session_id.as_deref()));
+                // kiln's MCP server (code mode, deployments) and skills, where this machine's kiln
+                // serves them.
+                if let Some(kit) = crate::mcp::kit() {
+                    p.arg("--mcp-config").arg(&kit.claude_mcp_config);
+                    p.arg("--plugin-dir").arg(&kit.plugin_dir);
+                }
                 // File snapshots before edits, so a rewind can restore them.
                 p.env("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING", "1");
             }

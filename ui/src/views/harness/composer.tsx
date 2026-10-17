@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import type { Attachments } from "./controls";
 import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, type Reply } from "./palette";
 import { SendWith } from "./run-settings";
+import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
 
 const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
@@ -483,6 +484,7 @@ export function Composer({
               </Tip>
             </>
           )}
+          <MicButton field={ta} setText={setText} onNote={setNote} disabled={disabled} />
           {running && modes.length > 1 && (
             <>
               <div className="cp-modes" role="radiogroup" aria-label="How to send while it works">

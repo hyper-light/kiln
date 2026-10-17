@@ -71,19 +71,9 @@
 .ms-check {
   grid-area: check;
   display: grid;
+  align-self: stretch;
   place-items: center;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.ms-row:hover .ms-check,
-.ms-row:focus-within .ms-check,
-[data-selecting] .ms-check {
-  opacity: 1;
-}
-.ms-check input {
-  width: 14px;
-  height: 14px;
-  accent-color: #bab0e3;
+  cursor: pointer;
 }
 .ms-main {
   grid-area: main;
@@ -459,299 +449,6 @@ a.ms-why:hover {
   letter-spacing: -0.02em;
 }
 
-/* ---------------------------------------------------------------- message many */
-.ms-broadcast {
-  position: sticky;
-  bottom: 12px;
-  z-index: 20;
-  margin-top: 24px;
-  padding: 14px 16px;
-  border: 1px solid #2a3039;
-  border-radius: 9px;
-  /* Opaque: Safari draws a sticky, see-through panel with the list showing through it. */
-  background: #0a0c0f;
-  box-shadow: 0 18px 48px rgb(0 0 0 / 55%);
-  isolation: isolate;
-}
-.ms-actions-head {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-.ms-bc-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-.ms-bc-reach {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  color: #97999f;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* To: the same quiet tabs as Queue/Steer/Now. */
-.ms-bc-to {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 18px;
-  margin-top: 12px;
-}
-.ms-bc-to > button,
-.ms-bc-q {
-  position: relative;
-  padding: 6px 0;
-  color: #8f929b;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-.ms-bc-to > button:hover,
-.ms-bc-q:hover:not(:disabled) {
-  color: #ededee;
-}
-.ms-bc-to > button[aria-checked="true"] {
-  color: #ededee;
-}
-.ms-bc-to > button[aria-checked="true"]::after {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 1px;
-  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
-  content: "";
-}
-.ms-bc-q:disabled {
-  color: #55585f;
-}
-.ms-bc-q[aria-expanded="true"] {
-  color: #ededee;
-}
-.ms-bc-danger:not(:disabled) {
-  color: #d1aaad;
-}
-.ms-bc-filter {
-  margin-top: 6px;
-}
-.ms-bc-summary {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 100%;
-  padding: 4px 0;
-  overflow: hidden;
-  color: #c8cad0;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  letter-spacing: 0.08em;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-.ms-bc-facets {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin: 6px 0 2px;
-  padding-left: 18px;
-}
-.ms-bc-facet {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-.ms-bc-facet-label {
-  width: 64px;
-  color: #7b7e88;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-/* A choice: a pill, filled when on. */
-.ms-bc-chip {
-  display: inline-flex;
-  min-height: 28px;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 11px;
-  border: 1px solid #30323a;
-  border-radius: 999px;
-  color: #b4b6bd;
-  font-size: 12px;
-}
-.ms-bc-chip:hover:not(:disabled) {
-  border-color: #4a4c55;
-  color: #ededee;
-}
-.ms-bc-chip[aria-pressed="true"] {
-  border-color: #b9b2dc;
-  background: rgb(185 178 220 / 12%);
-  color: #ededee;
-}
-.ms-bc-chip > i {
-  color: #c6b08e;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-style: normal;
-}
-.ms-bc-compose {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 12px;
-}
-.ms-bc-compose .ms-broadcast-input {
-  margin: 0 0 10px;
-}
-.ms-bc-quick,
-.ms-bc-ask {
-  display: flex;
-  min-height: 36px;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 18px;
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid #22252b;
-}
-.ms-bc-gap {
-  flex: 1;
-}
-.ms-bc-ask {
-  justify-content: space-between;
-  color: #e2cfae;
-  font-size: 12.5px;
-}
-.ms-bc-ask-actions {
-  display: flex;
-  gap: 8px;
-}
-.ms-bc-choices {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
-}
-/* After a send: one line, opened for each agent's outcome. Its place is kept, sent or not. */
-.ms-bc-result {
-  min-height: 22px;
-  margin-top: 6px;
-}
-.ms-bc-result-line {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: #c8cad0;
-  font-family: var(--font-mono);
-  font-size: 11px;
-}
-.ms-bc-outcomes {
-  max-height: min(34dvh, 300px);
-  margin: 4px 0 0;
-  padding: 0;
-  overflow-y: auto;
-  list-style: none;
-  overscroll-behavior: contain;
-}
-.ms-bc-outcomes > li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 2px 12px;
-  padding: 6px 0;
-  border-top: 1px solid #1f2227;
-  font-size: 12px;
-}
-.ms-bc-o-name {
-  min-width: 0;
-  overflow: hidden;
-  color: #e4e5e7;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ms-bc-o-where {
-  color: #7b7e88;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-}
-.ms-bc-o-result {
-  color: #a8c9bc;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  text-transform: uppercase;
-}
-.ms-bc-outcomes > li[data-result="skipped"] .ms-bc-o-result {
-  color: #c6b08e;
-}
-.ms-bc-outcomes > li[data-result="failed"] .ms-bc-o-result {
-  color: #d1aaad;
-}
-.ms-bc-o-why {
-  grid-column: 1 / -1;
-  color: #8f939e;
-  font-size: 11.5px;
-}
-.ms-broadcast-input {
-  display: block;
-  width: 100%;
-  margin: 12px 0 10px;
-  padding: 10px 12px;
-  border: 1px solid #303239;
-  border-radius: 6px;
-  background: #0b0c0e;
-  color: #ededee;
-  font-size: 16px;
-  line-height: 1.5;
-  resize: vertical;
-  outline: none;
-}
-@media (pointer: fine) {
-  .ms-broadcast-input {
-    font-size: 14px;
-  }
-}
-.ms-broadcast-input:focus {
-  border-color: #47464f;
-}
-.ms-broadcast-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.ms-modes {
-  display: inline-flex;
-  gap: 18px;
-}
-.ms-modes > button {
-  position: relative;
-  padding: 6px 0;
-  color: #8f929b;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-.ms-modes > button[aria-checked="true"] {
-  color: #ededee;
-}
-.ms-modes > button[aria-checked="true"]::after {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: 1px;
-  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
-  content: "";
-}
-
 /* ---------------------------------------------------------------- narrow: name and line on top, answers beneath */
 @container (max-width: 760px) {
   .ms-row {
@@ -763,18 +460,17 @@ a.ms-why:hover {
     min-height: 0;
     padding: 16px 4px 12px 12px;
   }
-  .ms-check {
-    display: none;
-  }
-  /* Picking agents to message: each row shows its checkbox, beside what it is. */
-  .ms-page[data-selecting] .ms-row:not(.ms-found-row) {
-    grid-template-columns: 28px minmax(0, 1fr) auto;
+  /* Its checkbox beside its name. */
+  .ms-row:not(.ms-found-row) {
+    grid-template-columns: 22px minmax(0, 1fr) auto;
     grid-template-areas:
       "check main main"
       "check meta actions";
+    padding-left: 6px;
   }
-  .ms-page[data-selecting] .ms-check {
-    display: grid;
+  .ms-check {
+    align-items: start;
+    padding-top: 3px;
   }
   .ms-name {
     font-size: 16px;
@@ -791,10 +487,6 @@ a.ms-why:hover {
     min-width: 0;
   }
   .ms-mark {
-    display: none;
-  }
-  /* Quick commands wrap from the left; nothing is pushed alone to a line of its own. */
-  .ms-bc-gap {
     display: none;
   }
   .ms-tool {
@@ -855,7 +547,6 @@ a.ms-why:hover {
 }
 @media (prefers-reduced-motion: reduce) {
   .ms-row,
-  .ms-check,
   .ms-go,
   .ms-chev {
     transition: none;
@@ -863,4 +554,172 @@ a.ms-why:hover {
 }
 .ms-left {
   color: #d8bb95;
+}
+
+/* ---------------------------------------------------------------- how the list is shown, and messaging it */
+/* The filter field and the sort, side by side; stacked on a phone. */
+.ms-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+@container (max-width: 760px) {
+  .ms-bar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* Message the agents: an agent's composer, in the page. */
+.ms-msg {
+  position: relative;
+  margin-bottom: 22px;
+}
+.ms-msg .hx-compose-input {
+  min-height: 44px;
+  max-height: 200px;
+  field-sizing: content;
+}
+.ms-msg-select {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 190px;
+  height: 30px;
+  padding: 0 26px 0 9px;
+  border: 1px solid #303239;
+  border-radius: 5px;
+  background: #0b0c0e
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E") right 9px
+    center / 10px no-repeat;
+  color: #c8cad0;
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  appearance: none;
+  cursor: pointer;
+}
+/* Three short words: it never gives way; the command select does. */
+.ms-msg-mode {
+  flex: none;
+}
+.ms-msg-select:hover:not(:disabled) {
+  border-color: #47464f;
+}
+.ms-msg-select:focus-visible {
+  border-color: #a5a0bf;
+  outline: 2px solid rgb(165 160 191 / 25%);
+  outline-offset: 1px;
+}
+.ms-msg-select:disabled {
+  color: #63666e;
+  cursor: default;
+}
+@media (pointer: coarse) {
+  .ms-msg-select {
+    height: 36px;
+  }
+}
+.ms-msg-field {
+  position: relative;
+}
+/* On a phone the composer's Send is a round icon; here its count stays: it says who it reaches. */
+@container (max-width: 520px) {
+  .ms-msg .cp-send {
+    width: auto;
+    padding: 0 13px;
+  }
+}
+/* The slash commands, under the field and over the list (like a select's options). */
+.ms-msg-pal {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  box-shadow: 0 12px 40px #0008;
+}
+.ms-msg-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  min-height: 32px;
+  margin-top: 8px;
+  padding: 0 4px;
+}
+.ms-msg-ask {
+  color: #ededee;
+  font-size: 13px;
+}
+.ms-msg-result {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+.ms-msg-result:hover {
+  color: #ededee;
+}
+.ms-msg-outcomes {
+  margin: 6px 0 0;
+  padding: 0;
+  border-top: 1px solid #25272c;
+  list-style: none;
+}
+.ms-msg-outcomes > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 2px 14px;
+  padding: 8px 4px;
+  border-bottom: 1px solid #1f2126;
+  font-size: 12.5px;
+}
+.ms-msg-o-name {
+  overflow: hidden;
+  color: #ededee;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-msg-o-where,
+.ms-msg-o-result {
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.ms-msg-outcomes > li[data-result="sent"] .ms-msg-o-result {
+  color: #a8c9bc;
+}
+.ms-msg-outcomes > li[data-result="skipped"] .ms-msg-o-result {
+  color: #cbb69a;
+}
+.ms-msg-outcomes > li[data-result="failed"] .ms-msg-o-result {
+  color: #d1aaad;
+}
+.ms-msg-o-why {
+  grid-column: 1 / -1;
+  color: #8f939e;
+  font-size: 12px;
+}
+
+/* Over the list: check them all, how many there are, and the list's own refresh. */
+.ms-listhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+  min-height: 40px;
+  padding: 0 8px 0 9px;
+}
+.ms-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 13px;
+  min-height: 36px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.ms-refresh {
+  margin-left: auto;
+  font-size: 12.5px;
 }

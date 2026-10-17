@@ -71,7 +71,7 @@ export default function Repos() {
   return (
     <div className="container-console page">
       <PageIntro
-        index={3}
+        index={4}
         label="Repositories"
         title="Repositories"
         lead="kiln polls each repository with conditional requests (ETag), so idle repos cost nothing against the GitHub rate limit. Pipelines live in .kiln/*.yaml."

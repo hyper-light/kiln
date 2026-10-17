@@ -1,39 +1,24 @@
 /**
- * Message many agents at once, on every machine. To: the ones selected, every agent, or a filter
- * (machine · harness · state). What: a prompt (queued after the current turn, steered into it, or
- * now), a slash command read in each agent's own catalog, a quick command (interrupt, restart,
- * mode, model, effort), or an answer to every tool call waiting on you. One line says how it went;
- * open it for each agent's outcome. Everything happens in the panel; nothing pops up.
+ * Message many agents at once, in the page, drawn like an agent's own composer: to the agents
+ * checked in the list or, with none checked, every one it shows. A prompt (queued after the current
+ * turn, steered into it, or sent now), a slash command read in their own catalogs, or a command:
+ * interrupt, restart, a mode, model or effort, an answer to everything waiting on you. Commands are
+ * asked once, in a line under the field; the same line then says how it went, and opens to each
+ * agent's outcome.
  */
 import * as React from "react";
-import { ChevronRight, Send, X } from "lucide-react";
-import { harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type BroadcastTo, type Command, type SendMode, type SlashCommand } from "@/api/harness";
+import "./console.css";
+import { ArrowUp, ChevronRight, CornerDownLeft } from "lucide-react";
+import { harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
-import { errorMessage } from "@/lib/hooks";
+import { errorMessage, useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { CommandList, matchCommands, parseSlash } from "./palette";
 
-type Who = "selected" | "all" | "filter";
-type Choose = "mode" | "model" | "effort";
-
-interface Filter {
-  machines: string[];
-  kinds: string[];
-  status: string[];
-}
-
-/** The states a filter can ask for, as Mission control words them. */
-const STATES = [
-  { id: "running", label: "Working" },
-  { id: "waiting", label: "Needs you" },
-  { id: "idle", label: "Ready" },
-  { id: "starting", label: "Starting" },
-  { id: "exited", label: "Ended" },
-];
-
-const machineOf = (target: string) => target.replace(/^agent:/, "");
 const machineLabel = (m: string) => (m === "local" ? "server" : m);
+/** Enter sends with a keyboard and pointer; on a touch screen it is a new line (as in the composer). */
+const fine = () => window.matchMedia?.("(pointer: fine)").matches;
 const count = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 interface Ask {
@@ -43,57 +28,35 @@ interface Ask {
   run: () => Promise<unknown>;
 }
 
-/** One facet of the filter: its options as toggles; none chosen means any. */
-function Facet({ label, options, chosen, onChange }: { label: string; options: { id: string; label: string }[]; chosen: string[]; onChange: (next: string[]) => void }) {
-  return (
-    <div className="ms-bc-facet" role="group" aria-label={label}>
-      <span className="ms-bc-facet-label">{label}</span>
-      {options.map((o) => {
-        const on = chosen.includes(o.id);
-        return (
-          <button key={o.id} type="button" className="ms-bc-chip" aria-pressed={on} onClick={() => onChange(on ? chosen.filter((c) => c !== o.id) : [...chosen, o.id])}>
-            {o.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
+/** Who the message goes to, in words: "2 selected", "5 shown", "all 7". */
+export type Reach = "selected" | "shown" | "all";
 
-export function MessageMany({ selected, agents, onClose }: { selected: string[]; agents: AgentInfo[]; onClose: () => void }) {
-  const [who, setWho] = React.useState<Who>(selected.length ? "selected" : "all");
-  const [filter, setFilter] = React.useState<Filter>({ machines: [], kinds: [], status: [] });
-  const [filterOpen, setFilterOpen] = React.useState(false);
+export function MessageBar({ agents, reach, onEnded }: { agents: AgentInfo[]; reach: Reach; onEnded?: () => void }) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
-  const [choose, setChoose] = React.useState<Choose | null>(null);
+  const [picked, setPicked] = React.useState("");
   const [ask, setAsk] = React.useState<Ask | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [report, setReport] = React.useState<BroadcastReport | null>(null);
   const [reportOpen, setReportOpen] = React.useState(false);
   const [preview, setPreview] = React.useState<BroadcastPreview | null>(null);
   const [index, setIndex] = React.useState(0);
+  const [focused, setFocused] = React.useState(false);
+  const roomy = useMediaQuery("(min-width: 640px)");
 
-  // A cleared selection leaves the panel writing to everything, never to nobody.
-  React.useEffect(() => {
-    if (who === "selected" && selected.length === 0) setWho("all");
-  }, [who, selected.length]);
-  React.useEffect(() => {
-    if (selected.length > 0) setWho("selected");
-  }, [selected.length]);
-
-  const to: BroadcastTo = React.useMemo(() => {
-    if (who === "selected") return { ids: selected };
-    if (who === "filter" && (filter.machines.length || filter.kinds.length || filter.status.length)) return { machines: filter.machines, kinds: filter.kinds, status: filter.status };
-    return { all: true };
-  }, [who, selected, filter]);
-  // Who that reaches, by the server's own picking: again as agents come, go or change state.
-  const key = JSON.stringify(to);
+  const ids = agents.map((a) => a.id);
+  const key = ids.join(",");
+  // What they understand (commands, modes, models, efforts, and how many have each): again as
+  // the agents picked change, come or go.
   const roster = agents.map((a) => `${a.id}:${a.status}`).join(",");
   React.useEffect(() => {
+    if (!key) {
+      setPreview(null);
+      return;
+    }
     let stop = false;
     const t = window.setTimeout(() => {
-      harnessApi.broadcastPreview(JSON.parse(key) as BroadcastTo).then(
+      harnessApi.broadcastPreview({ ids: key.split(",") }).then(
         (p) => {
           if (!stop) setPreview(p);
         },
@@ -105,20 +68,21 @@ export function MessageMany({ selected, agents, onClose }: { selected: string[];
       window.clearTimeout(t);
     };
   }, [key, roster]);
+  // A different set of agents: whatever was being asked is for the old one.
+  React.useEffect(() => {
+    setAsk(null);
+    setPicked("");
+  }, [key]);
 
-  const picked = preview?.agents ?? [];
-  const n = picked.length;
-  const ids = new Set(picked.map((p) => p.id));
-  const waiting = agents.filter((a) => ids.has(a.id)).reduce((s, a) => s + a.approvals.filter((p) => p.tool !== "question").length, 0);
-  const working = picked.filter((p) => p.status === "running").length;
-  const machines = [...new Set(agents.map((a) => machineOf(a.target)))];
-  const kinds = [...new Map(agents.map((a) => [a.kind, a.kind_name])).entries()];
-  const reach = preview ? `${count(n, "agent")} on ${count(preview.machines.length, "machine")}` : "…";
+  const n = agents.length;
+  const who = reach === "selected" ? `${n} selected` : reach === "shown" ? `${n} shown` : n === 1 ? "the one agent" : `all ${n}`;
+  const working = agents.filter((a) => a.status === "running").length;
+  const waiting = agents.reduce((s, a) => s + a.approvals.filter((p) => p.tool !== "question" && p.tool !== "plan").length, 0);
 
   const send = async (body: Omit<BroadcastBody, "to">) => {
     setBusy(true);
     try {
-      setReport(await harnessApi.broadcastTo({ to, ...body }));
+      setReport(await harnessApi.broadcastTo({ to: { ids }, ...body }));
       setReportOpen(false);
       return true;
     } catch (e) {
@@ -127,14 +91,14 @@ export function MessageMany({ selected, agents, onClose }: { selected: string[];
     } finally {
       setBusy(false);
       setAsk(null);
-      setChoose(null);
+      setPicked("");
     }
   };
   const command = (c: Command) => send({ command: c });
 
-  // The slash palette: what the agents picked understand, marked where only some do.
+  // The slash palette: what the agents understand, marked where only some do.
   const slash = parseSlash(text);
-  const items = slash?.typingName ? matchCommands(preview?.commands ?? [], slash.name) : [];
+  const items = focused && slash?.typingName ? matchCommands(preview?.commands ?? [], slash.name) : [];
   const note = (c: SlashCommand) => {
     const k = (c as SlashCommand & { count?: number }).count;
     return k !== undefined && k < n ? `${k} of ${n}` : undefined;
@@ -147,192 +111,232 @@ export function MessageMany({ selected, agents, onClose }: { selected: string[];
     const body = text.trim();
     if (!body || n === 0 || busy) return;
     const go = () => send({ text: body, mode }).then((ok) => ok && setText(""));
-    if (mode === "now" && working > 0) setAsk({ ask: `Stop the turn of ${count(working, "working agent")} and send this now?`, label: "Send now", run: go });
+    if (mode === "now" && working > 0)
+      setAsk({
+        ask: `Stop the turn of ${count(working, "working agent")} and send this now?`,
+        label: "Send now",
+        run: go,
+      });
     else void go();
   };
 
-  const options = choose === "mode" ? (preview?.modes ?? []) : choose === "model" ? (preview?.models ?? []) : choose === "effort" ? (preview?.efforts ?? []) : [];
-  const set = (id: string, dangerous?: boolean) => {
-    const c: Command = choose === "mode" ? { type: "set_mode", mode: id } : choose === "model" ? { type: "set_model", model: id } : { type: "set_effort", effort: id };
-    if (dangerous) setAsk({ ask: `Switch ${count(n, "agent")} to a mode that skips permission checks?`, label: "Switch", danger: true, run: () => command(c) });
-    else void command(c);
+  const some = (k: number) => (k < n ? ` (${k} of ${n})` : "");
+  const modes = preview?.modes ?? [];
+  const models = preview?.models ?? [];
+  const efforts = preview?.efforts ?? [];
+  /** A command picked from the select: asked in the line under the field, run from there. */
+  const choose = (v: string) => {
+    setPicked(v);
+    if (!v) {
+      setAsk(null);
+      return;
+    }
+    const [what, id = ""] = v.split(":");
+    const many = count(n, "agent");
+    if (what === "interrupt")
+      setAsk({
+        ask: `Stop the turn of ${count(working, "working agent")}?`,
+        label: "Interrupt",
+        run: () => command({ type: "interrupt" }),
+      });
+    else if (what === "restart")
+      setAsk({
+        ask: `Restart ${many}?`,
+        label: "Restart",
+        run: () => command({ type: "restart" }),
+      });
+    else if (what === "mode") {
+      const m = modes.find((x) => x.id === id);
+      setAsk({
+        ask: `Switch ${many} to ${m?.label ?? id}?${m?.dangerous ? " It skips permission checks." : ""}`,
+        label: "Switch",
+        danger: m?.dangerous,
+        run: () => command({ type: "set_mode", mode: id }),
+      });
+    } else if (what === "model")
+      setAsk({
+        ask: `Switch ${many} to ${models.find((x) => x.id === id)?.label ?? id}?`,
+        label: "Switch",
+        run: () => command({ type: "set_model", model: id }),
+      });
+    else if (what === "effort")
+      setAsk({
+        ask: `Set the effort of ${many} to ${efforts.find((x) => x.id === id)?.label ?? id}?`,
+        label: "Set",
+        run: () => command({ type: "set_effort", effort: id }),
+      });
+    else if (what === "allow")
+      setAsk({
+        ask: `Allow ${count(waiting, "tool call")} waiting on you?`,
+        label: "Allow",
+        run: () => send({ approvals: "allow" }),
+      });
+    else if (what === "deny")
+      setAsk({
+        ask: `Deny ${count(waiting, "tool call")} waiting on you?`,
+        label: "Deny",
+        run: () => send({ approvals: "deny" }),
+      });
+    else if (what === "end")
+      setAsk({
+        ask: `End ${many}? Their processes stop on their machines.`,
+        label: "End",
+        danger: true,
+        run: async () => {
+          await Promise.allSettled(ids.map((id) => harnessApi.stop(id)));
+          setAsk(null);
+          setPicked("");
+          onEnded?.();
+        },
+      });
   };
-  const summary = [
-    filter.machines.length ? filter.machines.map(machineLabel).join(" + ") : "all machines",
-    filter.kinds.length ? filter.kinds.map((k) => kinds.find(([id]) => id === k)?.[1] ?? k).join(" + ") : "any harness",
-    filter.status.length ? filter.status.map((s) => STATES.find((x) => x.id === s)?.label ?? s).join(" + ") : "not ended",
-  ].join(" · ");
+
+  // A phone has room for who it goes to, not the hints.
+  const placeholder =
+    n === 0
+      ? "No agent to message"
+      : mode === "steer"
+        ? `Steer ${who}${roomy ? ": each reads this at its next step" : "…"}`
+        : mode === "now"
+          ? `Stop ${who} and say…`
+          : `Message ${who}${roomy ? ": a prompt, or / for a command" : "…"}`;
+  const outcome = report
+    ? [report.sent ? `Sent to ${report.sent}` : "", report.skipped ? `${report.skipped} skipped` : "", report.failed ? `${report.failed} failed` : ""].filter(Boolean).join(" · ") ||
+      "No agent to send to"
+    : "";
 
   return (
-    <section className="ms-broadcast" aria-label="Message agents">
-      <div className="ms-bc-head">
-        <span className="ms-eyebrow">Message agents</span>
-        <span className="ms-bc-reach">{reach}</span>
-        <button type="button" className="hx-icon" aria-label="Close" onClick={onClose}>
-          <X size={14} />
-        </button>
-      </div>
-
-      <div className="ms-bc-to" role="radiogroup" aria-label="To">
-        {selected.length > 0 && (
-          <button type="button" role="radio" aria-checked={who === "selected"} onClick={() => setWho("selected")}>
-            Selected · {selected.length}
-          </button>
-        )}
-        <button type="button" role="radio" aria-checked={who === "all"} onClick={() => setWho("all")}>
-          Everything
-        </button>
-        <button
-          type="button"
-          role="radio"
-          aria-checked={who === "filter"}
-          onClick={() => {
-            setWho("filter");
-            setFilterOpen(true);
-          }}
-        >
-          Filter
-        </button>
-      </div>
-      {who === "filter" && (
-        <div className="ms-bc-filter">
-          <button type="button" className="ms-bc-summary" aria-expanded={filterOpen} onClick={() => setFilterOpen(!filterOpen)}>
-            <ChevronRight size={12} className={cn("ms-chev", filterOpen && "rotate-90")} aria-hidden="true" />
-            {summary}
-          </button>
-          {filterOpen && (
-            <div className="ms-bc-facets">
-              <Facet label="Machine" options={machines.map((m) => ({ id: m, label: machineLabel(m) }))} chosen={filter.machines} onChange={(machines) => setFilter({ ...filter, machines })} />
-              <Facet label="Harness" options={kinds.map(([id, label]) => ({ id, label }))} chosen={filter.kinds} onChange={(kinds) => setFilter({ ...filter, kinds })} />
-              <Facet label="State" options={STATES} chosen={filter.status} onChange={(status) => setFilter({ ...filter, status })} />
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="ms-bc-compose">
-        {items.length > 0 && <CommandList items={items} index={Math.min(index, items.length - 1)} onPick={pick} onHover={setIndex} note={note} />}
-        <textarea
-          className="ms-broadcast-input"
-          rows={2}
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value);
-            setIndex(0);
-          }}
-          onKeyDown={(e) => {
-            if (items.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-              e.preventDefault();
-              setIndex((i) => (i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length);
-            } else if (items.length > 0 && (e.key === "Tab" || e.key === "Enter")) {
-              e.preventDefault();
-              const c = items[Math.min(index, items.length - 1)];
-              if (c) pick(c);
-            } else if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              sendText();
-            }
-          }}
-          placeholder="A prompt, or a /command, to every agent picked"
-          aria-label="Message"
-        />
-      </div>
-      <div className="ms-broadcast-bar">
-        <div className="ms-modes" role="radiogroup" aria-label="How to send">
-          {(["queue", "steer", "now"] as SendMode[]).map((m) => (
-            <button key={m} type="button" role="radio" aria-checked={mode === m} onClick={() => setMode(m)}>
-              {m === "queue" ? "Queue" : m === "steer" ? "Steer" : "Now"}
-            </button>
-          ))}
-        </div>
-        <Button size="sm" onClick={sendText} disabled={busy || !text.trim() || n === 0}>
-          <Send /> Send to {n}
-        </Button>
-      </div>
-
-      {ask ? (
-        <div className="ms-bc-ask" role="group" aria-label="Confirm">
-          <span>{ask.ask}</span>
-          <span className="ms-bc-ask-actions">
-            <Button size="xs" variant={ask.danger ? "danger" : "primary"} disabled={busy} onClick={() => void ask.run()}>
-              {ask.label}
-            </Button>
-            <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsk(null)}>
-              Cancel
-            </Button>
-          </span>
-        </div>
-      ) : (
-        <div className="ms-bc-quick" role="group" aria-label="Quick commands">
-          <button type="button" className="ms-bc-q" disabled={busy || working === 0} onClick={() => setAsk({ ask: `Stop the turn of ${count(working, "working agent")}?`, label: "Interrupt", run: () => command({ type: "interrupt" }) })}>
-            Interrupt
-          </button>
-          <button type="button" className="ms-bc-q" disabled={busy || n === 0} onClick={() => setAsk({ ask: `Restart ${count(n, "agent")}?`, label: "Restart", run: () => command({ type: "restart" }) })}>
-            Restart
-          </button>
-          {(["mode", "model", "effort"] as Choose[]).map((c) =>
-            (c === "mode" ? preview?.modes : c === "model" ? preview?.models : preview?.efforts)?.length ? (
-              <button key={c} type="button" className="ms-bc-q" aria-expanded={choose === c} disabled={busy || n === 0} onClick={() => setChoose(choose === c ? null : c)}>
-                {c === "mode" ? "Mode" : c === "model" ? "Model" : "Effort"}
-              </button>
-            ) : null,
-          )}
-          <span className="ms-bc-gap" aria-hidden="true" />
-          <button type="button" className="ms-bc-q" disabled={busy || waiting === 0} onClick={() => setAsk({ ask: `Allow ${count(waiting, "tool call")} waiting on you?`, label: "Allow", run: () => send({ approvals: "allow" }) })}>
-            Allow {waiting > 0 ? waiting : ""} waiting
-          </button>
-          <button type="button" className="ms-bc-q" disabled={busy || waiting === 0} onClick={() => setAsk({ ask: `Deny ${count(waiting, "tool call")} waiting on you?`, label: "Deny", run: () => send({ approvals: "deny" }) })}>
-            Deny {waiting > 0 ? waiting : ""} waiting
-          </button>
-          {who === "selected" && (
-            <button
-              type="button"
-              className="ms-bc-q ms-bc-danger"
-              disabled={busy}
-              onClick={() =>
-                setAsk({
-                  ask: `End ${count(selected.length, "agent")}? Their processes stop on their machines.`,
-                  label: "End",
-                  danger: true,
-                  run: async () => {
-                    await Promise.allSettled(selected.map((id) => harnessApi.stop(id)));
-                    onClose();
-                  },
-                })
+    <section className="ms-msg cp" aria-label="Message agents">
+      <div className="ms-msg-field">
+        <div className={cn("hx-compose-box", working > 0 && "hx-compose-live")}>
+          <textarea
+            className="hx-compose-input"
+            rows={1}
+            value={text}
+            disabled={n === 0}
+            placeholder={placeholder}
+            aria-label={`Message ${who}`}
+            enterKeyHint="send"
+            autoCapitalize="sentences"
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
+            onChange={(e) => {
+              setText(e.target.value);
+              setIndex(0);
+            }}
+            onKeyDown={(e) => {
+              if (items.length > 0 && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                e.preventDefault();
+                setIndex((i) => (i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length);
+              } else if (items.length > 0 && (e.key === "Tab" || e.key === "Enter")) {
+                e.preventDefault();
+                const c = items[Math.min(index, items.length - 1)];
+                if (c) pick(c);
+              } else if (e.key === "Enter" && !e.nativeEvent.isComposing && (e.metaKey || e.ctrlKey || (!e.shiftKey && fine()))) {
+                e.preventDefault();
+                sendText();
               }
-            >
-              End {selected.length}
+            }}
+          />
+          <div className="cp-bar">
+            <select className="ms-msg-select ms-msg-mode" aria-label="How to send to agents that are working" value={mode} onChange={(e) => setMode(e.target.value as SendMode)}>
+              <option value="queue">Queue</option>
+              <option value="steer">Steer</option>
+              <option value="now">Now</option>
+            </select>
+            <select className="ms-msg-select" aria-label="Command" value={picked} disabled={n === 0 || busy} onChange={(e) => choose(e.target.value)}>
+              <option value="">Command…</option>
+              <option value="interrupt" disabled={working === 0}>
+                Interrupt{working > 0 ? ` (${working} working)` : ""}
+              </option>
+              <option value="restart">Restart</option>
+              {modes.length > 0 && (
+                <optgroup label="Permissions">
+                  {modes.map((m) => (
+                    <option key={m.id} value={`mode:${m.id}`}>
+                      {m.label}
+                      {some(m.count)}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {models.length > 0 && (
+                <optgroup label="Model">
+                  {models.map((m) => (
+                    <option key={m.id} value={`model:${m.id}`}>
+                      {m.label}
+                      {some(m.count)}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {efforts.length > 0 && (
+                <optgroup label="Effort">
+                  {efforts.map((m) => (
+                    <option key={m.id} value={`effort:${m.id}`}>
+                      {m.label}
+                      {some(m.count)}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label="Waiting on you">
+                <option value="allow" disabled={waiting === 0}>
+                  Allow {waiting > 0 ? `${waiting} ` : ""}waiting
+                </option>
+                <option value="deny" disabled={waiting === 0}>
+                  Deny {waiting > 0 ? `${waiting} ` : ""}waiting
+                </option>
+              </optgroup>
+              {reach === "selected" && <option value="end">End {count(n, "agent")}</option>}
+            </select>
+            <span className="cp-gap" />
+            <button type="button" className="cp-send" data-mode={working > 0 ? mode : "send"} disabled={busy || !text.trim() || n === 0} onClick={sendText}>
+              {working > 0 && mode === "queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}
+              <span>Send to {n}</span>
             </button>
-          )}
+          </div>
         </div>
-      )}
-      {choose && !ask && (
-        <div className="ms-bc-choices" role="group" aria-label={choose}>
-          {options.map((o) => (
-            <button key={o.id} type="button" className="ms-bc-chip" disabled={busy} onClick={() => set(o.id, (o as { dangerous?: boolean }).dangerous === true)}>
-              {o.label}
-              {o.count < n && <i>{o.count}/{n}</i>}
-            </button>
-          ))}
-        </div>
-      )}
-
-      <div className="ms-bc-result">
-        {report && (
-          <button type="button" className="ms-bc-result-line" aria-expanded={reportOpen} onClick={() => setReportOpen(!reportOpen)}>
-            <ChevronRight size={12} className={cn("ms-chev", reportOpen && "rotate-90")} aria-hidden="true" />
-            {[report.sent ? `Sent to ${report.sent}` : "", report.skipped ? `${report.skipped} skipped` : "", report.failed ? `${report.failed} failed` : ""].filter(Boolean).join(" · ") || "No agent to send to"}
-          </button>
+        {items.length > 0 && (
+          <div className="ms-msg-pal">
+            <CommandList items={items} index={Math.min(index, items.length - 1)} onPick={pick} onHover={setIndex} note={note} />
+          </div>
         )}
       </div>
-      {report && reportOpen && (
-        <ul className="ms-bc-outcomes">
+      {ask ? (
+        <div className="ms-msg-line" role="group" aria-label="Confirm">
+          <span className="ms-msg-ask">{ask.ask}</span>
+          <Button size="xs" variant={ask.danger ? "danger" : "primary"} disabled={busy} onClick={() => void ask.run()}>
+            {ask.label}
+          </Button>
+          <Button
+            size="xs"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => {
+              setAsk(null);
+              setPicked("");
+            }}
+          >
+            Cancel
+          </Button>
+        </div>
+      ) : report ? (
+        <div className="ms-msg-line">
+          <button type="button" className="ms-msg-result" aria-expanded={reportOpen} onClick={() => setReportOpen(!reportOpen)}>
+            <ChevronRight size={12} className={cn("ms-chev", reportOpen && "rotate-90")} aria-hidden="true" />
+            {outcome}
+          </button>
+        </div>
+      ) : null}
+      {report && reportOpen && !ask && (
+        <ul className="ms-msg-outcomes">
           {report.results.map((r) => (
             <li key={r.id} data-result={r.result}>
-              <span className="ms-bc-o-name">{r.name}</span>
-              <span className="ms-bc-o-where">{machineLabel(r.machine)}</span>
-              <span className="ms-bc-o-result">{r.result}</span>
-              {r.reason && <span className="ms-bc-o-why">{r.reason}</span>}
+              <span className="ms-msg-o-name">{r.name}</span>
+              <span className="ms-msg-o-where">{machineLabel(r.machine)}</span>
+              <span className="ms-msg-o-result">{r.result}</span>
+              {r.reason && <span className="ms-msg-o-why">{r.reason}</span>}
             </li>
           ))}
         </ul>

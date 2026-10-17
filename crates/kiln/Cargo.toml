@@ -5,10 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kiln-cd = { path = "../kiln-cd" }
 hyper-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 hyper-rt = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 hyper-rt-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 hyper-quic = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1", default-features = false }
+hyper-raft = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-durable = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-log = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 anyhow = "1.0.104"
 base64 = "0.23.1"
@@ -56,6 +61,7 @@ vt100 = "0.16.2"
 socket2 = { version = "0.6.5", features = ["all"] }
 # Process tables everywhere (AI sessions); host and process metrics where there is no procfs.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk", "network"] }
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
 [target.'cfg(unix)'.dependencies]

@@ -13,6 +13,7 @@ import { changesetOf, diffStats, duration, relPath, stepStatus, stepSummary, tur
 import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
+import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
 import { Beam, PrismLabel, ThinkingBody, ThinkingHead, type BeamStatus } from "./signals";
 
@@ -22,10 +23,12 @@ const Asking = React.createContext<ReadonlySet<string>>(new Set());
 /** The notice saying the harness isn't signed in (the latest, unless it has worked since), and where to sign it in. */
 const SignIn = React.createContext<{ notice: string; target: string; kind: string } | null>(null);
 
-function Contexts({ asking, signIn, children }: { asking: ReadonlySet<string>; signIn: React.ContextType<typeof SignIn>; children: React.ReactNode }) {
+function Contexts({ asking, signIn, findNow, children }: { asking: ReadonlySet<string>; signIn: React.ContextType<typeof SignIn>; findNow: FindNow | null; children: React.ReactNode }) {
   return (
     <Asking.Provider value={asking}>
-      <SignIn.Provider value={signIn}>{children}</SignIn.Provider>
+      <SignIn.Provider value={signIn}>
+        <FindNowContext.Provider value={findNow}>{children}</FindNowContext.Provider>
+      </SignIn.Provider>
     </Asking.Provider>
   );
 }
@@ -61,7 +64,7 @@ function ExploreBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
   return (
     <ul className="hx-list">
       {calls.map((c) => (
-        <li key={c.id} className="hx-list-row">
+        <li key={c.id} className="hx-list-row" data-ev={c.id}>
           <ToolIcon kind={c.tool} size={12} className="text-[var(--color-subtle)]" />
           <span className="hx-mono hx-trunc">{c.tool === "read" ? relPath(c.title, cwd) : c.title}</span>
           {c.detail && <span className="hx-dim hx-trunc">{c.tool === "read" ? c.detail : relPath(c.detail, cwd)}</span>}
@@ -74,18 +77,19 @@ function ExploreBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
 
 function EditBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
   const many = calls.reduce((n, c) => n + (c.diffs?.length ?? 0), 0) > 3;
+  const now = React.useContext(FindNowContext);
   return (
     <div className="hx-stack">
       {calls.map((c) =>
         (c.diffs?.length ?? 0) > 0 ? (
           (c.diffs ?? []).map((d, i) => (
-            <div key={`${c.id}-${i}`} className={cn(c.status === "denied" && "opacity-60")}>
+            <div key={`${c.id}-${i}`} className={cn(c.status === "denied" && "opacity-60")} data-ev={c.id}>
               {c.status === "denied" && <div className="hx-dim mb-1 text-[11px]">Refused — not applied</div>}
-              <FileDiffView diff={d} label={relPath(d.path, cwd)} defaultOpen={!many} />
+              <FileDiffView diff={d} label={relPath(d.path, cwd)} defaultOpen={!many} reveal={now?.id === c.id ? now.n : 0} />
             </div>
           ))
         ) : (
-          <div key={c.id} className="hx-list-row">
+          <div key={c.id} className="hx-list-row" data-ev={c.id}>
             <ToolIcon kind="edit" size={12} />
             <span className="hx-mono hx-trunc">{relPath(c.title, cwd)}</span>
             {c.status === "error" && c.output && <span className="hx-bad hx-trunc">{c.output}</span>}
@@ -98,9 +102,13 @@ function EditBody({ calls, cwd }: { calls: ToolEvent[]; cwd: string }) {
 
 function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
   const [open, setOpen] = React.useState(Boolean(initial));
+  useRevealed(
+    (id) => id === c.id,
+    () => setOpen(true),
+  );
   const failed = c.status === "error" || (c.exit_code !== undefined && c.exit_code !== 0);
   return (
-    <div className="hx-cmd" data-failed={failed || undefined}>
+    <div className="hx-cmd" data-failed={failed || undefined} data-ev={c.id}>
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
         <i className="dot" data-status={dotFor(failed ? "error" : c.status)} aria-hidden="true" />
         <code className="hx-cmd-line">{c.title}</code>
@@ -130,9 +138,13 @@ function PlanBody({ calls }: { calls: ToolEvent[] }) {
   if (!last) return null;
   if (last.tool === "plan") {
     const plan = (last.input as { plan?: string } | null)?.plan ?? last.output ?? last.title;
-    return <Prose text={plan} className="hx-plan-text" />;
+    return <Prose text={plan} className="hx-plan-text" ev={last.id} />;
   }
-  return <TodoList todos={last.todos ?? []} />;
+  return (
+    <div data-ev={last.id}>
+      <TodoList todos={last.todos ?? []} />
+    </div>
+  );
 }
 
 export function TodoList({ todos }: { todos: { text: string; status: string }[] }) {
@@ -155,7 +167,7 @@ function AskBody({ calls }: { calls: ToolEvent[] }) {
       {calls.map((c) => {
         const qs = ((c.input as { questions?: { question: string }[] } | null)?.questions ?? []).map((q) => q.question);
         return (
-          <div key={c.id} className="hx-ask">
+          <div key={c.id} className="hx-ask" data-ev={c.id}>
             {(qs.length ? qs : [c.title]).map((q, i) => (
               <div key={i} className="hx-ask-q">
                 {q}
@@ -179,7 +191,7 @@ function ToolBody({ calls }: { calls: ToolEvent[] }) {
       {calls.map((c) => {
         const input = c.input && typeof c.input === "object" && Object.keys(c.input as object).length ? JSON.stringify(c.input, null, 2) : null;
         return (
-          <div key={c.id} className="hx-generic">
+          <div key={c.id} className="hx-generic" data-ev={c.id}>
             <div className="hx-list-row">
               <ToolIcon kind={c.tool} size={12} />
               {c.server ? (
@@ -209,7 +221,7 @@ function AgentBody({ calls, tasks, onOpenTask }: { calls: ToolEvent[]; tasks: Ta
       {calls.map((c) => {
         const task = tasks.find((t) => t.tool_id === c.tool_id || t.id === c.task);
         return (
-          <div key={c.id} className="hx-sub">
+          <div key={c.id} className="hx-sub" data-ev={c.id}>
             <div className="hx-sub-head">
               <i className="dot" data-status={dotFor(task?.status === "running" ? "running" : c.status)} aria-hidden="true" />
               <span className="hx-sub-title">{task?.description ?? c.title}</span>
@@ -242,6 +254,11 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
   const asked = step.calls.some((c) => asking.has(c.tool_id));
   // Open by default: what needs attention, and what is happening right now.
   const [open, setOpen] = React.useState<boolean | null>(null);
+  // A match found in it opens it.
+  useRevealed(
+    (id) => step.calls.some((c) => c.id === id),
+    () => setOpen(true),
+  );
   const isOpen = open ?? (status === "running" || failures > 0 || step.group === "agent" || step.group === "ask" || (step.group === "plan" && step.calls.some((c) => c.tool === "plan")));
   const stats = step.group === "edit" ? diffStats(step.calls.filter((c) => c.status !== "denied").flatMap((c) => c.diffs ?? [])) : null;
   const first = step.calls[0];
@@ -263,7 +280,7 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
               : undefined;
 
   return (
-    <div className="hx-step" data-group={step.group} data-status={status}>
+    <div className="hx-step" data-group={step.group} data-status={status} data-ev={step.calls.map((c) => c.id).join(" ")}>
       <button type="button" className="hx-step-head" aria-expanded={isOpen} onClick={() => setOpen(!isOpen)}>
         <span className="hx-step-icon">
           <ToolIcon kind={STEP_ICON[step.group]} size={13} />
@@ -299,17 +316,21 @@ const StepRow = React.memo(function StepRow({ step, cwd, tasks, onOpenTask }: { 
 
 function Thought({ e, more = [] }: { e: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }) {
   const [open, setOpen] = React.useState(false);
+  useRevealed(
+    (id) => id === e.id || more.some((m) => m.id === id),
+    () => setOpen(true),
+  );
   if (e.redacted) return null;
   const all = [e, ...more].filter((x) => !x.redacted);
   const live = all.some((x) => x.streaming);
   return (
-    <div className="hx-thought">
+    <div className="hx-thought" data-ev={all.map((x) => x.id).join(" ")}>
       <ThinkingHead live={live} open={open} onToggle={() => setOpen(!open)} />
       {all.length > 1 && !open && <span className="hx-thought-n">{all.length} thoughts</span>}
       {open && (
         <ThinkingBody live={live}>
           {all.map((x) => (
-            <Prose key={x.id} text={x.text} className="hx-thought-text" />
+            <Prose key={x.id} text={x.text} className="hx-thought-text" ev={x.id} />
           ))}
         </ThinkingBody>
       )}
@@ -322,7 +343,7 @@ function Notice({ e }: { e: Extract<HEvent, { kind: "notice" }> }) {
   const I = e.level === "error" ? CircleAlert : e.level === "warn" ? TriangleAlert : Info;
   return (
     <>
-      <div className="hx-notice" data-level={e.level}>
+      <div className="hx-notice" data-level={e.level} data-ev={e.id}>
         <I size={12} /> <span>{e.text}</span>
       </div>
       {signIn?.notice === e.id && (
@@ -345,7 +366,7 @@ const DELIVERY: Record<Delivery, string> = {
 function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
   const system = e.origin && e.origin !== "human";
   return (
-    <div className="hx-prompt" data-origin={e.origin ?? "human"}>
+    <div className="hx-prompt" data-origin={e.origin ?? "human"} data-ev={e.id}>
       <div className="hx-prompt-meta">
         <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
         <span className="hx-dim">{new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
@@ -371,7 +392,7 @@ function ItemView({ item, cwd, tasks, onOpenTask }: { item: Item; cwd: string; t
     case "step":
       return <StepRow step={item} cwd={cwd} tasks={tasks} onOpenTask={onOpenTask} />;
     case "note":
-      return <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} />;
+      return <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} ev={item.event.id} />;
     case "thought":
       return <Thought e={item.event} more={item.more} />;
     case "notice":
@@ -415,7 +436,7 @@ const TurnView = React.memo(function TurnView({
         {live && turn.items.length === 0 && !turn.outcome && <PrismLabel live>Starting</PrismLabel>}
       </div>
       {turn.outcome && (
-        <div className="hx-outcome">
+        <div className="hx-outcome" data-ev={turn.outcome.id}>
           <Prose text={turn.outcome.text} />
           {(edits.length > 0 || turn.ended) && (
             <div className="hx-outcome-foot">
@@ -453,7 +474,10 @@ export function Timeline({
   target,
   kind,
   accountOpen,
+  find,
 }: {
+  /** Find in the conversation: the words, and the match being shown. */
+  find?: { q: string; now: FindNow | null };
   agentLabel?: string;
   /** The agent's own name, for what it asks. */
   agentName?: string;
@@ -487,6 +511,25 @@ export function Timeline({
     const el = ref.current;
     if (el && pinned.current) el.scrollTop = el.scrollHeight;
   });
+  // Find: every match on the page marked in place (again as the conversation grows), and the one
+  // being shown brought into view when it's chosen (not again after: you may scroll away).
+  const shown = React.useRef(0);
+  React.useLayoutEffect(() => {
+    const root = ref.current;
+    if (!root) return;
+    const now = find?.now ?? null;
+    const at = now ? elementOf(root, now.id) : null;
+    const first = mark(root, find?.q ?? "", at);
+    if (now && now.n !== shown.current) {
+      shown.current = now.n;
+      const target = first ?? at;
+      if (target) {
+        bringIntoView(target, root);
+        pinned.current = root.scrollHeight - root.scrollTop - root.clientHeight < 80;
+      }
+    }
+  });
+  React.useEffect(() => () => void mark(document.body, "", null), []);
   const running = state?.status === "running";
   const tasks = state?.tasks ?? [];
   const approvals = state?.approvals;
@@ -518,7 +561,7 @@ export function Timeline({
   }, [events, parent, kind, accountOpen]);
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
-    <Contexts asking={asking} signIn={signIn}>
+    <Contexts asking={asking} signIn={signIn} findNow={find?.now ?? null}>
       <div ref={ref} className="hx-timeline" onScroll={onScroll}>
         {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
         {turns.length === 0 &&

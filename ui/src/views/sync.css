@@ -1,0 +1,213 @@
+/* Synced repos (views/sync.tsx): one column of plain sections, every control in the page's flow. */
+
+.sync-page {
+  display: grid;
+  gap: 20px;
+}
+
+.sync-off {
+  margin: 0;
+  color: var(--color-fail);
+  font-size: 13px;
+}
+
+.sync-list {
+  display: grid;
+  gap: 16px;
+}
+
+.sync-repo {
+  display: grid;
+  gap: 10px;
+  padding: 16px 0 18px;
+  border-top: 1px solid var(--color-line);
+}
+
+.sync-repo-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+
+.sync-repo-head h2 {
+  margin: 0;
+  color: var(--color-bright);
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+}
+
+.sync-meta {
+  margin: 2px 0 0;
+  color: var(--color-meta);
+  font-size: 12.5px;
+}
+
+.sync-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.sync-error {
+  margin: 0;
+  color: var(--color-fail);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.sync-copies-list,
+.sync-conflicts ul {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sync-copy,
+.sync-conflict {
+  display: grid;
+  gap: 4px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+
+.sync-copy:last-child,
+.sync-conflict:last-child {
+  border-bottom: 0;
+}
+
+.sync-copy-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.sync-machine {
+  color: var(--color-foreground);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.sync-state {
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+}
+
+.sync-remove {
+  margin-left: auto;
+}
+
+.sync-path {
+  display: block;
+  min-width: 0;
+  color: var(--color-slate);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.sync-beside {
+  color: var(--color-muted);
+}
+
+.sync-beside::before {
+  content: "beside it: ";
+  color: var(--color-faint);
+}
+
+.sync-skipped summary {
+  cursor: pointer;
+  color: var(--color-muted);
+  font-size: 12.5px;
+}
+
+.sync-skipped ul {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.sync-confirm {
+  max-width: 72ch;
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-accent);
+  background: var(--color-surface);
+  color: var(--color-secondary);
+  font-size: 13px;
+}
+
+.sync-confirm p {
+  margin: 0 0 8px;
+}
+
+.sync-conflicts {
+  display: grid;
+  gap: 4px;
+}
+
+.sync-conflicts h3 {
+  margin: 0;
+}
+
+.sync-resolve {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.sync-resolve > div {
+  min-width: 0;
+  flex: 1 1 220px;
+  max-width: 320px;
+}
+
+.sync-form {
+  display: grid;
+  gap: 14px;
+  max-width: 760px;
+  padding: 16px 0;
+  border-top: 1px solid var(--color-line);
+}
+
+.sync-add {
+  padding: 8px 0 0;
+  border-top: 0;
+}
+
+.sync-copies {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.sync-copy-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: end;
+}
+
+@media (min-width: 640px) {
+  .sync-copy-fields {
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr) auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sync-page * {
+    transition: none !important;
+  }
+}

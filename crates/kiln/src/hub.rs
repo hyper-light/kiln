@@ -144,6 +144,8 @@ pub struct Hub {
     pub front_doors: crate::frontdoor::control::FrontDoors,
     /// The tailnet's split DNS for the front doors' names (`crate::frontdoor::tailnet`).
     pub tailnet: crate::frontdoor::tailnet::TailnetDns,
+    /// Repo sync: every synced repo's group, led from here (`crate::sync`).
+    pub sync: crate::sync::server::Sync,
 }
 
 impl Hub {
@@ -162,6 +164,7 @@ impl Hub {
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
+        let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
         Arc::new(Self {
             cfg,
             store,
@@ -199,7 +202,40 @@ impl Hub {
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
+            sync,
         })
+    }
+
+    /// Sends what repo sync says to each machine's syncing runner process, on the sync lane.
+    pub async fn sync_loop(self: Arc<Self>) -> anyhow::Result<()> {
+        let out = self.sync.outgoing();
+        while let Ok(o) = out.recv().await {
+            let peer = self.instances.lock().newest_with(&o.machine, proto::CAP_SYNC);
+            let Some(peer) = peer else { continue };
+            let msg = ServerMsg::Sync { json: crate::sync::wire::encode(&o.msg), raft: o.raft };
+            if let Ok(b) = proto::encode(&msg) {
+                self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// A runner process of `machine` that syncs said so: the newest such process syncs, and every
+    /// other one lets go.
+    async fn sync_announced(&self, machine: &str) {
+        let (newest, others) = {
+            let inst = self.instances.lock();
+            let newest = inst.newest_with(machine, proto::CAP_SYNC);
+            let others: Vec<PeerId> = inst.of(machine).into_iter().filter(|p| Some(*p) != newest && inst.get(*p).is_some_and(|i| i.caps & proto::CAP_SYNC != 0)).collect();
+            (newest, others)
+        };
+        let release = ServerMsg::Sync { json: crate::sync::wire::encode(&crate::sync::wire::Msg::Release), raft: Vec::new() };
+        if let Ok(b) = proto::encode(&release) {
+            for p in others {
+                self.net.send(p, proto::LANE_SYNC, Kind::Control, b.clone()).await;
+            }
+        }
+        self.sync.machine(machine, newest.is_some());
     }
 
     // ------------------------------------------------------------ UI events
@@ -484,6 +520,9 @@ impl Hub {
                 let name = self.peers.lock().remove(&peer);
                 let lost = self.instances.lock().lost(peer);
                 if let Some(name) = name {
+                    // Sync moves to another runner process of the machine that syncs, if any.
+                    let syncing = self.instances.lock().newest_with(&name, proto::CAP_SYNC).is_some();
+                    self.sync.machine(&name, syncing);
                     if self.instances.lock().of(&name).is_empty() {
                         self.agent_lost(&name, &reason).await;
                     } else {
@@ -692,7 +731,11 @@ impl Hub {
                 self.updates.on_build(self, &agent, &build);
                 self.emit(&serde_json::json!({ "type": "updates" }));
                 crate::frontdoor::control::on_build(self, &agent, caps).await;
+                if caps & proto::CAP_SYNC != 0 {
+                    self.sync_announced(&agent).await;
+                }
             }
+            AgentMsg::Sync { json, raft } => self.sync.from_runner(&agent, &json, raft),
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),

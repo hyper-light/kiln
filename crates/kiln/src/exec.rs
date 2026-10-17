@@ -21,6 +21,8 @@ pub enum Up {
     Log(LogChunk),
     /// Interactive terminal traffic: never buffered across a disconnect.
     Term(AgentMsg),
+    /// Repo sync, on its own lane: never buffered across a disconnect (it says it all again).
+    Sync(AgentMsg),
 }
 
 #[derive(Clone)]
