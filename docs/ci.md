@@ -170,9 +170,9 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | WS | Title | Depends on | Status | Progress |
 | --- | --- | --- | --- | --- |
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
-| W02 | Workflow model, dialects, validation | W01 (parser) | ready | |
-| W03 | Triggers and events | W02 | blocked (W02) | |
-| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | blocked (W02) | |
+| W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
+| W03 | Triggers and events | W02 | ready | |
+| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | ready | |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | ready (core state machine) | |
 | W06 | Step runtime on the runner | W01, W02 | ready | |
 | W07 | Actions | W06 | blocked (W06) | |
@@ -803,8 +803,9 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   neither dialect has a workflow, auto-detected pipelines run as today (`gitops.auto_pipelines`).
 - **W02-R03 YAML.** Files are parsed with a span-preserving YAML 1.2 parser (core schema), so every
   diagnostic points at a line and column. `on` is a string key (not YAML 1.1's boolean). Anchors
-  and aliases resolve as GitHub resolves them. Duplicate keys are an error. Files over 1 MiB, more
-  than 10,000 nodes deep or wide, or alias expansions over 1 MiB are refused (billion-laughs safe).
+  and aliases resolve as GitHub resolves them. Duplicate keys are an error. Files over 1 MiB, nesting
+  deeper than 256, more than 200,000 nodes, or alias expansions over 1 MiB are refused with
+  `KCI1003` (billion-laughs safe).
 - **W02-R04 The IR.** `kiln_ci::wf::Workflow` holds every key of Appendix A and Appendix E with its
   span, with every expression-bearing value stored parsed (`Expr` or `Template`). It is
   serializable (JSON) and hashed (`def_hash`, SHA-256 of the canonical JSON) for caching and reuse.
@@ -828,7 +829,7 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   | `on.schedule: ["cron", …]` | `schedule: [{cron}, …]` |
   | `retries: n` | `retry: { max: n, on: [runner-lost] }` (W05-R14) |
   | `artifacts: [globs]` | an implicit upload step at the end of the leg, artifact name `artifacts` (v1 tar compatibility kept for `GET /api/jobs/:id/artifacts`) |
-  | `cache: [dirs]` | `cache: [{ local: dirs }]`: directories kept on the runner between legs |
+  | `cache: [dirs]` | kept as written: a string in `cache:` is a v1 directory kept on the runner between legs, which W08-R09 reads as `{ local: [dir] }` |
   | `toolchain`, `image`, `exclusive`, `resources` | kept (Appendix E) |
   | implicit source checkout | `checkout: auto` (GHA dialect: none; workflows use `actions/checkout`) |
   | `timeout-minutes` default 60 | kept for the kiln dialect; GHA dialect default 360 |
@@ -849,10 +850,13 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   - `KCI6002`: an action not pinned to a full SHA (info unless the repository requires pins);
   - `KCI6003`: `pull_request_target` that checks out the head ref;
   - `KCI6004`: untrusted input (`github.event.*.title`, `body`, `head_ref`, …) interpolated into
-    `run:` (script injection);
+    `run:` (script injection), with a fix that moves each such expression into the step's `env:`
+    and reads the variable instead, quoted for the shell (`bash`/`sh`, `pwsh`, `cmd`; no fix for
+    other shells, flow-style steps, or text whose position can't be confirmed);
   - `KCI6005`: `secrets.*` interpolated into `run:` rather than passed by `env`;
   - `KCI6006`: a deprecated `::set-output`/`::save-state`;
-  - `KCI6007`: an unknown `runs-on` label that no routing rule maps and no runner has.
+  - `KCI6007`: an unknown `runs-on` label that no routing rule maps and no runner has (checked
+    where routing rules and runner facts are known: on the server, with W05 and W13).
 - **W02-R09 Schemas.** JSON Schemas (draft 2020-12) for the GHA dialect, the kiln dialect, overlays
   and action metadata are generated from the IR's definitions (one source), with descriptions taken
   from Appendix A and Appendix E. They are served at `GET /api/ci/schema/{gha,kiln,overlay,action}`
@@ -866,21 +870,29 @@ editor. Includes `kiln validate` and `POST /api/ci/validate`.
   `requires` and `permissions` (W07-R11, W09-R07).
 - **W02-R11 Loading and caching.** The loader (`crates/kiln/src/ci/load.rs`) lists the paths of
   W02-R01 at the commit (`git ls-tree`), reads each blob, parses, validates and stores the result
-  in `ci_workflows` keyed by `(repo, path, blob sha)`, so an unchanged file is never parsed twice.
+  in `ci_workflows` keyed by `(repo, path, content key)` (the blob's id, and the overlay's for a
+  GitHub workflow that has one), so an unchanged file is never parsed twice. GitHub workflows that
+  don't run (W02-R02) are read too, so pages can show them.
   A file with errors yields a run with conclusion `startup_failure` that shows the diagnostics
   (as v1 shows a failed run today), never a silent skip.
 - **W02-R12 CLI and API.** `kiln validate [--dialect gha|kiln] [--json] FILE…` prints diagnostics
   as `file:line:col: severity code: message` and a plan outline; exit status 1 on any error.
-  `POST /api/ci/validate { path, content, repo? }` answers `{ dialect, diagnostics, outline:
-  { jobs: [{ id, name, needs, legs_estimate, runs_on }] } }`.
+  `POST /api/ci/validate { path, content, dialect?, repo? }` answers `{ kind, dialect,
+  diagnostics, outline?: { name, dialect, events, jobs: [{ id, name, needs, runs_on, uses,
+  legs_estimate, steps }] } }`: the file is read as what its path says (workflow, overlay, action,
+  policy file), and `repo` is reserved for checks that need the repository (routing, actions).
+  `GET /api/ci/repos/:repo/workflows?ref=` lists a ref's workflows, each with `runs` and the
+  reason GitHub's run or don't; `GET /api/ci/repos/:repo/workflows/:path?ref=` gives one workflow's
+  source, model and diagnostics. `:repo` is the repository's id or its name, URL-encoded.
 - **W02-R13 Speed.** Parsing and validating a 2,000-line workflow takes < 20 ms.
 
-**Design.** `crates/kiln-ci/src/wf/`: `yaml.rs` (span-preserving node tree over a pure-Rust YAML
-parser such as `saphyr`; add the dependency, no unsafe), `ir.rs` (the model), `gha.rs` and
-`kiln.rs` (the two front ends: node tree → IR + diagnostics), `overlay.rs`, `action.rs`,
-`validate.rs` (cross-checks: needs, cycles, contexts per Appendix B, references), `schema.rs`
-(JSON Schema generation), `diag.rs`. The v1 `pipeline::parse` keeps its signature and becomes
-`kiln_ci::wf::kiln::parse` + an adapter to `PlannedJob` until W04 replaces planning.
+**Design.** `crates/kiln-ci/src/wf/`: `yaml.rs` (a span-preserving node tree over yaml-rust2's
+events), `keys.rs` (every key of both dialects with its type and description: the one source for
+checks, schemas and the editor), `ir.rs` (the model), `front.rs` (node tree → IR + diagnostics,
+both dialects), `overlay.rs`, `action.rs`, `validate.rs` (needs, cycles, contexts per Appendix B,
+references, lints and their fixes), `schema.rs` (JSON Schemas from `keys.rs`), `diag.rs`, and
+`check()` (one file, as its path says). The v1 `pipeline::parse` keeps running v1 until W04;
+`pipeline::from_ir` maps the new model to v1's, which is how W02-AC04 compares them.
 
 **Interfaces.** Gives the IR to W03 (`on`), W04 (everything else), W07 (action metadata), W20
 (validation for agents), W21 (schemas, diagnostics). Takes W01's parser.
@@ -921,7 +933,49 @@ parser such as `saphyr`; add the dependency, no unsafe), `ir.rs` (the model), `g
 - **W02-S05** `run: echo "${{ github.event.pull_request.title }}"` → `KCI6004` with a fix that
   moves the value to `env:`.
 
-**Progress.** Not started.
+**Progress.** Done, except W02-AC09. That criterion needs runs (W03, W05); the loader already
+returns a broken file with its diagnostics for the run to show.
+
+- *Code.*
+  - `crates/kiln-ci/src/wf/` (above).
+  - `crates/kiln/src/ci/load.rs`: the loader, reading through a `Source` trait. The server's
+    source is the repository's mirror and `ci_workflows` (migration `20261017-1200_w02_workflows`);
+    tests use a plain repository.
+  - `ci/workflows.rs`: the routes of W02-R12.
+  - `kiln validate` in `main.rs`.
+  - `pipeline::from_ir`.
+- *Tests.*
+  - AC01, `crates/kiln-ci/tests/wf_corpus.rs`: 457 files (F-03: GitHub's starter workflows and 25
+    repositories), zero errors, and the model round-trips through JSON.
+  - AC02, `tests/wf_negative.rs`: 32 codes, each at its exact line and column (F-04).
+  - AC03, `tests/wf_props.rs`: the corpus conforms to the schema, and structural errors fail it.
+  - AC04, `crates/kiln/tests/v1_compat.rs`: 30 v1 files, 240 plans, 2,392 planned jobs, all
+    identical, plus S04's 62 jobs.
+  - AC05: a unit test, and the loader applying an overlay in `ci_load.rs`.
+  - AC06: 10⁵ mutations in 9.5 s in release, run with `KILN_CI_MUTATIONS=100000` (CI runs 1,500
+    in debug and 20,000 in release). A watchdog fails any case that runs past 30 s and reports its
+    input. That watchdog found the needs-cycle check looping forever on a job that needs itself.
+  - AC07: a 2,000-line workflow in under 20 ms in release.
+  - AC08, `crates/kiln/tests/ci_load.rs`: real commits under `auto`, `on` and `off`, plus overlays,
+    broken files and the cache.
+  - S01–S05: unit tests. S05's fix is applied to the file and the result read again.
+- *Choices.*
+  - YAML goes through yaml-rust2's events, for positions. serde_yaml is a lenient fallback for the
+    rare file GitHub accepts that yaml-rust2 refuses (info `KCI1004`, e.g. cpython's `mypy.yml`).
+  - GitHub's 2026 keys are in the model and checked:
+    - background steps (W06-R17);
+    - `concurrency.queue` (W05-R06);
+    - `cache-mode` (W08-R14);
+    - `environment.deployment` (W15-R04);
+    - `$/` references (W07-R01, W04-R24);
+    - the `copilot-requests` permission;
+    - `snapshot`, kept as written.
+  - Where GitHub's context table has no row for a key, the key is checked as the closest key that
+    has one (Appendix B).
+- *Left to other workstreams.*
+  - `KCI6007` needs routing rules and runner facts (W05, W13).
+  - `POST /api/ci/repos/:repo/workflows/:path/edit` comes with W14 and W21.
+  - Repository-aware checks behind `/api/ci/validate`'s `repo` come with W05 and W07.
 
 ### W03 Triggers and events
 
@@ -1098,9 +1152,11 @@ for GHA semantics; kiln's matrix and data-flow additions on top. Pure code in
   `[ci] max_job_minutes`, default 7 days), step `timeout-minutes`, and a run limit
   (`[ci] max_run_days`, default 35, as GitHub).
 - **W04-R06 Permissions.** Workflow `permissions` apply to jobs that don't set their own; values
-  are GitHub's scopes (`actions`, `attestations`, `checks`, `contents`, `deployments`, `id-token`,
-  `issues`, `discussions`, `models`, `packages`, `pages`, `pull-requests`, `repository-projects`,
-  `security-events`, `statuses`) with `read`/`write`/`none`, plus `read-all`, `write-all` and `{}`.
+  are GitHub's scopes (`actions`, `attestations`, `checks`, `contents`, `copilot-requests`,
+  `deployments`, `id-token`, `issues`, `discussions`, `models`, `packages`, `pages`,
+  `pull-requests`, `repository-projects`, `security-events`, `statuses`) with
+  `read`/`write`/`none`, plus `read-all`, `write-all` and `{}`. (`copilot-requests` is accepted;
+  the facade has no Copilot API, so it grants nothing there.)
   Unset means the repository's default (`ci.default_token_permissions`: `read` by default, which is
   `contents: read` and `metadata: read`). Untrusted runs are capped at read. The resolved set
   drives `GITHUB_TOKEN` (W14) and the job token (W10).
@@ -1213,7 +1269,8 @@ for GHA semantics; kiln's matrix and data-flow additions on top. Pure code in
 
 **Requirements: reusable workflows**, GitHub-exact
 
-- **W04-R24** `jobs.<id>.uses` names `./.github/workflows/<file>` (same commit) or
+- **W04-R24** `jobs.<id>.uses` names `./.github/workflows/<file>` or `$/.github/workflows/<file>`
+  (both the same commit; `$/` reads it without a checkout, GitHub-exact) or
   `owner/repo/.github/workflows/<file>@ref` (fetched through W07's mirror, pinned to the SHA the
   ref resolved to when the run started). Inputs are typed (`boolean`, `number`, `string`) with
   defaults and `required`; `secrets` are mapped explicitly or `inherit`ed; outputs map
@@ -1330,14 +1387,19 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
 **Requirements: concurrency, priorities, fairness**
 
 - **W05-R06 Concurrency groups**, GitHub-exact, at workflow and job level, scoped to the
-  repository: at most one member in progress and one pending; a new member makes the previous
-  pending member `cancelled`; with `cancel-in-progress: true` it also cancels the member in
-  progress. The cancelled run says "cancelled: superseded in group <name>".
-- **W05-R07 Group extensions** (kiln): `limit: N` (N in progress), `queue: fifo` (pending members
-  wait in order instead of replacing each other), `queue: latest` (GitHub's behaviour, the default),
-  `queue: cancel-in-progress` (the same as `cancel-in-progress: true`). Groups may be shared across
-  repositories when declared in server configuration (`[[ci.groups]] name, repos, limit`), for
-  shared resources such as one staging cluster.
+  repository: at most one member in progress. With `queue: single` (the default) at most one
+  member is pending, and a new member makes the previous pending member `cancelled`. With
+  `queue: max`, up to 100 are pending and start in order; a member that arrives when 100 are
+  pending is cancelled. `cancel-in-progress: true` also cancels the member in progress. It can't be
+  combined with `queue: max`: written literally, that is a validation error (`KCI1015`); as an
+  expression that evaluates to true, the run fails to start with the same message. The cancelled
+  run says "cancelled: superseded in group <name>".
+- **W05-R07 Group extensions** (kiln): `limit: N` (N members in progress at once instead of one),
+  and `[ci] max_pending` to raise `queue: max`'s bound (default 100, as GitHub). Groups may be
+  shared across repositories when declared in server configuration (`[[ci.groups]] name, repos,
+  limit`), for shared resources such as one staging cluster. (An earlier draft gave kiln its own
+  `queue: fifo | latest | cancel-in-progress`. GitHub's `queue: single | max` now covers them,
+  so kiln uses GitHub's.)
 - **W05-R08 Superseded runs** (opt-in, G-22): `supersede: { when: [branch, stack, pull_request],
   action: cancel | deprioritize, keep: [main] }` on a workflow cancels or lowers older active runs
   of the same workflow when a new push arrives for the same branch, a new version of a diff in the
@@ -1481,7 +1543,8 @@ W20.
 
 - **W05-AC01 Groups.** Simulation tests for every GitHub concurrency behaviour (one in progress and
   one pending, replacement of the pending member, `cancel-in-progress`), job-level groups inside
-  matrices, and the kiln `limit`, `fifo`, cross-repository groups. *Unit test.*
+  matrices, `queue: max` (order, the bound of 100, and its refusal with `cancel-in-progress`), and
+  the kiln `limit` and cross-repository groups. *Unit test.*
 - **W05-AC02 Supersede.** Pushes 1, 2, 3 to a branch with `supersede: { when: [branch], action:
   cancel }`: runs 1 and 2 cancelled with the reason, 3 runs; without it all three run. *Unit test.*
 - **W05-AC03 Priorities and aging.** A low-priority leg under a constant stream of high-priority
@@ -1626,6 +1689,24 @@ It replaces `exec.rs` for `AssignV2`.
   linked, as GitHub shows.
 - **W06-R16 Annotations** are stored up to 1,000 per leg (GitHub shows 10 warnings and 10 errors per
   step and 50 per job; kiln shows those first and the rest on demand).
+- **W06-R17 Background steps**, GitHub-exact.
+  - `background: true` on a `run` or `uses` step that has an `id` starts the step, and the job goes
+    on to the next one.
+  - At most 10 background steps run at once in a leg. Any more wait their turn.
+  - `wait: id | [ids]` pauses until those steps finish; `wait-all:` pauses until every running
+    background step does. Their outputs and environment changes (`GITHUB_ENV`, `GITHUB_PATH`)
+    apply only after that, in the order the steps were declared.
+  - A background step that failed fails the `wait` or `wait-all` that includes it, unless the step
+    has `continue-on-error: true`.
+  - `cancel: id` stops one background step: SIGTERM, then SIGKILL after a grace period. Use
+    GitHub's value, confirmed by W22-AC03; until then, 10 s. The step concludes `cancelled`.
+  - `wait`, `wait-all` and `cancel` always run; they take no `if`.
+  - `parallel: [steps]` runs its steps as background steps, with an implicit `wait` for all of
+    them after the group.
+  - An implicit `wait-all` runs before the post steps.
+  - A composite action's steps can't be background steps, though the action itself can be one.
+  - Each background step keeps its own log; only the live view interleaves them. The leg's
+    timeline shows the overlap.
 
 **Design.** `crates/kiln/src/runner/runtime/`: `env.rs`, `contexts.rs`, `step.rs` (evaluation and
 the step state machine), `shell.rs`, `commands.rs` (the line parser and dispatcher),
@@ -1664,6 +1745,16 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
   Docker action, `/github/workspace` and `/github/file_commands`. *Integration test with Docker.*
 - **W06-AC07 Corpus jobs.** The jobs of F-03 that need no secrets or external services run green
   unmodified on the host and Docker executors. *E2E (W22-AC01).*
+- **W06-AC08 Background steps.** Covers:
+  - a server started in the background and read by a later step, with its output collected by
+    `wait`;
+  - a failing background step failing its `wait`, and not failing it under `continue-on-error`;
+  - `cancel` of a step that ignores SIGTERM, which is killed after the grace period;
+  - 12 background steps, of which 10 run at once;
+  - `parallel` with its outputs used after the group;
+  - the implicit `wait-all` before the post steps.
+
+  *Integration test on the host executor.*
 
 **Scenarios**
 
@@ -1674,6 +1765,9 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
 - **W06-S03** A secret `hunter2-long-secret` printed in base64 → `***` in the log.
 - **W06-S04** `continue-on-error: true` on a failing step → `steps.s.outcome == 'failure'`,
   `steps.s.conclusion == 'success'`, leg succeeds.
+- **W06-S05** `{ id: db, run: ./start-db, background: true }`, then `{ run: ./integration-tests }`,
+  then `{ cancel: db }` → the tests run against the database, the leg succeeds, and `db` concludes
+  `cancelled`.
 
 **Progress.** Not started.
 
@@ -1684,7 +1778,9 @@ plus kiln's own actions.
 
 **Requirements**
 
-- **W07-R01 Forms.** `./path` (in the workspace, after checkout, GitHub-exact), `owner/repo@ref`,
+- **W07-R01 Forms.** `./path` (in the workspace, after checkout, GitHub-exact), `$/path` (this
+  repository at the running commit, read from the server's mirror so no checkout is needed;
+  GitHub-exact), `owner/repo@ref`,
   `owner/repo/path@ref`, `docker://image[:tag|@digest]`, and in the kiln dialect
   `kiln://owner/repo/path@ref` (a kiln-hosted repository) and `kiln/<name>@v1` (built in,
   W07-R10).
@@ -1856,6 +1952,30 @@ reusing the results of jobs whose inputs have not changed.
   and downloads use parallel ranges and never hold an object in memory.
 - **W08-R13 Insights.** Hits, misses, bytes restored and saved, time saved per key prefix and per
   workflow, for W19.
+- **W08-R14 Cache access** (`cache-mode`), GitHub-exact.
+  - The modes: `read` (restore only), `write` (both), `write-only` (save only) and `none`.
+  - Where it is set: on the workflow and on jobs. A job's mode wins, and it also caps the reusable
+    workflows that job calls.
+  - When it is unset:
+    - `write` for trusted events: `push`, `workflow_dispatch`, `repository_dispatch`, `delete`,
+      `registry_package`, `page_build` and `schedule`.
+    - `read` for any other event whose run resolves to the default branch (`pull_request_target`,
+      `issue_comment`, `workflow_run`, …), so a low-trust run can't poison the default branch's
+      caches.
+    - `pull_request` runs are not affected: they keep writing only to their merge ref's scope.
+  - kiln's own events follow the same rule.
+    - Trusted: `land` and `deploy`.
+    - Not trusted: `diff`, `review`, `comment`, `agent`, `webhook` and `pipeline`.
+    - A repository opts a workflow in with an explicit `cache-mode: write`.
+  - Enforcement: the runtime token's cache scopes (W08-R04). Actions see the mode as
+    `ACTIONS_CACHE_MODE`, which `actions/cache` and the toolkit read.
+  - When the mode stops an operation, the step doesn't fail.
+    - A skipped restore is a miss.
+    - A skipped save is an informational message.
+    - A save the server refuses is a warning.
+  - Called workflows: one that asks for more than its caller allows is a validation error, and
+    the run doesn't start. Examples are `write` under a `read` caller, or `read` under a
+    `write-only` caller (the two don't overlap).
 
 **Design.** `crates/kiln/src/ci/services/`: `cas.rs` (chunker, chunk files, objects, eviction),
 `blob.rs` (the Azure-compatible endpoint), `twirp.rs` (the two Twirp services), `cache_v1.rs`,
@@ -1889,6 +2009,11 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
   entries; expiry after 7 days of disuse (simulated clock). *Unit test.*
 - **W08-AC08 Speed.** 1 GiB restore ≥ 500 MiB/s on the CI benchmark host's loopback with a 10 GbE
   shaped link. *Bench.*
+- **W08-AC09 Cache access.** For each event and each explicit `cache-mode`, check the effective
+  mode, `ACTIONS_CACHE_MODE`, and what `actions/cache`, `actions/cache/restore` and
+  `actions/cache/save` do. A `pull_request_target` run restores from the default branch and can't
+  save there. A reusable workflow asking for more than its caller allows doesn't start.
+  *Integration test.*
 
 **Progress.** Not started.
 
@@ -2581,7 +2706,10 @@ environment model both use.
   its protection is enforced before the leg starts (the leg waits with reason `approval`, approved
   on the leg itself in one step), its secrets and variables apply, `concurrency` limits its
   deployments, and a deployment record is created with the leg's result and the evaluated `url`.
-  The facade's deployment endpoints reflect them.
+  The facade's deployment endpoints reflect them. `environment: { name, deployment: false }`
+  applies the environment's secrets, variables and protection without recording a deployment. As
+  on GitHub, it can't be combined with custom protection rules (kiln's custom gates, W15-R03): the
+  run fails to start, saying why.
 - **W15-R05 CI drives CD.** `uses: kiln/deploy@v1` with `{ app?, environment, revision? (default
   the run's commit), wait: synced | healthy, timeout }` asks CD to sync and streams the sync's
   progress (waves, resources, health) into the step's log; the step fails if the sync fails or
@@ -3340,20 +3468,24 @@ improvement on top. Every row cites the requirement that delivers it.
 | `on.workflow_dispatch.inputs` (string, boolean, choice, number, environment) | S | W03-R11 |
 | `on.workflow_call.{inputs,outputs,secrets}` | S | W04-R24 |
 | `on.workflow_run.{workflows,types,branches,branches-ignore}` | S | W03-R13 |
-| `permissions` (workflow, job) | S | W04-R06 |
+| `permissions` (workflow, job; every scope, including `models` and `copilot-requests`) | S | W04-R06 |
 | `env` (workflow, job, step) | S | W06-R04 |
 | `defaults.run.{shell,working-directory}` | S | W04-R28 |
-| `concurrency` (string or `{group, cancel-in-progress}`; workflow and job) | S (+K `limit`, `queue`) | W05-R06, W05-R07 |
+| `concurrency` (string or `{group, cancel-in-progress, queue}`; workflow and job) | S (+K `limit`) | W05-R06, W05-R07 |
+| `cache-mode` (workflow, job) | S | W08-R14 |
 | `jobs.<id>.name`, `needs`, `if` | S | W04-R02, W04-R03 |
 | `jobs.<id>.runs-on` (string, list, `{group, labels}`) | S (+K routing) | W05-R19 |
-| `jobs.<id>.environment` (string, `{name, url}`) | S | W15-R04 |
+| `jobs.<id>.environment` (string, `{name, url, deployment}`) | S | W15-R04 |
 | `jobs.<id>.outputs` | S (+K typed, legs, secret) | W04-R18 to R22 |
 | `jobs.<id>.timeout-minutes`, `continue-on-error` | S | W04-R05, W06-R12 |
 | `jobs.<id>.strategy.{matrix,fail-fast,max-parallel}` | S (+K) | W04-R07 to R17 |
 | `jobs.<id>.container` (`image`, `credentials`, `env`, `ports`, `volumes`, `options`) | S | W13-R08 |
 | `jobs.<id>.services.<id>` | S | W13-R08 |
-| `jobs.<id>.uses`, `with`, `secrets` (`inherit`) | S | W04-R24 |
+| `jobs.<id>.uses` (local, `$/` and remote), `with`, `secrets` (`inherit`) | S | W04-R24 |
+| `jobs.<id>.snapshot` (custom images) | S\* (read and kept; runner images are built W13's way) | W02-R04, W13 |
 | `jobs.<id>.steps[*].{id,if,name,uses,run,shell,with,env,working-directory,continue-on-error,timeout-minutes}` | S | W06-R04 |
+| `steps[*].{background,wait,wait-all,cancel,parallel}` | S | W06-R17 |
+| `steps[*].uses`: `./path`, `$/path`, `owner/repo[/path]@ref`, `docker://` | S | W07-R01 |
 | `steps[*].with.{args,entrypoint}` (Docker actions) | S | W07-R06 |
 | YAML anchors and aliases | S | W02-R03 |
 
@@ -3419,6 +3551,10 @@ Cache service v2 (Twirp + Azure-compatible blobs) and the v1 `_apis/artifactcach
 | Cache per repository | 10 GiB | 10 GiB (configurable) |
 | `workflow_dispatch` inputs | GitHub's current limit | 100 |
 | Path filters | the first 300 changed files | every changed file |
+| Background steps running at once | 10 per job | 10 per leg |
+| Pending members of a concurrency group | 1 (`queue: single`), 100 (`queue: max`) | the same; `[ci] max_pending` raises `max`'s |
+| Cache key length | 512 characters | 512 |
+| Unused cache entries kept | 7 days | 7 days (configurable) |
 
 ### A.8 Behaviours confirmed by W22-AC03
 
@@ -3432,7 +3568,8 @@ literals.
 `hashFiles` sorted order (W01-R09); all changed files for path filters (W03-R05); no schedule
 minimum or auto-disable (W03-R10); the v1 cache protocol kept (W08-R07); 1,000 stored annotations
 per leg (W06-R16); kiln dialect's v1 forms and defaults (W02-R06); unmasked short secrets flagged
-(W06-R08).
+(W06-R08); a lenient YAML fallback for files GitHub accepts and the strict reader refuses
+(`KCI1004`, W02-R03).
 
 ## Appendix B. Where each context is available
 
@@ -3459,7 +3596,7 @@ marked ‡.
 | `jobs.<id>.outputs.<id>` | github, needs, strategy, matrix, job, runner, env, vars, secrets, steps, inputs |
 | `jobs.<id>.runs-on` | github, needs, strategy, matrix, vars, inputs |
 | `jobs.<id>.secrets.<id>` | github, needs, strategy, matrix, secrets, inputs, vars |
-| `jobs.<id>.services`, `.services.<id>.image` | github, needs, strategy, matrix, vars, inputs |
+| `jobs.<id>.services` (and `.services.<id>.image`, which GitHub's table doesn't list) | github, needs, strategy, matrix, vars, inputs |
 | `jobs.<id>.services.<id>.credentials` | github, needs, strategy, matrix, env, vars, secrets, inputs |
 | `jobs.<id>.services.<id>.env.<id>` | github, needs, strategy, matrix, job, runner, env, vars, secrets, inputs |
 | `jobs.<id>.steps.continue-on-error` ‡ | github, needs, strategy, matrix, job, runner, env, vars, secrets, steps, inputs |
@@ -3476,9 +3613,19 @@ marked ‡.
 | `on.workflow_call.inputs.<id>.default` | github, inputs, vars |
 | `on.workflow_call.outputs.<id>.value` | github, jobs, vars, inputs |
 
-The table is checked against GitHub's current documentation when W02 is implemented, and its source
-revision recorded here. kiln-dialect keys follow the closest GHA key (for example `strategy.where`
-as `jobs.<id>.strategy` plus `matrix`; `retry` as `jobs.<id>.continue-on-error`).
+Checked on 2026-10-17 against GitHub's table
+(<https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability>,
+34 rows; the page carries no revision). It is identical, apart from one row: GitHub has none for
+`services.<id>.image`, which kiln reads as `services`.
+
+Keys GitHub's table doesn't list are checked as the closest key that it does:
+- `steps[*].background` as `steps.continue-on-error`.
+- `environment.deployment` as `jobs.<id>.environment`.
+- `wait`, `wait-all` and `cancel` take step ids. `cache-mode` and `concurrency.queue` take
+  literals, not expressions.
+
+kiln-dialect keys follow the closest GHA key in the same way. For example, `strategy.where` is
+read as `jobs.<id>.strategy` plus `matrix`, and `retry` as `jobs.<id>.continue-on-error`.
 
 ## Appendix C. Integration catalog
 
@@ -3606,7 +3753,7 @@ in `.github/workflows`. Each key's semantics are in the requirement cited.
 | job | `toolchain`, `image`, `exclusive`, `resources: { cpu, memory, disk, gpu }` (O for `resources`) | W02-R06, W05-R03 |
 | job | `requires: [constraints]`, `prefer: [preferences]`, `priority` (O) | W05-R22, W05-R23, W05-R09 |
 | job, step | `retry: { max, on, backoff, runner }` (O) | W05-R14 |
-| job | `concurrency.{limit,queue}` (O) | W05-R07 |
+| workflow, job | `concurrency.limit` (O) | W05-R07 |
 | job | `strategy.matrix.{where,platforms,emulate}`, `strategy.{when,shard,chunk}`, `strategy.max-parallel: {total, per}`, `strategy.fail-fast: {scope, cancel}` (O) | W04-R11 to R16 |
 | job | `needs: [{ job, matrix: same } \| { job, where }]` (O) | W04-R17 |
 | job | `outputs.<name>: { value, secret }`, `exports: { env }`, `env-from` (O) | W04-R20 to R22 |
@@ -3756,6 +3903,22 @@ GitHub Actions behaviour (the reference for every "GitHub-exact"):
 - Webhook payload schemas: <https://github.com/octokit/webhooks>.
 - Independent implementations, useful for the runtime services' wire details: nektos/act
   (<https://github.com/nektos/act>) and Gitea/Forgejo Actions (<https://gitea.com/gitea/act_runner>).
+- Pages checked on 2026-10-17 for W02 (none of them carries a revision):
+  - context availability:
+    <https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability>;
+  - workflow syntax, for background steps, `concurrency.queue`, `cache-mode`,
+    `environment.deployment` and `snapshot`:
+    <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax>;
+  - dependency caching, for the `cache-mode` defaults, low-trust triggers, `ACTIONS_CACHE_MODE`
+    and the limits:
+    <https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching>;
+  - limits: <https://docs.github.com/en/actions/reference/limits>.
+- GitHub's changelog (<https://github.blog/changelog/>) announced these 2026 features:
+  - concurrency queues (2026-05-07);
+  - parallel and background steps (2026-06-25);
+  - read-only caches for low-trust triggers (2026-06-26);
+  - `$/` self-repository references (2026-07-30);
+  - `cache-mode` (2026-09-10).
 
 shards:
 
