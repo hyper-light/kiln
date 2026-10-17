@@ -286,6 +286,12 @@ fn mirror(cd: &Cd, url: &str) -> anyhow::Result<Mirror> {
 
 /// Finds what `ask` names: the repository, trunk, the base and the stack's commits.
 fn find(cd: &Cd, ask: &Ask) -> Result<Stack, Fail> {
+    // Revisions go to git as arguments: none may read as an option.
+    for (name, v) in [("commit", &ask.commit), ("head", &ask.head), ("base", &ask.base), ("trunk", &ask.trunk)] {
+        if v.as_deref().is_some_and(|r| r.starts_with('-') || r.chars().any(char::is_whitespace)) {
+            return Err(bad(format!("{name} is not a revision")));
+        }
+    }
     let want = match (&ask.commit, &ask.head, ask.pr) {
         (Some(c), None, None) => Want::Commit(c.clone()),
         (None, Some(h), None) => Want::Head(h.clone()),
@@ -674,17 +680,17 @@ async fn plan_app(cd: Arc<Cd>, st: Arc<Stack>, id: String, def: AppDef, brief: b
                             let against = prev.or(trunk);
                             let (never, confirm) = (cur.never(), cur.confirm());
                             let (was_never, was_confirm) = against.map(|p| (p.never(), p.confirm())).unwrap_or_default();
-                            let mut problems: Vec<String> = never
+                            let problems: Vec<String> = never
                                 .difference(&was_never)
                                 .map(|k| format!("{} leaves git but is marked Prune=false: no sync deletes it, so the app stays out of sync until someone does", named(k)))
                                 .collect();
+                            let mut notes: Vec<String> = Vec::new();
                             if matches!(below, Below::Failed) {
-                                problems.push("the diff below can't be read, so this diff's own change isn't known".into());
+                                notes.push("the diff below can't be read, so this diff's own change isn't known".into());
                             }
-                            let mut notes: Vec<String> = confirm
+                            notes.extend(confirm
                                 .difference(&was_confirm)
-                                .map(|k| format!("{} leaves git and is pruned only once a person confirms (Prune=confirm)", named(k)))
-                                .collect();
+                                .map(|k| format!("{} leaves git and is pruned only once a person confirms (Prune=confirm)", named(k))));
                             notes.extend(cur.plan.taken.iter().map(|(k, other)| format!("{} is deployed by {other}, which keeps it", named(k))));
                             let (gone, unknown): (Vec<&ResKey>, Vec<&ResKey>) = cur.plan.unread.iter().partition(|k| unserved.contains(*k));
                             notes.extend(gone.iter().map(|k| {

@@ -546,7 +546,12 @@ fn print_plan(v: &Value, diff: bool) {
         1 => "1 app".to_owned(),
         n => format!("{n} apps"),
     };
-    println!("\n{} touched, {} planned; {} following {} untouched.", n("affected"), count(&apps, "planned"), n("unaffected"), s(&trunk, "branch"));
+    let others = match count(&apps, "unaffected") {
+        0 => String::new(),
+        1 => format!(" 1 other app follows {} and isn't touched.", s(&trunk, "branch")),
+        k => format!(" {k} other apps follow {} and aren't touched.", s(&trunk, "branch")),
+    };
+    println!("\n{} touched, {} planned.{others}", n("affected"), count(&apps, "planned"));
     for n in v.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
         println!("note: {n}");
     }
