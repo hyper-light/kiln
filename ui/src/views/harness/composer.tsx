@@ -5,7 +5,7 @@
  * on every device until they go out.
  */
 import * as React from "react";
-import { ArrowUp, ChevronDown, CornerDownLeft, Paperclip, Square, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, type Meta, type SendMode, type SessionStore, type State } from "@/api/harness";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -56,28 +56,40 @@ function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: str
         </button>
       )}
       <span className="qd-acts">
-        <button type="button" onClick={() => setEditing(true)}>
-          edit
-        </button>
-        {canSteer && (
-          <button type="button" onClick={() => store.send({ type: "queue_steer", id })} title="Into the running turn now, without interrupting it">
-            steer
+        <Tip content="Edit">
+          <button type="button" className="hx-icon" aria-label="Edit" onClick={() => setEditing(true)}>
+            <Pencil size={13} />
           </button>
+        </Tip>
+        {canSteer && (
+          <Tip content="Steer it into the running turn now, without interrupting">
+            <button type="button" className="hx-icon" aria-label="Steer now" onClick={() => store.send({ type: "queue_steer", id })}>
+              <Navigation size={13} />
+            </button>
+          </Tip>
         )}
         {canNow && (
-          <button type="button" onClick={() => store.send({ type: "queue_send_now", id })} title="Stop the current turn and send this now">
-            now
-          </button>
+          <Tip content="Stop the current turn and send this now">
+            <button type="button" className="hx-icon" aria-label="Send now" onClick={() => store.send({ type: "queue_send_now", id })}>
+              <Zap size={13} />
+            </button>
+          </Tip>
         )}
-        <button type="button" aria-label="Move up" disabled={index === 0} onClick={() => store.send({ type: "queue_move", id, index: index - 1 })}>
-          ↑
-        </button>
-        <button type="button" aria-label="Move down" disabled={index === count - 1} onClick={() => store.send({ type: "queue_move", id, index: index + 1 })}>
-          ↓
-        </button>
-        <button type="button" className="qd-remove" onClick={() => store.send({ type: "queue_remove", id })}>
-          remove
-        </button>
+        <Tip content="Move up">
+          <button type="button" className="hx-icon" aria-label="Move up" disabled={index === 0} onClick={() => store.send({ type: "queue_move", id, index: index - 1 })}>
+            <ArrowUp size={13} />
+          </button>
+        </Tip>
+        <Tip content="Move down">
+          <button type="button" className="hx-icon" aria-label="Move down" disabled={index === count - 1} onClick={() => store.send({ type: "queue_move", id, index: index + 1 })}>
+            <ArrowDown size={13} />
+          </button>
+        </Tip>
+        <Tip content="Remove">
+          <button type="button" className="hx-icon qd-remove" aria-label="Remove" onClick={() => store.send({ type: "queue_remove", id })}>
+            <X size={13} />
+          </button>
+        </Tip>
       </span>
     </li>
   );

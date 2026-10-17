@@ -13,7 +13,11 @@ import { duration, tildify } from "./derive";
 import { Optic } from "./signals";
 
 const BACKGROUND = new Set(["shell", "monitor", "mcp"]);
-export const isBackground = (t: Task) => (t.class ? BACKGROUND.has(t.class) : false);
+/** What a task is; machines from before `class` only say the harness's own task type. */
+export const classOf = (t: Task): string =>
+  t.class ??
+  (t.kind?.startsWith("monitor") ? "monitor" : t.kind === "local_bash" ? "shell" : t.kind === "local_workflow" ? "workflow" : t.kind?.includes("mcp") ? "mcp" : "agent");
+export const isBackground = (t: Task) => BACKGROUND.has(classOf(t));
 const isLive = (t: Task) => t.status === "running" || t.status === "pending" || t.status === "paused";
 const WORD: Record<string, string> = { shell: "Shell", monitor: "Monitor", mcp: "MCP call" };
 
@@ -71,19 +75,19 @@ function Row({ t, agent, send }: { t: Task; agent: string; send: (c: Command) =>
   const what = t.command || t.description || t.id;
   const facts = [
     live ? (t.status === "paused" ? "paused" : `running ${duration(now - t.started)}`) : t.exit_code !== undefined ? `ended · exit ${t.exit_code}` : `ended ${t.status !== "completed" ? `· ${t.status}` : ""}`.trim(),
-    t.class === "monitor" && t.events ? `${t.events} event${t.events === 1 ? "" : "s"}` : "",
-    t.class === "monitor" && t.wakes ? (t.wakes === "agent" ? "wakes the agent" : "wakes its subagent") : "",
+    classOf(t) === "monitor" && t.events ? `${t.events} event${t.events === 1 ? "" : "s"}` : "",
+    classOf(t) === "monitor" && t.wakes ? (t.wakes === "agent" ? "wakes the agent" : "wakes its subagent") : "",
     t.cwd ? tildify(t.cwd) : "",
   ].filter(Boolean);
   return (
     <li className="bg-row" data-live={live || undefined}>
       <div className="bg-main">
-        <span className="bg-class">{WORD[t.class ?? ""] ?? t.class}</span>
+        <span className="bg-class">{WORD[classOf(t)] ?? classOf(t)}</span>
         <span className="bg-what" title={what}>
           {what}
         </span>
         <span className="bg-facts">{facts.join(" · ")}</span>
-        {t.class === "monitor" && t.last_event && <span className="bg-last">Latest: {t.last_event}</span>}
+        {classOf(t) === "monitor" && t.last_event && <span className="bg-last">Latest: {t.last_event}</span>}
       </div>
       <div className="bg-actions">
         <button type="button" className="bg-btn" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -167,8 +171,8 @@ export function ActivityLine({ state, agent, onOpenTask }: { state: State | null
   const bg = tasks.filter((t) => isBackground(t) && isLive(t));
   if (subs.length + bg.length === 0) return null;
   const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
-  const shells = bg.filter((t) => t.class === "shell").length;
-  const monitors = bg.filter((t) => t.class === "monitor").length;
+  const shells = bg.filter((t) => classOf(t) === "shell").length;
+  const monitors = bg.filter((t) => classOf(t) === "monitor").length;
   const other = bg.length - shells - monitors;
   const summary = [count(subs.length, "subagent"), count(shells, "shell"), count(monitors, "monitor"), count(other, "background call")].filter(Boolean).join(" · ");
   return (
@@ -182,7 +186,9 @@ export function ActivityLine({ state, agent, onOpenTask }: { state: State | null
         <ul className="al-list">
           {[...subs, ...bg].map((t) => {
             const isSub = !isBackground(t);
-            const last = isSub ? t.last_tool : t.class === "monitor" ? t.last_event : undefined;
+            const last = isSub ? t.last_tool : classOf(t) === "monitor" ? t.last_event : undefined;
+            // The header already says what they are; a row names its kind only in a mixed list.
+            const mixed = subs.length > 0 && bg.length > 0;
             return (
               <li key={t.id} className="al-item">
                 <button
@@ -195,11 +201,13 @@ export function ActivityLine({ state, agent, onOpenTask }: { state: State | null
                 >
                   <Optic state={t.status === "pending" ? "thinking" : "tool"} />
                   <span className="al-what">
-                    <span className="al-kind">{isSub ? "Subagent" : (WORD[t.class ?? ""] ?? t.class)}</span>
+                    {mixed && <span className="al-kind">{isSub ? "Subagent" : (WORD[classOf(t)] ?? classOf(t))}</span>}
                     <span className="al-desc">{t.description || t.command || t.id}</span>
                   </span>
-                  <span className="al-time">{duration(now - t.started)}</span>
-                  {last && <span className="al-last">{last}</span>}
+                  <span className="al-time">
+                    {last && <span className="al-last">{last}</span>}
+                    {duration(now - t.started)}
+                  </span>
                 </button>
                 {shown === t.id && <Output agent={agent} task={t} />}
               </li>
