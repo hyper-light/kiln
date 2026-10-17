@@ -708,11 +708,14 @@ const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfill
 
 const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
-/** A snapshot that doesn't end with the server's "synced" (a machine sending its sessions again) is complete once its frames pause this long… */
+/**
+ * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
+ * sending its sessions again) doesn't, and is taken as complete once its frames pause this long…
+ */
 const QUIET_MS = 300;
 /** …or this long while none of its events came yet (a big first batch takes a while on a slow link). */
 const QUIET_FIRST_MS = 1500;
-/** What's shown is never held longer than this while a snapshot comes. */
+/** What's shown is never held longer than this while a snapshot comes (a server without "synced": this long). */
 const HOLD_MS = 5000;
 /** A session the server doesn't know (yet) is tried this many times before it's taken as ended… */
 const UNKNOWN_TRIES = 6;
@@ -812,8 +815,6 @@ export class SessionStore {
   private ended = false;
   private misses = 0;
   private missingSince = 0;
-  /** The last snapshot ended with "synced": the next ones will too. */
-  private tells = false;
   private attempt = 0;
   private timer = 0;
   private quiet = 0;
@@ -1016,11 +1017,11 @@ export class SessionStore {
         this.ended = false;
         this.misses = 0;
         this.attempt = 0;
-        this.begin(u.info, this.tells && this.frames === 1);
+        // Sent as the socket opens: the server's own snapshot, which it ends with "synced".
+        this.begin(u.info, this.frames === 1);
         if (this.snap.ready && this.snap.conn !== "open") this.patch({ conn: "open" });
         return;
       case "synced":
-        this.tells = true;
         this.commit();
         return;
       case "closed":
