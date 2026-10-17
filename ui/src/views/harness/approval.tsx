@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { diffStats, relPath, tildify } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
+import { answersToClaude, Choices, type ChoiceQuestion } from "./choices";
 import { Prose, ToolIcon } from "./parts";
 
 export type Decide = (c: Extract<Command, { type: "approve" }>) => void;
@@ -25,54 +26,30 @@ const VERB: Partial<Record<Approval["tool"], string>> = {
   plan: "start on its plan",
 };
 
+/** A question, answered where it was asked: the stepper inline in the card (never a popup). */
 function Questions({ a, onDecide }: { a: Approval; onDecide: Decide }) {
-  const qs = a.questions ?? [];
-  const [picked, setPicked] = React.useState<Record<string, string[]>>({});
-  const toggle = (q: string, label: string, multi: boolean) =>
-    setPicked((p) => {
-      const cur = p[q] ?? [];
-      return { ...p, [q]: multi ? (cur.includes(label) ? cur.filter((l) => l !== label) : [...cur, label]) : [label] };
-    });
-  const ready = qs.every((q) => (picked[q.question]?.length ?? 0) > 0);
+  const [busy, setBusy] = React.useState(false);
+  const questions: ChoiceQuestion[] = (a.questions ?? []).map((q) => ({
+    id: q.id,
+    question: q.question,
+    header: q.header,
+    multi: q.multi,
+    options: q.options.map((o) => ({ label: o.label, description: o.description, preview: o.preview })),
+    other: q.other ?? true,
+    secret: q.secret,
+  }));
   return (
-    <div className="hx-stack">
-      {qs.map((q) => (
-        <div key={q.question} className="hx-q">
-          {q.header && <div className="hx-eyebrow">{q.header}</div>}
-          <div className="hx-q-text">{q.question}</div>
-          <div className="hx-q-opts">
-            {q.options.map((o) => {
-              const on = picked[q.question]?.includes(o.label) ?? false;
-              return (
-                <button key={o.label} type="button" className="hx-opt" aria-pressed={on} onClick={() => toggle(q.question, o.label, Boolean(q.multi))}>
-                  <span className="hx-opt-label">{o.label}</span>
-                  {o.description && <span className="hx-opt-desc">{o.description}</span>}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ))}
-      <div className="hx-approve-actions">
-        <Button
-          size="sm"
-          disabled={!ready}
-          onClick={() =>
-            onDecide({
-              type: "approve",
-              id: a.id,
-              decision: "allow",
-              answers: Object.fromEntries(Object.entries(picked).map(([q, ls]) => [q, ls.join(", ")])),
-            })
-          }
-        >
-          <Check /> Answer
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => onDecide({ type: "approve", id: a.id, decision: "deny", message: "The user chose not to answer." })}>
-          Skip
-        </Button>
-      </div>
-    </div>
+    <Choices
+      layout="inline"
+      questions={questions}
+      busy={busy}
+      canDecline
+      onDecline={() => onDecide({ type: "approve", id: a.id, decision: "deny", message: "The user chose not to answer." })}
+      onSubmit={(answers) => {
+        setBusy(true);
+        onDecide({ type: "approve", id: a.id, decision: "allow", answers: answersToClaude(answers) });
+      }}
+    />
   );
 }
 
