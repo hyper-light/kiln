@@ -39,6 +39,9 @@ const KEY_PREFIX: &str = "front_door/";
 const ISSUE_EVERY: Duration = Duration::from_secs(60);
 /// An uploaded chain and key, as JSON.
 const UPLOAD_LIMIT: usize = 256 * 1024;
+/// A runner process that has announced no build this long after connecting never will: it is
+/// from before builds were announced, so from before front doors.
+const BUILD_GRACE: i64 = 15;
 
 pub type Answer = Result<Response, (StatusCode, String)>;
 
@@ -156,11 +159,21 @@ pub async fn push(hub: &Hub, machine: &str, issued: Option<String>, custom: Opti
 }
 
 /// A runner process said what it can do (`AgentMsg::Build`): one that runs front doors gets
-/// its machine's (and its other processes stand by).
+/// its machine's (and its other processes stand by). Whether it can is known from now on, so
+/// the UI asks again.
 pub async fn on_build(hub: &Hub, machine: &str, caps: u32) {
     if caps & CAP_FRONT_DOOR != 0 {
         push(hub, machine, None, None).await;
     }
+    hub.emit(&json!({ "type": "front_door", "runner": machine }));
+}
+
+/// What the process that runs a machine's front door can do, once that is known: unknown from
+/// its connecting until its `AgentMsg::Build`, which follows Hello within moments; nothing, for a
+/// process too old to announce a build (from before instances, or silent past [`BUILD_GRACE`]).
+fn caps_known(i: Option<&crate::instances::Instance>, now: i64) -> Option<u32> {
+    let i = i?;
+    (i.build.is_some() || i.id.is_none() || now - i.connected_at > BUILD_GRACE).then_some(i.caps)
 }
 
 /// A runner process of `machine` went away: another one may run its front door now.
@@ -266,7 +279,12 @@ pub async fn view(hub: &Hub, name: &str) -> serde_json::Value {
     let settings = hub.front_doors.settings(name);
     let (status, status_at) = hub.front_doors.status(name);
     let connected = hub.agents.lock().get(name).is_some_and(|a| a.connected);
-    let supported = connected.then(|| hub.runner_caps(name) & CAP_FRONT_DOOR != 0);
+    // Unknown (null: "waiting for the runner") until the runner has said what it can do.
+    let caps = {
+        let inst = hub.instances.lock();
+        caps_known(inst.newest(name).and_then(|p| inst.get(p)), crate::util::now_unix())
+    };
+    let supported = if connected { caps.map(|c| c & CAP_FRONT_DOOR != 0) } else { None };
     let applied = status.as_ref().map(|s| s.settings == settings.fingerprint());
     let status = status.map(|mut s| {
         s.csr = None;
@@ -461,6 +479,44 @@ mod tests {
         };
         assert_eq!(names_to_sign(&settings, &status), ["kiln.home", "*.kiln.home", "ci.home", "kiln.local", "192.168.1.77"]);
         assert_eq!(date(1_825_000_000), "2027-10-31");
+    }
+
+    /// A runner that has just connected has not said what it can do yet: unknown, not "too old",
+    /// until its Build arrives; one that never says (too old to) is known to have nothing.
+    #[test]
+    fn whether_a_runner_runs_front_doors_is_unknown_until_it_says() {
+        let hello = crate::proto::Hello {
+            protocol: crate::proto::VERSION,
+            name: "rocket".into(),
+            labels: vec![],
+            slots: 1,
+            hostname: "rocket".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            version: "0.1.0".into(),
+            ephemeral: false,
+            dedicated_job: None,
+            running: vec![],
+            terminal: true,
+        };
+        let supported = |m: &crate::instances::Instances, peer: PeerId, now: i64| caps_known(m.get(peer), now).map(|c| c & CAP_FRONT_DOOR != 0);
+        let mut m = crate::instances::Instances::default();
+        m.announce(7, crate::proto::InstanceHello { id: "new".into(), created_at: 100, pid: 1 });
+        m.join(7, "rocket", hello.clone(), 1_000);
+        assert_eq!(supported(&m, 7, 1_000), None, "just connected: not known yet");
+        assert_eq!(supported(&m, 7, 1_000 + BUILD_GRACE), None, "still within the grace");
+        m.set_build(7, "build-1".into(), CAP_FRONT_DOOR | crate::proto::CAP_UPGRADE);
+        assert_eq!(supported(&m, 7, 1_001), Some(true));
+        m.set_build(7, "build-0".into(), crate::proto::CAP_UPGRADE);
+        assert_eq!(supported(&m, 7, 1_001), Some(false), "it said so: too old for a front door");
+        // A process that never announces a build is too old once the grace is over.
+        m.announce(8, crate::proto::InstanceHello { id: "silent".into(), created_at: 200, pid: 2 });
+        m.join(8, "quiet", hello.clone(), 1_000);
+        assert_eq!(supported(&m, 8, 1_000 + BUILD_GRACE + 1), Some(false));
+        // One from before instances says nothing, ever: known at once.
+        m.join(9, "legacy", hello, 1_000);
+        assert_eq!(supported(&m, 9, 1_000), Some(false));
+        assert_eq!(caps_known(None, 1_000), None, "no process: not known");
     }
 
     #[test]
