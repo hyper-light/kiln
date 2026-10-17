@@ -18,6 +18,7 @@ import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, 
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession } from "./accounts.ts";
+import { handlePages } from "./pages.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -1555,6 +1556,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
 
     return err(res, 404, `no route for ${m} ${p}`);
   } catch (e) {
