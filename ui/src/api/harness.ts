@@ -452,6 +452,8 @@ export type Command =
   | { type: "set_model"; model: string }
   | { type: "stop_task"; task: string }
   | { type: "stop_tasks" }
+  /** Take a queued message out of the queue and steer it into the running turn (no interrupt). */
+  | { type: "queue_steer"; id: string }
   | { type: "restart" }
   | { type: "suggest"; client: string; query: string }
   | { type: "snapshot" };

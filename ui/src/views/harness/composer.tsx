@@ -5,7 +5,7 @@
  * on every device until they go out.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
 import { clientId, type Meta, type SendMode, type SessionStore, type State } from "@/api/harness";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
@@ -19,7 +19,7 @@ const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] =
 
 const fine = () => typeof window !== "undefined" && window.matchMedia?.("(pointer: fine)").matches;
 
-function QueueRow({ id, text, index, count, store, canNow }: { id: string; text: string; index: number; count: number; store: SessionStore; canNow: boolean }) {
+function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: string; text: string; index: number; count: number; store: SessionStore; canNow: boolean; canSteer: boolean }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(text);
   React.useEffect(() => setDraft(text), [text]);
@@ -60,6 +60,13 @@ function QueueRow({ id, text, index, count, store, canNow }: { id: string; text:
         <button type="button" className="hx-icon" aria-label="Move down" disabled={index === count - 1} onClick={() => store.send({ type: "queue_move", id, index: index + 1 })}>
           <ArrowDown size={12} />
         </button>
+        {canSteer && (
+          <Tip content="Steer it into the running turn now — no interrupt">
+            <button type="button" className="hx-icon" aria-label="Steer now" onClick={() => store.send({ type: "queue_steer", id })}>
+              <Navigation size={12} />
+            </button>
+          </Tip>
+        )}
         {canNow && (
           <Tip content="Stop the current turn and send this now">
             <button type="button" className="hx-icon" aria-label="Send now" onClick={() => store.send({ type: "queue_send_now", id })}>
@@ -198,7 +205,7 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
           </div>
           <ol>
             {queue.map((q, i) => (
-              <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={features.includes("send_now")} />
+              <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={features.includes("send_now")} canSteer={features.includes("queue_steer")} />
             ))}
           </ol>
         </div>
