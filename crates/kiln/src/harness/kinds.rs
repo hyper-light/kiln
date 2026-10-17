@@ -5,6 +5,7 @@
 use std::process::Command as Process;
 
 use super::claude::Claude;
+use super::codex::Codex;
 use super::core::Core;
 use super::model::Command;
 use super::session::Spec;
@@ -24,9 +25,14 @@ pub struct Kind {
 pub enum Protocol {
     /// Claude Code's stream-json + control protocol.
     ClaudeStreamJson,
+    /// Codex's app-server (JSON-RPC v2).
+    CodexAppServer,
 }
 
-const KINDS: &[Kind] = &[Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson }];
+const KINDS: &[Kind] = &[
+    Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson },
+    Kind { id: "codex", name: "Codex", program: "codex", verified: true, protocol: Protocol::CodexAppServer },
+];
 
 impl Kind {
     pub fn all() -> &'static [Kind] {
@@ -45,6 +51,7 @@ impl Kind {
     pub fn adapter(&self, spec: &Spec) -> Adapter {
         match self.protocol {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass))),
+            Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::new(spec.resume.clone(), spec.model.clone(), spec.mode.clone(), spec.allow_bypass))),
         }
     }
 
@@ -74,6 +81,10 @@ impl Kind {
                 let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
                 p.args(super::claude::args(spec.model.as_deref(), spec.mode.as_deref(), spec.resume.as_deref(), session_id.as_deref(), spec.allow_bypass));
             }
+            // Model, mode and resume go over the protocol (thread/start, turn/start).
+            Protocol::CodexAppServer => {
+                p.args(super::codex::args());
+            }
         }
         Ok(p)
     }
@@ -83,30 +94,35 @@ impl Kind {
 /// its input. Pure state machines over [`Core`]; the session owns the process.
 pub enum Adapter {
     Claude(Box<Claude>),
+    Codex(Box<Codex>),
 }
 
 impl Adapter {
     pub fn start(&mut self, core: &mut Core) {
         match self {
             Self::Claude(a) => a.start(core),
+            Self::Codex(a) => a.start(core),
         }
     }
 
     pub fn line(&mut self, core: &mut Core, line: &str) {
         match self {
             Self::Claude(a) => a.line(core, line),
+            Self::Codex(a) => a.line(core, line),
         }
     }
 
     pub fn command(&mut self, core: &mut Core, c: Command) {
         match self {
             Self::Claude(a) => a.command(core, c),
+            Self::Codex(a) => a.command(core, c),
         }
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
         match self {
             Self::Claude(a) => a.exited(core, code, error),
+            Self::Codex(a) => a.exited(core, code, error),
         }
     }
 }

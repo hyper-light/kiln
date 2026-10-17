@@ -311,7 +311,7 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Ve
 }
 
 enum Ev {
-    Change(Option<(String, Option<super::model::FileChange>)>),
+    Change(Option<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
     Ctl(Option<Ctl>),
@@ -322,7 +322,7 @@ enum Ev {
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>) {
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
-    let (ch_tx, ch_rx) = async_channel::unbounded::<(String, Option<super::model::FileChange>)>();
+    let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
     // Announce it before anything else, so whoever mirrors it knows what it is.
     let _ = sink.send((s.id.clone(), Update::Open { info: Box::new(s.info()) })).await;
     let mut first = true;
@@ -374,7 +374,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         let tx = ch_tx.clone();
                         crate::rt::spawn(async move {
                             let abs = job.abs.clone();
-                            let change = crate::rt::blocking(move || super::diff::file_change(&job)).await.ok().flatten();
+                            let change = crate::rt::blocking(move || super::diff::file_change(&job)).await.unwrap_or((None, None));
                             let _ = tx.send((abs, change)).await;
                         });
                     }
@@ -444,8 +444,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Preview(None) | Ev::Change(None) => {}
-                        Ev::Change(Some((abs, change))) => {
-                            s.core.lock().set_change(&abs, change);
+                        Ev::Change(Some((abs, (change, resolved)))) => {
+                            s.core.lock().set_change(&abs, change, resolved);
                         }
                         Ev::Exit(c) => {
                             code = c;

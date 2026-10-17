@@ -4,6 +4,7 @@
 //! * [`model`] — the normalized timeline, state and commands every adapter speaks.
 //! * [`core`] — a session's state plus what came out of the last step (updates, stdin lines).
 //! * [`claude`] — Claude Code over stream-json and the control protocol.
+//! * [`codex`] — Codex over its app-server (JSON-RPC v2).
 //! * [`diff`] — line diffs for edit previews.
 //! * [`kinds`] — the registry of harnesses and their adapters.
 //! * [`session`] — one agent session: the harness process, its adapter and its state.
@@ -12,6 +13,7 @@
 
 pub mod claude;
 pub mod cli;
+pub mod codex;
 pub mod core;
 pub mod diff;
 pub mod host;

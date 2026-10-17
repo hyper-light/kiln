@@ -209,15 +209,88 @@ fn group(a: &[&str], b: &[&str], ops: &[Op], context: usize) -> Vec<Hunk> {
     hunks
 }
 
+/// The hunks of a unified diff of one file (headers before the first `@@` are skipped).
+pub fn parse_unified(diff: &str) -> Vec<Hunk> {
+    let mut out: Vec<Hunk> = Vec::new();
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("@@ ") {
+            // @@ -a,b +c,d @@ optional heading
+            let mut nums = rest.split_whitespace();
+            let parse = |s: Option<&str>, sign: char| -> (u32, u32) {
+                let s = s.unwrap_or("").trim_start_matches(sign);
+                let mut it = s.split(',');
+                let start = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                let len = it.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                (start, len)
+            };
+            let (old_start, old_lines) = parse(nums.next(), '-');
+            let (new_start, new_lines) = parse(nums.next(), '+');
+            out.push(Hunk { old_start, old_lines, new_start, new_lines, lines: Vec::new() });
+            continue;
+        }
+        let Some(h) = out.last_mut() else { continue };
+        if line.starts_with('\\') {
+            continue; // "\ No newline at end of file"
+        }
+        if line.starts_with(['+', '-', ' ']) {
+            h.lines.push(line.to_owned());
+        } else if line.is_empty() {
+            h.lines.push(" ".to_owned());
+        }
+    }
+    out
+}
+
+/// The text before `hunks` were applied to it, given the text after. None when they do not fit.
+pub fn reverse_apply(now: &str, hunks: &[Hunk]) -> Option<String> {
+    let lines: Vec<&str> = now.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut cursor = 0usize; // next line of `now` not yet copied (0-based)
+    for h in hunks {
+        // Where the hunk's new side begins in `now`.
+        let start = if h.new_lines == 0 { h.new_start as usize } else { (h.new_start as usize).saturating_sub(1) };
+        if start < cursor || start > lines.len() {
+            return None;
+        }
+        out.extend(lines.get(cursor..start)?.iter().map(|l| (*l).to_owned()));
+        cursor = start;
+        for l in &h.lines {
+            let (tag, text) = l.split_at(l.len().min(1));
+            match tag {
+                " " => {
+                    if lines.get(cursor).copied()? != text {
+                        return None;
+                    }
+                    out.push(text.to_owned());
+                    cursor += 1;
+                }
+                "+" => {
+                    if lines.get(cursor).copied()? != text {
+                        return None;
+                    }
+                    cursor += 1;
+                }
+                "-" => out.push(text.to_owned()),
+                _ => return None,
+            }
+        }
+    }
+    out.extend(lines.get(cursor..)?.iter().map(|l| (*l).to_owned()));
+    let mut text = out.join("\n");
+    if now.ends_with('\n') || (now.is_empty() && !text.is_empty()) {
+        text.push('\n');
+    }
+    Some(text)
+}
+
 /// Lines of hunks kept per changed file (the counts always cover everything).
 const MAX_CHANGE_LINES: usize = 4_000;
 
 /// A file's cumulative change: its baseline against how it is on disk now. Blocking (reads the
-/// file); None when there is no net change.
-pub fn file_change(job: &super::core::ChangeJob) -> Option<super::model::FileChange> {
+/// file). Returns the change (None: no net change) and, when the baseline had to be worked out
+/// from the file (`Baseline::Reverse`), the baseline found, to keep for later changes.
+pub fn file_change(job: &super::core::ChangeJob) -> (Option<super::model::FileChange>, Option<super::core::Baseline>) {
     use super::core::Baseline;
-    use super::model::FileChange;
-    let at = crate::util::now_ms();
     let path = std::path::Path::new(&job.abs);
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
     let now: Option<Result<String, ()>> = meta.map(|m| {
@@ -226,6 +299,23 @@ pub fn file_change(job: &super::core::ChangeJob) -> Option<super::model::FileCha
         }
         std::fs::read(path).ok().and_then(|b| String::from_utf8(b).ok()).ok_or(())
     });
+    if let Baseline::Reverse(hunks) = &job.baseline {
+        let resolved = match &now {
+            Some(Ok(text)) => reverse_apply(text, hunks).map_or(Baseline::TooLarge, Baseline::Text),
+            Some(Err(())) => Baseline::TooLarge,
+            // Gone already: what it was is what the patch removed.
+            None => Baseline::Text(hunks.iter().flat_map(|h| h.lines.iter()).filter_map(|l| l.strip_prefix('-').or_else(|| l.strip_prefix(' '))).map(|l| format!("{l}\n")).collect()),
+        };
+        let job = super::core::ChangeJob { abs: job.abs.clone(), rel: job.rel.clone(), baseline: resolved.clone() };
+        return (compare(&job, now), Some(resolved));
+    }
+    (compare(job, now), None)
+}
+
+fn compare(job: &super::core::ChangeJob, now: Option<Result<String, ()>>) -> Option<super::model::FileChange> {
+    use super::core::Baseline;
+    use super::model::FileChange;
+    let at = crate::util::now_ms();
     let count = |hunks: &[Hunk]| -> (u32, u32) {
         let mut add = 0u32;
         let mut del = 0u32;
@@ -279,7 +369,7 @@ pub fn file_change(job: &super::core::ChangeJob) -> Option<super::model::FileCha
             let (hunks, cut) = shown(all);
             Some(FileChange { path: job.rel.clone(), created: false, deleted: false, added: add, removed: del, hunks, truncated: cut, at })
         }
-        (Baseline::TooLarge, _) | (_, Some(Err(()))) => Some(blank(&job.rel)),
+        (Baseline::TooLarge | Baseline::Reverse(_), _) | (_, Some(Err(()))) => Some(blank(&job.rel)),
     }
 }
 
@@ -366,6 +456,21 @@ mod tests {
     }
 
     #[test]
+    fn unified_diffs_parse_and_reverse() {
+        let d = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,3 +1,4 @@ fn x\n a\n-b\n+B\n+B2\n c\n@@ -10 +11,0 @@\n-z\n";
+        let h = parse_unified(d);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.first().map(|h| (h.old_start, h.old_lines, h.new_start, h.new_lines)), Some((1, 3, 1, 4)));
+        assert_eq!(h.get(1).map(|h| (h.old_start, h.old_lines, h.new_start, h.new_lines)), Some((10, 1, 11, 0)));
+        let before = "a\nb\nc\n";
+        let after = "a\nB\nB2\nc\n";
+        let hh = hunks(before, after, CONTEXT);
+        assert_eq!(reverse_apply(after, &hh).as_deref(), Some(before));
+        // A patch that does not fit the text.
+        assert!(reverse_apply("q\nr\n", &hh).is_none());
+    }
+
+    #[test]
     fn cumulative_file_changes() -> anyhow::Result<()> {
         use super::super::core::{Baseline, ChangeJob};
         let dir = tempfile::tempdir()?;
@@ -374,18 +479,23 @@ mod tests {
         std::fs::write(&f, "one\ntwo\nthree\n")?;
         let job = |b: Baseline| ChangeJob { abs: abs.clone(), rel: "a.txt".into(), baseline: b };
         // Edited twice since the baseline: one change, counted once.
-        let c = file_change(&job(Baseline::Text("one\n2\nthree\n".into()))).ok_or_else(|| anyhow::anyhow!("no change"))?;
+        let c = file_change(&job(Baseline::Text("one\n2\nthree\n".into()))).0.ok_or_else(|| anyhow::anyhow!("no change"))?;
         assert_eq!((c.added, c.removed, c.created, c.deleted), (1, 1, false, false));
         // Back to how it was: nothing.
-        assert!(file_change(&job(Baseline::Text("one\ntwo\nthree\n".into()))).is_none());
+        assert!(file_change(&job(Baseline::Text("one\ntwo\nthree\n".into()))).0.is_none());
+        // A baseline worked out by undoing a patch on the file as it is now.
+        let patch = parse_unified("--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n one\n-2\n+two\n three\n");
+        let (c, resolved) = file_change(&job(Baseline::Reverse(patch)));
+        assert_eq!(resolved, Some(Baseline::Text("one\n2\nthree\n".into())));
+        assert_eq!(c.map(|c| (c.added, c.removed)), Some((1, 1)));
         // New file.
-        let c = file_change(&job(Baseline::Absent)).ok_or_else(|| anyhow::anyhow!("no change"))?;
+        let c = file_change(&job(Baseline::Absent)).0.ok_or_else(|| anyhow::anyhow!("no change"))?;
         assert!(c.created && c.added == 3);
         // Deleted.
         std::fs::remove_file(&f)?;
-        let c = file_change(&job(Baseline::Text("x\ny\n".into()))).ok_or_else(|| anyhow::anyhow!("no change"))?;
+        let c = file_change(&job(Baseline::Text("x\ny\n".into()))).0.ok_or_else(|| anyhow::anyhow!("no change"))?;
         assert!(c.deleted && c.removed == 2);
-        assert!(file_change(&job(Baseline::Absent)).is_none());
+        assert!(file_change(&job(Baseline::Absent)).0.is_none());
         Ok(())
     }
 }

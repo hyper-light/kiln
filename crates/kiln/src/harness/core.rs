@@ -41,6 +41,9 @@ pub enum Baseline {
     Text(String),
     /// Too large to keep: changes to it are counted, not shown.
     TooLarge,
+    /// Not known yet: it is the file as it is now with these hunks undone (harnesses that report
+    /// patches, not the file before them).
+    Reverse(Vec<super::model::Hunk>),
 }
 
 /// Largest file content kept as a baseline.
@@ -137,8 +140,12 @@ impl Core {
         self.change_jobs.push(ChangeJob { abs: abs.to_owned(), rel: rel.to_owned(), baseline });
     }
 
-    /// A file's cumulative change, recomputed (None: it is back to how it was).
-    pub fn set_change(&mut self, abs: &str, change: Option<super::model::FileChange>) {
+    /// A file's cumulative change, recomputed (None: it is back to how it was), and its baseline
+    /// when the recomputation had to work it out.
+    pub fn set_change(&mut self, abs: &str, change: Option<super::model::FileChange>, resolved: Option<Baseline>) {
+        if let Some(b) = resolved {
+            self.baselines.insert(abs.to_owned(), b);
+        }
         match change {
             Some(c) => {
                 self.changes.insert(abs.to_owned(), c);
