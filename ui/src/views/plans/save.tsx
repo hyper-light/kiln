@@ -1,7 +1,7 @@
 /** Keeping a plan an agent made: "Save plan" wherever a plan shows in a conversation. */
 import * as React from "react";
 import { Link } from "react-router";
-import { planHref, plansApi, type PlanRan, type PlanSource } from "@/api/plans";
+import { planHref, plansApi, type PlanMode, type PlanRan, type PlanSource } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { SelectField } from "@/components/ui/misc";
 import { errorMessage, useResource } from "@/lib/hooks";
@@ -51,7 +51,7 @@ export function todosAsPlan(todos: readonly { text: string }[]): string {
 export function RunSavedPlan({ session }: { session: string }) {
   const res = useResource((s) => plansApi.list(s), []);
   const [id, setId] = React.useState("");
-  const [mode, setMode] = React.useState<"message" | "steps">("message");
+  const [mode, setMode] = React.useState<PlanMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -91,8 +91,16 @@ export function RunSavedPlan({ session }: { session: string }) {
       <SelectField
         label="As"
         value={as}
-        onChange={(v) => setMode(v as "message" | "steps")}
-        options={[{ value: "message", label: "One message" }, ...(plan.steps.length ? [{ value: "steps", label: `Step by step, each after the last turn ends` }] : [])]}
+        onChange={(v) => setMode(v as PlanMode)}
+        options={[
+          { value: "message", label: "One message" },
+          ...(plan.steps.length
+            ? [
+                { value: "steps", label: `Step by step, each after the last turn ends` },
+                { value: "goals", label: `Goals, each once the one before is met` },
+              ]
+            : []),
+        ]}
       />
       <div className="plan-actions">
         <Button size="sm" variant="secondary" disabled={busy} onClick={() => void run()}>
@@ -101,7 +109,7 @@ export function RunSavedPlan({ session }: { session: string }) {
         <Link to={planHref(plan.id)} className="plan-here-open">
           Open the plan
         </Link>
-        {ran && <span className="plan-ok">Sent {ran.sent === 1 ? "the plan" : `${ran.sent} messages`}</span>}
+        {ran && <span className="plan-ok">{as === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}</span>}
         {error && <span className="plan-error">{error}</span>}
       </div>
     </div>

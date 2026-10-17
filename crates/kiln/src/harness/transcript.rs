@@ -36,6 +36,11 @@ pub fn find(config: &Path, session: &str) -> Option<PathBuf> {
     std::fs::read_dir(config.join("projects")).ok()?.flatten().map(|e| e.path().join(&name)).find(|p| p.is_file())
 }
 
+/// The last `bytes` of `session`'s transcript under `config`, as whole lines.
+pub fn tail(config: &Path, session: &str, bytes: u64) -> Option<Vec<String>> {
+    tail_lines(&find(config, session)?, bytes)
+}
+
 /// The last `bytes` of a file as whole lines.
 fn tail_lines(path: &Path, bytes: u64) -> Option<Vec<String>> {
     let mut f = std::fs::File::open(path).ok()?;

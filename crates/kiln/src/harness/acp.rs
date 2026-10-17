@@ -31,6 +31,7 @@ fn acp_extras() -> Vec<SlashCommand> {
         SlashCommand::view("new", "Start another agent", "Kiln", "new_agent"),
         SlashCommand::view("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
         SlashCommand::view("screen", "The agent's own terminal interface, in its folder", "Kiln", "screen"),
+        SlashCommand::view("goals", "Goals one after another: each sent once the one before is done", "Kiln", "goals"),
     ]
 }
 

@@ -72,6 +72,10 @@ pub enum Effect {
     /// Answer `client` with the first of these files that can be read (`{"content", "path"}`),
     /// or `{"error"}`.
     Read { client: String, paths: Vec<String> },
+    /// Read the end of the harness's own transcript of `session` (Claude Code's, under its
+    /// configuration directory `config`). The lines come back as a run's end (`run_done`, code 0,
+    /// one record a line; code 1 when it can't be read) under `job`.
+    TranscriptTail { job: String, config: String, session: String, bytes: u64 },
     /// Make a GET request to a sign-in callback the harness listens for on this machine's
     /// loopback (a browser on another device cannot reach it). Only loopback addresses are
     /// fetched. Its result comes back as a run's end (`run_done`) under `job`.

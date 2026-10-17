@@ -14,6 +14,7 @@ import { McpPanel, SkillsPanel } from "./tools";
 import { TodoList } from "./timeline";
 import { Background, isBackground } from "./background";
 import { PlanSourceContext, RunSavedPlan, SavePlan, todosAsPlan } from "@/views/plans/save";
+import { Goals } from "./goals";
 
 /** Three places beside the conversation: what it changed, what it is doing (plan, subagents, commands), and what it works with (MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
@@ -245,10 +246,13 @@ export function Inspector({
   className,
   hideTabs,
   agentId,
+  harness,
   send,
 }: {
   /** The agent, and how to send it commands (background tasks: output, stop). */
   agentId?: string;
+  /** The agent's harness, by name ("Claude Code"). */
+  harness?: string;
   send?: (c: Command) => void;
   /** The page shows its own tabs (phones). */
   hideTabs?: boolean;
@@ -319,6 +323,12 @@ export function Inspector({
                   <h3 className="in-sec-head">Proposed plan</h3>
                   <Prose text={proposed} className="hx-plan-text" />
                   <SavePlan body={proposed} />
+                </section>
+              )}
+              {agentId && (
+                <section>
+                  <h3 className="in-sec-head">Goals</h3>
+                  <Goals agent={agentId} harness={harness} />
                 </section>
               )}
               {agentId && (

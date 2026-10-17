@@ -75,7 +75,7 @@ pub struct ApprovalBrief {
 }
 
 /// A session as lists show it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Info {
     pub id: String,
     pub kind: String,
@@ -113,6 +113,9 @@ pub struct Info {
     /// What the person first asked for.
     #[serde(default)]
     pub goal: String,
+    /// The goal the harness itself pursues, and how it stands (see `State::objective`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<super::model::Objective>,
     /// The agent's latest words, shortened.
     #[serde(default)]
     pub summary: String,
@@ -174,6 +177,7 @@ impl Info {
         self.activity.clone_from(&s.activity);
         self.exit.clone_from(&s.exit);
         self.goal = super::model::clip_middle(&s.goal, 200).0;
+        self.objective.clone_from(&s.objective);
         self.summary = super::model::clip_middle(&s.summary, 300).0;
         self.doing.clone_from(&s.doing);
         let total = u32::try_from(s.todos.len()).unwrap_or(u32::MAX);
@@ -405,6 +409,7 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
         last_activity: now,
         exit: None,
         goal: String::new(),
+        objective: None,
         summary: String::new(),
         doing: None,
         todos_done: 0,
@@ -692,6 +697,17 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                             }
                             Err(e) => (None, format!("{e:#}")),
                         },
+                    };
+                    let _ = tx.send(Done::Run { job, code, output }).await;
+                });
+            }
+            super::core::Effect::TranscriptTail { job, config, session, bytes } => {
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let lines = crate::rt::blocking(move || super::transcript::tail(std::path::Path::new(&config), &session, bytes)).await.ok().flatten();
+                    let (code, output) = match lines {
+                        Some(l) => (Some(0), l.join("\n")),
+                        None => (Some(1), String::new()),
                     };
                     let _ = tx.send(Done::Run { job, code, output }).await;
                 });
@@ -1175,6 +1191,7 @@ mod tests {
             last_activity: 1,
             exit: None,
             goal: String::new(),
+            objective: None,
             summary: String::new(),
             doing: None,
             todos_done: 0,

@@ -339,6 +339,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         last_activity: now,
         exit: Some(exit.clone()),
         goal: spec.prompt.clone().map(|p| super::model::clip_middle(&p, 200).0).unwrap_or_default(),
+        objective: None,
         summary: String::new(),
         doing: None,
         todos_done: 0,

@@ -38,7 +38,7 @@ export interface PlanRun {
   id: string;
   version: number;
   session: string;
-  mode: "message" | "steps";
+  mode: "message" | "steps" | "goals";
   at: number;
   by: string;
 }
@@ -57,6 +57,9 @@ export interface SharedPlan {
   updated_at: number;
 }
 
+/** How a plan runs: as one message, a message a step, or a goal a step (the agent's goal stack). */
+export type PlanMode = "message" | "steps" | "goals";
+
 export type PlanRunTarget = { session: string } | { new: { target: string; kind: string; cwd?: string } };
 
 const enc = encodeURIComponent;
@@ -70,7 +73,7 @@ export const plansApi = {
   versions: (id: string, signal?: AbortSignal) => request<PlanVersion[]>("GET", `/api/plans/${enc(id)}/versions`, undefined, { signal }),
   runs: (id: string, signal?: AbortSignal) => request<PlanRun[]>("GET", `/api/plans/${enc(id)}/runs`, undefined, { signal }),
   restore: (id: string, version: number) => request<Plan>("POST", `/api/plans/${enc(id)}/restore`, { version }),
-  run: (id: string, target: PlanRunTarget, mode: "message" | "steps") => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode }),
+  run: (id: string, target: PlanRunTarget, mode: PlanMode) => request<PlanRan>("POST", `/api/plans/${enc(id)}/run`, { ...target, mode }),
   share: (id: string, on: boolean) => request<Plan>("POST", `/api/plans/${enc(id)}/share`, { on }),
   shared: (token: string, signal?: AbortSignal) => request<SharedPlan>("GET", `/api/shared/plans/${enc(token)}`, undefined, { signal }),
 };

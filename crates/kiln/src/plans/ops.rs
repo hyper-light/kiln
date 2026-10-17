@@ -145,7 +145,7 @@ pub fn list_ops() -> Vec<Op> {
                         "id": {"type": "string", "description": ID},
                         "session": {"type": "string"},
                         "new": {"type": "object", "properties": {"target": {"type": "string"}, "kind": {"type": "string"}, "cwd": {"type": "string"}}},
-                        "mode": {"type": "string", "enum": ["message", "steps"]}
+                        "mode": {"type": "string", "enum": ["message", "steps", "goals"], "description": "message: the whole plan at once; steps: a message a turn; goals: each step a goal in the agent's goal stack."}
                     }),
                     &["id"],
                 )

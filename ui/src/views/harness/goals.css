@@ -1,0 +1,163 @@
+/* An agent's goal stack (goals.tsx), in the Plan tab's flow: the goals as a quiet numbered list,
+   each with its state as a mark and a word (met in the prism's green, under way lit, not met in the
+   console's red), the stack's state above them, then one field to add goals and a row of plain
+   buttons. Phones first: words wrap, nothing scrolls sideways, touch targets are 40px. */
+
+.gs {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.gs-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  margin: 0;
+  color: #9a9da6;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.gs-state[data-state="running"] {
+  color: #d8d9dd;
+}
+.gs-reason {
+  color: #e3c9a0;
+  font-family: var(--font-sans, inherit);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.gs-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.gs-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #1d2128;
+  color: #c9cbd1;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.gs-item:last-child {
+  border-bottom: 0;
+}
+.gs-mark {
+  color: #6f737c;
+  font-family: var(--font-mono);
+  text-align: center;
+}
+.gs-item[data-status="met"] .gs-mark {
+  color: #b8d9d2;
+}
+.gs-item[data-status="active"] .gs-mark {
+  color: #a6c4ed;
+}
+.gs-item[data-status="active"] {
+  color: #ededee;
+}
+.gs-item[data-status="unmet"] .gs-mark {
+  color: #e3a7a0;
+}
+.gs-item[data-status="skipped"],
+.gs-item[data-status="met"] {
+  color: #8d9099;
+}
+.gs-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.gs-word {
+  display: block;
+  color: #7d818b;
+  font-size: 11.5px;
+}
+.gs-item[data-status="unmet"] .gs-word {
+  color: #d9a29b;
+}
+.gs-add {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.gs-area {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #2a3039;
+  border-radius: 8px;
+  background: #0a0c0f;
+  color: #ededee;
+  font-size: 13px;
+  line-height: 1.45;
+  resize: vertical;
+}
+.gs-add-field {
+  min-height: 36px;
+  resize: none;
+}
+.gs-area:focus {
+  border-color: #3a4250;
+  outline: none;
+}
+.gs-how {
+  margin: 0;
+  color: #7d818b;
+  font-size: 12px;
+}
+.gs-actions,
+.gs-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+.gs-confirm {
+  color: #c9cbd1;
+  font-size: 12px;
+}
+.gs-edit {
+  display: grid;
+  gap: 8px;
+}
+.gs-error {
+  margin: 0;
+  color: #e3a7a0;
+  font-size: 12px;
+}
+
+@media (pointer: coarse) {
+  .gs-add-field {
+    min-height: 40px;
+    font-size: 16px;
+  }
+}
+.gs-more {
+  padding: 2px 0 6px 26px;
+}
+.gs-more-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.gs-more-btn:hover {
+  color: #ededee;
+}
+@media (pointer: coarse) {
+  .gs-more-btn {
+    min-height: 40px;
+  }
+}
