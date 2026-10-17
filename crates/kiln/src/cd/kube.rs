@@ -196,14 +196,18 @@ impl Cluster {
     pub async fn request_as(&self, method: Method, path: &str, ctype: Option<&str>, body: Option<Bytes>, accept: &str) -> Result<(u16, Bytes)> {
         let auth = self.authorization().await?;
         let fut = async {
-            // A kept-alive connection may have closed since: try the next, then a new one.
-            for _ in 0..3 {
+            // A kept-alive connection may have closed since: try the next, then a new one. One the
+            // API server closed while idle is dropped without costing an attempt, so a pool of
+            // stale connections can't fail a request that never reached the server.
+            let mut attempts = 0;
+            while attempts < 3 {
                 let pooled = self.pool.lock().pop();
                 let mut sender = match pooled {
                     Some(s) if !s.is_closed() => s,
                     Some(_) => continue,
                     None => self.connect().await?,
                 };
+                attempts += 1;
                 if sender.ready().await.is_err() {
                     continue;
                 }
