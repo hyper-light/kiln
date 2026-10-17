@@ -70,6 +70,14 @@ impl Store {
         crate::pki::front_door_csr(want, &key)
     }
 
+    /// Drop the pending key (renewing now): the next CSR is for a new one.
+    pub fn forget_pending(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join(PENDING_KEY)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     /// The CA's certificate for the pending key: kept, and the pending key becomes the key in
     /// use. A certificate for any other key is refused (one already in use is fine).
     pub fn take_issued(&self, cert_pem: &str) -> anyhow::Result<()> {

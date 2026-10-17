@@ -171,6 +171,29 @@ pub fn covers(names: &[String], host: &str) -> bool {
     })
 }
 
+/// The certificates of a PEM text (a chain, or a chain and its key pasted together), PEM again:
+/// its `CERTIFICATE` sections and nothing else, so what comes out never carries a key.
+pub fn public_chain_pem(pem: &str) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    use hyper_quic::rustls::pki_types::CertificateDer;
+    use hyper_quic::rustls::pki_types::pem::PemObject as _;
+    let chain = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("bad certificate pem: {e:?}"))?;
+    anyhow::ensure!(!chain.is_empty(), "no certificate found (-----BEGIN CERTIFICATE-----)");
+    let mut out = String::new();
+    for der in &chain {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+        out.push_str("-----BEGIN CERTIFICATE-----\n");
+        for line in b64.as_bytes().chunks(64) {
+            out.push_str(&String::from_utf8_lossy(line));
+            out.push('\n');
+        }
+        out.push_str("-----END CERTIFICATE-----\n");
+    }
+    Ok(out)
+}
+
 /// A CSR for a front door's certificate: `names` signed with `key_pem` (the server decides the
 /// names it signs anyway, see [`Pki::sign_front_door`]).
 pub fn front_door_csr(names: &[String], key_pem: &str) -> anyhow::Result<String> {
@@ -465,6 +488,27 @@ mod tests {
         assert!(pki.sign_front_door(&csr, &["kiln-server".to_owned()], 30).is_err());
         assert!(pki.sign_front_door(&csr, &[], 30).is_err());
         assert!(pki.sign_front_door("not a csr", &names, 30).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_public_chain_is_the_certificates_and_never_a_key() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open(dir.path())?;
+        let key = new_key_pem()?;
+        let leaf = pki.sign_front_door(&front_door_csr(&["kiln.dev".to_owned()], &key)?, &["kiln.dev".to_owned()], 30)?;
+        // A leaf, the CA and the key pasted as one text: the two certificates come out, in order.
+        let pasted = format!("{leaf}\n{key}\n{}", pki.ca_pem);
+        let chain = public_chain_pem(&pasted)?;
+        assert!(!chain.contains("PRIVATE KEY") && !chain.contains(key.trim()), "no key, ever");
+        assert_eq!(chain.matches("-----BEGIN CERTIFICATE-----").count(), 2);
+        assert_eq!(pem_to_der(&chain)?, pem_to_der(&leaf)?, "the leaf first");
+        assert_eq!(cert_info(&chain)?.names, ["kiln.dev"]);
+        // Clean PEM: lines of at most 64, and it reads back as the same certificates.
+        assert!(chain.lines().all(|l| l.len() <= 64));
+        assert_eq!(public_chain_pem(&chain)?, chain);
+        assert!(public_chain_pem(&key).is_err(), "a key alone is no certificate");
+        assert!(public_chain_pem("junk").is_err());
         Ok(())
     }
 

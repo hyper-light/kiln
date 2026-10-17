@@ -11,6 +11,10 @@
 //! * **Uploads.** A certificate and key uploaded for a runner are checked (they parse, the key
 //!   is the certificate's, it serves TLS, it has not expired) and sent to the runner, which keeps
 //!   them; the server keeps neither, logs neither, and never sends the key back.
+//! * **Renewing now.** Asked to, the server tells the runner to renew its self-signed
+//!   certificate (a new key, a CSR for it at once) and lets that CSR past the once-a-minute limit.
+//! * **Downloads.** A runner's status carries the chain it serves, certificates only; the server
+//!   hands it out (`GET …/front-door/cert`) and leaves it out of the view.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -148,7 +152,7 @@ pub async fn push(hub: &Hub, machine: &str, issued: Option<String>, custom: Opti
     }
     let Some(peer) = runs else { return false };
     let settings = hub.front_doors.settings(machine);
-    send(hub, peer, &Push { settings, standby: false, issued, custom }).await
+    send(hub, peer, &Push { settings, standby: false, issued, custom, renew: false }).await
 }
 
 /// A runner process said what it can do (`AgentMsg::Build`): one that runs front doors gets
@@ -240,7 +244,7 @@ async fn issue(hub: &Hub, peer: PeerId, machine: &str, csr: &str, status: &Statu
     tracing::info!(machine, names = ?names, "front door: issued a certificate from the kiln CA");
     hub.store.audit(machine.to_owned(), "front_door.certificate".into(), format!("kiln CA certificate for {} until {}", names.join(", "), date(until))).await;
     let settings = hub.front_doors.settings(machine);
-    send(hub, peer, &Push { settings, standby: false, issued: Some(pem), custom: None }).await;
+    send(hub, peer, &Push { settings, standby: false, issued: Some(pem), custom: None, renew: false }).await;
 }
 
 fn date(unix: i64) -> String {
@@ -266,6 +270,7 @@ pub async fn view(hub: &Hub, name: &str) -> serde_json::Value {
     let applied = status.as_ref().map(|s| s.settings == settings.fingerprint());
     let status = status.map(|mut s| {
         s.csr = None;
+        s.cert.pem = None;
         s
     });
     let ca = crate::pki::cert_info_der(&hub.pki.ca_der).ok();
@@ -361,6 +366,65 @@ pub async fn upload(hub: &Hub, name: &str, req: Request) -> Answer {
     Ok(srv::json(StatusCode::OK, &json!({ "cert": info, "front_door": view(hub, name).await })))
 }
 
+/// Why a runner's front door cannot renew its certificate now, if it cannot.
+fn renewable(settings: &Settings, name: &str) -> Result<(), String> {
+    if !settings.https.enabled {
+        return Err(format!("HTTPS is off on {name}: turn it on and save first"));
+    }
+    if settings.cert.mode != CertMode::Kiln {
+        return Err(format!("{name} serves your own certificate: renewing is for the self-signed one (upload a new certificate instead)"));
+    }
+    Ok(())
+}
+
+/// `POST /api/runners/:name/front-door/cert/renew`: a new key and self-signed certificate now.
+/// The runner makes the key and asks with a CSR at once; the CA signs it as soon as it arrives.
+pub async fn renew(hub: &Hub, name: &str) -> Answer {
+    if !known(hub, name).await {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
+    }
+    renewable(&hub.front_doors.settings(name), name).map_err(|e| fail(StatusCode::CONFLICT, e))?;
+    let Some(peer) = peers(hub, name).0 else {
+        return Err(fail(StatusCode::CONFLICT, format!("{name} is not connected (or too old for a front door): its key is made there, so it has to be online")));
+    };
+    // The new key's CSR is signed as soon as it arrives, even within a minute of the last one.
+    if let Some(e) = hub.front_doors.inner.lock().get_mut(name) {
+        e.issued_at = None;
+    }
+    let settings = hub.front_doors.settings(name);
+    if !send(hub, peer, &Push { settings, renew: true, ..Push::default() }).await {
+        return Err(fail(StatusCode::BAD_GATEWAY, format!("{name} could not be reached; try again")));
+    }
+    hub.store.audit("admin".into(), "front_door.renew".into(), format!("{name}: asked for a new key and self-signed certificate")).await;
+    hub.emit(&json!({ "type": "front_door", "runner": name }));
+    Ok(srv::json(StatusCode::OK, &view(hub, name).await))
+}
+
+/// The file name a downloaded certificate gets: its first name (a wildcard's domain), else the
+/// runner's, `.pem`.
+fn pem_filename(info: Option<&super::CertInfo>, runner: &str) -> String {
+    let first = info.and_then(|i| i.names.iter().find(|n| n.parse::<IpAddr>().is_err()).cloned()).unwrap_or_default();
+    let name: String = first.trim_start_matches("*.").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-').collect();
+    let name = name.trim_matches('.');
+    if name.is_empty() { format!("{}.pem", crate::pki::sanitize_name(runner)) } else { format!("{name}.pem") }
+}
+
+/// `GET /api/runners/:name/front-door/cert`: the certificate chain the runner's HTTPS serves, as
+/// it last reported it (PEM, certificates only: never a key).
+pub async fn download(hub: &Hub, name: &str) -> Answer {
+    if !known(hub, name).await {
+        return Err(fail(StatusCode::NOT_FOUND, format!("no runner named {name}")));
+    }
+    let (status, _) = hub.front_doors.status(name);
+    let cert = status.map(|s| s.cert).unwrap_or_default();
+    let Some(pem) = cert.pem.and_then(|p| crate::pki::public_chain_pem(&p).ok()) else {
+        return Err(fail(StatusCode::NOT_FOUND, format!("{name} serves no certificate (yet)")));
+    };
+    let r = srv::response(StatusCode::OK, "application/x-pem-file", srv::full(pem.into_bytes()));
+    let r = srv::with_header(r, header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}\"", pem_filename(cert.info.as_ref(), name)));
+    Ok(srv::with_header(r, header::CACHE_CONTROL, "no-cache"))
+}
+
 /// `GET /ca.pem`, `/ca.crt` (DER) and `/ca.mobileconfig`: kiln's CA certificate for devices,
 /// open (it is public).
 pub fn ca(hub: &Arc<Hub>, which: &str) -> Response {
@@ -397,6 +461,27 @@ mod tests {
         };
         assert_eq!(names_to_sign(&settings, &status), ["kiln.home", "*.kiln.home", "ci.home", "kiln.local", "192.168.1.77"]);
         assert_eq!(date(1_825_000_000), "2027-10-31");
+    }
+
+    #[test]
+    fn only_a_self_signed_certificate_with_https_on_renews() {
+        let on = Settings { domain: "kiln.dev".into(), https: Https { enabled: true, ..Https::default() }, ..Settings::default() };
+        assert_eq!(renewable(&on, "rocket"), Ok(()));
+        let off = Settings { https: Https { enabled: false, ..Https::default() }, ..on.clone() };
+        assert!(renewable(&off, "rocket").err().is_some_and(|e| e.contains("HTTPS is off")));
+        let own = Settings { cert: crate::frontdoor::Cert { mode: CertMode::Custom }, ..on };
+        assert!(renewable(&own, "rocket").err().is_some_and(|e| e.contains("your own")));
+    }
+
+    #[test]
+    fn downloads_are_named_after_the_certificate() {
+        let info = |names: &[&str]| super::super::CertInfo { names: names.iter().map(|n| (*n).to_owned()).collect(), ..super::super::CertInfo::default() };
+        assert_eq!(pem_filename(Some(&info(&["kiln.dev", "*.kiln.dev"])), "rocket"), "kiln.dev.pem");
+        assert_eq!(pem_filename(Some(&info(&["*.kiln.dev"])), "rocket"), "kiln.dev.pem");
+        assert_eq!(pem_filename(Some(&info(&["192.168.1.77", "ci.home"])), "rocket"), "ci.home.pem");
+        assert_eq!(pem_filename(Some(&info(&["192.168.1.77"])), "Rocket Box"), "rocket-box.pem");
+        assert_eq!(pem_filename(Some(&info(&["\"evil\";.x"])), "rocket"), "evil.x.pem", "nothing that breaks the header");
+        assert_eq!(pem_filename(None, "rocket"), "rocket.pem");
     }
 
     #[test]

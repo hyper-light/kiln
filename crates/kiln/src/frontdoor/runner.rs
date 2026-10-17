@@ -9,10 +9,12 @@
 //!   each listener is started, moved (another port, other addresses), kept, or stopped to match
 //!   the settings. Names, addresses, upstreams and certificates change in place, without
 //!   rebinding. Whatever failed to bind is tried again.
-//! * **Certificates.** In `kiln` mode the runner asks for one with a CSR in its status (its key
-//!   stays here) when it has none, when the names it serves changed, or when the one it has
-//!   expires within 30 days; it asks again every [`ASK_AGAIN`] until the server answers. In
-//!   `custom` mode it serves the uploaded one.
+//! * **Certificates.** In `kiln` mode (self-signed) the runner asks for one with a CSR in its
+//!   status (its key stays here) when it has none, when the names it serves changed, or when the
+//!   one it has expires within 30 days; it asks again every [`ASK_AGAIN`] until the server
+//!   answers. Told to renew now, it makes a new key and asks for it at once, serving the one it
+//!   has until the new one is in. In `custom` mode it serves the uploaded one. Either way its
+//!   status carries the chain it serves, certificates only, for downloads.
 //! * **Standby.** While another runner process of the machine is the newest (an upgrade beside
 //!   this one), the server tells this one to stand by: its listeners stop so the other can bind.
 
@@ -224,6 +226,8 @@ struct FrontDoor {
     asked: Option<Instant>,
     asked_unix: i64,
     upload_error: Option<String>,
+    /// Renewing now: the new key's CSR is out, the certificate for it not in yet.
+    renewing: bool,
 }
 
 impl FrontDoor {
@@ -253,6 +257,7 @@ impl FrontDoor {
             asked: None,
             asked_unix: 0,
             upload_error: None,
+            renewing: false,
         };
         if fd.settings.any() {
             tracing::info!(front_door = %fd.settings.summary(), "front door: starting with the settings stored last");
@@ -275,6 +280,7 @@ impl FrontDoor {
                     tracing::info!("front door: kiln's CA issued its certificate");
                     self.csr = None;
                     self.asked = None;
+                    self.renewing = false;
                 }
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "front door: the certificate from the server was not taken"),
             }
@@ -302,8 +308,32 @@ impl FrontDoor {
                 }
                 Err(e) => tracing::warn!(error = %e, "front door: the server's settings do not validate here; keeping the ones in use"),
             }
+            if push.renew {
+                self.renew_now();
+            }
         }
         self.reconcile();
+    }
+
+    /// Renew the self-signed certificate now: a new key (the pending one, if any, is dropped) and
+    /// a CSR for it at the next reconcile. The certificate in use keeps serving until the new one
+    /// is in; then both it and its key are replaced.
+    fn renew_now(&mut self) {
+        if !(self.settings.https.enabled && self.settings.cert.mode == CertMode::Kiln) {
+            return;
+        }
+        if self.renewing {
+            // Asked again before the new one came in: the same new key, asked for again at once.
+            self.asked = None;
+            return;
+        }
+        if let Err(e) = self.store.forget_pending() {
+            tracing::warn!(error = %format!("{e:#}"), "front door: the pending key was not removed; renewing with it");
+        }
+        tracing::info!("front door: renewing its certificate now, with a new key");
+        self.csr = None;
+        self.asked = None;
+        self.renewing = true;
     }
 
     fn stop(&mut self) {
@@ -322,6 +352,7 @@ impl FrontDoor {
         let tls = if active && s.https.enabled { self.reconcile_cert(&s) } else {
             self.cert = CertStatus { mode: s.cert.mode, ..CertStatus::default() };
             self.csr = None;
+            self.renewing = false;
             None
         };
         self.reconcile_https(&s, active, tls);
@@ -378,13 +409,13 @@ impl FrontDoor {
                     let info = crate::pki::cert_info(&c).ok()?;
                     let tls = ServerTls::from_pem(&c, &k).ok()?;
                     let ours = tls.leaf().is_some_and(|leaf| crate::pki::verify_issued(&self.ctx.ca_der, leaf));
-                    Some((info, tls, ours))
+                    Some((info, tls, ours, crate::pki::public_chain_pem(&c).ok()))
                 });
                 match current {
-                    Some((info, tls, true)) if info.not_after > now => {
+                    Some((info, tls, true, pem)) if info.not_after > now => {
                         let missing: Vec<String> = want.iter().filter(|n| !info.names.contains(n)).cloned().collect();
                         let renew = info.not_after - now < RENEW_BEFORE;
-                        if missing.is_empty() && !renew {
+                        if missing.is_empty() && !renew && !self.renewing {
                             self.csr = None;
                         } else {
                             self.ask(&want);
@@ -393,6 +424,8 @@ impl FrontDoor {
                         cs.state = State::On;
                         cs.kiln = true;
                         cs.info = Some(info);
+                        cs.pem = pem;
+                        cs.renewing = self.renewing;
                         Some(tls)
                     }
                     _ => {
@@ -405,6 +438,7 @@ impl FrontDoor {
             }
             CertMode::Custom => {
                 self.csr = None;
+                self.renewing = false;
                 match self.store.custom() {
                     None => {
                         cs.state = State::Error;
@@ -413,6 +447,7 @@ impl FrontDoor {
                     }
                     Some((c, k)) => match (ServerTls::from_pem(&c, &k), crate::pki::cert_info(&c)) {
                         (Ok(tls), Ok(info)) => {
+                            cs.pem = crate::pki::public_chain_pem(&c).ok();
                             cs.missing = names.iter().filter(|n| !crate::pki::covers(&info.names, n)).cloned().collect();
                             cs.kiln = tls.leaf().is_some_and(|leaf| crate::pki::verify_issued(&self.ctx.ca_der, leaf));
                             if info.not_after <= now {
@@ -674,7 +709,7 @@ mod tests {
                 cert: Cert { mode: CertMode::Kiln },
                 ..Settings::default()
             };
-            let push = |s: &Settings, issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: s.clone(), standby, issued, custom: None });
+            let push = |s: &Settings, issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: s.clone(), standby, issued, custom: None, renew: false });
             fd.on_push(&push(&settings, None, false)?);
             let st = fd.status();
             assert_eq!(st.settings, settings.fingerprint());
@@ -743,7 +778,7 @@ mod tests {
                 cert: Cert { mode: CertMode::Custom },
                 ..Settings::default()
             };
-            let push = |custom: Option<crate::frontdoor::CustomCert>| serde_json::to_string(&Push { settings: settings.clone(), standby: false, issued: None, custom });
+            let push = |custom: Option<crate::frontdoor::CustomCert>| serde_json::to_string(&Push { settings: settings.clone(), standby: false, issued: None, custom, renew: false });
             fd.on_push(&push(None)?);
             let st = fd.status();
             assert_eq!(st.cert.state, State::Error);
@@ -756,11 +791,88 @@ mod tests {
             assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
             assert_eq!(st.cert.missing, ["kiln.test", "*.kiln.test"]);
             assert!(!serde_json::to_string(&st)?.contains("PRIVATE KEY"), "the status never carries the key");
+            // Pasted with its key in the certificate field: served, and the status's chain is the
+            // certificate alone.
+            let key2 = crate::pki::new_key_pem()?;
+            let mine = pki.sign_front_door(&crate::pki::front_door_csr(&["kiln.test".to_owned()], &key2)?, &["kiln.test".to_owned(), "*.kiln.test".to_owned()], 30)?;
+            fd.on_push(&push(Some(crate::frontdoor::CustomCert { cert_pem: format!("{mine}{key2}"), key_pem: key2.clone() }))?);
+            let st = fd.status();
+            assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
+            assert!(st.cert.missing.is_empty() && !st.cert.renewing);
+            let pem = st.cert.pem.clone().unwrap_or_default();
+            assert_eq!(pem, crate::pki::public_chain_pem(&mine)?);
+            assert!(!serde_json::to_string(&st)?.contains("PRIVATE KEY"), "the status never carries the key");
             // A broken upload is refused, and the stored one stays.
             fd.on_push(&push(Some(crate::frontdoor::CustomCert { cert_pem: "junk".into(), key_pem: "junk".into() }))?);
             let st = fd.status();
             assert_eq!(st.cert.state, State::On);
             assert!(st.cert.error.as_deref().is_some_and(|e| e.contains("not taken")), "{:?}", st.cert.error);
+            // Renewing is for the self-signed certificate: here it changes nothing.
+            fd.on_push(&serde_json::to_string(&Push { settings: settings.clone(), renew: true, ..Push::default() })?);
+            let st = fd.status();
+            assert!(st.csr.is_none() && !st.cert.renewing && st.cert.state == State::On);
+            Ok(())
+        })
+    }
+
+    /// Renew now: a new key and a CSR for it at once, the old certificate serving until the new
+    /// one is in, then both replaced; asked twice, the second ask is for the same new key.
+    #[test]
+    fn renewing_now_brings_a_new_key_and_certificate() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+            let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: pki.ca_der.clone() };
+            let mut fd = FrontDoor::new(ctx);
+            let settings = Settings {
+                domain: "kiln.dev".into(),
+                https: Https { enabled: true, port: free_port()?, http_port: 0, ..Https::default() },
+                ..Settings::default()
+            };
+            let push = |issued: Option<String>, renew: bool| serde_json::to_string(&Push { settings: settings.clone(), issued, renew, ..Push::default() });
+            let issue = |st: &Status| -> anyhow::Result<String> {
+                let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;
+                pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)
+            };
+            fd.on_push(&push(None, false)?);
+            fd.on_push(&push(Some(issue(&fd.status())?), false)?);
+            let st = fd.status();
+            assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
+            let first = st.cert.info.clone().ok_or_else(|| anyhow::anyhow!("a certificate"))?;
+            let (first_pem, first_key) = fd.store.kiln().ok_or_else(|| anyhow::anyhow!("stored"))?;
+            // The status carries the chain it serves, and never the key.
+            assert_eq!(st.cert.pem.as_deref(), Some(crate::pki::public_chain_pem(&first_pem)?.as_str()));
+            assert!(!serde_json::to_string(&st)?.contains("PRIVATE KEY"));
+            assert_eq!(fd.tls_leaf.as_deref(), Some(first.sha256.as_str()));
+
+            // Renew: a CSR at once, for a key that is not the one in use; the old one still serves.
+            fd.on_push(&push(None, true)?);
+            let st = fd.status();
+            assert!(st.cert.renewing && st.csr.is_some(), "{:?}", st.cert);
+            assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
+            assert_eq!(st.cert.info.as_ref().map(|i| i.sha256.as_str()), Some(first.sha256.as_str()));
+            let renewed = issue(&st)?;
+            let pending = std::fs::read_to_string(fd.store.dir().join("kiln.key.pending"))?;
+            assert!(crate::pki::cert_matches_key(&renewed, &pending) && !crate::pki::cert_matches_key(&renewed, &first_key), "a new key");
+            // Asked again before it came in: asked again at once, for the same new key.
+            fd.on_push(&push(None, true)?);
+            let again = fd.status();
+            assert!(again.cert.renewing && again.csr.is_some() && again.csr != st.csr);
+            assert!(crate::pki::cert_matches_key(&issue(&again)?, &pending));
+
+            // The new one comes in: served, stored with its key, the old pair gone.
+            fd.on_push(&push(Some(renewed.clone()), false)?);
+            let st = fd.status();
+            assert!(!st.cert.renewing && st.csr.is_none(), "{:?}", st.cert);
+            assert_eq!((st.cert.state, st.https.state), (State::On, State::On));
+            let second = st.cert.info.clone().ok_or_else(|| anyhow::anyhow!("a certificate"))?;
+            assert_ne!(second.sha256, first.sha256);
+            assert_eq!(second.names, first.names);
+            assert_eq!(fd.tls_leaf.as_deref(), Some(second.sha256.as_str()), "HTTPS serves the new one");
+            let (pem, key) = fd.store.kiln().ok_or_else(|| anyhow::anyhow!("stored"))?;
+            assert_eq!(pem, renewed);
+            assert_eq!(key, pending);
+            assert!(crate::pki::cert_matches_key(&pem, &key) && !fd.store.dir().join("kiln.key.pending").exists());
             Ok(())
         })
     }

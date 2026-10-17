@@ -1,15 +1,16 @@
 //! A runner's **front door**: the machine people's phones and laptops can reach, made into kiln's
 //! address on the LAN. Configured per runner from the UI, stored by the server, run by the runner:
 //!
-//! * **DNS** ([`dns`], [`zone`]): answers A/AAAA for a domain (`kiln.home`), its aliases and
-//!   `*.<domain>` with the runner's LAN address facing the asker (or configured addresses). As a
-//!   *resolver* it forwards every other query to the system's upstream resolvers, so a phone or a
-//!   router can use the runner as its DNS server; as an *authoritative* server it refuses them, for
-//!   a router that forwards only the domain (conditional forwarding).
-//! * **HTTPS** ([`proxy`]): accepts TLS for those names with a certificate from the kiln CA
-//!   (issued for the runner's CSR, renewed well before it expires) or one uploaded for it, and
-//!   pipes the bytes both ways to the kiln server (the runner's own `--server` URL by default), so
-//!   WebSockets and streams work unchanged. Plain HTTP on another port redirects to it.
+//! * **DNS** ([`dns`], [`zone`]): answers A/AAAA for a domain, any name the admin chooses
+//!   (`kiln.dev`), its aliases and `*.<domain>` with the runner's LAN address facing the asker (or
+//!   configured addresses). As a *resolver* it forwards every other query to the system's upstream
+//!   resolvers, so a phone or a router can use the runner as its DNS server; as an *authoritative*
+//!   server it refuses them, for a router that forwards only the domain (conditional forwarding).
+//! * **HTTPS** ([`proxy`]): accepts TLS for those names with a self-signed certificate from the
+//!   kiln CA (issued for the runner's CSR, renewed well before it expires, or at once when asked)
+//!   or one uploaded for it, and pipes the bytes both ways to the kiln server (the runner's own
+//!   `--server` URL by default), so WebSockets and streams work unchanged. Plain HTTP on another
+//!   port redirects to it.
 //! * **`.local`**: answers `<name>.local` through kiln's multicast DNS responder: no setup at all.
 //!
 //! The server pushes [`Push`] (settings, and a certificate the CA issued or one uploaded) with
@@ -46,7 +47,8 @@ const MAX_ADDRESSES: usize = 8;
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// The name devices use, e.g. `kiln.home`; every name under it (`*.kiln.home`) answers too.
+    /// The name devices use, any the admin chooses (`kiln.dev`, `kiln.home`); every name under
+    /// it (`*.kiln.dev`) answers too.
     pub domain: String,
     /// More names for the same front door, e.g. `ci.home`.
     pub aliases: Vec<String>,
@@ -104,7 +106,8 @@ impl Default for Https {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CertMode {
-    /// Issued by the kiln CA for the front door's names and the runner's addresses.
+    /// Self-signed: issued by the kiln CA (kiln's own root) for the front door's names and the
+    /// runner's addresses, installed and renewed by kiln.
     #[default]
     Kiln,
     /// A certificate and key uploaded for it (`POST /api/runners/:name/front-door/cert`).
@@ -156,7 +159,7 @@ pub fn host_name(s: &str) -> Result<String, String> {
         }
     }
     if labels.len() < 2 {
-        return Err(format!("{n} needs a dot, like {n}.home or {n}.lan"));
+        return Err(format!("{n} needs a dot, like {n}.dev"));
     }
     if labels.last().is_some_and(|t| t.bytes().all(|b| b.is_ascii_digit())) {
         return Err(format!("{n} ends in a number, which no top-level domain does"));
@@ -221,10 +224,10 @@ impl Settings {
         }
         s.aliases = aliases;
         if (s.dns.enabled || s.https.enabled) && s.domain.is_empty() && !(s.https.enabled && s.mdns.enabled) {
-            return Err("Choose a domain (e.g. kiln.home) for DNS and HTTPS".to_owned());
+            return Err("Choose a domain for DNS and HTTPS: any name, like kiln.dev".to_owned());
         }
         if s.dns.enabled && s.domain.is_empty() {
-            return Err("DNS answers for a domain: choose one (e.g. kiln.home)".to_owned());
+            return Err("DNS answers for a domain: choose one, like kiln.dev".to_owned());
         }
         // DNS
         if s.dns.port == 0 {
@@ -337,7 +340,7 @@ impl Settings {
         }
         if self.https.enabled {
             let cert = match self.cert.mode {
-                CertMode::Kiln => "kiln certificate",
+                CertMode::Kiln => "self-signed certificate",
                 CertMode::Custom => "own certificate",
             };
             let http = if self.https.http_port == 0 { String::new() } else { format!(", HTTP :{} redirects", self.https.http_port) };
@@ -368,6 +371,9 @@ pub struct Push {
     /// A certificate and key uploaded for this front door: stored with mode 0600, never logged,
     /// never sent back.
     pub custom: Option<CustomCert>,
+    /// Renew the self-signed certificate now (`POST /api/runners/:name/front-door/cert/renew`):
+    /// a new key, and a CSR for it at once. The certificate in use serves until the new one is in.
+    pub renew: bool,
 }
 
 impl std::fmt::Debug for Push {
@@ -377,6 +383,7 @@ impl std::fmt::Debug for Push {
             .field("standby", &self.standby)
             .field("issued", &self.issued.as_ref().map(String::len))
             .field("custom", &self.custom)
+            .field("renew", &self.renew)
             .finish()
     }
 }
@@ -442,6 +449,11 @@ pub struct CertStatus {
     /// Names the front door serves that the certificate does not cover.
     pub missing: Vec<String>,
     pub error: Option<String>,
+    /// The chain it serves, its certificates only ([`crate::pki::public_chain_pem`]): never a
+    /// key. The server keeps it for downloads and leaves it out of the view.
+    pub pem: Option<String>,
+    /// A new self-signed certificate was asked for (renew now) and is not in yet.
+    pub renewing: bool,
 }
 
 /// Something to run once on the machine (the front door cannot do it as the user it runs as).
@@ -506,7 +518,7 @@ mod tests {
         assert_eq!(s.dns_names(), ["kiln.home", "ci.home"]);
         assert_eq!(s.origins(), ["https://kiln.home", "https://ci.home", "https://kiln.local"]);
         assert!(s.serves("x.kiln.home") && s.serves("kiln.local") && !s.serves("kiln.lan"));
-        assert_eq!(s.summary(), "kiln.home, ci.home · DNS :53 (resolver) · HTTPS :443 (kiln certificate, HTTP :80 redirects) · kiln.local");
+        assert_eq!(s.summary(), "kiln.home, ci.home · DNS :53 (resolver) · HTTPS :443 (self-signed certificate, HTTP :80 redirects) · kiln.local");
         // Validating again changes nothing.
         assert_eq!(s.validated().map_err(anyhow::Error::msg)?, s);
         let off = Settings::default().validated().map_err(anyhow::Error::msg)?;
@@ -551,10 +563,13 @@ mod tests {
     #[test]
     fn settings_and_status_round_trip_as_json() -> anyhow::Result<()> {
         let s = on().validated().map_err(anyhow::Error::msg)?;
-        let push = Push { settings: s.clone(), standby: false, issued: Some("PEM".into()), custom: Some(CustomCert { cert_pem: "C".into(), key_pem: "SECRET KEY".into() }) };
+        let push = Push { settings: s.clone(), standby: false, issued: Some("PEM".into()), custom: Some(CustomCert { cert_pem: "C".into(), key_pem: "SECRET KEY".into() }), renew: true };
         let json = serde_json::to_string(&push)?;
         let back: Push = serde_json::from_str(&json)?;
         assert_eq!(back.settings, s);
+        assert!(back.renew);
+        // A push from a server that knows nothing of renewing renews nothing.
+        assert!(!serde_json::from_str::<Push>(r#"{"settings":{"domain":"kiln.dev"}}"#)?.renew);
         assert_eq!(back.custom.as_ref().map(|c| c.key_pem.as_str()), Some("SECRET KEY"));
         // Debug output (logs) never carries the key.
         assert!(!format!("{back:?}").contains("SECRET"));
@@ -573,6 +588,52 @@ mod tests {
         };
         assert_eq!(serde_json::from_str::<Status>(&serde_json::to_string(&status)?)?, status);
         assert_eq!(serde_json::to_value(State::Waiting)?, serde_json::json!("waiting"));
+        Ok(())
+    }
+
+    /// The domain is any name the admin chooses: `kiln.dev`, a name on a public suffix, a deep
+    /// one, an internationalized one (as its `xn--` form), not only `.home` or `.lan`.
+    #[test]
+    fn any_name_is_a_domain() -> anyhow::Result<()> {
+        let long_label = "k".repeat(63);
+        for (asked, kept) in [
+            ("kiln.dev", "kiln.dev"),
+            ("Kiln.Dev.", "kiln.dev"),
+            (" kiln.dev ", "kiln.dev"),
+            ("kiln.app", "kiln.app"),
+            ("ci.example.com", "ci.example.com"),
+            ("kiln.internal", "kiln.internal"),
+            ("kiln.home.arpa", "kiln.home.arpa"),
+            ("my-kiln.io", "my-kiln.io"),
+            ("a.b.c.kiln.dev", "a.b.c.kiln.dev"),
+            ("xn--kln-0na.dev", "xn--kln-0na.dev"),
+            ("kiln.lan", "kiln.lan"),
+            ("kiln.home", "kiln.home"),
+            ("kiln.x1", "kiln.x1"),
+        ] {
+            assert_eq!(host_name(asked).as_deref(), Ok(kept), "{asked:?}");
+        }
+        assert_eq!(host_name(&format!("{long_label}.dev")).map(|n| n.len()), Ok(67));
+        assert!(host_name(&format!("{long_label}k.dev")).is_err(), "a label of 64");
+        assert!(host_name("kiln").err().is_some_and(|e| e.contains("like kiln.dev")));
+        assert!(host_name("kiln dev").is_err() && host_name("kiln..dev").is_err() && host_name("*.kiln.dev").is_err());
+
+        // kiln.dev as a front door: DNS, HTTPS, its wildcard, an alias under it.
+        let s = Settings {
+            domain: "kiln.dev".into(),
+            aliases: vec!["ci.kiln.dev".into(), "kiln.example.com".into()],
+            dns: Dns { enabled: true, ..Dns::default() },
+            https: Https { enabled: true, ..Https::default() },
+            ..Settings::default()
+        }
+        .validated()
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(s.cert_names(), ["kiln.dev", "*.kiln.dev", "ci.kiln.dev", "kiln.example.com"]);
+        assert_eq!(s.origins(), ["https://kiln.dev", "https://ci.kiln.dev", "https://kiln.example.com"]);
+        assert!(s.serves("kiln.dev") && s.serves("www.kiln.dev") && s.serves("kiln.example.com") && !s.serves("kiln.home"));
+        assert_eq!(s.summary(), "kiln.dev, ci.kiln.dev, kiln.example.com · DNS :53 (resolver) · HTTPS :443 (self-signed certificate, HTTP :80 redirects)");
+        let none = Settings { dns: Dns { enabled: true, ..Dns::default() }, ..Settings::default() };
+        assert!(none.validated().err().is_some_and(|e| e.contains("kiln.dev")), "the example is kiln.dev");
         Ok(())
     }
 }

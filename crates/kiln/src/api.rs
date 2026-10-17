@@ -267,6 +267,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let name = (*name).to_owned();
             front_door(crate::frontdoor::control::upload(&hub, &name, req).await)
         }
+        (&Method::GET, ["api", "runners", name, "front-door", "cert"]) => front_door(crate::frontdoor::control::download(&hub, name).await),
+        (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(crate::frontdoor::control::renew(&hub, name).await),
         (&Method::PUT, ["api", "settings", "password"]) => set_password(&hub, req).await,
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
