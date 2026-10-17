@@ -2,15 +2,25 @@
 //! kiln's additions in the kiln dialect. One implementation serves the server (job-level keys)
 //! and the runner (step-level keys), so both sides agree on every value.
 //!
-//! This file fixes the public interface that the other workstreams build against (docs/ci.md
-//! §5.3). W01 fills in the parser and evaluator behind it; until then [`Expr::parse`] keeps the
-//! source without checking it, evaluation answers `KCI2000`, and [`Template::parse`] already
-//! splits literal text from `${{ … }}` parts exactly, string literals included.
+//! GitHub's reference is `github.com/actions/languageservices` (`expressions/`), whose test
+//! vectors run against this module (`tests/oracle.rs`). Where GitHub's TypeScript and C#
+//! implementations differ, kiln follows the C# runner that actually runs workflows (error
+//! positions are offsets from the start of the expression; `''` escapes are all replaced).
+//!
+//! - [`value`]: values, coercion, comparison, JavaScript numbers, JSON.
+//! - [`parser`]: tokens, the tree, limits and errors.
+//! - [`eval`]: evaluation and the functions.
+//! - [`files`]: the `hashFiles` function.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+pub mod eval;
+pub mod files;
+pub mod parser;
+pub mod value;
 
-/// Which language a file is written in. GitHub's (`.github/workflows`), or kiln's superset
+pub use parser::{Func, Node, ParseOptions};
+pub use value::{Kind, Map, Value, js_number_to_string, json_parse, json_stringify};
+
+/// Which language a file is written in: GitHub's (`.github/workflows`), or kiln's superset
 /// (`.kiln/*.yaml`, overlays).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -19,8 +29,9 @@ pub enum Dialect {
     Kiln,
 }
 
-/// Why parsing or evaluating failed: a stable code (`KCI2xxx`, docs/ci.md W02-R08), a message,
-/// and the 1-based column in the expression's source when there is one.
+/// Why parsing or evaluating failed: a stable code (`KCI2xxx`, `KCI3xxx`, `KCI5xxx`; docs/ci.md
+/// W02-R08), GitHub's message, and the 1-based position (in UTF-16 code units from the start of
+/// the expression) when there is one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {message}")]
 pub struct ExprError {
@@ -32,6 +43,14 @@ pub struct ExprError {
 impl ExprError {
     pub fn new(code: &'static str, message: impl Into<String>, column: Option<u32>) -> Self {
         Self { code, message: message.into(), column }
+    }
+
+    /// The message as GitHub prints it, with where it happened.
+    pub fn located(&self, expr: &str) -> String {
+        match self.column {
+            Some(c) => format!("{}. Located at position {c} within expression: {expr}", self.message),
+            None => format!("{}. Located within expression: {expr}", self.message),
+        }
     }
 }
 
@@ -56,67 +75,13 @@ impl ContextPath {
             _ => String::new(),
         }
     }
-}
 
-/// An object's members, in insertion order. Lookup by name is case-insensitive (W01-R03); the
-/// written case is kept for `toJSON`.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Map(pub Vec<(Arc<str>, Value)>);
-
-impl Map {
-    pub fn get(&self, name: &str) -> Option<&Value> {
-        self.0.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v)
-    }
-}
-
-/// A value: JSON's types, shared cheaply. `Send + Sync`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Null,
-    Bool(bool),
-    Number(f64),
-    String(Arc<str>),
-    Array(Arc<[Value]>),
-    Object(Arc<Map>),
-}
-
-impl Value {
-    pub fn from_json(v: &serde_json::Value) -> Self {
-        match v {
-            serde_json::Value::Null => Self::Null,
-            serde_json::Value::Bool(b) => Self::Bool(*b),
-            serde_json::Value::Number(n) => Self::Number(n.as_f64().unwrap_or(f64::NAN)),
-            serde_json::Value::String(s) => Self::String(s.as_str().into()),
-            serde_json::Value::Array(a) => Self::Array(a.iter().map(Self::from_json).collect()),
-            serde_json::Value::Object(o) => {
-                Self::Object(Arc::new(Map(o.iter().map(|(k, v)| (Arc::from(k.as_str()), Self::from_json(v))).collect())))
-            }
+    /// The name at depth `i` (0 is the context), if it is a name.
+    pub fn name(&self, i: usize) -> Option<&str> {
+        match self.0.get(i) {
+            Some(PathSeg::Name(n)) => Some(n),
+            _ => None,
         }
-    }
-
-    pub fn to_json(&self) -> serde_json::Value {
-        match self {
-            Self::Null => serde_json::Value::Null,
-            Self::Bool(b) => serde_json::Value::Bool(*b),
-            Self::Number(n) => serde_json::Number::from_f64(*n).map_or(serde_json::Value::Null, serde_json::Value::Number),
-            Self::String(s) => serde_json::Value::String(s.to_string()),
-            Self::Array(a) => serde_json::Value::Array(a.iter().map(Self::to_json).collect()),
-            Self::Object(o) => {
-                let mut m = serde_json::Map::new();
-                for (k, v) in &o.0 {
-                    m.insert(k.to_string(), v.to_json());
-                }
-                serde_json::Value::Object(m)
-            }
-        }
-    }
-
-    pub fn str(s: &str) -> Self {
-        Self::String(s.into())
-    }
-
-    pub fn object(members: impl IntoIterator<Item = (String, Value)>) -> Self {
-        Self::Object(Arc::new(Map(members.into_iter().map(|(k, v)| (Arc::from(k.as_str()), v)).collect())))
     }
 }
 
@@ -132,10 +97,11 @@ pub struct StatusView {
 
 /// Supplies contexts lazily (the `github.event` payload can be large).
 pub trait Contexts {
-    /// A context by name (`github`, `matrix`, `steps`, …); `None` when it has no value here.
+    /// A context by name (`github`, `matrix`, `steps`, …), case-insensitive; `None` when it has
+    /// no value here.
     fn get(&self, name: &str) -> Option<Value>;
     fn status(&self) -> StatusView;
-    /// `hashFiles(…)`, only on the runner (W01-R09).
+    /// `hashFiles(…)`, only on the runner (W01-R09; see [`files::hash_files`]).
     fn hash_files(&self, patterns: &[String]) -> Result<String, ExprError> {
         let _ = patterns;
         Err(ExprError::new("KCI2010", "hashFiles is only available on the runner", None))
@@ -147,16 +113,23 @@ pub trait Contexts {
     }
 }
 
-/// Plain contexts in a map, for tests and simple callers.
+/// Plain contexts in a list, for tests and simple callers.
 #[derive(Debug, Clone, Default)]
 pub struct MapContexts {
-    pub values: BTreeMap<String, Value>,
+    pub values: Vec<(String, Value)>,
     pub status: StatusView,
+}
+
+impl MapContexts {
+    pub fn with(mut self, name: &str, v: Value) -> Self {
+        self.values.push((name.to_owned(), v));
+        self
+    }
 }
 
 impl Contexts for MapContexts {
     fn get(&self, name: &str) -> Option<Value> {
-        self.values.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
+        self.values.iter().find(|(k, _)| value::ci_eq(k, name)).map(|(_, v)| v.clone())
     }
 
     fn status(&self) -> StatusView {
@@ -164,7 +137,7 @@ impl Contexts for MapContexts {
     }
 }
 
-/// Bounds on one evaluation (W01-R13).
+/// Bounds on one evaluation (W01-R13). GitHub's own bounds (length, depth, memory) always apply.
 #[derive(Debug, Clone)]
 pub struct Budget {
     /// Evaluation steps left.
@@ -184,15 +157,21 @@ impl Default for Budget {
 pub struct Expr {
     src: String,
     dialect: Dialect,
+    ast: Node,
 }
 
 impl Expr {
-    /// Parses `src` in `dialect`.
+    /// Parses `src` in `dialect`, accepting any context name and every function of the dialect.
     pub fn parse(src: &str, dialect: Dialect) -> Result<Expr, ExprError> {
-        if src.len() > 64 << 10 {
-            return Err(ExprError::new("KCI2001", "expression longer than 64 KiB", None));
-        }
-        Ok(Expr { src: src.trim().to_owned(), dialect })
+        Self::parse_with(src, &ParseOptions::permissive(dialect))
+    }
+
+    /// Parses `src` accepting only what `opts` allows (where a key's contexts and functions are
+    /// limited, docs/ci.md Appendix B).
+    pub fn parse_with(src: &str, opts: &ParseOptions) -> Result<Expr, ExprError> {
+        let tokens = parser::lex(src, opts.dialect)?;
+        let ast = parser::parse(&tokens, opts)?;
+        Ok(Expr { src: src.trim().to_owned(), dialect: opts.dialect, ast })
     }
 
     pub fn source(&self) -> &str {
@@ -203,15 +182,116 @@ impl Expr {
         self.dialect
     }
 
-    /// Whether it calls `success()`, `always()`, `cancelled()` or `failure()` anywhere (W01-R10).
-    pub fn uses_status_function(&self) -> bool {
-        let s = self.src.to_ascii_lowercase();
-        ["success(", "always(", "cancelled(", "failure("].iter().any(|f| s.contains(f))
+    pub fn ast(&self) -> &Node {
+        &self.ast
     }
 
-    /// Every context path it reads (W01-R12).
+    /// Source text for this expression's tree (normalized spacing; parses to the same tree).
+    pub fn print(&self) -> String {
+        parser::print(&self.ast)
+    }
+
+    /// Whether it calls `success()`, `always()`, `cancelled()` or `failure()` anywhere (W01-R10).
+    pub fn uses_status_function(&self) -> bool {
+        self.functions().iter().any(|f| f.is_status())
+    }
+
+    /// Every function it calls.
+    pub fn functions(&self) -> Vec<Func> {
+        let mut out = Vec::new();
+        walk(&self.ast, &mut |n| {
+            if let Node::Call(f, _) = n
+                && !out.contains(f)
+            {
+                out.push(*f);
+            }
+        });
+        out
+    }
+
+    /// Every context path it reads (W01-R12): the longest path of each access chain, with
+    /// [`PathSeg::Any`] where a filter or a computed index stands.
     pub fn references(&self) -> Vec<ContextPath> {
-        Vec::new()
+        let mut out = Vec::new();
+        refs(&self.ast, &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+fn walk(n: &Node, f: &mut dyn FnMut(&Node)) {
+    f(n);
+    match n {
+        Node::Index(o, i) => {
+            walk(o, f);
+            if let parser::Index::Expr(e) = i {
+                walk(e, f);
+            }
+        }
+        Node::Not(e) | Node::Group(e) => walk(e, f),
+        Node::Binary(_, l, r) => {
+            walk(l, f);
+            walk(r, f);
+        }
+        Node::And(a) | Node::Or(a) | Node::Call(_, a) => {
+            for x in a {
+                walk(x, f);
+            }
+        }
+        Node::Literal(_) | Node::Context(_) | Node::Empty => {}
+    }
+}
+
+/// The path an access chain reads, if it starts at a context.
+fn chain(n: &Node, out: &mut Vec<ContextPath>) -> Option<Vec<PathSeg>> {
+    match n {
+        Node::Context(name) => Some(vec![PathSeg::Name(name.clone())]),
+        Node::Group(e) => chain(e, out),
+        Node::Index(obj, idx) => {
+            let mut p = chain(obj, out)?;
+            p.push(match idx {
+                parser::Index::Star => PathSeg::Any,
+                parser::Index::Prop(s) => PathSeg::Name(s.clone()),
+                parser::Index::Expr(e) => match e.as_ref() {
+                    Node::Literal(Value::String(s)) => PathSeg::Name(s.to_string()),
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    Node::Literal(Value::Number(x)) if *x >= 0.0 && x.fract() == 0.0 && *x < 9e15 => PathSeg::Index(*x as u64),
+                    other => {
+                        refs(other, out);
+                        PathSeg::Any
+                    }
+                },
+            });
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
+fn refs(n: &Node, out: &mut Vec<ContextPath>) {
+    if let Some(p) = chain(n, out) {
+        out.push(ContextPath(p));
+        return;
+    }
+    match n {
+        Node::Index(o, i) => {
+            refs(o, out);
+            if let parser::Index::Expr(e) = i {
+                refs(e, out);
+            }
+        }
+        Node::Not(e) | Node::Group(e) => refs(e, out),
+        Node::Binary(_, l, r) => {
+            refs(l, out);
+            refs(r, out);
+        }
+        Node::And(a) | Node::Or(a) | Node::Call(_, a) => {
+            for x in a {
+                refs(x, out);
+            }
+        }
+        Node::Literal(_) | Node::Context(_) | Node::Empty => {}
     }
 }
 
@@ -229,10 +309,14 @@ pub struct Template {
 }
 
 impl Template {
-    /// Splits `src` into literal text and expressions. A `}}` inside a single-quoted string
-    /// literal (or, in the kiln dialect, a double-quoted one) does not close the expression; an
-    /// unclosed `${{` is an error with its column.
+    /// Splits `src` into literal text and expressions, accepting what the dialect has.
     pub fn parse(src: &str, dialect: Dialect) -> Result<Template, ExprError> {
+        Self::parse_with(src, &ParseOptions::permissive(dialect))
+    }
+
+    /// Splits `src` into literal text and expressions parsed with `opts`. A `}}` inside a
+    /// string literal does not close the expression; an unclosed `${{` is an error at its column.
+    pub fn parse_with(src: &str, opts: &ParseOptions) -> Result<Template, ExprError> {
         let mut parts = Vec::new();
         let mut text = String::new();
         let mut rest = src;
@@ -241,14 +325,14 @@ impl Template {
             text.push_str(rest.get(..start).unwrap_or_default());
             let body_start = start + 3;
             let body = rest.get(body_start..).unwrap_or_default();
-            let Some(end) = find_close(body, dialect) else {
+            let Some(end) = find_close(body, opts.dialect) else {
                 let col = u32::try_from(offset + start + 1).unwrap_or(u32::MAX);
                 return Err(ExprError::new("KCI2002", "`${{` is not closed by `}}`", Some(col)));
             };
             if !text.is_empty() {
                 parts.push(Part::Text(std::mem::take(&mut text)));
             }
-            parts.push(Part::Expr(Expr::parse(body.get(..end).unwrap_or_default(), dialect)?));
+            parts.push(Part::Expr(Expr::parse_with(body.get(..end).unwrap_or_default(), opts)?));
             let consumed = body_start + end + 2;
             offset += consumed;
             rest = rest.get(consumed..).unwrap_or_default();
@@ -265,12 +349,18 @@ impl Template {
         self.parts.iter().all(|p| matches!(p, Part::Text(_)))
     }
 
-    /// Exactly one expression and no literal text around it.
+    /// Exactly one expression, with nothing but whitespace around it.
     pub fn single_expr(&self) -> Option<&Expr> {
-        match self.parts.as_slice() {
-            [Part::Expr(e)] => Some(e),
-            _ => None,
+        let mut found = None;
+        for p in &self.parts {
+            match p {
+                Part::Expr(e) if found.is_none() => found = Some(e),
+                Part::Expr(_) => return None,
+                Part::Text(t) if t.trim().is_empty() => {}
+                Part::Text(_) => return None,
+            }
         }
+        found
     }
 
     pub fn expressions(&self) -> impl Iterator<Item = &Expr> {
@@ -278,6 +368,14 @@ impl Template {
             Part::Expr(e) => Some(e),
             Part::Text(_) => None,
         })
+    }
+
+    /// Every context path its expressions read.
+    pub fn references(&self) -> Vec<ContextPath> {
+        let mut out: Vec<ContextPath> = self.expressions().flat_map(Expr::references).collect();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -290,7 +388,6 @@ fn find_close(body: &str, dialect: Dialect) -> Option<usize> {
         match quote {
             Some(q) => {
                 if b == q {
-                    // `''` inside a single-quoted string is an escaped quote.
                     if bytes.get(i + 1) == Some(&q) {
                         i += 2;
                         continue;
@@ -311,21 +408,83 @@ fn find_close(body: &str, dialect: Dialect) -> Option<usize> {
     None
 }
 
-fn unimplemented_yet() -> ExprError {
-    ExprError::new("KCI2000", "expression evaluation is not implemented yet (docs/ci.md W01)", None)
+/// An `if:` value as GitHub reads it (W01-R10): a bare expression, a single `${{ }}`, or text
+/// with expressions in it (a string, truthy when not empty: the pitfall `KCI6001` warns about).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Condition {
+    Expr(Expr),
+    Template(Template),
+}
+
+impl Condition {
+    pub fn parse(src: &str, opts: &ParseOptions) -> Result<Condition, ExprError> {
+        let t = src.trim();
+        if t.contains("${{") {
+            let tpl = Template::parse_with(t, opts)?;
+            if let Some(e) = tpl.single_expr() {
+                return Ok(Condition::Expr(e.clone()));
+            }
+            return Ok(Condition::Template(tpl));
+        }
+        Ok(Condition::Expr(Expr::parse_with(t, opts)?))
+    }
+
+    /// Literal text around an expression (`KCI6001`).
+    pub fn has_literal_text(&self) -> bool {
+        matches!(self, Condition::Template(_))
+    }
+
+    pub fn uses_status_function(&self) -> bool {
+        match self {
+            Condition::Expr(e) => e.uses_status_function(),
+            Condition::Template(t) => t.expressions().any(Expr::uses_status_function),
+        }
+    }
+
+    pub fn references(&self) -> Vec<ContextPath> {
+        match self {
+            Condition::Expr(e) => e.references(),
+            Condition::Template(t) => t.references(),
+        }
+    }
 }
 
 /// Evaluates `e`.
 pub fn eval(e: &Expr, cx: &dyn Contexts, b: &mut Budget) -> Result<Value, ExprError> {
-    let _ = (e, cx, b);
-    Err(unimplemented_yet())
+    let mut ev = eval::Evaluator { cx, budget: b, dialect: e.dialect, memory: 0 };
+    let v = ev.eval(&e.ast)?;
+    if v.mem_size() > ev.budget.result_bytes.saturating_add(64) && !matches!(v, Value::Null | Value::Bool(_) | Value::Number(_)) {
+        return Err(ExprError::new("KCI2022", "the expression's result is larger than allowed", None));
+    }
+    Ok(v)
 }
 
-/// Evaluates an `if:` condition, with `success() &&` implied when no status function is called
+/// Evaluates an `if:` expression, with `success() &&` implied when no status function is called
 /// (W01-R10).
 pub fn eval_if(e: &Expr, cx: &dyn Contexts, b: &mut Budget) -> Result<bool, ExprError> {
-    let _ = (e, cx, b);
-    Err(unimplemented_yet())
+    if !e.uses_status_function() {
+        let s = cx.status();
+        if s.failed || s.cancelled {
+            return Ok(false);
+        }
+    }
+    Ok(eval(e, cx, b)?.truthy())
+}
+
+/// Evaluates an `if:` value of any form.
+pub fn eval_condition(c: &Condition, cx: &dyn Contexts, b: &mut Budget) -> Result<bool, ExprError> {
+    match c {
+        Condition::Expr(e) => eval_if(e, cx, b),
+        Condition::Template(t) => {
+            if !c.uses_status_function() {
+                let s = cx.status();
+                if s.failed || s.cancelled {
+                    return Ok(false);
+                }
+            }
+            Ok(!render(t, cx, b)?.is_empty())
+        }
+    }
 }
 
 /// Renders a template to a string (W01-R07).
@@ -334,34 +493,20 @@ pub fn render(t: &Template, cx: &dyn Contexts, b: &mut Budget) -> Result<String,
     for p in &t.parts {
         match p {
             Part::Text(s) => out.push_str(s),
-            Part::Expr(e) => {
-                let _ = eval(e, cx, b)?;
-            }
+            Part::Expr(e) => out.push_str(&eval(e, cx, b)?.coerce_string()),
         }
     }
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn templates_split_text_and_expressions() -> Result<(), ExprError> {
-        let t = Template::parse("a ${{ x }} b ${{ 'y}}' }}", Dialect::Gha)?;
-        let exprs: Vec<&str> = t.expressions().map(Expr::source).collect();
-        assert_eq!(exprs, vec!["x", "'y}}'"]);
-        assert!(Template::parse("plain", Dialect::Gha)?.is_literal());
-        assert!(Template::parse("${{ a }}", Dialect::Gha)?.single_expr().is_some());
-        let err = Template::parse("x ${{ open", Dialect::Gha).err();
-        assert_eq!(err.map(|e| (e.code, e.column)), Some(("KCI2002", Some(3))));
-        Ok(())
-    }
-
-    #[test]
-    fn escaped_quotes_stay_inside_the_literal() -> Result<(), ExprError> {
-        let t = Template::parse("${{ 'it''s }} fine' }}", Dialect::Gha)?;
-        assert_eq!(t.expressions().map(Expr::source).collect::<Vec<_>>(), vec!["'it''s }} fine'"]);
-        Ok(())
+/// A template's value: the expression's own value when the template is a single `${{ }}`
+/// (so `${{ fromJSON(…) }}` gives an array where a key takes one), else the rendered string.
+pub fn eval_value(t: &Template, cx: &dyn Contexts, b: &mut Budget) -> Result<Value, ExprError> {
+    match t.single_expr() {
+        Some(e) => eval(e, cx, b),
+        None => render(t, cx, b).map(|s| Value::String(s.into())),
     }
 }
+
+#[cfg(test)]
+mod tests;
