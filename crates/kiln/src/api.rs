@@ -251,6 +251,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid, &q, req).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "fork"]) => ai_fork(&hub, machine, pid).await,
+        (&Method::GET, ["api", "voice"]) => {
+            Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
+        }
+        (&Method::POST, ["api", "voice", "transcribe"]) => voice_transcribe(&hub, &q, req).await,
         (&Method::GET, ["api", "accounts"]) => accounts_status(&hub, &q).await,
         (&Method::POST, ["api", "accounts", "login"]) => accounts_login(&hub, req).await,
         (&Method::POST, ["api", "accounts", "logout"]) => accounts_logout(&hub, req).await,
@@ -494,6 +498,28 @@ async fn accounts_input(id: &str, req: Request) -> R {
     let a: AccountInput = srv::body_json(req.into_body(), 16 * 1024).await.map_err(|_| err(StatusCode::BAD_REQUEST, "expected {\"text\": \"…\"}"))?;
     crate::accounts::input(id, &a.text).map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+// ------------------------------------------------------------------ voice
+
+/// Speech to text for the console's microphone where the browser can't do it itself: the body is
+/// the recording (`audio/*`, as `MediaRecorder` made it), `?lang=` overrides `[voice] language`;
+/// answers `{text}`.
+async fn voice_transcribe(hub: &Hub, q: &HashMap<String, String>, req: Request) -> R {
+    if !hub.cfg.voice.enabled() {
+        return Err(err(StatusCode::NOT_IMPLEMENTED, "voice transcription isn't set up on this server: set [voice] transcribe_url to a speech-to-text service (docs/voice.md)"));
+    }
+    let kind = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+    if !kind.starts_with("audio/") {
+        return Err(err(StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("expected a recording (audio/*), not {kind:?}")));
+    }
+    let max = crate::voice::MAX_AUDIO;
+    let audio = srv::body_bytes(req.into_body(), max).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("a recording is up to {} MiB ({e:#})", max >> 20)))?;
+    if audio.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "the recording is empty"));
+    }
+    let text = crate::voice::transcribe(&hub.cfg.voice, &audio, &kind, q.get("lang").map(String::as_str)).await.map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({ "text": text })))
 }
 
 /// The recent messages of one session, read from its machine.

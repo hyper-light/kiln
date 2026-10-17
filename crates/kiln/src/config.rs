@@ -19,6 +19,8 @@ pub struct Config {
     pub terminal: Terminal,
     pub retention: Retention,
     pub telemetry: Telemetry,
+    /// Speech to text for the console's microphone where the browser can't do it itself.
+    pub voice: crate::voice::Voice,
     pub discovery: Discovery,
     /// Deployments (docs/cd.md).
     pub cd: Cd,

@@ -84,6 +84,8 @@ interface JoinRequest { id; name /* agent name asked for */; hostname; os; arch;
 | GET | `/api/metrics/history?agent=` | `{ [agent]: HostSample[] }` last hour, 5 s resolution (`agent` optional; server is `"server"`) |
 | GET | `/api/system` | `{ version, uptime_s, generation, children: Child[], crash_log: string[], config: object }` |
 | GET | `/api/audit?limit=` | `{ts, actor, action, detail}[]` |
+| GET | `/api/voice` | `{ transcribe, language }`: whether kiln transcribes recordings ([voice.md](voice.md)) |
+| POST | `/api/voice/transcribe?lang=` | body: the recording (`Content-Type: audio/*`, up to 25 MiB) → `{ text }`; 501 not set up, 415 not a recording, 413 too big, 502 the service failed |
 | POST | `/api/hooks/github` | GitHub webhook (HMAC `X-Hub-Signature-256`) → immediate poll |
 | GET | `/metrics` | Prometheus exposition |
 | GET | `/healthz`, `/readyz` | liveness / readiness |
