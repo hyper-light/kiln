@@ -97,6 +97,17 @@ pub fn spawn(
     cols: u16,
     rows: u16,
 ) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+    spawn_with(shell, command, cols, rows, &[])
+}
+
+/// [`spawn`], with extra environment for the shell (e.g. how `kiln spawn` reaches its kiln).
+pub fn spawn_with(
+    shell: Option<&str>,
+    command: Option<&str>,
+    cols: u16,
+    rows: u16,
+    env: &[(&str, String)],
+) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
     let pty = native_pty_system().openpty(size(cols, rows))?;
     let shell = default_shell(shell);
     let mut cmd = CommandBuilder::new(&shell);
@@ -116,6 +127,9 @@ pub fn spawn(
     }
     if cfg!(unix) && std::env::var_os("LANG").is_none() {
         cmd.env("LANG", "C.UTF-8");
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     cmd.cwd(crate::os::home_dir());
     let io = crate::os::pty::PtyIo::new(pty.master.as_ref()).context("PTY master")?;

@@ -42,6 +42,9 @@ pub struct Spec {
     /// Offer the harness's skip-all-permissions mode (it is never the default).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_bypass: bool,
+    /// Run this executable instead of the harness's usual one (a custom install, tests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
 }
 
 /// A pending approval, as lists show it.
@@ -90,6 +93,31 @@ pub struct Info {
     pub last_activity: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<ExitInfo>,
+    /// What the person first asked for.
+    #[serde(default)]
+    pub goal: String,
+    /// The agent's latest words, shortened.
+    #[serde(default)]
+    pub summary: String,
+    /// What it is doing right now, in plain words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doing: Option<String>,
+    #[serde(default)]
+    pub todos_done: u32,
+    #[serde(default)]
+    pub todos_total: u32,
+    #[serde(default)]
+    pub files_changed: u32,
+    #[serde(default)]
+    pub lines_added: u32,
+    #[serde(default)]
+    pub lines_removed: u32,
+    /// How full the context window is, 0–100, when the harness says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pct: Option<u8>,
+    /// Unix ms the current turn started (None when idle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started: Option<i64>,
 }
 
 impl Info {
@@ -113,6 +141,20 @@ impl Info {
         self.cost_usd = s.usage.cost_usd;
         self.activity.clone_from(&s.activity);
         self.exit.clone_from(&s.exit);
+        self.goal = super::model::clip_middle(&s.goal, 200).0;
+        self.summary = super::model::clip_middle(&s.summary, 300).0;
+        self.doing.clone_from(&s.doing);
+        let total = u32::try_from(s.todos.len()).unwrap_or(u32::MAX);
+        self.todos_total = total;
+        self.todos_done = u32::try_from(s.todos.iter().filter(|t| t.status == "completed").count()).unwrap_or(total);
+        self.files_changed = s.files_changed;
+        self.lines_added = s.lines_added;
+        self.lines_removed = s.lines_removed;
+        self.context_pct = match (s.usage.context_tokens, s.usage.context_window) {
+            (Some(t), Some(w)) if w > 0 => u8::try_from((t.saturating_mul(100) / w).min(100)).ok(),
+            _ => None,
+        };
+        self.turn_started = s.turn_started;
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -157,9 +199,11 @@ impl Session {
         let _ = self.ctl.try_send(Ctl::Close);
     }
 
-    /// Everything a new viewer (or a restarted server) needs.
+    /// Everything a new viewer (or a restarted server) needs, starting with the announcement.
     pub fn snapshot(&self) -> Vec<Update> {
-        self.core.lock().snapshot(256 * 1024)
+        let mut out = vec![Update::Open { info: Box::new(self.info()) }];
+        out.extend(self.core.lock().snapshot(256 * 1024));
+        out
     }
 
     /// What resuming this session takes: its spec with the harness's session id to continue.
@@ -204,6 +248,16 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
         activity: None,
         last_activity: now,
         exit: None,
+        goal: String::new(),
+        summary: String::new(),
+        doing: None,
+        todos_done: 0,
+        todos_total: 0,
+        files_changed: 0,
+        lines_added: 0,
+        lines_removed: 0,
+        context_pct: None,
+        turn_started: None,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -225,12 +279,18 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
     Ok(s)
 }
 
+/// Background work a step asked for.
+struct Jobs {
+    previews: Vec<super::core::PreviewJob>,
+    changes: Vec<super::core::ChangeJob>,
+}
+
 /// Hand out what the core produced: updates to the sink, lines to the process.
-async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Vec<u8>>>) -> Vec<super::core::PreviewJob> {
-    let (updates, writes, previews) = {
+async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Vec<u8>>>) -> Jobs {
+    let (updates, writes, previews, changes) = {
         let mut core = s.core.lock();
         let u = core.take_out();
-        (u, core.take_writes(), std::mem::take(&mut core.previews))
+        (u, core.take_writes(), std::mem::take(&mut core.previews), std::mem::take(&mut core.change_jobs))
     };
     if let Some(stdin) = stdin {
         for w in writes {
@@ -247,10 +307,11 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Ve
             break;
         }
     }
-    previews
+    Jobs { previews, changes }
 }
 
 enum Ev {
+    Change(Option<(String, Option<super::model::FileChange>)>),
     Out(Option<Vec<u8>>),
     Err(Option<Vec<u8>>),
     Ctl(Option<Ctl>),
@@ -261,6 +322,9 @@ enum Ev {
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>) {
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
+    let (ch_tx, ch_rx) = async_channel::unbounded::<(String, Option<super::model::FileChange>)>();
+    // Announce it before anything else, so whoever mirrors it knows what it is.
+    let _ = sink.send((s.id.clone(), Update::Open { info: Box::new(s.info()) })).await;
     let mut first = true;
     let mut crashes: Vec<Instant> = Vec::new();
     // A message that arrived while the process was down, sent once it is back.
@@ -290,7 +354,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                 }
                 on_change();
-                let mut previews = flush(&s, &sink, Some(&p.stdin)).await;
+                let mut jobs = flush(&s, &sink, Some(&p.stdin)).await;
                 let mut buf: Vec<u8> = Vec::new();
                 let mut stderr_tail: Vec<u8> = Vec::new();
                 let mut out_open = true;
@@ -298,7 +362,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut last_session = s.core.lock().state.harness_session.clone();
                 let mut last_queue = 0usize;
                 loop {
-                    for job in previews.drain(..) {
+                    for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
                         crate::rt::spawn(async move {
                             let id = job.approval.clone();
@@ -306,11 +370,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             let _ = tx.send((id, diffs)).await;
                         });
                     }
+                    for job in jobs.changes.drain(..) {
+                        let tx = ch_tx.clone();
+                        crate::rt::spawn(async move {
+                            let abs = job.abs.clone();
+                            let change = crate::rt::blocking(move || super::diff::file_change(&job)).await.ok().flatten();
+                            let _ = tx.send((abs, change)).await;
+                        });
+                    }
                     let ev = futures::select_biased! {
                         c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
                         o = p.stdout.recv().fuse() => if out_open { Ev::Out(o.ok()) } else { Ev::Out(None) },
                         e = p.stderr.recv().fuse() => if err_open { Ev::Err(e.ok()) } else { Ev::Err(None) },
                         d = pv_rx.recv().fuse() => Ev::Preview(d.ok()),
+                        c = ch_rx.recv().fuse() => Ev::Change(c.ok()),
                         x = (&mut p.exit).fuse() => Ev::Exit(x.ok().flatten()),
                     };
                     match ev {
@@ -347,6 +420,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             }
                         }
                         Ev::Ctl(Some(Ctl::Cmd(Command::Restart))) => {}
+                        Ev::Ctl(Some(Ctl::Cmd(Command::Snapshot))) => {
+                            for u in s.snapshot() {
+                                let _ = sink.send((s.id.clone(), u)).await;
+                            }
+                        }
                         Ev::Ctl(Some(Ctl::Cmd(c))) => {
                             let mut core = s.core.lock();
                             adapter.command(&mut core, c);
@@ -365,7 +443,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 core.touch_state();
                             }
                         }
-                        Ev::Preview(None) => {}
+                        Ev::Preview(None) | Ev::Change(None) => {}
+                        Ev::Change(Some((abs, change))) => {
+                            s.core.lock().set_change(&abs, change);
+                        }
                         Ev::Exit(c) => {
                             code = c;
                             // Read what is left on stdout (the last lines often explain the exit).
@@ -382,7 +463,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             break;
                         }
                     }
-                    previews = flush(&s, &sink, Some(&p.stdin)).await;
+                    jobs = flush(&s, &sink, Some(&p.stdin)).await;
                     let (session, queue) = {
                         let core = s.core.lock();
                         (core.state.harness_session.clone(), core.state.queue.len())
@@ -421,6 +502,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         loop {
             match ctl_rx.recv().await {
                 Ok(Ctl::Cmd(Command::Restart)) => break,
+                Ok(Ctl::Cmd(Command::Snapshot)) => {
+                    for u in s.snapshot() {
+                        let _ = sink.send((s.id.clone(), u)).await;
+                    }
+                }
                 Ok(Ctl::Cmd(c @ Command::Send { .. })) => {
                     carry.push(c);
                     break;
@@ -469,6 +555,16 @@ mod tests {
             activity: None,
             last_activity: 1,
             exit: None,
+            goal: String::new(),
+            summary: String::new(),
+            doing: None,
+            todos_done: 0,
+            todos_total: 0,
+            files_changed: 0,
+            lines_added: 0,
+            lines_removed: 0,
+            context_pct: None,
+            turn_started: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

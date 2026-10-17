@@ -7,10 +7,16 @@
 //! * [`diff`] — line diffs for edit previews.
 //! * [`kinds`] — the registry of harnesses and their adapters.
 //! * [`session`] — one agent session: the harness process, its adapter and its state.
+//! * [`host`] — a machine's sessions: limits, commands, continuing them after a restart.
+//! * [`registry`] — the server's mirror of every session, for any number of viewers.
 
 pub mod claude;
+pub mod cli;
 pub mod core;
 pub mod diff;
+pub mod host;
 pub mod kinds;
 pub mod model;
+pub mod registry;
 pub mod session;
+pub mod socket;

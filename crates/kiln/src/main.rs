@@ -84,6 +84,11 @@ enum Cmd {
         #[command(flatten)]
         server: ServerArgs,
     },
+    /// Start AI coding agents (claude, ...) from this kiln shell: they work in this directory and
+    /// show up under this shell in kiln's UI.
+    Spawn(kiln::harness::cli::SpawnArgs),
+    /// List, stop, interrupt or message this kiln shell's agents.
+    Agents(kiln::harness::cli::AgentsArgs),
 }
 
 /// Which server a CLI command talks to. By default kiln finds it: the cluster bootstrap's
@@ -396,6 +401,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             out(&config::Config::render_default());
             Ok(())
         }
+        Cmd::Spawn(a) => kiln::harness::cli::spawn(a),
+        Cmd::Agents(a) => kiln::harness::cli::agents(a),
         Cmd::Status { server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;

@@ -23,12 +23,37 @@ pub enum Update {
     Meta { meta: Box<Meta> },
     /// Upserts by id.
     Events { events: Vec<Event> },
+    /// The session's whole changeset so far (replaces the previous one).
+    Changes { files: Vec<super::model::FileChange> },
     /// Text to append to a streaming event.
     Stream { id: String, text: String },
     /// The answer to one client's request (file suggestions ...).
     Reply { client: String, value: serde_json::Value },
     /// The timeline starts over (a snapshot follows).
     Reset,
+}
+
+/// How a file was before the agent first changed it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Baseline {
+    /// It did not exist.
+    Absent,
+    Text(String),
+    /// Too large to keep: changes to it are counted, not shown.
+    TooLarge,
+}
+
+/// Largest file content kept as a baseline.
+pub const BASELINE_MAX: usize = 2 << 20;
+/// Most files tracked in a session's changeset.
+const MAX_CHANGED_FILES: usize = 500;
+
+/// Recompute one file's cumulative change (reads the file as it is now; off the event loop).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChangeJob {
+    pub abs: String,
+    pub rel: String,
+    pub baseline: Baseline,
 }
 
 /// Work the brain does off the event loop and feeds back: e.g. reading a file to show what an
@@ -59,6 +84,13 @@ pub struct Core {
     stream: Vec<(String, String)>,
     /// Events changed since the last flush, by id (coalesced).
     changed: Vec<String>,
+    /// Files the agent changed, as they were before its first change (absolute paths).
+    pub baselines: HashMap<String, Baseline>,
+    /// Files whose cumulative change must be recomputed.
+    pub change_jobs: Vec<ChangeJob>,
+    /// The changeset: one entry per file that differs from its baseline (absolute path keys).
+    changes: std::collections::BTreeMap<String, super::model::FileChange>,
+    changes_dirty: bool,
 }
 
 impl Default for Core {
@@ -82,7 +114,49 @@ impl Core {
             meta_dirty: true,
             stream: Vec::new(),
             changed: Vec::new(),
+            baselines: HashMap::new(),
+            change_jobs: Vec::new(),
+            changes: std::collections::BTreeMap::new(),
+            changes_dirty: false,
         }
+    }
+
+    /// The agent is about to change (or just changed) `abs`; `before` is how it was. Only the
+    /// first one counts: the changeset is relative to how the file was before the session.
+    pub fn note_baseline(&mut self, abs: &str, before: Baseline) {
+        if self.baselines.contains_key(abs) || self.baselines.len() >= MAX_CHANGED_FILES {
+            return;
+        }
+        self.baselines.insert(abs.to_owned(), before);
+    }
+
+    /// Recompute `abs` (shown as `rel`) once the brain gets to it.
+    pub fn want_change(&mut self, abs: &str, rel: &str) {
+        let Some(baseline) = self.baselines.get(abs).cloned() else { return };
+        self.change_jobs.retain(|j| j.abs != abs);
+        self.change_jobs.push(ChangeJob { abs: abs.to_owned(), rel: rel.to_owned(), baseline });
+    }
+
+    /// A file's cumulative change, recomputed (None: it is back to how it was).
+    pub fn set_change(&mut self, abs: &str, change: Option<super::model::FileChange>) {
+        match change {
+            Some(c) => {
+                self.changes.insert(abs.to_owned(), c);
+            }
+            None => {
+                self.changes.remove(abs);
+            }
+        }
+        let s = &mut self.state;
+        s.files_changed = u32::try_from(self.changes.len()).unwrap_or(u32::MAX);
+        s.lines_added = self.changes.values().map(|c| c.added).sum();
+        s.lines_removed = self.changes.values().map(|c| c.removed).sum();
+        self.changes_dirty = true;
+        self.state_dirty = true;
+    }
+
+    pub fn changes(&self) -> Vec<super::model::FileChange> {
+        self.changes.values().cloned().collect()
     }
 
     pub fn now() -> i64 {
@@ -223,6 +297,10 @@ impl Core {
             self.meta_dirty = false;
             self.out.push(Update::Meta { meta: Box::new(self.meta.clone()) });
         }
+        if self.changes_dirty {
+            self.changes_dirty = false;
+            self.out.push(Update::Changes { files: self.changes() });
+        }
         if self.state_dirty {
             self.state_dirty = false;
             self.out.push(Update::State { state: Box::new(self.state.clone()) });
@@ -232,6 +310,9 @@ impl Core {
     /// Everything a newly attached viewer needs, as updates (events in bounded batches).
     pub fn snapshot(&self, batch_bytes: usize) -> Vec<Update> {
         let mut out = vec![Update::Reset, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(self.state.clone()) }];
+        if !self.changes.is_empty() {
+            out.push(Update::Changes { files: self.changes() });
+        }
         let mut batch: Vec<Event> = Vec::new();
         let mut size = 0usize;
         for e in &self.events {

@@ -50,6 +50,12 @@ pub enum AgentMsg {
     /// Answer to [`ServerMsg::AiTranscript`]: the messages as JSON, `None` when that session has
     /// no transcript (any more).
     AiTranscript { req: u64, json: Option<String> },
+    /// One update of a kiln-native agent session running on this machine (JSON
+    /// [`crate::harness::core::Update`]). Appended last: postcard encodes variants by index.
+    Harness { session: String, json: String },
+    /// The agent sessions this machine runs and the harnesses it offers (JSON
+    /// [`crate::harness::host::Inventory`]); sent on every (re)connect, before their snapshots.
+    HarnessInventory { json: String },
 }
 
 /// A terminal session kept by an agent.
@@ -106,6 +112,13 @@ pub enum ServerMsg {
     /// Send the recent messages of the AI session running as `pid` (answered by AiTranscript).
     /// Appended last: postcard encodes variants by index.
     AiTranscript { req: u64, pid: u32 },
+    /// Start a kiln-native agent session under this id (JSON [`crate::harness::session::Spec`]).
+    /// Appended last: postcard encodes variants by index.
+    HarnessOpen { session: String, json: String },
+    /// A command for an agent session (JSON [`crate::harness::model::Command`]).
+    HarnessCmd { session: String, json: String },
+    /// Stop an agent session for good.
+    HarnessClose { session: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

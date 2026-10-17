@@ -169,6 +169,26 @@ pub struct Hunk {
     pub lines: Vec<String>,
 }
 
+/// One file's cumulative change over the whole session: from how it was before the agent first
+/// touched it to how it is now.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChange {
+    /// Relative to the session's directory when inside it.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub created: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleted: bool,
+    pub added: u32,
+    pub removed: u32,
+    pub hunks: Vec<Hunk>,
+    /// Too large (or binary) to show; counts only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Unix ms of the last change.
+    pub at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Todo {
     pub text: String,
@@ -387,6 +407,25 @@ pub struct State {
     pub mode: String,
     #[serde(default)]
     pub title: String,
+    /// What the person first asked for (the session's goal), shortened.
+    #[serde(default)]
+    pub goal: String,
+    /// Unix ms the current turn started (None when idle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started: Option<i64>,
+    /// The agent's latest words (main thread), shortened: what it last said it did or found.
+    #[serde(default)]
+    pub summary: String,
+    /// What it is doing right now, in plain words ("Running cargo test", "Editing src/main.rs").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doing: Option<String>,
+    /// The changeset so far, in numbers (the files themselves come as a `changes` update).
+    #[serde(default)]
+    pub files_changed: u32,
+    #[serde(default)]
+    pub lines_added: u32,
+    #[serde(default)]
+    pub lines_removed: u32,
     #[serde(default)]
     pub approvals: Vec<Approval>,
     #[serde(default)]
@@ -493,6 +532,8 @@ pub enum Command {
         client: String,
         query: String,
     },
+    /// Announce the session again with its whole state (a server that lost track of it).
+    Snapshot,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -546,8 +587,8 @@ mod tests {
         assert_eq!(clip_middle("short", 10), ("short".to_owned(), false));
         let v = serde_json::json!({"content": "x".repeat(50), "n": 3, "list": ["y".repeat(50)]});
         let c = clip_json(&v, 20);
-        assert!(c["content"].as_str().is_some_and(|s| s.len() < 50));
-        assert_eq!(c["n"], 3);
+        assert!(c.get("content").and_then(serde_json::Value::as_str).is_some_and(|s| s.len() < 50));
+        assert_eq!(c.get("n"), Some(&serde_json::json!(3)));
     }
 
     #[test]

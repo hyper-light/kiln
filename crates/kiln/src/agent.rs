@@ -147,6 +147,7 @@ enum Ev {
     Redial,
     Term(String, PtyOut),
     Up(Up),
+    Harness(String, crate::harness::core::Update),
 }
 
 async fn sleep_until_opt(t: Option<Instant>) {
@@ -205,6 +206,24 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     adopt_handover(&o, &mut terms, &term_tx);
     // AI coding sessions running on this machine (job pods have none), reported as they change.
     let ai = (!o.ephemeral).then(|| crate::aisessions::Reporter::new(crate::os::home_dir()));
+    // Kiln-native agent sessions on this machine (not in job pods, and not in the server's own
+    // in-process agent: the server hosts those itself). They outlive the server connection and
+    // this process's restarts: each continues its harness session.
+    let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
+    let harness = (!o.ephemeral && o.terminal).then(|| {
+        let h = crate::harness::host::Host::new(harness_tx.clone(), Some(o.state_dir.join("harness.json")), Default::default());
+        h.restore();
+        h
+    });
+    // What `kiln spawn` in this machine's terminals talks to.
+    let harness_sock = harness.as_ref().and_then(|h| match crate::harness::socket::serve(h, crate::harness::socket::path(&name)) {
+        Ok(p) => Some(p.to_string_lossy().into_owned()),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
+            None
+        }
+    });
+    let mut harness_wait: Option<Instant> = None;
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
@@ -250,6 +269,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = sleep_until_opt(redial).fuse() => Ev::Redial,
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
+            h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
         };
         match ev {
             Ev::Shutdown => {
@@ -279,7 +299,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         upgrade_pending = true;
                         tracing::info!(jobs = jobs.len(), terminals = terms.len(), "new kiln binary on disk; upgrading in place once running jobs finish");
                     }
-                    if upgrade_pending && jobs.is_empty() && let Some(exe) = exe.as_deref() {
+                    // Agent sessions mid-turn get up to ten minutes to finish it; then they are
+                    // stopped and continue (resumed) in the new image.
+                    let agents_busy = harness.as_ref().map_or(0, |h| h.busy());
+                    if upgrade_pending && agents_busy > 0 {
+                        harness_wait.get_or_insert_with(Instant::now);
+                    }
+                    let agents_ready = agents_busy == 0 || harness_wait.is_some_and(|t| t.elapsed() > Duration::from_secs(600));
+                    if upgrade_pending && jobs.is_empty() && agents_ready && let Some(exe) = exe.as_deref() {
+                        if let Some(h) = &harness {
+                            h.stop_all();
+                        }
                         let err = upgrade_in_place(&o, exe, &terms);
                         // Only reached when the exec failed: carry on with this binary.
                         tracing::error!(error = %err, "in-place upgrade failed; continuing on the running binary");
@@ -345,6 +375,21 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         uplink.0.send(Up::Term(AgentMsg::TermList { sessions })).await.ok();
                         if let Some(ai) = &ai {
                             ai.reset();
+                        }
+                        // The server learns (again) which agent sessions run here, then all of each.
+                        if let Some(h) = &harness {
+                            while harness_rx.try_recv().is_ok() {}
+                            if let Ok(json) = serde_json::to_string(&h.inventory()) {
+                                uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
+                            }
+                            for info in h.list() {
+                                let Some(s) = h.get(&info.id) else { continue };
+                                for u in s.snapshot() {
+                                    if let Ok(json) = serde_json::to_string(&u) {
+                                        uplink.0.send(Up::Term(AgentMsg::Harness { session: info.id.clone(), json })).await.ok();
+                                    }
+                                }
+                            }
                         }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
                     }
@@ -414,7 +459,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if terms.contains_key(&session) {
                             continue;
                         }
-                        match terminal::spawn(o.shell.as_deref(), command.as_deref(), cols, rows) {
+                        // `kiln spawn` in this terminal reaches this agent's sessions.
+                        let mut env = vec![("KILN_TERM_SESSION", session.clone())];
+                        if let Some(sock) = &harness_sock {
+                            env.push(("KILN_HARNESS_SOCK", sock.clone()));
+                        }
+                        match terminal::spawn_with(o.shell.as_deref(), command.as_deref(), cols, rows, &env) {
                             Ok((pty, rx)) => {
                                 let tx = term_tx.clone();
                                 let s = session.clone();
@@ -465,6 +515,54 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             uplink.0.send(Up::Term(AgentMsg::AiTranscript { req, json: None })).await.ok();
                         }
                     },
+                    ServerMsg::HarnessOpen { session, json } => {
+                        let opened = match (&harness, serde_json::from_str::<crate::harness::session::Spec>(&json)) {
+                            (None, _) => Err(anyhow::anyhow!("agent sessions are not enabled on this runner")),
+                            (_, Err(e)) => Err(anyhow::anyhow!("bad session spec: {e}")),
+                            (Some(h), Ok(mut spec)) => {
+                                // Started on a shell: in that shell's directory and environment.
+                                if let Some(pid) = spec.shell.as_ref().and_then(|t| terms.get(t)).and_then(|(pty, _)| pty.pid()) {
+                                    let (cwd, env) = crate::harness::host::shell_context(pid);
+                                    if spec.cwd.is_none() {
+                                        spec.cwd = cwd;
+                                    }
+                                    if spec.env.is_empty() {
+                                        spec.env = env;
+                                    }
+                                }
+                                h.open(Some(session.clone()), spec).map(|_| ())
+                            }
+                        };
+                        if let Err(e) = opened {
+                            for u in crate::harness::host::refusal(&session, &json, &format!("{e:#}")) {
+                                if let Ok(json) = serde_json::to_string(&u) {
+                                    uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                                }
+                            }
+                        }
+                    }
+                    ServerMsg::HarnessCmd { session, json } => {
+                        let known = harness.as_ref().is_some_and(|h| h.get(&session).is_some());
+                        match serde_json::from_str::<crate::harness::model::Command>(&json) {
+                            Ok(c) if known => {
+                                if let Some(h) = &harness {
+                                    h.command(&session, c);
+                                }
+                            }
+                            Ok(_) => {
+                                // Gone here (e.g. stopped while the server was away): say so.
+                                if let Ok(json) = serde_json::to_string(&crate::harness::core::Update::Closed) {
+                                    uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
+                                }
+                            }
+                            Err(e) => tracing::debug!(error = %e, "unreadable agent session command"),
+                        }
+                    }
+                    ServerMsg::HarnessClose { session } => {
+                        if let Some(h) = &harness {
+                            h.close(&session);
+                        }
+                    }
                 }
             }
             Ev::Term(session, out) => {
@@ -501,6 +599,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             buffered = buffered.saturating_sub(d.len());
                         }
                     }
+                }
+            }
+            Ev::Harness(session, u) => {
+                // Not kept across a disconnect: the reconnect sends every session whole.
+                if connected && let Ok(json) = serde_json::to_string(&u) {
+                    uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
                 }
             }
             Ev::Done(r) => {

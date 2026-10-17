@@ -95,6 +95,8 @@ pub struct Hub {
     pub terms: Mutex<HashMap<String, async_channel::Sender<TermOut>>>,
     /// Every terminal session, local and on machines.
     pub terminals: crate::termsess::Sessions,
+    /// Every kiln-native agent session, local and on machines.
+    pub harness: crate::harness::registry::Registry,
     /// The AI coding sessions each connected machine last reported.
     pub ai_sessions: Mutex<HashMap<String, Vec<crate::aisessions::AiSession>>>,
     /// Transcript requests waiting for their machine's answer, by request number.
@@ -137,6 +139,7 @@ impl Hub {
         let generation =
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
+        let harness_dir = cfg.data("harness");
         Arc::new(Self {
             cfg,
             store,
@@ -149,6 +152,7 @@ impl Hub {
             events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
             terminals: crate::termsess::Sessions::new(),
+            harness: crate::harness::registry::Registry::new(harness_dir),
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
@@ -426,6 +430,8 @@ impl Hub {
             }
         }
         metrics::agent_samples().write().remove(name);
+        // Its agent sessions keep running there too; they are announced again on reconnect.
+        self.harness.machine_lost(self, name);
         if self.ai_sessions.lock().remove(name).is_some() {
             self.emit(&serde_json::json!({ "type": "ai_sessions", "machine": name }));
         }
@@ -547,6 +553,14 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
+            AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
+                Ok(u) => self.harness.ingest(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u),
+                Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session update"),
+            },
+            AgentMsg::HarnessInventory { json } => match serde_json::from_str::<crate::harness::host::Inventory>(&json) {
+                Ok(inv) => self.harness.inventory(self, &agent, inv),
+                Err(e) => tracing::debug!(%agent, error = %e, "unreadable agent session inventory"),
+            },
             AgentMsg::TermReplay { session, data } => {
                 let key = format!("{agent}/{session}");
                 let tx = self.terms.lock().get(&key).cloned();

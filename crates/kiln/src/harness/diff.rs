@@ -209,6 +209,80 @@ fn group(a: &[&str], b: &[&str], ops: &[Op], context: usize) -> Vec<Hunk> {
     hunks
 }
 
+/// Lines of hunks kept per changed file (the counts always cover everything).
+const MAX_CHANGE_LINES: usize = 4_000;
+
+/// A file's cumulative change: its baseline against how it is on disk now. Blocking (reads the
+/// file); None when there is no net change.
+pub fn file_change(job: &super::core::ChangeJob) -> Option<super::model::FileChange> {
+    use super::core::Baseline;
+    use super::model::FileChange;
+    let at = crate::util::now_ms();
+    let path = std::path::Path::new(&job.abs);
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
+    let now: Option<Result<String, ()>> = meta.map(|m| {
+        if m.len() > MAX_FILE {
+            return Err(());
+        }
+        std::fs::read(path).ok().and_then(|b| String::from_utf8(b).ok()).ok_or(())
+    });
+    let count = |hunks: &[Hunk]| -> (u32, u32) {
+        let mut add = 0u32;
+        let mut del = 0u32;
+        for l in hunks.iter().flat_map(|h| h.lines.iter()) {
+            match l.as_bytes().first() {
+                Some(b'+') => add += 1,
+                Some(b'-') => del += 1,
+                _ => {}
+            }
+        }
+        (add, del)
+    };
+    let shown = |mut hunks: Vec<Hunk>| -> (Vec<Hunk>, bool) {
+        let mut total = 0usize;
+        let mut keep = hunks.len();
+        for (i, h) in hunks.iter().enumerate() {
+            total += h.lines.len();
+            if total > MAX_CHANGE_LINES {
+                keep = i;
+                break;
+            }
+        }
+        let cut = keep < hunks.len();
+        hunks.truncate(keep);
+        (hunks, cut)
+    };
+    let blank = |rel: &str| FileChange { path: rel.to_owned(), created: false, deleted: false, added: 0, removed: 0, hunks: Vec::new(), truncated: true, at };
+    match (&job.baseline, now) {
+        (Baseline::Absent, None) => None,
+        (Baseline::Absent, Some(Ok(text))) => {
+            let d = created(&job.rel, &text);
+            let (add, _) = count(&d.hunks);
+            let (hunks, cut) = shown(d.hunks);
+            Some(FileChange { path: job.rel.clone(), created: true, deleted: false, added: add, removed: 0, hunks, truncated: cut, at })
+        }
+        (Baseline::Text(before), None) => {
+            let hunks = hunks(before, "", CONTEXT);
+            let (_, del) = count(&hunks);
+            let (hunks, cut) = shown(hunks);
+            Some(FileChange { path: job.rel.clone(), created: false, deleted: true, added: 0, removed: del, hunks, truncated: cut, at })
+        }
+        (Baseline::Text(before), Some(Ok(text))) => {
+            if *before == text {
+                return None;
+            }
+            let all = hunks(before, &text, CONTEXT);
+            if all.is_empty() {
+                return None;
+            }
+            let (add, del) = count(&all);
+            let (hunks, cut) = shown(all);
+            Some(FileChange { path: job.rel.clone(), created: false, deleted: false, added: add, removed: del, hunks, truncated: cut, at })
+        }
+        (Baseline::TooLarge, _) | (_, Some(Err(()))) => Some(blank(&job.rel)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +363,29 @@ mod tests {
         let created = created("x.rs", "fn main() {}\n");
         assert!(created.created);
         assert_eq!(created.hunks.first().map(|h| h.new_lines), Some(1));
+    }
+
+    #[test]
+    fn cumulative_file_changes() -> anyhow::Result<()> {
+        use super::super::core::{Baseline, ChangeJob};
+        let dir = tempfile::tempdir()?;
+        let f = dir.path().join("a.txt");
+        let abs = f.to_string_lossy().into_owned();
+        std::fs::write(&f, "one\ntwo\nthree\n")?;
+        let job = |b: Baseline| ChangeJob { abs: abs.clone(), rel: "a.txt".into(), baseline: b };
+        // Edited twice since the baseline: one change, counted once.
+        let c = file_change(&job(Baseline::Text("one\n2\nthree\n".into()))).ok_or_else(|| anyhow::anyhow!("no change"))?;
+        assert_eq!((c.added, c.removed, c.created, c.deleted), (1, 1, false, false));
+        // Back to how it was: nothing.
+        assert!(file_change(&job(Baseline::Text("one\ntwo\nthree\n".into()))).is_none());
+        // New file.
+        let c = file_change(&job(Baseline::Absent)).ok_or_else(|| anyhow::anyhow!("no change"))?;
+        assert!(c.created && c.added == 3);
+        // Deleted.
+        std::fs::remove_file(&f)?;
+        let c = file_change(&job(Baseline::Text("x\ny\n".into()))).ok_or_else(|| anyhow::anyhow!("no change"))?;
+        assert!(c.deleted && c.removed == 2);
+        assert!(file_change(&job(Baseline::Absent)).is_none());
+        Ok(())
     }
 }

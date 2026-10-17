@@ -50,7 +50,10 @@ impl Kind {
 
     /// The process to start for `spec` (cwd, environment and arguments).
     pub fn launch(&self, spec: &Spec) -> anyhow::Result<Process> {
-        let program = crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?;
+        let program = match &spec.program {
+            Some(p) => std::path::PathBuf::from(p),
+            None => crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
+        };
         let mut p = Process::new(program);
         let cwd = spec.cwd.clone().unwrap_or_else(|| crate::os::home_dir().to_string_lossy().into_owned());
         if !std::path::Path::new(&cwd).is_dir() {

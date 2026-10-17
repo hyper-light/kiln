@@ -231,6 +231,28 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
         (&Method::GET, ["api", "terminal", "ws"]) => terminal_ws(hub.clone(), q, req).await,
+        (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
+        (&Method::GET, ["api", "harness", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.harness.list())),
+        (&Method::POST, ["api", "harness", "sessions"]) => harness_open(&hub, req).await,
+        (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.list().into_iter().find(|i| i.id == *id) {
+            Some(info) => Ok(srv::json(StatusCode::OK, &info)),
+            None => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
+        },
+        (&Method::DELETE, ["api", "harness", "sessions", id]) => {
+            let id = (*id).to_owned();
+            if hub.harness.close(&hub, &id).await {
+                hub.store.audit("admin".into(), "agent.close".into(), id).await;
+                Ok(srv::status(StatusCode::NO_CONTENT))
+            } else {
+                Err(err(StatusCode::NOT_FOUND, "no such agent session"))
+            }
+        }
+        (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
+            let id = (*id).to_owned();
+            harness_command(&hub, &id, req).await
+        }
+        (&Method::POST, ["api", "harness", "command"]) => harness_broadcast(&hub, req).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -1269,6 +1291,126 @@ async fn terminal_attach(
     session.detach();
     hub.emit_terminals();
     result
+}
+
+// ------------------------------------------------------------------ agent sessions (kiln-native)
+
+/// The harnesses each machine offers; `?target=` narrows it to one ("local", "agent:<name>").
+fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
+    let all = hub.harness.kinds();
+    match q.get("target") {
+        Some(t) => srv::json(StatusCode::OK, &all.get(t).cloned().unwrap_or_default()),
+        None => srv::json(StatusCode::OK, &all),
+    }
+}
+
+#[derive(Deserialize)]
+struct HarnessOpen {
+    target: String,
+    spec: crate::harness::session::Spec,
+    #[serde(default)]
+    count: Option<usize>,
+}
+
+async fn harness_open(hub: &Hub, req: Request) -> R {
+    let body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Agents run programs as the machine's user, like terminals: the same switch governs both.
+    if body.target == "local" && !hub.cfg.terminal.enabled {
+        return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
+    }
+    if crate::harness::kinds::Kind::get(&body.spec.kind).is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, format!("unknown harness {:?}", body.spec.kind)));
+    }
+    hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
+    let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &infos))
+}
+
+async fn harness_command(hub: &Hub, id: &str, req: Request) -> R {
+    let c: crate::harness::model::Command = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    match hub.harness.command(hub, id, c).await {
+        crate::harness::registry::Sent::Ok => Ok(srv::status(StatusCode::NO_CONTENT)),
+        crate::harness::registry::Sent::NoSession => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
+        crate::harness::registry::Sent::Unreachable => Err(err(StatusCode::CONFLICT, "the session's machine is not connected")),
+    }
+}
+
+#[derive(Deserialize)]
+struct HarnessBroadcast {
+    ids: Vec<String>,
+    command: crate::harness::model::Command,
+}
+
+/// One command for several sessions (a message to a selection, interrupt all, ...). Each send
+/// gets its own message id.
+async fn harness_broadcast(hub: &Hub, req: Request) -> R {
+    use crate::harness::model::Command;
+    let b: HarnessBroadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let mut done = Vec::new();
+    for id in b.ids.iter().take(256) {
+        let c = match &b.command {
+            Command::Send { text, mode, .. } => Command::Send { id: crate::util::new_id(), text: text.clone(), mode: *mode },
+            other => other.clone(),
+        };
+        if hub.harness.command(hub, id, c).await == crate::harness::registry::Sent::Ok {
+            done.push(id.clone());
+        }
+    }
+    Ok(srv::json(StatusCode::OK, &json!({ "sent": done })))
+}
+
+fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
+    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    crate::rt::spawn(async move {
+        let Ok(socket) = upgrade.await else { return };
+        if let Err(e) = harness_attach(hub, id, socket).await {
+            tracing::debug!(error = %format!("{e:#}"), "agent session websocket ended");
+        }
+    });
+    Ok(resp)
+}
+
+/// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
+/// viewer sends commands (JSON tagged `type`).
+async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    let (mut tx, mut rx) = socket.split();
+    let Some(att) = hub.harness.attach(&id) else {
+        tx.send(ws::text(json!({"t": "closed"}).to_string())).await?;
+        return Ok(());
+    };
+    for f in att.frames {
+        tx.send(ws::text(f)).await?;
+    }
+    let mut live = att.live;
+    loop {
+        futures::select_biased! {
+            f = live.recv().fuse() => match f {
+                Ok(frame) => tx.send(ws::text(frame.as_ref())).await?,
+                Err(async_broadcast::RecvError::Overflowed(_)) => {
+                    // Fell behind: start over from the current state (it begins with "open").
+                    for f in hub.harness.frames(&id).unwrap_or_default() {
+                        tx.send(ws::text(f)).await?;
+                    }
+                }
+                Err(async_broadcast::RecvError::Closed) => return Ok(()),
+            },
+            m = rx.next().fuse() => match m {
+                Some(Ok(Message::Text(t))) => match serde_json::from_str::<crate::harness::model::Command>(t.as_str()) {
+                    Ok(c) => match hub.harness.command(&hub, &id, c).await {
+                        crate::harness::registry::Sent::Ok => {}
+                        crate::harness::registry::Sent::NoSession => tx.send(ws::text(json!({"t": "error", "error": "this session is gone"}).to_string())).await?,
+                        crate::harness::registry::Sent::Unreachable => {
+                            tx.send(ws::text(json!({"t": "error", "error": "the session's machine is not connected"}).to_string())).await?;
+                        }
+                    },
+                    Err(e) => tx.send(ws::text(json!({"t": "error", "error": format!("bad command: {e}")}).to_string())).await?,
+                },
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
+                _ => {}
+            },
+        }
+    }
 }
 
 // ------------------------------------------------------------------ misc

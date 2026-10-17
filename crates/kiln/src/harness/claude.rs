@@ -144,6 +144,17 @@ impl Claude {
         core.upsert(&format!("notice-{}", self.notice_seq), parent, Body::Notice { level, text: text.into() });
     }
 
+    /// Something is being worked on: note when the turn began.
+    fn begin(&mut self, core: &mut Core) {
+        if !self.turn {
+            self.turn = true;
+            if core.state.turn_started.is_none() {
+                core.state.turn_started = Some(Core::now());
+                core.touch_state();
+            }
+        }
+    }
+
     fn busy(&self, core: &Core) -> bool {
         self.turn || !self.inflight.is_empty() || !core.state.approvals.is_empty()
     }
@@ -176,6 +187,8 @@ impl Claude {
         }
         core.state.exit = Some(ExitInfo { code, error });
         core.state.activity = None;
+        core.state.turn_started = None;
+        core.state.doing = None;
         core.set_status(Status::Exited);
         core.touch_state();
     }
@@ -228,8 +241,8 @@ impl Claude {
             Command::Suggest { client, query } => {
                 self.request(core, Pending::Suggest(client), json!({"subtype": "file_suggestions", "query": query}));
             }
-            // Restarts are the brain's (it owns the process).
-            Command::Restart => {}
+            // Restarts and snapshots are the session's (it owns the process and the sink).
+            Command::Restart | Command::Snapshot => {}
         }
     }
 
@@ -257,6 +270,9 @@ impl Claude {
             o.insert("priority".into(), json!("now"));
         }
         core.write(&msg);
+        if core.state.goal.is_empty() {
+            core.state.goal = clip_middle(&text, 600).0;
+        }
         self.inflight.insert(id.clone());
         core.state.delivery.insert(id.clone(), Delivery::Sent);
         prune_delivery(core);
@@ -300,6 +316,9 @@ impl Claude {
                 }
                 if let Some(tid) = approval.tool_id.as_deref() {
                     set_tool_status(core, tid, ToolStatus::Running);
+                    if let Some(Body::Tool(t)) = core.get(tid).map(|e| &e.body) {
+                        core.state.doing = Some(doing(t));
+                    }
                 }
                 r
             }
@@ -488,6 +507,11 @@ impl Claude {
         if let Some(tid) = tool_id.as_deref() {
             set_tool_status(core, tid, ToolStatus::Pending);
         }
+        core.state.doing = Some(match tool {
+            ToolKind::Question => "Asking you a question".to_owned(),
+            ToolKind::Plan => "Waiting for you to review a plan".to_owned(),
+            _ => "Waiting for your approval".to_owned(),
+        });
         self.asks.insert(id, Ask { input });
         core.add_approval(approval);
         self.settle(core);
@@ -526,7 +550,7 @@ impl Claude {
                 }
                 let activity = str_of(v, "status").map(str::to_owned);
                 if activity.as_deref() == Some("requesting") {
-                    self.turn = true;
+                    self.begin(core);
                 }
                 core.state.activity = activity;
                 core.touch_state();
@@ -534,11 +558,13 @@ impl Claude {
             }
             "session_state_changed" => match str_of(v, "state") {
                 Some("running") => {
-                    self.turn = true;
+                    self.begin(core);
                     self.settle(core);
                 }
                 Some("idle") => {
                     self.turn = false;
+                    core.state.turn_started = None;
+                    core.touch_state();
                     self.settle(core);
                     self.drain_queue(core);
                 }
@@ -677,7 +703,7 @@ impl Claude {
             .or_else(|| ev.get("message").and_then(|m| str_of(m, "id")))
             .unwrap_or("")
             .to_owned();
-        self.turn = true;
+        self.begin(core);
         match str_of(ev, "type").unwrap_or("") {
             "message_start" => {
                 self.streams.entry(msg_id).or_default();
@@ -687,6 +713,19 @@ impl Claude {
                 let index = ev.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let block = ev.get("content_block").cloned().unwrap_or(Value::Null);
                 let id = format!("{msg_id}:{index}");
+                if parent.is_none() {
+                    let now = match str_of(&block, "type") {
+                        Some("text") => Some("Writing"),
+                        Some("thinking") => Some("Thinking"),
+                        _ => None,
+                    };
+                    if let Some(d) = now
+                        && self.tools.is_empty()
+                    {
+                        core.state.doing = Some(d.to_owned());
+                        core.touch_state();
+                    }
+                }
                 match str_of(&block, "type") {
                     Some("text") => {
                         core.upsert(&id, parent, Body::Assistant { text: str_of(&block, "text").unwrap_or("").to_owned(), streaming: true });
@@ -714,14 +753,15 @@ impl Claude {
     }
 
     fn assistant(&mut self, core: &mut Core, v: &Value, parent: Option<String>) {
-        self.turn = true;
+        self.begin(core);
         let Some(msg) = v.get("message") else { return };
         let msg_id = str_of(msg, "id").unwrap_or("").to_owned();
-        if let Some(m) = str_of(msg, "model").filter(|_| parent.is_none()) {
-            if core.state.model != m && !m.starts_with("<synthetic") {
-                core.state.model = m.to_owned();
-                core.touch_state();
-            }
+        if let Some(m) = str_of(msg, "model").filter(|_| parent.is_none())
+            && core.state.model != m
+            && !m.starts_with("<synthetic")
+        {
+            core.state.model = m.to_owned();
+            core.touch_state();
         }
         let error = v.get("error").is_some() || v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true);
         for block in msg.get("content").and_then(Value::as_array).cloned().unwrap_or_default() {
@@ -738,6 +778,10 @@ impl Claude {
                     if error {
                         self.notice(core, Level::Error, text, parent.clone());
                     } else {
+                        if parent.is_none() && !text.trim().is_empty() {
+                            core.state.summary = clip_middle(text.trim(), 600).0;
+                            core.touch_state();
+                        }
                         core.upsert(&id, parent.clone(), Body::Assistant { text: clip_middle(&text, super::model::TEXT_MAX).0, streaming: false });
                     }
                 }
@@ -774,6 +818,10 @@ impl Claude {
                         started: Core::now(),
                         ended: None,
                     };
+                    if parent.is_none() {
+                        core.state.doing = Some(doing(&call));
+                        core.touch_state();
+                    }
                     self.tools.insert(tid.clone(), (name, input));
                     core.upsert(&tid, parent.clone(), Body::Tool(Box::new(call)));
                 }
@@ -828,6 +876,11 @@ impl Claude {
         }
         let id = if uuid.is_empty() { format!("user-{}", Core::now()) } else { uuid.to_owned() };
         let ours = core.state.delivery.contains_key(&id);
+        let human = ours || v.get("isReplay").and_then(Value::as_bool) == Some(true);
+        if human && core.state.goal.is_empty() {
+            core.state.goal = clip_middle(t, 600).0;
+            core.touch_state();
+        }
         core.upsert(
             &id,
             parent,
@@ -835,7 +888,7 @@ impl Claude {
                 text: clip_middle(t, super::model::TEXT_MAX).0,
                 images: 0,
                 client_id: ours.then(|| id.clone()),
-                origin: Some(if ours || v.get("isReplay").and_then(Value::as_bool) == Some(true) { "human".into() } else { "system".into() }),
+                origin: Some(if human { "human".into() } else { "system".into() }),
             },
         );
     }
@@ -870,6 +923,9 @@ impl Claude {
         } else {
             ToolStatus::Done
         };
+        if status == ToolStatus::Done {
+            track_changes(core, structured);
+        }
         let (output, truncated) = clip_middle(&text, OUTPUT_MAX);
         if let Some(ev) = core.get_mut(tid)
             && let Body::Tool(t) = &mut ev.body
@@ -908,10 +964,16 @@ impl Claude {
             );
         }
         self.tools.remove(tid);
+        if self.tools.is_empty() && self.turn && core.state.approvals.is_empty() {
+            core.state.doing = Some("Thinking".to_owned());
+            core.touch_state();
+        }
     }
 
     fn result(&mut self, core: &mut Core, v: &Value) {
         self.turn = false;
+        core.state.turn_started = None;
+        core.state.doing = None;
         let u = &mut core.state.usage;
         if let Some(c) = v.get("total_cost_usd").and_then(Value::as_f64) {
             u.cost_usd = u.cost_usd.max(c);
@@ -972,7 +1034,7 @@ impl Claude {
             self.inflight.remove(id);
         }
         if state == Delivery::Started {
-            self.turn = true;
+            self.begin(core);
         }
         if core.state.delivery.contains_key(id) {
             core.state.delivery.insert(id.to_owned(), state);
@@ -1010,6 +1072,59 @@ fn finish_tool(core: &mut Core, id: &str, status: ToolStatus, output: Option<Str
             t.output = output;
         }
         t.ended = Some(Core::now());
+    }
+}
+
+/// What a running tool call is doing, in plain words.
+pub fn doing(t: &ToolCall) -> String {
+    let short = |s: &str, n: usize| -> String {
+        let one = s.lines().next().unwrap_or("").trim();
+        if one.chars().count() > n { format!("{}…", one.chars().take(n).collect::<String>()) } else { one.to_owned() }
+    };
+    match t.tool {
+        ToolKind::Shell => format!("Running {}", short(&t.title, 60)),
+        ToolKind::Edit => format!("Editing {}", short(&t.title, 60)),
+        ToolKind::Read => format!("Reading {}", short(&t.title, 60)),
+        ToolKind::Search => format!("Searching for {}", short(&t.title, 50)),
+        ToolKind::Web if t.name == "WebSearch" => format!("Searching the web for {}", short(&t.title, 50)),
+        ToolKind::Web => format!("Fetching {}", short(&t.title, 60)),
+        ToolKind::Agent => format!("Delegating: {}", short(&t.title, 60)),
+        ToolKind::Skill => format!("Using the {} skill", short(&t.title, 40)),
+        ToolKind::Todo => "Updating the plan".to_owned(),
+        ToolKind::Question => "Asking you a question".to_owned(),
+        ToolKind::Plan => "Presenting a plan".to_owned(),
+        ToolKind::Mcp => format!("Calling {}", short(&t.title, 60)),
+        ToolKind::Other => format!("Using {}", t.name),
+    }
+}
+
+/// Note the files a finished edit changed, for the session's changeset.
+fn track_changes(core: &mut Core, structured: &Value) {
+    use super::core::{BASELINE_MAX, Baseline};
+    let Some(o) = structured.as_object() else { return };
+    let cwd = core.state.cwd.clone();
+    let abs = |p: &str| -> String {
+        if std::path::Path::new(p).is_absolute() || cwd.is_empty() { p.to_owned() } else { format!("{}/{p}", cwd.trim_end_matches('/')) }
+    };
+    if let Some(fp) = o.get("filePath").and_then(Value::as_str) {
+        let a = abs(fp);
+        if o.contains_key("originalFile") {
+            let before = match o.get("originalFile") {
+                Some(Value::String(t)) if t.len() > BASELINE_MAX => Baseline::TooLarge,
+                Some(Value::String(t)) => Baseline::Text(t.clone()),
+                _ => Baseline::Absent,
+            };
+            core.note_baseline(&a, before);
+        }
+        core.want_change(&a, &rel(fp, &cwd));
+    }
+    // Files a shell command changed that the agent had read or edited before.
+    if let Some(files) = o.get("bashEditDiff").and_then(|b| b.get("files")).and_then(Value::as_array) {
+        for f in files {
+            if let Some(fp) = f.get("filePath").and_then(Value::as_str) {
+                core.want_change(&abs(fp), &rel(fp, &cwd));
+            }
+        }
     }
 }
 
