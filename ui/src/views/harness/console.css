@@ -259,6 +259,27 @@
   background: #ffffff0d;
   color: #ededee;
 }
+/* The microphone: listening, it says so (a stop square and the time); where it can't listen it
+   stays, dimmed, and says why when tapped. */
+.cp-mic[data-state="listening"] {
+  display: inline-flex;
+  width: auto;
+  gap: 7px;
+  padding: 0 11px;
+  background: #d5a4ad1f;
+  color: #ecc9cc;
+}
+.cp-mic[data-state="off"] {
+  color: #5d606a;
+}
+.cp-mic:disabled {
+  cursor: default;
+}
+.cp-mic-time {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
 .cp-badge {
   position: absolute;
   top: 2px;

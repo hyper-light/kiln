@@ -56,12 +56,12 @@ export async function request<T>(
   method: string,
   path: string,
   body?: unknown,
-  opts: { raw?: boolean; signal?: AbortSignal; file?: Blob } = {},
+  opts: { raw?: boolean; signal?: AbortSignal; file?: Blob; type?: string } = {},
 ): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: "same-origin",
-    headers: opts.file ? { "content-type": "application/octet-stream" } : body !== undefined ? { "content-type": "application/json" } : undefined,
+    headers: opts.file ? { "content-type": opts.type ?? "application/octet-stream" } : body !== undefined ? { "content-type": "application/json" } : undefined,
     body: opts.file ?? (body !== undefined ? JSON.stringify(body) : undefined),
     signal: opts.signal,
   };
@@ -193,6 +193,11 @@ export const api = {
   upgradeServer: (action: "restart" | "replace") => post<UpdateJob>("/api/updates/server", { action }),
   uploadBinary: (target: string, file: Blob) => request<KilnBinary>("POST", `/api/updates/binaries${qs({ target })}`, undefined, { file }),
   deleteBinary: (target: string) => del<void>(`/api/updates/binaries/${enc(target)}`),
+
+  /** Whether kiln turns recordings into text (for browsers without speech recognition of their own). */
+  voice: (signal?: AbortSignal) => get<{ transcribe: boolean; language: string }>("/api/voice", signal),
+  /** A recording's words; sent as recorded (its own audio type), up to 25 MiB. */
+  transcribe: (audio: Blob) => request<{ text: string }>("POST", "/api/voice/transcribe", undefined, { file: audio, type: audio.type || "audio/webm" }),
 };
 
 /* ---------------------------- folders on a machine ---------------------------- */
