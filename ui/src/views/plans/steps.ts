@@ -44,7 +44,27 @@ export function withoutTitle(body: string, title: string): string {
   return lines.slice(1).join("\n").trim();
 }
 
-/** A plan as one markdown file: its title as the heading, then its text. */
-export function planMarkdown(title: string, body: string): string {
-  return `# ${title}\n\n${withoutTitle(body, title)}\n`;
+/** A plan's items as markdown, each under its own heading (crates/kiln/src/plans `markdown`). */
+export function itemsMarkdown(items: readonly { title: string; description: string; examples: string; acceptance: string; testing: string }[]): string {
+  return items
+    .map((it, i) => {
+      const parts = [`## ${i + 1}. ${it.title.trim()}`];
+      if (it.description.trim()) parts.push(it.description.trim());
+      for (const [name, v] of [
+        ["Examples", it.examples],
+        ["Acceptance criteria", it.acceptance],
+        ["Testing", it.testing],
+      ] as const) {
+        if (v.trim()) parts.push(`**${name}**\n\n${v.trim()}`);
+      }
+      return parts.join("\n\n");
+    })
+    .join("\n\n");
+}
+
+/** A plan as one markdown file: its title as the heading, its text, then its items. */
+export function planMarkdown(title: string, body: string, items: Parameters<typeof itemsMarkdown>[0] = []): string {
+  const text = withoutTitle(body, title);
+  const rest = itemsMarkdown(items);
+  return `# ${title}\n\n${[text, rest].filter(Boolean).join("\n\n")}\n`;
 }

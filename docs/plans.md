@@ -6,34 +6,41 @@ any harness kiln runs (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...
 
 ## Keeping one
 
-- **Agents → Plans → New plan**: a title and the plan in markdown, with tags.
+- **In an agent's Plan tab**, under **Your plans**: **New plan**, then its steps one at a time,
+  each with its own **description**, **examples**, **acceptance criteria** (when it's done) and
+  **testing** (examples, scenarios, criteria); an optional overview for what every step should
+  know. Save it, change it (**Edit**), and run it on that agent, without leaving it.
+- **Agents → Plans → New plan**: the same, with tags, and the plan's text in markdown as well.
 - **Save plan** under a plan an agent proposes: a plan-mode plan waiting for approval, the plan an
   agent laid out, or its todo list. The plan keeps where it came from (agent, harness, machine,
   folder); naming only the agent (`source.session`) is enough, kiln fills in the rest.
 - **Agents** keep theirs with kiln's MCP tools: `plans_create` (and `plans_list`, `plans_get`,
   `plans_update`, `plans_versions`, `plans_run`, `plans_delete`), or `kiln.plans.*` in code mode.
 
-A plan's **steps** are the items of its top-level lists (`1.`, `-`, `*`, `- [ ]`); lines indented
-under an item belong to it, and lists in code blocks don't count. The editor shows them as you
-type.
+A plan's **steps** are the ones written with their parts; a plan written only as text has the
+items of its top-level lists (`1.`, `-`, `*`, `- [ ]`) as its steps (lines indented under an
+item belong to it, and lists in code blocks don't count). The editor shows them as you type.
 
 ## Changing one
 
-Saving a new title or text makes a new version; the old ones stay, readable, and any one can be
-made current again (as a new version, so nothing is lost). Tags change without a new version.
+Saving a new title, text or steps makes a new version; the old ones stay, readable, and any one
+can be made current again (as a new version, so nothing is lost). Tags change without a new
+version.
 
 ## Running one
 
 From the plan: **Run it**, on an agent that runs or on a new one (machine, harness, folder):
 
 - **One message**: the whole plan, asking the agent to carry it out.
-- **Step by step**: each step its own message, waiting in the agent's queue until the turn before it
-  ends, so the agent does one step a turn.
+- **Step by step**: each step its own message (with its parts), waiting in the agent's queue until
+  the turn before it ends, so the agent does one step a turn.
 - **Goals**: each step a goal in the agent's goal stack (docs/goals.md): the next goes once the one
-  before is met, as its harness's own `/goal` where it has one.
+  before is met, as its harness's own `/goal` where it has one. A step's goal is one line: its
+  title, what to do, its examples, "Done when:" its acceptance criteria and "Tested by:" its
+  testing, so `/goal` both works toward it and checks it.
 
-From an agent: its **Plan** tab shows the plan it proposed (with **Save plan**) and **Run a saved
-plan**, which runs any kept plan on that agent the same two ways.
+From an agent: its **Plan** tab shows the plan it proposed (with **Save plan**), **Your plans** (write
+one, pick one, **Run here** any of the three ways) and its **Goal stack**.
 
 A run sends the saved version and is listed under the plan with the agent it went to.
 
@@ -49,6 +56,9 @@ turning it on again makes a new one. **Export as markdown** downloads it; the sh
 the plan**, for keeping it in another kiln.
 
 ## API
+
+A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing}]` (up to 100, each part up to 16 KiB); `steps` is what runs, one string a step.
+
 
 | Method | Path | |
 | --- | --- | --- |

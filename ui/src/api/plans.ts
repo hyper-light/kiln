@@ -10,11 +10,27 @@ export interface PlanSource {
   agent?: string | null;
 }
 
+/** One item of a plan: a piece of the work, with what it's like and what makes it done. */
+export interface PlanItem {
+  title: string;
+  /** What to do (markdown). */
+  description: string;
+  examples: string;
+  /** When it's done. */
+  acceptance: string;
+  /** How it's tested: examples, scenarios, criteria. */
+  testing: string;
+}
+
+export const emptyItem = (): PlanItem => ({ title: "", description: "", examples: "", acceptance: "", testing: "" });
+
 export interface Plan {
   id: string;
   title: string;
-  /** Markdown; its top-level list items are its steps. */
+  /** Markdown; without items, its top-level list items are its steps. */
   body: string;
+  /** The work, item by item. */
+  items: PlanItem[];
   tags: string[];
   source: PlanSource | null;
   /** Its share link's token, when shared. */
@@ -30,6 +46,7 @@ export interface PlanVersion {
   version: number;
   title: string;
   body: string;
+  items?: PlanItem[];
   at: number;
   by: string;
 }
@@ -52,6 +69,7 @@ export interface PlanRan {
 export interface SharedPlan {
   title: string;
   body: string;
+  items?: PlanItem[];
   steps: string[];
   version: number;
   updated_at: number;
@@ -67,8 +85,8 @@ const enc = encodeURIComponent;
 export const plansApi = {
   list: (signal?: AbortSignal) => request<Plan[]>("GET", "/api/plans", undefined, { signal }),
   get: (id: string, signal?: AbortSignal) => request<Plan>("GET", `/api/plans/${enc(id)}`, undefined, { signal }),
-  create: (p: { title?: string; body: string; tags?: string[]; source?: PlanSource }) => request<Plan>("POST", "/api/plans", p),
-  update: (id: string, patch: { title?: string; body?: string; tags?: string[] }) => request<Plan>("PATCH", `/api/plans/${enc(id)}`, patch),
+  create: (p: { title?: string; body: string; items?: PlanItem[]; tags?: string[]; source?: PlanSource }) => request<Plan>("POST", "/api/plans", p),
+  update: (id: string, patch: { title?: string; body?: string; items?: PlanItem[]; tags?: string[] }) => request<Plan>("PATCH", `/api/plans/${enc(id)}`, patch),
   remove: (id: string) => request<void>("DELETE", `/api/plans/${enc(id)}`),
   versions: (id: string, signal?: AbortSignal) => request<PlanVersion[]>("GET", `/api/plans/${enc(id)}/versions`, undefined, { signal }),
   runs: (id: string, signal?: AbortSignal) => request<PlanRun[]>("GET", `/api/plans/${enc(id)}/runs`, undefined, { signal }),

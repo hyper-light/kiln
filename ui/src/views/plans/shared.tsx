@@ -7,7 +7,7 @@ import { CopyButton } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useResource } from "@/lib/hooks";
 import { Prose } from "@/views/harness/parts";
-import { planMarkdown, withoutTitle } from "./steps";
+import { itemsMarkdown, planMarkdown, withoutTitle } from "./steps";
 import "./plans.css";
 
 export default function SharedPlanPage() {
@@ -33,9 +33,9 @@ export default function SharedPlanPage() {
           <p className="plan-dim plan-shared-meta">
             {p.steps.length ? `${p.steps.length} step${p.steps.length === 1 ? "" : "s"} · ` : ""}version {p.version} · changed {relativeTime(p.updated_at)}
           </p>
-          <Prose text={withoutTitle(p.body, p.title)} />
+          <Prose text={[withoutTitle(p.body, p.title), itemsMarkdown(p.items ?? [])].filter(Boolean).join("\n\n")} />
           <div className="plan-shared-actions">
-            <CopyButton text={planMarkdown(p.title, p.body)} label="Copy the plan" />
+            <CopyButton text={planMarkdown(p.title, p.body, p.items ?? [])} label="Copy the plan" />
             <span className="plan-dim">as markdown, to keep in your own kiln: Agents, Plans, New plan</span>
           </div>
         </article>
