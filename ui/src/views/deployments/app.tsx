@@ -442,7 +442,8 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
   const op = a.operation;
   if (op) {
     const at = op.finished_ms ?? op.started_ms;
-    const by = op.by ?? (op.trigger !== "manual" ? (TRIGGER_WORD[op.trigger] ?? op.trigger).toLowerCase() : null);
+    // opWords already says what started it when it wasn't a person.
+    const by = op.by;
     return (
       <>
         <StatePair tone={opTone(op)} word={opWords(op)} />
@@ -530,7 +531,7 @@ function SyncPanel({
     <div className="cd-confirm cd-sync" role="group" aria-label="Sync">
       <p>
         Apply what git holds{a.revision ? ` at ${shortRev(a.revision)}` : ""} to {placeOf(a)}
-        {a.out_of_sync ? `: ${a.out_of_sync} object${a.out_of_sync === 1 ? "" : "s"} differ.` : ". Nothing differs now."}
+        {a.out_of_sync ? `: ${a.out_of_sync} ${a.out_of_sync === 1 ? "object differs" : "objects differ"}.` : ". Nothing differs now."}
       </p>
       <label className="cd-opt">
         <input type="checkbox" className="check" checked={prune} onChange={(e) => setPrune(e.target.checked)} /> Prune: delete what git no longer holds
@@ -575,7 +576,7 @@ function SyncPanel({
                     }}
                   />
                   <KindBadge kind={n.kind} group={n.group} />
-                  <span className="cd-pickrow-name">{n.namespace ? `${n.namespace}/${n.name}` : n.name}</span>
+                  <span className="cd-pickrow-name">{n.namespace && n.namespace !== a.namespace ? `${n.namespace}/${n.name}` : n.name}</span>
                   <NodeMarks n={n} />
                 </label>
               </li>
@@ -681,7 +682,7 @@ function Resources({
 
   return (
     <section className="cd-resources-section" aria-label="Resources">
-      <div className="cd-viewbar">
+      <div className="cd-viewbar" data-view={view}>
         <SelectField label="View" hideLabel value={view} onChange={(v) => set({ view: v as View })} options={VIEWS} className="cd-view-select" />
         <FacetBox
           className="cd-view-filter"
@@ -693,8 +694,8 @@ function Resources({
           chosen={chosen}
           onChosen={setChosen}
         />
-        {view === "list" && <SelectField label="Sort by" hideLabel value={sort} onChange={(v) => set({ sort: v as ListSort })} options={SORTS} className="cd-view-select" />}
-        {view === "pods" && <SelectField label="Group by" hideLabel value={group} onChange={(v) => set({ group: v as PodGroup })} options={GROUPS} className="cd-view-select" />}
+        {view === "list" && <SelectField label="Sort by" hideLabel value={sort} onChange={(v) => set({ sort: v as ListSort })} options={SORTS} className="cd-view-sort" />}
+        {view === "pods" && <SelectField label="Group by" hideLabel value={group} onChange={(v) => set({ group: v as PodGroup })} options={GROUPS} className="cd-view-sort" />}
         {view !== "pods" && (
           <label className="cd-opt cd-view-opt" title="The live objects the app's objects own: ReplicaSets, Pods, Jobs, EndpointSlices…">
             <input type="checkbox" className="check" checked={children} onChange={(e) => set({ children: e.target.checked })} /> Live children
@@ -777,7 +778,7 @@ function sortNodes(list: CdNode[], sort: ListSort): CdNode[] {
 }
 
 /** One object in a list: its kind, name, place, marks, what it says, its age. */
-function Row({ n, now, selected, onSelect }: { n: CdNode; now: number; selected: boolean; onSelect: (n: CdNode) => void }) {
+function Row({ n, now, selected, onSelect, sub }: { n: CdNode; now: number; selected: boolean; onSelect: (n: CdNode) => void; sub?: string }) {
   const note = n.why ?? (n.health && n.health !== "Healthy" ? n.message : null) ?? nodeLine(n, "");
   return (
     <button
@@ -791,7 +792,7 @@ function Row({ n, now, selected, onSelect }: { n: CdNode; now: number; selected:
       <KindBadge kind={n.kind} group={n.group} />
       <span className="cd-lrow-main">
         <span className="cd-lrow-name">{n.name}</span>
-        <span className="cd-lrow-sub">{[n.namespace || "cluster", n.managed ? "" : "live"].filter(Boolean).join(" · ")}</span>
+        <span className="cd-lrow-sub">{sub ?? [n.namespace || "cluster", n.managed ? "" : "live"].filter(Boolean).join(" · ")}</span>
       </span>
       <span className="cd-lrow-marks">
         <NodeMarks n={n} />
@@ -820,8 +821,10 @@ function FlatList({
   details: React.ReactNode;
 }) {
   const sorted = React.useMemo(() => sortNodes(nodes, sort), [nodes, sort]);
+  const inView = sorted.some((n) => n.id === selected);
   return (
     <ul className="cd-llist" aria-label="Objects">
+      {!inView && details ? <li>{details}</li> : null}
       {sorted.map((n) => (
         <li key={n.id}>
           <Row n={n} now={now} selected={selected === n.id} onSelect={onSelect} />
@@ -853,7 +856,12 @@ function PodList({
   const groups = React.useMemo(() => {
     const m = new Map<string, { label: string; owner: CdNode | null; pods: CdNode[] }>();
     for (const p of pods) {
-      const owner = p.parents.map((u) => byId.get(u)).find(Boolean) ?? null;
+      // The app's own object that runs it (a Deployment, not its ReplicaSet of the day).
+      let owner: CdNode | null = p.parents.map((u) => byId.get(u)).find(Boolean) ?? null;
+      for (let hops = 0; owner && !owner.managed && hops < 8; hops++) {
+        owner = owner.parents.map((u) => byId.get(u)).find(Boolean) ?? owner;
+        if (owner.managed || !owner.parents.length) break;
+      }
       const key = group === "node" ? (p.node ?? "") : (owner?.id ?? "");
       const label = group === "node" ? (p.node ?? "Not scheduled") : owner ? `${owner.kind} ${owner.name}` : "No owner";
       const g = m.get(key);
@@ -862,8 +870,11 @@ function PodList({
     }
     return [...m.values()].sort((x, y) => compareText(x.label, y.label)).map((g) => ({ ...g, pods: [...g.pods].sort((x, y) => compareText(x.name, y.name)) }));
   }, [pods, group, byId]);
+  // An owner chosen from a pod's details isn't a pod: its details open on top.
+  const inView = pods.some((p) => p.id === selected);
   return (
     <div className="cd-pods">
+      {!inView && details}
       {groups.map((g) => {
         const bad = g.pods.filter((p) => p.health === "Degraded").length;
         return (
@@ -878,7 +889,7 @@ function PodList({
             <ul className="cd-llist">
               {g.pods.map((p) => (
                 <li key={p.id}>
-                  <Row n={p} now={now} selected={selected === p.id} onSelect={onSelect} />
+                  <Row n={p} now={now} selected={selected === p.id} onSelect={onSelect} sub={group === "node" ? (p.parents.map((u) => byId.get(u)?.name).find(Boolean) ?? "") : (p.node ?? "Not scheduled")} />
                   {selected === p.id && details}
                 </li>
               ))}

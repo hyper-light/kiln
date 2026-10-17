@@ -131,7 +131,8 @@ export function NodeMarks({ n, words = true }: { n: Pick<CdNode, "health" | "syn
 export function nodeLine(n: CdNode, ageText: string): string {
   const parts: string[] = [];
   if (n.kind === "Pod" && n.status && n.status !== "Running") parts.push(n.status);
-  if (n.ready) parts.push(n.kind === "Pod" || n.kind === "EndpointSlice" ? `${n.ready} ready` : n.ready);
+  // A finished pod's containers are done, not unready.
+  if (n.ready && !(n.kind === "Pod" && n.status === "Completed")) parts.push(n.kind === "Pod" || n.kind === "EndpointSlice" ? `${n.ready} ready` : n.ready);
   if (n.restarts) parts.push(`${n.restarts} restart${n.restarts === 1 ? "" : "s"}`);
   const rev = n.kind === "ReplicaSet" || n.kind === "ControllerRevision" ? n.info.find((i) => i.name === "Revision")?.value : undefined;
   if (rev) parts.push(`rev ${rev}`);

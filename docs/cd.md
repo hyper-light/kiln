@@ -337,22 +337,34 @@ The API lives under `/api/cd`. It follows [access.md](access.md)'s conventions: 
 
 | Method | Path | |
 | --- | --- | --- |
-| GET | `/api/cd/apps?project=&env=&cluster=&sync=&health=&q=&cursor=&limit=` | apps, with counts |
+| GET | `/api/cd/apps?project=&env=&cluster=&namespace=&sync=&health=&q=&sort=&cursor=&limit=` | apps, a page at a time; `sort` is `name`, `health` (worst first), `sync` (out of sync first) or `deployed` (newest first) |
+| GET | `/api/cd/facets?…` | how many apps each sync, health, project, cluster and namespace would show |
 | POST | `/api/cd/apps` | create (or update) an app kept in kiln |
 | GET / PATCH / DELETE | `/api/cd/apps/:app` | spec and status; change; delete (`?cascade=foreground\|background\|orphan`) |
-| GET | `/api/cd/apps/:app/tree` | resources, with health and sync state |
+| GET | `/api/cd/apps/:app/tree?fresh=` | the app's objects and every live object they own (ReplicaSets, Pods, ControllerRevisions, Jobs, EndpointSlices), joined on owner uids: each node's uid, parents, health, sync, age, ready counts, restarts, images, containers and a few info pairs |
 | GET | `/api/cd/apps/:app/diff` | rendered against live, per resource |
-| GET | `/api/cd/apps/:app/manifests?revision=` | rendered manifests |
+| GET | `/api/cd/apps/:app/manifests` | what the app renders now, as kiln applies it (another revision's: not yet) |
 | POST | `/api/cd/apps/:app/{refresh,sync,rollback,follow,terminate}` | |
 | GET | `/api/cd/apps/:app/history` | deployments |
-| GET / POST / DELETE | `/api/cd/apps/:app/resources/:key[/actions/:action\|/logs\|/events]` | one resource |
+| GET | `/api/cd/apps/:app/resources/:key` | one object of the tree: its node, live manifest, desired manifest and diff (managed objects), labels, annotations, conditions and owners. `:key` is `group~kind~namespace~name` |
+| GET | `/api/cd/apps/:app/resources/:key/events` | its Kubernetes events, newest first |
+| GET | `/api/cd/apps/:app/resources/:key/logs?container=&pod=&tail_lines=&since_seconds=&previous=` | the last lines of a pod's log, or of a workload's pods merged by time; `/logs/ws` follows them over a WebSocket |
+| POST / DELETE | `/api/cd/apps/:app/resources/:key/actions/:action` | resource actions (restart, delete a pod): not yet |
 | POST | `/api/cd/bulk` | `{ selector, action }` over many apps |
 | GET | `/api/cd/plans?commit=\|diff=\|pr=` | a plan |
 | GET | `/api/cd/{environments,previews,fleets,windows}` | |
 | GET / POST / PATCH / DELETE | `/api/cd/{clusters,repos,projects}[/:id]` | |
 
 `/api/events` adds `cd_app` (a coalesced summary), `cd_operation` and `cd_plan`.
-`GET /api/cd/apps/:app/ws` streams one app's resource tree.
+`GET /api/cd/apps/:app/ws` will stream one app's resource tree (not yet: the page reads the tree again
+every few seconds and when the app's status changes).
+
+The tree and an object's live form are read from the cluster when someone asks, bounded: the
+app's own objects are listed by its tracking label where it has one (one list per kind and
+namespace, Secrets as metadata alone), children only in the namespaces where something that owns
+such children lives, and lists and trees are kept 4 s and shared by every app and viewer that
+asks meanwhile. Only objects in the app's tree can be read this way, and Secret values are masked
+everywhere (`last-applied-configuration` included).
 
 CLI: `kiln cd apps`, `kiln cd app <app> [--tree|--diff|--history]`, `kiln cd sync <app>…
 [--selector] [--prune] [--dry-run] [--wait]`, `kiln cd rollback <app> [n]`, `kiln cd follow <app>`, `kiln cd plan
@@ -362,6 +374,18 @@ UI: **Deployments**: the fleet as one list (sync and health per app, filtered by
 cluster and project, 100,000 apps scrolling smoothly), an app's resource tree, diffs, history and
 rollback, the environments board, previews by stack, fleets and their rollouts. Each diff's page
 gets a **Deploy** panel with its plan.
+
+An app's page does what Argo CD's application view does, in the console's own look. Its head says
+the sync and health, the revision with its commit message, author and time, the last sync's
+result, and where the app comes from and goes to; its actions (Sync with prune, dry run or only
+chosen objects; Refresh and Hard refresh; Diff; History and rollback; Delete) open in the page.
+Below, its objects and every live object they own as a tree (a left-to-right graph on wide
+screens, an indented list with guide lines on phones, alike siblings folded into "12 pods"), a
+list sortable by kind, name, namespace, health, sync and age, or its pods by owner or node, chosen
+with a select. The console's one filter field (kind, health, sync, namespace, names) applies to
+every view; in the tree a match keeps its owners in view. An object opens in the page: summary,
+live and desired manifests, diff, events, and logs for pods and what runs them (container, pod,
+since, lines; follow, wrap, times, previous run, copy).
 
 ## State, replication and scale
 
@@ -458,7 +482,7 @@ and the network come on top, and are measured separately as they are built.
 | `/api/cd`, `kiln cd` | built |
 | MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; Claude Code sessions kiln starts get it | built |
 | Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI) | built |
-| UI: the fleet list (windowed, filtered on the server, live; a filter box with counts per value; row checkboxes for syncing or refreshing many) and an app's page (resources, diff, history; sync, rollback, refresh, take over, stop, delete, each confirmed in place) | built; environments board, previews, fleets: not yet |
+| UI: the fleet list (windowed, filtered and sorted on the server, live; the console's filter field with counts per value, namespace included; the fleet's counts; row checkboxes for syncing or refreshing many) and an app's page (revision, last sync, source; the resource tree as a graph or an indented list, a list, pods by owner or node; one filter over every view; an object's summary, manifests, diff, events and logs, followed live; sync of chosen objects, rollback, refresh and hard refresh, take over, stop, delete, each confirmed in place) | built; environments board, previews, fleets, resource actions, the tree over a WebSocket: not yet |
 | Notifications, windows, projects and RBAC, plans and previews for diffs | not yet |
 
 Checked against a live cluster: in shadow mode, kiln agrees with Argo CD on kiln's own app of

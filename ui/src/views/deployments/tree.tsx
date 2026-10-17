@@ -18,7 +18,7 @@ import { HEALTH_TONE, KindBadge, NodeMarks, nodeLine } from "./parts";
 const NODE_H = 54;
 const ROW_GAP = 10;
 const COL_GAP = 52;
-const NODE_MAX = 252;
+const NODE_MAX = 300;
 /** Narrower than this, the graph gives way to the list. */
 export const NODE_MIN = 156;
 
@@ -223,8 +223,11 @@ export function TreeList({
       else next.add(id);
       return next;
     });
+  // The object chosen isn't a row here (its owner is folded): its details open on top.
+  const inView = rows.some((r) => r.item.type === "node" && r.item.node.id === selected);
   return (
     <ul className="cd-tlist" aria-label="Resource tree">
+      {!inView && details ? <li className="cd-trow-details">{details}</li> : null}
       {rows.map(({ item, depth }) => {
         const guides = <span className="cd-guides" style={{ "--depth": depth } as React.CSSProperties} aria-hidden="true" />;
         if (item.type === "group") {
@@ -278,8 +281,7 @@ export function TreeList({
                   <NodeMarks n={n} />
                 </span>
                 <span className="cd-trow-line">
-                  {[n.namespace !== namespace ? n.namespace || "cluster-scoped" : "", nodeLine(n, age(n.created_at, now))].filter(Boolean).join(" · ") ||
-                    n.kind}
+                  {[n.namespace && n.namespace !== namespace ? n.namespace : "", nodeLine(n, age(n.created_at, now))].filter(Boolean).join(" · ") || n.kind}
                 </span>
               </button>
             </li>
