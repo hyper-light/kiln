@@ -476,7 +476,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             for info in h.list() {
                                 let Some(s) = h.get(&info.id) else { continue };
                                 for u in s.snapshot() {
-                                    if let Ok(json) = serde_json::to_string(&u) {
+                                    for json in harness_frames(&info.id, &u) {
                                         uplink.0.send(Up::Term(AgentMsg::Harness { session: info.id.clone(), json })).await.ok();
                                     }
                                 }
@@ -775,8 +775,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Harness(session, u) => {
                 // Not kept across a disconnect: the reconnect sends every session whole.
-                if connected && let Ok(json) = serde_json::to_string(&u) {
-                    uplink.0.send(Up::Term(AgentMsg::Harness { session, json })).await.ok();
+                if connected {
+                    for json in harness_frames(&session, &u) {
+                        uplink.0.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                    }
                 }
             }
             Ev::Done(r) => {
@@ -825,6 +827,97 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
     credentials(o, &Shutdown::new()).await.map(|_| ())
 }
 
+
+/// Most of one agent-session update a frame carries. They go on the interactive lane, which
+/// refuses frames past 1 MiB ([`net::Kiln`]); a resumed session's history can be several.
+const HARNESS_FRAME: usize = 512 * 1024;
+
+/// An agent-session update as frames that fit: a long run of events goes in parts (events are
+/// upserts by id, so the parts mean what the whole did), and an event too large on its own has
+/// its longest texts cut, saying so. Anything else too large is dropped, and logged.
+fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
+    use crate::harness::core::Update;
+    let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
+    if json.len() <= HARNESS_FRAME {
+        return vec![json];
+    }
+    let Update::Events { events } = u else {
+        tracing::warn!(session, bytes = json.len(), "agent session update too large to send; dropped");
+        return Vec::new();
+    };
+    let one = HARNESS_FRAME - 1024;
+    let mut frames = Vec::new();
+    let mut part = Vec::new();
+    let mut size = 0;
+    for e in events {
+        let mut e = e.clone();
+        if json_len(&e) > one {
+            e = cut(e, one);
+        }
+        let n = json_len(&e).saturating_add(1);
+        if n > one {
+            tracing::warn!(session, event = %e.id, bytes = n, "agent session event too large to send, even cut; dropped");
+            continue;
+        }
+        if size + n > one && !part.is_empty() {
+            frames.extend(serde_json::to_string(&Update::Events { events: std::mem::take(&mut part) }));
+            size = 0;
+        }
+        size += n;
+        part.push(e);
+    }
+    if !part.is_empty() {
+        frames.extend(serde_json::to_string(&Update::Events { events: part }));
+    }
+    frames
+}
+
+fn json_len<T: Serialize>(v: &T) -> usize {
+    serde_json::to_vec(v).map_or(usize::MAX, |b| b.len())
+}
+
+/// An event cut to about `budget` bytes of JSON: its longest texts shortened, each saying so.
+fn cut(e: crate::harness::model::Event, budget: usize) -> crate::harness::model::Event {
+    let Ok(mut v) = serde_json::to_value(&e) else { return e };
+    for _ in 0..64 {
+        let len = json_len(&v);
+        if len <= budget {
+            break;
+        }
+        let mut best = (0, String::new());
+        longest(&v, String::new(), &mut best);
+        let Some(serde_json::Value::String(s)) = v.pointer_mut(&best.1) else { break };
+        if s.len() < 256 {
+            break;
+        }
+        let mut at = s.len().saturating_sub(len - budget + 64);
+        while !s.is_char_boundary(at) {
+            at -= 1;
+        }
+        let dropped = s.len() - at;
+        s.truncate(at);
+        s.push_str(&format!("\n… [{dropped} bytes cut by kiln to fit]"));
+    }
+    serde_json::from_value(v).unwrap_or(e)
+}
+
+/// The JSON pointer of the longest string in `v`.
+fn longest(v: &serde_json::Value, at: String, best: &mut (usize, String)) {
+    match v {
+        serde_json::Value::String(s) if s.len() > best.0 => *best = (s.len(), at),
+        serde_json::Value::Array(a) => {
+            for (i, x) in a.iter().enumerate() {
+                longest(x, format!("{at}/{i}"), best);
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for (k, x) in o {
+                longest(x, format!("{at}/{}", k.replace('~', "~0").replace('/', "~1")), best);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// The binary's modification time (an upgrade replaces the file).
 fn binary_mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -927,5 +1020,51 @@ fn adopt_handover(o: &Opts, terms: &mut HashMap<String, (PtySession, Arc<crate::
     }
     if adopted > 0 {
         tracing::info!(terminals = adopted, "terminals carried across the upgrade");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::core::Update;
+    use crate::harness::model::{Body, Event};
+
+    fn said(id: usize, text: String) -> Event {
+        Event { id: format!("e{id}"), seq: id as u64, at: 0, parent: None, body: Body::Assistant { text, streaming: false } }
+    }
+
+    fn events(frame: &str) -> Vec<Event> {
+        match serde_json::from_str::<Update>(frame) {
+            Ok(Update::Events { events }) => events,
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_long_history_goes_in_parts_that_fit() {
+        // A resumed session's history: 900 events, about 1.8 MB.
+        let all: Vec<Event> = (0..900).map(|i| said(i, "x".repeat(2000))).collect();
+        let frames = harness_frames("s", &Update::Events { events: all.clone() });
+        assert!(frames.len() >= 4, "{} frames", frames.len());
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let sent: Vec<Event> = frames.iter().flat_map(|f| events(f)).collect();
+        assert_eq!(sent, all, "every event, whole and in order");
+        // Small ones go as they are.
+        let small = Update::Events { events: all.get(..3).unwrap_or_default().to_vec() };
+        assert_eq!(harness_frames("s", &small), vec![serde_json::to_string(&small).unwrap_or_default()]);
+    }
+
+    #[test]
+    fn an_event_too_large_alone_is_cut_and_says_so() {
+        let huge = said(7, format!("start {}", "é".repeat(1_500_000)));
+        let frames = harness_frames("s", &Update::Events { events: vec![said(1, "hi".into()), huge] });
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let sent: Vec<Event> = frames.iter().flat_map(|f| events(f)).collect();
+        assert_eq!(sent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["e1", "e7"]);
+        let text = match sent.last().map(|e| &e.body) {
+            Some(Body::Assistant { text, .. }) => text.as_str(),
+            _ => "",
+        };
+        assert!(text.starts_with("start ") && text.ends_with("bytes cut by kiln to fit]"), "{}", text.get(..40).unwrap_or(text));
     }
 }
