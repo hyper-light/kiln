@@ -10,6 +10,7 @@ import { clientId, type Meta, type SendMode, type SessionStore, type State } fro
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { Attachments } from "./controls";
+import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, type Reply } from "./palette";
 
 const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -89,6 +90,7 @@ export function Composer({
   disabled,
   attachments,
   toMain,
+  onView,
 }: {
   store: SessionStore;
   state: State | null;
@@ -97,6 +99,8 @@ export function Composer({
   attachments: Attachments;
   /** Shown over a subagent's thread: what's typed here goes to the main agent. */
   toMain?: boolean;
+  /** A command that opens a kiln panel (model, mcp, changes, tasks…). */
+  onView?: (view: string) => void;
 }) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
@@ -122,15 +126,24 @@ export function Composer({
     el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight / 3))}px`;
   }, [text]);
 
-  // Slash commands and @-file suggestions for the word being typed at the end.
+  // Commands, while a name is typed after "/": every one the agent's harness offers, by name,
+  // alias or what it does.
+  const commands = React.useMemo(() => meta?.commands ?? [], [meta]);
+  const slash = parseSlash(text);
+  const [palIndex, setPalIndex] = React.useState(0);
+  const [palClosed, setPalClosed] = React.useState(false);
+  const [reply, setReply] = React.useState<Reply | "loading" | null>(null);
+  const [note, setNote] = React.useState<string | null>(null);
+  const palItems = React.useMemo(() => (slash?.typingName && !palClosed ? matchCommands(commands, slash.name) : []), [slash?.typingName, slash?.name, palClosed, commands]);
   React.useEffect(() => {
-    const slash = text.match(/^\/(\S*)$/);
-    if (slash && meta?.commands.length) {
-      const q = (slash[1] ?? "").toLowerCase();
-      const items = meta.commands.filter((c) => c.name.toLowerCase().startsWith(q)).slice(0, 8);
-      setSuggest(items.length ? { kind: "/", items: items.map((c) => ({ label: `/${c.name}`, hint: c.description })), index: 0 } : null);
-      return;
-    }
+    setPalIndex(0);
+    setPalClosed(false);
+    setNote(null);
+  }, [slash?.name]);
+  const typed = slash && !slash.typingName ? findCommand(commands, slash.name) : undefined;
+
+  // @-file suggestions for the word being typed at the end.
+  React.useEffect(() => {
     const at = text.match(/(?:^|\s)@(\S*)$/);
     if (at && features.includes("file_suggestions")) {
       let live = true;
@@ -152,13 +165,58 @@ export function Composer({
   }, [text, meta, features, store]);
 
   const complete = (label: string) => {
-    setText((t) => (suggest?.kind === "/" ? `${label} ` : t.replace(/@\S*$/, `${label} `)));
+    setText((t) => t.replace(/@\S*$/, `${label} `));
     setSuggest(null);
     ta.current?.focus();
   };
 
+  /** Run a catalog command with the words typed after it. True when it was handled here. */
+  const runEntry = (entry: NonNullable<ReturnType<typeof findCommand>>, args: string): string | true => {
+    const out = runCommand(entry, args, store);
+    if (out.kind === "send") return out.text;
+    setText("");
+    if (out.kind === "view") {
+      if (out.view === "files") {
+        setText("@");
+        ta.current?.focus();
+      } else onView?.(out.view);
+    } else if (out.kind === "unsupported") setNote(`/${entry.name}: ${out.reason}`);
+    else if (out.kind === "reply") {
+      setReply("loading");
+      out.promise.then(setReply, (e: unknown) => setReply({ title: `/${entry.name}`, text: "", error: e instanceof Error ? e.message : String(e) }));
+    }
+    return true;
+  };
+
+  /** Pick a command from the list: one that takes no words runs; otherwise its name goes in the field. */
+  const pick = (entry: NonNullable<ReturnType<typeof findCommand>>) => {
+    if (entry.route?.kind === "unsupported") {
+      setNote(`/${entry.name}: ${entry.route.reason}`);
+      return;
+    }
+    if (entry.args === "none" || (!entry.args && entry.route?.kind === "view")) {
+      const r = runEntry(entry, "");
+      if (r !== true) sendText(r);
+      return;
+    }
+    setText(`/${entry.name} `);
+    setPalClosed(true);
+    ta.current?.focus();
+  };
+
   const submit = () => {
-    const body = text.trim();
+    const raw = text.trim();
+    const s = parseSlash(raw);
+    const entry = s ? findCommand(commands, s.name) : undefined;
+    if (entry && s) {
+      const r = runEntry(entry, s.args);
+      if (r !== true) sendText(r);
+      return;
+    }
+    sendText(raw);
+  };
+
+  const sendText = (body: string) => {
     if ((!body && files.length === 0) || disabled || pending > 0) return;
     const ok = store.send({
       type: "send",
@@ -179,6 +237,27 @@ export function Composer({
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (palItems.length > 0) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const n = palItems.length;
+        setPalIndex((i) => (i + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        const it = palItems[palIndex];
+        if (it) {
+          e.preventDefault();
+          pick(it);
+          return;
+        }
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setPalClosed(true);
+        return;
+      }
+    }
     if (suggest) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
@@ -226,6 +305,25 @@ export function Composer({
         </div>
       )}
 
+      {reply && <ReplyPanel reply={reply} onClose={() => setReply(null)} />}
+      {palItems.length > 0 && <CommandList items={palItems} index={palIndex} onPick={pick} onHover={setPalIndex} />}
+      {note && (
+        <div className="pl-note" role="status">
+          <span>{note}</span>
+          <button type="button" className="hx-icon" aria-label="Dismiss" onClick={() => setNote(null)}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
+      {typed && palItems.length === 0 && (typed.hint || typed.description) && (
+        <div className="pl-typed">
+          <span className="pl-name">
+            /{typed.name}
+            {typed.hint && <span className="pl-hint"> {typed.hint}</span>}
+          </span>
+          {typed.description && <span className="pl-desc">{typed.description}</span>}
+        </div>
+      )}
       {suggest && (
         <ul className="hx-suggest" role="listbox">
           {suggest.items.map((it, i) => (

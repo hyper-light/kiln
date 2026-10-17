@@ -107,6 +107,8 @@ export function AgentHeader({
   onSettings,
   onRisky,
   onBackground,
+  runOpen,
+  onRunOpenChange,
 }: {
   info: AgentInfo | null;
   state: State | null;
@@ -121,9 +123,14 @@ export function AgentHeader({
   onRisky: (mode: string) => void;
   /** Show what it left running in the background. */
   onBackground?: () => void;
+  /** "How it runs", opened from elsewhere too (/model, /permissions). */
+  runOpen?: boolean;
+  onRunOpenChange?: (o: boolean) => void;
 }) {
   const navigate = useNavigate();
-  const [sheet, setSheet] = React.useState(false);
+  const [ownSheet, setOwnSheet] = React.useState(false);
+  const sheet = runOpen ?? ownSheet;
+  const setSheet = onRunOpenChange ?? setOwnSheet;
   const features = meta?.features ?? [];
   const sessionControls = (meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session").length;
   const running = status === "running" || status === "waiting";
