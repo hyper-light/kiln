@@ -48,6 +48,23 @@ pub struct Entry {
     pub hash: String,
 }
 
+/// A commit as people read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    /// Its hash.
+    pub sha: String,
+    /// Its author's name.
+    pub author: String,
+    /// Its author's email.
+    pub email: String,
+    /// When it was authored, seconds since the epoch.
+    pub at: i64,
+    /// Its message's first line.
+    pub subject: String,
+    /// The rest of its message.
+    pub body: String,
+}
+
 fn git(dir: Option<&Path>, auth: &Auth) -> Command {
     let mut c = Command::new("git");
     c.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "true").env("LC_ALL", "C");
@@ -120,6 +137,20 @@ impl Mirror {
             }
         }
         bail!("{} has no revision {rev:?}", self.url)
+    }
+
+    /// Who wrote a commit, when, and what it says.
+    pub fn commit(&self, commit: &str) -> Result<Commit> {
+        let mut c = git(Some(&self.dir), &self.auth);
+        c.args(["show", "--no-patch", "--format=%H%x00%an%x00%ae%x00%at%x00%s%x00%b", &format!("{commit}^{{commit}}"), "--"]);
+        let out = String::from_utf8_lossy(&run(c)?).into_owned();
+        let mut f = out.splitn(6, '\0');
+        let mut next = || f.next().unwrap_or("").to_owned();
+        let (sha, author, email, at, subject, body) = (next(), next(), next(), next(), next(), next());
+        if sha.trim().is_empty() {
+            bail!("{} has no commit {commit}", self.url);
+        }
+        Ok(Commit { sha: sha.trim().to_owned(), author, email, at: at.trim().parse().unwrap_or(0), subject, body: body.trim().to_owned() })
     }
 
     /// The hash of each path at `commit` (`None` where nothing is there), in one call.
@@ -302,6 +333,27 @@ mod tests {
             bail!("{}", String::from_utf8_lossy(&out.stderr));
         }
         Ok(text(out.stdout))
+    }
+
+    #[test]
+    fn a_commit_says_who_when_and_what() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work)?;
+        sh(&work, &["init", "-q", "-b", "main"])?;
+        std::fs::write(work.join("a.yaml"), "kind: ConfigMap\n")?;
+        sh(&work, &["add", "."])?;
+        sh(&work, &["commit", "-qm", "Fix the probe\n\nIt timed out on cold starts."])?;
+        let head = sh(&work, &["rev-parse", "HEAD"])?;
+        let m = Mirror::open(&tmp.path().join("mirror.git"), work.to_str().unwrap_or(""), Auth::default())?;
+        let c = m.commit("main")?;
+        assert_eq!(c.sha, head);
+        assert_eq!((c.author.as_str(), c.email.as_str()), ("t", "t@t"));
+        assert_eq!(c.subject, "Fix the probe");
+        assert_eq!(c.body, "It timed out on cold starts.");
+        assert!(c.at > 1_600_000_000);
+        assert!(m.commit("0000000000000000000000000000000000000000").is_err());
+        Ok(())
     }
 
     #[test]
