@@ -89,6 +89,18 @@ export default function AgentPage() {
     setTab("plan");
     setPhoneTab("plan");
   };
+  const [runOpen, setRunOpen] = React.useState(false);
+  /** A slash command that opens one of kiln's panels. */
+  const openView = (view: string) => {
+    if (view === "settings") setSettings(true);
+    else if (view === "model" || view === "permissions") setRunOpen(true);
+    else if (view === "tasks") showPlan();
+    else if (view === "changes") {
+      setTab("changes");
+      setPhoneTab("changes");
+    } else if (view === "new_agent") navigate("/agents?new=1");
+    else showTools();
+  };
 
   const stop = async () => {
     try {
@@ -146,7 +158,7 @@ export default function AgentPage() {
             )}
           </div>
         ) : null}
-        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} />
+        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} onView={openView} />
       </div>
     </div>
   );
@@ -198,6 +210,8 @@ export default function AgentPage() {
         send={send}
         onUsage={showTools}
         onBackground={showPlan}
+        runOpen={runOpen}
+        onRunOpenChange={setRunOpen}
         onSettings={() => setSettings(true)}
         onRisky={setRisky}
       />

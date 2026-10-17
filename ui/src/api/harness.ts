@@ -309,6 +309,17 @@ export interface SlashCommand {
   name: string;
   description?: string;
   hint?: string;
+  /** "Session", "Model & mode", "Context", "Tools & MCP", "Skills", "Plugins", "Kiln". */
+  group?: string;
+  /** Whether it takes words after its name. */
+  args?: "none" | "optional" | "required";
+  aliases?: string[];
+  /** What running it does (servers that predate the catalog send none: a prompt). */
+  route?:
+    | { kind: "prompt"; text?: string; skill?: boolean }
+    | { kind: "control"; command: Record<string, unknown> }
+    | { kind: "view"; view: string }
+    | { kind: "unsupported"; reason: string };
 }
 
 export interface ControlOption {
