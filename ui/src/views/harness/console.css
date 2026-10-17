@@ -885,6 +885,58 @@
   margin-top: 10px;
 }
 
+/* ---------------------------------------------------------------- plan usage: the badge opens it in place */
+.ag-head .hx-usage-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 440px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #1d1f23;
+  animation: ag-usage-in 0.12s ease-out;
+}
+.hx-usage-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hx-usage-limits {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.hx-usage-more {
+  align-self: flex-start;
+  min-height: 28px;
+  color: #a1a4ad;
+  font-size: 12px;
+  text-decoration: underline;
+  text-decoration-color: #a1a4ad55;
+  text-underline-offset: 3px;
+}
+.hx-usage-more:hover {
+  color: var(--color-bright);
+}
+.ag-head .hx-limit-badge[aria-expanded="true"] {
+  border-color: #55545e;
+  color: var(--color-bright);
+}
+@keyframes ag-usage-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ag-head .hx-usage-panel {
+    animation: none;
+  }
+}
+:root[data-motion="paused"] .ag-head .hx-usage-panel {
+  animation: none;
+}
+
 /* ---------------------------------------------------------------- queued messages: a line that opens in place */
 .qd {
   min-width: 0;

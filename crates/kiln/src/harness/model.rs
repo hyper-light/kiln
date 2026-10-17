@@ -721,6 +721,10 @@ pub enum Route {
     View { view: String },
     /// Not available from kiln, and why.
     Unsupported { reason: String },
+    /// Done in the harness's own terminal interface: kiln opens it beside the agent, in a terminal
+    /// in the agent's folder on its machine, on `command` (typed by the user when the harness
+    /// can't start on one). The agent starts again once it closes, to load what was changed.
+    Terminal { command: String },
 }
 
 impl Default for Route {
@@ -763,6 +767,11 @@ impl SlashCommand {
 
     pub fn unsupported(name: &str, description: &str, group: &str, reason: &str) -> Self {
         Self::new(name, description, "", group, Route::Unsupported { reason: reason.to_owned() })
+    }
+
+    /// One done in the harness's own screen, opened beside the agent on `/name`.
+    pub fn terminal(name: &str, description: &str, group: &str) -> Self {
+        Self::new(name, description, "", group, Route::Terminal { command: format!("/{name}") })
     }
 }
 
@@ -1298,6 +1307,7 @@ mod tests {
         // The route's JSON: tagged by kind; a plain prompt is just its kind.
         assert_eq!(serde_json::to_value(Route::default()).ok(), Some(serde_json::json!({"kind": "prompt"})));
         assert_eq!(serde_json::to_value(Route::Unsupported { reason: "r".into() }).ok(), Some(serde_json::json!({"kind": "unsupported", "reason": "r"})));
+        assert_eq!(serde_json::to_value(Route::Terminal { command: "/doctor".into() }).ok(), Some(serde_json::json!({"kind": "terminal", "command": "/doctor"})));
     }
 
     #[test]

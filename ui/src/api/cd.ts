@@ -9,6 +9,9 @@ import type {
   CdEvent,
   CdFacets,
   CdLogs,
+  CdPlan,
+  CdPlanAsk,
+  CdPlanRepo,
   CdResource,
   CdResourceDetail,
   CdResourceKey,
@@ -103,7 +106,14 @@ export const cdApi = {
   follow: (id: string) => request<unknown>("POST", `${appPath(id)}/follow`, {}),
   remove: (id: string, cascade: "foreground" | "orphan") => request<unknown>("DELETE", `${appPath(id)}${qs({ cascade })}`),
   clusters: (signal?: AbortSignal) => request<{ clusters: CdCluster[] }>("GET", "/api/cd/clusters", undefined, { signal }),
+  /** What a commit, a stack or a pull request would deploy. */
+  plan: (ask: CdPlanAsk, signal?: AbortSignal) => request<CdPlan>("POST", "/api/cd/plans", ask, { signal }),
+  /** The repositories apps deploy from, with their branches. */
+  planRepos: (signal?: AbortSignal) => request<{ repos: CdPlanRepo[] }>("GET", "/api/cd/plans/repos", undefined, { signal }),
 };
 
 /** The route of an app's page. */
 export const appHref = (id: string) => `/deployments/apps/${id.split("/").map(enc).join("/")}`;
+
+/** The route of the deploy plans page. */
+export const plansHref = "/deployments/plans";

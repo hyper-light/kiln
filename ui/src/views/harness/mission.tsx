@@ -279,9 +279,14 @@ export default function Mission() {
         title="Mission control."
         lead={lead}
         actions={
-          <Button onClick={() => setSpawn(true)}>
-            New agents <Plus />
-          </Button>
+          <>
+            <Button asChild variant="secondary">
+              <Link to="/agents/plans">Plans</Link>
+            </Button>
+            <Button onClick={() => setSpawn(true)}>
+              New agents <Plus />
+            </Button>
+          </>
         }
       />
 

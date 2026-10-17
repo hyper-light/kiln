@@ -27,6 +27,8 @@ browsers watching it.
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
 | WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
+| GET | `/api/harness/sessions/:id/terminals` | the terminals beside it (its shell, its harness's own screen), live ones first → `[{terminal, what, command?, to_type?}]`; see below |
+| POST | `/api/harness/sessions/:id/terminals` | `{what: "shell" \| "screen", command?, cols?, rows?}`: open one beside it → 201 `{terminal, what, command?, to_type?}`; see below |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it), `takeover`, `fork` (a copy can be continued) and `managed_by?` (the agent session already continuing that conversation) |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
 | POST | `/api/ai-sessions/:machine/:pid/fork` | continue a copy of a found session, leaving it running → `Info[]`; see below |
@@ -40,6 +42,24 @@ request), `reset` (the timeline starts over), `closed`.
 `Spec`: `kind`, `cwd?`, `model?`, `mode?`, `effort?`, `resume?` (the harness's own session id),
 `resume_at?`, `fork?`, `prompt?`, `name?`, `shell?`, `allow_bypass?`, `takeover_pid?` (set by a
 take-over: start only once that process has ended).
+
+### Terminals beside an agent
+
+A terminal in the agent's folder, on its machine, shown under its conversation:
+
+- **its shell** (`what: "shell"`; in the console `/terminal`, `/shell`, or `!command`, which runs
+  the command there instead of sending it): for what the agent can't or won't run. One per agent:
+  asking again returns it, with `command` typed into it.
+- **its harness's own screen** (`what: "screen"`; `/screen`, and the commands only that screen
+  does, routed `terminal` in the catalog): Claude Code's `/permissions` editor, `/doctor`,
+  `/config`-like setups, Codex's `/experimental` … Claude Code starts on `command`; harnesses that
+  can't start on one say `to_type: true` and you type it there. When it ends (you quit it, or close
+  it), the agent starts again once it's idle, its conversation continued, to load what you changed
+  (`reload_config`); even when the server restarted while it was open.
+
+They are ordinary kiln terminals (any device can attach; the server's terminal switch and limits
+apply), kept off the Terminal page and found again by the agent they belong to. "Add to message"
+puts the end of what's on screen into the message being written.
 
 ### Taking over a found session
 
@@ -214,11 +234,13 @@ with `available_commands_update`. Sorted by group, then name; one entry per name
 |---|---|---|
 | `prompt` | `text?`, `skill?` | sends a message: `text` with `{args}` replaced when there is one, else `/name words`; with `skill: true`, `skill_run {name, args}` |
 | `control` | `command` | sends `command` (a kiln command) with `{args}` (the words typed after the name) and `{client}` (its client id) replaced in its strings. One that carries `{client}` answers that console alone with `reply {client, value}`: `{title, text, format?: "markdown", filename?, path?}`, or `{error}` |
-| `view` | `view` | opens a kiln panel: `model`, `permissions`, `settings`, `mcp`, `skills`, `plugins`, `hooks`, `tasks`, `changes`, `usage`, `status`, `context`, `files`, `new_agent` |
+| `view` | `view` | opens a kiln panel: `model`, `effort`, `permissions` (those three: that run setting in the head), `settings`, `mcp`, `skills`, `plugins`, `hooks`, `tasks`, `changes`, `usage`, `status`, `context`, `files`, `new_agent`, `terminal` (its shell), `screen` (its harness's own screen) |
 | `unsupported` | `reason` | sends nothing; says why |
+| `terminal` | `command` | opens the harness's own screen beside the agent, on `command` (see "Terminals beside an agent") |
 
-Nothing that changes the account (sign in or out, feedback that uploads the conversation, plan
-upgrades, plugin installs) is routed anywhere but `unsupported`.
+kiln changes nothing about the account itself (sign in or out goes through the account card;
+plan upgrades, privacy settings and integrations open the harness's own screen, where you do them;
+feedback that uploads the conversation, and handing this session to the cloud, are `unsupported`).
 
 - **Claude Code**: the CLI's own list (what it runs without its terminal: its commands, bundled
   and user skills, plugins' and MCP servers' commands), sent as text, except where kiln does the
@@ -226,29 +248,38 @@ upgrades, plugin installs) is routed anywhere but `unsupported`.
   `/effort`, `/context`, `/mcp`, `/usage`, `/reload-skills`, `/reload-plugins` (a control
   request: the CLI binds the command to its terminal). Then the commands of its terminal
   interface: those kiln runs with the CLI's control requests (`/btw` a side question, its answer
-  kept out of the conversation; `/cost`; `/export`; `/plan`; `/permissions` the rules in force and
-  their sources; `/memory` the instruction files and memory folders; `/git-diff` the workspace's
-  diff file by file), `/branch` (the conversation continued in another agent), kiln's panels
-  (`/status`, `/diff`, `/tasks`, `/hooks`, `/skills`, `/plugin`, `/workflows`), and the rest as
-  unsupported with why. Commands bound to the CLI's terminal (init's
-  `terminal_slash_commands`: `/doctor`, `/color`, `/focus`) are unsupported. When rows share a
-  name, `/name` runs the one marked built-in, as in the CLI.
+  kept out of the conversation; `/cost`; `/export`; `/plan`; `/permission-rules` the rules in force
+  and their sources; `/memory` the instruction files and memory folders; `/git-diff` the
+  workspace's diff file by file), `/branch` (the conversation continued in another agent), kiln's
+  panels (`/status`, `/diff`, `/tasks`, `/hooks`, `/skills`, `/plugin`, `/workflows`). Claude
+  Code's own screen, beside the agent: `/permissions` (its editor of allow, ask and deny rules),
+  the commands bound to the CLI's terminal (init's `terminal_slash_commands`: `/doctor`, `/color`,
+  `/focus`), its terminal's settings (`/theme`, `/tui`, `/terminal-setup` …), account settings and
+  setups (`/upgrade`, `/privacy-settings`, `/setup-bedrock`, `/install-github-app`, `/import` …) and
+  cloud setups and reviews (`/web-setup`, `/remote-env`, `/ultrareview`, `/autofix-pr` …). The rest
+  (handing this session elsewhere, `/feedback`, `/voice`, `/ide`) are unsupported with why. When
+  rows share a name, `/name` runs the one marked built-in, as in the CLI.
 - **Codex**: its terminal interface's commands (its app-server runs none): panels (`/model`,
   `/approvals`, `/permissions`, `/diff`, `/mention`, `/status`, `/usage`, `/mcp`, `/ps`,
   `/agent`, `/hooks`, `/skills`, `/plugins`; `/new` and `/clear` start another agent), controls
   (`/review`, `/compact`, `/rename`, `/goal`, `/fork`, `/undo`, `/export`, `/rollout`, `/pwd`),
-  `/init` (Codex's own prompt), the rest unsupported. Its skills join; one named like a command
+  `/init` (Codex's own prompt); in Codex's own screen, beside the agent (typed there): `/memory`,
+  `/apps`, `/experimental`, `/debug-config`, `/theme`, `/statusline`, `/title`, `/raw`, `/vim`;
+  the rest unsupported. Its skills join; one named like a command
   runs from the skills panel. `/goal <objective>` sets the goal and Codex starts working toward
   it, turn after turn, until it is done; `/goal pause`, `/goal resume`, `/goal clear` as in
   Codex; `/goal` alone shows it with its status and the tokens used.
 - **ACP agents**: the agent's own commands, sent as text (one named like kiln's wins), and
   kiln's: `/export` (the timeline as Markdown), `/status`, `/model`, `/diff`, `/restart`, `/new`.
-- Every harness: `/stop-tasks` (`stop_tasks`) and `/restart` in "Kiln".
+- Every harness: `/stop-tasks` (`stop_tasks`), `/restart`, `/terminal` (`/shell`) and `/screen`
+  in "Kiln".
 
 `control` ids the catalog uses: Claude Code `side_question {text, client}`, `session_cost`,
 `export`, `plan`, `permission_rules`, `memory`, `workspace_diff` (each `{client}`),
 `reload_plugins`, `fork`; Codex `goal {text?, client}`, `fork`, `undo`, `export`, `rollout`,
-`pwd` (`{client}`); ACP `export {client}`.
+`pwd` (`{client}`); ACP `export {client}`. Claude Code and Codex: `reload_config {what}`, sent
+when the harness's own screen beside it ends: start again once idle, resuming, to load settings
+changed outside it.
 
 ## State
 

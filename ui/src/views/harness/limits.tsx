@@ -9,15 +9,42 @@ import { HarnessMark } from "./parts";
 
 const tone = (pct: number | null) => (pct === null ? "none" : pct >= 90 ? "fail" : pct >= 70 ? "warn" : "ok");
 
-function resetsIn(at: number | undefined, now: number): string | null {
-  if (!at) return null;
-  const ms = at - now;
-  if (ms <= 0) return "resetting";
-  const m = Math.round(ms / 60000);
-  if (m < 60) return `resets in ${m}m`;
+const DAY = 86_400_000;
+
+/** How long until then, in short words: "45m", "2h 5m", "3d 4h". */
+function leftWords(ms: number): string {
+  const m = Math.max(1, Math.round(ms / 60000));
+  if (m < 60) return `${m}m`;
   const h = Math.floor(m / 60);
-  if (h < 48) return `resets in ${h}h ${m % 60}m`;
-  return `resets ${new Date(at).toLocaleDateString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })}`;
+  if (h < 48) return `${h}h ${m % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+/** When a window starts over, in local time: "4:30 PM PDT", "tomorrow 9:00 AM PDT", "Tue, Oct 21, 9:00 AM PDT". */
+export function resetWhen(at: number, now: number): string {
+  const d = new Date(at);
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+  const day = (ms: number) => new Date(ms).toDateString();
+  if (day(at) === day(now)) return time;
+  if (day(at) === day(now + DAY)) return `tomorrow ${time}`;
+  return `${d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })}, ${time}`;
+}
+
+/** When it starts over and how long until then, as pieces that wrap whole. */
+function resetsIn(at: number | undefined, now: number): string[] {
+  if (!at) return [];
+  const ms = at - now;
+  if (ms <= 0) return ["Starting over now"];
+  return [`Resets ${resetWhen(at, now)}`, `in ${leftWords(ms)}`];
+}
+
+const num = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(2));
+
+/** How much is used: "42%", "12.40 / 50 USD · 25%". */
+function amount(l: Limit): string {
+  const pct = l.used_percent !== null ? `${Math.round(l.used_percent)}%` : null;
+  const of = l.used !== undefined && l.limit ? `${num(l.used)} / ${num(l.limit)}${l.unit ? ` ${l.unit}` : ""}` : null;
+  return [of, pct].filter(Boolean).join(" · ") || "—";
 }
 
 function useMinuteClock() {
@@ -33,19 +60,57 @@ export function LimitMeter({ limit, compact }: { limit: Limit; compact?: boolean
   const now = useMinuteClock();
   const pct = limit.used_percent;
   const reset = resetsIn(limit.resets_at, now);
+  // "5h": the session window, which its label ("Session") doesn't say the length of.
+  const hours = /^(\d+)h$/.exec(limit.window ?? "")?.[1];
+  const said = limit.status === "rejected" ? "Limit reached" : limit.status === "warning" ? "Close to the limit" : null;
   return (
-    <div className={cn("hx-limit", compact && "hx-limit-compact")} data-tone={tone(pct)}>
+    <div className={cn("hx-limit", compact && "hx-limit-compact")} data-tone={limit.status === "rejected" ? "fail" : tone(pct)}>
       <div className="hx-limit-top">
-        <span className="hx-limit-label">{limit.label}</span>
+        <span className="hx-limit-label">
+          {limit.label}
+          {hours && !compact && <span className="hx-limit-window"> · {hours} hours</span>}
+        </span>
         <span className="hx-meta-num">
-          {pct !== null ? `${Math.round(pct)}%` : limit.used !== undefined && limit.limit ? `${limit.used} / ${limit.limit}${limit.unit ? ` ${limit.unit}` : ""}` : "—"}
+          {said && <span className="hx-limit-said">{said} · </span>}
+          {amount(limit)}
         </span>
       </div>
       <div className="hx-limit-bar" role="meter" aria-label={limit.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct ?? undefined}>
         <span style={{ width: `${Math.min(100, Math.max(0, pct ?? 0))}%` }} />
       </div>
-      {reset && <div className="hx-limit-reset">{reset}</div>}
+      {reset.length > 0 && (
+        <div className="hx-limit-reset">
+          {reset.map((r) => (
+            <span key={r}>{r}</span>
+          ))}
+        </div>
+      )}
     </div>
+  );
+}
+
+/**
+ * The plan's limits in full, opened in place from the head's usage badge (no popup): how much of
+ * each window is used, and when it starts over, in local time.
+ */
+export function UsagePanel({ id, limits, plan, onMore }: { id: string; limits: Limit[]; plan?: string; onMore?: () => void }) {
+  return (
+    <section id={id} className="hx-usage-panel" aria-label="Plan usage">
+      <div className="hx-usage-head">
+        <span className="hx-eyebrow">Plan usage</span>
+        {plan && <span className="hx-tag">{plan}</span>}
+      </div>
+      <div className="hx-usage-limits">
+        {limits.map((l) => (
+          <LimitMeter key={l.id} limit={l} />
+        ))}
+      </div>
+      {onMore && (
+        <button type="button" className="hx-usage-more" onClick={onMore}>
+          This session&apos;s cost, context and status
+        </button>
+      )}
+    </section>
   );
 }
 
@@ -54,11 +119,20 @@ export function topLimit(limits: Limit[] | undefined): Limit | null {
   return (limits ?? []).reduce<Limit | null>((best, l) => ((l.used_percent ?? -1) > (best?.used_percent ?? -1) ? l : best), null);
 }
 
-export function LimitBadge({ limits, onClick }: { limits: Limit[] | undefined; onClick?: () => void }) {
+/** The most-used limit; it opens the rest (`controls`: the panel it opens, `open`: whether it is). */
+export function LimitBadge({ limits, onClick, open, controls }: { limits: Limit[] | undefined; onClick?: () => void; open?: boolean; controls?: string }) {
   const top = topLimit(limits);
   if (!top || top.used_percent === null) return null;
   return (
-    <button type="button" className="hx-limit-badge" data-tone={tone(top.used_percent)} onClick={onClick} title={(limits ?? []).map((l) => `${l.label}: ${l.used_percent ?? "?"}%`).join(" · ")}>
+    <button
+      type="button"
+      className="hx-limit-badge"
+      data-tone={tone(top.used_percent)}
+      onClick={onClick}
+      aria-expanded={open}
+      aria-controls={open ? controls : undefined}
+      title={(limits ?? []).map((l) => `${l.label}: ${l.used_percent ?? "?"}%`).join(" · ")}
+    >
       {top.label} {Math.round(top.used_percent)}%
     </button>
   );

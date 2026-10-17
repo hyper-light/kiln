@@ -575,6 +575,7 @@ impl FrontDoor {
         }
         // Plain HTTP redirects there, once HTTPS answers.
         *self.redirect.names.write() = s.cert_names();
+        *self.redirect.ca_der.write() = self.ctx.ca_der.clone();
         *self.redirect.primary.write() = if s.domain.is_empty() { s.local_name().unwrap_or_default() } else { s.domain.clone() };
         self.redirect.https_port.store(s.https.port, Ordering::Relaxed);
         if s.https.http_port == 0 || self.https.is_none() {

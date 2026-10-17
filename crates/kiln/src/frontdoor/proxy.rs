@@ -1,6 +1,8 @@
 //! The front door's HTTPS: TLS terminated here, then the bytes piped both ways to the kiln server
 //! (HTTP, or HTTPS trusting kiln's CA), so WebSockets, streamed logs and uploads work unchanged.
-//! And plain HTTP on another port, answered with a redirect to it.
+//! And plain HTTP on another port, answered with a redirect to it, except for what a device needs
+//! before it can trust that HTTPS: kiln's CA (`/ca.mobileconfig`, `/ca.crt`, `/ca.pem`), and, at an
+//! address rather than a name, a short page saying how to trust it.
 //!
 //! * **Listening.** `[::]:<port>` accepting IPv4 too, else `0.0.0.0:<port>`; TCP keepalive (60 s)
 //!   so phones that leave the Wi-Fi do not hold connections forever. At most [`MAX_CONNECTIONS`]
@@ -271,13 +273,16 @@ where
 
 // ------------------------------------------------------------------------------ plain HTTP
 
-/// Where the plain-HTTP redirect points.
+/// Where the plain-HTTP redirect points, and the CA it hands out.
 #[derive(Default)]
 pub struct Redirect {
     /// Names it redirects to as asked (`Host`); any other goes to `primary`.
     pub names: RwLock<Vec<String>>,
     pub primary: RwLock<String>,
     pub https_port: AtomicU16,
+    /// kiln's CA certificate (DER), handed out over plain HTTP: a device can't trust the front
+    /// door's HTTPS before it has it, and a `.dev` name can't even be opened until then.
+    pub ca_der: RwLock<Vec<u8>>,
 }
 
 impl Redirect {
@@ -302,11 +307,101 @@ fn strip_port(h: &str) -> String {
     h.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(h, |(n, _)| n).to_ascii_lowercase()
 }
 
+/// `der` as PEM.
+fn pem_of(der: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        out.push_str(&String::from_utf8_lossy(line));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
+}
+
+impl Redirect {
+    /// kiln's CA as a file a device installs: the Apple profile, the certificate (DER), or PEM.
+    fn ca_file(&self, path: &str) -> Option<Response> {
+        let der = self.ca_der.read().clone();
+        if der.is_empty() {
+            return None;
+        }
+        let (mime, file, body): (&str, &str, Vec<u8>) = match path {
+            "/ca.mobileconfig" => ("application/x-apple-aspen-config", "kiln-ca.mobileconfig", super::mobileconfig::profile(&der).into_bytes()),
+            "/ca.crt" => ("application/x-x509-ca-cert", "kiln-ca.crt", der),
+            "/ca.pem" => ("application/x-pem-file", "kiln-ca.pem", pem_of(&der).into_bytes()),
+            _ => return None,
+        };
+        let r = srv::response(StatusCode::OK, mime, srv::full(body));
+        let r = srv::with_header(r, header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{file}\""));
+        Some(srv::with_header(r, header::CACHE_CONTROL, "no-cache"))
+    }
+
+    /// What a device that opens the front door by its address sees: how to trust kiln's CA here,
+    /// and where kiln is once it does.
+    fn trust_page(&self) -> String {
+        let der = self.ca_der.read().clone();
+        let fingerprint = crate::util::sha256_hex(&der).to_ascii_uppercase().as_bytes().chunks(2).map(|c| String::from_utf8_lossy(c).into_owned()).collect::<Vec<_>>().join(":");
+        let primary = self.primary.read().clone();
+        let port = match self.https_port.load(Ordering::Relaxed) {
+            443 => String::new(),
+            p => format!(":{p}"),
+        };
+        let kiln = html_escape(&format!("https://{primary}{port}/"));
+        let name = html_escape(&primary);
+        format!(
+            r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trust kiln on this device</title>
+<style>
+:root{{color-scheme:dark}}body{{margin:0;background:#08090a;color:#d6d7db;font:15px/1.55 system-ui,-apple-system,sans-serif}}
+main{{max-width:560px;margin:0 auto;padding:28px 20px 40px}}h1{{margin:0 0 6px;font-size:22px;font-weight:600;color:#ededee}}
+p{{margin:0 0 14px}}.k{{margin:22px 0 6px;color:#8f929b;font:11px/1.4 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase}}
+ol{{margin:0 0 6px;padding-left:20px}}li{{margin:0 0 6px}}a{{color:#d1c6e6}}.go{{display:inline-block;margin:6px 0 2px;padding:11px 18px;border:1px solid #3a3c44;border-radius:999px;color:#ededee;text-decoration:none}}
+.note{{color:#8f929b;font-size:13px}}code{{font:12px ui-monospace,monospace;color:#cdc4e0;overflow-wrap:anywhere}}
+</style></head><body><main>
+<h1>Trust kiln on this device</h1>
+<p>{name} uses kiln&rsquo;s own certificate. Trust it once here and <a href="{kiln}">{name}</a> opens without warnings, on every runner and after every renewal.</p>
+<p class="k">iPhone, iPad</p>
+<ol>
+<li>In <b>Safari</b> (Chrome can&rsquo;t install it): <a href="/ca.mobileconfig">install the profile</a>, then Allow.</li>
+<li>Settings &rarr; <b>Profile Downloaded</b> &rarr; Install. &ldquo;Not Signed&rdquo; is expected.</li>
+<li>Settings &rarr; General &rarr; About &rarr; Certificate Trust Settings &rarr; turn on <b>kiln CA</b>.</li>
+</ol>
+<p class="note">If Safari then can&rsquo;t find {name}: iCloud Private Relay sends Safari&rsquo;s lookups past your network. Use Chrome for it, or turn Private Relay off.</p>
+<p class="k">Mac</p>
+<p><a href="/ca.mobileconfig">Install the profile</a>, then System Settings &rarr; General &rarr; Device Management &rarr; kiln CA &rarr; Install.</p>
+<p class="k">Android, Windows, Linux</p>
+<p><a href="/ca.crt">Download the certificate</a> and install it as a trusted root (CA) certificate.</p>
+<p class="k">Then</p>
+<p><a class="go" href="{kiln}">Open {name}</a></p>
+<p class="note">Check it&rsquo;s kiln&rsquo;s: SHA-256 <code>{fingerprint}</code></p>
+</main></body></html>
+"#
+        )
+    }
+}
+
+/// Whether `host` (a `Host` header) is an address rather than a name.
+fn is_address(host: Option<&str>) -> bool {
+    host.map(strip_port).is_none_or(|h| h.is_empty() || h.trim_matches(['[', ']']).parse::<IpAddr>().is_ok())
+}
+
 struct RedirectHandler(Arc<Redirect>);
 
 impl srv::Handler for RedirectHandler {
     async fn handle(self: Arc<Self>, req: Request) -> Response {
         let host = srv::header_str(&req, &header::HOST);
+        if let Some(file) = self.0.ca_file(req.uri().path()) {
+            return file;
+        }
+        // At an address (a phone typing http://100.64.0.5), how to trust kiln first: HTTPS there
+        // would only show a certificate warning.
+        if req.uri().path() == "/" && is_address(host) && !self.0.ca_der.read().is_empty() {
+            let r = srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(self.0.trust_page()));
+            return srv::with_header(r, header::CACHE_CONTROL, "no-cache");
+        }
         let path = req.uri().path_and_query().map_or("/", http::uri::PathAndQuery::as_str);
         let to = self.0.location(host, path);
         let body = format!("<!doctype html><title>kiln</title><p>kiln is at <a href=\"{0}\">{0}</a></p>\n", html_escape(&to));
@@ -319,7 +414,8 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Plain HTTP on `port`, every request redirected to the HTTPS front door.
+/// Plain HTTP on `port`: kiln's CA and, at an address, how to trust it; everything else
+/// redirected to the HTTPS front door.
 pub fn listen_redirect(port: u16, redirect: &Arc<Redirect>) -> io::Result<Listening> {
     let (std_listener, bound) = bind(port)?;
     let stop = Shutdown::new();
@@ -379,6 +475,47 @@ mod tests {
         assert_eq!(r.location(Some("[fd00::77]:8080"), "/"), "https://[fd00::77]:8443/");
         assert_eq!(strip_port("kiln.home:80"), "kiln.home");
         assert_eq!(html_escape("\"<a>&"), "&quot;&lt;a&gt;&amp;");
+    }
+
+    #[test]
+    fn plain_http_hands_out_the_ca_and_says_how_to_trust_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+            let r = Arc::new(Redirect::default());
+            *r.names.write() = vec!["kiln.test".into(), "*.kiln.test".into()];
+            *r.primary.write() = "kiln.test".into();
+            r.https_port.store(443, Ordering::Relaxed);
+            *r.ca_der.write() = pki.ca_der.clone();
+            let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+            let _l = listen_redirect(port, &r)?;
+            let client = crate::http::client::Client::public()?;
+            // By address (127.0.0.1) or by a name (localhost, not one of the front door's).
+            let get = |host: &str, path: &str| client.get(&format!("http://{host}:{port}{path}")).send();
+            // The CA, three ways, over plain HTTP.
+            let crt = get("127.0.0.1", "/ca.crt").await?;
+            assert_eq!((crt.status(), crt.header("content-type").map(str::to_owned)), (200, Some("application/x-x509-ca-cert".to_owned())));
+            assert_eq!(crt.bytes(1 << 16).await?.to_vec(), pki.ca_der);
+            let mc = get("localhost", "/ca.mobileconfig").await?;
+            assert_eq!(mc.header("content-type"), Some("application/x-apple-aspen-config"));
+            assert!(String::from_utf8_lossy(&mc.bytes(1 << 16).await?).contains("com.apple.security.root"));
+            let pem = String::from_utf8_lossy(&get("127.0.0.1", "/ca.pem").await?.bytes(1 << 16).await?).into_owned();
+            assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n") && pem.trim_end().ends_with("-----END CERTIFICATE-----"));
+            assert_eq!(crate::pki::cert_info(&pem).map(|i| i.sha256)?, crate::util::sha256_hex(&pki.ca_der));
+            // At an address: the page that says how; at a name: the redirect.
+            let page = get("127.0.0.1", "/").await?;
+            assert_eq!(page.status(), 200);
+            let html = String::from_utf8_lossy(&page.bytes(1 << 16).await?).into_owned();
+            assert!(html.contains("/ca.mobileconfig") && html.contains("https://kiln.test/") && html.contains("Certificate Trust Settings"), "{html}");
+            let named = get("localhost", "/").await?;
+            assert_eq!((named.status(), named.header("location").map(str::to_owned)), (307, Some("https://kiln.test/".to_owned())));
+            assert_eq!(get("127.0.0.1", "/runs").await?.status(), 307);
+            // Without a CA to hand out, an address is redirected like any name.
+            r.ca_der.write().clear();
+            assert_eq!(get("127.0.0.1", "/").await?.status(), 307);
+            assert_eq!(get("127.0.0.1", "/ca.crt").await?.status(), 307);
+            Ok(())
+        })
     }
 
     #[test]

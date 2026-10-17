@@ -3,12 +3,13 @@
  * the agent's name, a line of state, round controls; then how it runs — permissions, model, effort —
  * as one line of words that opens in place to change them (no popups). Settings live in ⋯.
  */
+import * as React from "react";
 import { Link, useNavigate } from "react-router";
 import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
 import { costText, modelLabel, tildify } from "./derive";
 import { RoundButton } from "./figure/figure";
-import { LimitBadge } from "./limits";
+import { LimitBadge, UsagePanel } from "./limits";
 import { machineName, StateWord } from "./parts";
 import { RunSettings } from "./run-settings";
 import type { useAgentActions } from "./actions";
@@ -38,6 +39,7 @@ export function AgentHeader({
   cwd: string;
   actions: ReturnType<typeof useAgentActions>;
   send: (c: Command) => void;
+  /** Everything about the session's usage and status (the inspector's Tools). */
   onUsage: () => void;
   onSettings: () => void;
   /** Show what it left running in the background. */
@@ -56,6 +58,18 @@ export function AgentHeader({
   const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), ...(sessionControls > 0 ? [{ label: "Settings…", onSelect: onSettings }] : [])];
   // Codex takes a new permission mode, model or effort from its next turn.
   const nextTurn = info?.kind === "codex" ? { mode: true, model: true, effort: true } : undefined;
+  // The plan's limits open in place under the line, from the usage badge.
+  const limits = state?.limits ?? info?.limits ?? [];
+  const [usage, setUsage] = React.useState(false);
+  const usageId = React.useId();
+  React.useEffect(() => {
+    if (!usage) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setUsage(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [usage]);
   // The kind already names an agent that has no name of its own.
   const named = Boolean(info && info.name.trim().toLowerCase() !== info.kind_name.trim().toLowerCase());
 
@@ -93,7 +107,7 @@ export function AgentHeader({
                 {left} left running
               </button>
             )}
-            <LimitBadge limits={state?.limits ?? info?.limits} onClick={onUsage} />
+            <LimitBadge limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} />
             {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
           </div>
         </div>
@@ -129,6 +143,17 @@ export function AgentHeader({
           )}
         </div>
       </div>
+      {usage && limits.length > 0 && (
+        <UsagePanel
+          id={usageId}
+          limits={limits}
+          plan={plan}
+          onMore={() => {
+            setUsage(false);
+            onUsage();
+          }}
+        />
+      )}
       <RunSettings
         className="ag-run"
         modes={meta?.modes ?? []}

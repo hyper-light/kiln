@@ -186,6 +186,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             return put_artifacts(&hub, &id, req).await;
         }
         (&Method::POST, ["api", "hooks", "github"]) => return github_hook(&hub, req).await,
+        (&Method::GET, ["api", "shared", "plans", token]) => return shared_plan(&hub, token).await,
         (&Method::GET | &Method::HEAD, ["api", "sync", "blobs", hash]) => {
             let hash = (*hash).to_owned();
             return sync_blob_get(&hub, &hash, &req);
@@ -315,6 +316,16 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             sync_ask(&hub, "sync.copy.remove", id, crate::sync::server::Ask::RemoveCopy { repo: (*id).to_owned(), member }).await
         }
         (&Method::POST, ["api", "sync", id, "conflicts", "resolve"]) => sync_resolve(&hub, id, req).await,
+        (&Method::GET, ["api", "plans"]) => plans_list(&hub, &q).await,
+        (&Method::POST, ["api", "plans"]) => plans_create(&hub, req).await,
+        (&Method::GET, ["api", "plans", id]) => crate::plans::get(&hub, id).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
+        (&Method::PATCH, ["api", "plans", id]) => plans_update(&hub, id, req).await,
+        (&Method::DELETE, ["api", "plans", id]) => plans_delete(&hub, id).await,
+        (&Method::GET, ["api", "plans", id, "versions"]) => crate::plans::versions(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
+        (&Method::GET, ["api", "plans", id, "runs"]) => crate::plans::runs(&hub, id).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(plan_err),
+        (&Method::POST, ["api", "plans", id, "restore"]) => plans_restore(&hub, id, req).await,
+        (&Method::POST, ["api", "plans", id, "run"]) => plans_run(&hub, id, req).await,
+        (&Method::POST, ["api", "plans", id, "share"]) => plans_share(&hub, id, req).await,
         (&Method::GET, ["api", "voice"]) => {
             Ok(srv::json(StatusCode::OK, &serde_json::json!({ "transcribe": hub.cfg.voice.enabled(), "language": hub.cfg.voice.language })))
         }
@@ -365,6 +376,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
+        (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
+            let id = (*id).to_owned();
+            harness_terminal(&hub, &id, req).await
+        }
         (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
@@ -704,6 +720,105 @@ async fn sync_ask(hub: &Hub, action: &str, id: &str, ask: crate::sync::server::A
     hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), action.to_owned(), id.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+// ------------------------------------------------------------------ plans (crate::plans)
+
+fn plan_err(e: crate::plans::Error) -> ApiError {
+    match e {
+        crate::plans::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
+        crate::plans::Error::Missing => err(StatusCode::NOT_FOUND, "no such plan"),
+        crate::plans::Error::Other(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+async fn plans_list(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let plans = crate::plans::list(hub, q.get("q").cloned(), q.get("tag").cloned()).await.map_err(plan_err)?;
+    Ok(srv::json(StatusCode::OK, &plans))
+}
+
+async fn plans_create(hub: &Hub, req: Request) -> R {
+    let n: crate::plans::New = srv::body_json(req.into_body(), 512 * 1024).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let p = crate::plans::create(hub, n, "admin").await.map_err(plan_err)?;
+    hub.store.audit("admin".into(), "plan.create".into(), p.title.clone()).await;
+    Ok(srv::json(StatusCode::CREATED, &p))
+}
+
+async fn plans_update(hub: &Hub, id: &str, req: Request) -> R {
+    let patch: crate::plans::Patch = srv::body_json(req.into_body(), 512 * 1024).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let p = crate::plans::update(hub, id, patch, "admin").await.map_err(plan_err)?;
+    hub.store.audit("admin".into(), "plan.update".into(), format!("{} (v{})", p.title, p.version)).await;
+    Ok(srv::json(StatusCode::OK, &p))
+}
+
+async fn plans_delete(hub: &Hub, id: &str) -> R {
+    crate::plans::delete(hub, id).await.map_err(plan_err)?;
+    hub.store.audit("admin".into(), "plan.delete".into(), id.to_owned()).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+#[derive(Deserialize)]
+struct PlanRestore {
+    version: i64,
+}
+
+async fn plans_restore(hub: &Hub, id: &str, req: Request) -> R {
+    let r: PlanRestore = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let p = crate::plans::restore(hub, id, r.version, "admin").await.map_err(plan_err)?;
+    hub.store.audit("admin".into(), "plan.restore".into(), format!("{} (v{} as v{})", p.title, r.version, p.version)).await;
+    Ok(srv::json(StatusCode::OK, &p))
+}
+
+#[derive(Deserialize)]
+struct PlanRun {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    new: Option<PlanRunNew>,
+    #[serde(default)]
+    mode: crate::plans::Mode,
+}
+
+#[derive(Deserialize)]
+struct PlanRunNew {
+    #[serde(default)]
+    target: Option<String>,
+    kind: String,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+async fn plans_run(hub: &Hub, id: &str, req: Request) -> R {
+    let r: PlanRun = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let target = match (r.session, r.new) {
+        (Some(s), _) => crate::plans::Target::Session(s),
+        (None, Some(n)) => crate::plans::Target::New { target: n.target.unwrap_or_else(|| "local".into()), kind: n.kind, cwd: n.cwd },
+        (None, None) => return Err(err(StatusCode::BAD_REQUEST, "say where to run it: an agent (`session`) or a new one (`new`)")),
+    };
+    let ran = crate::plans::run(hub, id, target, r.mode, "admin").await.map_err(plan_err)?;
+    hub.store.audit("admin".into(), "plan.run".into(), format!("{id} on {} ({} messages)", ran.session, ran.sent)).await;
+    Ok(srv::json(StatusCode::OK, &ran))
+}
+
+#[derive(Deserialize)]
+struct PlanShare {
+    on: bool,
+}
+
+async fn plans_share(hub: &Hub, id: &str, req: Request) -> R {
+    let r: PlanShare = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let p = crate::plans::share(hub, id, r.on).await.map_err(plan_err)?;
+    hub.store.audit("admin".into(), if r.on { "plan.share" } else { "plan.unshare" }.into(), p.title.clone()).await;
+    Ok(srv::json(StatusCode::OK, &p))
+}
+
+/// A shared plan, for anyone with its link: its words only, never where it came from.
+async fn shared_plan(hub: &Hub, token: &str) -> R {
+    if token.len() < 16 {
+        return Err(err(StatusCode::NOT_FOUND, "no such plan"));
+    }
+    let p = crate::plans::shared(hub, token).await.map_err(plan_err)?;
+    Ok(srv::json(StatusCode::OK, &json!({ "title": p.title, "body": p.body, "steps": p.steps, "version": p.version, "updated_at": p.updated_at })))
 }
 
 // ------------------------------------------------------------------ voice
@@ -2107,6 +2222,20 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
+}
+
+/// A terminal beside an agent: a shell in its folder, or its harness's own screen
+/// (`crate::harness::screen`).
+async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
+    if !hub.cfg.terminal.enabled {
+        return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
+    }
+    let o: crate::harness::screen::Open = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if hub.harness.list().iter().all(|i| i.id != id) {
+        return Err(err(StatusCode::NOT_FOUND, "no such agent"));
+    }
+    let b = crate::harness::screen::open(hub, id, o).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::CREATED, &b))
 }
 
 #[derive(Deserialize)]

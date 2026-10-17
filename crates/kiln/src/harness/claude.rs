@@ -402,6 +402,12 @@ impl Claude {
                 self.slash(core, &format!("Use the {kind} subagent for this task: {t}"));
             }
             "background" => self.request(core, Pending::Plain("background".into()), json!({"subtype": "background_tasks"})),
+            // Settings changed outside it (its own screen, beside it): start again to load them.
+            "reload_config" => {
+                let what = value.as_ref().and_then(|v| v.get("what")).and_then(Value::as_str).unwrap_or("Changed settings").to_owned();
+                self.reload = Some(what);
+                self.reload_when_idle(core);
+            }
             "fork" => match core.state.harness_session.clone() {
                 Some(session) => core.effects.push(Effect::Branch { resume: session, resume_at: None }),
                 None => self.notice(core, Level::Info, "Nothing to branch yet: the conversation starts with the first message.", None),
@@ -968,7 +974,7 @@ impl Claude {
                 }
                 k
             } else if terminal.contains(&name) {
-                SlashCommand::unsupported(name, &desc, "Session", "it works on the terminal Claude Code runs in")
+                SlashCommand::terminal(name, &desc, "Session")
             } else if name.ends_with(" (MCP)") {
                 SlashCommand::prompt(name, &desc, hint, "Tools & MCP")
             } else if core.state.skills.iter().any(|s| s.name == name) {
@@ -2422,9 +2428,9 @@ fn claude_catalog() -> Vec<SlashCommand> {
     let ask = |name: &str, desc: &str, group: &str, id: &str| SlashCommand::control(name, desc, "", group, json!({"type": "control", "id": id, "value": {"client": "{client}"}}));
     let v = SlashCommand::view;
     let no = SlashCommand::unsupported;
-    let account = "it changes the account or its settings: use Claude Code in a terminal";
-    let cloud = "it hands the session to Anthropic's cloud or another app: use Claude Code in a terminal";
-    let terminal = "a setting of Claude Code's terminal interface";
+    // Done in Claude Code's own screen, opened beside the agent in its folder.
+    let t = SlashCommand::terminal;
+    let cloud = "it hands this session to Anthropic's cloud or another app: use Claude Code in a terminal";
     vec![
         // Session.
         ask("cost", "What this session has cost so far", "Session", "session_cost"),
@@ -2443,37 +2449,38 @@ fn claude_catalog() -> Vec<SlashCommand> {
         no("copy", "Copy the last response", "Session", "copy from the console"),
         no("cd", "Move this session to another folder", "Session", "an agent's folder is set when it starts"),
         no("fork", "A background agent that inherits the conversation", "Session", "Claude Code's in-session forks need its terminal interface: /branch continues the conversation in another agent"),
-        no("upgrade", "Upgrade the plan", "Session", account),
-        no("usage-credits", "Usage credits", "Session", account),
-        no("privacy-settings", "Privacy settings", "Session", account),
-        no("setup-bedrock", "Amazon Bedrock setup", "Session", account),
-        no("setup-vertex", "Google Vertex AI setup", "Session", account),
-        no("install-github-app", "Set up Claude GitHub Actions", "Session", "it sets up an integration step by step: use Claude Code in a terminal"),
-        no("install-slack-app", "Install the Claude Slack app", "Session", "it sets up an integration step by step: use Claude Code in a terminal"),
-        no("import", "Import another agent's configuration", "Session", "it changes Claude Code's settings: run it in a terminal"),
+        t("upgrade", "Upgrade the plan", "Session"),
+        t("usage-credits", "Usage credits", "Session"),
+        t("privacy-settings", "Privacy settings", "Session"),
+        t("setup-bedrock", "Amazon Bedrock setup", "Session"),
+        t("setup-vertex", "Google Vertex AI setup", "Session"),
+        t("install-github-app", "Set up Claude GitHub Actions", "Session"),
+        t("install-slack-app", "Install the Claude Slack app", "Session"),
+        t("import", "Import another agent's configuration", "Session"),
         no("teleport", "Send the session to the cloud, or resume one from claude.ai", "Session", cloud).aka(&["tp"]),
         no("remote-control", "Control this session from claude.ai", "Session", cloud).aka(&["rc"]),
         no("session", "The cloud session's address", "Session", cloud).aka(&["remote"]),
         no("desktop", "Continue in Claude Desktop", "Session", cloud).aka(&["app"]),
-        no("mobile", "The Claude mobile app", "Session", cloud).aka(&["ios", "android"]),
-        no("remote-env", "The cloud agents' environment", "Session", cloud),
-        no("web-setup", "Set up cloud sessions", "Session", cloud),
-        no("ultraplan", "Plan in the cloud", "Session", cloud),
-        no("ultrareview", "Review in the cloud", "Session", cloud),
-        no("autofix-pr", "Watch and fix the current pull request", "Session", cloud),
-        no("theme", "Change the theme", "Session", terminal),
-        no("color", "The prompt bar's color", "Session", terminal),
-        no("focus", "Focus view", "Session", terminal),
-        no("tui", "The terminal renderer", "Session", terminal),
-        no("scroll-speed", "Mouse wheel scroll speed", "Session", terminal),
-        no("terminal-setup", "Terminal key bindings", "Session", terminal),
-        no("voice", "Voice mode", "Session", terminal),
+        t("mobile", "The Claude mobile app", "Session").aka(&["ios", "android"]),
+        t("remote-env", "The cloud agents' environment", "Session"),
+        t("web-setup", "Set up cloud sessions", "Session"),
+        t("ultraplan", "Plan in the cloud", "Session"),
+        t("ultrareview", "Review in the cloud", "Session"),
+        t("autofix-pr", "Watch and fix the current pull request", "Session"),
+        t("theme", "Change the theme", "Session"),
+        t("color", "The prompt bar's color", "Session"),
+        t("focus", "Focus view", "Session"),
+        t("tui", "The terminal renderer", "Session"),
+        t("scroll-speed", "Mouse wheel scroll speed", "Session"),
+        t("terminal-setup", "Terminal key bindings", "Session"),
+        no("voice", "Voice mode", "Session", "it listens to the microphone of the machine Claude Code runs on: use the console's microphone"),
         no("ide", "IDE integrations", "Context", "Claude Code's IDE integration needs its terminal interface"),
         // Model & mode.
         v("model", "The model and its effort", "Model & mode", "model"),
-        v("effort", "The model's effort", "Model & mode", "model"),
+        v("effort", "The model's effort", "Model & mode", "effort"),
         v("output-style", "How it writes its replies", "Model & mode", "settings"),
-        ask("permissions", "The permission rules in force, and where each comes from", "Model & mode", "permission_rules").aka(&["allowed-tools"]),
+        t("permissions", "Permission rules: allow, ask and deny, in Claude Code's own editor", "Model & mode").aka(&["allowed-tools"]),
+        ask("permission-rules", "The permission rules in force, and where each comes from", "Model & mode", "permission_rules"),
         ask("plan", "Show the current plan", "Model & mode", "plan"),
         // Context.
         c("compact", "Summarize the conversation to free context", "[instructions]", "Context", json!({"type": "control", "id": "compact", "value": {"text": "{args}"}})),
@@ -2496,6 +2503,8 @@ fn claude_catalog() -> Vec<SlashCommand> {
         // kiln's own.
         c("stop-tasks", "Stop every shell, monitor and task this agent left running", "", "Kiln", json!({"type": "stop_tasks"})),
         c("restart", "Start Claude Code again, continuing the conversation", "", "Kiln", json!({"type": "restart"})),
+        v("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
+        v("screen", "Claude Code's own screen, in this agent's folder", "Kiln", "screen"),
     ]
 }
 
@@ -3710,7 +3719,7 @@ mod tests {
         ]);
         reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": commands, "models": [], "claude_code_version": "2.1.296"}));
         // Before init (it comes with the first turn): the terminal's commands 2.1.296 names.
-        assert!(core.meta.commands.iter().any(|e| e.name == "doctor" && matches!(e.route, Route::Unsupported { .. })));
+        assert!(core.meta.commands.iter().any(|e| e.name == "doctor" && matches!(e.route, Route::Terminal { .. })));
         c.line(
             &mut core,
             &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s1", "model": "m", "permissionMode": "default",
@@ -3739,14 +3748,17 @@ mod tests {
         assert!(matches!(get("kiln-test").route, Route::Prompt { skill: true, .. }) && get("kiln-test").group == "Skills" && get("kiln-test").args == "required");
         assert!(matches!(get("deep-research").route, Route::Prompt { skill: true, .. }));
         assert_eq!(get("echo-srv:greet (MCP)").group, "Tools & MCP");
-        // Bound to the CLI's terminal, or not runnable from kiln: why.
-        assert!(matches!(get("doctor").route, Route::Unsupported { reason } if reason.contains("terminal")));
-        assert!(matches!(get("color").route, Route::Unsupported { .. }));
+        // Bound to the CLI's terminal: done in Claude Code's own screen, opened beside the agent.
+        assert!(matches!(get("doctor").route, Route::Terminal { command } if command == "/doctor"));
+        assert!(matches!(get("color").route, Route::Terminal { .. }));
+        assert!(matches!(get("permissions").route, Route::Terminal { command } if command == "/permissions") && get("permissions").aliases == ["allowed-tools"]);
+        // Not runnable from kiln: why.
+        assert!(matches!(get("teleport").route, Route::Unsupported { .. }));
         assert!(matches!(get("login").route, Route::View { view } if view == "login"));
         assert!(matches!(get("logout").route, Route::View { view } if view == "logout"));
         // kiln's own requests: the CLI does not list them.
         assert_eq!((control("btw"), get("btw").args.as_str()), ("side_question".to_owned(), "required"));
-        assert_eq!((control("permissions"), control("plan"), control("memory"), control("git-diff"), control("export")), ("permission_rules".into(), "plan".into(), "memory".into(), "workspace_diff".into(), "export".into()));
+        assert_eq!((control("permission-rules"), control("plan"), control("memory"), control("git-diff"), control("export")), ("permission_rules".into(), "plan".into(), "memory".into(), "workspace_diff".into(), "export".into()));
         assert!(!cat.iter().any(|e| e.name.starts_with("__")));
         let mut names: Vec<&str> = cat.iter().flat_map(|e| std::iter::once(e.name.as_str()).chain(e.aliases.iter().map(String::as_str))).collect();
         let n = names.len();

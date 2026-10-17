@@ -65,7 +65,13 @@ export interface Reply {
   error?: string;
 }
 
-export type Outcome = { kind: "send"; text: string } | { kind: "sent" } | { kind: "view"; view: string } | { kind: "reply"; promise: Promise<Reply> } | { kind: "unsupported"; reason: string };
+export type Outcome =
+  | { kind: "send"; text: string }
+  | { kind: "sent" }
+  | { kind: "view"; view: string }
+  | { kind: "reply"; promise: Promise<Reply> }
+  | { kind: "unsupported"; reason: string }
+  | { kind: "terminal"; command: string };
 
 /** What running an entry with these words does. The caller sends "send" text the usual way. */
 export function runCommand(c: SlashCommand, args: string, store: SessionStore): Outcome {
@@ -79,6 +85,7 @@ export function runCommand(c: SlashCommand, args: string, store: SessionStore): 
   }
   if (r.kind === "view") return { kind: "view", view: r.view };
   if (r.kind === "unsupported") return { kind: "unsupported", reason: r.reason };
+  if (r.kind === "terminal") return { kind: "terminal", command: r.command };
   const asks = JSON.stringify(r.command).includes("{client}");
   if (!asks) {
     store.send(fill(r.command, args, "") as Command);
@@ -185,6 +192,7 @@ export function CommandList({
                   /{c.name}
                   {c.hint && <span className="pl-hint"> {c.hint}</span>}
                   {note?.(c) && <span className="pl-note">{note(c)}</span>}
+                  {c.route?.kind === "terminal" && <span className="pl-note">its own screen</span>}
                 </span>
                 <span className="pl-desc">{off && c.route?.kind === "unsupported" ? c.route.reason : c.description}</span>
               </button>

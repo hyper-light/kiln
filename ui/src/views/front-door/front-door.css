@@ -552,6 +552,30 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+/* The runner's own trust page, by address: what a phone opens before it trusts the name. */
+.fd-pages {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.fd-page > code {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+.fd-where {
+  color: var(--fd-faint);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+}
+.fd-relay {
+  margin: 6px 0 0;
+  color: #9a9ca5;
+  font-size: 12px;
+  line-height: 1.55;
+}
 .fd-steps {
   margin: 0;
   padding-left: 16px;

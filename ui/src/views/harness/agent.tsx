@@ -23,6 +23,8 @@ import { Inspector, type InspectorTab } from "./inspector";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
 import { Timeline } from "./timeline";
+import { BesideTerminals, type BesideRequest } from "./beside";
+import { PlanSourceContext } from "@/views/plans/save";
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -40,6 +42,16 @@ export default function AgentPage() {
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
   const [account, setAccount] = React.useState<"login" | "logout" | null>(null);
+  /** A terminal beside it (its shell, its harness's own screen), asked for from the composer. */
+  const [beside, setBeside] = React.useState<BesideRequest | null>(null);
+  /** What the terminal hands to the composer. */
+  const [handed, setHanded] = React.useState<{ text: string; seq: number } | null>(null);
+  const openBeside = React.useCallback((o: { what: "shell" | "screen"; command?: string }) => {
+    setBeside({ ...o, seq: Date.now() });
+    setPhoneTab("work");
+  }, []);
+  const hand = React.useCallback((text: string) => setHanded({ text, seq: Date.now() }), []);
+  const taken = React.useCallback(() => setBeside(null), []);
   // /login and /logout open the account in the conversation, below what was said: brought into view once.
   const showAccount = React.useCallback((el: HTMLDivElement | null) => el?.scrollIntoView({ block: "nearest", behavior: "smooth" }), []);
   // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown.
@@ -141,10 +153,20 @@ export default function AgentPage() {
     setPhoneTab("plan");
   };
   /** A slash command that opens one of kiln's panels. */
+  /** /model, /effort, /permissions: that setting of the head's run settings, opened in place. */
+  const openSetting = (label: "Model" | "Effort" | "Permissions") => {
+    const b = document.querySelector<HTMLButtonElement>(`.ag-head button.rs-v[aria-label^="${label}:"]`);
+    if (!b) return;
+    if (b.getAttribute("aria-expanded") !== "true") b.click();
+    b.focus({ preventScroll: true });
+    b.scrollIntoView({ block: "nearest" });
+  };
   const openView = (view: string) => {
     if (view === "settings") setSettings(true);
     else if (view === "login" || view === "logout") setAccount(view);
-    else if (view === "model" || view === "permissions") document.querySelector<HTMLButtonElement>(".ag-head .rs-line")?.click();
+    else if (view === "model" || view === "effort" || view === "permissions") openSetting(view === "model" ? "Model" : view === "effort" ? "Effort" : "Permissions");
+    else if (view === "terminal") openBeside({ what: "shell" });
+    else if (view === "screen") openBeside({ what: "screen" });
     else if (view === "tasks") showPlan();
     else if (view === "changes") {
       setTab("changes");
@@ -188,7 +210,8 @@ export default function AgentPage() {
           </button>
         </div>
       )}
-      <Timeline
+      <PlanSourceContext.Provider value={info ? { session: info.id, harness: info.kind, machine: info.target === "local" ? null : info.target.replace(/^agent:/, ""), cwd, agent: info.name } : null}>
+        <Timeline
         events={events}
         state={state}
         meta={meta}
@@ -204,13 +227,17 @@ export default function AgentPage() {
         accountOpen={account !== null}
         find={findOpen ? { q, now: findAt } : undefined}
         footer={
-          account && info ? (
-            <div ref={showAccount} className="hx-signin">
-              <AccountCard key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />
-            </div>
-          ) : undefined
+          <>
+            {account && info && (
+              <div ref={showAccount} className="hx-signin">
+                <AccountCard key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />
+              </div>
+            )}
+            {!task && <BesideTerminals agent={id} info={info ?? null} request={beside} onTaken={taken} onInsert={hand} />}
+          </>
         }
       />
+      </PlanSourceContext.Provider>
       <div className="hx-dock">
         <ActivityLine state={state} agent={id} onOpenTask={openTask} />
         {status === "exited" && state?.exit?.error && events.length === 0 ? (
@@ -235,7 +262,7 @@ export default function AgentPage() {
             )}
           </div>
         ) : null}
-        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} onView={openView} />
+        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} onView={openView} onTerminal={openBeside} insert={handed} />
       </div>
     </div>
   );
