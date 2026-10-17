@@ -547,6 +547,8 @@ export interface Spec {
   name?: string;
   shell?: string;
   allow_bypass?: boolean;
+  /** The effort level to start at (none: the model's own default). */
+  effort?: string;
 }
 
 export type Command =
