@@ -72,7 +72,7 @@ console picks) and are answered with a `reply` update to that client.
 | `stop_task` | `task` | the task's `status` (stopped) |
 | `stop_tasks` | | every live task stopped |
 | `suggest` | `client, query` | `{suggestions: [{path}], cwd}` |
-| `control` | `id, value?` (a `meta.controls` entry) | |
+| `control` | `id, value?` (a `meta.controls` entry, or one a catalog route names) | those with `client`: `{title, text, ...}` (below) |
 | `mcp_enable` | `name, enabled` | `state.mcp` |
 | `mcp_reconnect` / `mcp_refresh` | `name` / — | `state.mcp` |
 | `mcp_auth` | `name, client, redirect?` | `{url, callback, redirect}` to open, or `{ok, message}`; send it again with `redirect: <the address the sign-in ended on>` to finish a sign-in from another device |
@@ -81,6 +81,61 @@ console picks) and are answered with a `reply` update to that client.
 | `skill_view` | `name, client` | `{content, path}`, `{content, builtin: true, source}` (no file), or `{error}` |
 | `skill_run` | `name, args?, id?, mode?` | delivered like `send` |
 | `skills_reload` | | `state.skills` |
+
+## The command catalog (`meta.commands`)
+
+Every slash command the harness has, and what running it from kiln does. Known from the start
+(kiln's own entries) and completed when the harness lists its commands: Claude Code at
+initialize, then at init (which comes with the first turn); Codex with its skills; an ACP agent
+with `available_commands_update`. Sorted by group, then name; one entry per name.
+
+| field | |
+|---|---|
+| `name`, `description`, `hint` | `hint` is the placeholder for its words ("<name>", "[instructions]") |
+| `group` | "Session", "Model & mode", "Context", "Tools & MCP", "Skills", "Plugins", "Kiln" (kiln's own), in that order |
+| `args` | "none", "optional", "required" |
+| `aliases` | other names it runs under; never another entry's name, so a typed name matches a name before an alias |
+| `route` | what to do with it, by `kind`: |
+
+| `route.kind` | fields | the console |
+|---|---|---|
+| `prompt` | `text?`, `skill?` | sends a message: `text` with `{args}` replaced when there is one, else `/name words`; with `skill: true`, `skill_run {name, args}` |
+| `control` | `command` | sends `command` (a kiln command) with `{args}` (the words typed after the name) and `{client}` (its client id) replaced in its strings. One that carries `{client}` answers that console alone with `reply {client, value}`: `{title, text, format?: "markdown", filename?, path?}`, or `{error}` |
+| `view` | `view` | opens a kiln panel: `model`, `permissions`, `settings`, `mcp`, `skills`, `plugins`, `hooks`, `tasks`, `changes`, `usage`, `status`, `context`, `files`, `new_agent` |
+| `unsupported` | `reason` | sends nothing; says why |
+
+Nothing that changes the account (sign in or out, feedback that uploads the conversation, plan
+upgrades, plugin installs) is routed anywhere but `unsupported`.
+
+- **Claude Code**: the CLI's own list (what it runs without its terminal: its commands, bundled
+  and user skills, plugins' and MCP servers' commands), sent as text, except where kiln does the
+  job itself: `/compact`, `/clear` (with its aliases `/reset`, `/new`), `/rename`, `/model`,
+  `/effort`, `/context`, `/mcp`, `/usage`, `/reload-skills`, `/reload-plugins` (a control
+  request: the CLI binds the command to its terminal). Then the commands of its terminal
+  interface: those kiln runs with the CLI's control requests (`/btw` a side question, its answer
+  kept out of the conversation; `/cost`; `/export`; `/plan`; `/permissions` the rules in force and
+  their sources; `/memory` the instruction files and memory folders; `/git-diff` the workspace's
+  diff file by file), `/branch` (the conversation continued in another agent), kiln's panels
+  (`/status`, `/diff`, `/tasks`, `/hooks`, `/skills`, `/plugin`, `/workflows`), and the rest as
+  unsupported with why. Commands bound to the CLI's terminal (init's
+  `terminal_slash_commands`: `/doctor`, `/color`, `/focus`) are unsupported. When rows share a
+  name, `/name` runs the one marked built-in, as in the CLI.
+- **Codex**: its terminal interface's commands (its app-server runs none): panels (`/model`,
+  `/approvals`, `/permissions`, `/diff`, `/mention`, `/status`, `/usage`, `/mcp`, `/ps`,
+  `/agent`, `/hooks`, `/skills`, `/plugins`; `/new` and `/clear` start another agent), controls
+  (`/review`, `/compact`, `/rename`, `/goal`, `/fork`, `/undo`, `/export`, `/rollout`, `/pwd`),
+  `/init` (Codex's own prompt), the rest unsupported. Its skills join; one named like a command
+  runs from the skills panel. `/goal <objective>` sets the goal and Codex starts working toward
+  it, turn after turn, until it is done; `/goal pause`, `/goal resume`, `/goal clear` as in
+  Codex; `/goal` alone shows it with its status and the tokens used.
+- **ACP agents**: the agent's own commands, sent as text (one named like kiln's wins), and
+  kiln's: `/export` (the timeline as Markdown), `/status`, `/model`, `/diff`, `/restart`, `/new`.
+- Every harness: `/stop-tasks` (`stop_tasks`) and `/restart` in "Kiln".
+
+`control` ids the catalog uses: Claude Code `side_question {text, client}`, `session_cost`,
+`export`, `plan`, `permission_rules`, `memory`, `workspace_diff` (each `{client}`),
+`reload_plugins`, `fork`; Codex `goal {text?, client}`, `fork`, `undo`, `export`, `rollout`,
+`pwd` (`{client}`); ACP `export {client}`.
 
 ## State
 
@@ -147,6 +202,9 @@ their `server` and `tool_short`; skill calls their `skill`.
   shows each as a "shell" task, kept running when the turn ends, with its output kept by kiln
   (the last 256 KiB). Codex has no way to stop one from outside: `stop_task` stops the process
   itself (the newest under Codex running that command, with what it started).
+- **Codex** refuses to fork a thread for a moment after a turn ends (it is still writing the
+  thread's history out): kiln opens the branch again at the next tick, up to six times, with
+  `state.doing` saying so meanwhile.
 - **Codex**: stdio servers are added with `codex mcp add`; http servers are written to its
   configuration through its own API (the CLI would sign in at once, in a browser on the agent's
   machine). Removing an http server signs it out first. Effort and model are set per turn.
@@ -203,4 +261,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | monitors: events counted, the latest kept | unit (not offered to API-key sessions) | — | — | — |
 | pause / resume a task | — | — | — | — |
 | take over a session found running in a kiln terminal | ✓ | ✓ | — | — |
+| command catalog: every command with its route, aliases | ✓ | ✓ | ✓ | ? |
+| catalog commands kiln runs, answered to the asking console | ✓ (/btw /cost /export /plan /permissions /memory /git-diff) | ✓ (/goal /export /rollout /pwd) | ✓ (/export) | — |
+| /branch, /fork, /undo from the catalog | ✓ (/branch) | ✓ (/fork, /undo) | — | — |
 | refuse one running outside kiln | ✓ | ✓ | — | — |

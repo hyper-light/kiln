@@ -16,7 +16,7 @@ use super::core::{Baseline, Core, Effect};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Known, Level, Limit, McpServer,
     McpStatus, McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
-    ToolKind, ToolStatus, OUTPUT_MAX, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url, window_words,
+    ToolKind, ToolStatus, OUTPUT_MAX, Route, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog, window_words,
 };
 use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
 
@@ -76,6 +76,8 @@ enum Pending {
     McpAuth { client: String, name: String },
     /// An http server written into the configuration (answered to `client`).
     McpAdded { name: String, client: Option<String> },
+    /// thread/goal/get or set: the goal, shown to `client`.
+    Goal(String),
 }
 
 /// A run of the CLI (or a fetch) kiln is waiting on.
@@ -92,6 +94,10 @@ enum Run {
 /// How often the plan's rate limits are read while a session runs (Codex also pushes them
 /// during turns).
 const USAGE_EVERY_MS: i64 = 180_000;
+/// How often kiln opens a thread Codex is not ready to fork yet (once a tick).
+const OPEN_TRIES: u32 = 6;
+/// What the console shows meanwhile.
+const CATCHING_UP: &str = "Waiting for Codex to catch up with the conversation";
 
 /// Reasoning efforts every Codex reasoning model takes, offered until model/list says which the
 /// model in use has, and for a model it does not list.
@@ -177,6 +183,13 @@ pub struct Codex {
     mcp_again: bool,
     /// Terminals kiln is stopping: their end reads as stopped, not failed.
     stopping: std::collections::HashSet<String>,
+    /// The thread's rollout file.
+    rollout: Option<String>,
+    /// The thread open kiln sent (method, params), how often, and whether to send it again at
+    /// the next tick.
+    opening: Option<(&'static str, Value)>,
+    open_tries: u32,
+    reopen: bool,
 }
 
 impl Codex {
@@ -228,6 +241,10 @@ impl Codex {
             mcp_status_seen: false,
             mcp_again: false,
             stopping: std::collections::HashSet::new(),
+            rollout: None,
+            opening: None,
+            open_tries: 0,
+            reopen: false,
         }
     }
 
@@ -310,7 +327,23 @@ impl Codex {
     fn control(&mut self, core: &mut Core, id: &str, value: Option<Value>) {
         let text = || value.as_ref().and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("text").and_then(Value::as_str).map(str::to_owned))).unwrap_or_default();
         let event = || value.as_ref().and_then(|v| v.get("event")).and_then(Value::as_str).map(str::to_owned);
-        let Some(thread) = self.thread.clone() else { return };
+        let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("").to_owned();
+        // Answered from what kiln knows, thread or not.
+        if matches!(id, "export" | "rollout" | "pwd") {
+            let reply = match id {
+                "export" => json!({"title": "Conversation", "text": core.export(), "format": "markdown", "filename": "conversation.md"}),
+                "rollout" => json!({"title": "Rollout file", "text": self.rollout.clone().unwrap_or_else(|| "Not known yet.".to_owned())}),
+                _ => json!({"title": "Working directory", "text": core.state.cwd.clone()}),
+            };
+            core.reply(client, reply);
+            return;
+        }
+        let Some(thread) = self.thread.clone() else {
+            if id == "goal" {
+                core.reply(client, json!({"error": "Codex has not started the conversation yet."}));
+            }
+            return;
+        };
         match id {
             "reasoning_summary" => {
                 self.summary = Some(text());
@@ -358,6 +391,28 @@ impl Codex {
                 };
                 core.effects.push(Effect::Branch { resume: thread, resume_at: Some(turn) });
             }
+            // Run by the command catalog.
+            // As Codex's own: /goal [<objective>|clear|pause|resume].
+            "goal" => {
+                let t = text();
+                let (method, params) = match t.trim() {
+                    "" => ("thread/goal/get", json!({"threadId": thread})),
+                    "clear" => ("thread/goal/clear", json!({"threadId": thread, "origin": "user"})),
+                    "pause" => ("thread/goal/set", json!({"threadId": thread, "status": "paused", "origin": "user"})),
+                    "resume" => ("thread/goal/set", json!({"threadId": thread, "status": "active", "origin": "user"})),
+                    objective => ("thread/goal/set", json!({"threadId": thread, "objective": objective, "origin": "user"})),
+                };
+                self.request(core, Pending::Goal(client), method, params);
+            }
+            "fork" => core.effects.push(Effect::Branch { resume: thread, resume_at: None }),
+            "undo" => {
+                // The last prompt's turn, undone with everything after it.
+                let last = core.events().filter(|e| matches!(&e.body, Body::User { origin, .. } if origin.as_deref() != Some("system")) && self.turns.contains_key(&e.id)).last().map(|e| e.id.clone());
+                match last {
+                    Some(ev) => self.control(core, "rewind", Some(json!({"event": ev}))),
+                    None => self.notice(core, Level::Info, "Nothing to undo"),
+                }
+            }
             // Older consoles' MCP controls (now commands of their own).
             "mcp_refresh" => self.command(core, Command::McpRefresh),
             "mcp_reload" => self.mcp_reload(core),
@@ -387,6 +442,10 @@ impl Codex {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        // Codex's commands (skills join when they are listed).
+        if core.meta.commands.is_empty() {
+            core.meta.commands = sort_catalog(codex_catalog());
+        }
         // Effort can be set from the start (model/list narrows the levels to the model's).
         if core.meta.efforts.is_empty() {
             core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
@@ -666,8 +725,15 @@ impl Codex {
         }
     }
 
-    /// Every few seconds: servers still starting; the plan's rate limits now and then.
+    /// Every few seconds: a thread open to send again; servers still starting; the plan's rate
+    /// limits now and then.
     pub fn tick(&mut self, core: &mut Core) {
+        if std::mem::take(&mut self.reopen)
+            && let Some((method, params)) = self.opening.clone()
+        {
+            self.open_thread(core, method, params);
+            return;
+        }
         if matches!(core.state.status, Status::Starting | Status::Exited) {
             return;
         }
@@ -679,6 +745,13 @@ impl Codex {
             self.usage_at = now;
             self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
         }
+    }
+
+    /// thread/start, thread/resume or thread/fork, kept to be sent again.
+    fn open_thread(&mut self, core: &mut Core, method: &'static str, params: Value) {
+        self.open_tries += 1;
+        self.opening = Some((method, params.clone()));
+        self.request(core, Pending::Thread, method, params);
     }
 
     fn ask_mcp(&mut self, core: &mut Core) {
@@ -1056,6 +1129,13 @@ impl Codex {
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
                 }
+                // Codex writes a thread's history out a moment after a turn ends, and refuses to
+                // fork it until then: tried again at the next tick, a few times.
+                Pending::Thread if msg.contains("behind durable rollout") && self.open_tries < OPEN_TRIES => {
+                    self.reopen = true;
+                    core.state.doing = Some(CATCHING_UP.to_owned());
+                    core.touch_state();
+                }
                 Pending::Thread => {
                     self.notice(core, Level::Error, format!("Codex could not open the conversation: {msg}"));
                     core.set_status(Status::Idle);
@@ -1077,7 +1157,7 @@ impl Codex {
                     }
                     self.compose_mcp(core);
                 }
-                Pending::McpAuth { client, .. } => core.reply(client, json!({"error": msg})),
+                Pending::McpAuth { client, .. } | Pending::Goal(client) => core.reply(client, json!({"error": msg})),
                 Pending::McpAdded { client, .. } => answer(core, client, json!({"ok": false, "error": msg})),
                 Pending::McpConfig(what) => {
                     self.notice(core, Level::Warn, format!("{what}: {msg}"));
@@ -1112,15 +1192,15 @@ impl Codex {
                                 o.insert("lastTurnId".into(), json!(at));
                             }
                         }
-                        self.request(core, Pending::Thread, "thread/fork", params);
+                        self.open_thread(core, "thread/fork", params);
                     }
                     (Some(t), None) => {
                         if let Some(o) = params.as_object_mut() {
                             o.insert("threadId".into(), json!(t));
                         }
-                        self.request(core, Pending::Thread, "thread/resume", params);
+                        self.open_thread(core, "thread/resume", params);
                     }
-                    (None, _) => self.request(core, Pending::Thread, "thread/start", params),
+                    (None, _) => self.open_thread(core, "thread/start", params),
                 }
                 self.request(core, Pending::Models, "model/list", json!({}));
                 self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd.clone()]}));
@@ -1134,6 +1214,9 @@ impl Codex {
                 }
             }
             Pending::Thread => {
+                if core.state.doing.as_deref() == Some(CATCHING_UP) {
+                    core.state.doing = None;
+                }
                 let thread = result.get("thread").cloned().unwrap_or(Value::Null);
                 if let Some(id) = thread.get("id").and_then(Value::as_str) {
                     self.thread = Some(id.to_owned());
@@ -1147,6 +1230,9 @@ impl Codex {
                 }
                 if let Some(p) = result.get("modelProvider").and_then(Value::as_str) {
                     self.provider = Some(p.to_owned());
+                }
+                if let Some(p) = thread.get("path").and_then(Value::as_str) {
+                    self.rollout = Some(p.to_owned());
                 }
                 if let Some(v) = thread.get("cliVersion").and_then(Value::as_str) {
                     core.meta.version = v.to_owned();
@@ -1273,10 +1359,14 @@ impl Codex {
                             continue;
                         }
                         self.skills.insert(name.to_owned(), path.to_owned());
-                        cmds.push(SlashCommand { name: name.to_owned(), description: short, hint: String::new() });
+                        cmds.push(SlashCommand::new(name, &clip_middle(&short, 300).0, "", "Skills", Route::Prompt { text: None, skill: true }));
                     }
                 }
-                core.meta.commands = cmds;
+                // Codex's own commands first: a skill of the same name is run from the skills
+                // panel (Codex names skills with "$", its commands with "/").
+                let mut catalog = codex_catalog();
+                catalog.extend(cmds);
+                core.meta.commands = sort_catalog(catalog);
                 core.touch_meta();
                 core.state.skills = all;
                 core.state.plugins = self.plugins();
@@ -1341,6 +1431,19 @@ impl Codex {
                 core.touch_state();
             }
             Pending::McpConfig(_) => self.mcp_reload(core),
+            Pending::Goal(client) => {
+                let goal = result.get("goal").filter(|g| g.is_object());
+                let text = match goal {
+                    Some(g) => {
+                        let status = g.get("status").and_then(Value::as_str).unwrap_or("active");
+                        let next = if status == "active" { "Codex works toward it until it is done: /goal pause, /goal clear." } else { "/goal resume, /goal clear." };
+                        format!("{}\n\nStatus: {status} · {} tokens used\n{next}", g.get("objective").and_then(Value::as_str).unwrap_or(""), g.get("tokensUsed").and_then(Value::as_i64).unwrap_or(0))
+                    }
+                    None if result.get("cleared").and_then(Value::as_bool) == Some(true) => "Goal cleared.".to_owned(),
+                    None => "No goal is set. Give one after /goal.".to_owned(),
+                };
+                core.reply(client, json!({"title": "Goal", "text": text}));
+            }
             Pending::McpAdded { name, client } => {
                 answer(core, client, json!({"ok": true, "message": format!("Added MCP server {name} to Codex's configuration")}));
                 self.mcp_reload(core);
@@ -2113,6 +2216,70 @@ impl Codex {
     }
 }
 
+/// The first lines of Codex's own /init prompt.
+const INIT_PROMPT: &str = "Generate a file named AGENTS.md that serves as a contributor guide for this repository. Before writing, check whether AGENTS.md already exists in the current working directory. If it does, do not overwrite or modify it. Produce a clear, concise (200-400 words), well-structured document titled \"Repository Guidelines\", with sections as they apply: project structure and module organization; build, test and development commands; coding style and naming conventions; testing guidelines; commit and pull request guidelines.";
+
+/// Codex's own commands (its TUI's), and what each does from kiln: Codex's app-server runs no
+/// slash commands, so each is a kiln panel or control, a prompt, or unavailable.
+fn codex_catalog() -> Vec<SlashCommand> {
+    let c = |name: &str, desc: &str, hint: &str, group: &str, command: Value| SlashCommand::control(name, desc, hint, group, command);
+    let v = SlashCommand::view;
+    let no = SlashCommand::unsupported;
+    let terminal = "a setting of Codex's terminal interface";
+    vec![
+        v("model", "Choose the model and reasoning effort", "Model & mode", "model"),
+        v("approvals", "Choose what Codex is allowed to do", "Model & mode", "permissions"),
+        v("permissions", "Choose what Codex is allowed to do", "Model & mode", "permissions"),
+        c("review", "Review the current changes and find issues", "[instructions]", "Context", json!({"type": "control", "id": "review", "value": {"text": "{args}"}})),
+        c("compact", "Summarize the conversation to free context", "", "Context", json!({"type": "control", "id": "compact"})),
+        v("diff", "The changes (git diff, untracked files too)", "Context", "changes"),
+        v("mention", "Mention a file", "Context", "files"),
+        SlashCommand::new("init", "Create an AGENTS.md file with instructions for Codex", "", "Context", Route::Prompt { text: Some(INIT_PROMPT.to_owned()), skill: false }),
+        v("status", "Session configuration and token usage", "Session", "status"),
+        v("usage", "Account usage and limits", "Session", "usage"),
+        c("rename", "Rename the conversation", "<name>", "Session", json!({"type": "control", "id": "rename", "value": "{args}"})),
+        c("goal", "Set, show, pause, resume or clear the goal for a long-running task", "[<objective>|clear|pause|resume]", "Session", json!({"type": "control", "id": "goal", "value": {"text": "{args}", "client": "{client}"}})),
+        c("fork", "Fork the conversation into another agent", "", "Session", json!({"type": "control", "id": "fork"})),
+        c("undo", "Undo the last turn", "", "Session", json!({"type": "control", "id": "undo"})),
+        c("export", "The conversation as Markdown", "", "Session", json!({"type": "control", "id": "export", "value": {"client": "{client}"}})),
+        c("rollout", "The rollout file's path", "", "Session", json!({"type": "control", "id": "rollout", "value": {"client": "{client}"}})),
+        c("pwd", "The working directory", "", "Session", json!({"type": "control", "id": "pwd", "value": {"client": "{client}"}})),
+        v("mcp", "MCP servers: status, tools, sign-in", "Tools & MCP", "mcp"),
+        v("ps", "Background terminals", "Tools & MCP", "tasks"),
+        v("agent", "This session's subagents", "Tools & MCP", "tasks"),
+        v("hooks", "Lifecycle hooks", "Tools & MCP", "hooks"),
+        v("skills", "Skills: view and run", "Skills", "skills"),
+        v("plugins", "Installed plugins", "Plugins", "plugins"),
+        c("stop-tasks", "Stop every background terminal and task", "", "Kiln", json!({"type": "stop_tasks"})),
+        c("restart", "Start Codex again, continuing the conversation", "", "Kiln", json!({"type": "restart"})),
+        v("new", "Start a new conversation (another agent)", "Kiln", "new_agent"),
+        v("clear", "Start a new conversation (another agent)", "Kiln", "new_agent"),
+        no("resume", "Resume a saved chat", "Session", "continue another conversation from kiln's agents list"),
+        no("plan", "Switch to Plan mode", "Model & mode", "Codex's Plan mode is not offered through its app-server"),
+        no("side", "A side conversation in an ephemeral fork", "Context", "Codex's side conversations are not offered through its app-server"),
+        no("copy", "Copy the last response", "Session", "copy from the console"),
+        no("cd", "Change the working directory", "Session", "an agent's folder is set when it starts"),
+        no("worktree", "Continue in a new worktree", "Session", "start an agent in the worktree's folder"),
+        no("archive", "Archive this session", "Session", "manage saved conversations with the Codex CLI"),
+        no("delete", "Delete this session", "Session", "manage saved conversations with the Codex CLI"),
+        no("logout", "Sign out", "Session", "signing out changes the account: use the Codex CLI"),
+        no("feedback", "Send logs to the maintainers", "Session", "it sends logs to OpenAI: use the Codex CLI"),
+        no("quit", "Exit Codex", "Session", "close the agent in kiln"),
+        no("exit", "Exit Codex", "Session", "close the agent in kiln"),
+        no("memory", "Configure memory", "Context", "configure Codex's memory with the Codex CLI"),
+        no("apps", "Manage apps", "Tools & MCP", "manage apps with the Codex CLI"),
+        no("experimental", "Toggle experimental features", "Session", "change Codex's features with the Codex CLI"),
+        no("debug-config", "Config layers and requirement sources", "Session", "run it in the Codex CLI"),
+        no("theme", "Syntax highlighting theme", "Session", terminal),
+        no("statusline", "Status line items", "Session", terminal),
+        no("title", "Terminal title items", "Session", terminal),
+        no("raw", "Raw scrollback mode", "Session", terminal),
+        no("vim", "Vim keys in the composer", "Session", terminal),
+        no("voice", "Voice input", "Session", terminal),
+        no("ide", "Context from your IDE", "Context", "Codex's IDE integration is not offered through its app-server"),
+    ]
+}
+
 /// Answer the client that asked, or say it in the timeline when no one is waiting.
 fn answer(core: &mut Core, client: Option<String>, value: Value) {
     match client.filter(|c| !c.is_empty()) {
@@ -2654,6 +2821,94 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_codex_is_not_ready_for_is_tried_again() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let spec = super::super::session::Spec { kind: "codex".into(), resume: Some("th1".into()), fork: true, ..Default::default() };
+        let mut c = Codex::from_spec(&spec);
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1 (Linux)"}));
+        let w = written(&mut core);
+        let fork = w.iter().find(|v| v.get("method") == Some(&json!("thread/fork"))).cloned().unwrap_or_default();
+        let id = fork.get("id").cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32603, "message": "failed to prepare paginated fork: thread-store internal error: thread history projection for th1 is behind durable rollout"}})]);
+        assert!(core.state.doing.as_deref() == Some(CATCHING_UP) && core.state.status == Status::Starting);
+        assert!(!core.events().any(|e| matches!(&e.body, Body::Notice { .. })));
+        c.tick(&mut core);
+        let w = written(&mut core);
+        let again = w.iter().find(|v| v.get("method") == Some(&json!("thread/fork"))).cloned().unwrap_or_default();
+        assert_eq!(again.get("params"), fork.get("params"));
+        respond(&mut c, &mut core, &w, "thread/fork", json!({"thread": {"id": "th2", "turns": []}, "model": "gpt-5", "cwd": "/work"}));
+        assert!(core.state.doing.is_none() && core.state.harness_session.as_deref() == Some("th2"));
+        // Other refusals are said at once.
+        let mut core = Core::new();
+        let mut c = Codex::from_spec(&spec);
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1 (Linux)"}));
+        let w = written(&mut core);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/fork"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "no such thread"}})]);
+        assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text.contains("no such thread"))) && core.state.status == Status::Idle);
+        Ok(())
+    }
+
+    #[test]
+    fn the_command_catalog_and_what_its_controls_answer() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        // Codex's commands from the start, each with a route; names unique.
+        let cat = core.meta.commands.clone();
+        let route = |n: &str| cat.iter().find(|e| e.name == n).map(|e| e.route.clone());
+        assert!(matches!(route("model"), Some(Route::View { view }) if view == "model"));
+        assert!(matches!(route("ps"), Some(Route::View { view }) if view == "tasks"));
+        assert!(matches!(route("init"), Some(Route::Prompt { text: Some(t), .. }) if t.contains("AGENTS.md")));
+        assert!(matches!(route("logout"), Some(Route::Unsupported { reason }) if !reason.is_empty()));
+        assert!(matches!(route("goal"), Some(Route::Control { command }) if command.pointer("/value/client") == Some(&json!("{client}"))));
+        let mut names: Vec<&str> = cat.iter().map(|e| e.name.as_str()).collect();
+        names.dedup();
+        assert_eq!(names.len(), cat.len());
+        // Answered before the thread is open: the export and the folder; a goal says it must wait.
+        c.command(&mut core, Command::Control { id: "pwd".into(), value: Some(json!({"client": "k1"})) });
+        c.command(&mut core, Command::Control { id: "goal".into(), value: Some(json!({"client": "k2"})) });
+        let r = replies(&mut core);
+        assert!(r.iter().any(|(cl, v)| cl == "k1" && v.get("text") == Some(&json!("/work"))), "{r:?}");
+        assert!(r.iter().any(|(cl, v)| cl == "k2" && v.get("error").is_some()), "{r:?}");
+        let (mut c, mut core, _) = opened();
+        // /goal with words sets it; without, shows it.
+        c.command(&mut core, Command::Control { id: "goal".into(), value: Some(json!({"text": " ship it ", "client": "k3"})) });
+        let w = written(&mut core);
+        let set = w.iter().find(|v| v.get("method") == Some(&json!("thread/goal/set"))).cloned().unwrap_or_default();
+        assert_eq!(set.get("params"), Some(&json!({"threadId": "th1", "objective": "ship it", "origin": "user"})));
+        respond(&mut c, &mut core, &w, "thread/goal/set", json!({"goal": {"objective": "ship it", "status": "active", "tokensUsed": 12}}));
+        let r = replies(&mut core);
+        assert!(r.iter().any(|(cl, v)| cl == "k3" && v.get("title") == Some(&json!("Goal")) && v.get("text").and_then(Value::as_str).is_some_and(|t| t.contains("ship it") && t.contains("12 tokens"))), "{r:?}");
+        c.command(&mut core, Command::Control { id: "goal".into(), value: Some(json!({"text": "pause", "client": "k4"})) });
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method") == Some(&json!("thread/goal/set")) && v.get("params") == Some(&json!({"threadId": "th1", "status": "paused", "origin": "user"}))));
+        c.command(&mut core, Command::Control { id: "goal".into(), value: Some(json!({"text": "clear", "client": "k4"})) });
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "thread/goal/clear", json!({"cleared": true}));
+        assert!(replies(&mut core).iter().any(|(cl, v)| cl == "k4" && v.get("text") == Some(&json!("Goal cleared."))));
+        c.command(&mut core, Command::Control { id: "goal".into(), value: Some(json!({"client": "k4"})) });
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "thread/goal/get", json!({"goal": null}));
+        assert!(replies(&mut core).iter().any(|(cl, v)| cl == "k4" && v.get("text").and_then(Value::as_str).is_some_and(|t| t.starts_with("No goal"))));
+        // /fork: the whole thread in another agent; /undo with no prompt yet says so.
+        c.command(&mut core, Command::Control { id: "fork".into(), value: None });
+        assert!(matches!(core.effects.pop(), Some(Effect::Branch { resume, resume_at: None }) if resume == "th1"));
+        c.command(&mut core, Command::Control { id: "undo".into(), value: None });
+        assert!(written(&mut core).iter().all(|v| v.get("method") != Some(&json!("thread/revert"))));
+        // /export: the conversation from the timeline.
+        c.command(&mut core, Command::Control { id: "export".into(), value: Some(json!({"client": "k5"})) });
+        assert!(replies(&mut core).iter().any(|(cl, v)| cl == "k5" && v.get("format") == Some(&json!("markdown"))));
+        Ok(())
+    }
+
+    #[test]
     fn skills_and_plugins_are_listed_viewed_and_run() -> anyhow::Result<()> {
         let (mut c, mut core, w) = opened();
         respond(
@@ -2670,7 +2925,10 @@ mod tests {
         );
         let sk: Vec<(&str, &str, bool)> = core.state.skills.iter().map(|s| (s.name.as_str(), s.source.as_str(), s.enabled)).collect();
         assert_eq!(sk, vec![("imagegen", "system", true), ("review", "project", true), ("deploy", "plugin", true), ("off", "user", false)]);
-        assert_eq!(core.meta.commands.len(), 3);
+        // Skills join the catalog; Codex's own /review keeps its name (the skill runs from the panel).
+        let skills: Vec<&str> = core.meta.commands.iter().filter(|c| matches!(c.route, Route::Prompt { skill: true, .. })).map(|c| c.name.as_str()).collect();
+        assert_eq!(skills, vec!["deploy", "imagegen"]);
+        assert!(core.meta.commands.iter().any(|c| c.name == "review" && matches!(&c.route, Route::Control { command } if command.get("id") == Some(&json!("review")))));
         respond(&mut c, &mut core, &w, "plugin/installed", json!({"marketplaces": [{"name": "market", "plugins": [{"id": "ops@market", "name": "ops", "installed": true, "enabled": true, "localVersion": "2.0.0", "interface": {"displayName": "Ops"}}, {"id": "x@market", "name": "x", "installed": false, "enabled": false}]}], "marketplaceLoadErrors": []}));
         assert_eq!(core.state.plugins.iter().map(|p| (p.name.as_str(), p.source.as_str(), p.version.as_deref())).collect::<Vec<_>>(), vec![("Ops", "market", Some("2.0.0"))]);
         c.command(&mut core, Command::SkillView { name: "review".into(), client: "v1".into() });

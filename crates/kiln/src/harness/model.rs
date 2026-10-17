@@ -637,13 +637,110 @@ pub struct ModelOption {
     pub description: String,
 }
 
+/// One entry of a harness's command catalog (`Meta::commands`): every slash command it has, and
+/// what running it from kiln does (`route`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SlashCommand {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// The placeholder for its words ("<model>", "[instructions]").
     #[serde(default)]
     pub hint: String,
+    /// "Session", "Model & mode", "Context", "Tools & MCP", "Skills", "Plugins" or "Kiln".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
+    /// Whether it takes words after its name: "none", "optional" or "required".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub args: String,
+    /// Other names it answers to (never another entry's name).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub route: Route,
+}
+
+/// What running a catalog command does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Route {
+    /// Sent as a message: `text` when given (with "{args}" replaced by the words typed after the
+    /// name), else "/name words". A skill (`skill`) runs with `skill_run`.
+    Prompt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skill: bool,
+    },
+    /// Sends this kiln `Command` (JSON), with "{args}" and "{client}" in its strings replaced (the
+    /// words typed after the name; the asking client). One that answers replies to that client
+    /// with `{title, text, format?, filename?}` ("text" or "markdown").
+    Control { command: serde_json::Value },
+    /// Opens a kiln panel: "model", "permissions", "settings", "mcp", "skills", "plugins",
+    /// "hooks", "tasks", "changes", "usage", "status", "context", "files", "new_agent".
+    View { view: String },
+    /// Not available from kiln, and why.
+    Unsupported { reason: String },
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Self::Prompt { text: None, skill: false }
+    }
+}
+
+impl SlashCommand {
+    pub fn new(name: &str, description: &str, hint: &str, group: &str, route: Route) -> Self {
+        let args = if hint.starts_with('<') {
+            "required"
+        } else if hint.is_empty() {
+            "none"
+        } else {
+            "optional"
+        };
+        Self { name: name.to_owned(), description: description.to_owned(), hint: hint.to_owned(), group: group.to_owned(), args: args.to_owned(), aliases: Vec::new(), route }
+    }
+
+    /// The same, answering to other names too.
+    pub fn aka(mut self, aliases: &[&str]) -> Self {
+        self.aliases = aliases.iter().map(|a| (*a).to_owned()).collect();
+        self
+    }
+
+    /// Run by the harness itself: sent as "/name words".
+    pub fn prompt(name: &str, description: &str, hint: &str, group: &str) -> Self {
+        Self::new(name, description, hint, group, Route::default())
+    }
+
+    /// A kiln command (`command` as JSON, "{args}" and "{client}" filled in when sent).
+    pub fn control(name: &str, description: &str, hint: &str, group: &str, command: serde_json::Value) -> Self {
+        Self::new(name, description, hint, group, Route::Control { command })
+    }
+
+    pub fn view(name: &str, description: &str, group: &str, view: &str) -> Self {
+        Self::new(name, description, "", group, Route::View { view: view.to_owned() })
+    }
+
+    pub fn unsupported(name: &str, description: &str, group: &str, reason: &str) -> Self {
+        Self::new(name, description, "", group, Route::Unsupported { reason: reason.to_owned() })
+    }
+}
+
+/// The order groups are shown in.
+pub fn group_rank(group: &str) -> usize {
+    ["Session", "Model & mode", "Context", "Tools & MCP", "Skills", "Plugins", "Kiln"].iter().position(|g| *g == group).unwrap_or(7)
+}
+
+/// A catalog in group order, then by name, one entry per name (the first kept), and no alias
+/// that is another entry's name (or an alias an earlier entry has).
+pub fn sort_catalog(mut c: Vec<SlashCommand>) -> Vec<SlashCommand> {
+    let mut seen = std::collections::HashSet::new();
+    c.retain(|e| seen.insert(e.name.clone()));
+    for e in &mut c {
+        e.aliases.retain(|a| seen.insert(a.clone()));
+    }
+    c.sort_by(|a, b| group_rank(&a.group).cmp(&group_rank(&b.group)).then_with(|| a.name.cmp(&b.name)));
+    c
 }
 
 /// A control the harness offers (a setting or an action), described so the UI can render it
@@ -1133,6 +1230,26 @@ pub fn clip_json(v: &serde_json::Value, max: usize) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_catalog_has_one_entry_per_name_and_no_alias_hides_one() {
+        let c = sort_catalog(vec![
+            SlashCommand::prompt("usage", "", "", "Session").aka(&["cost", "stats"]),
+            SlashCommand::control("cost", "", "", "Session", serde_json::json!({"type": "control", "id": "session_cost"})),
+            SlashCommand::prompt("usage", "a second one", "", "Session"),
+            SlashCommand::prompt("clear", "", "[name]", "Context").aka(&["stats", "reset"]),
+            SlashCommand::prompt("zed", "", "<x>", "Nowhere"),
+        ]);
+        let names: Vec<(&str, Vec<String>, &str)> = c.iter().map(|e| (e.name.as_str(), e.aliases.clone(), e.args.as_str())).collect();
+        assert_eq!(
+            names,
+            vec![("cost", vec![], "none"), ("usage", vec!["stats".to_owned()], "none"), ("clear", vec!["reset".to_owned()], "optional"), ("zed", vec![], "required")]
+        );
+        assert_eq!(c.get(1).map(|e| e.description.as_str()), Some(""));
+        // The route's JSON: tagged by kind; a plain prompt is just its kind.
+        assert_eq!(serde_json::to_value(Route::default()).ok(), Some(serde_json::json!({"kind": "prompt"})));
+        assert_eq!(serde_json::to_value(Route::Unsupported { reason: "r".into() }).ok(), Some(serde_json::json!({"kind": "unsupported", "reason": "r"})));
+    }
 
     #[test]
     fn clipping_keeps_head_and_tail_on_char_boundaries() {
