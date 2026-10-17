@@ -20,6 +20,7 @@ import { relativeTime } from "@/lib/format";
 import { money, plain, tildify } from "./derive";
 import { DiffStat } from "./diff";
 import { HarnessMark, StatusPill, ToolIcon } from "./parts";
+import { AccountLimits } from "./limits";
 import { SpawnDialog } from "./spawn";
 
 type Group = "status" | "shell" | "machine";
@@ -163,7 +164,11 @@ const AgentCard = React.memo(function AgentCard({ a, selected, onSelect, now }: 
             {a.files_changed} file{a.files_changed === 1 ? "" : "s"} <DiffStat add={a.lines_added ?? 0} del={a.lines_removed ?? 0} />
           </span>
         )}
-        {a.tasks_running > 0 && <span>{a.tasks_running} subagent{a.tasks_running === 1 ? "" : "s"}</span>}
+        {a.tasks_running > 0 && (
+          <span>
+            {a.tasks_running} subagent{a.tasks_running === 1 ? "" : "s"}
+          </span>
+        )}
         {a.queued > 0 && <span>{a.queued} queued</span>}
         {(a.context_pct ?? 0) >= 1 && <span>context {Math.round(a.context_pct ?? 0)}%</span>}
         {a.cost_usd > 0 && <span>{money(a.cost_usd)}</span>}
@@ -312,6 +317,8 @@ export default function Mission() {
         }
       />
 
+      <AccountLimits agents={agents} />
+
       {inbox.length > 0 && (
         <section className="hx-inbox" aria-label="Waiting on you">
           <div className="hx-section-head">
@@ -354,8 +361,7 @@ export default function Mission() {
             </Button>
           }
         >
-          Start Claude Code, Codex or any harness your machines have — one or a dozen. kiln runs them and is their whole front end: steer them, approve what they do,
-          review their changes.
+          Start Claude Code, Codex or any harness your machines have — one or a dozen. kiln runs them and is their whole front end: steer them, approve what they do, review their changes.
         </EmptyState>
       ) : (
         groups.map(([k, as]) => (
@@ -409,4 +415,3 @@ export default function Mission() {
     </div>
   );
 }
-

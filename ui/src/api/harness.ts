@@ -136,6 +136,29 @@ export interface Usage {
   context_window?: number;
 }
 
+/** A plan limit of the account the agent runs as (5-hour window, weekly …). */
+export interface Limit {
+  id: string;
+  label: string;
+  used_percent: number | null;
+  used?: number;
+  limit?: number;
+  unit?: string;
+  /** Unix ms. */
+  resets_at?: number;
+  window?: string;
+  /** A stable, non-secret id of the account ("claude:max:3f2a…"), the same across its agents. */
+  account?: string;
+}
+
+/** One line of the harness's status: version, account, model, sandbox, MCP servers … */
+export interface StatusItem {
+  group: string;
+  label: string;
+  value: string;
+  tone?: "ok" | "warn" | "error";
+}
+
 export interface ExitInfo {
   code: number | null;
   error?: string;
@@ -180,6 +203,9 @@ export interface State {
   effort?: string;
   /** Live values of Meta.controls, by id. */
   control_values?: Record<string, unknown>;
+  limits?: Limit[];
+  /** The harness's own status lines (`status` is the session's lifecycle). */
+  harness_status?: StatusItem[];
 }
 
 export interface ModeOption {
@@ -302,6 +328,9 @@ export interface AgentInfo {
   context_pct?: number;
   doing?: string;
   turn_started?: number;
+  limits?: Limit[];
+  account?: string;
+  plan?: string;
 }
 
 export interface KindInfo {

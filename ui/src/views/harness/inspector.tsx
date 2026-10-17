@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { changesetOf, duration, money, relPath, runsOf, tokens, type FileChange, type ToolEvent } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
 import { Output } from "./parts";
+import { LimitMeter, StatusList } from "./limits";
 import { TodoList } from "./timeline";
 
 export type InspectorTab = "changes" | "plan" | "runs" | "agents" | "usage";
@@ -163,6 +164,29 @@ export function Subagents({ state, meta, store, onOpen }: { state: State | null;
   return <ul className="hx-tasks">{rows}</ul>;
 }
 
+function Status({ state }: { state: State | null }) {
+  const limits = state?.limits ?? [];
+  const items = state?.harness_status ?? [];
+  return (
+    <div className="hx-stack">
+      {limits.length > 0 && (
+        <section className="hx-stack">
+          <div className="hx-eyebrow">Plan usage</div>
+          {limits.map((l) => (
+            <LimitMeter key={l.id} limit={l} />
+          ))}
+        </section>
+      )}
+      <section className="hx-stack">
+        <div className="hx-eyebrow">This session</div>
+        <Usage state={state} />
+      </section>
+      {items.length > 0 && <StatusList items={items} />}
+      {limits.length === 0 && items.length === 0 && <div className="hx-dim text-[12px]">This harness hasn't reported its status or plan limits yet.</div>}
+    </div>
+  );
+}
+
 function Usage({ state }: { state: State | null }) {
   const u = state?.usage;
   if (!u) return null;
@@ -240,7 +264,7 @@ export function Inspector({
     { id: "plan", label: "Plan", count: todos.length ? `${done}/${todos.length}` : undefined },
     { id: "runs", label: "Runs", count: runs.length ? String(runs.length) : undefined },
     { id: "agents", label: "Subagents", count: tasks.length ? String(tasks.length) : undefined },
-    { id: "usage", label: "Usage" },
+    { id: "usage", label: "Status" },
   ];
   return (
     <div className={cn("hx-inspector", className)}>
@@ -267,7 +291,7 @@ export function Inspector({
           ))}
         {tab === "runs" && <Runs events={events} />}
         {tab === "agents" && <Subagents state={state} meta={meta} store={store} onOpen={onOpenTask} />}
-        {tab === "usage" && <Usage state={state} />}
+        {tab === "usage" && <Status state={state} />}
       </div>
     </div>
   );

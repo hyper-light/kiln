@@ -17,6 +17,7 @@ import { Composer } from "./composer";
 import { SettingsButton, SettingsSheet, useAttachments } from "./controls";
 import { money, tildify } from "./derive";
 import { Inspector, type InspectorTab } from "./inspector";
+import { LimitBadge } from "./limits";
 import { HarnessMark, StatusPill } from "./parts";
 import { Timeline } from "./timeline";
 
@@ -187,6 +188,13 @@ export default function AgentPage() {
             <span>{info?.target === "local" ? "server" : (info?.target ?? "").replace(/^agent:/, "")}</span>
             <span className="hx-trunc">{tildify(cwd)}</span>
             {state?.usage && state.usage.cost_usd > 0 && <span>{money(state.usage.cost_usd)}</span>}
+            <LimitBadge
+              limits={state?.limits ?? info?.limits}
+              onClick={() => {
+                setTab("usage");
+                setPhoneTab("usage");
+              }}
+            />
             {conn === "reconnecting" && <span className="hx-warn">reconnecting…</span>}
           </div>
         </div>
@@ -229,7 +237,7 @@ export default function AgentPage() {
           <div className="hx-tabs hx-phone-tabs" role="tablist">
             {(["work", "changes", "plan", "runs", "agents", "usage"] as PhoneTab[]).map((t) => (
               <button key={t} type="button" role="tab" aria-selected={phoneTab === t} className="hx-tab" onClick={() => setPhoneTab(t)}>
-                {t === "work" ? "Work" : t === "changes" ? "Changes" : t === "plan" ? "Plan" : t === "runs" ? "Runs" : t === "agents" ? "Subagents" : "Usage"}
+                {t === "work" ? "Work" : t === "changes" ? "Changes" : t === "plan" ? "Plan" : t === "runs" ? "Runs" : t === "agents" ? "Subagents" : "Status"}
                 {t === "work" && approvals.length > 0 && <span className="hx-tab-count hx-tab-alert">{approvals.length}</span>}
               </button>
             ))}
