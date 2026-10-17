@@ -171,10 +171,10 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | --- | --- | --- | --- | --- |
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
-| W03 | Triggers and events | W02 | ready | |
-| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | ready | |
-| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | ready (core state machine) | |
-| W06 | Step runtime on the runner | W01, W02 | ready | |
+| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; push, tag, PR, manual from polling |
+| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit); preview and fixtures left |
+| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` steps GitHub-exact on the host executor; `uses:` with W07 |
 | W07 | Actions | W06 | blocked (W06) | |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | ready | |
 | W09 | Secrets and variables | W01 | ready | |
@@ -1027,8 +1027,9 @@ as a hint).
 - **W03-R07 Payloads.** `$GITHUB_EVENT_PATH` holds the GitHub-shaped payload. Webhook and App
   events pass GitHub's payload through. For polled and native events kiln synthesizes it: for
   `push` the `ref`, `before`, `after`, `created`, `deleted`, `forced`, `base_ref`, `compare`,
-  `commits` (up to 20, each with `id`, `tree_id`, `message`, `timestamp`, `author`, `committer`,
-  `added`, `removed`, `modified`), `head_commit`, `repository`, `pusher`, `sender`; for
+  `commits` (up to 20, each with `id`, `tree_id`, `message`, `timestamp`, `author`, `committer`;
+  as in GitHub's payload for Actions, no `added`, `removed` or `modified`), `head_commit`,
+  `repository`, `pusher`, `sender`; for
   `pull_request` the `action`, `number`, `pull_request` (`number`, `title`, `body`, `state`,
   `draft`, `user`, `labels`, `head` and `base` with `ref`, `sha`, `repo`), `repository`, `sender`.
   Fields kiln cannot know (labels of a polled PR without a token) are absent, and
@@ -1120,7 +1121,30 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
 - **W03-S05** `on: { workflow_run: { workflows: [ci], types: [completed], branches: [main] } }` → a
   run after each completed `ci` run on main, with the triggering run in `github.event.workflow_run`.
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - `kiln_ci::trigger`:
+    - `event` (R01);
+    - `matcher` (R03, R09, every "no" with its reason);
+    - `pattern` (R04, every row of GitHub's cheat sheet, AC02);
+    - `skip` (R06, AC03);
+    - `cron` (R10 with time zones and DST, AC06's two 2026 transitions in Berlin and New York;
+      `jitter`);
+    - `context`: the `github` context, and payloads for push, pull request, dispatch and schedule
+      (R07).
+  - `crates/kiln/src/ci/events.rs`: the server path. gitops' push, tag, pull-request and manual
+    triggers become events, with changed files (R05), commit messages and payloads. Matching
+    workflows start runs. A broken workflow gets a `startup_failure` run listing its diagnostics.
+    v1's auto-detected pipeline stands aside when GitHub workflows run. All of this is behind
+    `[ci] enabled`.
+  - Checked end to end on a local server: push → matrix legs → needs → outputs.
+- *Left.*
+  - Webhook and App payloads passed through (today the webhook only wakes the poll).
+  - The schedule loop for GitHub workflows, dedup (R14) and `repository_dispatch`.
+  - `workflow_run` and `pipeline` events from finished runs.
+  - kiln's native events, with W14, W15 and W20.
+  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05.
 
 ### W04 Planner: graph, matrices, reusable workflows, outputs
 
@@ -1141,7 +1165,10 @@ for GHA semantics; kiln's matrix and data-flow additions on top. Pure code in
   finished evaluate their `if` (contexts `github`, `needs`, `vars`, `inputs`, status functions over
   the needs, transitively), then expand their matrix (which may read `needs` outputs) and yield
   `Queue(leg)` actions, or finish as `skipped`. `PlanAction` is `Queue(LegSpec)`,
-  `Skip(job, reason)`, `Cancel(leg, reason)`, `Finish(conclusion)`.
+  `Settle { leg, conclusion, reason }` (a leg decided without running: skipped by `when`, cancelled
+  before it was queued, failed to start), `Job { job, conclusion, reason }` (a job that ended with
+  no legs), `Cancel { leg, reason, queued_only }`, `Warn { leg, message }` and
+  `Finish(conclusion)`.
 - **W04-R03 Skips**, GitHub-exact: when a job fails or is skipped, the jobs that need it are
   skipped unless their `if` calls a status function that lets them run (`always()`, `failure()`,
   `!cancelled()`, …).
@@ -1345,7 +1372,29 @@ contexts to every later evaluation, and plan previews to W20 and W21.
 - **W04-S05** `exports: { env: [IMAGE_TAG] }` on `build`, `env-from: [build]` on `deploy`; `build`
   appends `IMAGE_TAG=abc` to `$GITHUB_ENV` → `deploy`'s steps see `IMAGE_TAG=abc`.
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.* `kiln_ci::plan`:
+  - `matrix`: R07, R08, R13 to R15, and AC01's every documented example. An `include` entry that
+    fits nothing is appended once.
+  - `perms` (R06).
+  - The engine (`RunPlan`): GitHub's graph and skips, status functions over transitive needs,
+    `continue-on-error`, `fail-fast`, `max-parallel`, dynamic matrices, cancellation (`always()`
+    and `cancelled()` jobs run), timeouts.
+  - Reusable workflows as scopes: typed inputs, secrets mapped or inherited, outputs,
+    permissions only reduced, 10 levels and 50 workflows.
+  - kiln's `where`, `when`, `platforms`/`emulate`, `shard` (LPT over history), `chunk`, per-axis
+    `max-parallel`, scoped `fail-fast`, leg-level needs (`same`, `where`).
+  - Outputs: last writer, `legs`, typed, `exports`/`env-from`, `run.env`, secret outputs kept out
+    of contexts, limits with warnings, and provenance (`reads`).
+  - `preview` (R29's core).
+  - Tests: 42 unit tests (AC03 to AC06, S01 to S05) and the AC02 property test.
+  - `ci/runs.rs` persists runs and legs; `ci_plans` and `ci_plan_log` rebuild a plan by replay.
+- *Left.*
+  - `POST /api/ci/plan-preview`.
+  - Fixtures F-10 to F-15, AC07 and AC08 end to end.
+  - Remote reusable workflows (W07's mirror).
+  - The live checks of AC04 and AC06.
 
 ### W05 Scheduler: queues, concurrency, priorities, routing, retries
 
@@ -1363,11 +1412,15 @@ scans agents) with an event-driven state machine in `kiln_ci::sched`, driven by
   polling tick, and never reads the database to decide. Its state is in memory and rebuilt from
   SQLite at start (W05-R25).
 - **W05-R02 Inputs and outputs.** `Scheduler::handle(Input, now) -> Vec<Command>`. Inputs:
-  `LegQueued`, `LegCancelled`, `AttemptStarted`, `AttemptFinished{ class }`, `RunnerUp{ facts,
-  labels, executors, caps, capacity }`, `RunnerChanged`, `RunnerLost`, `RunnerDraining`,
-  `PoolChanged`, `RulesChanged`, `ApprovalGranted`, `Tick` (only for timers it asked for).
-  Commands: `Assign{ leg, runner, executor }`, `Cancel{ leg, attempt, reason }`,
-  `Retry{ leg, at }`, `Wait{ leg, reason }`, `Fail{ leg, reason }`, `ScaleUp{ pool, count,
+  `RunQueued{ group, supersede }` and `RunFinished` (workflow-level concurrency, W05-R06,
+  W05-R08), `LegQueued`, `LegRunning` (a leg adopted after a restart), `LegCancelled`,
+  `AttemptStarted`, `AttemptFinished{ outcome }` (success, failed with a class, cancelled),
+  `Rejected` (the runner refused it: back to the queue, same attempt, another runner),
+  `RunnerUp{ facts, labels, executors, caps, capacity }`, `RunnerChanged`, `RunnerLost`,
+  `RunnerDraining`, `PoolChanged`, `RulesChanged`, `ApprovalGranted`, `Tick` (only for timers it
+  asked for). Commands: `StartRun`, `CancelRun`, `Assign{ leg, runner, attempt, executor }`,
+  `Cancel{ leg, attempt, reason }`, `Retry{ leg, attempt, at }`, `Wait{ leg, reason }`,
+  `Settled{ leg, outcome, reason }` (done for good: the plan hears of it), `ScaleUp{ pool, count,
   signature }`, `ScaleDown{ pool, runner }`, `Timer{ at }`.
 - **W05-R03 Capacity.** A runner offers `slots` (v1, still the default) or, when it reports
   resources and `[ci.scheduler] mode = "resources"`, CPU, memory, disk and GPUs. A leg requests
@@ -1584,7 +1637,31 @@ W20.
 - **W05-S04** A leg killed by the OOM killer with `retry: { max: 2, on: [oom] }` and
   `resources.memory: 4Gi` → a second attempt; the attempt list shows "oom".
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - `kiln_ci::sched`:
+    - `routing`: constraints (R22), GitHub-exact labels with self-hosted runners' implicit
+      labels, rules (R21, GitHub's label rules off until enabled), explanations (R20),
+      preferences (R23);
+    - `groups` (R06, R07);
+    - `retry` (R14 to R16);
+    - `state`: the event-driven scheduler (R01 to R04, R09 to R11, R13, R19, R24) with
+      signatures, aged priority as a time-invariant key, fair share, run and job groups,
+      supersede, retries with backoff, `Rejected`, quotas, exclusive legs, slots or resources,
+      and restart adoption;
+    - `sim`, the simulator.
+  - Tests: AC01 to AC06, AC10, S01 to S04, and AC08 at 127,000 assignments per second with a p99
+    of 6 µs per input, against a target of 2,000.
+  - `crates/kiln/src/ci/dispatch.rs`, the dispatcher, behind `[ci] enabled`:
+    - it uses the hub's slot bookkeeping, so v1 and v2 share runners;
+    - v1 code reads only v1 rows;
+    - legs need `CAP_CI2`.
+- *Left.*
+  - Pools and scaling (R27, with W13), reservations (R12).
+  - `/api/ci/legs/:id/routing`.
+  - AC07 (cancel timing on the host executor), AC09 at 10,000 legs, AC11 live.
+  - Resource capacity from W13's facts.
 
 ### W06 Step runtime on the runner
 
@@ -1708,7 +1785,9 @@ It replaces `exec.rs` for `AssignV2`.
   - Each background step keeps its own log; only the live view interleaves them. The leg's
     timeline shows the overlap.
 
-**Design.** `crates/kiln/src/runner/runtime/`: `env.rs`, `contexts.rs`, `step.rs` (evaluation and
+**Design.** (As built so far: the pure parsers are `kiln_ci::runner::{commands, envfiles, mask}`,
+tested at kiln-ci's speed; the process side is `crates/kiln/src/runner/runtime.rs`.) Planned:
+`crates/kiln/src/runner/runtime/`: `env.rs`, `contexts.rs`, `step.rs` (evaluation and
 the step state machine), `shell.rs`, `commands.rs` (the line parser and dispatcher),
 `envfiles.rs`, `mask.rs` (Aho–Corasick over a ring buffer), `matchers.rs` (problem matchers),
 `summary.rs`, `post.rs`. The parsers are pure functions with exhaustive tests; process control
@@ -1769,7 +1848,30 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
   then `{ cancel: db }` → the tests run against the database, the leg succeeds, and `db` concludes
   `cancelled`.
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - `kiln_ci::runner`, the pure parsers:
+    - `commands`: R06, both syntaxes, AC02;
+    - `envfiles`: R07, with the runner's messages;
+    - `mask`: R08, streaming and chunk-safe, with every two-cut split tested (AC03).
+  - `crates/kiln/src/runner/runtime.rs` runs `AssignV2` on the host executor:
+    - R01's layout and R02's variables;
+    - R03's contexts;
+    - R04's evaluation order;
+    - R05's shells;
+    - commands and environment files between steps;
+    - masking before output leaves;
+    - step outcome and conclusion, `continue-on-error` and timeouts;
+    - GitHub's cancel sequence (W05-R18);
+    - job outputs (R10, one holding a secret is dropped);
+    - a step's background processes kept until the leg ends.
+  - Runners announce `CAP_CI2`.
+- *Left.*
+  - `uses:` (W07), with pre and post steps (R11).
+  - Background steps (R17), problem matchers, `KILN_OUTPUT_JSON` and `exports`.
+  - Job containers and services (W13), debug (R13).
+  - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.
 
 ### W07 Actions
 
