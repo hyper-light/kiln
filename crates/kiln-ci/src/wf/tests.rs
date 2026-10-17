@@ -249,3 +249,36 @@ fn check_reads_a_file_as_its_path_says() {
     assert_eq!(check(".kiln/review.yaml", "anything: [", None).kind, "policy");
     assert!(check(".github/workflows/bad.yml", "on: push\njobs: [", None).has_errors());
 }
+
+#[test]
+fn background_steps_follow_githubs_rules() {
+    let job = |steps: &str| format!("on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n{steps}");
+    // A wait, wait-all or cancel step always runs.
+    let (_, d) = gha(&job("      - id: s\n        run: serve\n        background: true\n      - wait: s\n        if: always()\n"));
+    assert!(errors(&d).iter().any(|e| e.contains("KCI1012") && e.contains("always runs")), "{d:?}");
+    // cancel names one step.
+    let (_, d) = gha(&job("      - id: s\n        run: serve\n        background: true\n      - cancel: [s]\n"));
+    assert!(errors(&d).iter().any(|e| e.contains("KCI1011")), "{d:?}");
+    let (_, d) = gha(&job("      - id: s\n        run: serve\n        background: true\n      - cancel: s\n"));
+    assert!(errors(&d).is_empty(), "{d:?}");
+    // A background expression reads what continue-on-error may.
+    let (_, d) = gha(&job("      - id: s\n        run: serve\n        background: ${{ jobs.x.result == 'y' }}\n      - wait-all:\n"));
+    assert!(errors(&d).iter().any(|e| e.contains("KCI3001")), "{d:?}");
+    let (_, d) = gha(&job("      - id: s\n        run: serve\n        background: ${{ matrix.slow == 'yes' }}\n      - wait-all:\n"));
+    assert!(errors(&d).is_empty(), "{d:?}");
+    // A composite action's steps can't run in the background.
+    let (_, d) = parse_action("name: x\nruns:\n  using: composite\n  steps:\n    - run: serve\n      shell: bash\n      background: true\n");
+    assert!(d.iter().any(|x| x.code == "KCI1020" && x.message.contains("background")), "{d:?}");
+}
+
+/// Found by W02-AC06's mutations: a job that needs itself looped forever.
+#[test]
+fn needs_of_itself_and_twice_end() {
+    let (_, d) = gha("on: push\njobs:\n  build:\n    runs-on: x\n    needs: build\n    steps: [{run: a}]\n");
+    assert_eq!(codes(&d).iter().filter(|c| **c == "KCI4002").count(), 1, "{d:?}");
+    // The same job twice is one need, not a cycle.
+    let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    needs: [a, a]\n    steps: [{run: b}]\n");
+    assert!(errors(&d).is_empty(), "{d:?}");
+    let (_, d) = gha("on: push\njobs:\n  a:\n    runs-on: x\n    needs: b\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    needs: [a, b]\n    steps: [{run: b}]\n");
+    assert!(errors(&d).iter().any(|e| e.contains("form a cycle")), "{d:?}");
+}

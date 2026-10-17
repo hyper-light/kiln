@@ -143,6 +143,10 @@ fn runs(fe: &mut Fe<'_>, n: &Node) -> ActionRuns {
                     if st.run.is_some() && st.shell.is_none() {
                         fe.diags.push(Diag::error("KCI1020", "a composite action's `run` step needs `shell`", st.range).at(format!("runs.steps[{i}]")));
                     }
+                    // GitHub: a composite action can run in the background, its steps can't.
+                    if st.background.is_some() || !st.parallel.is_empty() {
+                        fe.diags.push(Diag::error("KCI1020", "a composite action's steps can't use `background` or `parallel`: the action itself can run in the background", st.range).at(format!("runs.steps[{i}]")));
+                    }
                 }
             }
             None => fe.diags.push(Diag::error("KCI1014", "a composite action needs `runs.steps`", n.range).at("runs.steps")),

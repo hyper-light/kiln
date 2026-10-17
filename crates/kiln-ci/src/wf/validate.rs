@@ -3,7 +3,7 @@
 //! B), and the lints `KCI6001`–`KCI6006`.
 
 use super::diag::{Diag, Edit, Pos, Range, suggest};
-use super::ir::{Axis, Job, JobSecrets, Matrix, Need, RunsOn, Step, Tpl, Workflow, YVal};
+use super::ir::{Axis, Job, JobSecrets, Matrix, RunsOn, Step, Tpl, Workflow, YVal};
 use crate::expr::{Condition, Dialect, Expr, ParseOptions, template_spans};
 
 /// Where an expression stands, which decides what it may read (Appendix B).
@@ -224,6 +224,10 @@ pub fn validate(wf: &Workflow, dialect: Dialect, src: &str, diags: &mut Vec<Diag
         }
         if let Some(e) = &j.environment {
             v.tpl(&e.name, Site::JobEnvironment, &format!("{p}.environment"));
+            // Not in GitHub's table: as `environment`, the closest key (Appendix B).
+            if let Some(YVal::Str(t)) = &e.deployment {
+                v.tpl(t, Site::JobEnvironment, &format!("{p}.environment.deployment"));
+            }
             if let Some(u) = &e.url {
                 v.tpl(u, Site::JobEnvironmentUrl, &format!("{p}.environment.url"));
             }
@@ -325,6 +329,10 @@ pub fn validate(wf: &Workflow, dialect: Dialect, src: &str, diags: &mut Vec<Diag
             if let Some(YVal::Str(t)) = &s.continue_on_error {
                 v.tpl(t, Site::StepContinueOnError, &format!("{sp}.continue-on-error"));
             }
+            // Not in GitHub's table: as `continue-on-error`, the closest key (Appendix B).
+            if let Some(YVal::Str(t)) = &s.background {
+                v.tpl(t, Site::StepContinueOnError, &format!("{sp}.background"));
+            }
             if let Some(u) = &s.uses {
                 lint_uses(v.diags, u, s, prt, &format!("{sp}.uses"));
             }
@@ -385,18 +393,31 @@ fn graph(wf: &Workflow, diags: &mut Vec<Diag>) {
             }
         }
     }
-    let mut indeg: Vec<usize> = wf.jobs.iter().map(|j| j.needs.iter().filter(|n| ids.contains(&n.job()) && n.job() != j.id).count()).collect();
+    // Kahn's algorithm over each job's distinct needs of other jobs here (needs of itself or of
+    // no job are reported above). Every job is ready at most once, so this ends on any input.
+    let deps: Vec<Vec<usize>> = wf
+        .jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| {
+            let mut d: Vec<usize> = j.needs.iter().filter_map(|n| ids.iter().position(|x| *x == n.job())).filter(|k| *k != i).collect();
+            d.sort_unstable();
+            d.dedup();
+            d
+        })
+        .collect();
+    let mut indeg: Vec<usize> = deps.iter().map(Vec::len).collect();
     let mut ready: Vec<usize> = indeg.iter().enumerate().filter(|(_, d)| **d == 0).map(|(i, _)| i).collect();
     let mut seen = 0usize;
     while let Some(i) = ready.pop() {
         seen += 1;
-        let Some(done) = wf.jobs.get(i).map(|j| j.id.as_str()) else { continue };
-        for (k, j) in wf.jobs.iter().enumerate() {
-            if j.needs.iter().any(|n: &Need| n.job() == done)
-                && let Some(d) = indeg.get_mut(k)
+        for (k, d) in deps.iter().enumerate() {
+            if d.contains(&i)
+                && let Some(n) = indeg.get_mut(k)
+                && *n > 0
             {
-                *d = d.saturating_sub(1);
-                if *d == 0 {
+                *n -= 1;
+                if *n == 0 {
                     ready.push(k);
                 }
             }

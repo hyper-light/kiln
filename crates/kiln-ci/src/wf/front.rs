@@ -1006,7 +1006,13 @@ impl Fe<'_> {
                 "background" => s.background = self.bool_or_expr(v, &at),
                 "wait" => s.wait = self.str_list(v, &at),
                 "wait-all" => s.wait_all = !matches!(v.as_scalar(), Some(Scalar::Bool(false))),
-                "cancel" => s.cancel = self.str_list(v, &at),
+                "cancel" => {
+                    // GitHub: one background step, by id.
+                    if v.as_seq().is_some() {
+                        self.err("KCI1011", "`cancel` names one background step: a step id, not a list", v.range, &at);
+                    }
+                    s.cancel = self.str_list(v, &at);
+                }
                 "parallel" => s.parallel = self.steps(v, &at),
                 "retry" => kiln.retry = Some(self.yval(v)),
                 "with-secrets" => kiln.with_secrets = self.str_map(v, &at).into_iter().map(|(a, b)| (a, b.src)).collect(),
@@ -1025,6 +1031,11 @@ impl Fe<'_> {
                     self.err("KCI1012", "a `wait`, `wait-all`, `cancel` or `parallel` step runs nothing itself: it can't have `run` or `uses`", n.range, path)
                 }
                 _ => {}
+            }
+            // GitHub: "A `wait` step always runs and does not support the `if` conditional" (and
+            // so do `wait-all` and `cancel`).
+            if s.cond.is_some() && (!s.wait.is_empty() || s.wait_all || !s.cancel.is_empty()) {
+                self.err("KCI1012", "a `wait`, `wait-all` or `cancel` step always runs: it can't have `if`", n.range, path);
             }
         }
         s

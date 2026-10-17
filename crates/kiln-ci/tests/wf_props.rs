@@ -75,45 +75,62 @@ impl Rng {
     }
 }
 
+/// Mutated corpus files never panic, never hang (each case finishes within 30 s, or the test fails
+/// with the input), and every problem is a diagnostic inside the file.
 #[test]
-fn w02_ac06_mutated_workflows_never_panic() {
-    let files = corpus();
-    let mut rng = Rng(42);
-    let tokens = ["${{", "}}", ":", "-", "  ", "\n", "[", "]", "{", "}", "'", "\"", "&a", "*a", "if: ", "uses: ", "run: ", "needs: [x]", "matrix:", "on:", "#", "|", ">", "\t"];
-    let files: Vec<(String, String)> = files.into_iter().filter(|(_, s)| s.len() < 20_000).collect();
-    let n = if cfg!(debug_assertions) { 1_500 } else { 20_000 };
-    for i in 0..n {
-        let Some((_, src)) = files.get(rng.below(files.len())) else { return };
-        let mut chars: Vec<char> = src.chars().collect();
-        for _ in 0..(1 + rng.below(4)) {
-            let at = rng.below(chars.len().max(1));
-            match rng.below(3) {
-                0 => {
-                    let end = (at + 1 + rng.below(20)).min(chars.len());
-                    chars.drain(at.min(end)..end);
-                }
-                1 => {
-                    let t = tokens.get(rng.below(tokens.len())).copied().unwrap_or("");
-                    for (k, c) in t.chars().enumerate() {
-                        chars.insert((at + k).min(chars.len()), c);
+fn w02_ac06_mutated_workflows_never_panic() -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, String)>();
+    let worker = std::thread::spawn(move || -> Result<(), String> {
+        let files = corpus();
+        let mut rng = Rng(42);
+        let tokens = ["${{", "}}", ":", "-", "  ", "\n", "[", "]", "{", "}", "'", "\"", "&a", "*a", "if: ", "uses: ", "run: ", "needs: [x]", "matrix:", "on:", "#", "|", ">", "\t"];
+        let files: Vec<(String, String)> = files.into_iter().filter(|(_, s)| s.len() < 20_000).collect();
+        // W02-AC06 asks for 10⁵ cases: `KILN_CI_MUTATIONS=100000 cargo test --release` (nightly).
+        let n = std::env::var("KILN_CI_MUTATIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(if cfg!(debug_assertions) { 1_500 } else { 20_000 });
+        for i in 0..n {
+            let Some((_, src)) = files.get(rng.below(files.len())) else { return Ok(()) };
+            let mut chars: Vec<char> = src.chars().collect();
+            for _ in 0..(1 + rng.below(4)) {
+                let at = rng.below(chars.len().max(1));
+                match rng.below(3) {
+                    0 => {
+                        let end = (at + 1 + rng.below(20)).min(chars.len());
+                        chars.drain(at.min(end)..end);
+                    }
+                    1 => {
+                        let t = tokens.get(rng.below(tokens.len())).copied().unwrap_or("");
+                        for (k, c) in t.chars().enumerate() {
+                            chars.insert((at + k).min(chars.len()), c);
+                        }
+                    }
+                    _ => {
+                        if let Some(c) = chars.get_mut(at) {
+                            *c = if *c == ' ' { 'x' } else { ' ' };
+                        }
                     }
                 }
-                _ => {
-                    if let Some(c) = chars.get_mut(at) {
-                        *c = if *c == ' ' { 'x' } else { ' ' };
-                    }
+            }
+            let mutated: String = chars.into_iter().collect();
+            let _ = tx.send((i, mutated.clone()));
+            let lines = u32::try_from(mutated.lines().count() + 2).unwrap_or(u32::MAX);
+            for dialect in [Dialect::Gha, Dialect::Kiln] {
+                let (_, diags) = parse_workflow(".github/workflows/m.yml", &mutated, dialect);
+                if let Some(d) = diags.iter().find(|d| d.range.start.line > lines) {
+                    return Err(format!("case {i}: a diagnostic outside the file: {d:?}\n{mutated}"));
                 }
             }
         }
-        let mutated: String = chars.into_iter().collect();
-        let lines = u32::try_from(mutated.lines().count() + 2).unwrap_or(u32::MAX);
-        for dialect in [Dialect::Gha, Dialect::Kiln] {
-            let (_, diags) = parse_workflow(".github/workflows/m.yml", &mutated, dialect);
-            for d in &diags {
-                assert!(d.range.start.line <= lines, "case {i}: a diagnostic outside the file: {d:?}");
-            }
+        Ok(())
+    });
+    let mut last = (0, String::new());
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(c) => last = c,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(format!("case {} has not finished in 30 s:\n{}", last.0, last.1)),
         }
     }
+    worker.join().map_err(|_| format!("case {} panicked:\n{}", last.0, last.1))?
 }
 
 #[test]
