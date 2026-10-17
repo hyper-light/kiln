@@ -436,10 +436,13 @@ impl Scanner {
         let have_records = records_dir.is_dir();
         for r in claude_records(&records_dir) {
             // The pid may since belong to something else.
-            let Some(p) = self.sys.process(Pid::from_u32(r.pid)).filter(|p| tool_of(p) == Some(Tool::Claude)).map(Proc::of) else { continue };
-            if r.kind.as_deref().is_some_and(|k| k != "interactive") {
+            let Some(sp) = self.sys.process(Pid::from_u32(r.pid)).filter(|p| tool_of(p) == Some(Tool::Claude)) else { continue };
+            // A run a program drives (`claude -p`: kiln's own agents, the Agent SDK's) is that
+            // program's to show, though its record says "interactive" all the same.
+            if r.kind.as_deref().is_some_and(|k| k != "interactive") || !interactive(Tool::Claude, &args_of(sp)) {
                 continue;
             }
+            let p = Proc::of(sp);
             seen.insert(r.pid);
             let file = self.claude_file(&r.session_id, &r.cwd);
             let summary = file.as_deref().and_then(|f| self.summary(Tool::Claude, f));
@@ -1294,6 +1297,19 @@ mod tests {
 
     fn lines(s: &str) -> Vec<String> {
         s.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn kiln_s_own_agents_are_not_sessions_found_elsewhere() {
+        // Claude Code records the sessions kiln drives as "interactive" too: their `-p` tells.
+        let spec = crate::harness::session::Spec { kind: "claude".into(), mode: Some("bypassPermissions".into()), ..Default::default() };
+        let mut bin = vec!["/usr/local/bin/claude".to_owned()];
+        bin.extend(crate::harness::claude::args(&spec, None));
+        let mut node = vec!["node".to_owned(), "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js".to_owned()];
+        node.extend(crate::harness::claude::args(&spec, Some("01a14a73-8779-77b9-ba23-49a19e001122")));
+        assert!(!interactive(Tool::Claude, &bin) && !interactive(Tool::Claude, &node));
+        // One you started in a terminal is yours to take over.
+        assert!(interactive(Tool::Claude, &["claude".to_owned(), "--resume".to_owned(), "01a14a73".to_owned()]));
     }
 
     #[test]
