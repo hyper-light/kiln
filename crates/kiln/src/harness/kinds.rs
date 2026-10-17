@@ -67,7 +67,7 @@ impl Kind {
 
     pub fn adapter(&self, spec: &Spec) -> Adapter {
         match self.protocol {
-            Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass))),
+            Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
             Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::new(spec.resume.clone()))),
         }
@@ -88,15 +88,7 @@ impl Kind {
             anyhow::bail!("{cwd} is not a directory on this machine");
         }
         p.current_dir(&cwd);
-        for (k, v) in &spec.env {
-            // The shell's own terminal plumbing stays out of the agent's environment.
-            if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "TERM" | "COLUMNS" | "LINES") {
-                p.env(k, v);
-            }
-        }
-        for k in super::claude::SCRUB_ENV {
-            p.env_remove(k);
-        }
+        set_env(&mut p, spec);
         match self.protocol {
             Protocol::ClaudeStreamJson => {
                 let session_id = spec.resume.is_none().then(|| uuid::Uuid::now_v7().to_string());
@@ -115,6 +107,59 @@ impl Kind {
         }
         Ok(p)
     }
+}
+
+impl Kind {
+    /// The harness's own CLI with these arguments (`mcp add ...`), run the way the session runs
+    /// the harness: same executable, directory and environment, so it changes the configuration
+    /// the session uses. Its program is the session's own when the spec names one.
+    pub fn cli(&self, spec: &Spec, args: &[String]) -> anyhow::Result<Process> {
+        if !self.structured() {
+            anyhow::bail!("{} has no command line kiln can run", self.name);
+        }
+        let program = match &spec.program {
+            Some(p) => std::path::PathBuf::from(p),
+            None => crate::os::which(self.program).ok_or_else(|| anyhow::anyhow!("{} ({}) is not installed on this machine", self.name, self.program))?,
+        };
+        let mut p = Process::new(program);
+        let cwd = spec.cwd.clone().unwrap_or_else(|| crate::os::home_dir().to_string_lossy().into_owned());
+        if std::path::Path::new(&cwd).is_dir() {
+            p.current_dir(&cwd);
+        }
+        set_env(&mut p, spec);
+        // Nothing it runs from here may open a browser on the machine's desktop (a sign-in is
+        // kiln's to show, wherever the person is).
+        p.env("BROWSER", "true");
+        p.args(args);
+        p.stdin(std::process::Stdio::null());
+        Ok(p)
+    }
+}
+
+/// The session's environment over the machine's: what its shell had (minus the shell's own
+/// terminal plumbing), without what a Claude Code session sets for its children.
+fn set_env(p: &mut Process, spec: &Spec) {
+    for (k, v) in &spec.env {
+        if !matches!(k.as_str(), "KILN_TERM_SESSION" | "KILN_HARNESS_SOCK" | "TERM" | "COLUMNS" | "LINES") {
+            p.env(k, v);
+        }
+    }
+    for k in super::claude::SCRUB_ENV {
+        p.env_remove(k);
+    }
+}
+
+/// Where Claude Code keeps its configuration for this session: `CLAUDE_CONFIG_DIR` from the
+/// session's environment or the machine's, else `~/.claude`.
+fn claude_config_dir(spec: &Spec) -> String {
+    spec.env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| crate::os::home_dir().join(".claude").to_string_lossy().into_owned())
 }
 
 /// A harness adapter: turns the harness's output into the normalized model and commands into
@@ -155,6 +200,26 @@ impl Adapter {
             Self::Claude(a) => a.exited(core, code, error),
             Self::Codex(a) => a.exited(core, code, error),
             Self::Acp(a) => a.exited(core, code, error),
+        }
+    }
+
+    /// A run (`Effect::Run` or `Effect::Fetch`) ended: its exit code (None: it could not start
+    /// or was stopped) and its output (stdout then stderr, shortened).
+    pub fn run_done(&mut self, core: &mut Core, job: &str, code: Option<i32>, output: &str) {
+        match self {
+            Self::Claude(a) => a.run_done(core, job, code, output),
+            Self::Codex(a) => a.run_done(core, job, code, output),
+            Self::Acp(a) => a.run_done(core, job, code, output),
+        }
+    }
+
+    /// Every few seconds while the process runs: a chance to poll what the harness only reports
+    /// when asked (plan usage, servers still connecting).
+    pub fn tick(&mut self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => a.tick(core),
+            Self::Codex(a) => a.tick(core),
+            Self::Acp(_) => {}
         }
     }
 }

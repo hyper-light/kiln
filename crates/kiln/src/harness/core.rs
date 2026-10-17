@@ -66,6 +66,16 @@ pub enum Effect {
     Restart { resume_at: Option<String> },
     /// Start a new session that branches off this one at `resume_at`.
     Branch { resume: String, resume_at: Option<String> },
+    /// Run the harness's own CLI beside the session (`mcp add ...`), in its directory and
+    /// environment. Its exit and output come back to the adapter (`run_done`) under `job`.
+    Run { job: String, args: Vec<String> },
+    /// Answer `client` with the first of these files that can be read (`{"content", "path"}`),
+    /// or `{"error"}`.
+    Read { client: String, paths: Vec<String> },
+    /// Make a GET request to a sign-in callback the harness listens for on this machine's
+    /// loopback (a browser on another device cannot reach it). Only loopback addresses are
+    /// fetched. Its result comes back as a run's end (`run_done`) under `job`.
+    Fetch { job: String, url: String },
 }
 
 /// Work the brain does off the event loop and feeds back: e.g. reading a file to show what an
@@ -147,6 +157,8 @@ impl Core {
                 self.index.remove(&e.id);
             }
         }
+        // Sequence numbers stay contiguous: an event's place is found from its number.
+        self.next_seq = seq;
         self.changed.clear();
         self.stream.clear();
         self.reset = true;
@@ -228,7 +240,10 @@ impl Core {
     }
 
     /// Add an event, or replace the one with the same id (keeping its place and time).
-    pub fn upsert(&mut self, id: &str, parent: Option<String>, body: Body) {
+    pub fn upsert(&mut self, id: &str, parent: Option<String>, mut body: Body) {
+        if let Body::Tool(t) = &mut body {
+            t.annotate();
+        }
         if let Some(e) = self.get_mut(id) {
             e.body = body;
             if parent.is_some() {
@@ -436,5 +451,25 @@ mod tests {
         let total: usize = snap.iter().map(|u| if let Update::Events { events } = u { events.len() } else { 0 }).sum();
         assert_eq!(total, MAX_EVENTS);
         assert!(snap.len() > 4);
+    }
+
+    #[test]
+    fn events_after_a_rewind_go_out() {
+        let mut c = Core::new();
+        for id in ["one", "reply one", "two", "reply two"] {
+            c.upsert(id, None, Body::Assistant { text: id.into(), streaming: false });
+        }
+        c.take_out();
+        c.truncate_from("two");
+        let out = c.take_out();
+        assert!(matches!(out.first(), Some(Update::Reset)));
+        c.upsert("three", None, Body::Assistant { text: "three".into(), streaming: true });
+        c.append("three", "!");
+        let out = c.take_out();
+        assert!(matches!(out.first(), Some(Update::Events { events }) if events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>() == ["three"]));
+        c.append("three", "?");
+        assert_eq!(c.take_out(), vec![Update::Stream { id: "three".into(), text: "?".into() }]);
+        assert_eq!(c.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["one", "reply one", "three"]);
+        assert!(c.get("three").is_some_and(|e| matches!(&e.body, Body::Assistant { text, .. } if text == "three!?")));
     }
 }
