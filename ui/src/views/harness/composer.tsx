@@ -290,31 +290,37 @@ export function Composer({
 
   // @-file suggestions for the word being typed at the end, asked for a moment after typing stops.
   const asking = React.useRef({ n: 0, timer: 0 });
-  const suggestFor = (t: string) => {
-    const a = asking.current;
-    a.n += 1;
-    window.clearTimeout(a.timer);
-    const at = t.match(/(?:^|\s)@(\S*)$/);
-    if (!at || !features.includes("file_suggestions")) {
-      setSuggest(null);
-      return;
-    }
-    const n = a.n;
-    a.timer = window.setTimeout(() => {
-      void store
-        .request((client) => ({ type: "suggest", client, query: at[1] ?? "" }))
-        .then((v) => {
-          if (asking.current.n !== n) return;
-          const list = Array.isArray(v) ? (v as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 8) : [];
-          setSuggest(list.length ? { kind: "@", items: list.map((p) => ({ label: `@${p}` })), index: 0 } : null);
-        });
-    }, 120);
-  };
+  const suggestFor = React.useCallback(
+    (t: string) => {
+      const a = asking.current;
+      a.n += 1;
+      window.clearTimeout(a.timer);
+      const at = t.match(/(?:^|\s)@(\S*)$/);
+      if (!at || !features.includes("file_suggestions")) {
+        setSuggest(null);
+        return;
+      }
+      const n = a.n;
+      a.timer = window.setTimeout(() => {
+        void store
+          .request((client) => ({ type: "suggest", client, query: at[1] ?? "" }))
+          .then((v) => {
+            if (asking.current.n !== n) return;
+            const list = Array.isArray(v) ? (v as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 8) : [];
+            setSuggest(list.length ? { kind: "@", items: list.map((p) => ({ label: `@${p}` })), index: 0 } : null);
+          });
+      }, 120);
+    },
+    [features, store],
+  );
   /** The text changed here (typed, completed, cleared): its suggestions follow it. */
-  const write = (t: string) => {
-    setText(t);
-    suggestFor(t);
-  };
+  const write = React.useCallback(
+    (t: string) => {
+      setText(t);
+      suggestFor(t);
+    },
+    [setText, suggestFor],
+  );
 
   const complete = (label: string) => {
     write(text.replace(/@\S*$/, `${label} `));

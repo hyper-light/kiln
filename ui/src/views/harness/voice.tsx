@@ -77,13 +77,13 @@ interface MicProps {
  * The microphone, beside a text field: tap to speak, tap again to stop. `field` is the text field
  * and `setText` sets its text; `onNote` says, in a line, why it can't listen or what went wrong.
  */
-export function MicButton(props: MicProps) {
+export const MicButton = React.memo(function MicButton(props: MicProps) {
   return (
     <Loadable label="Loading the microphone" fallback={<Unready className={props.className} />}>
       <Microphone {...props} />
     </Loadable>
   );
-}
+});
 
 /** The button while it's still asked how this browser can take speech: there, not yet usable. */
 function Unready({ className }: { className?: string }) {
