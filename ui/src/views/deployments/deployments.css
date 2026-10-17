@@ -474,20 +474,22 @@
 .cd-resources-section {
   margin-top: 30px;
 }
+/* The view, the filter, the sort or grouping, and whether children show: one row on a wide screen. */
 .cd-viewbar {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr) auto;
+  grid-template-columns: 150px minmax(0, 1fr) auto auto;
   align-items: start;
   gap: 10px;
 }
-.cd-viewbar > .cd-view-select + .cd-view-filter + .cd-view-select {
+.cd-view-sort {
   min-width: 190px;
 }
 .cd-view-select {
   min-width: 0;
 }
 .cd-view-opt {
-  margin-left: auto;
+  min-height: 40px;
+  padding: 0 2px 0 4px;
   white-space: nowrap;
 }
 .cd-viewhead {
@@ -502,19 +504,40 @@
   min-width: 0;
 }
 @container (max-width: 760px) {
-  /* The filter on top; under it the view, and the sort or grouping beside it when there is one. */
+  /* The filter on top; under it the view with what goes beside it: "Live children" for the tree,
+     the sort for the list (children under them), the grouping for pods. */
   .cd-viewbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "filter filter"
+      "view opt";
+  }
+  .cd-viewbar[data-view="list"] {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "filter filter"
+      "view sort"
+      "opt opt";
+  }
+  .cd-viewbar[data-view="pods"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "filter filter"
+      "view sort";
   }
   .cd-view-filter {
-    grid-column: 1 / -1;
-    grid-row: 1;
+    grid-area: filter;
   }
-  .cd-viewbar:not(:has(> :nth-child(3))) > .cd-view-select {
-    grid-column: 1 / -1;
+  .cd-viewbar > .cd-view-select {
+    grid-area: view;
   }
-  .cd-viewbar > .cd-view-select + .cd-view-filter + .cd-view-select {
+  .cd-view-sort {
+    grid-area: sort;
     min-width: 0;
+  }
+  .cd-view-opt {
+    grid-area: opt;
+    justify-self: start;
   }
 }
 

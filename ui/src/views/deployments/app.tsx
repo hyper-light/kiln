@@ -682,7 +682,7 @@ function Resources({
 
   return (
     <section className="cd-resources-section" aria-label="Resources">
-      <div className="cd-viewbar">
+      <div className="cd-viewbar" data-view={view}>
         <SelectField label="View" hideLabel value={view} onChange={(v) => set({ view: v as View })} options={VIEWS} className="cd-view-select" />
         <FacetBox
           className="cd-view-filter"
@@ -694,8 +694,13 @@ function Resources({
           chosen={chosen}
           onChosen={setChosen}
         />
-        {view === "list" && <SelectField label="Sort by" hideLabel value={sort} onChange={(v) => set({ sort: v as ListSort })} options={SORTS} className="cd-view-select" />}
-        {view === "pods" && <SelectField label="Group by" hideLabel value={group} onChange={(v) => set({ group: v as PodGroup })} options={GROUPS} className="cd-view-select" />}
+        {view === "list" && <SelectField label="Sort by" hideLabel value={sort} onChange={(v) => set({ sort: v as ListSort })} options={SORTS} className="cd-view-sort" />}
+        {view === "pods" && <SelectField label="Group by" hideLabel value={group} onChange={(v) => set({ group: v as PodGroup })} options={GROUPS} className="cd-view-sort" />}
+        {view !== "pods" && (
+          <label className="cd-opt cd-view-opt" title="The live objects the app's objects own: ReplicaSets, Pods, Jobs, EndpointSlices…">
+            <input type="checkbox" className="check" checked={children} onChange={(e) => set({ children: e.target.checked })} /> Live children
+          </label>
+        )}
       </div>
       <div className="cd-viewhead">
         <span className="cd-count" aria-live="polite">
@@ -712,11 +717,6 @@ function Resources({
           >
             Clear the filter
           </button>
-        )}
-        {view !== "pods" && (
-          <label className="cd-opt cd-view-opt" title="The live objects the app's objects own: ReplicaSets, Pods, Jobs, EndpointSlices…">
-            <input type="checkbox" className="check" checked={children} onChange={(e) => set({ children: e.target.checked })} /> Live children
-          </label>
         )}
       </div>
       {treeError && (
