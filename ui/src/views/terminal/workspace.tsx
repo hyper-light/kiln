@@ -1,20 +1,7 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { useLocation, useNavigate } from "react-router";
-import {
-  ChevronDown,
-  ClipboardCopy,
-  Eraser,
-  Keyboard,
-  Maximize2,
-  Minimize2,
-  Minus,
-  Plus,
-  RotateCcw,
-  Server,
-  SquareTerminal,
-  X,
-} from "lucide-react";
+import { ChevronDown, ClipboardCopy, Eraser, Keyboard, Maximize2, Minimize2, Minus, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, TerminalSessionInfo } from "@/api/types";
@@ -24,9 +11,11 @@ import { Button } from "@/components/ui/button";
 import { Optic } from "@/components/ui/misc";
 import { Chips } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
-import { useLocalStorage } from "@/lib/hooks";
+import { useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { SpawnHereButton } from "@/views/harness/spawn-here";
+import { SpawnDialog } from "@/views/harness/spawn";
+import { DesktopNew, MobileBar } from "./switcher";
 import { TerminalSession, type SessionHandle, type SessionState } from "./session";
 
 interface Tab {
@@ -49,8 +38,7 @@ interface Tab {
 let tabSeq = 0;
 
 /** Phones and tablets: show the on-screen keyboard by default. */
-const isTouchDevice = () =>
-  typeof window !== "undefined" && (window.matchMedia?.("(pointer: coarse)").matches || (navigator.maxTouchPoints ?? 0) > 0);
+const isTouchDevice = () => typeof window !== "undefined" && (window.matchMedia?.("(pointer: coarse)").matches || (navigator.maxTouchPoints ?? 0) > 0);
 
 function targetLabel(target: string) {
   return target === "local" ? "server" : target.replace(/^agent:/, "");
@@ -100,7 +88,10 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   }, [visible]);
 
   const loadAgents = React.useCallback(() => {
-    api.agents().then(setAgents).catch(() => undefined);
+    api
+      .agents()
+      .then(setAgents)
+      .catch(() => undefined);
   }, []);
   React.useEffect(() => {
     if (visible) loadAgents();
@@ -337,6 +328,12 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   // Job pods run CI jobs; they aren't machines to open shells on.
   const connected = agents.filter((a) => a.connected && !a.ephemeral);
 
+  // Phones: one pinned bar (current session, a switcher, new terminal/agents) instead of tabs that scroll off screen.
+  const narrow = useMediaQuery("(max-width: 639px)");
+  const [spawn, setSpawn] = React.useState<{ target?: string; shell?: string } | null>(null);
+  const targets = ["local", ...connected.map((a) => `agent:${a.name}`)];
+  const switcherTabs = tabs.map((t) => ({ id: t.id, title: t.title, target: t.target, state: t.state.kind }));
+
   const toggleFull = async () => {
     const el = panelRef.current;
     if (!el) return;
@@ -385,9 +382,31 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
 
   return (
     <div ref={panelRef} className="flex min-h-0 flex-1 flex-col bg-[#08090a]" style={{ height: full ? "100dvh" : "calc(100dvh - var(--header-h) - 1px)" }}>
+      {narrow && (
+        <MobileBar
+          tabs={switcherTabs}
+          activeId={activeId}
+          onSelect={setActiveId}
+          onClose={close}
+          targets={targets}
+          onOpenTarget={open}
+          onNewAgents={() => setSpawn({})}
+          kbVisible={kbVisible}
+          onToggleKb={() => setKbVisible(!kbVisible)}
+          more={[
+            { label: "Start agents in this shell", onSelect: () => active && setSpawn({ target: active.target, shell: active.sessionId ?? undefined }), disabled: !active?.sessionId },
+            { label: "Larger text", onSelect: () => setFontSize(Math.min(24, fontSize + 1)) },
+            { label: "Smaller text", onSelect: () => setFontSize(Math.max(9, fontSize - 1)) },
+            { label: "Copy on select", pressed: copyOnSelect, onSelect: () => setCopyOnSelect(!copyOnSelect) },
+            { label: "Clear scrollback", disabled: !active, onSelect: () => active && handles.current.get(active.id)?.clear() },
+            { label: "Reconnect", disabled: !active, onSelect: () => active && handles.current.get(active.id)?.reconnect() },
+            { label: full ? "Exit full screen" : "Full screen", onSelect: () => void toggleFull() },
+          ]}
+        />
+      )}
       {/* tab strip */}
-      <div className="flex h-10 shrink-0 items-stretch border-b border-[#1d1f23]">
-        <div role="tablist" aria-label="Terminal sessions" className="flex min-w-0 flex-1 items-stretch overflow-x-auto">
+      <div className={cn("flex h-10 shrink-0 items-stretch border-b border-[#1d1f23]", narrow && "hidden")}>
+        <div role="tablist" aria-label="Terminal sessions" className="term-tabs flex min-w-0 flex-1 items-stretch overflow-x-auto">
           {tabs.map((t, i) => (
             <div
               key={t.id}
@@ -423,12 +442,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
               </button>
             </div>
           ))}
-          {targetMenu(
-            <button className="flex shrink-0 items-center gap-1.5 px-3 text-[12px] text-[#a1a4ad] hover:bg-white/[0.04] hover:text-white" aria-label="New terminal session">
-              <Plus size={14} /> <span className="hidden sm:inline">New</span> <ChevronDown size={12} />
-            </button>,
-          )}
         </div>
+        <DesktopNew targets={targets} onOpenTarget={open} onNewAgents={() => setSpawn({})} />
         <div className="flex shrink-0 items-center gap-0.5 border-l border-[#1d1f23] px-1.5">
           {renderer && (
             <span className="mr-2 hidden font-mono text-[9px] tracking-[0.08em] text-[#6d7078] uppercase md:inline" title="Active renderer">
@@ -472,7 +487,14 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
             </button>
           </Tip>
           <Tip content="Clear scrollback">
-            <button className="icon-btn hidden sm:inline-grid" data-variant="bare" data-size="sm" aria-label="Clear scrollback" disabled={!active} onClick={() => active && handles.current.get(active.id)?.clear()}>
+            <button
+              className="icon-btn hidden sm:inline-grid"
+              data-variant="bare"
+              data-size="sm"
+              aria-label="Clear scrollback"
+              disabled={!active}
+              onClick={() => active && handles.current.get(active.id)?.clear()}
+            >
               <Eraser size={14} />
             </button>
           </Tip>
@@ -489,6 +511,15 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
         </div>
       </div>
 
+      <SpawnDialog
+        open={spawn !== null}
+        onOpenChange={(o) => !o && setSpawn(null)}
+        defaults={spawn ?? undefined}
+        onStarted={(started) => {
+          setSpawn(null);
+          navigate(started.length === 1 && started[0] ? `/agents/${started[0].id}` : "/agents");
+        }}
+      />
       {/* sessions */}
       <div className="relative min-h-0 flex-1">
         {tabs.map((t) => (

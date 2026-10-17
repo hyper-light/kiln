@@ -1,5 +1,6 @@
 /** Small shared pieces of the agent views: harness marks, status, tool icons, prose. */
 import * as React from "react";
+import "./harness.css";
 import {
   Bot,
   FilePen,

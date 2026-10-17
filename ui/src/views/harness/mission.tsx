@@ -22,39 +22,12 @@ import { DiffStat } from "./diff";
 import { HarnessMark, StatusPill, ToolIcon } from "./parts";
 import { AccountLimits } from "./limits";
 import { SpawnDialog } from "./spawn";
+import { useAgents } from "./use-agents";
 
 type Group = "status" | "shell" | "machine";
 
 const machineOf = (a: AgentInfo) => (a.target === "local" ? "server" : a.target.replace(/^agent:/, ""));
 const ORDER: Record<AgentInfo["status"], number> = { waiting: 0, running: 1, starting: 2, idle: 3, disconnected: 4, exited: 5 };
-
-function useAgents() {
-  const [list, setList] = React.useState<AgentInfo[] | null>(null);
-  const [error, setError] = React.useState<Error | null>(null);
-  const load = React.useCallback(() => {
-    harnessApi.list().then(
-      (l) => {
-        setList(l);
-        setError(null);
-      },
-      (e: unknown) => setError(e instanceof Error ? e : new Error(String(e))),
-    );
-  }, []);
-  React.useEffect(load, [load]);
-  useServerEvents((ev) => {
-    if (ev.type === "harness")
-      setList((l) => {
-        const cur = l ?? [];
-        const i = cur.findIndex((a) => a.id === ev.info.id);
-        if (i === -1) return [...cur, ev.info];
-        const next = cur.slice();
-        next[i] = ev.info;
-        return next;
-      });
-    else if (ev.type === "harness_closed") setList((l) => (l ?? []).filter((a) => a.id !== ev.id));
-  });
-  return { list, error, reload: load };
-}
 
 function InboxRow({ agent, a }: { agent: AgentInfo; a: ApprovalBrief }) {
   const [busy, setBusy] = React.useState(false);

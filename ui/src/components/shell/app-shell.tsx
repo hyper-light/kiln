@@ -1,5 +1,6 @@
 import * as React from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router";
+import { UpdateNotice } from "./update-notice";
 import { Dialog } from "radix-ui";
 import { ArrowUpRight, LogOut, Menu, Search, Settings, X } from "lucide-react";
 import { api } from "@/api/client";
@@ -204,6 +205,7 @@ export function AppShell({ me }: { me: Me | null }) {
         </footer>
       )}
       <CommandPalette />
+      <UpdateNotice />
     </div>
   );
 }
