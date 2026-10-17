@@ -16,7 +16,7 @@ use super::core::{Baseline, Core, Effect};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Known, Level, Limit, McpServer,
     McpStatus, McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
-    ToolKind, ToolStatus, OUTPUT_MAX, Route, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog, window_words,
+    ChoiceAnswer, ToolKind, ToolStatus, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog, window_words,
 };
 use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
 
@@ -94,10 +94,24 @@ enum Run {
 /// How often the plan's rate limits are read while a session runs (Codex also pushes them
 /// during turns).
 const USAGE_EVERY_MS: i64 = 180_000;
-/// How often kiln opens a thread Codex is not ready to fork yet (once a tick).
-const OPEN_TRIES: u32 = 6;
+/// How often kiln opens a thread Codex cannot open yet (once a tick, two minutes in all): it
+/// refuses to fork a thread whose history it is still writing out, and to resume one its
+/// app-server daemon still holds for a terminal that just quit (for about a minute).
+const OPEN_TRIES: u32 = 24;
 /// What the console shows meanwhile.
 const CATCHING_UP: &str = "Waiting for Codex to catch up with the conversation";
+const LETTING_GO: &str = "Waiting for Codex to let go of the conversation (it still holds it for the terminal it ran in)";
+
+/// Why Codex cannot open a thread yet, when that passes.
+fn not_yet(msg: &str) -> Option<&'static str> {
+    if msg.contains("behind durable rollout") {
+        Some(CATCHING_UP)
+    } else if msg.contains("already has an active writer") {
+        Some(LETTING_GO)
+    } else {
+        None
+    }
+}
 
 /// Reasoning efforts every Codex reasoning model takes, offered until model/list says which the
 /// model in use has, and for a model it does not list.
@@ -515,7 +529,7 @@ impl Codex {
                     self.send(core, item, SendMode::Now);
                 }
             }
-            Command::Approve { id, decision, message, always, answers } => self.answer(core, &id, decision, message, always, answers),
+            Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
             Command::Interrupt => self.interrupt(core),
             Command::SetMode { mode } => {
                 // Takes effect from the next turn (Codex sets policy per turn): the mode's approval
@@ -1032,7 +1046,7 @@ impl Codex {
         }
     }
 
-    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, answers: Option<std::collections::BTreeMap<String, String>>) {
+    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
         let Some(approval) = core.take_approval(id) else { return };
         let Some(ask) = self.asks.remove(id) else { return };
         let feedback = message.filter(|m| !m.trim().is_empty());
@@ -1040,11 +1054,20 @@ impl Codex {
             AskKind::UserInput => {
                 let mut out = serde_json::Map::new();
                 if decision != Decision::Deny {
+                    // Each option chosen and any free text one answer, commas and all; a note as
+                    // Codex's own TUI sends it.
                     for (qid, text) in &ask.questions {
-                        if let Some(a) = answers.as_ref().and_then(|a| a.get(text)) {
-                            let list: Vec<&str> = a.split(", ").collect();
-                            out.insert(qid.clone(), json!({"answers": list}));
+                        let Some(c) = choices.as_ref().and_then(|cs| cs.iter().find(|c| c.id.as_deref() == Some(qid.as_str())).or_else(|| cs.iter().find(|c| c.question == *text))) else {
+                            continue;
+                        };
+                        let mut list: Vec<String> = c.selected.clone();
+                        if let Some(o) = c.other.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+                            list.push(o.to_owned());
                         }
+                        if let Some(n) = c.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                            list.push(format!("user_note: {n}"));
+                        }
+                        out.insert(qid.clone(), json!({"answers": list}));
                     }
                 }
                 json!({"answers": out})
@@ -1122,6 +1145,7 @@ impl Codex {
         let result = v.get("result").cloned().unwrap_or(Value::Null);
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("request failed").to_owned();
+            let wait = not_yet(&msg).filter(|_| self.open_tries < OPEN_TRIES);
             match kind {
                 Pending::Suggest(client) => core.reply(client, json!({"error": msg})),
                 Pending::Turn(id) | Pending::Steer(id) => {
@@ -1129,11 +1153,10 @@ impl Codex {
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
                 }
-                // Codex writes a thread's history out a moment after a turn ends, and refuses to
-                // fork it until then: tried again at the next tick, a few times.
-                Pending::Thread if msg.contains("behind durable rollout") && self.open_tries < OPEN_TRIES => {
+                // Not yet: tried again at the next tick.
+                Pending::Thread if wait.is_some() => {
                     self.reopen = true;
-                    core.state.doing = Some(CATCHING_UP.to_owned());
+                    core.state.doing = wait.map(str::to_owned);
                     core.touch_state();
                 }
                 Pending::Thread => {
@@ -1214,7 +1237,7 @@ impl Codex {
                 }
             }
             Pending::Thread => {
-                if core.state.doing.as_deref() == Some(CATCHING_UP) {
+                if core.state.doing.as_deref().is_some_and(|d| d == CATCHING_UP || d == LETTING_GO) {
                     core.state.doing = None;
                 }
                 let thread = result.get("thread").cloned().unwrap_or(Value::Null);
@@ -1584,9 +1607,12 @@ impl Codex {
                         qs.iter()
                             .filter_map(|q| {
                                 Some(Question {
+                                    id: q.get("id").and_then(Value::as_str).unwrap_or("").to_owned(),
                                     question: q.get("question").and_then(Value::as_str)?.to_owned(),
                                     header: q.get("header").and_then(Value::as_str).unwrap_or("").to_owned(),
                                     multi: false,
+                                    other: q.get("isOther").and_then(Value::as_bool).unwrap_or(false),
+                                    secret: q.get("isSecret").and_then(Value::as_bool).unwrap_or(false),
                                     options: q
                                         .get("options")
                                         .and_then(Value::as_array)
@@ -1596,6 +1622,7 @@ impl Codex {
                                                     Some(QuestionOption {
                                                         label: x.get("label").and_then(Value::as_str)?.to_owned(),
                                                         description: x.get("description").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                                        preview: String::new(),
                                                     })
                                                 })
                                                 .collect()
@@ -2545,7 +2572,7 @@ mod tests {
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/steer"));
         assert_eq!(w.first().and_then(|v| v.pointer("/params/expectedTurnId")).and_then(Value::as_str), Some("t1"));
         // Always allow with the exec-policy amendment.
-        c.command(&mut core, Command::Approve { id: "srv-7".into(), decision: Decision::Always, message: None, always: Some(1), answers: None });
+        c.command(&mut core, Command::Approve { id: "srv-7".into(), decision: Decision::Always, message: None, always: Some(1), answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("id")).and_then(Value::as_str), Some("srv-7"));
         assert!(w.first().and_then(|v| v.pointer("/result/decision/acceptWithExecpolicyAmendment")).is_some());
@@ -2624,7 +2651,7 @@ mod tests {
         // Queue while busy; deny with feedback declines and steers the feedback in.
         c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         assert_eq!(core.state.queue.len(), 1);
-        c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None });
+        c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/decision")).and_then(Value::as_str), Some("decline"));
         assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/steer") && v.pointer("/params/input/0/text").and_then(Value::as_str) == Some("keep old")));
@@ -2640,7 +2667,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"id": "q1", "method": "item/tool/requestUserInput", "params": {"threadId": "th9", "turnId": "t2", "itemId": "i9", "isBlocking": true, "questions": [{"id": "db", "header": "DB", "question": "Which database?", "options": [{"label": "Postgres", "description": ""}, {"label": "SQLite", "description": ""}]}]}})]);
         let mut answers = std::collections::BTreeMap::new();
         answers.insert("Which database?".to_owned(), "SQLite".to_owned());
-        c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers) });
+        c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers), choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/answers/db/answers/0")).and_then(Value::as_str), Some("SQLite"));
         Ok(())
@@ -2821,6 +2848,39 @@ mod tests {
     }
 
     #[test]
+    fn structured_answers_keep_commas_free_text_secrets_and_notes() -> anyhow::Result<()> {
+        use super::super::model::ChoiceAnswer;
+        let (mut c, mut core, _) = opened();
+        feed(&mut c, &mut core, &[json!({"id": "q7", "method": "item/tool/requestUserInput", "params": {"threadId": "th1", "turnId": "t1", "itemId": "i7", "isBlocking": true, "questions": [
+            {"id": "db", "header": "DB", "question": "Which database?", "isOther": true, "options": [{"label": "Postgres, with replicas", "description": ""}, {"label": "SQLite", "description": ""}]},
+            {"id": "token", "header": "Token", "question": "API token?", "isOther": true, "isSecret": true, "options": null},
+            {"id": "name", "header": "Name", "question": "Name it?", "isOther": true, "options": []}
+        ]}})]);
+        let a = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no approval"))?;
+        let qs: Vec<(&str, bool, bool)> = a.questions.iter().map(|q| (q.id.as_str(), q.other, q.secret)).collect();
+        assert_eq!(qs, vec![("db", true, false), ("token", true, true), ("name", true, false)]);
+        let choices = vec![
+            ChoiceAnswer { question: "Which database?".into(), id: Some("db".into()), selected: vec!["Postgres, with replicas".into()], note: Some("keep it cheap".into()), ..ChoiceAnswer::default() },
+            ChoiceAnswer { question: "API token?".into(), id: Some("token".into()), other: Some("sk-123".into()), ..ChoiceAnswer::default() },
+            // Matched by its text when no id comes with it.
+            ChoiceAnswer { question: "Name it?".into(), other: Some("alpha, beta".into()), ..ChoiceAnswer::default() },
+        ];
+        c.command(&mut core, Command::Approve { id: "q7".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: Some(choices) });
+        let w = written(&mut core);
+        assert_eq!(
+            w.first().and_then(|v| v.pointer("/result/answers")),
+            Some(&json!({"db": {"answers": ["Postgres, with replicas", "user_note: keep it cheap"]}, "token": {"answers": ["sk-123"]}, "name": {"answers": ["alpha, beta"]}}))
+        );
+        // The older map: its text is one answer, commas and all.
+        feed(&mut c, &mut core, &[json!({"id": "q8", "method": "item/tool/requestUserInput", "params": {"threadId": "th1", "turnId": "t1", "itemId": "i8", "isBlocking": true, "questions": [{"id": "db", "header": "DB", "question": "Which database?", "options": [{"label": "Postgres, with replicas", "description": ""}]}]}})]);
+        let mut answers = std::collections::BTreeMap::new();
+        answers.insert("Which database?".to_owned(), "Postgres, with replicas".to_owned());
+        c.command(&mut core, Command::Approve { id: "q8".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers), choices: None });
+        assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/result/answers/db/answers")), Some(&json!(["Postgres, with replicas"])));
+        Ok(())
+    }
+
+    #[test]
     fn a_fork_codex_is_not_ready_for_is_tried_again() -> anyhow::Result<()> {
         let mut core = Core::new();
         core.state.cwd = "/work".into();
@@ -2841,6 +2901,19 @@ mod tests {
         assert_eq!(again.get("params"), fork.get("params"));
         respond(&mut c, &mut core, &w, "thread/fork", json!({"thread": {"id": "th2", "turns": []}, "model": "gpt-5", "cwd": "/work"}));
         assert!(core.state.doing.is_none() && core.state.harness_session.as_deref() == Some("th2"));
+        // A resume the daemon still holds for a terminal waits too.
+        let mut core = Core::new();
+        let held = super::super::session::Spec { kind: "codex".into(), resume: Some("th1".into()), ..Default::default() };
+        let mut c = Codex::from_spec(&held);
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1 (Linux)"}));
+        let w = written(&mut core);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/resume"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "thread th1 already has an active writer"}})]);
+        assert_eq!(core.state.doing.as_deref(), Some(LETTING_GO));
+        c.tick(&mut core);
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("thread/resume"))));
         // Other refusals are said at once.
         let mut core = Core::new();
         let mut c = Codex::from_spec(&spec);

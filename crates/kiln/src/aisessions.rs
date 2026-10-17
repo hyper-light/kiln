@@ -272,6 +272,15 @@ impl Proc {
     }
 }
 
+/// A Codex rollout's `session_meta`: its folder, when its thread began (unix seconds) and what
+/// started it ("codex-tui", "kiln", ...).
+#[derive(Clone, Default)]
+struct CodexHead {
+    cwd: String,
+    began: i64,
+    originator: String,
+}
+
 /// Finds the sessions. Keeps the process table and parsed transcripts between scans, so a scan
 /// only rereads transcripts that changed.
 pub struct Scanner {
@@ -286,8 +295,8 @@ pub struct Scanner {
     claude_files: HashMap<String, PathBuf>,
     /// Codex transcripts by process (pid, start time), once found.
     codex_files: HashMap<(u32, u64), PathBuf>,
-    /// The `session_meta` (id, cwd) of Codex transcripts, read once per file.
-    codex_meta: HashMap<PathBuf, (String, String)>,
+    /// The `session_meta` of Codex transcripts, read once per file.
+    codex_meta: HashMap<PathBuf, CodexHead>,
     /// Each reported session's transcript by pid, for [`Scanner::transcript`].
     open: HashMap<u32, (Tool, PathBuf)>,
 }
@@ -533,8 +542,10 @@ impl Scanner {
             .map(|(_, f)| f)
     }
 
-    /// A Codex process's rollout: `codex resume <id>` names it; otherwise the newest rollout of
-    /// the same directory written since the process started.
+    /// A Codex process's rollout: the one `codex resume <id>` names, or the newest of its
+    /// directory whose thread began after the process started (a new session's own; Codex writes
+    /// it from the first turn on). A session resumed from Codex's menu writes to an older rollout
+    /// that could as well be another session's: none is claimed for it.
     fn codex_file(&mut self, p: &Proc, taken: &HashSet<PathBuf>) -> Option<PathBuf> {
         let key = (p.pid, p.start);
         if let Some(f) = self.codex_files.get(&key) {
@@ -542,12 +553,13 @@ impl Scanner {
         }
         let root = self.codex.join("sessions");
         let resume = p.args.iter().position(|a| a == "resume").and_then(|i| p.args.get(i + 1)).filter(|a| !a.starts_with('-'));
+        // (A second of slack for the start time's rounding.)
+        let since = p.start.saturating_sub(1);
         let mut files = Vec::new();
         match resume {
             // Resumed sessions keep writing their original rollout, from whatever day it began.
             Some(id) => walk_jsonl(&root, 3, &mut |f| f.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&format!("{id}.jsonl"))), &mut files),
             None => {
-                let since = p.start.saturating_sub(60);
                 for day in recent_days(&root, since) {
                     walk_jsonl(&day, 0, &mut |f| modified_since(f, since), &mut files);
                 }
@@ -559,8 +571,10 @@ impl Scanner {
                 continue;
             }
             if resume.is_none() {
-                let (_, file_cwd) = self.codex_session_meta(&f);
-                if file_cwd != p.cwd {
+                let head = self.codex_session_meta(&f);
+                // A terminal's thread: not one kiln's agent sessions (or an editor) started.
+                let tui = head.originator.is_empty() || head.originator.contains("tui") || head.originator.contains("cli");
+                if head.cwd != p.cwd || u64::try_from(head.began).unwrap_or(0) < since || !tui {
                     continue;
                 }
             }
@@ -574,15 +588,22 @@ impl Scanner {
         Some(f)
     }
 
-    fn codex_session_meta(&mut self, f: &Path) -> (String, String) {
+    fn codex_session_meta(&mut self, f: &Path) -> CodexHead {
         if let Some(m) = self.codex_meta.get(f) {
             return m.clone();
         }
         let first = head_line(f).unwrap_or_default();
         let (meta, _) = parse_codex(std::slice::from_ref(&first));
-        let m = (meta.id, meta.cwd);
+        let v = serde_json::from_str::<Value>(&first).unwrap_or(Value::Null);
+        let began = v
+            .pointer("/payload/timestamp")
+            .and_then(Value::as_str)
+            .and_then(|t| time::OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok())
+            .map_or(0, time::OffsetDateTime::unix_timestamp);
+        let originator = v.pointer("/payload/originator").and_then(Value::as_str).unwrap_or("").to_owned();
+        let m = CodexHead { cwd: meta.cwd, began, originator };
         // Only remember a complete header: a brand-new file may not have one yet.
-        if !m.1.is_empty() {
+        if !m.cwd.is_empty() {
             self.codex_meta.insert(f.to_owned(), m.clone());
         }
         m
@@ -1072,6 +1093,45 @@ mod tests {
         let _ = child.wait();
         let found = found.map(|f| (f.tool, f.terminal));
         assert_eq!(found, Some(("claude".to_owned(), Some("t-elsewhere".to_owned()))));
+    }
+
+    #[test]
+    fn a_codex_process_gets_its_own_rollout() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let day = dir.path().join("sessions").join(time::OffsetDateTime::now_utc().format(&time::macros::format_description!("[year]/[month]/[day]"))?);
+        std::fs::create_dir_all(&day)?;
+        let now = time::OffsetDateTime::now_utc();
+        let rfc = |t: time::OffsetDateTime| t.format(&time::format_description::well_known::Rfc3339).unwrap_or_default();
+        let rollout = |id: &str, cwd: &str, began: time::OffsetDateTime| -> anyhow::Result<PathBuf> {
+            let f = day.join(format!("rollout-x-{id}.jsonl"));
+            let originator = if id.starts_with("kiln") { "kiln" } else { "codex-tui" };
+            let head = serde_json::json!({"timestamp": rfc(now), "type": "session_meta", "payload": {"id": id, "cwd": cwd, "timestamp": rfc(began), "originator": originator}});
+            std::fs::write(&f, format!("{head}\n"))?;
+            Ok(f)
+        };
+        let mut sc = Scanner::new(dir.path().to_owned());
+        sc.codex = dir.path().to_owned();
+        let start = u64::try_from(now.unix_timestamp()).unwrap_or(0).saturating_sub(5);
+        let p = Proc { pid: 4242, start, cwd: "/work".into(), args: vec!["codex".into()] };
+        // A thread that began before the process did, still written to (another session in the
+        // same folder, ending): not its.
+        rollout("other-1", "/work", now - time::Duration::minutes(3))?;
+        assert_eq!(sc.codex_file(&p, &HashSet::new()), None);
+        // Another folder's, or a thread one of kiln's agent sessions began meanwhile: not its
+        // either. Its own, once written: its for good.
+        rollout("elsewhere-1", "/other", now)?;
+        rollout("kiln-1", "/work", now)?;
+        assert_eq!(sc.codex_file(&p, &HashSet::new()), None);
+        let own = rollout("own-1", "/work", now - time::Duration::seconds(2))?;
+        assert_eq!(sc.codex_file(&p, &HashSet::new()).as_ref(), Some(&own));
+        assert_eq!(sc.codex_files.get(&(4242, start)), Some(&own));
+        // Resumed from Codex's menu: an older thread, nobody's for sure.
+        let q = Proc { pid: 4343, start, cwd: "/work".into(), args: vec!["codex".into(), "resume".into()] };
+        assert_eq!(sc.codex_file(&q, &HashSet::from([own.clone()])), None);
+        // Resumed by id: that one.
+        let r = Proc { pid: 4444, start, cwd: "/work".into(), args: vec!["codex".into(), "resume".into(), "other-1".into()] };
+        assert!(sc.codex_file(&r, &HashSet::new()).is_some_and(|f| f.to_string_lossy().ends_with("other-1.jsonl")));
+        Ok(())
     }
 
     #[test]

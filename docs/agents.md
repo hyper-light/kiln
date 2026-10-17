@@ -66,7 +66,7 @@ console picks) and are answered with a `reply` update to that client.
 |---|---|---|
 | `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
-| `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, answers?` | |
+| `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
 | `stop_task` | `task` | the task's `status` (stopped) |
@@ -81,6 +81,23 @@ console picks) and are answered with a `reply` update to that client.
 | `skill_view` | `name, client` | `{content, path}`, `{content, builtin: true, source}` (no file), or `{error}` |
 | `skill_run` | `name, args?, id?, mode?` | delivered like `send` |
 | `skills_reload` | | `state.skills` |
+
+### Questions
+
+An approval with `tool: "question"` carries `questions`: `id` (the harness's own, Codex),
+`question`, `header`, `multi` (several may be chosen), `other` (free text is accepted; always
+for Claude Code), `secret` (mask what is typed; Codex), `options: [{label, description,
+preview}]` (`preview`: what to show while the option is focused, Claude Code). Answer with
+`approve {id, decision: "allow", choices: [{question, id?, selected: [labels], other?,
+note?}]}`, one per question: labels with commas, free text and notes reach the harness as they
+are.
+
+- Claude Code (AskUserQuestion): `answers` maps each question to the labels chosen and the free
+  text, joined with ", " (the tool's own format); a note goes in `annotations[question].notes`,
+  with the chosen option's `preview`, as its own dialog does.
+- Codex (request_user_input): each label chosen and the free text are one answer each; a note
+  rides as `user_note: …`, as Codex's terminal sends it. Codex asks only in its Plan mode.
+- The older `answers` (question → one string) still works; each string is one choice.
 
 ## The command catalog (`meta.commands`)
 
@@ -203,8 +220,13 @@ their `server` and `tool_short`; skill calls their `skill`.
   (the last 256 KiB). Codex has no way to stop one from outside: `stop_task` stops the process
   itself (the newest under Codex running that command, with what it started).
 - **Codex** refuses to fork a thread for a moment after a turn ends (it is still writing the
-  thread's history out): kiln opens the branch again at the next tick, up to six times, with
-  `state.doing` saying so meanwhile.
+  thread's history out), and to resume one its app-server daemon still holds for a terminal
+  that just quit (about a minute after a take-over ends the TUI): kiln opens it again at each
+  tick, for up to two minutes, with `state.doing` saying so meanwhile.
+- **Codex** TUIs are matched to their rollout by the thread they began after they started (or
+  the id `codex resume <id>` names). One resumed from Codex's own menu writes to an older
+  rollout that could be another session's: it is listed without a conversation (`no_id`) and
+  cannot be taken over.
 - **Codex**: stdio servers are added with `codex mcp add`; http servers are written to its
   configuration through its own API (the CLI would sign in at once, in a browser on the agent's
   machine). Removing an http server signs it out first. Effort and model are set per turn.
@@ -232,7 +254,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | send now | ✓ | ✓ | unit | ? |
 | interrupt | ✓ | ✓ | ✓ | ? |
 | approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? |
-| questions | unit | unit | — | — |
+| questions: previews, free text, notes, labels with commas | ✓ | unit (Codex asks only in its Plan mode, which kiln does not run) | — | — |
 | plans to approve | unit | — | — | — |
 | permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (from the next turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |
