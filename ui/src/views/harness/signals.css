@@ -3,7 +3,7 @@
 .sg-optic,
 .sg-label,
 .sg-think,
-.sg-beam,
+.sg-trace,
 .sg-caret {
   /* --prism, horizontal (rules, text) and as a seamless vertical loop (the thinking rule, the caret). */
   --sg-prism: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
@@ -200,106 +200,123 @@
   }
 }
 
-/* ------------------------------------------------------------ beam */
+/* ------------------------------------------------------------ trace (a tool call's state) */
 
-/* A fixed 30px slot so settling never shifts the row; the chip settles at its left end. */
-.sg-beam {
-  position: relative;
-  display: inline-block;
+/* hyperlight's mark, drawn small. A fixed 14px square, so settling never shifts the row. */
+.sg-trace {
   flex: none;
-  width: 30px;
-  height: 6px;
+  width: 14px;
+  height: 14px;
+  overflow: visible;
   vertical-align: middle;
+  fill: none;
+  stroke-linecap: round;
   --sg-tone: #97999f;
 }
-.sg-beam-rule,
-.sg-beam-dot,
-.sg-beam-chip {
-  position: absolute;
-  left: 0;
+/* Stroke in the mark's own units (32 across): 1.4px at 14px. Dash lengths are fractions of the
+   loop (pathLength 100), which a non-scaling stroke would break. */
+.sg-trace path {
+  stroke-width: 3.2;
 }
-.sg-beam-rule {
-  top: 2px;
-  width: 30px;
-  height: 2px;
-  border-radius: 1px;
-  background: var(--sg-prism);
-  background-size: 250% 100%;
-  transform-origin: left center;
-  transform: scaleX(0.2);
-  opacity: 0;
+.sg-trace-loop {
+  stroke: var(--sg-tone);
+  opacity: 0.22;
   transition:
-    transform 0.25s var(--sg-ease),
-    opacity 0.15s ease 0.1s;
+    opacity 0.25s var(--sg-ease),
+    stroke 0.25s ease;
 }
-/* The bead samples the rule's gradient at its own position, ringed in the page colour so it reads as a bead. */
-.sg-beam-dot {
-  top: 0;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--sg-prism);
-  background-size: 30px 6px;
-  box-shadow:
-    0 0 0 1.5px var(--background, #08090a),
-    0 0 6px rgb(186 176 227 / 50%);
+/* The light: a quarter of the loop, travelling it end to end and out through the refraction. */
+.sg-trace-light {
+  stroke-dasharray: 26 74;
+  stroke-dashoffset: 100;
   opacity: 0;
-  transition: opacity 0.12s ease;
 }
-.sg-beam-chip {
-  top: 0;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--sg-tone);
-  transform: scale(0.35);
+.sg-trace-tail {
+  stroke: var(--sg-tone);
   opacity: 0;
-  transition:
-    transform 0.25s var(--sg-ease) 0.1s,
-    opacity 0.15s ease 0.1s;
+  transition: opacity 0.25s ease;
 }
-.sg-beam[data-status="running"] .sg-beam-rule {
-  transform: none;
+.sg-trace[data-status="running"] .sg-trace-light {
   opacity: 1;
-  transition: none;
-  animation: sg-prism-current 6s ease-in-out infinite alternate;
+  animation: sg-trace-run 1.8s linear infinite;
 }
-.sg-beam[data-status="running"] .sg-beam-dot {
-  opacity: 1;
-  animation: sg-beam-travel 1.6s ease-in-out infinite alternate;
+.sg-trace[data-status="running"] .sg-trace-tail {
+  stroke: #bcb1d8;
+  animation: sg-trace-refract 1.8s linear infinite;
 }
-.sg-beam:not([data-status="running"]) .sg-beam-chip {
-  transform: none;
-  opacity: 1;
+/* Settled: the loop draws itself closed in the outcome's tone. */
+.sg-trace:not([data-status="running"]) .sg-trace-loop {
+  opacity: 0.9;
+  stroke-dasharray: 100;
+  animation: sg-trace-close 0.35s var(--sg-ease) both;
 }
-.sg-beam[data-status="done"] {
+.sg-trace:not([data-status="running"]) .sg-trace-tail {
+  opacity: 0.9;
+}
+.sg-trace[data-status="done"] {
   --sg-tone: #a8c9bc;
 }
-.sg-beam[data-status="error"] {
+.sg-trace[data-status="error"] {
   --sg-tone: #d8bb95;
 }
-.sg-beam[data-status="denied"] {
+/* An error leaves the loop broken… */
+.sg-trace[data-status="error"] .sg-trace-loop {
+  stroke-dasharray: 74 26;
+  animation: none;
+}
+.sg-trace[data-status="denied"] {
   --sg-tone: #d5a4ad;
 }
-.sg-beam[data-status="pending"] {
+/* …a denial leaves it dashed… */
+.sg-trace[data-status="denied"] .sg-trace-loop {
+  stroke-dasharray: 3 5;
+  animation: none;
+}
+.sg-trace[data-status="pending"] {
   --sg-tone: #aab8d2;
 }
-.sg-beam[data-status="pending"] .sg-beam-chip {
+/* …and a pending call is only sketched, breathing. */
+.sg-trace[data-status="pending"] .sg-trace-loop {
+  opacity: 0.6;
+  stroke-dasharray: 2 6;
   animation: sg-soft-pulse 2.4s ease-in-out infinite alternate;
 }
-/* Cancelled is hollow, like the cancelled status dot. */
-.sg-beam[data-status="cancelled"] .sg-beam-chip {
-  background: transparent;
-  box-shadow: inset 0 0 0 1px var(--sg-tone);
+.sg-trace[data-status="pending"] .sg-trace-tail,
+.sg-trace[data-status="cancelled"] .sg-trace-tail {
+  opacity: 0;
 }
-@keyframes sg-beam-travel {
+.sg-trace[data-status="cancelled"] .sg-trace-loop {
+  opacity: 0.35;
+  stroke-dasharray: none;
+  animation: none;
+}
+@keyframes sg-trace-run {
   from {
-    transform: translateX(0);
-    background-position: 0 0;
+    stroke-dashoffset: 100;
   }
   to {
-    transform: translateX(24px);
-    background-position: -24px 0;
+    stroke-dashoffset: 0;
+  }
+}
+/* The refraction lights as the light reaches the loop's end. */
+@keyframes sg-trace-refract {
+  0%,
+  62% {
+    opacity: 0.15;
+  }
+  82% {
+    opacity: 0.85;
+  }
+  100% {
+    opacity: 0.15;
+  }
+}
+@keyframes sg-trace-close {
+  from {
+    stroke-dashoffset: 100;
+  }
+  to {
+    stroke-dashoffset: 0;
   }
 }
 @keyframes sg-soft-pulse {
@@ -337,28 +354,25 @@
 :root[data-motion="paused"] .sg-optic > span,
 :root[data-motion="paused"] .sg-label,
 :root[data-motion="paused"] .sg-think::before,
-:root[data-motion="paused"] .sg-beam-rule,
-:root[data-motion="paused"] .sg-beam-dot,
-:root[data-motion="paused"] .sg-beam-chip,
+:root[data-motion="paused"] .sg-trace path,
 :root[data-motion="paused"] .sg-caret {
   animation-play-state: paused;
 }
 
-/* No movement at all: live things show the static prism, the bead is hidden, settling is instant. */
+/* No movement at all: live things show the static prism, settling is instant. */
 @media (prefers-reduced-motion: reduce) {
   .sg-optic > span,
   .sg-label,
   .sg-think::before,
-  .sg-beam-rule,
-  .sg-beam-dot,
-  .sg-beam-chip,
+  .sg-trace path,
   .sg-caret,
   .sg-chev {
     animation: none !important;
     transition: none !important;
   }
-  .sg-beam[data-status="running"] .sg-beam-dot {
-    opacity: 0;
+  /* Running shows the whole loop in the prism, still. */
+  .sg-trace[data-status="running"] .sg-trace-light {
+    stroke-dasharray: none;
   }
 }
 
@@ -367,5 +381,8 @@
   .sg-label[data-live="true"] {
     color: CanvasText;
     background: none;
+  }
+  .sg-trace path {
+    stroke: CanvasText;
   }
 }
