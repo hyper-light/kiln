@@ -1135,10 +1135,11 @@ async fn terminal_attach(
             }
         }
     };
-    tx.send(ws::text(json!({"type": "session", "session": session.info()}).to_string())).await?;
     let attachment = session.attach();
     let mut live = attachment.live;
     let result: anyhow::Result<()> = async {
+        // Read after subscribing: a resize from here on also arrives as a live size frame.
+        tx.send(ws::text(json!({"type": "session", "session": session.info()}).to_string())).await?;
         if !attachment.replay.is_empty() {
             tx.send(ws::binary(attachment.replay)).await?;
         }
@@ -1154,6 +1155,7 @@ async fn terminal_attach(
             futures::select_biased! {
                 f = live.recv().fuse() => match f {
                     Ok(Frame::Data(d)) => tx.send(ws::binary(d)).await?,
+                    Ok(Frame::Size { cols, rows }) => tx.send(ws::text(json!({"type": "size", "cols": cols, "rows": rows}).to_string())).await?,
                     Ok(Frame::Exit { error: Some(e), .. }) if e == "__reconnect__" => {
                         tx.send(ws::text(json!({"type": "reconnect"}).to_string())).await.ok();
                         return Ok(());

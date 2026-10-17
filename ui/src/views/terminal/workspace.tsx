@@ -18,7 +18,8 @@ import {
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, TerminalSessionInfo } from "@/api/types";
-import { TerminalKeyboard, type KeyboardMode } from "@/components/terminal/keyboard";
+import { TerminalKeyboard, type KeyboardFold, type KeyboardMode } from "@/components/terminal/keyboard";
+import { presetFor } from "@/components/terminal/presets";
 import { Button } from "@/components/ui/button";
 import { Optic } from "@/components/ui/misc";
 import { Chips } from "@/components/ui/status";
@@ -49,18 +50,35 @@ function targetLabel(target: string) {
   return target === "local" ? "server" : target.replace(/^agent:/, "");
 }
 
+const tabTitle = (target: string, title: string) => (title ? `${targetLabel(target)} · ${title}` : targetLabel(target));
+
+function sameState(a: SessionState, b: SessionState) {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === "reconnecting" && b.kind === "reconnecting") return a.attempt === b.attempt;
+  if (a.kind === "exited" && b.kind === "exited") return a.code === b.code;
+  if (a.kind === "error" && b.kind === "error") return a.message === b.message;
+  return true;
+}
+
 export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   const [tabs, setTabs] = React.useState<Tab[]>([]);
   const [activeId, setActiveId] = React.useState<string | null>(null);
   const [kbVisible, setKbVisible] = useLocalStorage("kiln.term.keyboard", isTouchDevice());
   const [kbMode, setKbMode] = useLocalStorage<KeyboardMode>("kiln.term.keyboardMode", isTouchDevice() ? "full" : "keys");
   const [presets, setPresets] = useLocalStorage<Record<string, string>>("kiln.term.presets", {});
+  // Folded away on purpose (kept per device), or shrunk for the moment while reading.
+  const [kbClosed, setKbClosed] = useLocalStorage("kiln.term.keyboardClosed", false);
+  const [kbShrunk, setKbShrunk] = React.useState(false);
   const [agents, setAgents] = React.useState<Agent[]>([]);
   const [fontSize, setFontSize] = useLocalStorage("kiln.term.fontSize", 13);
   const [copyOnSelect, setCopyOnSelect] = useLocalStorage("kiln.term.copyOnSelect", false);
   const [renderer, setRenderer] = React.useState<"webgl" | "dom" | null>(null);
   const [full, setFull] = React.useState(false);
   const handles = React.useRef(new Map<string, SessionHandle>());
+  /** One ref callback per tab, kept stable so memoized session views don't re-render. */
+  const refs = React.useRef(new Map<string, (h: SessionHandle | null) => void>());
+  const activeRef = React.useRef(activeId);
+  activeRef.current = activeId;
   const panelRef = React.useRef<HTMLDivElement>(null);
   const location = useLocation();
   const navigate = useNavigate();
@@ -99,7 +117,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
               id: s.id,
               sessionId: s.id,
               target: s.target,
-              title: s.title ? `${targetLabel(s.target)} · ${s.title}` : targetLabel(s.target),
+              title: tabTitle(s.target, s.title),
               hints: `${s.command ?? ""} ${s.title}`,
               state: { kind: "connecting" },
             }));
@@ -130,32 +148,67 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
       const next = cur
         .filter((x) => x !== dup)
         .map((x) =>
-          x.id === tabId
-            ? { ...x, sessionId: info.id, hints: `${info.command ?? ""} ${info.title}`, title: info.title ? `${targetLabel(info.target)} · ${info.title}` : x.title }
-            : x,
+          x.id === tabId ? { ...x, sessionId: info.id, hints: `${info.command ?? ""} ${info.title}`, title: info.title ? tabTitle(info.target, info.title) : x.title } : x,
         );
       if (dup) {
         handles.current.delete(dup.id);
+        refs.current.delete(dup.id);
         setActiveId((a) => (a === dup.id ? tabId : a));
       }
       return next;
     });
   }, []);
 
-  /** Close a tab. A running session is ended (its shell stops on every device). */
-  const close = React.useCallback((id: string) => {
+  /** Drop a tab (and select its neighbour) without touching its session. */
+  const dropTab = React.useCallback((id: string) => {
+    handles.current.delete(id);
+    refs.current.delete(id);
     setTabs((t) => {
-      const tab = t.find((x) => x.id === id);
-      const running = tab && tab.sessionId && tab.state.kind !== "exited" && tab.state.kind !== "error";
-      if (running && tab.sessionId && !window.confirm("End this session? Its shell stops on every device.")) return t;
-      if (running && tab.sessionId) void api.closeTerminalSession(tab.sessionId).catch(() => undefined);
-      handles.current.delete(id);
       const idx = t.findIndex((x) => x.id === id);
+      if (idx === -1) return t;
       const next = t.filter((x) => x.id !== id);
       setActiveId((cur) => (cur === id ? (next[Math.max(0, idx - 1)]?.id ?? null) : cur));
       return next;
     });
   }, []);
+
+  const onState = React.useCallback((tabId: string, state: SessionState) => {
+    setTabs((t) => (t.some((x) => x.id === tabId && !sameState(x.state, state)) ? t.map((x) => (x.id === tabId ? { ...x, state } : x)) : t));
+  }, []);
+
+  const onTitle = React.useCallback((tabId: string, title: string) => {
+    setTabs((t) => {
+      const tab = t.find((x) => x.id === tabId);
+      if (!tab || tab.hints === title) return t;
+      return t.map((x) => (x.id === tabId ? { ...x, title: tabTitle(x.target, title), hints: title } : x));
+    });
+  }, []);
+
+  const refFor = (id: string) => {
+    let fn = refs.current.get(id);
+    if (!fn) {
+      fn = (h: SessionHandle | null) => {
+        if (h) handles.current.set(id, h);
+      };
+      refs.current.set(id, fn);
+    }
+    return fn;
+  };
+
+  /** Close a tab. A running session is ended (its shell stops on every device). */
+  const close = React.useCallback(
+    (id: string) => {
+      const tab = tabs.find((x) => x.id === id);
+      if (!tab) return;
+      const running = tab.sessionId && tab.state.kind !== "exited" && tab.state.kind !== "error";
+      if (running && tab.sessionId) {
+        if (!window.confirm("End this session? Its shell stops on every device.")) return;
+        void api.closeTerminalSession(tab.sessionId).catch(() => undefined);
+      }
+      dropTab(id);
+    },
+    [tabs, dropTab],
+  );
 
   // ?open=<target> deep links (command palette, agent cards)
   React.useEffect(() => {
@@ -168,9 +221,61 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     }
   }, [visible, location.search, open, navigate]);
 
-  const patch = (id: string, p: Partial<Tab>) => setTabs((t) => t.map((x) => (x.id === id ? { ...x, ...p } : x)));
-
   const active = tabs.find((t) => t.id === activeId) ?? null;
+  const activeSession = active?.sessionId ?? null;
+  const autoPresetId = React.useMemo(() => presetFor(active?.hints ?? "").id, [active?.hints]);
+
+  // The keyboard's callbacks act on whichever tab is selected when a key is pressed; they stay the
+  // same functions so the memoized keyboard never re-renders for them.
+  const kbSend = React.useCallback((bytes: string) => {
+    const id = activeRef.current;
+    if (id) handles.current.get(id)?.send(bytes);
+  }, []);
+  const kbAppCursor = React.useCallback(() => {
+    const id = activeRef.current;
+    return (id && handles.current.get(id)?.appCursor()) || false;
+  }, []);
+  const kbPreset = React.useCallback(
+    (id: string | null) => {
+      if (!activeSession) return;
+      const next = { ...presets };
+      if (id) next[activeSession] = id;
+      else delete next[activeSession];
+      setPresets(next);
+    },
+    [activeSession, presets, setPresets],
+  );
+  const kbFold: KeyboardFold = kbClosed ? "closed" : kbShrunk ? "shrunk" : "open";
+  const kbOnFold = React.useCallback(
+    (f: "open" | "closed") => {
+      setKbShrunk(false);
+      setKbClosed(f === "closed");
+    },
+    [setKbClosed],
+  );
+  /** Like a phone keyboard: scrolling the terminal shrinks it, tapping the terminal brings it back. */
+  const onGesture = React.useCallback(
+    (_tabId: string, g: "scroll" | "tap") => {
+      if (g === "scroll") setKbShrunk(true);
+      else {
+        setKbShrunk(false);
+        setKbClosed(false);
+      }
+    },
+    [setKbClosed],
+  );
+  const kbOnMode = React.useCallback(
+    (m: KeyboardMode) => {
+      setKbMode(m);
+      // Switching to the device keyboard: focus the terminal so it opens.
+      if (m === "keys")
+        requestAnimationFrame(() => {
+          const id = activeRef.current;
+          if (id) handles.current.get(id)?.focus();
+        });
+    },
+    [setKbMode],
+  );
   // Job pods run CI jobs; they aren't machines to open shells on.
   const connected = agents.filter((a) => a.connected && !a.ephemeral);
 
@@ -330,19 +435,19 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
         {tabs.map((t) => (
           <TerminalSession
             key={t.id}
-            ref={(h) => {
-              if (h) handles.current.set(t.id, h);
-            }}
+            ref={refFor(t.id)}
+            tabId={t.id}
             sessionId={t.sessionId}
-            onSession={(info) => onSession(t.id, info)}
-            deviceKeyboard={!(kbVisible && kbMode === "full")}
             target={t.target}
-            active={t.id === activeId}
-            visible={visible}
+            active={visible && t.id === activeId}
             fontSize={fontSize}
             copyOnSelect={copyOnSelect}
-            onState={(s) => patch(t.id, { state: s })}
-            onTitle={(title) => patch(t.id, { title: title ? `${targetLabel(t.target)} · ${title}` : targetLabel(t.target), hints: title })}
+            deviceKeyboard={!(kbVisible && kbMode === "full")}
+            onState={onState}
+            onTitle={onTitle}
+            onSession={onSession}
+            onClosed={dropTab}
+            onGesture={onGesture}
             onRenderer={setRenderer}
           />
         ))}
@@ -414,24 +519,15 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
       {/* On-screen keyboard: shown by default on touch devices, toggled from the toolbar. */}
       {active && kbVisible && (
         <TerminalKeyboard
-          send={(bytes) => handles.current.get(active.id)?.send(bytes)}
-          appCursor={() => handles.current.get(active.id)?.appCursor() ?? false}
-          hints={active.hints}
-          presetId={(active.sessionId && presets[active.sessionId]) || null}
-          onPreset={(id) => {
-            if (!active.sessionId) return;
-            const next = { ...presets };
-            if (id) next[active.sessionId] = id;
-            else delete next[active.sessionId];
-            setPresets(next);
-          }}
+          send={kbSend}
+          appCursor={kbAppCursor}
+          autoPresetId={autoPresetId}
+          presetId={(activeSession && presets[activeSession]) || null}
+          onPreset={kbPreset}
           mode={kbMode}
-          onMode={(m) => {
-            setKbMode(m);
-            // Switching to the device keyboard: focus the terminal so it opens.
-            if (m === "keys") requestAnimationFrame(() => handles.current.get(active.id)?.focus());
-          }}
-          onHide={() => setKbVisible(false)}
+          onMode={kbOnMode}
+          fold={kbFold}
+          onFold={kbOnFold}
         />
       )}
     </div>

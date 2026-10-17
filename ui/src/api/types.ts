@@ -345,4 +345,6 @@ export type TerminalControlFrame =
   /** The session isn't known (yet): e.g. its machine is reconnecting. Retry by id. */
   | { type: "missing"; session: string }
   /** The session's machine dropped; it keeps running there. Reattach by id. */
-  | { type: "reconnect" };
+  | { type: "reconnect" }
+  /** The session's size changed (the device in use set it): draw at exactly this size. */
+  | { type: "size"; cols: number; rows: number };
