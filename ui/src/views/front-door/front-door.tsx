@@ -9,36 +9,42 @@
  * runner needs follows.
  */
 import * as React from "react";
-import { Switch } from "radix-ui";
 import { Check, Copy, Download, Minus, Plus } from "lucide-react";
 import { frontDoorApi } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, CertInfo, CertMode, DnsMode, FrontDoorFix, FrontDoorListener, FrontDoorSettings, FrontDoorState, FrontDoorStatus, FrontDoorView } from "@/api/types";
 import { Button } from "@/components/ui/button";
+import { Hold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
 import { SectionHeading } from "@/components/ui/misc";
-import { errorMessage, useLocalStorage, useResource } from "@/lib/hooks";
+import type { Res } from "@/lib/data";
+import { errorMessage } from "@/lib/hooks";
+import { getPref, setPref } from "@/lib/prefs";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/views/terminal/clipboard";
 import { RelTime } from "@/views/shared";
 import { TailnetDetails, tailnetLine } from "./tailnet";
 import "./front-door.css";
 
+/** Every runner's front door, in brief (which are on, their origins). */
+export const frontDoorsRes: Res<FrontDoorView[]> = { key: "front-door", fetch: (s) => frontDoorApi.list(s), opts: { on: ["front_door"] } };
+
+const PICKED = "kiln.frontdoor.runner";
+
 /* ------------------------------------------------------------------ the section */
 
 export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: string }) {
   const runners = React.useMemo(() => agents.filter((a) => !a.ephemeral).sort((a, b) => a.name.localeCompare(b.name)), [agents]);
-  const doors = useResource((s) => frontDoorApi.list(s), []);
-  const [picked, setPicked] = useLocalStorage<string>("kiln.frontdoor.runner", "");
-  useServerEvents((ev) => {
-    if (ev.type === "front_door") doors.reload();
-  });
-  // The runner chosen last; else the one whose front door is on; else the first connected one.
-  const on = doors.data?.find((d) => d.settings.dns.enabled || d.settings.https.enabled || d.settings.mdns.enabled)?.runner;
+  const doors = useSuspenseResource(frontDoorsRes.key, frontDoorsRes.fetch, frontDoorsRes.opts).data;
+  // The runner chosen last (kept per browser); else the one whose front door is on; else the first connected one.
+  const [picked, setPicked] = React.useState(() => getPref(PICKED, ""));
+  const on = doors.find((d) => d.settings.dns.enabled || d.settings.https.enabled || d.settings.mdns.enabled)?.runner;
   const fallback = on ?? runners.find((a) => a.connected)?.name ?? runners[0]?.name ?? "";
   const runner = runners.some((a) => a.name === picked) ? picked : fallback;
   const agent = runners.find((a) => a.name === runner);
   const selectId = React.useId();
-  const summary = doors.data?.find((d) => d.runner === runner);
+  const summary = doors.find((d) => d.runner === runner);
 
   return (
     <section className="fd" aria-labelledby="fd-title">
@@ -60,7 +66,17 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
             <label className="fd-key" htmlFor={selectId}>
               Runner
             </label>
-            <select id={selectId} className="fd-select" value={runner} onChange={(e) => setPicked(e.target.value)}>
+            <select
+              id={selectId}
+              className="fd-select"
+              value={runner}
+              onChange={(e) => {
+                const v = e.target.value;
+                setPref(PICKED, v);
+                // The runner shown stays until the one chosen is in.
+                React.startTransition(() => setPicked(v));
+              }}
+            >
               {runners.map((a) => (
                 <option key={a.name} value={a.name}>
                   {a.name}
@@ -75,7 +91,11 @@ export function FrontDoorSection({ agents, index }: { agents: Agent[]; index: st
               </span>
             )}
           </div>
-          {runner && <FrontDoorPanel key={runner} runner={runner} onSaved={doors.reload} />}
+          {runner && (
+            <Loadable label={`${runner}'s front door`} fallback={<Hold height={420} className="fd-body" />}>
+              <FrontDoorPanel key={runner} runner={runner} />
+            </Loadable>
+          )}
         </>
       )}
     </section>
@@ -153,26 +173,25 @@ function settingsOf(d: Draft, base: FrontDoorSettings): FrontDoorSettings | stri
   };
 }
 
-function FrontDoorPanel({ runner, onSaved }: { runner: string; onSaved: () => void }) {
-  const view = useResource((s) => frontDoorApi.get(runner, s), [runner]);
+function FrontDoorPanel({ runner }: { runner: string }) {
+  const view = useSuspenseResource(`front-door/${runner}`, (s) => frontDoorApi.get(runner, s));
   useServerEvents((ev) => {
-    if ((ev.type === "front_door" && ev.runner === runner) || (ev.type === "agent" && ev.agent.name === runner)) view.reload();
+    if ((ev.type === "front_door" && ev.runner === runner) || (ev.type === "agent" && ev.agent.name === runner && ev.agent.connected !== view.data.connected)) view.reload();
   });
-  const v = view.data?.runner === runner ? view.data : undefined;
-  const saved = React.useMemo(() => (v ? draftOf(v.settings) : null), [v]);
+  const v = view.data;
+  const saved = React.useMemo(() => draftOf(v.settings), [v]);
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [saving, setSaving] = React.useState(false);
   const [msg, setMsg] = React.useState<{ tone: "ok" | "error" | "quiet"; text: string } | null>(null);
   // Until something is typed, the form follows what is stored (another tab, another admin).
   const d = draft ?? saved;
-  const dirty = Boolean(draft && saved && JSON.stringify(draft) !== JSON.stringify(saved));
+  const dirty = Boolean(draft && JSON.stringify(draft) !== JSON.stringify(saved));
   const set = (p: Partial<Draft>) => {
-    if (d) setDraft({ ...d, ...p });
+    setDraft({ ...d, ...p });
     setMsg(null);
   };
 
   const save = async () => {
-    if (!d || !v) return;
     const s = settingsOf(d, v.settings);
     if (typeof s === "string") {
       setMsg({ tone: "error", text: s });
@@ -184,7 +203,7 @@ function FrontDoorPanel({ runner, onSaved }: { runner: string; onSaved: () => vo
       view.setData(() => next);
       setDraft(null);
       setMsg({ tone: "ok", text: next.connected ? `Saved. ${runner} applies it now.` : `Saved. ${runner} applies it when it connects.` });
-      onSaved();
+      invalidate("front-door");
     } catch (e) {
       setMsg({ tone: "error", text: errorMessage(e) });
     } finally {
@@ -192,38 +211,33 @@ function FrontDoorPanel({ runner, onSaved }: { runner: string; onSaved: () => vo
     }
   };
 
-  if (view.error && !v) return <p className="fd-msg" data-tone="error">{errorMessage(view.error)}</p>;
   return (
-    <div className="fd-body" aria-busy={!v}>
+    <div className="fd-body">
       <StatusLines v={v} />
-      {d && v ? (
-        <form
-          className="fd-form"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void save();
-          }}
-        >
-          <NamesGroup d={d} set={set} />
-          <DnsGroup d={d} set={set} v={v} />
-          <TailnetGroup d={d} set={set} v={v} />
-          <HttpsGroup d={d} set={set} v={v} onView={(next) => view.setData(() => next)} />
-          <div className="fd-actions">
-            <Button type="submit" size="xs" className="fd-btn" disabled={saving || !dirty}>
-              {saving ? "Saving…" : "Save"}
-            </Button>
-            <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={saving || !dirty} onClick={() => setDraft(null)}>
-              Revert
-            </Button>
-            <span className="fd-msg" role="status" data-tone={msg?.tone ?? "quiet"}>
-              {msg?.text ?? (dirty ? "Not saved yet." : appliedWords(v))}
-            </span>
-          </div>
-        </form>
-      ) : (
-        <div className="fd-form fd-loading" aria-hidden="true" />
-      )}
-      {v?.status && v.status.fixes.length > 0 && <Setup runner={runner} fixes={v.status.fixes} />}
+      <form
+        className="fd-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void save();
+        }}
+      >
+        <NamesGroup d={d} set={set} />
+        <DnsGroup d={d} set={set} v={v} />
+        <TailnetGroup d={d} set={set} v={v} />
+        <HttpsGroup d={d} set={set} v={v} onView={(next) => view.setData(() => next)} />
+        <div className="fd-actions">
+          <Button type="submit" size="xs" className="fd-btn" disabled={saving || !dirty}>
+            {saving ? "Saving…" : "Save"}
+          </Button>
+          <Button type="button" size="xs" variant="ghost" className="fd-btn" disabled={saving || !dirty} onClick={() => setDraft(null)}>
+            Revert
+          </Button>
+          <span className="fd-msg" role="status" data-tone={msg?.tone ?? "quiet"}>
+            {msg?.text ?? (dirty ? "Not saved yet." : appliedWords(v))}
+          </span>
+        </div>
+      </form>
+      {v.status && v.status.fixes.length > 0 && <Setup runner={runner} fixes={v.status.fixes} />}
     </div>
   );
 }
@@ -391,13 +405,19 @@ function StatusLines({ v }: { v: FrontDoorView | undefined }) {
 
 function CopyIcon({ text, label }: { text: string; label: string }) {
   const [done, setDone] = React.useState(false);
-  React.useEffect(() => {
-    if (!done) return;
-    const t = window.setTimeout(() => setDone(false), 1500);
-    return () => window.clearTimeout(t);
-  }, [done]);
   return (
-    <button type="button" className="fd-copy" aria-label={done ? "Copied" : label} title={done ? "Copied" : label} onClick={() => void copyText(text).then(setDone)}>
+    <button
+      type="button"
+      className="fd-copy"
+      aria-label={done ? "Copied" : label}
+      title={done ? "Copied" : label}
+      onClick={() =>
+        void copyText(text).then((ok) => {
+          setDone(ok);
+          if (ok) window.setTimeout(() => setDone(false), 1500);
+        })
+      }
+    >
       {done ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
     </button>
   );
@@ -420,17 +440,11 @@ function Field({ label, hint, children, wide }: { label: string; hint?: React.Re
   );
 }
 
+/** A feature turned on or off: a checkbox and what it does. */
 function Toggle({ checked, onChange, label, children }: { checked: boolean; onChange: (v: boolean) => void; label: string; children: React.ReactNode }) {
   return (
     <label className="fd-toggle">
-      <Switch.Root
-        checked={checked}
-        onCheckedChange={onChange}
-        aria-label={label}
-        className="relative h-[18px] w-8 shrink-0 rounded-full border border-white/15 bg-white/[0.04] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#08090a] data-[state=checked]:border-[#8f87b3]/70 data-[state=checked]:bg-[#8f87b3]/25"
-      >
-        <Switch.Thumb className="block size-3 translate-x-[2px] rounded-full bg-[#a1a4ad] transition-transform duration-200 data-[state=checked]:translate-x-[15px] data-[state=checked]:bg-[#e6e1f6]" />
-      </Switch.Root>
+      <input type="checkbox" className="check" checked={checked} onChange={(e) => onChange(e.target.checked)} aria-label={label} />
       <span>{children}</span>
     </label>
   );
@@ -536,7 +550,11 @@ function TailnetGroup({ d, set, v }: GroupProps & { v: FrontDoorView }) {
       <Toggle checked={d.tailscale} onChange={(tailscale) => set({ tailscale })} label="On the tailnet">
         Serve these names on your tailnet too (Tailscale), to every device on it
       </Toggle>
-      {d.tailscale && <TailnetDetails settings={v.settings} status={v.status} dnsOn={d.dnsEnabled && v.settings.dns.enabled} />}
+      {d.tailscale && (
+        <Loadable label="the tailnet" fallback={<Hold height={72} />}>
+          <TailnetDetails settings={v.settings} status={v.status} dnsOn={d.dnsEnabled && v.settings.dns.enabled} />
+        </Loadable>
+      )}
     </fieldset>
   );
 }

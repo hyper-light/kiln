@@ -2776,24 +2776,6 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 .runner-up-go {
   margin-left: auto;
 }
-.runner-up-confirm {
-  display: grid;
-  gap: 8px;
-  max-width: 72ch;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-accent);
-  background: var(--color-surface);
-  color: var(--color-secondary);
-  font-size: 13px;
-}
-.runner-up-confirm p {
-  margin: 0;
-}
-.runner-up-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
 .upd-confirm {
   display: grid;
   gap: 8px;

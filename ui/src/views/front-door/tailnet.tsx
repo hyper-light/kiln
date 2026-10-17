@@ -8,10 +8,10 @@
 import * as React from "react";
 import { Check, Copy } from "lucide-react";
 import { tailscaleApi } from "@/api/client";
-import { useServerEvents } from "@/api/events";
 import type { FrontDoorFix, FrontDoorSettings, FrontDoorState, FrontDoorStatus, TailnetStatus } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { errorMessage, useResource } from "@/lib/hooks";
+import { errorMessage } from "@/lib/hooks";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { copyText } from "@/views/terminal/clipboard";
 import { RelTime } from "@/views/shared";
 import "./tailnet.css";
@@ -60,13 +60,19 @@ export function tailnetLine(s: FrontDoorSettings, st: FrontDoorStatus | null): T
 
 function CopyButton({ text, label }: { text: string; label: string }) {
   const [done, setDone] = React.useState(false);
-  React.useEffect(() => {
-    if (!done) return;
-    const t = window.setTimeout(() => setDone(false), 1500);
-    return () => window.clearTimeout(t);
-  }, [done]);
   return (
-    <button type="button" className="fd-copy" aria-label={done ? "Copied" : label} title={done ? "Copied" : label} onClick={() => void copyText(text).then(setDone)}>
+    <button
+      type="button"
+      className="fd-copy"
+      aria-label={done ? "Copied" : label}
+      title={done ? "Copied" : label}
+      onClick={() =>
+        void copyText(text).then((ok) => {
+          setDone(ok);
+          if (ok) window.setTimeout(() => setDone(false), 1500);
+        })
+      }
+    >
       {done ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
     </button>
   );
@@ -88,10 +94,8 @@ function Value({ text, label }: { text: string; label: string }) {
  * for every runner), or the values for the admin console.
  */
 export function TailnetDetails({ settings, status, dnsOn }: { settings: FrontDoorSettings; status: FrontDoorStatus | null; dnsOn: boolean }) {
-  const ts = useResource((s) => tailscaleApi.get(s), []);
-  useServerEvents((ev) => {
-    if (ev.type === "tailscale") ts.reload();
-  });
+  const ts = useSuspenseResource("tailscale", (s) => tailscaleApi.get(s), { on: ["tailscale"] });
+  const reload = () => invalidate("tailscale");
   const t: TailnetStatus | null | undefined = status?.tailscale;
   const names = dnsNames(settings);
   const nameserver = t?.nameserver ?? t?.addresses.find((a) => !a.includes(":")) ?? null;
@@ -146,10 +150,10 @@ export function TailnetDetails({ settings, status, dnsOn }: { settings: FrontDoo
                   </>
                 )}
               </span>
-              <Forget onDone={ts.reload} />
+              <Forget onDone={reload} />
             </div>
           ) : (
-            unrouted.length > 0 && <Setup names={unrouted} nameserver={nameserver} onConnected={ts.reload} />
+            unrouted.length > 0 && <Setup names={unrouted} nameserver={nameserver} onConnected={reload} />
           )}
         </>
       )}
