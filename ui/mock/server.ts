@@ -16,7 +16,7 @@ import os from "node:os";
 import { WebSocketServer, WebSocket } from "ws";
 import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, ServerEvent, Status, Step } from "../src/api/types.ts";
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
-import { AUTHORS, REPOS, commitMessage, hashStr, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
+import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -1498,6 +1498,27 @@ const server = http.createServer(async (req, res) => {
       emit({ type: "agent", agent: a });
       addAudit("admin", a.draining ? "agent.drain" : "agent.undrain", a.name);
       return noContent(res);
+    }
+
+    // ---- folders on machines (the folder picker) ----
+    if ((mm = p.match(/^\/api\/machines\/([^/]+)\/dirs$/)) && m === "GET") {
+      const target = decodeURIComponent(mm[1]!);
+      const path = url.searchParams.get("path") ?? "";
+      let os: "linux" | "macos" = "linux";
+      let wait = between(20, 60);
+      if (target !== "local") {
+        const name = target.replace(/^agent:/, "");
+        const a = agents.get(name);
+        if (!a || !a.connected) return err(res, 409, `${name} is not connected`);
+        if (a.ephemeral) return err(res, 403, `${name} has terminals (and so agents) turned off`);
+        // Runners older than this server never announced that they list folders.
+        if (a.version !== VERSION) return err(res, 409, `${name}'s runner is too old to list folders: upgrade it`);
+        if (a.os === "macos") os = "macos";
+        // A machine answers over its QUIC session; its network mount answers slowly.
+        wait = /^\/mnt\/nfs(\/|$)/.test(path.trim()) ? 2500 : between(90, 280);
+      }
+      await new Promise((r) => setTimeout(r, wait));
+      return json(res, 200, mockDirList(os, path));
     }
 
     // ---- metrics / system ----

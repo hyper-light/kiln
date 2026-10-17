@@ -1,0 +1,310 @@
+/* Where an agent works: one line (IN  ~ / Projects / kiln) that opens in place into the path to
+   type, the folders inside as words and the folders used before. The console's mode-word voice, as
+   in the run-settings tuner: mono, muted, the current word bright over the prism hairline. Words,
+   not buttons: no boxes, no fills, no popover; what follows moves down while it's open. */
+
+.ip {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* ---------------------------------------------------------------- the line */
+.ip-line {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  margin: 0;
+  padding: 5px 0 4px;
+  border: 0;
+  background: none;
+  color: #8f929b;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+/* 40px to tap, reaching mostly below the letters. */
+.ip-line::before {
+  position: absolute;
+  inset: -4px 0 -8px;
+  content: "";
+}
+.ip-line:focus-visible {
+  border-radius: 3px;
+  outline: 2px solid #bab0e3;
+  outline-offset: 2px;
+}
+.ip-eyebrow {
+  flex: none;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  line-height: 16px;
+  text-transform: uppercase;
+}
+.ip-path {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: baseline;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 16px;
+}
+/* Each folder on the line is its own tap (the line's own reach is underneath). */
+.ip-seg {
+  position: relative;
+  flex: none;
+  padding-bottom: 3px;
+  color: #8f929b;
+  transition: color 0.15s;
+}
+.ip-seg::before {
+  position: absolute;
+  inset: -5px -3px -9px;
+  content: "";
+}
+.ip-seg[data-last] {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #ededee;
+  text-overflow: ellipsis;
+}
+/* The folder being looked at: the composer's prism hairline. */
+.ip-seg[data-current] {
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2) 0 100% / 100% 1px no-repeat;
+}
+.ip-sep {
+  flex: none;
+  padding: 0 7px 3px;
+  color: #5d6068;
+}
+@media (hover: hover) {
+  .ip-seg:hover {
+    color: #d6d7db;
+  }
+  .ip-seg[data-last]:hover {
+    color: #ffffff;
+  }
+}
+
+/* ---------------------------------------------------------------- open */
+.ip-panel {
+  min-width: 0;
+}
+/* The path to type: plain text on a hairline. It wraps (and grows) rather than scroll sideways. */
+.ip-field {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: 4px 0 0;
+  padding: 5px 0 6px;
+  border: 0;
+  border-bottom: 1px solid #2b2d32;
+  border-radius: 0;
+  background: none;
+  color: #ededee;
+  caret-color: #b8a6d5;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 18px;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  resize: none;
+  outline: none;
+  transition: border-color 0.15s;
+  animation: ip-fade 0.12s ease-out;
+}
+.ip-field::placeholder {
+  color: #5d6068;
+}
+@media (hover: hover) {
+  .ip-field:hover {
+    border-bottom-color: #3a3c43;
+  }
+}
+.ip-field:focus,
+.ip-field:focus-visible {
+  border-bottom-color: #8f929b;
+  outline: none;
+}
+
+/* One line for what's going on: reading, nothing there, can't look. */
+.ip-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 8px 0 0;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  overflow-wrap: anywhere;
+}
+.ip-status:empty {
+  margin: 0;
+}
+.ip:not([data-open]) .ip-status:not(:empty) {
+  margin-top: 2px;
+}
+.ip-status[data-tone="warn"] {
+  color: #d8bb95;
+}
+.ip-optic {
+  display: inline-flex;
+  flex: none;
+}
+
+/* The folders inside, and the ones used before, as words that wrap. */
+.ip-words,
+.ip-row {
+  /* The first word's letters line up with the field; its padding hangs to the left. */
+  margin: 4px 0 0 -6px;
+  animation: ip-fade 0.12s ease-out;
+}
+.ip-row {
+  margin-top: 0;
+}
+.ip-list {
+  display: inline;
+}
+.ip-word,
+.ip-key {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  margin: 0;
+  padding: 7px 6px;
+  border: 0;
+  background: none;
+  font-family: var(--font-mono);
+  line-height: 16px;
+  vertical-align: top;
+}
+.ip-word {
+  color: #8f929b;
+  font-size: 12px;
+  font-weight: 400;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: color 0.15s;
+}
+.ip-word-text {
+  padding-bottom: 3px;
+}
+.ip-word[aria-selected="true"] {
+  color: #ededee;
+}
+.ip-word[aria-selected="true"] .ip-word-text {
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2) 0 100% / 100% 1px no-repeat;
+}
+.ip-up {
+  color: #a1a4ad;
+}
+.ip-more {
+  color: #7b7e88;
+}
+.ip-key {
+  font-size: 10.5px;
+}
+@media (hover: hover) {
+  .ip-word:hover {
+    color: #d6d7db;
+  }
+  .ip-word[aria-selected="true"]:hover {
+    color: #ffffff;
+  }
+}
+.ip-word:focus-visible {
+  border-radius: 5px;
+  outline: 2px solid #bab0e3;
+  outline-offset: -2px;
+}
+/* The last folder's words, while the next folder's come. */
+.ip-words[data-stale] .ip-word {
+  opacity: 0.45;
+  pointer-events: none;
+}
+/* Fingers: 36px to tap. */
+@media (pointer: coarse) {
+  .ip-word,
+  .ip-key {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+}
+
+/* ---------------------------------------------------------------- motion */
+@keyframes ip-fade {
+  from {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ip-field,
+  .ip-words,
+  .ip-row {
+    animation: none;
+  }
+  .ip-seg,
+  .ip-word,
+  .ip-field {
+    transition: none;
+  }
+}
+/* Paused motion would freeze a fade at its first frame, so these don't animate at all. */
+:root[data-motion="paused"] .ip-field,
+:root[data-motion="paused"] .ip-words,
+:root[data-motion="paused"] .ip-row {
+  animation: none;
+}
+:root[data-motion="paused"] .ip-seg,
+:root[data-motion="paused"] .ip-word,
+:root[data-motion="paused"] .ip-field {
+  transition: none;
+}
+
+/* ---------------------------------------------------------------- contrast */
+@media (prefers-contrast: more) {
+  .ip-eyebrow,
+  .ip-seg,
+  .ip-sep,
+  .ip-word,
+  .ip-more,
+  .ip-status {
+    color: #c4c5ce;
+  }
+  .ip-seg[data-last],
+  .ip-word[aria-selected="true"] {
+    color: #ffffff;
+  }
+  .ip-status[data-tone="warn"] {
+    color: #e6cba6;
+  }
+  .ip-field {
+    border-bottom-color: #666976;
+  }
+}
+@media (forced-colors: active) {
+  .ip-seg[data-current],
+  .ip-word[aria-selected="true"] .ip-word-text {
+    background: none;
+    text-decoration: underline;
+  }
+  .ip-field {
+    border-bottom-color: CanvasText;
+  }
+}

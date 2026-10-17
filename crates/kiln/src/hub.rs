@@ -329,6 +329,33 @@ impl Hub {
         self.ai_ask(machine, move |req| ServerMsg::HarnessTaskOutput { req, session, task, since }).await
     }
 
+    /// The folders at `path` on a machine, as JSON [`crate::dirs::Listing`], read by its newest
+    /// runner process. Only one that announced [`proto::CAP_DIRS`] is sent [`ServerMsg::DirList`]:
+    /// `Ok(None)` when it is too old to list folders.
+    pub async fn dir_list(&self, machine: &str, path: &str) -> anyhow::Result<Option<String>> {
+        let peer = {
+            let inst = self.instances.lock();
+            if inst.newest(machine).is_none() {
+                anyhow::bail!("{machine} is not connected");
+            }
+            inst.newest_with(machine, proto::CAP_DIRS)
+        };
+        let Some(peer) = peer else { return Ok(None) };
+        let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = proto::encode(&ServerMsg::DirList { req, path: path.to_owned() })?;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.ai_requests.lock().insert(req, tx);
+        let sent = self.net.send(peer, LANE_TERM, Kind::Term, frame).await;
+        let answer = if sent { crate::rt::timeout(crate::dirs::WAIT, rx).await.ok() } else { None };
+        self.ai_requests.lock().remove(&req);
+        match answer {
+            Some(Ok(Some(json))) => Ok(Some(json)),
+            Some(_) => anyhow::bail!("{machine} did not answer"),
+            None if !sent => anyhow::bail!("{machine} is not connected"),
+            None => anyhow::bail!("{machine} did not answer in time"),
+        }
+    }
+
     async fn ai_ask(&self, machine: &str, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<String>> {
         let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -628,6 +655,11 @@ impl Hub {
             AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
+                }
+            }
+            AgentMsg::DirList { req, json } => {
+                if let Some(tx) = self.ai_requests.lock().remove(&req) {
+                    let _ = tx.send(Some(json));
                 }
             }
             AgentMsg::Build { build, caps } => {

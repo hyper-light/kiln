@@ -241,6 +241,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
         (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid).await,
+        (&Method::GET, ["api", "machines", target, "dirs"]) => machine_dirs(&hub, target, &q).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.visible())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
@@ -1809,6 +1810,38 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> any
             },
         }
     }
+}
+
+// ------------------------------------------------------------------ folders
+
+/// The folders in a folder on a machine, for the console's folder picker: `target` is `local`
+/// (this server) or a machine (`<name>` or `agent:<name>`), `?path=` as typed. What can't be listed
+/// (no such folder, permission denied) is said in a 200 answer; see `crate::dirs`. Folders are
+/// offered where agents may run: where terminals are on.
+async fn machine_dirs(hub: &Hub, target: &str, q: &HashMap<String, String>) -> R {
+    let path = q.get("path").cloned().unwrap_or_default();
+    if target == "local" {
+        if !hub.cfg.terminal.enabled {
+            return Err(err(StatusCode::FORBIDDEN, "terminals (and so agents) are disabled on this server"));
+        }
+        return Ok(srv::json(StatusCode::OK, &crate::dirs::here(path).await));
+    }
+    let machine = target.strip_prefix("agent:").unwrap_or(target);
+    let (connected, agents) = hub.agents.lock().get(machine).map_or((false, false), |a| (a.connected, a.terminal && !a.ephemeral));
+    if !connected {
+        return Err(err(StatusCode::CONFLICT, format!("{machine} is not connected")));
+    }
+    if !agents {
+        return Err(err(StatusCode::FORBIDDEN, format!("{machine} has terminals (and so agents) turned off")));
+    }
+    let json = match hub.dir_list(machine, &path).await {
+        Ok(Some(json)) => json,
+        Ok(None) => return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is too old to list folders: upgrade it"))),
+        Err(e) => return Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    };
+    let listing: crate::dirs::Listing =
+        serde_json::from_str(&json).map_err(|e| err(StatusCode::BAD_GATEWAY, format!("{machine} sent an unreadable folder list: {e}")))?;
+    Ok(srv::json(StatusCode::OK, &listing))
 }
 
 // ------------------------------------------------------------------ misc

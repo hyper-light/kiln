@@ -181,6 +181,13 @@ impl Instances {
         self.newest_of(name)
     }
 
+    /// The machine's newest instance if it announced every capability in `caps`
+    /// ([`crate::proto::CAP_DIRS`] ...), so it is never sent a message it can't read. An older
+    /// instance that could is not asked instead: new work goes to the newest.
+    pub fn newest_with(&self, name: &str, caps: u32) -> Option<PeerId> {
+        self.newest_of(name).filter(|p| self.by_peer.get(p).is_some_and(|i| i.caps & caps == caps))
+    }
+
     /// [`crate::proto::AgentMsg::Build`]: which build an instance runs and what it can do.
     pub fn set_build(&mut self, peer: PeerId, build: String, caps: u32) {
         if let Some(i) = self.by_peer.get_mut(&peer) {
@@ -370,5 +377,34 @@ mod tests {
         m.own(Owned::Terminal("t".into()), 99);
         assert_eq!(m.route("box", &ServerMsg::TermInput { session: "t".into(), data: vec![] }), Some(1));
         assert_eq!(m.route("other", &ServerMsg::TermInput { session: "t".into(), data: vec![] }), None);
+    }
+
+    #[test]
+    fn folder_listings_only_go_to_a_newest_runner_that_announced_them() {
+        use crate::proto::{CAP_DIRS, CAP_TAKEOVER, CAP_UPGRADE};
+        let mut m = Instances::default();
+        assert_eq!(m.newest_with("box", CAP_DIRS), None);
+        // A legacy runner announces nothing; one from before CAP_DIRS announces the rest.
+        m.join(1, "box", hello("legacy"), 1);
+        assert_eq!(m.newest_with("box", CAP_DIRS), None);
+        m.set_build(1, "b1".into(), CAP_UPGRADE | CAP_TAKEOVER);
+        assert_eq!(m.newest_with("box", CAP_DIRS), None);
+        assert_eq!(m.newest_with("box", CAP_TAKEOVER), Some(1));
+
+        // A current runner joins beside it: nothing until its Build says CAP_DIRS.
+        m.announce(2, ih("new", 100));
+        m.join(2, "box", hello("new"), 2);
+        assert_eq!(m.newest_with("box", CAP_DIRS), None);
+        m.set_build(2, "b2".into(), CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS);
+        assert_eq!(m.newest_with("box", CAP_DIRS), Some(2));
+
+        // A newer runner without it (a downgrade): the older one that could is not asked instead.
+        m.announce(3, ih("newer", 200));
+        m.join(3, "box", hello("newer"), 3);
+        m.set_build(3, "b3".into(), CAP_UPGRADE);
+        assert_eq!(m.newest_with("box", CAP_DIRS), None);
+        m.lost(3);
+        assert_eq!(m.newest_with("box", CAP_DIRS), Some(2));
+        assert_eq!(m.newest_with("other", CAP_DIRS), None);
     }
 }

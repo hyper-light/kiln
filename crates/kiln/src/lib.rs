@@ -8,6 +8,7 @@ pub mod autodetect;
 pub mod http;
 pub mod kubeapi;
 pub mod config;
+pub mod dirs;
 pub mod discovery;
 pub mod dns;
 pub mod exec;
