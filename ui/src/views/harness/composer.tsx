@@ -163,6 +163,45 @@ function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text:
   );
 }
 
+/** How a message goes while it works: kept until changed (the composer's typing doesn't render it). */
+const SendModes = React.memo(function SendModes({ modes, mode, onMode }: { modes: typeof MODES; mode: SendMode; onMode: (m: SendMode) => void }) {
+  return (
+    <>
+      <div className="cp-modes" role="radiogroup" aria-label="How to send while it works">
+        {modes.map((m) => (
+          <Tip key={m.id} content={m.hint}>
+            <button type="button" role="radio" aria-checked={mode === m.id} data-mode={m.id} onClick={() => onMode(m.id)}>
+              {m.label}
+            </button>
+          </Tip>
+        ))}
+      </div>
+      <label className="cp-mode-pick" data-mode={mode}>
+        <span className="cp-mode-value">{modes.find((m) => m.id === mode)?.label ?? "Queue"}</span>
+        <ChevronDown size={11} aria-hidden="true" />
+        <select aria-label="How to send while it works" value={mode} onChange={(e) => onMode(e.target.value as SendMode)}>
+          {modes.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+      </label>
+    </>
+  );
+});
+
+const StopTurn = React.memo(function StopTurn({ store }: { store: SessionStore }) {
+  return (
+    <Tip content="Stop the current turn (Esc)">
+      <button type="button" className="cp-stop" onClick={() => store.send({ type: "interrupt" })} aria-label="Stop the current turn">
+        <Square size={10} fill="currentColor" />
+        <span className="cp-label">Stop</span>
+      </button>
+    </Tip>
+  );
+});
+
 const NO_QUEUE: QueueItem[] = [];
 const NO_FEATURES: string[] = [];
 const NO_COMMANDS: SlashCommand[] = [];
@@ -202,7 +241,7 @@ export function Composer({
   const ta = React.useRef<HTMLTextAreaElement | null>(null);
   const features = meta?.features ?? NO_FEATURES;
   const running = status === "running" || status === "waiting";
-  const modes = MODES.filter((m) => !m.feature || features.includes(m.feature));
+  const modes = React.useMemo(() => MODES.filter((m) => !m.feature || features.includes(m.feature)), [features]);
   // How you chose to send stays chosen; an agent that can't send that way queues.
   const mode: SendMode = modes.some((m) => m.id === chosen) ? chosen : "queue";
   const canAttach = attachments.enabled;
@@ -535,39 +574,9 @@ export function Composer({
             </>
           )}
           <MicButton field={ta} setText={write} onNote={setNote} disabled={disabled} />
-          {running && modes.length > 1 && (
-            <>
-              <div className="cp-modes" role="radiogroup" aria-label="How to send while it works">
-                {modes.map((m) => (
-                  <Tip key={m.id} content={m.hint}>
-                    <button type="button" role="radio" aria-checked={mode === m.id} data-mode={m.id} onClick={() => setMode(m.id)}>
-                      {m.label}
-                    </button>
-                  </Tip>
-                ))}
-              </div>
-              <label className="cp-mode-pick" data-mode={mode}>
-                <span className="cp-mode-value">{modes.find((m) => m.id === mode)?.label ?? "Queue"}</span>
-                <ChevronDown size={11} aria-hidden="true" />
-                <select aria-label="How to send while it works" value={mode} onChange={(e) => setMode(e.target.value as SendMode)}>
-                  {modes.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </>
-          )}
+          {running && modes.length > 1 && <SendModes modes={modes} mode={mode} onMode={setMode} />}
           <span className="cp-gap" />
-          {running && features.includes("interrupt") && (
-            <Tip content="Stop the current turn (Esc)">
-              <button type="button" className="cp-stop" onClick={() => store.send({ type: "interrupt" })} aria-label="Stop the current turn">
-                <Square size={10} fill="currentColor" />
-                <span className="cp-label">Stop</span>
-              </button>
-            </Tip>
-          )}
+          {running && features.includes("interrupt") && <StopTurn store={store} />}
           <button
             type="button"
             className="cp-send"

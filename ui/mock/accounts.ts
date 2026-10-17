@@ -17,6 +17,7 @@ import type http from "node:http";
 import { randomBytes } from "node:crypto";
 import type { WebSocket } from "ws";
 import type { Account, AccountFlow, AccountMethod, AgentInfo, HEvent, Meta, SlashCommand, State } from "../src/api/harness.ts";
+import { longInfo } from "./conversation.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -302,6 +303,8 @@ export function handleDemoSession(ws: WebSocket, id: string): boolean {
   send({ t: "meta", meta: d.meta });
   send({ t: "state", state: stateOf(d) });
   send({ t: "events", events: d.events });
+  // As the server's socket does: the snapshot is complete.
+  if (process.env.MOCK_NO_SYNCED !== "1") send({ t: "synced" });
   ws.on("message", (raw) => {
     let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string };
     try {
@@ -348,7 +351,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     json(
       res,
       200,
-      [...demos.values()].map((d) => d.info),
+      [...[...demos.values()].map((d) => d.info), longInfo()],
     );
     return true;
   }

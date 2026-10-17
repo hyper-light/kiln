@@ -2,6 +2,7 @@
  * Views over an agent's timeline: turns made of steps (not one row per tool call), the cumulative
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
+import { useState } from "react";
 import type { FileDiff, HEvent, ToolCall, ToolKind } from "@/api/harness";
 
 export type ToolEvent = Extract<HEvent, { kind: "tool" }>;
@@ -182,6 +183,21 @@ export function changesetOf(events: HEvent[]): FileChange[] {
 
 export function runsOf(events: HEvent[]): ToolEvent[] {
   return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "shell");
+}
+
+/** The edits it made (or proposed). */
+export function editsOf(events: HEvent[]): ToolEvent[] {
+  return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "edit");
+}
+
+/**
+ * `list`, or the list last returned here while it holds the same items: what's worked out from it
+ * (and what shows it) stays as it was while the rest of the conversation streams.
+ */
+export function useSameList<T>(list: T[]): T[] {
+  const [kept] = useState(() => ({ list }));
+  if (kept.list !== list && (kept.list.length !== list.length || kept.list.some((x, i) => x !== list[i]))) kept.list = list;
+  return kept.list;
 }
 
 /** What a group of calls did, in a few words. */

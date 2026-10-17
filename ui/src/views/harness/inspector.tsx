@@ -6,7 +6,7 @@ import * as React from "react";
 import { Bot, Square } from "lucide-react";
 import { useSession, type Command, type FileChange as ServerChange, type HEvent, type Meta, type SessionStore, type State, type Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
-import { changesetOf, duration, money, relPath, runsOf, tokens, type FileChange, type ToolEvent } from "./derive";
+import { changesetOf, duration, editsOf, money, relPath, runsOf, tokens, useSameList, type FileChange, type ToolEvent } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
 import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
@@ -16,6 +16,8 @@ import { Background, isBackground } from "./background";
 import { PlansHere } from "@/views/plans/here";
 import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
 import { Goals } from "./goals";
+
+const NO_EVENTS: HEvent[] = [];
 
 /** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
@@ -33,7 +35,8 @@ function fromServer(files: ServerChange[]): FileChange[] {
   }));
 }
 
-export function Changes({ events, changes, cwd }: { events: HEvent[]; changes: ServerChange[] | null; cwd: string }) {
+/** `events`: only its edits matter (the changeset is worked out from them when the server sends none). */
+export const Changes = React.memo(function Changes({ events, changes, cwd }: { events: HEvent[]; changes: ServerChange[] | null; cwd: string }) {
   const local = React.useMemo(() => (changes ? null : changesetOf(events)), [events, changes]);
   const files = React.useMemo(() => (changes ? fromServer(changes) : (local ?? [])), [changes, local]);
   const [sel, setSel] = React.useState<string | null>(null);
@@ -83,10 +86,11 @@ export function Changes({ events, changes, cwd }: { events: HEvent[]; changes: S
       </div>
     </div>
   );
-}
+});
 
-function Runs({ events }: { events: HEvent[] }) {
-  const runs = React.useMemo(() => runsOf(events).slice().reverse(), [events]);
+/** `runs`: the commands it ran, in order. */
+const Runs = React.memo(function Runs({ runs: ran }: { runs: ToolEvent[] }) {
+  const runs = React.useMemo(() => ran.slice().reverse(), [ran]);
   const [open, setOpen] = React.useState<string | null>(null);
   if (runs.length === 0) return <div className="hx-empty">No commands yet.</div>;
   return (
@@ -110,7 +114,7 @@ function Runs({ events }: { events: HEvent[] }) {
       })}
     </ul>
   );
-}
+});
 
 function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void }) {
   const running = t.status === "running" || t.status === "pending";
@@ -265,8 +269,10 @@ export function Inspector({
   const changes = useSession(store, (s) => s.changes);
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
-  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(events).length), [changes, events]);
-  const runs = React.useMemo(() => runsOf(events), [events]);
+  // What's worked out from the conversation stays as it was while it streams, unless it's what changed.
+  const edits = useSameList(React.useMemo(() => (changes ? NO_EVENTS : editsOf(events)), [changes, events]));
+  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
+  const runs = useSameList(React.useMemo(() => runsOf(events), [events]));
   const todos = state?.todos ?? [];
   const done = todos.filter((t) => t.status === "completed").length;
   // The plan it last proposed (plan mode), to read and keep.
@@ -292,7 +298,7 @@ export function Inspector({
         ))}
       </div>
       <div className="hx-inspector-body">
-        {tab === "changes" && <Changes events={events} changes={changes} cwd={cwd} />}
+        {tab === "changes" && <Changes events={edits} changes={changes} cwd={cwd} />}
         {tab === "plan" && (
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
@@ -345,7 +351,7 @@ export function Inspector({
             {runs.length > 0 && (
               <section>
                 <h3 className="in-sec-head">Commands it ran<span>{runs.length}</span></h3>
-                <Runs events={events} />
+                <Runs runs={runs} />
               </section>
             )}
             <section>

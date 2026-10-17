@@ -22,7 +22,7 @@ import { AccountCard } from "./account-card";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
-import { changesetOf } from "./derive";
+import { changesetOf, editsOf, useSameList } from "./derive";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
 import { AgentHeader } from "./head";
@@ -454,9 +454,10 @@ function Dock({
 function PhoneTabs({ store, tab, onTab }: { store: SessionStore; tab: PhoneTab; onTab: (t: PhoneTab) => void }) {
   const approvals = useSession(store, (s) => s.state?.approvals.length ?? 0);
   const changes = useSession(store, (s): FileChange[] | null => s.changes);
-  // Counted from the conversation only when the server sends no changeset.
+  // Counted from the conversation's edits only when the server sends no changeset.
   const events = useSession(store, (s) => (s.changes ? NO_EVENTS : s.events));
-  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(events).length), [changes, events]);
+  const edits = useSameList(React.useMemo(() => editsOf(events), [events]));
+  const fileCount = React.useMemo(() => (changes ? changes.length : changesetOf(edits).length), [changes, edits]);
   const todos = useSession(store, (s) => s.state?.todos ?? NO_TODOS);
   const todosDone = todos.filter((t) => t.status === "completed").length;
   const tabs: { id: PhoneTab; label: string; n?: string; warn?: boolean }[] = [
