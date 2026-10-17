@@ -376,6 +376,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "sessions", id, "terminals"]) => Ok(srv::json(StatusCode::OK, &crate::harness::screen::list(&hub, id))),
+        (&Method::POST, ["api", "harness", "sessions", id, "terminals"]) => {
+            let id = (*id).to_owned();
+            harness_terminal(&hub, &id, req).await
+        }
         (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
@@ -2217,6 +2222,20 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
+}
+
+/// A terminal beside an agent: a shell in its folder, or its harness's own screen
+/// (`crate::harness::screen`).
+async fn harness_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
+    if !hub.cfg.terminal.enabled {
+        return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
+    }
+    let o: crate::harness::screen::Open = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if hub.harness.list().iter().all(|i| i.id != id) {
+        return Err(err(StatusCode::NOT_FOUND, "no such agent"));
+    }
+    let b = crate::harness::screen::open(hub, id, o).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::CREATED, &b))
 }
 
 #[derive(Deserialize)]

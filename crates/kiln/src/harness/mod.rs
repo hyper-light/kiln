@@ -25,6 +25,7 @@ pub mod host;
 pub mod kinds;
 pub mod model;
 pub mod registry;
+pub mod screen;
 pub mod session;
 pub mod socket;
 pub mod transcript;

@@ -5,6 +5,7 @@
  */
 import * as React from "react";
 import { wsUrl } from "@/api/client";
+import type { TerminalSessionInfo } from "./types";
 
 /* ------------------------------------------------------------------ model */
 
@@ -321,7 +322,19 @@ export interface SlashCommand {
     | { kind: "prompt"; text?: string; skill?: boolean }
     | { kind: "control"; command: Record<string, unknown> }
     | { kind: "view"; view: string }
-    | { kind: "unsupported"; reason: string };
+    | { kind: "unsupported"; reason: string }
+    /** Done in the harness's own screen, opened beside the agent on `command`. */
+    | { kind: "terminal"; command: string };
+}
+
+/** A terminal beside an agent, in its folder on its machine: its shell, or its harness's own screen. */
+export interface BesideTerminal {
+  terminal: TerminalSessionInfo;
+  what: "shell" | "screen";
+  /** The screen's slash command, when it was opened on one. */
+  command?: string;
+  /** That command is for you to type there (the harness can't start on one). */
+  to_type?: boolean;
 }
 
 /** Which agents a broadcast picks: `ids` exactly; else `all`, or filters that must all match (none: nothing). */
@@ -587,6 +600,11 @@ export const harnessApi = {
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  /** The terminals beside an agent (its shell, its harness's own screen), live ones first. */
+  terminals: (id: string) => call<BesideTerminal[]>("GET", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`),
+  /** Open one beside it: its shell (the one already open, with `command` run in it), or its harness's own screen on `command`. */
+  openTerminal: (id: string, body: { what: "shell" | "screen"; command?: string; cols?: number; rows?: number }) =>
+    call<BesideTerminal>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/terminals`, body),
   /** A machine's recent ended conversations (newest first), for one harness or all. */
   history: (target: string, kind?: string, limit = 40) =>
     call<PastSession[]>("GET", `/api/harness/history?target=${encodeURIComponent(target)}${kind ? `&kind=${encodeURIComponent(kind)}` : ""}&limit=${limit}`),

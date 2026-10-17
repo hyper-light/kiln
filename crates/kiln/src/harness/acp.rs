@@ -29,6 +29,8 @@ fn acp_extras() -> Vec<SlashCommand> {
         SlashCommand::view("diff", "What this agent changed", "Context", "changes"),
         SlashCommand::control("restart", "Start the agent again", "", "Kiln", json!({"type": "restart"})),
         SlashCommand::view("new", "Start another agent", "Kiln", "new_agent"),
+        SlashCommand::view("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
+        SlashCommand::view("screen", "The agent's own terminal interface, in its folder", "Kiln", "screen"),
     ]
 }
 

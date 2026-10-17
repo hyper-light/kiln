@@ -20,6 +20,10 @@ pub struct Kind {
     pub verified: bool,
     /// How kiln talks to it.
     pub protocol: Protocol,
+    /// Its own terminal interface: the program and arguments that open it.
+    pub screen: &'static [&'static str],
+    /// That interface starts on a slash command given as its first argument (`claude /doctor`).
+    pub screen_takes_command: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,15 +39,15 @@ pub enum Protocol {
 }
 
 const KINDS: &[Kind] = &[
-    Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson },
-    Kind { id: "codex", name: "Codex", program: "codex", verified: true, protocol: Protocol::CodexAppServer },
-    Kind { id: "gemini", name: "Gemini CLI", program: "gemini", verified: false, protocol: Protocol::Acp(&["--acp"]) },
-    Kind { id: "opencode", name: "opencode", program: "opencode", verified: false, protocol: Protocol::Acp(&["acp"]) },
-    Kind { id: "goose", name: "Goose", program: "goose", verified: false, protocol: Protocol::Acp(&["acp"]) },
+    Kind { id: "claude", name: "Claude Code", program: "claude", verified: true, protocol: Protocol::ClaudeStreamJson, screen: &["claude"], screen_takes_command: true },
+    Kind { id: "codex", name: "Codex", program: "codex", verified: true, protocol: Protocol::CodexAppServer, screen: &["codex"], screen_takes_command: false },
+    Kind { id: "gemini", name: "Gemini CLI", program: "gemini", verified: false, protocol: Protocol::Acp(&["--acp"]), screen: &["gemini"], screen_takes_command: false },
+    Kind { id: "opencode", name: "opencode", program: "opencode", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["opencode"], screen_takes_command: false },
+    Kind { id: "goose", name: "Goose", program: "goose", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["goose", "session"], screen_takes_command: false },
     // Amp has no ACP mode of its own; its ACP adapter (amp-acp) wraps the signed-in Amp CLI.
-    Kind { id: "amp", name: "Amp", program: "amp-acp", verified: false, protocol: Protocol::Acp(&[]) },
+    Kind { id: "amp", name: "Amp", program: "amp-acp", verified: false, protocol: Protocol::Acp(&[]), screen: &["amp"], screen_takes_command: false },
     // Antigravity's CLI has no documented structured mode: it runs in a terminal.
-    Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: false, protocol: Protocol::Terminal },
+    Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: false, protocol: Protocol::Terminal, screen: &["agy"], screen_takes_command: false },
 ];
 
 impl Kind {

@@ -215,6 +215,8 @@ pub struct Codex {
     opening: Option<(&'static str, Value)>,
     open_tries: u32,
     reopen: bool,
+    /// Settings changed outside it (its own screen): it starts again to load them once idle.
+    reload: Option<String>,
 }
 
 impl Codex {
@@ -271,6 +273,7 @@ impl Codex {
             opening: None,
             open_tries: 0,
             reopen: false,
+            reload: None,
         }
     }
 
@@ -442,6 +445,11 @@ impl Codex {
             // Older consoles' MCP controls (now commands of their own).
             "mcp_refresh" => self.command(core, Command::McpRefresh),
             "mcp_reload" => self.mcp_reload(core),
+            // Settings changed outside it (its own screen, beside it): start again to load them.
+            "reload_config" => {
+                self.reload = Some(value.as_ref().and_then(|v| v.get("what")).and_then(Value::as_str).unwrap_or("Changed settings").to_owned());
+                self.reload_when_idle(core);
+            }
             _ => {}
         }
         self.compose_status(core);
@@ -460,6 +468,21 @@ impl Codex {
 
     fn busy(&self, core: &Core) -> bool {
         self.turn.is_some() || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
+    }
+
+    /// Start again with the changed settings (resuming the thread), unless a turn is under way or
+    /// it left background terminals running: then once it's idle and they've ended.
+    fn reload_when_idle(&mut self, core: &mut Core) {
+        if self.reload.is_none() || self.busy(core) || core.state.status == Status::Starting || core.state.tasks.iter().any(|t| t.left_running()) {
+            return;
+        }
+        let Some(what) = self.reload.take() else { return };
+        // Not running, or nothing to resume: its next start reads the settings anyway.
+        if core.state.status == Status::Exited || core.state.harness_session.is_none() {
+            return;
+        }
+        self.notice(core, Level::Info, format!("{what}: Codex starts again to load it (the conversation continues)"));
+        core.effects.push(Effect::Restart { resume_at: None });
     }
 
     fn settle(&self, core: &mut Core) {
@@ -767,6 +790,7 @@ impl Codex {
     /// Every few seconds: a thread open to send again; servers still starting; the plan's rate
     /// limits now and then.
     pub fn tick(&mut self, core: &mut Core) {
+        self.reload_when_idle(core);
         if std::mem::take(&mut self.reopen)
             && let Some((method, params)) = self.opening.clone()
         {
@@ -2352,7 +2376,8 @@ fn codex_catalog() -> Vec<SlashCommand> {
     let c = |name: &str, desc: &str, hint: &str, group: &str, command: Value| SlashCommand::control(name, desc, hint, group, command);
     let v = SlashCommand::view;
     let no = SlashCommand::unsupported;
-    let terminal = "a setting of Codex's terminal interface";
+    // Done in Codex's own screen, opened beside the agent in its folder.
+    let t = SlashCommand::terminal;
     vec![
         v("model", "Choose the model and reasoning effort", "Model & mode", "model"),
         v("approvals", "Choose what Codex is allowed to do", "Model & mode", "permissions"),
@@ -2380,6 +2405,8 @@ fn codex_catalog() -> Vec<SlashCommand> {
         c("stop-tasks", "Stop every background terminal and task", "", "Kiln", json!({"type": "stop_tasks"})),
         c("restart", "Start Codex again, continuing the conversation", "", "Kiln", json!({"type": "restart"})),
         v("new", "Start a new conversation (another agent)", "Kiln", "new_agent"),
+        v("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
+        v("screen", "Codex's own screen, in this agent's folder", "Kiln", "screen"),
         v("clear", "Start a new conversation (another agent)", "Kiln", "new_agent"),
         no("resume", "Resume a saved chat", "Session", "continue another conversation from kiln's agents list"),
         no("plan", "Switch to Plan mode", "Model & mode", "Codex's Plan mode is not offered through its app-server"),
@@ -2394,16 +2421,16 @@ fn codex_catalog() -> Vec<SlashCommand> {
         no("feedback", "Send logs to the maintainers", "Session", "it sends logs to OpenAI: use the Codex CLI"),
         no("quit", "Exit Codex", "Session", "close the agent in kiln"),
         no("exit", "Exit Codex", "Session", "close the agent in kiln"),
-        no("memory", "Configure memory", "Context", "configure Codex's memory with the Codex CLI"),
-        no("apps", "Manage apps", "Tools & MCP", "manage apps with the Codex CLI"),
-        no("experimental", "Toggle experimental features", "Session", "change Codex's features with the Codex CLI"),
-        no("debug-config", "Config layers and requirement sources", "Session", "run it in the Codex CLI"),
-        no("theme", "Syntax highlighting theme", "Session", terminal),
-        no("statusline", "Status line items", "Session", terminal),
-        no("title", "Terminal title items", "Session", terminal),
-        no("raw", "Raw scrollback mode", "Session", terminal),
-        no("vim", "Vim keys in the composer", "Session", terminal),
-        no("voice", "Voice input", "Session", terminal),
+        t("memory", "Configure memory", "Context"),
+        t("apps", "Manage apps", "Tools & MCP"),
+        t("experimental", "Toggle experimental features", "Session"),
+        t("debug-config", "Config layers and requirement sources", "Session"),
+        t("theme", "Syntax highlighting theme", "Session"),
+        t("statusline", "Status line items", "Session"),
+        t("title", "Terminal title items", "Session"),
+        t("raw", "Raw scrollback mode", "Session"),
+        t("vim", "Vim keys in the composer", "Session"),
+        no("voice", "Voice input", "Session", "it listens to the microphone of the machine Codex runs on: use the console's microphone"),
         no("ide", "Context from your IDE", "Context", "Codex's IDE integration is not offered through its app-server"),
     ]
 }

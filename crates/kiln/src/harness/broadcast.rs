@@ -122,6 +122,7 @@ fn plan(b: &Broadcast, info: &Info, meta: Option<&Value>, approvals: &[(String, 
             }
             Some("view") => Err(format!("/{name} opens {} in its console: nothing to send", route.get("view").and_then(Value::as_str).unwrap_or("a panel"))),
             Some("unsupported") => Err(route.get("reason").and_then(Value::as_str).map_or_else(|| format!("{} can't do /{name} from kiln", info.kind_name), |r| format!("/{name}: {r}"))),
+            Some("terminal") => Err(format!("/{name} is done in {}'s own screen: open it from that agent", info.kind_name)),
             _ => {
                 let words = route.get("text").and_then(Value::as_str).map_or_else(|| text.to_owned(), |t| t.replace("{args}", args));
                 Ok(vec![send(words)])

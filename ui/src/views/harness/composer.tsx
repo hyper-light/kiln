@@ -155,6 +155,8 @@ export function Composer({
   attachments,
   toMain,
   onView,
+  onTerminal,
+  insert,
 }: {
   store: SessionStore;
   state: State | null;
@@ -165,6 +167,10 @@ export function Composer({
   toMain?: boolean;
   /** A command that opens a kiln panel (model, mcp, changes, tasks…). */
   onView?: (view: string) => void;
+  /** Open a terminal beside the agent: its shell (`!command`), or its harness's own screen (a command only that screen does). */
+  onTerminal?: (open: { what: "shell" | "screen"; command?: string }) => void;
+  /** Words to add to what's being written (from the terminal beside it), once per `seq`. */
+  insert?: { text: string; seq: number } | null;
 }) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
@@ -184,7 +190,8 @@ export function Composer({
   const pressTimer = React.useRef(0);
   const longPressed = React.useRef(false);
   const approvals = state?.approvals.length ?? 0;
-  const sendLabel = running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
+  const shellLine = Boolean(onTerminal) && text.trimStart().startsWith("!");
+  const sendLabel = shellLine ? "Run" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
 
   // Grow with the text, up to a third of the screen.
   React.useLayoutEffect(() => {
@@ -202,6 +209,14 @@ export function Composer({
   const [palClosed, setPalClosed] = React.useState(false);
   const [reply, setReply] = React.useState<Reply | "loading" | null>(null);
   const [note, setNote] = React.useState<string | null>(null);
+  // What the terminal beside it hands over goes after what's written.
+  const insertSeq = insert?.seq;
+  React.useEffect(() => {
+    if (!insert) return;
+    setText((t) => (t.trim() ? `${t.replace(/\s+$/, "")}\n\n${insert.text}` : insert.text));
+    ta.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per insert
+  }, [insertSeq]);
   const palItems = React.useMemo(() => (slash?.typingName && !palClosed ? matchCommands(commands, slash.name) : []), [slash?.typingName, slash?.name, palClosed, commands]);
   React.useEffect(() => {
     setPalIndex(0);
@@ -250,6 +265,10 @@ export function Composer({
         ta.current?.focus();
       } else onView?.(out.view);
     } else if (out.kind === "unsupported") setNote(`/${entry.name}: ${out.reason}`);
+    else if (out.kind === "terminal") {
+      if (onTerminal) onTerminal({ what: "screen", command: out.command });
+      else setNote(`/${entry.name} is done in the harness's own screen, in a terminal`);
+    }
     else if (out.kind === "reply") {
       setReply("loading");
       out.promise.then(setReply, (e: unknown) => setReply({ title: `/${entry.name}`, text: "", error: e instanceof Error ? e.message : String(e) }));
@@ -275,6 +294,12 @@ export function Composer({
 
   const submit = () => {
     const raw = text.trim();
+    // `!command` runs in the shell beside the agent, in its folder (not sent to it).
+    if (raw.startsWith("!") && onTerminal) {
+      onTerminal({ what: "shell", command: raw.slice(1).trim() || undefined });
+      setText("");
+      return;
+    }
     const s = parseSlash(raw);
     const entry = s ? findCommand(commands, s.name) : undefined;
     if (entry && s) {
