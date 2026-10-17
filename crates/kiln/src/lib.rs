@@ -36,6 +36,7 @@ pub mod server;
 pub mod store;
 pub mod sup;
 pub mod supervise;
+pub mod tailscale;
 pub mod terminal;
 pub mod termsess;
 pub mod tunnel;
