@@ -5,10 +5,11 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
+import { ArrowDown, ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
 import type { Command, Delivery, HEvent, Meta, State, Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, diffStats, duration, relPath, stepStatus, stepSummary, turnsOf, type Item, type Step, type ToolEvent, type Turn } from "./derive";
+import { ApprovalCard, type Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
 import { Output, Prose, ToolIcon } from "./parts";
@@ -427,8 +428,14 @@ export function Timeline({
   onCommand,
   footer,
   agentLabel,
+  agentName,
+  onDecide,
 }: {
   agentLabel?: string;
+  /** The agent's own name, for what it asks. */
+  agentName?: string;
+  /** Answers what waits on you (shown at the end of the conversation, where it was asked). */
+  onDecide?: Decide;
   events: HEvent[];
   state: State | null;
   meta?: Meta | null;
@@ -456,6 +463,20 @@ export function Timeline({
   const tasks = state?.tasks ?? [];
   const approvals = state?.approvals;
   const asking = React.useMemo(() => new Set((approvals ?? []).map((a) => a.tool_id).filter((t): t is string => Boolean(t))), [approvals]);
+  // What waits on you sits where it was asked: the latest thing the agent did, the conversation's
+  // end. Scrolled away from it, a pill floating over the bottom edge says so (nothing moves).
+  const pending = onDecide ? (approvals ?? []) : [];
+  const hasAsks = pending.length > 0;
+  const asksRef = React.useRef<HTMLDivElement>(null);
+  const [asksSeen, setAsksSeen] = React.useState(true);
+  React.useEffect(() => {
+    const el = asksRef.current;
+    const root = ref.current;
+    if (!hasAsks || !el || !root) return;
+    const io = new IntersectionObserver(([e]) => setAsksSeen(Boolean(e?.isIntersecting)), { root, threshold: 0.05 });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [hasAsks]);
   return (
     <Asking.Provider value={asking}>
       <div ref={ref} className="hx-timeline" onScroll={onScroll}>
@@ -484,7 +505,23 @@ export function Timeline({
             agentLabel={agentLabel}
           />
         ))}
+        {hasAsks && onDecide && (
+          <div ref={asksRef} className="hx-asks">
+            {pending.map((a) => (
+              <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} />
+            ))}
+          </div>
+        )}
         {footer}
+        <div className="hx-waiting-anchor">
+          {hasAsks && !asksSeen && (
+            <button type="button" className="hx-waiting" onClick={() => asksRef.current?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+              <i aria-hidden="true" />
+              {pending.length === 1 ? "Waiting on you" : `${pending.length} waiting on you`}
+              <ArrowDown size={12} aria-hidden="true" />
+            </button>
+          )}
+        </div>
       </div>
     </Asking.Provider>
   );

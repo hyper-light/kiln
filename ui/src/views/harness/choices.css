@@ -55,6 +55,24 @@
   pointer-events: none;
 }
 
+/* ------------------------------------------------------------ in the conversation (flow)
+   Answered where it was asked, drawn like the agent's own words: one eyebrow line, the question at
+   prose size, its options as plain rows. No card and no nested boxes; a quiet spectral rule at its
+   left says it waits on you. */
+.ch[data-layout="flow"] {
+  --ch-pad: 0px;
+  --ch-row: 0px;
+  --ch-ctl: 28px;
+  padding: 1px 0 2px 14px;
+  border: 0;
+  border-left: 2px solid #8f87b3;
+  border-radius: 0;
+  background: none;
+}
+.ch[data-layout="flow"]::before {
+  display: none;
+}
+
 /* ------------------------------------------------------------ frames */
 
 .ch-overlay {
@@ -1458,4 +1476,137 @@ textarea.ch-free {
   .ch-switch[aria-checked="true"] .ch-switch-track::after {
     background: Highlight;
   }
+}
+
+/* ------------------------------------------------------------ flow: the details */
+.ch[data-layout="flow"] .ch-head {
+  min-height: 0;
+  padding: 0;
+}
+.ch[data-layout="flow"] .ch-title {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+  text-transform: uppercase;
+  color: #8f929b;
+}
+.ch[data-layout="flow"] .ch-agent {
+  color: #cdc6ea;
+}
+.ch[data-layout="flow"] .ch-who > svg {
+  width: 13px;
+  height: 13px;
+}
+.ch[data-layout="flow"] .ch-kind {
+  display: none;
+}
+.ch[data-layout="flow"] .ch-decline {
+  height: auto;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  font-size: 12px;
+  color: var(--color-secondary);
+}
+.ch[data-layout="flow"] .ch-decline:hover:not(:disabled) {
+  background: none;
+  color: var(--color-bright);
+}
+.ch[data-layout="flow"] .ch-steps {
+  padding: 2px 0 0;
+}
+.ch[data-layout="flow"] .ch-body {
+  max-height: none;
+  padding: 0;
+  overflow: visible;
+}
+.ch[data-layout="flow"] .ch-q-head {
+  margin: 4px 0 6px;
+}
+.ch[data-layout="flow"] .ch-q-kind {
+  font-size: 10px;
+  color: #8f929b;
+}
+.ch[data-layout="flow"] .ch-q-text {
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.6;
+  color: var(--color-bright);
+}
+.ch[data-layout="flow"] .ch-opts {
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+.ch[data-layout="flow"] .ch-opt + .ch-opt {
+  border-top: 0;
+}
+.ch[data-layout="flow"] .ch-opt[data-checked] {
+  background: none;
+}
+.ch[data-layout="flow"] .ch-opt[data-checked]::after {
+  display: none;
+}
+.ch[data-layout="flow"] .ch-row {
+  min-height: 0;
+  margin: 0 -8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.ch[data-layout="flow"] .ch-row:hover,
+.ch[data-layout="flow"] .ch-opt[data-checked] > .ch-row:hover {
+  background: #111217;
+}
+.ch[data-layout="flow"] .ch-mark {
+  width: 14px;
+  height: 14px;
+}
+.ch[data-layout="flow"] .ch-label {
+  font-size: 14px;
+}
+.ch[data-layout="flow"] .ch-opt[data-checked] .ch-label {
+  color: var(--color-bright);
+}
+.ch[data-layout="flow"] .ch-desc {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #8f929b;
+}
+.ch[data-layout="flow"] .ch-key {
+  display: none;
+}
+.ch[data-layout="flow"] .ch-input {
+  padding: 4px 0;
+  border: 0;
+  border-bottom: 1px solid #2c2f36;
+  border-radius: 0;
+  background: none;
+  font-size: 14px;
+  box-shadow: none;
+}
+.ch[data-layout="flow"] .ch-input:focus,
+.ch[data-layout="flow"] .ch-input:focus-visible {
+  border-bottom-color: #8f87b3;
+  outline: none;
+  box-shadow: none;
+}
+.ch[data-layout="flow"] .ch-foot {
+  min-height: 0;
+  padding: 8px 0 0;
+  border: 0;
+  background: none;
+}
+/* Buttons the size of the words around them (the app's touch-sized ones stay elsewhere). */
+.ch[data-layout="flow"] .ch-foot button {
+  min-height: 30px;
+  height: 30px;
+  padding: 0 14px;
+  gap: 6px;
+  font-size: 12.5px;
+}
+.ch[data-layout="flow"] .ch-foot button svg {
+  width: 14px;
+  height: 14px;
 }
