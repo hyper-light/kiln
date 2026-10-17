@@ -61,7 +61,7 @@ pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String
     if let Some(m) = mode.filter(|m| !m.is_empty()) {
         a.extend(["--permission-mode".to_owned(), m.to_owned()]);
     }
-    if allow_bypass {
+    if allow_bypass && bypass_possible() {
         a.push("--allow-dangerously-skip-permissions".to_owned());
     }
     if let Some(e) = spec.effort.as_deref().filter(|e| !e.is_empty()) {
@@ -168,6 +168,8 @@ pub struct Claude {
     denied: BTreeSet<String>,
     notice_seq: u64,
     allow_bypass: bool,
+    /// Bypass was chosen, which it was not started able to use: it starts again able to.
+    bypass_next: bool,
     /// Every conversation entry, in order: its uuid, and the prompt's event id when it is one
     /// (rewinds and branches name an entry).
     entries: Vec<(String, Option<String>)>,
@@ -229,6 +231,7 @@ impl Claude {
             denied: BTreeSet::new(),
             notice_seq: 0,
             allow_bypass,
+            bypass_next: false,
             entries: Vec::new(),
             efforts: HashMap::new(),
             output_styles: Vec::new(),
@@ -597,7 +600,18 @@ impl Claude {
                 }
             }
             Command::SetMode { mode } => {
-                self.request(core, Pending::SetMode(mode.clone()), json!({"subtype": "set_permission_mode", "mode": mode}));
+                if mode == "bypassPermissions" && !self.allow_bypass {
+                    // Claude Code refuses it unless started able to: it starts again, in it,
+                    // continuing the conversation (once the turn under way ends).
+                    self.bypass_next = true;
+                    self.reload = Some("Bypass".to_owned());
+                    if self.busy(core) {
+                        self.notice(core, Level::Info, "Bypass comes on when this turn ends: Claude Code starts again with every permission check off (the conversation continues)".to_owned(), None);
+                    }
+                    self.reload_when_idle(core);
+                } else {
+                    self.request(core, Pending::SetMode(mode.clone()), json!({"subtype": "set_permission_mode", "mode": mode}));
+                }
             }
             Command::SetModel { model } => {
                 self.request(core, Pending::SetModel(model.clone()), json!({"subtype": "set_model", "model": model}));
@@ -734,11 +748,19 @@ impl Claude {
         }
         self.reload_waits = false;
         let Some(what) = self.reload.take() else { return };
+        // Bypass: from the next start it may skip checks, and starts in that mode.
+        let bypass = std::mem::take(&mut self.bypass_next);
+        if bypass {
+            core.effects.push(Effect::AllowBypass);
+            core.state.mode = "bypassPermissions".to_owned();
+            core.touch_state();
+        }
         // Not running, or nothing to resume: its next start reads the configuration anyway.
-        if core.state.status == Status::Exited || core.state.harness_session.is_none() {
+        if core.state.status == Status::Exited || (core.state.harness_session.is_none() && !bypass) {
             return;
         }
-        self.notice(core, Level::Info, format!("{what}: Claude Code starts again to load it (the conversation continues)"), None);
+        let why = if bypass { "Bypass: Claude Code starts again with every permission check off (the conversation continues)".to_owned() } else { format!("{what}: Claude Code starts again to load it (the conversation continues)") };
+        self.notice(core, Level::Info, why, None);
         core.effects.push(Effect::Restart { resume_at: None });
     }
 
@@ -3041,19 +3063,26 @@ pub fn rel(path: &str, cwd: &str) -> String {
     path.to_owned()
 }
 
-/// The permission modes Claude Code offers.
+/// The permission modes Claude Code offers. Bypass is always one: a session not started able to
+/// use it starts again in it (the conversation continues).
 pub fn modes(allow_bypass: bool) -> Vec<ModeOption> {
-    let mut m = vec![
+    let bypass = if allow_bypass { "Skip every permission check" } else { "Skip every permission check (Claude Code starts again to turn it on; the conversation continues)" };
+    vec![
         ModeOption { id: "default".into(), label: "Ask".into(), description: "Ask before edits and commands".into(), dangerous: false },
         ModeOption { id: "acceptEdits".into(), label: "Accept edits".into(), description: "Edit files without asking; ask before commands".into(), dangerous: false },
         ModeOption { id: "plan".into(), label: "Plan".into(), description: "Read and plan only; change nothing".into(), dangerous: false },
         ModeOption { id: "auto".into(), label: "Auto".into(), description: "A classifier approves safe actions; risky ones still ask".into(), dangerous: false },
-        ModeOption { id: "dontAsk".into(), label: "Don't ask".into(), description: "Deny anything not already allowed".into(), dangerous: false },
-    ];
-    if allow_bypass {
-        m.push(ModeOption { id: "bypassPermissions".into(), label: "Bypass".into(), description: "Skip every permission check".into(), dangerous: true });
-    }
-    m
+        // Claude Code's dontAsk never asks and refuses whatever isn't already allowed: it is not
+        // "go ahead without asking", which is Bypass.
+        ModeOption { id: "dontAsk".into(), label: "Allowed only".into(), description: "Never asks: refuses anything not already allowed".into(), dangerous: false },
+        ModeOption { id: "bypassPermissions".into(), label: "Bypass".into(), description: bypass.into(), dangerous: true },
+    ]
+}
+
+/// Whether Claude Code would let this process skip its checks: as root it refuses to, unless
+/// told it runs in a sandbox (`IS_SANDBOX`).
+fn bypass_possible() -> bool {
+    !crate::os::is_root() || std::env::var_os("IS_SANDBOX").is_some()
 }
 
 /// Kind, one-line title and detail for a tool call.
@@ -3612,6 +3641,7 @@ mod tests {
             resume_at: Some("u9".into()),
             fork: true,
             effort: Some("high".into()),
+            allow_bypass: false,
             ..Default::default()
         };
         let a = args(&spec, None);
@@ -3619,6 +3649,10 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--resume-session-at", "u9"]) && a.iter().any(|x| x == "--fork-session"));
         assert!(a.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(!a.iter().any(|x| x == "--allow-dangerously-skip-permissions"));
+        // Every session starts able to skip checks unless it says otherwise; none starts skipping them.
+        let a = args(&super::super::session::Spec { kind: "claude".into(), ..Default::default() }, None);
+        assert_eq!(a.iter().any(|x| x == "--allow-dangerously-skip-permissions"), bypass_possible());
+        assert!(!a.iter().any(|x| x == "--dangerously-skip-permissions") && !a.iter().any(|x| x == "--permission-mode"));
     }
 
     /// The control requests kiln wrote since the last call: (request id, subtype, request).
@@ -4140,12 +4174,41 @@ mod tests {
     }
 
     #[test]
+    fn bypass_without_its_flag_starts_claude_code_again_in_it() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        assert!(core.meta.modes.iter().any(|m| m.id == "bypassPermissions" && m.dangerous));
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "initialize", json!({"commands": []}));
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s1", "model": "m", "permissionMode": "default"}).to_string());
+        c.line(&mut core, r#"{"type":"system","subtype":"session_state_changed","state":"idle","uuid":"u","session_id":"s1"}"#);
+        let _ = requests(&mut core);
+        core.effects.clear();
+        c.command(&mut core, Command::SetMode { mode: "bypassPermissions".into() });
+        // Not asked of the CLI (it would refuse): it starts again able to, continuing the conversation.
+        assert!(!requests(&mut core).iter().any(|r| r.1 == "set_permission_mode"));
+        assert_eq!(core.effects, vec![Effect::AllowBypass, Effect::Restart { resume_at: None }]);
+        assert_eq!(core.state.mode, "bypassPermissions");
+        // Started able to, it switches in place.
+        let mut c = Claude::new(true);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let _ = requests(&mut core);
+        c.command(&mut core, Command::SetMode { mode: "bypassPermissions".into() });
+        assert!(requests(&mut core).iter().any(|r| r.1 == "set_permission_mode" && r.2.get("mode") == Some(&json!("bypassPermissions"))));
+        assert!(!core.effects.contains(&Effect::AllowBypass));
+    }
+
+    #[test]
     fn a_mode_change_mid_session() {
         let mut c = Claude::new(false);
         let mut core = Core::new();
         c.start(&mut core);
         let ids: Vec<&str> = core.meta.modes.iter().map(|m| m.id.as_str()).collect();
-        assert!(ids.contains(&"default") && ids.contains(&"plan") && ids.contains(&"acceptEdits") && !ids.contains(&"bypassPermissions"), "{ids:?}");
+        assert!(ids.contains(&"default") && ids.contains(&"plan") && ids.contains(&"acceptEdits") && ids.contains(&"bypassPermissions"), "{ids:?}");
+        // dontAsk refuses what isn't allowed: it never reads as going ahead without asking.
+        assert!(core.meta.modes.iter().any(|m| m.id == "dontAsk" && m.label == "Allowed only" && !m.dangerous));
         let _ = requests(&mut core);
         c.command(&mut core, Command::SetMode { mode: "plan".into() });
         let reqs = requests(&mut core);

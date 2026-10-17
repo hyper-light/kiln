@@ -64,6 +64,9 @@ pub struct ChangeJob {
 pub enum Effect {
     /// Start the harness again, continuing its session from `resume_at` (a rewind).
     Restart { resume_at: Option<String> },
+    /// From its next start the harness may skip every permission check: a person chose a mode
+    /// that turns checks off, which it was not started able to use.
+    AllowBypass,
     /// Start a new session that branches off this one at `resume_at`.
     Branch { resume: String, resume_at: Option<String> },
     /// Run the harness's own CLI beside the session (`mcp add ...`), in its directory and
