@@ -4,7 +4,7 @@ import { DropdownMenu, Switch } from "radix-ui";
 import { LayoutGrid, List, MoreHorizontal, Plus, Server, SquareTerminal, Trash2 } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, HostSample, Job, RunnerInstance } from "@/api/types";
+import type { Agent, HostSample, Job, RunnerInstance, RunnerUpdate } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { EmptyState, ErrorState, Facts, Meter, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
@@ -125,6 +125,7 @@ export default function Runners() {
       />
 
       <JoinNotice requests={joinRequests.data} discovery={discovery.data} />
+      <Upgrades />
 
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <Segmented
@@ -469,5 +470,127 @@ function AgentDrawer({
         </DialogContent>
       )}
     </Dialog>
+  );
+}
+
+/**
+ * Runners on an older build than the one this server hands out for their platform: upgraded from
+ * here, each confirmed in place; nothing they run stops. A platform with no build here yet is built
+ * by kiln's own release pipeline first.
+ */
+function Upgrades() {
+  const res = useResource((s) => api.updates(s), [], { pollMs: 20_000 });
+  const reload = res.reload;
+  useServerEvents((ev) => {
+    if (ev.type === "updates" || ev.type === "update_job") reload();
+  });
+  const [asking, setAsking] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const data = res.data;
+  if (!data) return null;
+  const upgrading = new Set(data.jobs.filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
+  const behind = data.runners.filter((r) => r.connected && !r.up_to_date);
+  if (behind.length === 0) return null;
+  const ready = behind.filter((r) => r.target_build && !upgrading.has(r.name) && !(r.method === "terminal" && !r.terminal));
+  const lacking = behind.filter((r) => !r.target_build);
+  const last = data.build?.last;
+  const building = last != null && (last.status === "queued" || last.status === "running" || last.status === "pending");
+
+  const upgrade = async (runners: RunnerUpdate[]) => {
+    setBusy(true);
+    try {
+      for (const r of runners) await api.upgradeRunner(r.name);
+      toast({ title: runners.length === 1 ? `Upgrading ${runners[0]?.name ?? ""}` : `Upgrading ${runners.length} runners`, description: "Nothing they run is stopped.", tone: "running" });
+    } catch (e) {
+      toast.error("Couldn't upgrade", errorMessage(e));
+    } finally {
+      setBusy(false);
+      setAsking(null);
+      reload();
+    }
+  };
+  const build = async () => {
+    setBusy(true);
+    try {
+      const run = await api.buildEveryPlatform();
+      toast({ title: "Building every platform", description: `run #${run.number}`, tone: "running" });
+    } catch (e) {
+      toast.error("Couldn't start the build", errorMessage(e));
+    } finally {
+      setBusy(false);
+      reload();
+    }
+  };
+  const confirm = (text: string, runners: RunnerUpdate[]) => (
+    <div className="runner-up-confirm" role="group" aria-label="Confirm the upgrade">
+      <p>{text}</p>
+      <div className="runner-up-actions">
+        <Button size="xs" disabled={busy} onClick={() => void upgrade(runners)}>
+          Upgrade
+        </Button>
+        <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsking(null)}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+
+  return (
+    <section className="runner-up" aria-label="Upgrades">
+      <div className="runner-up-head">
+        <p>
+          {behind.length === 1 ? "1 runner is" : `${behind.length} runners are`} on an older build than this server hands out.
+        </p>
+        {ready.length > 1 && asking !== "all" && (
+          <Button size="xs" variant="secondary" onClick={() => setAsking("all")}>
+            Upgrade all ({ready.length})
+          </Button>
+        )}
+      </div>
+      {asking === "all" && confirm(`Upgrade ${ready.map((r) => r.name).join(", ")}? Each takes the new build without a restart; nothing they run stops.`, ready)}
+      <ul className="runner-up-list">
+        {behind.map((r) => (
+          <li key={r.name}>
+            <div className="runner-up-line">
+              <StatusDot status={upgrading.has(r.name) ? "running" : r.target_build ? "queued" : "timed_out"} />
+              <span className="runner-up-name">{r.name}</span>
+              <span className="runner-up-build">
+                {r.build ?? "older runner"} → {r.target_build ?? `no ${r.target ?? "matching"} build here yet`}
+              </span>
+              {upgrading.has(r.name) ? (
+                <span className="runner-up-dim">upgrading…</span>
+              ) : (
+                r.target_build &&
+                asking !== r.name && (
+                  <Button size="xs" variant="secondary" className="runner-up-go" disabled={r.method === "terminal" && !r.terminal} onClick={() => setAsking(r.name)}>
+                    Upgrade
+                  </Button>
+                )
+              )}
+            </div>
+            {asking === r.name && confirm(`Upgrade ${r.name} to build ${r.target_build ?? ""}? It takes it without a restart; its terminals, agents and jobs keep running.`, [r])}
+          </li>
+        ))}
+      </ul>
+      {lacking.length > 0 && (
+        <div className="runner-up-build-every">
+          <p>
+            {building ? (
+              <>
+                Building every platform ·{" "}
+                <Link to={`/runs/${last?.id ?? ""}`}>run #{last?.number}</Link>; {lacking.map((r) => r.name).join(", ")} can be upgraded when it finishes.
+              </>
+            ) : (
+              <>kiln builds {[...new Set(lacking.map((r) => r.target ?? r.os))].join(", ")} itself, on the server&rsquo;s own runner, then {lacking.length === 1 ? "it" : "they"} can be upgraded.</>
+            )}
+          </p>
+          {!building && (
+            <Button size="xs" variant="secondary" disabled={busy || Boolean(data.build?.error)} onClick={() => void build()}>
+              Build every platform
+            </Button>
+          )}
+        </div>
+      )}
+    </section>
   );
 }

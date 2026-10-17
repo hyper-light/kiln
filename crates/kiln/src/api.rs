@@ -224,6 +224,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "updates"]) => Ok(updates_overview(&hub, false).await),
         (&Method::POST, ["api", "updates", "check"]) => Ok(updates_overview(&hub, true).await),
         (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
+        (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
         (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name).await,
         (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
         (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
@@ -1159,7 +1160,7 @@ async fn job_source(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
     Ok(srv::response(StatusCode::OK, "application/x-tar", srv::channel_body(stdout)))
 }
 
-fn artifact_path(hub: &Hub, job: &str) -> std::path::PathBuf {
+pub(crate) fn artifact_path(hub: &Hub, job: &str) -> std::path::PathBuf {
     let safe: String = job.chars().filter(char::is_ascii_alphanumeric).collect();
     hub.cfg.data("artifacts").join(format!("{safe}.tar"))
 }
@@ -1714,8 +1715,33 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
             "jobs": jobs,
             "binaries": crate::updates::binaries(hub),
             "targets": targets,
+            "build": release_build(hub).await,
         }),
     )
+}
+
+/// The pipeline that builds kiln for every platform (`[updates]`), and its latest run.
+async fn release_build(hub: &Hub) -> serde_json::Value {
+    let u = &hub.cfg.updates;
+    let repo = hub.store.repos().await.unwrap_or_default().into_iter().find(|r| r.name == u.release_repo);
+    let Some(repo) = repo else {
+        return json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "error": format!("kiln doesn't build {} (no repository of that name)", u.release_repo) });
+    };
+    let last = hub.store.runs(Some(repo.id.clone()), 100, None).await.unwrap_or_default().into_iter().find(|r| r.pipeline == u.release_pipeline);
+    json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "branch": u.release_branch, "last": last })
+}
+
+/// `POST /api/updates/build`: run the pipeline that builds kiln for every platform; when it
+/// succeeds, every platform's runners can be upgraded from here.
+async fn build_every_platform(hub: &Hub) -> R {
+    let u = &hub.cfg.updates;
+    let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln doesn't build {}", u.release_repo)))?;
+    let runs = crate::gitops::manual(hub, &repo, Some(u.release_branch.clone()), Some(u.release_pipeline.clone()))
+        .await
+        .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    let run = runs.into_iter().next().ok_or_else(|| err(StatusCode::CONFLICT, format!("{} has no pipeline called {}", u.release_repo, u.release_pipeline)))?;
+    hub.store.audit("admin".into(), "upgrade.build".into(), format!("{} {} #{}", u.release_repo, u.release_pipeline, run.number)).await;
+    Ok(srv::json(StatusCode::ACCEPTED, &run))
 }
 
 /// `POST /api/updates/runners/{name}`: upgrade that machine's runner (nothing it runs stops).

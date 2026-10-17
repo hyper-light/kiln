@@ -199,6 +199,8 @@ export const api = {
   checkUpdates: () => post<UpdatesOverview>("/api/updates/check"),
   upgradeRunner: (name: string) => post<UpdateJob>(`/api/updates/runners/${enc(name)}`),
   upgradeAllRunners: () => post<{ jobs: UpdateJob[]; errors: string[] }>("/api/updates/runners"),
+  /** Run the pipeline that builds kiln for every platform; its binaries are kept when it succeeds. */
+  buildEveryPlatform: () => post<Run>("/api/updates/build"),
   upgradeServer: (action: "restart" | "replace") => post<UpdateJob>("/api/updates/server", { action }),
   uploadBinary: (target: string, file: Blob) => request<KilnBinary>("POST", `/api/updates/binaries${qs({ target })}`, undefined, { file }),
   deleteBinary: (target: string) => del<void>(`/api/updates/binaries/${enc(target)}`),

@@ -2,15 +2,16 @@
  * Settings → Updates: which build the server runs and how it is upgraded, each machine's runner
  * and its processes, Upgrade per runner and for all of them with live output, and the binaries
  * kiln hands out. Runners are upgraded without a restart: the old runner keeps its terminals,
- * agents and jobs. Every action is confirmed first and says what will happen.
+ * agents and jobs. Every action is confirmed in place first and says what will happen. Binaries for
+ * other platforms come from kiln's own release pipeline (Build every platform) or an upload.
  */
 import * as React from "react";
+import { Link } from "react-router";
 import { ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";
 import { useConnection, useServerEvents } from "@/api/events";
-import type { KilnBinary, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatesOverview } from "@/api/types";
+import type { KilnBinary, ReleaseBuild, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatesOverview } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog, Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { Facts, Panel } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
@@ -24,6 +25,8 @@ const PENDING_KEY = "kiln.serverUpgrade";
 const RECENT_S = 3600;
 
 interface Confirm {
+  /** Where it is asked: "server", "all", or "runner:<name>". */
+  scope: string;
   title: string;
   /** One sentence; the plan below says step by step what will happen. */
   lead: string;
@@ -237,6 +240,7 @@ export function UpdatesPanel() {
             onUpload={() => pickUpload(data.server.target)}
             onAction={(action) =>
               setConfirm({
+                scope: "server",
                 title: action === "restart" ? "Restart the server onto the new image?" : "Install the new server build?",
                 lead: "What will happen:",
                 plan: <ServerPlan s={data.server} action={action} />,
@@ -245,6 +249,7 @@ export function UpdatesPanel() {
               })
             }
           />
+          {confirm?.scope === "server" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
           <section className="upd-section" aria-labelledby="upd-runners">
             <div className="upd-section-head">
               <div className="min-w-0">
@@ -263,6 +268,7 @@ export function UpdatesPanel() {
                 disabled={outdated.length === 0 || outdated.every((r) => runningRunners.has(r.name))}
                 onClick={() =>
                   setConfirm({
+                    scope: "all",
                     title: `Upgrade ${plural(outdated.length, "runner")}?`,
                     lead: "What will happen:",
                     plan: <AllPlan runners={outdated} />,
@@ -274,6 +280,7 @@ export function UpdatesPanel() {
                 Upgrade all{outdated.length ? ` (${outdated.length})` : ""}
               </Button>
             </div>
+            {confirm?.scope === "all" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
             <ul className="upd-runners">
               {data.runners.map((r) => (
                 <RunnerRow
@@ -282,8 +289,10 @@ export function UpdatesPanel() {
                   job={latest("runner", r.name)}
                   uploading={uploading}
                   onUpload={() => r.target && pickUpload(r.target)}
+                  plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
                   onUpgrade={() =>
                     setConfirm({
+                      scope: `runner:${r.name}`,
                       title: `Upgrade ${r.name}?`,
                       lead: "What will happen:",
                       plan: <RunnerPlan r={r} />,
@@ -295,51 +304,42 @@ export function UpdatesPanel() {
               ))}
             </ul>
           </section>
-          <Binaries data={data} uploading={uploading} onUpload={pickUpload} onRemoved={reload} />
+          <Binaries data={data} uploading={uploading} onUpload={pickUpload} onRemoved={reload} onBuilt={reloadSoon} />
         </div>
       )}
-      <PlanDialog confirm={confirm} onClose={() => setConfirm(null)} />
     </Panel>
   );
 }
 
-/** Confirm an upgrade, showing step by step what it will do. */
-function PlanDialog({ confirm, onClose }: { confirm: Confirm | null; onClose: () => void }) {
+/** Confirm an upgrade in place, showing step by step what it will do. */
+function InlinePlan({ confirm, onClose }: { confirm: Confirm; onClose: () => void }) {
   const [busy, setBusy] = React.useState(false);
-  // Keep the content while the dialog animates closed.
-  const [shown, setShown] = React.useState(confirm);
-  React.useEffect(() => {
-    if (confirm) setShown(confirm);
-  }, [confirm]);
   return (
-    <Dialog open={confirm !== null} onOpenChange={(o) => !o && !busy && onClose()}>
-      {shown && (
-        <DialogContent title={shown.title} eyebrow="Confirm" description={shown.lead}>
-          {shown.plan}
-          <div className="flex flex-wrap justify-end gap-2 pt-5">
-            <DialogClose asChild>
-              <Button variant="ghost" disabled={busy}>
-                Cancel
-              </Button>
-            </DialogClose>
-            <Button
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  await shown.run();
-                } finally {
-                  setBusy(false);
-                  onClose();
-                }
-              }}
-            >
-              {shown.confirmLabel}
-            </Button>
-          </div>
-        </DialogContent>
-      )}
-    </Dialog>
+    <div className="upd-confirm" role="group" aria-label={confirm.title}>
+      <p className="upd-confirm-title">{confirm.title}</p>
+      <p className="upd-sub">{confirm.lead}</p>
+      {confirm.plan}
+      <div className="upd-actions">
+        <Button
+          size="xs"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            try {
+              await confirm.run();
+            } finally {
+              setBusy(false);
+              onClose();
+            }
+          }}
+        >
+          {confirm.confirmLabel}
+        </Button>
+        <Button size="xs" variant="ghost" disabled={busy} onClick={onClose}>
+          Cancel
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -458,12 +458,15 @@ function RunnerRow({
   r,
   job,
   uploading,
+  plan,
   onUpgrade,
   onUpload,
 }: {
   r: RunnerUpdate;
   job: UpdateJob | undefined;
   uploading: string | null;
+  /** Its upgrade, being confirmed. */
+  plan: React.ReactNode;
   onUpgrade: () => void;
   onUpload: () => void;
 }) {
@@ -504,13 +507,14 @@ function RunnerRow({
               <Upload /> {uploading === r.target ? "Uploading…" : `Upload ${r.target}`}
             </Button>
           )}
-          {r.connected && !r.up_to_date && (
+          {r.connected && !r.up_to_date && !plan && (
             <Button size="xs" variant="secondary" disabled={job?.state === "running" || (r.method === "terminal" && !r.terminal)} onClick={onUpgrade}>
               Upgrade
             </Button>
           )}
         </div>
       </div>
+      {plan}
       {r.instances.length > 1 && (
         <ul className="upd-procs">
           {r.instances.map((i) => (
@@ -616,10 +620,29 @@ function JobLog({ job }: { job: UpdateJob }) {
 
 /* ---------------------------- binaries ---------------------------- */
 
-function Binaries({ data, uploading, onUpload, onRemoved }: { data: UpdatesOverview; uploading: string | null; onUpload: (t: string) => void; onRemoved: () => void }) {
+function Binaries({
+  data,
+  uploading,
+  onUpload,
+  onRemoved,
+  onBuilt,
+}: {
+  data: UpdatesOverview;
+  uploading: string | null;
+  onUpload: (t: string) => void;
+  onRemoved: () => void;
+  onBuilt: () => void;
+}) {
   const [target, setTarget] = React.useState(data.targets[0] ?? "");
   const [confirm, setConfirm] = React.useState<KilnBinary | null>(null);
-  const origin = (b: KilnBinary) => (b.origin === "server" ? "this server's own" : b.origin === "upload" ? `uploaded ${relativeTime(b.at)}` : `GitHub release, fetched ${relativeTime(b.at)}`);
+  const origin = (b: KilnBinary) =>
+    b.origin === "server"
+      ? "this server's own"
+      : b.origin === "upload"
+        ? `uploaded ${relativeTime(b.at)}`
+        : b.origin === "built"
+          ? `built by run #${b.run ?? "?"} from ${(b.sha ?? "").slice(0, 7)}, ${relativeTime(b.at)}`
+          : `GitHub release, fetched ${relativeTime(b.at)}`;
   return (
     <section className="upd-section" aria-labelledby="upd-binaries">
       <div className="upd-section-head">
@@ -627,9 +650,10 @@ function Binaries({ data, uploading, onUpload, onRemoved }: { data: UpdatesOverv
           <h4 id="upd-binaries" className="upd-h">
             Binaries
           </h4>
-          <p className="upd-sub">What runners download. Machines of another platform get an uploaded build, else this version&rsquo;s GitHub release.</p>
+          <p className="upd-sub">What runners download. Machines of another platform get the build kiln made of every platform, or an uploaded one.</p>
         </div>
       </div>
+      {data.build && <BuildEvery build={data.build} onStarted={onBuilt} />}
       <ul className="upd-bins">
         {data.binaries.map((b) => (
           <li key={`${b.target}-${b.origin}`}>
@@ -638,10 +662,38 @@ function Binaries({ data, uploading, onUpload, onRemoved }: { data: UpdatesOverv
               {b.build} · {formatBytes(b.size)}
             </span>
             <span className="upd-dim">{origin(b)}</span>
-            {b.origin !== "server" && (
+            {b.origin !== "server" && confirm?.target !== b.target && (
               <Button size="xs" variant="ghost" aria-label={`Remove the ${b.target} binary`} onClick={() => setConfirm(b)}>
                 <Trash2 />
               </Button>
+            )}
+            {confirm?.target === b.target && (
+              <div className="upd-confirm upd-bin-confirm" role="group" aria-label={`Remove the ${b.target} binary`}>
+                <p>
+                  Remove the {b.target} binary? Build {b.build} is no longer handed to machines of that platform until kiln builds every platform again or one is uploaded.
+                </p>
+                <div className="upd-actions">
+                  <Button
+                    size="xs"
+                    variant="danger"
+                    onClick={async () => {
+                      try {
+                        await api.deleteBinary(b.target);
+                        onRemoved();
+                      } catch (e) {
+                        toast.error("Couldn't remove it", errorMessage(e));
+                      } finally {
+                        setConfirm(null);
+                      }
+                    }}
+                  >
+                    Remove
+                  </Button>
+                  <Button size="xs" variant="ghost" onClick={() => setConfirm(null)}>
+                    Keep it
+                  </Button>
+                </div>
+              </div>
             )}
           </li>
         ))}
@@ -662,23 +714,50 @@ function Binaries({ data, uploading, onUpload, onRemoved }: { data: UpdatesOverv
           <Upload /> {uploading ? "Uploading…" : "Upload binary"}
         </Button>
       </div>
-      <ConfirmDialog
-        open={confirm !== null}
-        onOpenChange={(o) => !o && setConfirm(null)}
-        title={`Remove the ${confirm?.target ?? ""} binary?`}
-        description={`Build ${confirm?.build ?? ""} is no longer handed to machines of that platform; an upgrade then fetches this version's GitHub release, if one is published.`}
-        confirmLabel="Remove"
-        danger
-        onConfirm={async () => {
-          if (!confirm) return;
-          try {
-            await api.deleteBinary(confirm.target);
-            onRemoved();
-          } catch (e) {
-            toast.error("Couldn't remove it", errorMessage(e));
-          }
-        }}
-      />
     </section>
+  );
+}
+
+/** Building kiln for every platform with its own release pipeline, and how the last build went. */
+function BuildEvery({ build, onStarted }: { build: ReleaseBuild; onStarted: () => void }) {
+  const [busy, setBusy] = React.useState(false);
+  const last = build.last ?? null;
+  const building = last !== null && (last.status === "queued" || last.status === "running" || last.status === "pending");
+  const start = async () => {
+    setBusy(true);
+    try {
+      const run = await api.buildEveryPlatform();
+      toast({ title: "Building every platform", description: `${build.repo} ${build.pipeline} run #${run.number}`, tone: "running" });
+      onStarted();
+    } catch (e) {
+      toast.error("Couldn't start the build", errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const runLink = last ? <Link to={`/runs/${last.id}`}>run #{last.number}</Link> : null;
+  return (
+    <div className="upd-build-every">
+      <p className="upd-note" data-tone={build.error ? "timed_out" : building ? "running" : last?.status === "failed" ? "failed" : last ? "succeeded" : "queued"}>
+        <StatusDot status={build.error ? "timed_out" : building ? "running" : (last?.status ?? "queued")} />
+        <span>
+          {build.error ??
+            (building ? (
+              <>Building every platform · {runLink}</>
+            ) : last?.status === "succeeded" ? (
+              <>
+                Built every platform {relativeTime(last.finished_at ?? last.created_at)} from {last.branch} {last.sha.slice(0, 7)} · {runLink}
+              </>
+            ) : last ? (
+              <>The last build {last.status === "failed" ? "failed" : "didn't finish"} · {runLink}</>
+            ) : (
+              <>kiln hasn't built every platform here yet: {build.repo}&rsquo;s {build.pipeline} pipeline does, on the server&rsquo;s own runner.</>
+            ))}
+        </span>
+      </p>
+      <Button size="sm" variant="secondary" disabled={busy || building || Boolean(build.error)} onClick={() => void start()}>
+        {building ? "Building…" : "Build every platform"}
+      </Button>
+    </div>
   );
 }

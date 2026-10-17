@@ -206,6 +206,31 @@ impl Hub {
         })
     }
 
+    /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
+    /// each other platform's runners upgrade to now.
+    async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
+        let u = &self.cfg.updates;
+        if run.repo_name != u.release_repo || run.pipeline != u.release_pipeline {
+            return;
+        }
+        let path = crate::api::artifact_path(self, job);
+        if !path.exists() {
+            return;
+        }
+        let (cfg, run_c) = (self.cfg.clone(), run.clone());
+        let adopted = crate::rt::blocking(move || crate::updates::adopt_into(&cfg, &path, &run_c)).await;
+        match adopted {
+            Ok(Ok(kept)) if !kept.is_empty() => {
+                let targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
+                tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
+                self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
+                self.emit(&serde_json::json!({ "type": "updates" }));
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) | Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
+        }
+    }
+
     /// Sends what repo sync says to each machine's syncing runner process, on the sync lane.
     pub async fn sync_loop(self: Arc<Self>) -> anyhow::Result<()> {
         let out = self.sync.outgoing();
@@ -1113,6 +1138,11 @@ impl Hub {
         }
         self.emit_job(&r.job).await;
         self.emit_run(&run_id).await;
+        if r.status == crate::store::Status::Succeeded
+            && let Some(run) = &run
+        {
+            self.adopt_release(&r.job, run).await;
+        }
         if let (Some(status), Some(run)) = (settled, run) {
             crate::gitops::report_status(self, &run, status).await;
         }

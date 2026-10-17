@@ -94,11 +94,18 @@ pub struct Binary {
     pub target: String,
     pub sha256: String,
     pub size: u64,
-    /// "server" (this server's own), "upload" or "release".
+    /// "server" (this server's own), "upload", "release" (a GitHub release) or "built" (by kiln's
+    /// own release pipeline, `run` and `sha`).
     pub origin: String,
     pub at: i64,
     #[serde(default)]
     pub build: String,
+    /// The run of the release pipeline that built it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<i64>,
+    /// The commit it was built from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -243,18 +250,47 @@ fn executable(bytes: &[u8]) -> bool {
 
 /// Keep `bytes` as the binary for `target` (an upload, or a release download).
 pub fn store(hub: &Hub, target: &str, bytes: &[u8], origin: &str) -> anyhow::Result<Binary> {
+    keep(&store_dir(hub), target, bytes, origin, None)
+}
+
+/// What the release pipeline's job left in its artifacts (`dist/kiln-<target>[.exe]`): kept as the
+/// binaries each other platform's runners upgrade to. This server's own platform keeps its own
+/// build, so its runners run what it runs.
+pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
+    let dir = cfg.server.data_dir.join("binaries");
+    use std::io::Read as _;
+    let mut archive = tar::Archive::new(std::fs::File::open(artifacts).with_context(|| format!("open {}", artifacts.display()))?);
+    let mut kept = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().into_owned();
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        let Some(target) = name.strip_prefix("kiln-").map(|t| t.strip_suffix(".exe").unwrap_or(t)) else { continue };
+        if !known_target(target) || target == crate::api::TARGET || entry.size() > MAX_BINARY as u64 {
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
+        entry.read_to_end(&mut bytes)?;
+        let target = target.to_owned();
+        kept.push(keep(&dir, &target, &bytes, "built", Some((run.number, run.sha.clone())))?);
+    }
+    Ok(kept)
+}
+
+/// Keeps `bytes` as the binary for `target` in `dir` (`<data>/binaries`).
+fn keep(dir: &Path, target: &str, bytes: &[u8], origin: &str, built: Option<(i64, String)>) -> anyhow::Result<Binary> {
     anyhow::ensure!(known_target(target), "kiln has no platform called {target}");
     anyhow::ensure!(bytes.len() > 1 << 20, "that file is too small to be a kiln binary");
     anyhow::ensure!(executable(bytes), "that file is not an executable (ELF, Mach-O or PE)");
-    let dir = store_dir(hub);
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let tmp = dir.join(format!(".kiln-{target}.part"));
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     crate::os::make_executable(&tmp)?;
-    std::fs::rename(&tmp, stored_path(hub, target))?;
+    std::fs::rename(&tmp, dir.join(format!("kiln-{target}")))?;
     let sha256 = hex::encode(Sha256::digest(bytes));
-    let meta = Binary { target: target.to_owned(), build: build_id(&sha256), sha256, size: bytes.len() as u64, origin: origin.to_owned(), at: crate::util::now_unix() };
-    std::fs::write(meta_path(hub, target), serde_json::to_vec(&meta)?)?;
+    let (run, sha) = built.map_or((None, None), |(n, s)| (Some(n), Some(s)));
+    let meta = Binary { target: target.to_owned(), build: build_id(&sha256), sha256, size: bytes.len() as u64, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha };
+    std::fs::write(dir.join(format!("kiln-{target}.json")), serde_json::to_vec(&meta)?)?;
     Ok(meta)
 }
 
@@ -272,7 +308,7 @@ pub fn unstore(hub: &Hub, target: &str) -> bool {
 pub fn binaries(hub: &Hub) -> Vec<Binary> {
     let mut v = Vec::new();
     if let Ok((sha256, size)) = own_binary() {
-        v.push(Binary { target: crate::api::TARGET.to_owned(), build: build_id(&sha256), sha256, size, origin: "server".to_owned(), at: 0 });
+        v.push(Binary { target: crate::api::TARGET.to_owned(), build: build_id(&sha256), sha256, size, origin: "server".to_owned(), at: 0, run: None, sha: None });
     }
     let mut targets: Vec<&str> = crate::api::RELEASE_TARGETS.to_vec();
     if !targets.contains(&crate::api::TARGET) {
@@ -1324,6 +1360,58 @@ mod tests {
         for cap in [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_FRONT_DOOR] {
             assert_eq!(caps & cap, cap, "capability {cap} is announced");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_release_pipelines_binaries_are_kept_for_the_other_platforms() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut cfg = crate::config::Config::default();
+        cfg.server.data_dir = dir.path().to_owned();
+        let fake = |magic: &[u8]| -> Vec<u8> {
+            let mut b = magic.to_vec();
+            b.resize(2 << 20, 7);
+            b
+        };
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, bytes) in [
+            ("dist/kiln-aarch64-apple-darwin".to_owned(), fake(&[0xcf, 0xfa, 0xed, 0xfe])),
+            ("dist/kiln-x86_64-pc-windows-msvc.exe".to_owned(), fake(b"MZ")),
+            (format!("dist/kiln-{}", crate::api::TARGET), fake(b"\x7fELF")),
+            ("dist/SHA256SUMS".to_owned(), b"sums".to_vec()),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, &name, bytes.as_slice())?;
+        }
+        let artifacts = dir.path().join("artifacts.tar");
+        std::fs::write(&artifacts, tar.into_inner()?)?;
+        let run = crate::store::Run {
+            id: "r".into(),
+            repo_id: "k".into(),
+            repo_name: "hyper-light/kiln".into(),
+            number: 12,
+            pipeline: "release".into(),
+            event: "manual".into(),
+            branch: "main".into(),
+            sha: "0d21482abcdef".into(),
+            message: String::new(),
+            author: String::new(),
+            status: crate::store::Status::Succeeded,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            error: None,
+            concurrency_group: None,
+        };
+        let kept = adopt_into(&cfg, &artifacts, &run)?;
+        let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
+        targets.sort_unstable();
+        assert_eq!(targets, ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"], "this server's own platform keeps its own build");
+        assert!(kept.iter().all(|b| b.origin == "built" && b.run == Some(12) && b.sha.as_deref() == Some("0d21482abcdef")));
+        assert!(dir.path().join("binaries/kiln-aarch64-apple-darwin").exists());
         Ok(())
     }
 

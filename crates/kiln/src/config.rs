@@ -21,6 +21,8 @@ pub struct Config {
     pub telemetry: Telemetry,
     /// Speech to text for the console's microphone where the browser can't do it itself.
     pub voice: crate::voice::Voice,
+    /// Upgrades: where kiln's own binaries for every platform come from.
+    pub updates: Updates,
     pub discovery: Discovery,
     /// Deployments (docs/cd.md).
     pub cd: Cd,
@@ -412,5 +414,25 @@ impl Config {
 
     pub fn render_default() -> String {
         toml::to_string_pretty(&Config::default()).unwrap_or_default()
+    }
+}
+
+/// `[updates]`: the pipeline that builds kiln for every platform (`.kiln/release.yaml`). When its
+/// job succeeds, the binaries it leaves (`dist/kiln-<target>`) are what that platform's runners
+/// upgrade to: no token, no upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Updates {
+    /// The repository, as kiln names it.
+    pub release_repo: String,
+    /// Its pipeline.
+    pub release_pipeline: String,
+    /// The branch "Build every platform" builds.
+    pub release_branch: String,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned() }
     }
 }

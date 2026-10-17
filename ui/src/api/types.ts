@@ -527,9 +527,21 @@ export interface KilnBinary {
   sha256: string;
   size: number;
   build: string;
-  /** server: the server's own · upload: uploaded here · release: fetched from GitHub. */
-  origin: "server" | "upload" | "release";
+  /** server: the server's own · upload: uploaded here · release: fetched from GitHub · built: by kiln's own release pipeline. */
+  origin: "server" | "upload" | "release" | "built";
   at: number;
+  /** The release pipeline's run that built it, and the commit. */
+  run?: number;
+  sha?: string;
+}
+
+/** The pipeline that builds kiln for every platform, and its latest run. */
+export interface ReleaseBuild {
+  repo: string;
+  pipeline: string;
+  branch?: string;
+  last?: Run | null;
+  error?: string;
 }
 
 export interface ReleaseInfo {
@@ -590,6 +602,7 @@ export interface UpdatesOverview {
   jobs: UpdateJob[];
   binaries: KilnBinary[];
   targets: string[];
+  build?: ReleaseBuild;
 }
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
