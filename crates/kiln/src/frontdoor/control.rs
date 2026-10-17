@@ -50,6 +50,15 @@ struct Entry {
     issued_at: Option<Instant>,
 }
 
+impl Entry {
+    /// The runner's MagicDNS name, while its front door serves HTTPS on the tailnet.
+    fn tailnet_name(&self) -> Option<&str> {
+        let s = &self.settings;
+        let name = self.status.as_ref()?.tailscale.as_ref()?.name.as_str();
+        (s.tailscale.enabled && s.https.enabled && !name.is_empty()).then_some(name)
+    }
+}
+
 /// Every runner's front door, as the server knows it.
 #[derive(Default)]
 pub struct FrontDoors {
@@ -83,12 +92,11 @@ impl FrontDoors {
 
     /// `https://…` for every name a runner's front door serves.
     pub fn origins(&self) -> Vec<String> {
-        let g = self.inner.lock();
-        let mut runners: Vec<&String> = g.keys().collect();
+        let mut runners: Vec<String> = self.inner.lock().keys().cloned().collect();
         runners.sort();
         let mut out: Vec<String> = Vec::new();
         for r in runners {
-            for o in g.get(r).map(|e| e.settings.origins()).unwrap_or_default() {
+            for o in self.origins_of(&r) {
                 if !out.contains(&o) {
                     out.push(o);
                 }
@@ -97,10 +105,33 @@ impl FrontDoors {
         out
     }
 
+    /// `https://…` for every name one runner's front door serves (its MagicDNS name too, on the
+    /// tailnet).
+    pub fn origins_of(&self, runner: &str) -> Vec<String> {
+        let g = self.inner.lock();
+        let Some(e) = g.get(runner) else { return Vec::new() };
+        let port = if e.settings.https.port == super::HTTPS_PORT { String::new() } else { format!(":{}", e.settings.https.port) };
+        let mut out = e.settings.origins();
+        if let Some(o) = e.tailnet_name().map(|n| format!("https://{n}{port}"))
+            && !out.contains(&o)
+        {
+            out.push(o);
+        }
+        out
+    }
+
     /// Whether `host` (no port) is a name some runner's front door serves over HTTPS: a request
     /// for it came through a front door, so the browser is on HTTPS.
     pub fn serves(&self, host: &str) -> bool {
-        self.inner.lock().values().any(|e| e.settings.serves(host))
+        self.inner.lock().values().any(|e| e.settings.serves(host) || e.tailnet_name().is_some_and(|n| n.eq_ignore_ascii_case(host)))
+    }
+
+    /// Every runner's settings and last status, in name order (for the tailnet's DNS).
+    pub fn snapshot(&self) -> Vec<(String, Settings, Option<Status>)> {
+        let g = self.inner.lock();
+        let mut v: Vec<(String, Settings, Option<Status>)> = g.iter().map(|(k, e)| (k.clone(), e.settings.clone(), e.status.clone())).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
     }
 
     /// The runners with front-door settings, in name order.
@@ -177,16 +208,22 @@ pub async fn on_status(hub: &Hub, peer: PeerId, machine: &str, json: &str) {
     if status.standby || peers(hub, machine).0 != Some(peer) {
         return;
     }
-    let changed = {
+    // Where the tailnet's DNS should go, as this runner says: a change is synced to the tailnet.
+    let tailnet_of = |s: &Status| (s.settings.clone(), s.tailscale.as_ref().map(|t| t.nameserver.clone()));
+    let (changed, tailnet_changed) = {
         let mut g = hub.front_doors.inner.lock();
         let e = g.entry(machine.to_owned()).or_default();
         let changed = e.status.as_ref() != Some(&status);
+        let tailnet_changed = e.status.as_ref().map(tailnet_of) != Some(tailnet_of(&status));
         e.status = Some(status.clone());
         e.status_at = crate::util::now_unix();
-        changed
+        (changed, tailnet_changed)
     };
     if changed {
         hub.emit(&json!({ "type": "front_door", "runner": machine }));
+    }
+    if tailnet_changed {
+        hub.tailnet.wake.notify();
     }
     if let Some(csr) = &status.csr {
         issue(hub, peer, machine, csr, &status).await;
@@ -202,7 +239,8 @@ fn names_to_sign(settings: &Settings, status: &Status) -> Vec<String> {
         let ok = if let Ok(ip) = n.parse::<IpAddr>() {
             status.addresses.contains(n) && !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast()
         } else {
-            served.contains(n)
+            // The runner's MagicDNS name too, while its front door is on the tailnet.
+            served.contains(n) || (settings.tailscale.enabled && status.tailscale.as_ref().is_some_and(|t| !t.name.is_empty() && t.name == *n))
         };
         if ok && !names.contains(n) {
             names.push(n.clone());
@@ -277,7 +315,7 @@ pub async fn view(hub: &Hub, name: &str) -> serde_json::Value {
         "applied": applied,
         "status": status,
         "status_at": (status_at > 0).then_some(status_at),
-        "origins": settings.origins(),
+        "origins": hub.front_doors.origins_of(name),
         "ca": ca.map(|c| json!({ "subject": c.subject, "sha256": c.sha256, "not_after": c.not_after })),
     })
 }
@@ -310,6 +348,7 @@ pub async fn put(hub: &Hub, name: &str, req: Request) -> Answer {
     hub.front_doors.inner.lock().entry(name.to_owned()).or_default().settings = settings.clone();
     hub.store.audit("admin".into(), "front_door.update".into(), format!("{name}: {}", settings.summary())).await;
     push(hub, name, None, None).await;
+    hub.tailnet.wake.notify();
     hub.emit(&json!({ "type": "front_door", "runner": name }));
     Ok(srv::json(StatusCode::OK, &view(hub, name).await))
 }

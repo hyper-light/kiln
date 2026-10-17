@@ -88,6 +88,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
     // Runners' front doors: what the UI set, sent to each runner when it connects.
     hub.front_doors.load(&hub.store).await?;
+    // The tailnet's DNS for them: the Tailscale credential given in the UI, the routes kiln set.
+    hub.tailnet.load(&hub.cfg, &hub.store).await;
     // Process restarts by the supervisor count as restarts too (generation 1 = first start).
     crate::metrics::global().supervisor_restarts.add(hub.generation.saturating_sub(1));
 
@@ -116,6 +118,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     child!("gitops-discover", h => crate::gitops::discover_loop(h));
     child!("gitops-poll", h => crate::gitops::poll_loop(h));
     child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
+    child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
     // Home-network discovery (multicast DNS): announce this server, list the kiln instances nearby.
     if cfg.discovery.enabled && (cfg.discovery.announce || cfg.discovery.browse) {
         child!("discovery", h => crate::discovery::Discovery::serve(h));

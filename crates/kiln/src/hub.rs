@@ -142,6 +142,8 @@ pub struct Hub {
     pub updates: crate::updates::Updates,
     /// Runners' front doors: their settings and what each last reported (`crate::frontdoor`).
     pub front_doors: crate::frontdoor::control::FrontDoors,
+    /// The tailnet's split DNS for the front doors' names (`crate::frontdoor::tailnet`).
+    pub tailnet: crate::frontdoor::tailnet::TailnetDns,
 }
 
 impl Hub {
@@ -196,6 +198,7 @@ impl Hub {
             lost_instances: Mutex::new(HashMap::new()),
             updates: crate::updates::Updates::default(),
             front_doors: crate::frontdoor::control::FrontDoors::default(),
+            tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
         })
     }
 
@@ -450,6 +453,7 @@ impl Hub {
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
+        self.tailnet.wake.notify();
         self.update_slot_gauges();
         Ok(())
     }

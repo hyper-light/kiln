@@ -23,6 +23,7 @@ pub mod mobileconfig;
 pub mod netinfo;
 pub mod proxy;
 pub mod runner;
+pub mod tailnet;
 pub mod zone;
 
 use std::net::IpAddr;
@@ -54,6 +55,10 @@ pub struct Settings {
     pub https: Https,
     pub cert: Cert,
     pub mdns: Mdns,
+    /// The front door on the tailnet too (Tailscale), and the tailnet's DNS for its names.
+    /// Left out of the JSON while off, so settings that do not use it fingerprint as before.
+    #[serde(skip_serializing_if = "tailnet::Tailnet::is_off")]
+    pub tailscale: tailnet::Tailnet,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +351,9 @@ impl Settings {
         if let Some(l) = self.local_name() {
             parts.push(l);
         }
+        if self.tailscale.enabled {
+            parts.push("tailnet".to_owned());
+        }
         if parts.len() <= usize::from(!self.domain.is_empty()) {
             parts.push("off".to_owned());
         }
@@ -478,6 +486,8 @@ pub struct Status {
     /// When the CSR was (last) asked (unix seconds): asked again every few minutes until answered.
     pub asked: i64,
     pub fixes: Vec<Fix>,
+    /// The front door on the tailnet, while `tailscale.enabled`.
+    pub tailscale: Option<tailnet::TailnetStatus>,
 }
 
 #[cfg(test)]
@@ -492,6 +502,7 @@ mod tests {
             https: Https { enabled: true, ..Https::default() },
             cert: Cert::default(),
             mdns: Mdns { enabled: true, name: "Kiln.local".into() },
+            ..Settings::default()
         }
     }
 

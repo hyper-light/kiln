@@ -32,7 +32,7 @@ use crate::http::tls::ServerTls;
 use crate::rt::{Interval, Notify, Shutdown};
 
 use super::certs::Store;
-use super::{CertMode, CertStatus, DnsMode, Fix, Listener, Push, Settings, State, Status, netinfo, proxy};
+use super::{CertMode, CertStatus, DnsMode, Fix, Listener, Push, Settings, State, Status, netinfo, proxy, tailnet};
 
 /// How often the front door looks again (interfaces, failed binds, the certificate's age).
 pub const TICK: Duration = Duration::from_secs(15);
@@ -118,6 +118,8 @@ pub fn start(ctx: Ctx, shutdown: &Shutdown) -> Handle {
 async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>, shutdown: Shutdown) {
     let mut fd = FrontDoor::new(ctx);
     let mut tick = Interval::new(TICK);
+    // What Tailscale says about this machine changed: listen and report accordingly, at once.
+    let tailnet_changes = fd.tailnet.changes();
     loop {
         let json = serde_json::to_string(&fd.status()).unwrap_or_default();
         {
@@ -134,6 +136,7 @@ async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>
                 Err(_) => break,
             },
             () = tick.tick().fuse() => None,
+            () = tailnet_changes.changed().fuse() => None,
         };
         match cmd {
             Some(Command::Push(json)) => fd.on_push(&json),
@@ -217,6 +220,8 @@ struct FrontDoor {
     http_failure: Option<Failure>,
 
     mdns: Option<MdnsRun>,
+    /// What Tailscale says about this machine (asked while the settings want the tailnet).
+    tailnet: tailnet::Watcher,
 
     cert: CertStatus,
     tls_leaf: Option<String>,
@@ -247,6 +252,7 @@ impl FrontDoor {
             http: None,
             http_failure: None,
             mdns: None,
+            tailnet: tailnet::Watcher::start(),
             cert: CertStatus::default(),
             tls_leaf: None,
             csr: None,
@@ -315,8 +321,15 @@ impl FrontDoor {
 
     /// Match the listeners to the settings (and retry what failed).
     fn reconcile(&mut self) {
-        self.ifaces = netinfo::lan();
         let s = self.settings.clone();
+        self.ifaces = netinfo::lan();
+        // On the tailnet too: its addresses are the front door's like the LAN's.
+        let seen = self.tailnet.seen();
+        if s.tailscale.enabled
+            && let Some(i) = seen.as_ref().and_then(|x| x.local.as_ref().ok()).and_then(tailnet::iface)
+        {
+            self.ifaces.push(i);
+        }
         let active = !self.standby;
         self.reconcile_dns(&s, active);
         let tls = if active && s.https.enabled { self.reconcile_cert(&s) } else {
@@ -326,6 +339,13 @@ impl FrontDoor {
         };
         self.reconcile_https(&s, active, tls);
         self.reconcile_mdns(&s, active);
+        let primary = seen.as_ref().and_then(|x| x.local.as_ref().ok()).and_then(crate::tailscale::Local::primary);
+        let listening = primary.is_some_and(|ip| self.dns.as_ref().is_some_and(|d| d.bound().contains(&SocketAddr::new(ip, super::DNS_PORT))));
+        self.tailnet.want(tailnet::Probe {
+            enabled: active && s.tailscale.enabled,
+            resolve: (s.dns.enabled && !s.domain.is_empty()).then(|| s.domain.clone()),
+            listening,
+        });
     }
 
     fn reconcile_dns(&mut self, s: &Settings, active: bool) {
@@ -362,6 +382,14 @@ impl FrontDoor {
     fn want(&self, s: &Settings) -> Vec<String> {
         let mut v = s.cert_names();
         v.extend(netinfo::addresses(&self.ifaces).into_iter().filter(IpAddr::is_ipv4).take(CERT_ADDRESSES).map(|a| a.to_string()));
+        // On the tailnet: its address and MagicDNS name, however many LAN addresses came first.
+        if s.tailscale.enabled {
+            for n in tailnet::cert_names(self.tailnet.seen().as_ref()) {
+                if !v.contains(&n) {
+                    v.push(n);
+                }
+            }
+        }
         v
     }
 
@@ -374,6 +402,8 @@ impl FrontDoor {
             CertMode::Kiln => {
                 self.upload_error = None;
                 let want = self.want(s);
+                // On the tailnet, the certificate carries its names too: ask once Tailscale answered.
+                let settling = s.tailscale.enabled && self.tailnet.seen().is_none();
                 let current = self.store.kiln().and_then(|(c, k)| {
                     let info = crate::pki::cert_info(&c).ok()?;
                     let tls = ServerTls::from_pem(&c, &k).ok()?;
@@ -386,7 +416,7 @@ impl FrontDoor {
                         let renew = info.not_after - now < RENEW_BEFORE;
                         if missing.is_empty() && !renew {
                             self.csr = None;
-                        } else {
+                        } else if !settling {
                             self.ask(&want);
                         }
                         cs.missing = missing.into_iter().filter(|n| names.contains(n)).collect();
@@ -394,6 +424,11 @@ impl FrontDoor {
                         cs.kiln = true;
                         cs.info = Some(info);
                         Some(tls)
+                    }
+                    _ if settling => {
+                        cs.state = State::Waiting;
+                        cs.error = Some("Asking Tailscale about this machine first: the certificate carries its tailnet names.".to_owned());
+                        None
                     }
                     _ => {
                         self.ask(&want);
@@ -626,6 +661,12 @@ impl FrontDoor {
                 fixes.push(f);
             }
         }
+        let tailscale = if self.standby { None } else { tailnet::status(s, self.tailnet.seen().as_ref(), &self.dns.as_ref().map(super::dns::DnsServer::bound).unwrap_or_default()) };
+        if let Some(f) = tailscale.as_ref().and_then(|t| t.fix.clone())
+            && !fixes.contains(&f)
+        {
+            fixes.push(f);
+        }
         Status {
             settings: s.fingerprint(),
             standby: self.standby,
@@ -641,6 +682,7 @@ impl FrontDoor {
             want: self.csr.as_ref().map(|(_, w)| w.clone()).unwrap_or_default(),
             asked: if self.csr.is_some() { self.asked_unix } else { 0 },
             fixes,
+            tailscale,
         }
     }
 }
