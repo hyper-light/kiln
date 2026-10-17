@@ -281,6 +281,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             }
         }
         (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
+        (&Method::POST, ["api", "harness", "broadcast", "preview"]) => harness_broadcast_preview(&hub, req).await,
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();
             harness_command(&hub, &id, req).await
@@ -1875,6 +1876,57 @@ async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
     let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
     hub.store.audit("admin".into(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed)).await;
     Ok(srv::json(StatusCode::OK, &report))
+}
+
+/// Who a broadcast to `to` would reach (the same picking as the broadcast itself), the machines
+/// they are on, and what they understand: their catalogs (slash commands, modes, models, efforts)
+/// merged, each entry with `count`, how many of them have it.
+async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        to: crate::harness::broadcast::To,
+    }
+    let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let picked = crate::harness::broadcast::pick(&hub.harness.list(), &b.to);
+    let mut machines: Vec<String> = Vec::new();
+    // (field in each agent's meta, the key naming an entry, the entries seen with their counts)
+    let mut merged: [(&str, &str, Vec<(serde_json::Value, usize)>); 4] =
+        [("commands", "name", Vec::new()), ("modes", "id", Vec::new()), ("models", "id", Vec::new()), ("efforts", "id", Vec::new())];
+    for info in &picked {
+        let machine = info.target.strip_prefix("agent:").unwrap_or(&info.target).to_owned();
+        if !machines.contains(&machine) {
+            machines.push(machine);
+        }
+        let Some(meta) = hub.harness.meta(&info.id) else { continue };
+        for (field, key, seen) in &mut merged {
+            for entry in meta.get(*field).and_then(serde_json::Value::as_array).into_iter().flatten() {
+                let Some(name) = entry.get(*key).and_then(serde_json::Value::as_str) else { continue };
+                match seen.iter_mut().find(|(v, _)| v.get(*key).and_then(serde_json::Value::as_str) == Some(name)) {
+                    Some((_, n)) => *n += 1,
+                    None => seen.push((entry.clone(), 1)),
+                }
+            }
+        }
+    }
+    let counted = |seen: Vec<(serde_json::Value, usize)>| -> Vec<serde_json::Value> {
+        seen.into_iter()
+            .map(|(mut v, n)| {
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("count".into(), json!(n));
+                }
+                v
+            })
+            .collect()
+    };
+    let [(_, _, commands), (_, _, modes), (_, _, models), (_, _, efforts)] = merged;
+    let agents: Vec<serde_json::Value> = picked
+        .iter()
+        .map(|i| json!({"id": i.id, "name": i.name, "machine": i.target.strip_prefix("agent:").unwrap_or(&i.target), "kind": i.kind, "status": i.status}))
+        .collect();
+    Ok(srv::json(
+        StatusCode::OK,
+        &json!({"agents": agents, "machines": machines, "commands": counted(commands), "modes": counted(modes), "models": counted(models), "efforts": counted(efforts)}),
+    ))
 }
 
 async fn harness_command(hub: &Hub, id: &str, req: Request) -> R {

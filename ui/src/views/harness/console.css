@@ -768,6 +768,14 @@
 .pl-hint {
   color: #7b7e88;
 }
+/* How many of the agents written to have it, when not all do. */
+.pl-note {
+  margin-left: 8px;
+  color: #c6b08e;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
 .pl-desc {
   min-width: 0;
   overflow: hidden;

@@ -468,24 +468,235 @@ a.ms-why:hover {
   padding: 14px 16px;
   border: 1px solid #2a3039;
   border-radius: 9px;
-  background: rgb(10 12 15 / 96%);
+  /* Opaque: Safari draws a sticky, see-through panel with the list showing through it. */
+  background: #0a0c0f;
   box-shadow: 0 18px 48px rgb(0 0 0 / 55%);
-  backdrop-filter: blur(10px);
+  isolation: isolate;
 }
-.ms-broadcast-head {
+.ms-actions-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.ms-bc-head {
   display: flex;
   align-items: center;
   gap: 12px;
   min-width: 0;
 }
-.ms-broadcast-names {
+.ms-bc-reach {
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  color: #797c84;
-  font-size: 12px;
+  color: #97999f;
+  font-family: var(--font-mono);
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* To: the same quiet tabs as Queue/Steer/Now. */
+.ms-bc-to {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-top: 12px;
+}
+.ms-bc-to > button,
+.ms-bc-q {
+  position: relative;
+  padding: 6px 0;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.ms-bc-to > button:hover,
+.ms-bc-q:hover:not(:disabled) {
+  color: #ededee;
+}
+.ms-bc-to > button[aria-checked="true"] {
+  color: #ededee;
+}
+.ms-bc-to > button[aria-checked="true"]::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg, #a4cec2, #a4b0d6, #c3a5cf, #d2bda2);
+  content: "";
+}
+.ms-bc-q:disabled {
+  color: #55585f;
+}
+.ms-bc-q[aria-expanded="true"] {
+  color: #ededee;
+}
+.ms-bc-danger:not(:disabled) {
+  color: #d1aaad;
+}
+.ms-bc-filter {
+  margin-top: 6px;
+}
+.ms-bc-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 0;
+  overflow: hidden;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ms-bc-facets {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 6px 0 2px;
+  padding-left: 18px;
+}
+.ms-bc-facet {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.ms-bc-facet-label {
+  width: 64px;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+/* A choice: a pill, filled when on. */
+.ms-bc-chip {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 11px;
+  border: 1px solid #30323a;
+  border-radius: 999px;
+  color: #b4b6bd;
+  font-size: 12px;
+}
+.ms-bc-chip:hover:not(:disabled) {
+  border-color: #4a4c55;
+  color: #ededee;
+}
+.ms-bc-chip[aria-pressed="true"] {
+  border-color: #b9b2dc;
+  background: rgb(185 178 220 / 12%);
+  color: #ededee;
+}
+.ms-bc-chip > i {
+  color: #c6b08e;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-style: normal;
+}
+.ms-bc-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.ms-bc-compose .ms-broadcast-input {
+  margin: 0 0 10px;
+}
+.ms-bc-quick,
+.ms-bc-ask {
+  display: flex;
+  min-height: 36px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 18px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #22252b;
+}
+.ms-bc-gap {
+  flex: 1;
+}
+.ms-bc-ask {
+  justify-content: space-between;
+  color: #e2cfae;
+  font-size: 12.5px;
+}
+.ms-bc-ask-actions {
+  display: flex;
+  gap: 8px;
+}
+.ms-bc-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+/* After a send: one line, opened for each agent's outcome. Its place is kept, sent or not. */
+.ms-bc-result {
+  min-height: 22px;
+  margin-top: 6px;
+}
+.ms-bc-result-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #c8cad0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.ms-bc-outcomes {
+  max-height: min(34dvh, 300px);
+  margin: 4px 0 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  overscroll-behavior: contain;
+}
+.ms-bc-outcomes > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 2px 12px;
+  padding: 6px 0;
+  border-top: 1px solid #1f2227;
+  font-size: 12px;
+}
+.ms-bc-o-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #e4e5e7;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-bc-o-where {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.ms-bc-o-result {
+  color: #a8c9bc;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+}
+.ms-bc-outcomes > li[data-result="skipped"] .ms-bc-o-result {
+  color: #c6b08e;
+}
+.ms-bc-outcomes > li[data-result="failed"] .ms-bc-o-result {
+  color: #d1aaad;
+}
+.ms-bc-o-why {
+  grid-column: 1 / -1;
+  color: #8f939e;
+  font-size: 11.5px;
 }
 .ms-broadcast-input {
   display: block;
@@ -555,6 +766,16 @@ a.ms-why:hover {
   .ms-check {
     display: none;
   }
+  /* Picking agents to message: each row shows its checkbox, beside what it is. */
+  .ms-page[data-selecting] .ms-row:not(.ms-found-row) {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "check main main"
+      "check meta actions";
+  }
+  .ms-page[data-selecting] .ms-check {
+    display: grid;
+  }
   .ms-name {
     font-size: 16px;
     line-height: 22px;
@@ -570,6 +791,10 @@ a.ms-why:hover {
     min-width: 0;
   }
   .ms-mark {
+    display: none;
+  }
+  /* Quick commands wrap from the left; nothing is pushed alone to a line of its own. */
+  .ms-bc-gap {
     display: none;
   }
   .ms-tool {

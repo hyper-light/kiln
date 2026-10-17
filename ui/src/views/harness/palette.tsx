@@ -140,7 +140,20 @@ export function ReplyPanel({ reply, onClose }: { reply: Reply | "loading"; onClo
 }
 
 /** The list over the composer while a command name is typed. */
-export function CommandList({ items, index, onPick, onHover }: { items: SlashCommand[]; index: number; onPick: (c: SlashCommand) => void; onHover: (i: number) => void }) {
+export function CommandList({
+  items,
+  index,
+  onPick,
+  onHover,
+  note,
+}: {
+  items: SlashCommand[];
+  index: number;
+  onPick: (c: SlashCommand) => void;
+  onHover: (i: number) => void;
+  /** A word beside a name, e.g. how many of the agents written to have it. */
+  note?: (c: SlashCommand) => string | undefined;
+}) {
   const ref = React.useRef<HTMLUListElement>(null);
   React.useEffect(() => {
     ref.current?.querySelector<HTMLElement>('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
@@ -171,6 +184,7 @@ export function CommandList({ items, index, onPick, onHover }: { items: SlashCom
                 <span className="pl-name">
                   /{c.name}
                   {c.hint && <span className="pl-hint"> {c.hint}</span>}
+                  {note?.(c) && <span className="pl-note">{note(c)}</span>}
                 </span>
                 <span className="pl-desc">{off && c.route?.kind === "unsupported" ? c.route.reason : c.description}</span>
               </button>

@@ -322,6 +322,51 @@ export interface SlashCommand {
     | { kind: "unsupported"; reason: string };
 }
 
+/** Which agents a broadcast picks: `ids` exactly; else `all`, or filters that must all match (none: nothing). */
+export interface BroadcastTo {
+  all?: boolean;
+  ids?: string[];
+  machines?: string[];
+  kinds?: string[];
+  status?: string[];
+}
+
+export interface BroadcastBody {
+  to: BroadcastTo;
+  text?: string;
+  mode?: SendMode;
+  command?: Command;
+  approvals?: "allow" | "deny";
+}
+
+export interface BroadcastOutcome {
+  id: string;
+  name: string;
+  machine: string;
+  kind: string;
+  result: "sent" | "skipped" | "failed";
+  reason?: string;
+}
+
+export interface BroadcastReport {
+  id: string;
+  sent: number;
+  skipped: number;
+  failed: number;
+  results: BroadcastOutcome[];
+}
+
+type Counted<T> = T & { count: number };
+
+export interface BroadcastPreview {
+  agents: { id: string; name: string; machine: string; kind: string; status: Status }[];
+  machines: string[];
+  commands: Counted<SlashCommand>[];
+  modes: Counted<ModeOption>[];
+  models: Counted<ModelOption>[];
+  efforts: Counted<ControlOption>[];
+}
+
 export interface ControlOption {
   id: string;
   label: string;
@@ -571,6 +616,10 @@ export const harnessApi = {
   },
   /** One command to many agents (each send gets its own message id). */
   broadcast: (ids: string[], c: Command) => call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }),
+  /** One thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits. */
+  broadcastTo: (body: BroadcastBody) => call<BroadcastReport>("POST", "/api/harness/broadcast", body),
+  /** Who a broadcast to `to` would reach, and their catalogs merged (each entry with how many have it). */
+  broadcastPreview: (to: BroadcastTo) => call<BroadcastPreview>("POST", "/api/harness/broadcast/preview", { to }),
 };
 
 let seq = 0;

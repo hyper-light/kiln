@@ -7,10 +7,10 @@ import * as React from "react";
 import "./harness.css";
 import "./mission.css";
 import { Link, useNavigate, useSearchParams } from "react-router";
-import { ArrowUpRight, ChevronRight, Plus, Send, X } from "lucide-react";
+import { ArrowUpRight, ChevronRight, Plus } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import { clientId, harnessApi, type AgentInfo, type ApprovalBrief, type SendMode } from "@/api/harness";
+import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { ErrorState, PageIntro, SkeletonRows } from "@/components/ui/misc";
@@ -18,6 +18,7 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useLocalStorage } from "@/lib/hooks";
 import { plain } from "./derive";
 import { AgentMenu } from "./actions";
+import { MessageMany } from "./broadcast";
 import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { useSeen } from "./seen";
@@ -152,64 +153,6 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
   );
 });
 
-function Broadcast({ ids, agents, onDone }: { ids: string[]; agents: AgentInfo[]; onDone: () => void }) {
-  const [text, setText] = React.useState("");
-  const [mode, setMode] = React.useState<SendMode>("queue");
-  const [busy, setBusy] = React.useState(false);
-  const send = async () => {
-    const body = text.trim();
-    if (!body) return;
-    setBusy(true);
-    let failed = ids.length;
-    try {
-      const r = await harnessApi.broadcast(ids, { type: "send", id: clientId(), text: body, mode });
-      failed = ids.length - r.sent.length;
-    } catch {
-      /* counted as failed */
-    }
-    setBusy(false);
-    if (failed) toast.error(`${failed} of ${ids.length} didn't get it`, "Their machines may be reconnecting.");
-    else toast.success(`Sent to ${ids.length} agent${ids.length === 1 ? "" : "s"}`);
-    setText("");
-    onDone();
-  };
-  const names = agents.filter((a) => ids.includes(a.id)).map((a) => a.name);
-  return (
-    <div className="ms-broadcast" role="region" aria-label="Message the selected agents">
-      <div className="ms-broadcast-head">
-        <span className="ms-eyebrow">To {ids.length} agents</span>
-        <span className="ms-broadcast-names">{names.join(", ")}</span>
-        <button
-          type="button"
-          className="ms-link ms-danger"
-          onClick={() => {
-            if (!window.confirm(`End ${ids.length} agent${ids.length === 1 ? "" : "s"}? Their processes stop on the machines.`)) return;
-            void Promise.allSettled(ids.map((id) => harnessApi.stop(id))).then(onDone);
-          }}
-        >
-          End {ids.length}
-        </button>
-        <button type="button" className="hx-icon" aria-label="Clear selection" onClick={onDone}>
-          <X size={14} />
-        </button>
-      </div>
-      <textarea className="ms-broadcast-input" rows={2} value={text} onChange={(e) => setText(e.target.value)} placeholder="Message every selected agent" />
-      <div className="ms-broadcast-bar">
-        <div className="ms-modes" role="radiogroup" aria-label="How to send">
-          {(["queue", "steer", "now"] as SendMode[]).map((m) => (
-            <button key={m} type="button" role="radio" aria-checked={mode === m} onClick={() => setMode(m)}>
-              {m === "queue" ? "Queue" : m === "steer" ? "Steer" : "Now"}
-            </button>
-          ))}
-        </div>
-        <Button size="sm" onClick={send} disabled={busy || !text.trim()}>
-          <Send /> Send to {ids.length}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 export default function Mission() {
   useDocumentTitle("Agents");
   const { list, error, reload } = useAgents();
@@ -219,6 +162,8 @@ export default function Mission() {
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [spawn, setSpawn] = React.useState(false);
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
+  // Message agents: open with rows selected, or from the header for every agent (or a filter).
+  const [messaging, setMessaging] = React.useState(false);
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   // ?new=1 (links from elsewhere): open New agents.
@@ -292,16 +237,21 @@ export default function Mission() {
   }, []);
 
   return (
-    <div className="container-console page ms-page" data-selecting={selected.size > 0 || undefined}>
+    <div className="container-console page ms-page" data-selecting={selected.size > 0 || messaging || undefined}>
       <PageIntro
         index={5}
         label="Agents"
         title="Mission control."
         lead={lead}
         actions={
-          <Button onClick={() => setSpawn(true)}>
-            New agents <Plus />
-          </Button>
+          <div className="ms-actions-head">
+            <Button variant="secondary" onClick={() => setMessaging(true)} disabled={!list?.length}>
+              Message agents
+            </Button>
+            <Button onClick={() => setSpawn(true)}>
+              New agents <Plus />
+            </Button>
+          </div>
         }
       />
 
@@ -351,7 +301,16 @@ export default function Mission() {
         </section>
       )}
 
-      {selected.size > 0 && <Broadcast ids={[...selected]} agents={rows.map((r) => r.a)} onDone={() => setSelected(new Set())} />}
+      {(selected.size > 0 || messaging) && (
+        <MessageMany
+          selected={[...selected]}
+          agents={list ?? []}
+          onClose={() => {
+            setSelected(new Set());
+            setMessaging(false);
+          }}
+        />
+      )}
 
       <SpawnDialog
         open={spawn}
