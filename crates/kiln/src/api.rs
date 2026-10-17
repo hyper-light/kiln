@@ -220,6 +220,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
+        (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
@@ -255,6 +256,21 @@ fn ai_sessions(hub: &Hub) -> Response {
     }
     out.sort_by_key(|v| std::cmp::Reverse(v.get("last_activity").and_then(serde_json::Value::as_i64).unwrap_or(0)));
     srv::json(StatusCode::OK, &out)
+}
+
+/// Connected runners that have never reported AI sessions (an older kiln): what they run can't
+/// be listed. A current runner reports right after it connects, even when it has none.
+fn ai_silent(hub: &Hub) -> Response {
+    let reporting: std::collections::HashSet<String> = hub.ai_sessions.lock().keys().cloned().collect();
+    let mut machines: Vec<String> = hub
+        .agents
+        .lock()
+        .values()
+        .filter(|a| a.connected && !a.ephemeral && !reporting.contains(&a.name))
+        .map(|a| a.name.clone())
+        .collect();
+    machines.sort();
+    srv::json(StatusCode::OK, &json!({ "machines": machines }))
 }
 
 /// The recent messages of one session, read from its machine.
