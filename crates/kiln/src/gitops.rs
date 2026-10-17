@@ -113,6 +113,8 @@ pub async fn sync_mirror(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
     let path = mirror_path(hub, &repo.name);
     let p = path.to_string_lossy().to_string();
     if path.join("HEAD").exists() {
+        // The repository may have moved to another remote since the mirror was cloned.
+        run_git(hub, &["-C", &p, "remote", "set-url", "origin", &repo.clone_url], LS_REMOTE_TIMEOUT).await?;
         run_git(hub, &["-C", &p, "fetch", "--prune", "--quiet", "origin",
             "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", "+refs/pull/*/head:refs/pull/*/head"], GIT_TIMEOUT)
             .await?;
