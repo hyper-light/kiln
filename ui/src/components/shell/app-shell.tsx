@@ -22,6 +22,7 @@ const TerminalWorkspace = React.lazy(() => import("@/views/terminal/workspace"))
 export const NAV = [
   { to: "/", label: "Overview", end: true },
   { to: "/runs", label: "Runs" },
+  { to: "/deployments", label: "Deployments" },
   { to: "/repos", label: "Repos" },
   { to: "/runners", label: "Runners" },
   { to: "/agents", label: "Agents" },
@@ -130,8 +131,7 @@ export function AppShell({ me }: { me: Me | null }) {
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-[80] bg-black/65 backdrop-blur-sm" />
           <Dialog.Content
-            className="fixed inset-x-0 top-0 z-[90] max-h-[100dvh] overflow-y-auto border-b border-white/10 bg-[#08090a] px-5 pt-[max(0.5rem,env(safe-area-inset-top))] pb-8 text-[#e4e5e7] shadow-2xl outline-none sm:px-8"
-            style={{ animation: "dialog-in-top .3s var(--ease)" }}
+            className="nav-sheet fixed inset-x-0 top-0 z-[90] max-h-[100dvh] overflow-y-auto border-b border-white/10 bg-[#08090a] px-5 pt-[max(0.5rem,env(safe-area-inset-top))] pb-8 text-[#e4e5e7] shadow-2xl outline-none sm:px-8"
           >
             <Dialog.Title className="sr-only">Navigation</Dialog.Title>
             <Dialog.Description className="sr-only">kiln console sections</Dialog.Description>

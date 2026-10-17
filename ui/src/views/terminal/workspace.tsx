@@ -646,7 +646,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
             <div className="flex max-w-[640px] flex-col items-center text-center">
               <Optic size={200} />
               <div className="eyebrow mt-6">
-                <span className="spectrum-rule" /> 05 / Terminal
+                <span className="spectrum-rule" /> 07 / Terminal
               </div>
               <h1 className="mt-4 text-[clamp(28px,3.4vw,40px)] leading-[1.1] font-[450] tracking-[-0.045em]">Full control, any machine.</h1>
               <p className="mt-3 max-w-[460px] text-[14px] leading-[1.8] text-[#a1a4ad]">

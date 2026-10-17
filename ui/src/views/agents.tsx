@@ -110,7 +110,7 @@ export default function Agents() {
   return (
     <div className="container-console page">
       <PageIntro
-        index={5}
+        index={6}
         label="Agents"
         title="Sessions on your machines"
         lead={

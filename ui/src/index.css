@@ -1812,6 +1812,11 @@ html[data-motion="paused"] [data-reveal] {
 html[data-motion="paused"] .skeleton::after {
   display: none;
 }
+/* Arrivals play only while motion plays: a paused arrival would hold at its first, invisible
+   frame, and reduced-motion users are always paused. */
+html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .nav-sheet, .sp-sheet) {
+  animation: none;
+}
 
 @media (prefers-reduced-motion: reduce) {
   html {
@@ -1846,6 +1851,9 @@ html[data-motion="paused"] .skeleton::after {
   }
 }
 
+.nav-sheet {
+  animation: dialog-in-top 0.3s var(--ease);
+}
 @keyframes dialog-in-top {
   from {
     opacity: 0;

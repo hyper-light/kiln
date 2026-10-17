@@ -134,7 +134,10 @@ compared three ways against `last-applied-configuration` until kiln first applie
 
 Equality is checked on hashes first. Each object's normalized desired form and live form are
 hashed; a watch event or a new render recompares only the objects whose hashes moved. A
-human-readable diff is computed only when someone asks.
+human-readable diff is computed only when someone asks, and it shows what a sync would change:
+kiln predicts the live object after the apply (what it sets laid over what runs, what it no longer
+sets dropped) and diffs the two, so defaults the cluster filled in never show as differences.
+Secrets are masked alike on both sides, so a changed value still shows as changed.
 
 **Ignoring differences.** `ignore` rules take JSON pointers, a jq-style path subset
 (`.spec.template.spec.containers[] | select(.name == "app") | .image`) and field managers, per
@@ -364,6 +367,13 @@ objects, comparisons and health. It lives in the memory of the server that recon
 rebuilt from git and the clusters after a failover, and is never written per change. Argo CD writes
 status into every Application object; kiln writes only what it can't recompute.
 
+**Restarts.** A restarted server judges nothing before it has read the cluster: an object of a
+kind not yet listed is *unread*, not missing, and automation waits. An app's render waits for its
+cluster too, since Helm's `.Capabilities` come from it. Automation resumes from the replicated
+history, so the last sync of a render counts as attempted: a restart syncs nothing again, and
+drift stays where self-heal is off. Failed syncs are kept in the history too, but never push out
+successful ones.
+
 **Where work happens.** Apps are split into shards by destination cluster, so one server holds
 each cluster's watches. Each shard is a raft group. Its leader reconciles it, and shards move
 between servers as they join and leave (hyper-swim membership). One server runs every shard.
@@ -430,17 +440,22 @@ and the network come on top, and are measured separately as they are built.
 
 | Part | State |
 | --- | --- |
-| Engine (`crates/kiln-cd`): health, diff, sync planning (phases, waves, hooks, prunes), controller, retries, self-heal, request budgets | built, tested (62 tests), benchmarked to 1M apps |
+| Engine (`crates/kiln-cd`): health, diff (with predicted results), sync planning (phases, waves, hooks, prunes), controller, retries, self-heal, request budgets, restart safety | built, tested (70 tests), benchmarked to 1M apps |
 | Rendering: directories, Helm (binary), Kustomize (binary), plugins; content-addressed render keys | built; Helm tested on kiln's own charts. Jsonnet and kiln's native Helm and Kustomize engines: not yet |
 | Git: mirrors, revisions, path hashes, extraction, symlinks | built |
 | Durable state on hyper-raft (one voter) | built; replicas across servers: not yet |
-| Clusters: kubeconfig (exec plugins included), in-cluster, discovery, watches, server-side apply | built; runner and delegated modes: not yet |
+| Clusters: kubeconfig (exec plugins included), in-cluster, discovery (again when a CRD appears), watches, server-side apply | built; runner and delegated modes: not yet |
 | Argo CD Applications (import, app of apps, tracking, shadow mode, take-over) | built; ApplicationSets and AppProjects: not yet |
 | `.kiln/deploy.yaml` and environments | parsed and tested; read from kiln repositories: not yet |
 | `/api/cd`, `kiln cd` | built |
-| UI, MCP (code mode), skills, notifications, windows, projects and RBAC, plans and previews for diffs | not yet |
+| MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; Claude Code sessions kiln starts get it | built |
+| UI: the fleet list (windowed, filtered on the server, live) and an app's page (resources, diff, history; sync, refresh, take over, stop, delete) | built; environments board, previews, fleets, rollback: not yet |
+| Notifications, windows, projects and RBAC, plans and previews for diffs, rollback | not yet |
 
 Checked against a live cluster: in shadow mode, kiln agrees with Argo CD on kiln's own app of
 apps (four apps, the same sync, health and resource counts). On a cluster of its own, a kiln app
 synced through its PreSync hook and waves, followed a commit (with a prune), healed hand edits
-in 7 s, and was deleted with its objects while the namespace it created stayed.
+in 7 s, and was deleted with its objects while the namespace it created stayed. With self-heal
+off, a hand edit survived a restart of kiln untouched (no sync ran), and its diff showed only the
+edited fields. An app shipping two CRDs (one namespaced, one cluster-scoped) and an object of
+each synced in one go.
