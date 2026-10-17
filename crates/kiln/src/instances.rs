@@ -62,6 +62,10 @@ pub struct Instance {
     pub retire_sent: Option<Instant>,
     /// It was told to stop taking jobs (it is not the newest).
     pub drained: bool,
+    /// The build it runs ([`crate::proto::AgentMsg::Build`]); `None` for runners from before.
+    pub build: Option<String>,
+    /// What it can do ([`crate::proto::CAP_UPGRADE`] ...).
+    pub caps: u32,
 }
 
 impl Instance {
@@ -93,6 +97,10 @@ pub struct InstanceView {
     pub terminals: usize,
     pub agents: usize,
     pub jobs: usize,
+    /// The build it runs, when it says (runners from before builds were reported don't).
+    pub build: Option<String>,
+    /// It takes an upgrade command; older runners are upgraded through a terminal instead.
+    pub can_upgrade: bool,
 }
 
 #[derive(Default)]
@@ -141,6 +149,8 @@ impl Instances {
                 connected_at: now,
                 retire_sent: None,
                 drained: false,
+                build: None,
+                caps: 0,
             },
         );
         // Ownership moves with the instance.
@@ -169,6 +179,14 @@ impl Instances {
     /// The machine's newest connected instance: where new work goes.
     pub fn newest(&self, name: &str) -> Option<PeerId> {
         self.newest_of(name)
+    }
+
+    /// [`crate::proto::AgentMsg::Build`]: which build an instance runs and what it can do.
+    pub fn set_build(&mut self, peer: PeerId, build: String, caps: u32) {
+        if let Some(i) = self.by_peer.get_mut(&peer) {
+            i.build = Some(build);
+            i.caps = caps;
+        }
     }
 
     pub fn get(&self, peer: PeerId) -> Option<&Instance> {
@@ -243,6 +261,8 @@ impl Instances {
                     terminals,
                     agents,
                     jobs,
+                    build: i.build.clone(),
+                    can_upgrade: i.caps & crate::proto::CAP_UPGRADE != 0,
                 }
             })
             .collect();

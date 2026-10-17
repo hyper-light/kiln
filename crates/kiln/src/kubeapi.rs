@@ -1,6 +1,7 @@
 //! A minimal Kubernetes REST client: exactly what the pod executor needs (create, get, list by
-//! label, delete pods), over kiln's own HTTPS client on hyper-rt + hyper-tls. Object types come
-//! from `k8s-openapi` (plain serde types, no runtime).
+//! label, delete pods, read their logs) and restarting kiln's own Deployment (Settings →
+//! Updates), over kiln's own HTTPS client on hyper-rt + hyper-tls. Object types come from
+//! `k8s-openapi` (plain serde types, no runtime).
 //!
 //! Credentials, in order:
 //! 1. **In-cluster**: `KUBERNETES_SERVICE_HOST`/`_PORT` and the mounted service-account token
@@ -227,13 +228,19 @@ impl KubeApi {
     }
 
     async fn call(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> anyhow::Result<(u16, Vec<u8>)> {
+        self.call_as(method, path, body, "application/json", "application/json").await
+    }
+
+    /// [`Self::call`] naming the body's content type (patches say which kind they are) and what
+    /// to answer with (logs are text).
+    async fn call_as(&self, method: Method, path: &str, body: Option<Vec<u8>>, content_type: &str, accept: &str) -> anyhow::Result<(u16, Vec<u8>)> {
         let url = format!("{}{path}", self.server);
-        let mut req = self.client.request(method, &url).header("Accept", "application/json");
+        let mut req = self.client.request(method, &url).header("Accept", accept);
         if let Some(t) = self.bearer()? {
             req = req.bearer(&t);
         }
         if let Some(b) = body {
-            req = req.header("Content-Type", "application/json").body(b);
+            req = req.header("Content-Type", content_type).body(b);
         }
         let resp = req.send().await?;
         let status = resp.status();
@@ -273,6 +280,26 @@ impl KubeApi {
             return Err(Self::api_error(code, &resp));
         }
         Ok(serde_json::from_slice::<PodList>(&resp).context("decode pod list")?.items)
+    }
+
+    /// A pod's log (its only container's), as text.
+    pub async fn pod_log(&self, name: &str) -> anyhow::Result<String> {
+        let (code, resp) = self.call_as(Method::Get, &format!("{}/{}/log", self.pods_path(), encode(name)), None, "application/json", "*/*").await?;
+        if code != 200 {
+            return Err(Self::api_error(code, &resp));
+        }
+        Ok(String::from_utf8_lossy(&resp).into_owned())
+    }
+
+    /// Restart a Deployment's pods the way `kubectl rollout restart` (and ArgoCD's restart
+    /// action) does: a new pod-template annotation, so its rollout strategy replaces them.
+    pub async fn restart_deployment(&self, name: &str) -> anyhow::Result<()> {
+        let path = format!("/apis/apps/v1/namespaces/{}/deployments/{}", encode(&self.namespace), encode(name));
+        let patch = serde_json::json!({
+            "spec": { "template": { "metadata": { "annotations": { "kubectl.kubernetes.io/restartedAt": crate::util::now_rfc3339() } } } }
+        });
+        let (code, resp) = self.call_as(Method::Patch, &path, Some(serde_json::to_vec(&patch)?), "application/strategic-merge-patch+json", "application/json").await?;
+        if (200..300).contains(&code) { Ok(()) } else { Err(Self::api_error(code, &resp)) }
     }
 
     /// Delete a pod in the background (its containers stop on their grace period). A pod that is

@@ -293,6 +293,11 @@ impl Sessions {
         v
     }
 
+    /// The sessions people see: not those kiln opens for itself ([`hidden`]).
+    pub fn visible(&self) -> Vec<Info> {
+        self.list().into_iter().filter(|i| !hidden(i.command.as_deref())).collect()
+    }
+
     /// Sessions whose shell is still running.
     pub fn live(&self) -> usize {
         self.map.lock().values().filter(|s| !s.is_exited()).count()
@@ -392,6 +397,12 @@ pub fn open_local(hub: &Arc<Hub>, command: Option<String>, cols: u16, rows: u16)
     });
     hub.emit_terminals();
     Ok(session)
+}
+
+/// A terminal kiln opened for itself, such as upgrading an older runner
+/// ([`crate::updates::HIDDEN_MARK`]): never listed as anyone's terminal.
+pub fn hidden(command: Option<&str>) -> bool {
+    command.is_some_and(|c| c.contains(crate::updates::HIDDEN_MARK))
 }
 
 /// Open a shell on a machine through its agent.

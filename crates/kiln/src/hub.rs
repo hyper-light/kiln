@@ -133,6 +133,8 @@ pub struct Hub {
     /// Runner processes that went away while their machine stayed connected through another
     /// one, with when and the jobs they held (requeued if they do not come back in time).
     lost_instances: Mutex<HashMap<PeerId, (String, Instant, Vec<String>)>>,
+    /// Upgrades of runners and of this server, started from Settings → Updates.
+    pub updates: crate::updates::Updates,
 }
 
 impl Hub {
@@ -184,6 +186,7 @@ impl Hub {
             joins: crate::join::Requests::default(),
             instances: Mutex::new(crate::instances::Instances::default()),
             lost_instances: Mutex::new(HashMap::new()),
+            updates: crate::updates::Updates::default(),
         })
     }
 
@@ -621,6 +624,13 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
+            AgentMsg::Build { build, caps } => {
+                self.instances.lock().set_build(peer, build.clone(), caps);
+                self.updates.on_build(self, &agent, &build);
+                self.emit(&serde_json::json!({ "type": "updates" }));
+            }
+            AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
+            AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
                 Ok(u) => {
                     let closed = matches!(u, crate::harness::core::Update::Closed);
@@ -889,10 +899,16 @@ impl Hub {
 
     /// A machine's runner processes, while it has more than one, with what each holds.
     fn instance_views(&self, name: &str) -> Vec<crate::instances::InstanceView> {
-        use crate::instances::Owned;
         if self.instances.lock().of(name).len() < 2 {
             return Vec::new();
         }
+        self.runner_processes(name)
+    }
+
+    /// Every runner process of a machine and what each one holds (Settings → Updates lists
+    /// them always; agent views only while a machine has more than one).
+    pub fn runner_processes(&self, name: &str) -> Vec<crate::instances::InstanceView> {
+        use crate::instances::Owned;
         let target = format!("agent:{name}");
         let terms: Vec<Owned> = self.terminals.list().into_iter().filter(|t| t.target == target && !t.exited).map(|t| Owned::Terminal(t.id)).collect();
         let agents: Vec<Owned> = self.harness.list().into_iter().filter(|i| i.target == target).map(|i| Owned::Agent(i.id)).collect();

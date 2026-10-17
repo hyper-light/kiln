@@ -16,6 +16,9 @@ import type {
   RunDetail,
   SystemInfo,
   TerminalSessionInfo,
+  UpdateJob,
+  UpdatesOverview,
+  KilnBinary,
 } from "./types";
 
 export class ApiError extends Error {
@@ -52,13 +55,13 @@ async function request<T>(
   method: string,
   path: string,
   body?: unknown,
-  opts: { raw?: boolean; signal?: AbortSignal } = {},
+  opts: { raw?: boolean; signal?: AbortSignal; file?: Blob } = {},
 ): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: "same-origin",
-    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    headers: opts.file ? { "content-type": "application/octet-stream" } : body !== undefined ? { "content-type": "application/json" } : undefined,
+    body: opts.file ?? (body !== undefined ? JSON.stringify(body) : undefined),
     signal: opts.signal,
   };
   const res = await fetch(path, init);
@@ -179,6 +182,16 @@ export const api = {
   aiTranscript: (machine: string, pid: number, signal?: AbortSignal) =>
     get<AiTranscriptEntry[]>(`/api/ai-sessions/${enc(machine)}/${pid}/transcript`, signal),
   audit: (limit = 200, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit })}`, signal),
+
+  /** Settings → Updates: the server, every runner, recent upgrades and the binaries kiln has. */
+  updates: (signal?: AbortSignal) => get<UpdatesOverview>("/api/updates", signal),
+  /** Ask GitHub (and, in Kubernetes, the image on the node) again; an `updates` event follows. */
+  checkUpdates: () => post<UpdatesOverview>("/api/updates/check"),
+  upgradeRunner: (name: string) => post<UpdateJob>(`/api/updates/runners/${enc(name)}`),
+  upgradeAllRunners: () => post<{ jobs: UpdateJob[]; errors: string[] }>("/api/updates/runners"),
+  upgradeServer: (action: "restart" | "replace") => post<UpdateJob>("/api/updates/server", { action }),
+  uploadBinary: (target: string, file: Blob) => request<KilnBinary>("POST", `/api/updates/binaries${qs({ target })}`, undefined, { file }),
+  deleteBinary: (target: string) => del<void>(`/api/updates/binaries/${enc(target)}`),
 };
 
 /** Build a ws:// or wss:// URL for a same-origin path. */
