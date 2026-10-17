@@ -323,8 +323,18 @@ impl Data {
                 let app = deployment.app.clone();
                 let h = self.history.entry(app.clone()).or_default();
                 h.push_back(*deployment);
+                // Failures go first, so a run of failed syncs never pushes out the deployments a
+                // rollback needs; the newest entry always stays (automation goes on from it).
                 while h.len() > limit.max(1) as usize {
-                    h.pop_front();
+                    let newest = h.len().saturating_sub(1);
+                    match h.iter().position(|d| !d.succeeded).filter(|&i| i < newest) {
+                        Some(i) => {
+                            h.remove(i);
+                        }
+                        None => {
+                            h.pop_front();
+                        }
+                    }
                 }
                 changes.push(Change::Deployed(app));
             }
@@ -576,6 +586,18 @@ mod tests {
             cascade: true,
             managed_namespace: None,
         }
+    }
+
+    #[test]
+    fn failed_syncs_never_push_out_successful_ones() {
+        let mut d = Data::default();
+        let mut ch = Vec::new();
+        for (op, succeeded) in [(0, true), (1, true), (2, true), (3, false), (4, false), (5, false)] {
+            let dep = Deployment { app: "default/web".into(), op, succeeded, ..Deployment::default() };
+            assert!(d.apply(Command::Deployed { deployment: Box::new(dep), limit: 3 }, &mut ch).is_ok());
+        }
+        let ops: Vec<u64> = d.history.get("default/web").map(|h| h.iter().map(|x| x.op).collect()).unwrap_or_default();
+        assert_eq!(ops, [1, 2, 5]);
     }
 
     #[test]

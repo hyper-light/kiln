@@ -272,6 +272,11 @@ impl Scopes {
         }
     }
 
+    /// Whether discovery (or a CRD) said anything of this kind.
+    pub fn knows(&self, gk: &GroupKind) -> bool {
+        self.cluster.contains(gk) || self.namespaced.contains(gk)
+    }
+
     /// Whether objects of this kind live in namespaces.
     pub fn namespaced(&self, group: &str, kind: &str) -> bool {
         let gk = GroupKind::new(group, kind);

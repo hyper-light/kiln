@@ -51,6 +51,8 @@ pub struct Cluster {
     pub discovery: parking_lot::RwLock<Arc<Discovery>>,
     /// `gitVersion` without the `v`, for Helm's `--kube-version`.
     pub version: parking_lot::RwLock<Option<String>>,
+    /// When discovery last ran, so kinds it doesn't know send it again only now and then.
+    discovered_at: Mutex<Option<Instant>>,
 }
 
 impl Cluster {
@@ -89,6 +91,7 @@ impl Cluster {
             exec: Mutex::new(None),
             discovery: parking_lot::RwLock::new(Arc::new(Discovery::default())),
             version: parking_lot::RwLock::new(None),
+            discovered_at: Mutex::new(None),
         })
     }
 
@@ -249,6 +252,7 @@ impl Cluster {
 
     /// Discovers every kind the cluster serves, and its version.
     pub async fn discover(&self) -> Result<Arc<Discovery>> {
+        *self.discovered_at.lock() = Some(Instant::now());
         let mut d = Discovery::default();
         for path in ["/api", "/apis"] {
             let doc = self.get_json(path, true).await?;
@@ -266,7 +270,28 @@ impl Cluster {
     }
 
     fn resource(&self, group: &str, kind: &str) -> Result<Resource> {
-        self.discovery.read().get(group, kind).cloned().with_context(|| format!("cluster {} serves no {group}/{kind}", self.name))
+        // Worded as the API server words it, so a dry run of a kind whose CRD the same sync
+        // applies reads as the expected miss it is.
+        self.discovery
+            .read()
+            .get(group, kind)
+            .cloned()
+            .with_context(|| format!("{group}/{kind} not found: the server could not find the requested resource (cluster {} doesn't serve it)", self.name))
+    }
+
+    /// Whether discovery found `gk`.
+    pub fn knows(&self, gk: &GroupKind) -> bool {
+        self.discovery.read().get(&gk.group, &gk.kind).is_some()
+    }
+
+    /// Claims a discovery if the last ran at least `every` ago, so callers don't all run one.
+    pub fn claim_discovery(&self, every: Duration) -> bool {
+        let mut at = self.discovered_at.lock();
+        if at.is_some_and(|t| t.elapsed() < every) {
+            return false;
+        }
+        *at = Some(Instant::now());
+        true
     }
 
     /// Server-side apply of `object` as `manager`: the object as stored.

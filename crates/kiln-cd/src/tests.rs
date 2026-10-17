@@ -121,6 +121,112 @@ fn drift_is_healed_only_with_self_heal() {
 }
 
 #[test]
+fn a_diff_shows_only_what_a_sync_changes() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.sync.self_heal = false;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    let key = ResKey::new("apps", "Deployment", "web", "web");
+    h.edit("dev", &key, |v| {
+        if let Some(c) = v.pointer_mut("/spec/template/spec/containers/0").and_then(Value::as_object_mut) {
+            c.insert("image".into(), json!("evil:1"));
+        }
+    });
+    h.run_for(5_000);
+    let change = h.engine.change("web", &key);
+    let image = |v: Option<&Value>| v.and_then(|v| v.pointer("/spec/template/spec/containers/0/image")).cloned();
+    assert_eq!(
+        change.as_ref().map(|c| (image(c.before.as_ref()), image(c.after.as_ref()))),
+        Some((Some(json!("evil:1")), Some(json!("web:1"))))
+    );
+    // Everything else, the cluster's defaults included, is the same on both sides.
+    let mut healed = change.as_ref().and_then(|c| c.before.clone());
+    if let Some(c) = healed.as_mut().and_then(|v| v.pointer_mut("/spec/template/spec/containers/0")).and_then(Value::as_object_mut) {
+        c.insert("image".into(), json!("web:1"));
+    }
+    assert!(healed.as_ref().and_then(|v| v.pointer("/spec/template/spec/containers/0/imagePullPolicy")).is_some());
+    assert_eq!(healed, change.and_then(|c| c.after));
+}
+
+/// A second engine over the same simulated cluster: kiln restarted.
+fn restart(h: &mut Harness) -> (Harness, Git) {
+    let (mut h2, git2) = harness(fast());
+    if let Some(c) = h.clusters.remove("dev") {
+        h2.clusters.insert("dev".into(), c);
+    }
+    (h2, git2)
+}
+
+#[test]
+fn after_a_restart_nothing_syncs_before_the_cluster_is_read() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("web")));
+    let objects = vec![config_map("cfg", "1", json!({})), deployment("web", "web:1", json!({}))];
+    deploy(&mut h, &git, "web", "r1", objects.clone());
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    // The cluster's lists are slow to come back; the render is not.
+    let (mut h2, git2) = restart(&mut h);
+    h2.latency_ms = 2_000;
+    h2.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h2, &git2, "web", "r1", objects);
+    h2.run_for(1_000);
+    assert_eq!(status(&h2, "web").map(|s| s.sync), Some(Sync::Unknown));
+    h2.run_for(10_000);
+    assert!(!h2.records.iter().any(|r| matches!(r, Record::Started { .. })), "{:?}", h2.records);
+    assert_eq!(status(&h2, "web").map(|s| s.sync), Some(Sync::Synced));
+}
+
+#[test]
+fn a_restart_remembers_the_last_sync_and_leaves_drift_without_self_heal() {
+    let no_heal = || {
+        let mut a = auto("web");
+        a.sync.self_heal = false;
+        a
+    };
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(no_heal()));
+    let objects = vec![deployment("web", "web:1", json!({}))];
+    deploy(&mut h, &git, "web", "r1", objects.clone());
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    let last = h.records.iter().rev().find_map(|r| match r {
+        Record::Finished { key: Some(k), succeeded, .. } => Some((*k, *succeeded)),
+        _ => None,
+    });
+    assert!(last.is_some());
+    let key = ResKey::new("apps", "Deployment", "web", "web");
+    h.edit("dev", &key, |v| {
+        if let Some(s) = v.pointer_mut("/spec").and_then(Value::as_object_mut) {
+            s.insert("replicas".into(), json!(1));
+        }
+    });
+    let (mut h2, git2) = restart(&mut h);
+    h2.input(Input::UpsertApp(no_heal()));
+    if let Some((key, succeeded)) = last {
+        h2.input(Input::Remember { app: "web".into(), key, succeeded });
+    }
+    deploy(&mut h2, &git2, "web", "r1", objects);
+    h2.run_for(30_000);
+    assert!(!h2.records.iter().any(|r| matches!(r, Record::Started { .. })), "{:?}", h2.records);
+    assert_eq!(status(&h2, "web").map(|s| s.sync), Some(Sync::OutOfSync));
+}
+
+#[test]
+fn a_custom_resource_takes_its_scope_from_a_crd_in_the_same_render() {
+    let (mut h, git) = harness(fast());
+    let crd = json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition", "metadata": {"name": "issuers.example.com"},
+        "spec": {"group": "example.com", "names": {"kind": "ClusterIssuer", "plural": "clusterissuers"}, "scope": "Cluster",
+            "versions": [{"name": "v1", "served": true, "storage": true}]}});
+    let issuer = json!({"apiVersion": "example.com/v1", "kind": "ClusterIssuer", "metadata": {"name": "letsencrypt"}, "spec": {}});
+    h.input(Input::UpsertApp(AppConfig::new("web", "dev", "web")));
+    deploy(&mut h, &git, "web", "r1", vec![crd, issuer]);
+    h.run_for(1_000);
+    let keys: Vec<ResKey> = h.engine.resources("web").into_iter().map(|r| r.key).collect();
+    assert!(keys.contains(&ResKey::new("example.com", "ClusterIssuer", "", "letsencrypt")), "{keys:?}");
+}
+
+#[test]
 fn a_wave_starts_only_when_the_one_before_is_healthy() {
     let (mut h, git) = harness(fast());
     if let Some(c) = h.clusters.get_mut("dev") {

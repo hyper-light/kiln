@@ -110,7 +110,7 @@ pub fn ops() -> &'static [Op] {
             op!("cd.apps.resources", "An app's resources, each with sync, health, and why it differs when it does.", ro: true, destructive: false,
                 input: || obj_schema(json!({"app": {"type": "string", "description": APP}, "out_of_sync": {"type": "boolean", "description": "Only those that differ."}}), &["app"]),
                 run: resources),
-            op!("cd.apps.diff", "What differs in an app: per resource, desired and live YAML and the unified hunks between them.", ro: true, destructive: false,
+            op!("cd.apps.diff", "What a sync would change in an app: per resource that differs, the live YAML, what applying git makes of it (`predicted`), and the unified hunks between them. Fields the cluster fills in itself don't show.", ro: true, destructive: false,
                 input: app_only, run: diff),
             op!("cd.apps.history", "An app's deployments, newest first.", ro: true, destructive: false,
                 input: app_only, run: history),
@@ -321,23 +321,24 @@ async fn diff(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
     let key = id.clone();
-    let pairs = cx
+    let changes = cx
         .cd
         .query(move |e| {
             e.resources(&key)
                 .into_iter()
                 .filter(|r| r.sync != Sync::Synced && !r.hook)
-                .filter_map(|r| e.object(&key, &r.key).map(|(d, l)| (r.key, r.why, d, l)))
+                .filter_map(|r| e.change(&key, &r.key).map(|c| (r.key, r.why, c)))
                 .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_default();
     let mut out = Vec::new();
-    for (k, why, desired, live) in pairs {
-        let (d, l) = (desired.map(display), live.map(display));
-        let (dy, ly) = (yaml(d.as_ref()), yaml(l.as_ref()));
-        let hunks = crate::harness::diff::hunks(&ly, &dy, 3);
-        out.push(json!({"key": key_json(&k), "why": why, "desired": dy, "live": ly, "hunks": hunks}));
+    for (k, why, c) in changes {
+        let (mut before, mut after) = (c.before.map(display), c.after.map(display));
+        mask_secrets(&mut before, &mut after);
+        let (live, predicted) = (yaml(before.as_ref()), yaml(after.as_ref()));
+        let hunks = crate::harness::diff::hunks(&live, &predicted, 3);
+        out.push(json!({"key": key_json(&k), "why": why, "live": live, "predicted": predicted, "hunks": hunks}));
     }
     Ok(json!({"diffs": out}))
 }
@@ -381,7 +382,7 @@ fn sort_in_place(v: &mut Value, rank: &dyn Fn(&str) -> u8) {
     }
 }
 
-/// An object as people read it: no status, no server bookkeeping, secrets masked.
+/// An object as people read it: no status, no server bookkeeping.
 fn display(mut v: Value) -> Value {
     if let Some(m) = v.as_object_mut() {
         m.remove("status");
@@ -394,16 +395,29 @@ fn display(mut v: Value) -> Value {
             a.remove(kiln_cd::diff::LAST_APPLIED);
         }
     }
-    if obj::kind(&v) == "Secret" && obj::group(&v).is_empty() {
+    v
+}
+
+/// Masks a Secret's values on both sides of a diff alike: equal values get equal masks and
+/// different ones different masks, so a changed value still shows as changed and no value shows.
+fn mask_secrets(before: &mut Option<Value>, after: &mut Option<Value>) {
+    let secret = |v: &Value| obj::kind(v) == "Secret" && obj::group(v).is_empty();
+    if !before.as_ref().or(after.as_ref()).is_some_and(secret) {
+        return;
+    }
+    let mut seen: Vec<Value> = Vec::new();
+    for side in [before.as_mut(), after.as_mut()].into_iter().flatten() {
         for field in ["data", "stringData"] {
-            if let Some(d) = v.get_mut(field).and_then(Value::as_object_mut) {
-                for (i, val) in d.values_mut().enumerate() {
-                    *val = Value::String(format!("++++++++ ({})", i + 1));
-                }
+            let Some(d) = side.get_mut(field).and_then(Value::as_object_mut) else { continue };
+            for val in d.values_mut() {
+                let n = seen.iter().position(|s| s == val).unwrap_or_else(|| {
+                    seen.push(val.clone());
+                    seen.len() - 1
+                });
+                *val = Value::String("+".repeat(8 + n));
             }
         }
     }
-    v
 }
 
 async fn history(cx: Cx, v: Value) -> Out {

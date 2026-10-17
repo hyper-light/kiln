@@ -18,7 +18,7 @@ pub mod ops;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use kiln_cd::apps::{self, AppDef, Origin};
@@ -164,6 +164,11 @@ impl Cd {
             }
         }
         self.input(Input::UpsertApp(cfg));
+        // The last sync from before a restart: automation goes on from it, not from scratch.
+        let last = self.store.read(|d| d.history.get(&id).and_then(|h| h.back()).and_then(|h| Some((h.key?, h.succeeded))));
+        if let Some((key, succeeded)) = last {
+            self.input(Input::Remember { app: id.as_str().into(), key, succeeded });
+        }
         self.kick();
     }
 
@@ -225,11 +230,11 @@ impl Cd {
             }
             let this = self.clone();
             let def = a.def.clone();
-            let cluster = self.clusters.read().get(&def.destination.cluster).cloned();
-            let (kube_version, api_versions) = match &cluster {
-                Some(c) => (c.version.read().clone(), c.discovery.read().api_versions.clone()),
-                None => (None, Vec::new()),
-            };
+            // Renders read the cluster's version and API versions (Helm's .Capabilities), so an
+            // app's inputs wait for its cluster: a render without them would differ from the one
+            // after, and could be applied first.
+            let Some(cluster) = self.clusters.read().get(&def.destination.cluster).cloned() else { continue };
+            let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
             let result = crate::rt::blocking(move || this.inputs_of(&def, kube_version.as_deref(), &api_versions)).await.and_then(|r| r);
             match result {
                 Ok((revision, key, commits, deps)) => {
@@ -564,6 +569,17 @@ impl Cd {
                 }
                 continue;
             };
+            if !self.serves(&c, &kind, Duration::ZERO).await {
+                // The cluster serves no such kind (yet), so none of it exists: say so, or what
+                // waits for the kind to be read waits forever. Look again later: its CRD may be
+                // what a sync is about to apply.
+                self.input(Input::Live { cluster: name.clone(), change: LiveChange::Listed { kind: kind.clone(), objects: Vec::new() } });
+                if !self.hub.shutdown.sleep(wait).await {
+                    return;
+                }
+                wait = (wait * 2).min(Duration::from_secs(10));
+                continue;
+            }
             let selector = self.selector(&cluster);
             let listed = c.list(&kind, selector).await;
             let (objects, mut rv) = match listed {
@@ -624,6 +640,35 @@ impl Cd {
         }
     }
 
+    /// Whether `c` serves `kind`, discovering again when it doesn't seem to: a CRD applied since
+    /// the last discovery serves new kinds. With `wait`, keeps looking that long (a CRD just
+    /// applied takes a moment to be served). Discovery runs at most once a second per cluster,
+    /// and what it finds goes to the engine.
+    async fn serves(&self, c: &Arc<Cluster>, kind: &GroupKind, wait: Duration) -> bool {
+        let until = Instant::now() + wait;
+        loop {
+            if c.knows(kind) {
+                return true;
+            }
+            if c.claim_discovery(Duration::from_secs(1)) {
+                match c.discover().await {
+                    Ok(d) => {
+                        for (gk, r) in &d.kinds {
+                            self.input(Input::Scope { cluster: c.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced });
+                        }
+                        if c.knows(kind) {
+                            return true;
+                        }
+                    }
+                    Err(e) => tracing::debug!(cluster = %c.name, error = %format!("{e:#}"), "deployments: discovery failed"),
+                }
+            }
+            if Instant::now() >= until || !self.hub.shutdown.sleep(Duration::from_millis(500)).await {
+                return false;
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- actions
 
     async fn dispatch(self: Arc<Self>, rx: async_channel::Receiver<Action>) {
@@ -639,7 +684,16 @@ impl Cd {
                     crate::rt::spawn(async move {
                         let c = this.clusters.read().get(cluster.as_ref()).cloned();
                         let result = match c {
-                            Some(c) => c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}")),
+                            Some(c) => {
+                                // A kind discovery doesn't know may be a CRD's this very sync just
+                                // applied: look again, and give a real apply a moment for the CRD
+                                // to be served. A dry run doesn't wait; the engine knows a miss
+                                // the sync answers itself.
+                                let gk = GroupKind::new(obj::group(&object), obj::kind(&object));
+                                let wait = if dry_run { Duration::ZERO } else { Duration::from_secs(15) };
+                                this.serves(&c, &gk, wait).await;
+                                c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}"))
+                            }
                             None => Err(format!("cluster {cluster} is not connected")),
                         };
                         this.input(Input::Answer { id, result });
@@ -667,20 +721,18 @@ impl Cd {
     }
 
     fn record(&self, r: Record) {
-        let Record::Finished { app, op, revision, key, succeeded, message, applied, pruned, at_ms } = r else { return };
+        let Record::Finished { app, op, revision, key, trigger, by, succeeded, message, applied, pruned, at_ms } = r else { return };
         if !succeeded {
             tracing::info!(app = %app, op, message = %message, "deployments: a sync failed");
-            return;
         }
         let limit = self.apps.read().get(app.as_ref()).map(|e| e.def.history_limit).unwrap_or(10);
-        let trigger = self.statuses.read().get(app.as_ref()).and_then(|s| s.operation.as_ref().map(|o| o.trigger.as_str().to_owned())).unwrap_or_default();
         let d = Deployment {
             app: app.to_string(),
             op,
             revision: revision.map(|r| r.to_string()),
             key,
-            trigger,
-            by: None,
+            trigger: trigger.as_str().to_owned(),
+            by,
             succeeded,
             message,
             applied,

@@ -437,13 +437,7 @@ fn covers(d: &Value, l: Option<&Value>, w: &mut Walk) -> Option<Verdict> {
                         return Some(w.out(Why::Differs));
                     };
                     let found = la.iter().find(|li| key_of_item(li, keys).as_ref() == Some(&dk));
-                    let label = keys
-                        .iter()
-                        .zip(&dk)
-                        .map(|((k, _), v)| format!("{k}={}", v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    w.path.push(format!("[{label}]"));
+                    w.path.push(item_label(keys, &dk));
                     let r = match found {
                         Some(li) => covers(di, Some(li), w),
                         None => Some(w.out(Why::Missing)),
@@ -548,20 +542,9 @@ fn removed(f: &FieldSet, d: Option<&Value>, w: &mut Walk) -> Option<Verdict> {
                 }
             }
             PathElem::Key(keys) => {
-                // A key the desired item leaves out matches its default (a port's protocol).
                 let defaults = merge_keys(w.field(), w.parent()).unwrap_or(&[]);
-                let found = d.and_then(Value::as_array).and_then(|items| {
-                    items.iter().find(|item| {
-                        keys.iter().all(|(k, kv)| match item.get(k) {
-                            Some(iv) => scalar_eq(iv, kv, false),
-                            None => defaults
-                                .iter()
-                                .any(|(dk, dv)| dk == k && dv.is_some_and(|dv| kv.as_str() == Some(dv))),
-                        })
-                    })
-                });
-                let label = keys.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(",");
-                w.path.push(format!("[{label}]"));
+                let found = d.and_then(Value::as_array).and_then(|items| items.iter().find(|item| has_keys(item, keys, defaults)));
+                w.path.push(keys_label(keys));
                 let r = match found {
                     None => Some(w.out(Why::Removed)),
                     Some(item) => removed(child, Some(item), w),
@@ -592,6 +575,189 @@ fn removed(f: &FieldSet, d: Option<&Value>, w: &mut Walk) -> Option<Verdict> {
         }
     }
     None
+}
+
+/// Whether a list item is the one a `managedFields` key names. A key the item leaves out
+/// matches its default (a port's protocol).
+fn has_keys(item: &Value, keys: &Map<String, Value>, defaults: &[(&str, Option<&str>)]) -> bool {
+    keys.iter().all(|(k, kv)| match item.get(k) {
+        Some(iv) => scalar_eq(iv, kv, false),
+        None => defaults.iter().any(|(dk, dv)| dk == k && dv.is_some_and(|dv| kv.as_str() == Some(dv))),
+    })
+}
+
+/// A keyed list item as a path step: `[name=web]`, `[containerPort=8080,protocol=TCP]`.
+fn item_label(keys: &[(&str, Option<&str>)], values: &[Value]) -> String {
+    let parts: Vec<String> = keys.iter().zip(values).map(|((k, _), v)| format!("{k}={}", plain(v))).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// A `managedFields` key as a path step, spelled like [`item_label`].
+fn keys_label(keys: &Map<String, Value>) -> String {
+    let parts: Vec<String> = keys.iter().map(|(k, v)| format!("{k}={}", plain(v))).collect();
+    format!("[{}]", parts.join(","))
+}
+
+fn plain(v: &Value) -> String {
+    v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())
+}
+
+/// What the live object becomes when the desired one is applied: live, with each field kiln
+/// sets laid over it by the rules [`compare`] uses (a value equal by meaning keeps the live
+/// spelling, list items merge by their keys), and each field kiln owns but no longer sets
+/// removed. Diffing live against it shows exactly what a sync changes, and none of what the
+/// cluster filled in itself. `live` is a [`LiveView`]'s object, `owned` its [`LiveView::owned`].
+pub fn predict(desired: &Value, live: &Value, owned: Option<&FieldSet>) -> Value {
+    let mut out = live.clone();
+    if let Some(owned) = owned {
+        drop_unset(owned, Some(desired), &mut out, &mut Walk { path: Vec::new() });
+    }
+    overlay(desired, &mut out, &mut Walk { path: Vec::new() });
+    out
+}
+
+/// Removes from `l` what `f` owns and `d` no longer sets: the walk of [`removed`].
+fn drop_unset(f: &FieldSet, d: Option<&Value>, l: &mut Value, w: &mut Walk) {
+    let d = d.filter(|d| !d.is_null());
+    for (elem, child) in &f.members {
+        match elem {
+            PathElem::Field(name) => {
+                let dv = d.and_then(Value::as_object).and_then(|m| m.get(name));
+                w.path.push(name.clone());
+                match dv {
+                    None if is_status_or_server(&w.path) => {}
+                    None => {
+                        if let Some(m) = l.as_object_mut() {
+                            m.remove(name);
+                        }
+                    }
+                    Some(dv) => {
+                        if let Some(lv) = l.as_object_mut().and_then(|m| m.get_mut(name)) {
+                            drop_unset(child, Some(dv), lv, w);
+                        }
+                    }
+                }
+                w.path.pop();
+            }
+            PathElem::Key(keys) => {
+                let defaults = merge_keys(w.field(), w.parent()).unwrap_or(&[]);
+                let found = d.and_then(Value::as_array).and_then(|items| items.iter().find(|i| has_keys(i, keys, defaults)));
+                let Some(items) = l.as_array_mut() else { continue };
+                match found {
+                    None => items.retain(|i| !has_keys(i, keys, defaults)),
+                    Some(di) => {
+                        w.path.push(keys_label(keys));
+                        for li in items.iter_mut().filter(|i| has_keys(i, keys, defaults)) {
+                            drop_unset(child, Some(di), li, w);
+                        }
+                        w.path.pop();
+                    }
+                }
+            }
+            PathElem::Value(v) => {
+                let kept = d.and_then(Value::as_array).is_some_and(|items| items.iter().any(|i| scalar_eq(i, v, false)));
+                if let (false, Some(items)) = (kept, l.as_array_mut()) {
+                    items.retain(|i| !scalar_eq(i, v, false));
+                }
+            }
+            PathElem::Index(i) => {
+                // An item past the end of the desired list goes with the list, which the overlay
+                // replaces when its length changed.
+                let di = d.and_then(Value::as_array).and_then(|items| items.get(*i));
+                if let (Some(di), Some(li)) = (di, l.as_array_mut().and_then(|items| items.get_mut(*i))) {
+                    w.path.push(format!("[{i}]"));
+                    drop_unset(child, Some(di), li, w);
+                    w.path.pop();
+                }
+            }
+        }
+    }
+}
+
+/// Lays what `d` sets over `l`: the walk of [`covers`], writing where it would find a
+/// difference.
+fn overlay(d: &Value, l: &mut Value, w: &mut Walk) {
+    match d {
+        Value::Null => {}
+        Value::Object(dm) => {
+            if dm.is_empty() {
+                return;
+            }
+            if !l.is_object() {
+                *l = Value::Object(Map::new());
+            }
+            let Some(lm) = l.as_object_mut() else { return };
+            for (k, dv) in dm {
+                match lm.get_mut(k) {
+                    Some(lv) if !lv.is_null() => {
+                        w.path.push(k.clone());
+                        overlay(dv, lv, w);
+                        w.path.pop();
+                    }
+                    _ if is_empty(dv) => {}
+                    _ => {
+                        lm.insert(k.clone(), without_nulls(dv));
+                    }
+                }
+            }
+        }
+        Value::Array(da) => {
+            let field = w.field().to_owned();
+            let keyed = merge_keys(&field, w.parent()).filter(|keys| da.iter().all(|di| key_of_item(di, keys).is_some()));
+            let atomic = keyed.is_none() && !is_set(&field);
+            if !l.is_array() {
+                if !(l.is_null() && da.is_empty()) {
+                    *l = without_nulls(d);
+                }
+                return;
+            }
+            if atomic && l.as_array().map(Vec::len) != Some(da.len()) {
+                *l = without_nulls(d);
+                return;
+            }
+            let Some(la) = l.as_array_mut() else { return };
+            if let Some(keys) = keyed {
+                for di in da {
+                    let Some(dk) = key_of_item(di, keys) else { continue };
+                    match la.iter_mut().find(|li| key_of_item(li, keys).as_ref() == Some(&dk)) {
+                        Some(li) => {
+                            w.path.push(item_label(keys, &dk));
+                            overlay(di, li, w);
+                            w.path.pop();
+                        }
+                        None => la.push(without_nulls(di)),
+                    }
+                }
+            } else if !atomic {
+                for di in da {
+                    if !la.iter().any(|li| scalar_eq(di, li, false)) {
+                        la.push(di.clone());
+                    }
+                }
+            } else {
+                for (i, (di, li)) in da.iter().zip(la.iter_mut()).enumerate() {
+                    w.path.push(format!("[{i}]"));
+                    overlay(di, li, w);
+                    w.path.pop();
+                }
+            }
+        }
+        scalar => {
+            let same = if l.is_null() { is_empty(scalar) } else { scalar_eq(scalar, l, w.in_quantity_context()) };
+            if !same {
+                *l = scalar.clone();
+            }
+        }
+    }
+}
+
+/// A copy without null fields: what applying it leaves in an object.
+fn without_nulls(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(m.iter().filter(|(_, c)| !c.is_null()).map(|(k, c)| (k.clone(), without_nulls(c))).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(without_nulls).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Field paths no apply removes (kiln never compares them).
@@ -968,6 +1134,65 @@ mod tests {
             "spec": {"template": {"spec": {"containers": [{"name": "c", "livenessProbe": {"httpGet": {"path": "/", "port": 9100}}}]}}}});
         let view = LiveView::new(live, "argocd-controller");
         assert!(compare(&d, &view.object, view.owned("argocd-controller").as_ref()).synced());
+    }
+
+    #[test]
+    fn a_prediction_changes_only_what_kiln_sets() {
+        let mut old = deployment("web:1", 3);
+        normalize_desired(&mut old);
+        let mut l = live_of(&old, kiln_fields());
+        if let Some(c) = l.pointer_mut("/spec/template/spec/containers/0").and_then(Value::as_object_mut) {
+            c.insert("imagePullPolicy".into(), json!("IfNotPresent"));
+            c.insert("resources".into(), json!({"limits": {"cpu": "0.5", "memory": "1Gi"}}));
+        }
+        let view = LiveView::new(l, "kiln");
+        let mut d = deployment("web:2", 3);
+        normalize_desired(&mut d);
+        let after = predict(&d, &view.object, view.owned("kiln").as_ref());
+        // The image moves; the server's default and its spelling of the quantity stay.
+        let mut expected = view.object.clone();
+        if let Some(c) = expected.pointer_mut("/spec/template/spec/containers/0").and_then(Value::as_object_mut) {
+            c.insert("image".into(), json!("web:2"));
+        }
+        assert_eq!(after, expected);
+        assert!(compare(&d, &after, None).synced());
+    }
+
+    #[test]
+    fn a_prediction_drops_what_kiln_owns_and_no_longer_sets() {
+        let mut d = deployment("web:1", 3);
+        normalize_desired(&mut d);
+        let view = LiveView::new(live_of(&d, kiln_fields()), "kiln");
+        obj::remove(&mut d, &["spec", "replicas"]);
+        let after = predict(&d, &view.object, view.owned("kiln").as_ref());
+        assert_eq!(after.pointer("/spec/replicas"), None);
+        assert_eq!(after.pointer("/spec/template/spec/containers/0/image"), Some(&json!("web:1")));
+        // Without kiln's field set (an object kiln never applied) nothing is dropped.
+        assert_eq!(predict(&d, &view.object, None).pointer("/spec/replicas"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn a_prediction_merges_list_items_by_key() {
+        let mut d = deployment("web:1", 3);
+        normalize_desired(&mut d);
+        let view = LiveView::new(live_of(&d, kiln_fields()), "kiln");
+        let owned = view.owned("kiln");
+        let containers = |v: &Value| v.pointer("/spec/template/spec/containers").cloned();
+        // A container git adds joins the ones running.
+        let mut more = d.clone();
+        if let Some(cs) = more.pointer_mut("/spec/template/spec/containers").and_then(Value::as_array_mut) {
+            cs.push(json!({"name": "proxy", "image": "envoy:1", "env": null}));
+        }
+        let after = predict(&more, &view.object, owned.as_ref());
+        assert_eq!(after.pointer("/spec/template/spec/containers/0/name"), Some(&json!("web")));
+        assert_eq!(after.pointer("/spec/template/spec/containers/1"), Some(&json!({"name": "proxy", "image": "envoy:1"})));
+        // One kiln applied and git dropped goes.
+        let mut other = d.clone();
+        if let Some(spec) = other.pointer_mut("/spec/template/spec").and_then(Value::as_object_mut) {
+            spec.insert("containers".into(), json!([{"name": "api", "image": "api:1"}]));
+        }
+        let after = predict(&other, &view.object, owned.as_ref());
+        assert_eq!(containers(&after), Some(json!([{"name": "api", "image": "api:1"}])));
     }
 
     #[test]

@@ -236,6 +236,16 @@ pub enum Input {
         /// The app.
         app: Str,
     },
+    /// An app's last sync from before a restart (its kept history): automation goes on from it
+    /// as if this engine had run it, so a restart doesn't sync again what was already synced.
+    Remember {
+        /// The app.
+        app: Str,
+        /// The render key it synced.
+        key: u64,
+        /// Whether it succeeded.
+        succeeded: bool,
+    },
 }
 
 /// What the engine wants done.
@@ -375,6 +385,10 @@ pub enum Record {
         revision: Option<Str>,
         /// The render key synced (enough to roll back to it).
         key: Option<u64>,
+        /// Why it ran.
+        trigger: Trigger,
+        /// Who asked, if a person or agent did.
+        by: Option<String>,
         /// Whether it succeeded.
         succeeded: bool,
         /// Its last message.
@@ -408,6 +422,8 @@ struct Rendered {
 struct Render {
     key: u64,
     objects: Vec<Rendered>,
+    /// The kinds its CRDs define, and whether each is namespaced.
+    scopes: Vec<(GroupKind, bool)>,
 }
 
 enum RenderSlot {
@@ -426,7 +442,7 @@ struct Res {
     /// The last comparison.
     state: ResState,
     /// What it last added to its app's counts: (differs, health, desired).
-    counted: Option<(bool, Option<Health>, bool)>,
+    counted: Option<(bool, Option<Health>, bool, bool)>,
     /// Where it differs, when it does.
     why: Option<Box<str>>,
 }
@@ -454,6 +470,17 @@ enum ResState {
     Missing,
     /// Live, tracked, not desired: should be pruned.
     Prune,
+    /// Desired, and its kind not read from the cluster yet: neither missing nor there.
+    Unread,
+}
+
+/// What a sync changes in one object ([`Engine::change`]).
+#[derive(Clone, Debug)]
+pub struct Change {
+    /// The live object as kiln compares it, if there is one.
+    pub before: Option<Value>,
+    /// What applying the desired object makes of it, unless it is to be pruned.
+    pub after: Option<Value>,
 }
 
 /// A resource's view for queries.
@@ -482,6 +509,8 @@ struct Counts {
     resources: u32,
     out_of_sync: u32,
     health: [u32; 6],
+    /// Resources whose kind the cluster hasn't been read for yet.
+    unread: u32,
 }
 
 struct Op {
@@ -588,6 +617,8 @@ struct Cluster {
     res: Vec<Option<Res>>,
     free: Vec<ResIx>,
     watched: FxHashSet<GroupKind>,
+    /// Kinds listed at least once. Until a kind is, what isn't seen of it is unread, not missing.
+    listed: FxHashSet<GroupKind>,
     reachable: bool,
     bucket: Bucket,
     inflight: u32,
@@ -854,6 +885,14 @@ impl Engine {
                     self.terminate(a);
                 }
             }
+            Input::Remember { app, key, succeeded } => {
+                if let Some(&a) = self.app_by_id.get(&*app)
+                    && let Some(app) = self.app_mut(a)
+                    && app.auto.attempted.is_none()
+                {
+                    app.auto.attempted = Some((key, succeeded));
+                }
+            }
         }
         self.fire_timers();
         self.settle();
@@ -882,6 +921,7 @@ impl Engine {
             res: Vec::new(),
             free: Vec::new(),
             watched: FxHashSet::default(),
+            listed: FxHashSet::default(),
             reachable: true,
             bucket: Bucket::new(self.cfg.cluster_qps, self.cfg.cluster_burst, self.now),
             inflight: 0,
@@ -1093,6 +1133,7 @@ impl Engine {
 
     fn build_render(&mut self, key: u64, objects: Vec<Value>) -> Render {
         let mut out = Vec::with_capacity(objects.len());
+        let mut scopes = Vec::new();
         for mut o in objects {
             if !o.is_object() || sync::is_skipped(&o) {
                 continue;
@@ -1102,6 +1143,12 @@ impl Engine {
             let name = obj::name(&o);
             if kind.is_empty() || name.is_empty() {
                 continue;
+            }
+            if kind == "CustomResourceDefinition"
+                && obj::group(&o) == "apiextensions.k8s.io"
+                && let (Some(g), Some(k)) = (obj::str_at(&o, &["spec", "group"]), obj::str_at(&o, &["spec", "names", "kind"]))
+            {
+                scopes.push((GroupKind::new(g, k), obj::str_at(&o, &["spec", "scope"]) != Some("Cluster")));
             }
             out.push(Rendered {
                 hash: obj::hash_value(&o),
@@ -1113,7 +1160,7 @@ impl Engine {
                 blob: Blob::encode(&o),
             });
         }
-        Render { key, objects: out }
+        Render { key, objects: out, scopes }
     }
 
     /// The Namespace an app creates (`CreateNamespace=true`), as a render of its own: never
@@ -1135,6 +1182,7 @@ impl Engine {
         }
         Some(Arc::new(Render {
             key: 0,
+            scopes: Vec::new(),
             objects: vec![Rendered {
                 hash: obj::hash_value(&v),
                 group: "".into(),
@@ -1154,6 +1202,15 @@ impl Engine {
         let c = app.cluster;
         let default_ns = app.cfg.namespace.clone();
         let old: Vec<ResIx> = app.resources.iter().copied().collect();
+        // A custom resource whose CRD ships in the same render takes the CRD's scope until
+        // discovery serves the kind (and says so itself).
+        if let Some(cl) = self.clusters.get_mut(c as usize) {
+            for (gk, namespaced) in &render.scopes {
+                if !cl.scopes.knows(gk) {
+                    cl.scopes.set(gk.clone(), *namespaced);
+                }
+            }
+        }
         let mut keep: FxHashSet<ResIx> = FxHashSet::default();
         let mut hooks = Vec::new();
         let mut kinds: Vec<GroupKind> = Vec::new();
@@ -1391,6 +1448,18 @@ impl Engine {
                 for k in gone {
                     self.delete_live(c, &k);
                 }
+                // The kind's first list: what waited for it and isn't there is missing.
+                if self.clusters.get_mut(c as usize).is_some_and(|cl| cl.listed.insert(kind.clone())) {
+                    let of_kind: Vec<ResIx> = match self.clusters.get(c as usize) {
+                        Some(cl) => cl.index.iter().filter(|(k, _)| k.group == kind.group && k.kind == kind.kind).map(|(_, ix)| *ix).collect(),
+                        None => Vec::new(),
+                    };
+                    for ix in of_kind {
+                        if self.res(c, ix).is_some_and(|r| r.state == ResState::Unread) {
+                            self.recompare(c, ix);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1497,6 +1566,9 @@ impl Engine {
             (None, Some(l)) if l.hook => (ResState::None, None),
             (None, Some(_)) => (ResState::Prune, Some("not in git: requires pruning".into())),
             (None, None) => (ResState::None, None),
+            (Some(_), None) if !self.clusters.get(c as usize).is_some_and(|cl| cl.listed.contains(&res.key.group_kind())) => {
+                (ResState::Unread, Some("not read from the cluster yet".into()))
+            }
             (Some(_), None) => (ResState::Missing, Some("not in the cluster".into())),
             (Some(_), Some(l)) => {
                 let Some(d) = self.desired_object(app, res) else { return (ResState::OutOfSync, Some("the rendered object can't be read".into())) };
@@ -1538,6 +1610,7 @@ impl Engine {
             // Objects to prune don't count toward their app's health (Argo CD's rule).
             ResState::Prune => None,
             ResState::Synced | ResState::OutOfSync => res.live.as_ref().and_then(|l| l.health),
+            ResState::Unread => None,
         };
         let differs = matches!(res.state, ResState::OutOfSync | ResState::Missing | ResState::Prune);
         Some((a, differs, health))
@@ -1546,7 +1619,7 @@ impl Engine {
     fn count(&mut self, c: ClusterIx, ix: ResIx) {
         self.uncount(c, ix);
         let Some((a, differs, health)) = self.contribution(c, ix) else { return };
-        let desired = self.res(c, ix).is_some_and(|r| r.desired.is_some());
+        let (desired, unread) = self.res(c, ix).map(|r| (r.desired.is_some(), r.state == ResState::Unread)).unwrap_or_default();
         if let Some(app) = self.app_mut(a) {
             if desired {
                 app.counts.resources += 1;
@@ -1554,19 +1627,22 @@ impl Engine {
             if differs {
                 app.counts.out_of_sync += 1;
             }
+            if unread {
+                app.counts.unread += 1;
+            }
             if let Some(slot) = health.and_then(|h| app.counts.health.get_mut(h.index())) {
                 *slot += 1;
             }
         }
         if let Some(res) = self.res_mut(c, ix) {
-            res_counted_set(res, Some((differs, health, desired)));
+            res_counted_set(res, Some((differs, health, desired, unread)));
         }
         self.mark(a);
     }
 
     fn uncount(&mut self, c: ClusterIx, ix: ResIx) {
         let Some(res) = self.res_mut(c, ix) else { return };
-        let Some((differs, health, desired)) = res_counted_take(res) else { return };
+        let Some((differs, health, desired, unread)) = res_counted_take(res) else { return };
         let Some(a) = res.app else { return };
         if let Some(app) = self.app_mut(a) {
             if desired {
@@ -1574,6 +1650,9 @@ impl Engine {
             }
             if differs {
                 app.counts.out_of_sync = app.counts.out_of_sync.saturating_sub(1);
+            }
+            if unread {
+                app.counts.unread = app.counts.unread.saturating_sub(1);
             }
             if let Some(slot) = health.and_then(|h| app.counts.health.get_mut(h.index())) {
                 *slot = slot.saturating_sub(1);
@@ -1605,6 +1684,9 @@ impl Engine {
             Sync::Unknown
         } else if !cl.reachable {
             message = Some(format!("cluster {} is unreachable", cl.name));
+            Sync::Unknown
+        } else if app.counts.unread > 0 {
+            message = Some(format!("reading cluster {}", cl.name));
             Sync::Unknown
         } else if app.counts.out_of_sync > 0 {
             Sync::OutOfSync
@@ -1677,6 +1759,34 @@ impl Engine {
         Some((self.desired_object(app, res), res.live.as_ref().and_then(|l| l.blob.decode().ok())))
     }
 
+    /// What a sync changes in one object, for people to read: the live object as kiln compares
+    /// it (no status, server metadata or `managedFields`, ignored fields left out) and what it
+    /// becomes when the desired one is applied ([`diff::predict`]). A missing object has no
+    /// `before`, one to prune no `after`.
+    pub fn change(&self, id: &str, key: &ResKey) -> Option<Change> {
+        let a = *self.app_by_id.get(id)?;
+        let app = self.app(a)?;
+        let cl = self.clusters.get(app.cluster as usize)?;
+        let res = self.res(app.cluster, *cl.index.get(key)?)?;
+        let desired = self.desired_object(app, res);
+        let live = res.live.as_ref().and_then(|l| l.blob.decode().ok()).map(|l| LiveView::new(l, &app.cfg.manager));
+        Some(match (desired, live) {
+            (after, None) => Change { before: None, after },
+            (None, Some(view)) => Change { before: Some(view.object), after: None },
+            (Some(mut d), Some(view)) => {
+                let owned = view.owned(&app.cfg.manager);
+                let mut before = view.object.clone();
+                let (ignores, _) = Ignores::for_object(app.cfg.ignore.iter(), &d);
+                if !ignores.is_empty() {
+                    ignores.strip(&mut d, Some(&view));
+                    ignores.strip(&mut before, Some(&view));
+                }
+                let after = diff::predict(&d, &before, owned.as_ref());
+                Change { before: Some(before), after: Some(after) }
+            }
+        })
+    }
+
     fn settle(&mut self) {
         let mut guard = 0;
         while !self.dirty.is_empty() && guard < 8 {
@@ -1718,7 +1828,9 @@ impl Engine {
         if !self.clusters.get(app.cluster as usize).is_some_and(|cl| cl.reachable) {
             return;
         }
-        if app.counts.out_of_sync == 0 {
+        // Nothing counts as missing before the cluster is read: after a restart that would sync
+        // every app.
+        if app.counts.out_of_sync == 0 || app.counts.unread > 0 {
             return;
         }
         if render.objects.is_empty() && !app.cfg.sync.allow_empty {
@@ -2396,6 +2508,8 @@ impl Engine {
             op: op.id,
             revision: op.revision.clone(),
             key,
+            trigger: op.trigger,
+            by: op.by.clone(),
             succeeded,
             message,
             applied: op.applied,
@@ -2598,11 +2712,11 @@ fn op_status(op: &Op) -> OpStatus {
 }
 
 /// What a resource last added to its app's counts.
-fn res_counted_set(res: &mut Res, v: Option<(bool, Option<Health>, bool)>) {
+fn res_counted_set(res: &mut Res, v: Option<(bool, Option<Health>, bool, bool)>) {
     res.counted = v;
 }
 
-fn res_counted_take(res: &mut Res) -> Option<(bool, Option<Health>, bool)> {
+fn res_counted_take(res: &mut Res) -> Option<(bool, Option<Health>, bool, bool)> {
     res.counted.take()
 }
 

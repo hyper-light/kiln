@@ -35,7 +35,7 @@ return out;
 
 ## Then
 
-- A diff: `kiln.cd.apps.diff({ app })` gives desired and live YAML and unified hunks.
+- A diff: `kiln.cd.apps.diff({ app })` gives, per object that differs, the live YAML, what a sync makes of it (`predicted`) and the unified hunks between them. Only what a sync changes shows, not the fields the cluster filled in.
 - Drift someone made by hand: sync (self-heal does it by itself when enabled).
 - A bad change in git: fix forward with a commit; check `kiln.cd.apps.history({ app })` for
   what last deployed well.
