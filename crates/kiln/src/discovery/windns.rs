@@ -238,11 +238,6 @@ fn api() -> Result<&'static Api, String> {
     .map_err(Clone::clone)
 }
 
-/// Whether this Windows has the DNS-SD functions (1809 or later).
-pub fn available() -> Result<(), String> {
-    api().map(|_| ())
-}
-
 /// What every callback gets: the sink and the service type's suffix (`._kiln._tcp.local`).
 struct Shared {
     sink: Sink,

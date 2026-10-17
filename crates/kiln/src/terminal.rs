@@ -148,12 +148,18 @@ pub fn spawn_with(
 /// Take over a session handed across this process's re-exec ([`PtySession::handover`]). `None`
 /// when its descriptor did not survive (the session is then gone).
 pub fn adopt(h: Handover) -> Option<(PtySession, async_channel::Receiver<PtyOut>)> {
-    let fd = crate::os::reclaim_fd(h.fd)?;
     let (tx, rx) = async_channel::bounded::<PtyOut>(256);
     let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
-    let handle = crate::os::pty::adopt(fd, h.pid, tx, in_rx);
+    // One expression: on Windows the descriptor and the handle are both `()`.
+    let session = PtySession {
+        input: in_tx,
+        master: None,
+        killer: None,
+        handle: Some(crate::os::pty::adopt(crate::os::reclaim_fd(h.fd)?, h.pid, tx, in_rx)),
+        pid: Some(h.pid),
+    };
     crate::metrics::global().terminal_sessions.add(1);
-    Some((PtySession { input: in_tx, master: None, killer: None, handle: Some(handle), pid: Some(h.pid) }, rx))
+    Some((session, rx))
 }
 
 impl PtySession {

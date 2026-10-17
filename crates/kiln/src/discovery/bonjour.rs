@@ -47,9 +47,6 @@ pub enum Event {
 
 pub type Sink = Box<dyn Fn(Event) + Send + 'static>;
 
-/// `kDNSServiceErr_ServiceNotRunning`: mDNSResponder is not there.
-pub const ERR_SERVICE_NOT_RUNNING: i32 = -65563;
-
 type DnsServiceRef = *mut c_void;
 type RegisterReply = unsafe extern "C" fn(DnsServiceRef, u32, i32, *const c_char, *const c_char, *const c_char, *mut c_void);
 type BrowseReply = unsafe extern "C" fn(DnsServiceRef, u32, u32, i32, *const c_char, *const c_char, *const c_char, *mut c_void);

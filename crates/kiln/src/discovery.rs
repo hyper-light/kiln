@@ -730,7 +730,8 @@ pub struct Iface {
     pub v6: Vec<Ipv6Addr>,
 }
 
-/// Container and VM plumbing rather than a LAN.
+/// Container and VM plumbing rather than a LAN (Windows has `is_virtual_windows`).
+#[cfg(any(unix, test))]
 fn is_virtual(name: &str) -> bool {
     const PLUMBING: [&str; 14] = [
         "docker", "veth", "br-", "virbr", "vnet", "cni", "flannel", "cali", "cilium", "vxlan", "kube", "lxcbr", "lxdbr", "podman",
