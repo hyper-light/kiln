@@ -1,23 +1,24 @@
 /**
  * Deployments: every app kiln deploys, its sync and health, live. One list however large the
- * fleet: filters run on the server, pages arrive as you scroll, only the rows on screen are
- * drawn, and live updates are merged in once a frame. Above it, on every screen, a name search
- * and one filter box (sync, health, cluster and project, each value with how many it would show).
- * Rows have checkboxes, so a selection, or everything a filter shows, syncs or refreshes at once.
+ * fleet: filters and sorts run on the server, pages arrive as you scroll, only the rows on screen
+ * are drawn, and live updates are merged in once a frame. Above it, the fleet's counts, then the
+ * console's one filter field (names as you type; sync, health, project, cluster and namespace as
+ * checkboxes, each value with how many it would show) and a sort select. Rows have checkboxes, so
+ * a selection, or everything a filter shows, syncs or refreshes at once.
  */
 import * as React from "react";
 import { Link, useSearchParams } from "react-router";
 import { Rocket } from "lucide-react";
 
-import { appHref, cdApi, type CdFilters } from "@/api/cd";
+import { appHref, cdApi, type CdFilters, type CdSort } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
-import type { CdApp, CdFacets } from "@/api/types";
+import type { CdApp, CdFacets, CdSummary } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { FacetSelect, type FacetChoice, type FacetGroup } from "@/components/ui/facet-select";
-import { EmptyState, ErrorState, PageIntro, SearchField, SkeletonRows } from "@/components/ui/misc";
+import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
+import { EmptyState, ErrorState, PageIntro, SelectField, SkeletonRows } from "@/components/ui/misc";
 import { errorMessage, useResource } from "@/lib/hooks";
 import { useWindowedRows } from "@/lib/virtual";
-import { HealthPair, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
+import { HEALTH_TONE, HealthPair, StatePair, SYNC_TONE, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
 import "./deployments.css";
 
 const ROW = 68;
@@ -26,9 +27,17 @@ const PAGE = 500;
 const FACETS = [
   { id: "sync", label: "Sync" },
   { id: "health", label: "Health" },
-  { id: "cluster", label: "Cluster" },
   { id: "project", label: "Project" },
+  { id: "cluster", label: "Cluster" },
+  { id: "namespace", label: "Namespace" },
 ] as const;
+
+const SORTS: { value: CdSort; label: string }[] = [
+  { value: "name", label: "Name, A to Z" },
+  { value: "health", label: "Health, worst first" },
+  { value: "sync", label: "Sync, out of sync first" },
+  { value: "deployed", label: "Recently deployed" },
+];
 type FacetId = (typeof FACETS)[number]["id"];
 
 const WORDS: Record<string, string> = { OutOfSync: "Out of sync" };
@@ -39,6 +48,26 @@ const ORDER: Partial<Record<FacetId, string[]>> = {
 };
 
 const n = (x: number) => x.toLocaleString();
+
+/** The fleet at a glance: how many apps, and how many in each sync and health. */
+function Summary({ s }: { s: CdSummary | undefined }) {
+  if (!s || s.apps === 0) return null;
+  const sync = ORDER.sync?.filter((k) => s.sync[k]) ?? [];
+  const health = ORDER.health?.filter((k) => s.health[k]) ?? [];
+  return (
+    <p className="cd-summary-line" aria-label="Every app">
+      <span className="cd-count">
+        {n(s.apps)} {s.apps === 1 ? "app" : "apps"} · {n(s.clusters)} {s.clusters === 1 ? "cluster" : "clusters"}
+      </span>
+      {sync.map((k) => (
+        <StatePair key={`s-${k}`} tone={SYNC_TONE[k] ?? "skipped"} word={`${n(s.sync[k] ?? 0)} ${WORDS[k] ?? k}`.toLowerCase()} />
+      ))}
+      {health.map((k) => (
+        <StatePair key={`h-${k}`} tone={HEALTH_TONE[k] ?? "skipped"} word={`${n(s.health[k] ?? 0)} ${k}`.toLowerCase()} />
+      ))}
+    </p>
+  );
+}
 
 /** "6 apps · 1 out of sync · 1 degraded", or "2 of 6 apps" when filtered. */
 function countLine(f: CdFacets | undefined, all: number | undefined, filters: CdFilters) {
@@ -80,10 +109,30 @@ export default function Deployments() {
   const [params, setParams] = useSearchParams();
   const filters = React.useMemo<CdFilters>(() => {
     const list = (k: string) => (params.get(k) ?? "").split(",").filter(Boolean);
-    return { sync: list("sync"), health: list("health"), cluster: list("cluster"), project: list("project"), q: params.get("q") ?? "" };
+    return {
+      sync: list("sync"),
+      health: list("health"),
+      cluster: list("cluster"),
+      project: list("project"),
+      namespace: list("namespace"),
+      q: params.get("q") ?? "",
+    };
   }, [params]);
-  const choice: FacetChoice = { sync: filters.sync ?? [], health: filters.health ?? [], cluster: filters.cluster ?? [], project: filters.project ?? [] };
-  const setChoice = (c: FacetChoice) => {
+  const sort = (SORTS.find((x) => x.value === params.get("sort"))?.value ?? "name") as CdSort;
+  const setSort = (v: string) => {
+    const next = new URLSearchParams(params);
+    if (v && v !== "name") next.set("sort", v);
+    else next.delete("sort");
+    setParams(next, { replace: true });
+  };
+  const choice: Chosen = {
+    sync: filters.sync ?? [],
+    health: filters.health ?? [],
+    cluster: filters.cluster ?? [],
+    project: filters.project ?? [],
+    namespace: filters.namespace ?? [],
+  };
+  const setChoice = (c: Chosen) => {
     const next = new URLSearchParams(params);
     for (const f of FACETS) {
       const v = c[f.id] ?? [];
@@ -107,12 +156,14 @@ export default function Deployments() {
 
   const summary = useResource((s) => cdApi.summary(s), [], { pollMs: 30_000 });
   const facets = useResource((s) => cdApi.facets(filters, s), [filters], { pollMs: 30_000 });
-  const groups: FacetGroup[] = FACETS.map((f) => {
+  const groups: Facet[] = FACETS.flatMap((f) => {
     const counts = facets.data?.facets[f.id] ?? {};
     const order = ORDER[f.id];
     const rank = (v: string) => (order ? order.indexOf(v) + 1 || order.length + 1 : 0);
     const ids = [...new Set([...Object.keys(counts), ...(choice[f.id] ?? [])])].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
-    return { id: f.id, label: f.label, values: ids.map((id) => ({ id, label: WORDS[id] ?? id, count: counts[id] ?? 0 })) };
+    // A facet every app shares says nothing, unless something of it is chosen.
+    if (ids.length < 2 && !(choice[f.id]?.length ?? 0) && f.id !== "sync" && f.id !== "health") return [];
+    return [{ id: f.id, label: f.label, options: ids.map((id) => ({ id, label: WORDS[id] ?? id, count: counts[id] ?? 0 })) }];
   });
 
   // The list: pages in id order, kept in a map that live events update in place. `gen` drops
@@ -134,7 +185,7 @@ export default function Deployments() {
     setLoading(true);
     setError(null);
     cdApi
-      .apps({ ...filters, limit: PAGE }, ctl.signal)
+      .apps({ ...filters, sort, limit: PAGE }, ctl.signal)
       .then((page) => {
         if (g !== gen.current) return;
         apps.current = new Map(page.apps.map((a) => [a.app, a]));
@@ -149,14 +200,14 @@ export default function Deployments() {
         setLoading(false);
       });
     return () => ctl.abort();
-  }, [filters]);
+  }, [filters, sort]);
 
   const loadMore = React.useCallback(() => {
     if (!next || loadingMore.current || Date.now() - failedAt.current < 5_000) return;
     loadingMore.current = true;
     const g = gen.current;
     cdApi
-      .apps({ ...filters, limit: PAGE, cursor: next })
+      .apps({ ...filters, sort, limit: PAGE, cursor: next })
       .then((page) => {
         if (g !== gen.current) return;
         for (const a of page.apps) {
@@ -175,7 +226,7 @@ export default function Deployments() {
       .finally(() => {
         loadingMore.current = false;
       });
-  }, [filters, next]);
+  }, [filters, sort, next]);
 
   // Live: statuses arrive in batches; merge them and draw once a frame.
   const frame = React.useRef(0);
@@ -288,15 +339,26 @@ export default function Deployments() {
   return (
     <div className="container-console page cd-page">
       <PageIntro index={3} label="Deployments" title="Deployments." lead="What git says, and what runs: every app's sync and health, live." />
+      <Summary s={summary.data} />
       <div className="cd-toolbar">
-        <SearchField label="Find apps by name" placeholder="Find by name" value={query} onChange={setQuery} className="cd-search" />
-        <FacetSelect label="Filter apps" placeholder="All apps" groups={groups} chosen={choice} onChange={setChoice} className="cd-filter" />
+        <FacetBox
+          label="Filter apps"
+          placeholder="Filter by name, sync, health, project, cluster…"
+          query={query}
+          onQuery={setQuery}
+          facets={groups}
+          chosen={choice}
+          onChosen={setChoice}
+          className="cd-filter"
+        />
+        <SelectField label="Sort apps" hideLabel value={sort} onChange={setSort} options={SORTS} className="cd-sort" />
       </div>
 
       <div className="cd-list-head">
         <label className="cd-pick">
           <input
             type="checkbox"
+            className="check"
             checked={everything || allLoaded}
             ref={(el) => {
               if (el) el.indeterminate = !everything && !allLoaded && selected.size > 0;
@@ -389,7 +451,7 @@ const AppRow = React.memo(function AppRow({
   return (
     <div role="listitem" aria-posinset={pos} aria-setsize={size} className="cd-item" data-checked={checked || undefined} data-live={live || undefined} data-tone={tone}>
       <label className="cd-pick">
-        <input type="checkbox" checked={checked} onChange={(e) => onCheck(app.app, e.target.checked)} aria-label={`Select ${app.name}`} />
+        <input type="checkbox" className="check" checked={checked} onChange={(e) => onCheck(app.app, e.target.checked)} aria-label={`Select ${app.name}`} />
       </label>
       <Link to={appHref(app.app)} className="cd-row">
         <span className="cd-row-main">
