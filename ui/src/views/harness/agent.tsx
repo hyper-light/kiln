@@ -39,6 +39,8 @@ export default function AgentPage() {
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
   const [account, setAccount] = React.useState<"login" | "logout" | null>(null);
+  // /login and /logout open the account in the conversation, below what was said: brought into view once.
+  const showAccount = React.useCallback((el: HTMLDivElement | null) => el?.scrollIntoView({ block: "nearest", behavior: "smooth" }), []);
   const attachments = useAttachments((meta?.features ?? []).includes("attachments") ? "any" : (meta?.features ?? []).includes("images") ? "images" : "none");
   const [dragging, setDragging] = React.useState(false);
   const addFiles = attachments.add;
@@ -140,6 +142,13 @@ export default function AgentPage() {
         target={info?.target}
         kind={info?.kind}
         accountOpen={account !== null}
+        footer={
+          account && info ? (
+            <div ref={showAccount} className="hx-signin">
+              <AccountCard key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />
+            </div>
+          ) : undefined
+        }
       />
       <div className="hx-dock">
         <ActivityLine state={state} agent={id} onOpenTask={openTask} />
@@ -165,7 +174,6 @@ export default function AgentPage() {
             )}
           </div>
         ) : null}
-        {account && info && <AccountCard key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />}
         <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} onView={openView} />
       </div>
     </div>

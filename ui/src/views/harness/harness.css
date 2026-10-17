@@ -2888,3 +2888,8 @@ textarea.hx-input {
     animation: none;
   }
 }
+/* /login, /logout: the account, in the conversation below what was said. */
+.hx-signin {
+  margin-top: 18px;
+}
+

@@ -693,3 +693,58 @@
     forced-color-adjust: none;
   }
 }
+
+/* ---------------------------------------------------------------- in the conversation
+   Drawn the way a question is in the conversation (choices.css, flow): no card, a spectral rule at
+   its left, controls the size of the words around them. */
+.ac {
+  --ac-pad: 0px;
+  padding-left: 14px;
+  border: 0;
+  border-left: 2px solid #8f87b3;
+  border-radius: 0;
+  background: none;
+}
+.ac::before {
+  display: none;
+}
+.ac-acct[data-lit] {
+  background: none;
+}
+.ac-acct:last-child,
+.ac-acct:only-child {
+  border-radius: 0;
+}
+.ac .ac-btn {
+  min-height: 30px;
+  height: 30px;
+  padding: 0 14px;
+  font-size: 12.5px;
+}
+.ac .ac-close,
+.ac .ac-copy {
+  width: 30px;
+  height: 30px;
+}
+.ac-input {
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px solid #2c2f36;
+  border-radius: 0;
+  background: none;
+  font-size: 14px;
+}
+.ac-input:focus {
+  border-bottom-color: #8f87b3;
+  box-shadow: none;
+}
+/* Phones zoom into fields under 16px. */
+@media (pointer: coarse) {
+  .ac-input,
+  .ac-mono {
+    height: 34px;
+    font-size: 16px;
+  }
+}
+
