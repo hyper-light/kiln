@@ -246,3 +246,56 @@ pub fn kill_orphan_group(pid: i32, marker: &str) -> bool {
     let Ok(pid) = u32::try_from(pid) else { return false };
     pid > 0 && crate::os::metrics::process_has_env(pid, marker) && taskkill_tree(pid)
 }
+
+/// A child kiln talks to over all three pipes (a harness in its structured mode), in a job object
+/// so stopping it stops everything it started. The pipes are served by threads.
+pub struct Duplex {
+    pub pid: u32,
+    /// Bytes for its stdin; dropping every sender closes stdin.
+    pub stdin: async_channel::Sender<Vec<u8>>,
+    pub stdout: async_channel::Receiver<Vec<u8>>,
+    pub stderr: async_channel::Receiver<Vec<u8>>,
+    pub exit: oneshot::Receiver<Option<i32>>,
+    job: Arc<Mutex<GroupChild>>,
+}
+
+impl Duplex {
+    /// Windows has no SIGTERM for a job: kill it at once.
+    pub fn terminate(&self, _grace: Duration) {
+        let _ = self.job.lock().kill();
+    }
+}
+
+/// Spawn `cmd` with piped stdin/stdout/stderr in its own job.
+pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
+    use std::io::Write as _;
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_job(&mut cmd, true).with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    let pid = child.id();
+    let (out_tx, stdout) = async_channel::bounded::<Vec<u8>>(256);
+    let (err_tx, stderr) = async_channel::bounded::<Vec<u8>>(64);
+    if let Some(p) = child.inner().stdout.take() {
+        pump("kiln-harness-out", p, move |c| out_tx.send_blocking(c.to_vec()).is_ok())?;
+    }
+    if let Some(p) = child.inner().stderr.take() {
+        pump("kiln-harness-err", p, move |c| err_tx.send_blocking(c.to_vec()).is_ok())?;
+    }
+    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    if let Some(mut stdin) = child.inner().stdin.take() {
+        std::thread::Builder::new().name("kiln-harness-in".to_owned()).spawn(move || {
+            while let Ok(data) = in_rx.recv_blocking() {
+                if stdin.write_all(&data).and_then(|()| stdin.flush()).is_err() {
+                    break;
+                }
+            }
+        })?;
+    }
+    let job = Arc::new(Mutex::new(child));
+    let (exit_tx, exit_rx) = oneshot::channel();
+    let waiter = Arc::clone(&job);
+    crate::rt::spawn(async move {
+        let code = wait_shared(&waiter).await.ok().and_then(|s| s.code());
+        let _ = exit_tx.send(code);
+    });
+    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit: exit_rx, job })
+}

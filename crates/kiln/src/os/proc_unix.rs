@@ -269,3 +269,76 @@ fn leader_has_env(pid: i32, marker: &str) -> bool {
 fn leader_has_env(pid: i32, marker: &str) -> bool {
     u32::try_from(pid).is_ok_and(|pid| crate::os::metrics::process_has_env(pid, marker))
 }
+
+/// A child kiln talks to over all three pipes (a harness in its structured mode), in its own
+/// process group so stopping it stops everything it started.
+pub struct Duplex {
+    /// The child's pid, which is also its process-group id.
+    pub pid: u32,
+    /// Bytes for its stdin; dropping every sender closes stdin.
+    pub stdin: async_channel::Sender<Vec<u8>>,
+    /// Its stdout, chunk by chunk; closed at EOF.
+    pub stdout: async_channel::Receiver<Vec<u8>>,
+    /// Its stderr, chunk by chunk; closed at EOF.
+    pub stderr: async_channel::Receiver<Vec<u8>>,
+    /// The exit code once reaped (`None`: killed by a signal).
+    pub exit: oneshot::Receiver<Option<i32>>,
+}
+
+impl Duplex {
+    /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here).
+    pub fn terminate(&self, grace: Duration) {
+        let Ok(pgid) = i32::try_from(self.pid) else { return };
+        if pgid <= 0 {
+            return;
+        }
+        let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+        crate::rt::spawn(async move {
+            crate::rt::sleep(grace).await;
+            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+        });
+    }
+}
+
+/// Spawn `cmd` with piped stdin/stdout/stderr in a new process group.
+pub fn spawn_duplex(mut cmd: Command) -> anyhow::Result<Duplex> {
+    use std::os::unix::process::CommandExt as _;
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    let mut child = cmd.spawn().with_context(|| format!("spawn {:?}", cmd.get_program()))?;
+    let pid = child.id();
+    let input = OwnedFd::from(child.stdin.take().context("no stdin pipe")?);
+    let out = OwnedFd::from(child.stdout.take().context("no stdout pipe")?);
+    let err = OwnedFd::from(child.stderr.take().context("no stderr pipe")?);
+    for fd in [&input, &out, &err] {
+        nonblocking(fd)?;
+    }
+    let reader = |fd: OwnedFd, cap: usize| {
+        let (tx, rx) = async_channel::bounded::<Vec<u8>>(cap);
+        crate::rt::spawn(async move {
+            let mut buf = vec![0u8; CHUNK * 2];
+            while let Ok(Some(n)) = read_chunk(&fd, &mut buf).await {
+                if tx.send(buf.get(..n).map(<[u8]>::to_vec).unwrap_or_default()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        rx
+    };
+    let stdout = reader(out, 256);
+    let stderr = reader(err, 64);
+    let (in_tx, in_rx) = async_channel::unbounded::<Vec<u8>>();
+    crate::rt::spawn(async move {
+        while let Ok(data) = in_rx.recv().await {
+            if write_all(&input, &data).await.is_err() {
+                break;
+            }
+        }
+        // Dropping the fd here closes the child's stdin.
+    });
+    let (exit_tx, exit_rx) = oneshot::channel();
+    crate::rt::spawn(async move {
+        let code = wait_child(&mut child).await.ok().and_then(|s| s.code());
+        let _ = exit_tx.send(code);
+    });
+    Ok(Duplex { pid, stdin: in_tx, stdout, stderr, exit: exit_rx })
+}

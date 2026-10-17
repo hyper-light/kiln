@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod dns;
 pub mod exec;
 pub mod gitops;
+pub mod harness;
 pub mod host;
 pub mod hub;
 pub mod install;

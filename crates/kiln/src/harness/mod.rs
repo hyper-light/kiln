@@ -1,0 +1,16 @@
+//! kiln as the harness: AI coding agents (Claude Code, Codex, ...) run as structured sessions on
+//! a machine, and kiln's UI is their whole front end.
+//!
+//! * [`model`] — the normalized timeline, state and commands every adapter speaks.
+//! * [`core`] — a session's state plus what came out of the last step (updates, stdin lines).
+//! * [`claude`] — Claude Code over stream-json and the control protocol.
+//! * [`diff`] — line diffs for edit previews.
+//! * [`kinds`] — the registry of harnesses and their adapters.
+//! * [`session`] — one agent session: the harness process, its adapter and its state.
+
+pub mod claude;
+pub mod core;
+pub mod diff;
+pub mod kinds;
+pub mod model;
+pub mod session;
