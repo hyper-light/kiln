@@ -6,7 +6,7 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { MoreHorizontal, SlidersHorizontal, X } from "lucide-react";
-import type { Command, Control, Meta, State } from "@/api/harness";
+import { harnessApi, type Attachment, type Command, type Control, type Meta, type State } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
@@ -47,6 +47,7 @@ function useConfirm() {
 function ControlRow({ c, state, send, confirm }: { c: Control; state: State | null; send: Send; confirm: ReturnType<typeof useConfirm>["confirm"] }) {
   const v = valueOf(c, state);
   const [text, setText] = React.useState(typeof v === "string" ? v : "");
+  const [option, setOption] = React.useState("");
   const set = (value: unknown, dangerous?: boolean) =>
     confirm(dangerous ?? c.dangerous, `${c.label}?`, c.description ?? "This can't be undone from kiln.", () => send({ type: "control", id: c.id, value }));
   return (
@@ -87,21 +88,31 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
             <span />
           </button>
         )}
-        {c.kind === "action" && !c.input && (
+        {c.kind === "action" && !c.input && !c.options?.length && (
           <Button size="xs" variant={c.dangerous ? "danger" : "secondary"} onClick={() => set(null)}>
             {c.label}
           </Button>
         )}
-        {c.kind === "action" && c.input && (
+        {c.kind === "action" && (c.input || (c.options?.length ?? 0) > 0) && (
           <form
-            className="flex gap-2"
+            className="flex flex-wrap gap-2"
             onSubmit={(e) => {
               e.preventDefault();
-              set(text);
+              const chosen = c.options?.find((o) => o.id === option) ?? c.options?.[0];
+              set(c.options?.length ? { option: chosen?.id, text } : text, chosen?.dangerous);
               setText("");
             }}
           >
-            <input className="hx-input" value={text} placeholder={c.input} onChange={(e) => setText(e.target.value)} aria-label={c.label} />
+            {(c.options?.length ?? 0) > 0 && (
+              <select className="hx-select" value={option || c.options?.[0]?.id || ""} onChange={(e) => setOption(e.target.value)} aria-label={`${c.label}: kind`}>
+                {(c.options ?? []).map((o) => (
+                  <option key={o.id} value={o.id} title={o.description}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            )}
+            {c.input && <input className="hx-input" value={text} placeholder={c.input} onChange={(e) => setText(e.target.value)} aria-label={c.label} />}
             <Button size="xs" variant={c.dangerous ? "danger" : "secondary"} type="submit">
               {c.label}
             </Button>
@@ -144,7 +155,7 @@ export function SettingsSheet({ open, onOpenChange, meta, state, send }: { open:
           description="Everything this harness lets kiln set or do. Changes apply to this agent from its next step."
         >
           <div className="hx-ctls">
-            {groups.length === 0 && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
+            {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">
                 <div className="hx-eyebrow">{g}</div>
@@ -153,6 +164,21 @@ export function SettingsSheet({ open, onOpenChange, meta, state, send }: { open:
                 ))}
               </section>
             ))}
+            {(meta?.hooks?.length ?? 0) > 0 && (
+              <section className="hx-ctl-group">
+                <div className="hx-eyebrow">Hooks</div>
+                <ul className="hx-hooks">
+                  {(meta?.hooks ?? []).map((h, i) => (
+                    <li key={i}>
+                      <span className="hx-tag">{h.event}</span>
+                      {h.matcher && <span className="hx-dim">{h.matcher}</span>}
+                      <code className="hx-trunc">{h.command}</code>
+                      {h.source && <span className="hx-dim ml-auto">{h.source}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
           </div>
         </DialogContent>
       </Dialog>
@@ -210,8 +236,13 @@ const FILE_MAX_BYTES = 20 * 1024 * 1024;
 export interface Attached {
   name: string;
   mime: string;
-  data_base64: string;
   size: number;
+  /** Uploaded: the server's id for it. */
+  file_id?: string;
+  /** Not uploaded (the upload failed): sent inline instead. */
+  data_base64?: string;
+  /** A local preview of an image (object URL). */
+  preview?: string;
 }
 
 const toBase64 = (b: Blob) =>
@@ -252,47 +283,79 @@ const stamp = () => new Date().toTimeString().slice(0, 8).replace(/:/g, "");
 export function useAttachments(accepts: "any" | "images" | "none") {
   const enabled = accepts !== "none";
   const [files, setFiles] = React.useState<Attached[]>([]);
-  const [busy, setBusy] = React.useState(false);
+  const [pending, setPending] = React.useState(0);
+  const [failed, setFailed] = React.useState<string | null>(null);
   const add = React.useCallback(
     async (list: FileList | File[]) => {
       if (accepts === "none") return;
-      setBusy(true);
-      try {
-        const added: Attached[] = [];
-        for (const f of [...list]) {
-          if (accepts === "images" && !f.type.startsWith("image/")) continue;
-          const blob = f.type.startsWith("image/") ? await prepareImage(f) : f;
-          if (blob.size > FILE_MAX_BYTES) continue;
-          const ext = blob.type === "image/jpeg" ? "jpg" : (blob.type.split("/")[1] ?? "bin");
-          const unnamed = !f.name || f.name === "image.png" || f.name === "image";
-          const name = unnamed ? `screenshot-${stamp()}.${ext}` : blob !== f && blob.type !== f.type ? f.name.replace(/\.[^.]+$/, `.${ext}`) : f.name;
-          added.push({ name, mime: blob.type || "application/octet-stream", data_base64: await toBase64(blob), size: blob.size });
-        }
-        setFiles((cur) => [...cur, ...added]);
-      } finally {
-        setBusy(false);
-      }
+      const picked = [...list].filter((f) => accepts === "any" || f.type.startsWith("image/"));
+      setPending((n) => n + picked.length);
+      setFailed(null);
+      // Each file uploads as soon as it is attached, so sending is instant.
+      await Promise.all(
+        picked.map(async (f) => {
+          try {
+            const blob = f.type.startsWith("image/") ? await prepareImage(f) : f;
+            if (blob.size > FILE_MAX_BYTES) {
+              setFailed(`${f.name} is larger than ${FILE_MAX_BYTES / 1024 / 1024} MB`);
+              return;
+            }
+            const ext = blob.type === "image/jpeg" ? "jpg" : (blob.type.split("/")[1] ?? "bin");
+            const unnamed = !f.name || f.name === "image.png" || f.name === "image";
+            const name = unnamed ? `screenshot-${stamp()}.${ext}` : blob !== f && blob.type !== f.type ? f.name.replace(/\.[^.]+$/, `.${ext}`) : f.name;
+            const mime = blob.type || "application/octet-stream";
+            const preview = mime.startsWith("image/") ? URL.createObjectURL(blob) : undefined;
+            let att: Attached;
+            try {
+              att = { name, mime, size: blob.size, preview, file_id: await harnessApi.upload(blob, name, mime) };
+            } catch {
+              // Older servers without uploads: small files can still go inline.
+              if (blob.size > 8 * 1024 * 1024) throw new Error(`Couldn't upload ${name}`);
+              att = { name, mime, size: blob.size, preview, data_base64: await toBase64(blob) };
+            }
+            setFiles((cur) => [...cur, att]);
+          } catch (e) {
+            setFailed(e instanceof Error ? e.message : String(e));
+          } finally {
+            setPending((n) => n - 1);
+          }
+        }),
+      );
     },
     [accepts],
   );
-  const remove = (i: number) => setFiles((cur) => cur.filter((_, j) => j !== i));
-  const clear = React.useCallback(() => setFiles([]), []);
+  const remove = (i: number) =>
+    setFiles((cur) => {
+      const f = cur[i];
+      if (f?.preview) URL.revokeObjectURL(f.preview);
+      return cur.filter((_, j) => j !== i);
+    });
+  const clear = React.useCallback(() => {
+    setFiles((cur) => {
+      cur.forEach((f) => f.preview && URL.revokeObjectURL(f.preview));
+      return [];
+    });
+    setFailed(null);
+  }, []);
+  /** What a send carries. */
+  const payload = (): Attachment[] => files.map((f) => (f.file_id ? { name: f.name, mime: f.mime, file_id: f.file_id } : { name: f.name, mime: f.mime, data_base64: f.data_base64 ?? "" }));
   const chips =
-    files.length || busy ? (
+    files.length || pending || failed ? (
       <div className="hx-attach">
         {files.map((f, i) => (
           <span key={i} className="hx-attach-chip">
-            {f.mime.startsWith("image/") ? <img src={`data:${f.mime};base64,${f.data_base64}`} alt="" /> : null}
+            {f.preview ? <img src={f.preview} alt="" /> : null}
             <span className="hx-trunc">{f.name}</span>
             <button type="button" aria-label={`Remove ${f.name}`} onClick={() => remove(i)}>
               <X size={11} />
             </button>
           </span>
         ))}
-        {busy && <span className="hx-attach-chip hx-dim">Preparing…</span>}
+        {pending > 0 && <span className="hx-attach-chip hx-dim">Uploading {pending}…</span>}
+        {failed && <span className="hx-attach-chip hx-bad">{failed}</span>}
       </div>
     ) : null;
-  return { enabled, accepts, files, add, clear, chips };
+  return { enabled, accepts, files, pending, add, clear, chips, payload };
 }
 
 export type Attachments = ReturnType<typeof useAttachments>;

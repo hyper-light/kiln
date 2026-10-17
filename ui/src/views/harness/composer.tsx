@@ -87,7 +87,7 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
   const queue = state?.queue ?? [];
   const canAttach = attachments.enabled;
   const canOverride = features.includes("overrides");
-  const { files, add, clear, chips } = attachments;
+  const { files, add, clear, chips, pending } = attachments;
   const picker = React.useRef<HTMLInputElement>(null);
   const [override, setOverride] = React.useState<{ model?: string; effort?: string }>({});
 
@@ -136,13 +136,13 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
 
   const submit = () => {
     const body = text.trim();
-    if (!body || disabled) return;
+    if ((!body && files.length === 0) || disabled || pending > 0) return;
     const ok = store.send({
       type: "send",
       id: clientId(),
       text: body,
       mode: running ? mode : "queue",
-      attachments: files.length ? files.map(({ name, mime, data_base64 }) => ({ name, mime, data_base64 })) : undefined,
+      attachments: files.length ? attachments.payload() : undefined,
       overrides: override.model || override.effort ? override : undefined,
     });
     if (ok) {
@@ -325,7 +325,7 @@ export function Composer({ store, state, meta, disabled, attachments }: { store:
               </button>
             </Tip>
           )}
-          <Button size="sm" onClick={submit} disabled={!text.trim() || disabled} aria-label="Send">
+          <Button size="sm" onClick={submit} disabled={(!text.trim() && files.length === 0) || disabled || pending > 0} aria-label="Send">
             {running && mode === "queue" ? <CornerDownLeft /> : <Send />}
             {running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send"}
           </Button>

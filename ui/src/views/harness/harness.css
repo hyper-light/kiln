@@ -1845,3 +1845,20 @@ textarea.hx-input {
   font-size: 15px;
   color: #e1daf7;
 }
+.hx-hooks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.hx-hooks li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+}
+.hx-hooks code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #dfe3ea;
+}

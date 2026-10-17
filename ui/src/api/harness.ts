@@ -55,7 +55,7 @@ export interface ToolCall {
 }
 
 export type Body =
-  | { kind: "user"; text: string; images?: number; client_id?: string; origin?: string }
+  | { kind: "user"; text: string; images?: number; attachments?: string[]; client_id?: string; origin?: string }
   | { kind: "assistant"; text: string; streaming?: boolean }
   | { kind: "thinking"; text: string; streaming?: boolean; redacted?: boolean }
   | ({ kind: "tool" } & ToolCall)
@@ -230,15 +230,26 @@ export interface Control {
   input?: string;
 }
 
+/** A file sent with a message: inline, or uploaded first (`harnessApi.upload`) and referenced by id. */
 export interface Attachment {
   name: string;
   mime: string;
-  data_base64: string;
+  data_base64?: string;
+  file_id?: string;
+}
+
+/** A hook the harness runs on an event (read-only). */
+export interface HookInfo {
+  event: string;
+  matcher?: string;
+  command: string;
+  source?: string;
 }
 
 export interface Meta {
   version: string;
   controls?: Control[];
+  hooks?: HookInfo[];
   /** Reasoning effort levels, when the harness has them. */
   efforts?: ControlOption[];
   modes: ModeOption[];
@@ -374,6 +385,19 @@ export const harnessApi = {
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** A command without opening the session's socket (inbox answers). */
   command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
+  /** Upload a file for a later message (the agent's socket caps a message at 16 MB). */
+  upload: async (blob: Blob, name: string, mime: string): Promise<string> => {
+    const res = await fetch(`/api/harness/files?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(mime)}`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": mime || "application/octet-stream" },
+      body: blob,
+    });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const j = (await res.json()) as { file_id?: string };
+    if (!j.file_id) throw new Error("no file id");
+    return j.file_id;
+  },
   /** One command to many agents (each send gets its own message id). */
   broadcast: (ids: string[], c: Command) => call<{ sent: string[] }>("POST", "/api/harness/command", { ids, command: c }),
 };

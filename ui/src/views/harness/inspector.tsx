@@ -107,6 +107,11 @@ function Runs({ events }: { events: HEvent[] }) {
 
 function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number; canStop: boolean; store: SessionStore; onOpen?: (toolId: string) => void }) {
   const running = t.status === "running" || t.status === "pending";
+  const [out, setOut] = React.useState<string | null>(null);
+  const fetchOutput = async () => {
+    const v = await store.request((client) => ({ type: "control", id: "task_output", value: { task: t.id, client } }));
+    setOut(typeof v === "string" ? v : v && typeof v === "object" && "output" in v ? String((v as { output: unknown }).output) : "(no output)");
+  };
   return (
     <li className="hx-task" style={{ paddingLeft: depth * 14 }}>
       <div className="hx-task-head">
@@ -129,7 +134,11 @@ function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number;
         {t.tokens ? <span>{tokens(t.tokens)} tokens</span> : null}
         {t.duration_ms ? <span>{duration(t.duration_ms)}</span> : null}
         {running && t.last_tool && <span className="hx-trunc">{t.last_tool}</span>}
+        <button type="button" className="hx-link" onClick={() => (out === null ? void fetchOutput() : setOut(null))}>
+          {out === null ? "Output" : "Hide output"}
+        </button>
       </div>
+      {out !== null && <Output text={out} />}
     </li>
   );
 }

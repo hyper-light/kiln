@@ -303,7 +303,11 @@ function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "
         <span className="hx-eyebrow">{system ? e.origin : "You"}</span>
         <span className="hx-dim">{new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
         {delivery && <span className="hx-dim">· {DELIVERY[delivery]}</span>}
-        {e.images ? (
+        {e.attachments?.length ? (
+          <span className="hx-dim hx-trunc" title={e.attachments.join(", ")}>
+            · {e.attachments.join(", ")}
+          </span>
+        ) : e.images ? (
           <span className="hx-dim">
             · {e.images} image{e.images === 1 ? "" : "s"}
           </span>
