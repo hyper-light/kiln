@@ -823,7 +823,7 @@ async fn shared_plan(hub: &Hub, token: &str) -> R {
         return Err(err(StatusCode::NOT_FOUND, "no such plan"));
     }
     let p = crate::plans::shared(hub, token).await.map_err(plan_err)?;
-    Ok(srv::json(StatusCode::OK, &json!({ "title": p.title, "body": p.body, "steps": p.steps, "version": p.version, "updated_at": p.updated_at })))
+    Ok(srv::json(StatusCode::OK, &json!({ "title": p.title, "body": p.body, "items": p.items, "steps": p.steps, "version": p.version, "updated_at": p.updated_at })))
 }
 
 // ------------------------------------------------------------------ voice

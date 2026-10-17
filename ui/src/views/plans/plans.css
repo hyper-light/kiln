@@ -342,3 +342,154 @@ a.plan-row-main:hover {
   font-size: 12px;
   line-height: 1.5;
 }
+
+/* A plan's items (items.tsx): a numbered list, one item open at a time; the others a line each,
+   with which of their parts are filled. Then the plan creator in an agent's Plan tab (here.tsx). */
+.pi {
+  display: grid;
+  gap: 8px;
+}
+.pi-list {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid #23272e;
+  border-radius: 8px;
+}
+.pi-item + .pi-item {
+  border-top: 1px solid #23272e;
+}
+.pi-item[data-open] {
+  background: #0c0e12;
+}
+.pi-head {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+}
+.pi-n {
+  color: #7d818b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.pi-title {
+  display: grid;
+  min-width: 0;
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: #e3e4e9;
+  text-align: left;
+}
+.pi-name {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pi-parts {
+  overflow: hidden;
+  color: #7d818b;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pi-tools {
+  display: flex;
+  gap: 2px;
+}
+.pi-icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: #9a9da6;
+}
+.pi-icon:hover:not(:disabled) {
+  background: #151920;
+  color: #ededee;
+}
+.pi-icon:disabled {
+  opacity: 0.35;
+}
+.pi-body {
+  display: grid;
+  gap: 12px;
+  padding: 4px 12px 12px 40px;
+}
+.pi-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+.pi-text {
+  padding: 4px 0;
+  border: 0;
+  background: none;
+  color: #b9bcc4;
+  font-size: 12px;
+}
+.pi-text:hover {
+  color: #ededee;
+}
+.pi-remove {
+  color: #d9a29b;
+}
+.pi-add {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1px dashed #343a45;
+  border-radius: 999px;
+  background: none;
+  color: #c9cbd1;
+  font-size: 12px;
+}
+.pi-add:hover {
+  border-color: #4a5260;
+  color: #ededee;
+}
+.ph {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.ph-lead,
+.ph-meta {
+  margin: 0;
+  color: #8d9099;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.ph-meta a {
+  color: #c9cbd1;
+}
+
+@media (pointer: coarse) {
+  .pi-icon {
+    width: 40px;
+    height: 40px;
+  }
+  .pi-add,
+  .pi-text {
+    min-height: 40px;
+  }
+  .pi-body {
+    padding-left: 12px;
+  }
+}
+.plan-body[data-short] {
+  min-height: 96px;
+}
+.plan-items-label {
+  margin-top: 14px;
+}

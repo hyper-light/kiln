@@ -102,18 +102,19 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "plans.create",
-            summary: "Keep a plan in kiln (the plan you made, for the person to change, share and run later). Steps are its top-level list items.",
+            summary: "Keep a plan in kiln (the plan you made, for the person to change, share and run later): its text and/or its steps (`items`: each with description, examples, acceptance criteria, testing); without them, its text's top-level list items are its steps.",
             read_only: false,
             destructive: false,
             input: || {
                 schema(
                     json!({
                         "title": {"type": "string", "description": "Short; taken from the first heading when left out."},
-                        "body": {"type": "string", "description": "The plan, in markdown."},
+                        "body": {"type": "string", "description": "The plan's text, in markdown (optional with items)."},
+                        "items": {"type": "array", "description": "The plan's steps: each its title, what to do, examples, when it's done (acceptance) and how it's tested.", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "examples": {"type": "string"}, "acceptance": {"type": "string"}, "testing": {"type": "string"}}, "required": ["title"]}},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "source": {"type": "object", "description": "Where it came from: {session, harness, machine, cwd, agent}."}
                     }),
-                    &["body"],
+                    &[],
                 )
             },
             run: |cx, v| Box::pin(create(cx, v)),
@@ -123,7 +124,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Change a plan's title, text or tags; a new title or text is a new version.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"id": {"type": "string", "description": ID}, "title": {"type": "string"}, "body": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}}), &["id"]),
+            input: || schema(json!({"id": {"type": "string", "description": ID}, "title": {"type": "string"}, "body": {"type": "string"}, "items": {"type": "array", "description": "The plan's steps: each its title, what to do, examples, when it's done (acceptance) and how it's tested.", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "examples": {"type": "string"}, "acceptance": {"type": "string"}, "testing": {"type": "string"}}, "required": ["title"]}}, "tags": {"type": "array", "items": {"type": "string"}}}), &["id"]),
             run: |cx, v| Box::pin(update(cx, v)),
         },
         Op {

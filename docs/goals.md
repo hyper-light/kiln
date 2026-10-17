@@ -14,7 +14,7 @@ A goal is one line: a condition to meet ("the parser tests pass") or an objectiv
 
 ## In the console
 
-An agent's **Plan** tab has its **Goals** (`/goals` opens it): what's met, under way and next,
+An agent's **Plan** tab has its **Goal stack** (`/goals` opens it), in a panel of its own below its plans: what's met, under way and next,
 each with how it came out; a field to add goals (a line each); and:
 
 - **Start** (or **Resume**): goals go to the agent, the next once it's free (idle, nothing waiting
@@ -28,8 +28,10 @@ each with how it came out; a field to add goals (a line each); and:
 A goal that isn't met pauses the stack, and says why (Claude Code's or Codex's own words). The
 stack also pauses when the agent stops, goes away, or doesn't take a goal up.
 
-A plan runs as goals too: **Run it** (or **Run a saved plan**) **as Goals**, each step one, after
-the agent's others (a new agent is started for them when you pick one).
+A plan runs as goals too: **Run it** (or, in the agent's Plan tab, **Run here**) **as Goals**, each
+step one, after the agent's others (a new agent is started for them when you pick one). A step
+with parts goes as one line: its title, what to do, examples, "Done when:" its acceptance
+criteria and "Tested by:" its testing. The stack shows its title, the rest under it.
 
 The server keeps the stacks and drives them, so they go on with no console open and across
 restarts.

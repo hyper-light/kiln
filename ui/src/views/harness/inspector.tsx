@@ -13,7 +13,8 @@ import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
 import { TodoList } from "./timeline";
 import { Background, isBackground } from "./background";
-import { PlanSourceContext, RunSavedPlan, SavePlan, todosAsPlan } from "@/views/plans/save";
+import { PlansHere } from "@/views/plans/here";
+import { PlanSourceContext, SavePlan, todosAsPlan } from "@/views/plans/save";
 import { Goals } from "./goals";
 
 /** Three places beside the conversation: what it changed, its plan (and goals, and saved plans to run), and its tools (what it has running, subagents, commands it ran, MCP, skills, usage). */
@@ -299,7 +300,7 @@ export function Inspector({
           <div className="in-secs">
             <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
               <section>
-                <h3 className="in-sec-head">Plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
+                <h3 className="in-sec-head">Its plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
                 {todos.length > 0 ? (
                   <div className="hx-stack">
                     <div className="hx-progress">
@@ -314,7 +315,7 @@ export function Inspector({
                     <SavePlan body={proposed} />
                   </div>
                 ) : (
-                  <p className="in-none">No plan yet. It appears here when the agent writes one.</p>
+                  <p className="in-none">None yet: the plan it writes (or its to-do list) shows here, to keep as one of your plans.</p>
                 )}
               </section>
               {todos.length > 0 && proposed && (
@@ -326,16 +327,11 @@ export function Inspector({
               )}
               {agentId && (
                 <section>
-                  <h3 className="in-sec-head">Goals</h3>
-                  <Goals agent={agentId} harness={harness} />
+                  <h3 className="in-sec-head">Your plans</h3>
+                  <PlansHere session={agentId} />
                 </section>
               )}
-              {agentId && (
-                <section>
-                  <h3 className="in-sec-head">Run a saved plan</h3>
-                  <RunSavedPlan session={agentId} />
-                </section>
-              )}
+              {agentId && <Goals agent={agentId} harness={harness} />}
             </PlanSourceContext.Provider>
           </div>
         )}

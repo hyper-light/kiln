@@ -1,10 +1,8 @@
 /** Keeping a plan an agent made: "Save plan" wherever a plan shows in a conversation. */
 import * as React from "react";
 import { Link } from "react-router";
-import { planHref, plansApi, type PlanMode, type PlanRan, type PlanSource } from "@/api/plans";
-import { Button } from "@/components/ui/button";
-import { SelectField } from "@/components/ui/misc";
-import { errorMessage, useResource } from "@/lib/hooks";
+import { planHref, plansApi, type PlanSource } from "@/api/plans";
+import { errorMessage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import "./plans.css";
 
@@ -45,73 +43,4 @@ export function SavePlan({ body, title, className }: { body: string; title?: str
 /** A todo list as a plan's markdown. */
 export function todosAsPlan(todos: readonly { text: string }[]): string {
   return todos.map((t) => `- ${t.text}`).join("\n");
-}
-
-/** Run a saved plan on this agent: pick one, as one message or step by step. */
-export function RunSavedPlan({ session }: { session: string }) {
-  const res = useResource((s) => plansApi.list(s), []);
-  const [id, setId] = React.useState("");
-  const [mode, setMode] = React.useState<PlanMode>("message");
-  const [busy, setBusy] = React.useState(false);
-  const [ran, setRan] = React.useState<PlanRan | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
-  const plans = res.data ?? [];
-  const plan = plans.find((p) => p.id === id) ?? plans[0];
-  if (!res.data) return res.error ? <p className="in-none">{errorMessage(res.error)}</p> : null;
-  if (!plan)
-    return (
-      <p className="in-none">
-        No saved plans yet. <Link to="/agents/plans/new">Write one</Link>, or save one an agent makes.
-      </p>
-    );
-  const as = plan.steps.length ? mode : "message";
-  const run = async () => {
-    setBusy(true);
-    setError(null);
-    setRan(null);
-    try {
-      setRan(await plansApi.run(plan.id, { session }, as));
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div className="plan-here">
-      <SelectField
-        label="Plan"
-        value={plan.id}
-        onChange={(v) => {
-          setId(v);
-          setRan(null);
-        }}
-        options={plans.map((p) => ({ value: p.id, label: `${p.title}${p.steps.length ? ` · ${p.steps.length} step${p.steps.length === 1 ? "" : "s"}` : ""}` }))}
-      />
-      <SelectField
-        label="As"
-        value={as}
-        onChange={(v) => setMode(v as PlanMode)}
-        options={[
-          { value: "message", label: "One message" },
-          ...(plan.steps.length
-            ? [
-                { value: "steps", label: `Step by step, each after the last turn ends` },
-                { value: "goals", label: `Goals, each once the one before is met` },
-              ]
-            : []),
-        ]}
-      />
-      <div className="plan-actions">
-        <Button size="sm" variant="secondary" disabled={busy} onClick={() => void run()}>
-          {busy ? "Sending…" : "Run here"}
-        </Button>
-        <Link to={planHref(plan.id)} className="plan-here-open">
-          Open the plan
-        </Link>
-        {ran && <span className="plan-ok">{as === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`}</span>}
-        {error && <span className="plan-error">{error}</span>}
-      </div>
-    </div>
-  );
 }
