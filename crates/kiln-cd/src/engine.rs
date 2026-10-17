@@ -508,6 +508,9 @@ struct Op {
     request: SyncRequest,
     /// Requests this sync made (sent or not).
     requests: Vec<u64>,
+    /// The task creating the app's destination namespace, applied for real before the dry run
+    /// (gitops-engine's `getNamespaceCreationTask`), while it is still to do.
+    namespace_first: Option<usize>,
 }
 
 #[derive(Default)]
@@ -1852,6 +1855,7 @@ impl Engine {
             pruned: 0,
             request,
             requests: Vec::new(),
+            namespace_first: None,
         };
         if !plan.held.is_empty() {
             op.message = format!("{} objects need pruning but are kept by their Prune option", plan.held.len());
@@ -1869,6 +1873,12 @@ impl Engine {
         // applied, so a sync of one object skips it and costs one request, not two.
         let applies = op.tasks.iter().filter(|t| t.action != sync::Action::Prune).count();
         let dry_first = (self.cfg.dry_run_first && applies > 1) || op.dry_run_only;
+        if dry_first && !op.dry_run_only {
+            let ns = self.app(a).map(|x| x.cfg.namespace.clone()).unwrap_or_else(|| "".into());
+            op.namespace_first = op.tasks.iter().position(|t| {
+                t.action == sync::Action::Apply && t.key.group.is_empty() && &*t.key.kind == "Namespace" && *t.key.name == *ns
+            }).filter(|i| op.res.get(*i).copied().flatten().and_then(|ix| self.res(c, ix)).is_none_or(|r| r.live.is_none()));
+        }
         if let Some(app) = self.app_mut(a) {
             app.op = Some(op);
             app.retry = None;
@@ -1883,9 +1893,19 @@ impl Engine {
         let Some(app) = self.app(a) else { return };
         let Some(op) = app.op.as_ref() else { return };
         let c = app.cluster;
+        // The app's namespace first, for real: everything in it would fail validation without it.
+        if let Some(i) = op.namespace_first {
+            if let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) {
+                op.phase = OpPhase::DryRun;
+                op.message = "creating the namespace".into();
+                op.pending_dry_runs = 1;
+            }
+            self.send_group(a, c, &[i], false);
+            return;
+        }
         let mut sends = Vec::new();
         for (i, t) in op.tasks.iter().enumerate() {
-            if t.action == sync::Action::Prune {
+            if t.action == sync::Action::Prune || op.states.get(i).is_some_and(|s| *s != TaskState::Pending) {
                 continue;
             }
             let skip_missing = op.options.skip_dry_run_on_missing_resource.unwrap_or(false);
@@ -2218,16 +2238,43 @@ impl Engine {
             let current = self.app(a).and_then(|x| x.op.as_ref()).is_some_and(|op| op.id == req.op);
             if current {
                 match req.kind {
-                    ReqKind::Apply { dry_run: true, .. } => {
+                    ReqKind::Apply { dry_run: true, task, .. } => {
                         let mut fail = None;
                         if let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) {
                             op.pending_dry_runs = op.pending_dry_runs.saturating_sub(1);
-                            if let Err(e) = &result {
+                            if let Err(e) = &result
+                                && !dry_run_miss_expected(op, task as usize, e)
+                            {
                                 fail = Some(format!("one or more objects failed to apply (dry run): {e}"));
                             }
                         }
                         if let Some(msg) = fail {
                             self.fail_op(a, msg);
+                        }
+                    }
+                    ReqKind::Apply { task, fail_phase: false, dry_run: false }
+                        if self.app(a).and_then(|x| x.op.as_ref()).and_then(|o| o.namespace_first) == Some(task as usize) =>
+                    {
+                        let mut next = false;
+                        let mut fail = None;
+                        if let Some(op) = self.app_mut(a).and_then(|x| x.op.as_mut()) {
+                            op.namespace_first = None;
+                            op.pending_dry_runs = 0;
+                            match &result {
+                                Ok(_) => {
+                                    if let Some(s) = op.states.get_mut(task as usize) {
+                                        *s = TaskState::Settled;
+                                    }
+                                    op.applied += 1;
+                                    next = true;
+                                }
+                                Err(e) => fail = Some(format!("the namespace failed to apply: {e}")),
+                            }
+                        }
+                        if let Some(msg) = fail {
+                            self.fail_op(a, msg);
+                        } else if next {
+                            self.start_dry_run(a);
                         }
                     }
                     ReqKind::Apply { task, fail_phase, .. } | ReqKind::Delete { task, fail_phase } => {
@@ -2527,6 +2574,23 @@ fn tracking_names(rest: &str, key: &ResKey) -> bool {
     let Some((g, k)) = gk.split_once('/') else { return false };
     let Some((ns, name)) = nsname.split_once('/') else { return false };
     g == &*key.group && k == &*key.kind && name == &*key.name && (key.namespace.is_empty() || ns == &*key.namespace)
+}
+
+/// A dry run's "not found" that the sync itself answers: the object's namespace or its kind's
+/// CRD is created by this same sync, or `SkipDryRunOnMissingResource` says so (gitops-engine
+/// skips these too, for CRDs; kiln also for namespaces the sync creates).
+fn dry_run_miss_expected(op: &Op, task: usize, error: &str) -> bool {
+    if !(error.contains("404") || error.contains("not found") || error.contains("could not find")) {
+        return false;
+    }
+    let Some(t) = op.tasks.get(task) else { return false };
+    let created = |kind: &str, name: &dyn Fn(&str) -> bool| {
+        op.tasks.iter().any(|o| o.action != sync::Action::Prune && &*o.key.kind == kind && name(&o.key.name))
+    };
+    let namespace_created =
+        !t.key.namespace.is_empty() && created("Namespace", &|n| n == &*t.key.namespace) && error.contains(&format!("namespaces \"{}\"", t.key.namespace));
+    let crd_created = !t.key.group.is_empty() && created("CustomResourceDefinition", &|n| n.ends_with(&format!(".{}", t.key.group)));
+    namespace_created || crd_created || op.options.skip_dry_run_on_missing_resource == Some(true)
 }
 
 fn op_status(op: &Op) -> OpStatus {

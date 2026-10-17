@@ -352,3 +352,16 @@ fn crds_deployed_by_argo_cd_carry_no_tracking_and_still_compare_synced() {
     let s = status(&h, "default/crds");
     assert_eq!(s.map(|s| (s.sync, s.out_of_sync)), Some((Sync::Synced, 0)), "{s:?}");
 }
+
+#[test]
+fn a_sync_creates_its_namespace_before_validating_what_goes_in_it() {
+    let (mut h, git) = harness(Config { wave_delay_ms: 0, ..Config::default() });
+    if let Some(c) = h.clusters.get_mut("dev") {
+        c.strict_namespaces = true;
+    }
+    let mut a = auto("web");
+    a.create_namespace = Some((Vec::new(), Vec::new()));
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({})), deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+}

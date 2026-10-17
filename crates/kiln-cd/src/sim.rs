@@ -52,6 +52,8 @@ pub struct Cluster {
     pub fail_names: FxHashSet<String>,
     /// Jobs whose names are here fail instead of completing.
     pub failing_jobs: FxHashSet<String>,
+    /// Refuse objects in namespaces that don't exist, as the API server does.
+    pub strict_namespaces: bool,
     objects: FxHashMap<ResKey, Object>,
     rv: u64,
     uid: u64,
@@ -72,6 +74,7 @@ impl Cluster {
             job_ms: 2_000,
             fail_names: FxHashSet::default(),
             failing_jobs: FxHashSet::default(),
+            strict_namespaces: false,
             objects: FxHashMap::default(),
             rv: 1,
             uid: 1,
@@ -118,6 +121,9 @@ impl Cluster {
         let key = self.key(&desired).ok_or("object has no kind or name")?;
         if self.fail_names.contains(key.name.as_ref()) {
             return Err(format!("admission webhook denied {key}"));
+        }
+        if self.strict_namespaces && !key.namespace.is_empty() && !self.objects.contains_key(&ResKey::new("", "Namespace", "", &key.namespace)) {
+            return Err(format!("HTTP 404 NotFound: namespaces \"{}\" not found", key.namespace));
         }
         if let Some(m) = desired.as_object_mut() {
             m.remove("status");

@@ -430,6 +430,17 @@ and the network come on top, and are measured separately as they are built.
 
 | Part | State |
 | --- | --- |
-| Spec | this document |
-| Engine (`crates/kiln-cd`): health, diff, sync planning, controller, simulated clusters, benchmark | built, tested |
-| Rendering, git, clusters, API, CLI, UI, MCP, replication | not built yet |
+| Engine (`crates/kiln-cd`): health, diff, sync planning (phases, waves, hooks, prunes), controller, retries, self-heal, request budgets | built, tested (62 tests), benchmarked to 1M apps |
+| Rendering: directories, Helm (binary), Kustomize (binary), plugins; content-addressed render keys | built; Helm tested on kiln's own charts. Jsonnet and kiln's native Helm and Kustomize engines: not yet |
+| Git: mirrors, revisions, path hashes, extraction, symlinks | built |
+| Durable state on hyper-raft (one voter) | built; replicas across servers: not yet |
+| Clusters: kubeconfig (exec plugins included), in-cluster, discovery, watches, server-side apply | built; runner and delegated modes: not yet |
+| Argo CD Applications (import, app of apps, tracking, shadow mode, take-over) | built; ApplicationSets and AppProjects: not yet |
+| `.kiln/deploy.yaml` and environments | parsed and tested; read from kiln repositories: not yet |
+| `/api/cd`, `kiln cd` | built |
+| UI, MCP (code mode), skills, notifications, windows, projects and RBAC, plans and previews for diffs | not yet |
+
+Checked against a live cluster: in shadow mode, kiln agrees with Argo CD on kiln's own app of
+apps (four apps, the same sync, health and resource counts). On a cluster of its own, a kiln app
+synced through its PreSync hook and waves, followed a commit (with a prune), healed hand edits
+in 7 s, and was deleted with its objects while the namespace it created stayed.

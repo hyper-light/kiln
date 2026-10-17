@@ -11,6 +11,7 @@
 //! carry one line each for it.
 
 pub mod api;
+pub mod cli;
 pub mod kube;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

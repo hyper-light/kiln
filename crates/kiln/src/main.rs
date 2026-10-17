@@ -89,6 +89,8 @@ enum Cmd {
     Spawn(kiln::harness::cli::SpawnArgs),
     /// List, stop, interrupt or message this kiln shell's agents.
     Agents(kiln::harness::cli::AgentsArgs),
+    /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
+    Cd(kiln::cd::cli::CdArgs),
 }
 
 /// Which server a CLI command talks to. By default kiln finds it: the cluster bootstrap's
@@ -409,6 +411,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         }
         Cmd::Spawn(a) => kiln::harness::cli::spawn(a),
         Cmd::Agents(a) => kiln::harness::cli::agents(a),
+        Cmd::Cd(a) => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            kiln::cd::cli::run(a, &cfg).await
+        }
         Cmd::Status { server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;
