@@ -95,15 +95,34 @@
   letter-spacing: -0.025em;
   overflow-wrap: anywhere;
 }
+/* One line, whatever it says: what's doing and where give way (ellipsized) before it would wrap,
+   so the page under the head never moves when "reconnecting…" or a long activity comes and goes. */
 .ag-state {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px 14px;
+  min-width: 0;
   margin-top: 9px;
   color: #8f929b;
   font-family: var(--font-mono);
   font-size: 11px;
+}
+.ag-state > * {
+  flex: none;
+}
+.ag-state > .ag-activity,
+.ag-state > .ag-cwd {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+/* What it left running gives way only once those have. */
+.ag-state > .ag-left {
+  flex: 0 0.001 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ag-activity {
   max-width: 44ch;
