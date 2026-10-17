@@ -10,6 +10,7 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { duration, tildify } from "./derive";
+import { Optic } from "./signals";
 
 const BACKGROUND = new Set(["shell", "monitor", "mcp"]);
 export const isBackground = (t: Task) => (t.class ? BACKGROUND.has(t.class) : false);
@@ -21,7 +22,7 @@ export function backgroundOf(state: State | null): Task[] {
 }
 
 /** The task's output, tailed while it runs. */
-function Output({ agent, task }: { agent: string; task: Task }) {
+export function Output({ agent, task }: { agent: string; task: Task }) {
   const [text, setText] = React.useState("");
   const [note, setNote] = React.useState<string | null>(null);
   const offset = React.useRef<number | undefined>(undefined);
@@ -149,5 +150,63 @@ export function BackgroundStrip({ state, onView }: { state: State | null; onView
       <span className="bg-strip-what">{names.join(" · ")}</span>
       <ChevronRight size={13} aria-hidden="true" />
     </button>
+  );
+}
+
+/**
+ * By the composer: what's running besides the agent itself — its subagents, and the shells and
+ * monitors it started — as one line that opens in place. A subagent opens its thread; a shell or
+ * monitor shows its output right there.
+ */
+export function ActivityLine({ state, agent, onOpenTask }: { state: State | null; agent: string; onOpenTask: (toolId: string) => void }) {
+  const [open, setOpen] = React.useState(false);
+  const [shown, setShown] = React.useState<string | null>(null);
+  const now = useNow();
+  const tasks = state?.tasks ?? [];
+  const subs = tasks.filter((t) => !isBackground(t) && isLive(t));
+  const bg = tasks.filter((t) => isBackground(t) && isLive(t));
+  if (subs.length + bg.length === 0) return null;
+  const count = (n: number, one: string, many = `${one}s`) => (n ? `${n} ${n === 1 ? one : many}` : "");
+  const shells = bg.filter((t) => t.class === "shell").length;
+  const monitors = bg.filter((t) => t.class === "monitor").length;
+  const other = bg.length - shells - monitors;
+  const summary = [count(subs.length, "subagent"), count(shells, "shell"), count(monitors, "monitor"), count(other, "background call")].filter(Boolean).join(" · ");
+  return (
+    <div className="al" data-open={open || undefined}>
+      <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
+        <Optic state="tool" />
+        <span className="al-summary">{summary}</span>
+        <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
+      </button>
+      {open && (
+        <ul className="al-list">
+          {[...subs, ...bg].map((t) => {
+            const isSub = !isBackground(t);
+            const last = isSub ? t.last_tool : t.class === "monitor" ? t.last_event : undefined;
+            return (
+              <li key={t.id} className="al-item">
+                <button
+                  type="button"
+                  className="al-row"
+                  onClick={() => {
+                    if (isSub && t.tool_id) onOpenTask(t.tool_id);
+                    else setShown(shown === t.id ? null : t.id);
+                  }}
+                >
+                  <Optic state={t.status === "pending" ? "thinking" : "tool"} />
+                  <span className="al-what">
+                    <span className="al-kind">{isSub ? "Subagent" : (WORD[t.class ?? ""] ?? t.class)}</span>
+                    <span className="al-desc">{t.description || t.command || t.id}</span>
+                  </span>
+                  <span className="al-time">{duration(now - t.started)}</span>
+                  {last && <span className="al-last">{last}</span>}
+                </button>
+                {shown === t.id && <Output agent={agent} task={t} />}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
   );
 }

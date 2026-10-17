@@ -20,7 +20,7 @@ import { changesetOf } from "./derive";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { useMarkSeen } from "./seen";
-import { BackgroundStrip } from "./background";
+import { ActivityLine } from "./background";
 import { Timeline } from "./timeline";
 
 type PhoneTab = "work" | InspectorTab;
@@ -36,7 +36,6 @@ export default function AgentPage() {
   const [phoneTab, setPhoneTab] = React.useState<PhoneTab>("work");
   const [task, setTask] = React.useState<string | null>(null);
   const [confirmStop, setConfirmStop] = React.useState(false);
-  const [risky, setRisky] = React.useState<string | null>(null);
   const [settings, setSettings] = React.useState(false);
   const attachments = useAttachments((meta?.features ?? []).includes("attachments") ? "any" : (meta?.features ?? []).includes("images") ? "images" : "none");
   const [dragging, setDragging] = React.useState(false);
@@ -89,11 +88,10 @@ export default function AgentPage() {
     setTab("plan");
     setPhoneTab("plan");
   };
-  const [runOpen, setRunOpen] = React.useState(false);
   /** A slash command that opens one of kiln's panels. */
   const openView = (view: string) => {
     if (view === "settings") setSettings(true);
-    else if (view === "model" || view === "permissions") setRunOpen(true);
+    else if (view === "model" || view === "permissions") document.querySelector<HTMLButtonElement>(".ag-head .rs-line")?.click();
     else if (view === "tasks") showPlan();
     else if (view === "changes") {
       setTab("changes");
@@ -127,7 +125,7 @@ export default function AgentPage() {
       )}
       <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} agentLabel={task ? "Subagent" : info?.kind_name} />
       <div className="hx-dock">
-        <BackgroundStrip state={state} onView={showPlan} />
+        <ActivityLine state={state} agent={id} onOpenTask={openTask} />
         {approvals.length > 0 && (
           <div className="hx-dock-approvals">
             {approvals.length > 1 && <div className="hx-eyebrow px-1">{approvals.length} waiting on you</div>}
@@ -210,10 +208,7 @@ export default function AgentPage() {
         send={send}
         onUsage={showTools}
         onBackground={showPlan}
-        runOpen={runOpen}
-        onRunOpenChange={setRunOpen}
         onSettings={() => setSettings(true)}
-        onRisky={setRisky}
       />
 
       {conn === "gone" ? (
@@ -245,7 +240,21 @@ export default function AgentPage() {
           {phoneTab === "work" ? (
             work
           ) : (
-            <Inspector tab={phoneTab} onTab={(t) => setPhoneTab(t)} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} send={send} hideTabs className="hx-side hx-side-phone" />
+            <Inspector
+              tab={phoneTab}
+              onTab={(t) => setPhoneTab(t)}
+              events={events}
+              changes={changes}
+              state={state}
+              meta={meta}
+              store={store}
+              cwd={cwd}
+              onOpenTask={openTask}
+              agentId={id}
+              send={send}
+              hideTabs
+              className="hx-side hx-side-phone"
+            />
           )}
         </div>
       )}
@@ -260,18 +269,6 @@ export default function AgentPage() {
         confirmLabel="End agent"
         danger
         onConfirm={stop}
-      />
-      <ConfirmDialog
-        open={risky !== null}
-        onOpenChange={(o) => !o && setRisky(null)}
-        title="Turn off permission checks?"
-        description="In this mode the agent runs commands and changes files without asking you. Only use it in a sandbox you can throw away."
-        confirmLabel="Turn off checks"
-        danger
-        onConfirm={() => {
-          if (risky) send({ type: "set_mode", mode: risky });
-          setRisky(null);
-        }}
       />
     </div>
   );
