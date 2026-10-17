@@ -19,8 +19,12 @@ use crate::hub::Hub;
 
 /// Open routes; `None` when the path is not CI's.
 pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<Response, Fail>> {
+    if git_path(seg) {
+        // W14: the code host legs fetch from, at the server's root, because `actions/checkout`
+        // builds its remote from `GITHUB_SERVER_URL`'s origin only.
+        return Some(super::facade::git(hub, seg, req).await);
+    }
     match seg {
-        // W14: the code host legs fetch from.
         ["_kiln", "git", rest @ ..] => Some(super::facade::git(hub, rest, req).await),
         // W07: the run's pinned actions, for its legs.
         ["_kiln", "actions", rest @ ..] => Some(super::actions::tarball(hub, rest, &req).await),
@@ -31,7 +35,15 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
 
 /// Is this path one of [`open`]'s? (So the caller can hand the request over without cloning it.)
 pub fn is_open(seg: &[&str]) -> bool {
-    matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..])
+    git_path(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..])
+}
+
+/// git's smart HTTP for a repository: `/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`.
+fn git_path(seg: &[&str]) -> bool {
+    match seg {
+        [owner, _, "info", "refs"] | [owner, _, "git-upload-pack"] => !matches!(*owner, "api" | "_kiln" | "_apis" | "oidc" | "assets" | "dl"),
+        _ => false,
+    }
 }
 
 /// `/api/ci/<rest>`, authenticated.

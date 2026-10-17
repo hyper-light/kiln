@@ -821,7 +821,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let base = o.server_url.trim_end_matches('/').to_owned();
                         let rt = &mut a.runtime;
                         for u in [&mut rt.results_url, &mut rt.cache_url, &mut rt.facade_url, &mut rt.api_url, &mut rt.graphql_url] {
-                            if u.starts_with('/') {
+                            if u == "/" {
+                                // The server itself (`GITHUB_SERVER_URL` has no trailing slash).
+                                u.clone_from(&base);
+                            } else if u.starts_with('/') {
                                 *u = format!("{base}{u}");
                             }
                         }

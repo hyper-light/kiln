@@ -320,7 +320,7 @@ impl Dispatch {
     fn github_context(&self, s: &Start, number: i64, rowid: i64, name: &str) -> serde_json::Value {
         // The code host is kiln's facade; each runner sees it at its own address of the server.
         let base = self.hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-        let server_url = format!("{base}/_kiln/git");
+        let server_url = base.clone();
         let repo = kiln_ci::trigger::context::Repo { full_name: s.repo.name.clone(), id: 0, owner_id: 0, default_branch: String::new(), private: false, server_url };
         let run = kiln_ci::trigger::context::RunFacts {
             run_id: u64::try_from(rowid).unwrap_or(0),
@@ -563,8 +563,9 @@ impl Dispatch {
                 cache_url: "/_kiln/cache/".into(),
                 id_token_url: None,
                 id_token_request_token: None,
-                // The code host: kiln's mirror, which the leg's token reads (W14).
-                facade_url: "/_kiln/git".into(),
+                // The code host: kiln's mirror, which the leg's token reads (W14), at the
+                // server's root (`actions/checkout` keeps only the origin).
+                facade_url: "/".into(),
                 api_url: "/_kiln/api".into(),
                 graphql_url: "/_kiln/api/graphql".into(),
                 github_token: token,
