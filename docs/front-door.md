@@ -56,6 +56,9 @@ kiln's root and the public roots.
 
 Plain HTTP on port 80 answers every request with a redirect (307) to the same path over HTTPS,
 keeping the name or address that was asked when it is one of the front door's (else the domain).
+Three things it serves itself, because a device needs them before it trusts the HTTPS: kiln's root
+at `/ca.mobileconfig`, `/ca.crt` and `/ca.pem`, and, opened by address (`http://100.107.111.49`),
+a page saying how to trust that root, with a link on to the domain.
 Set the port to 0 for no redirect. The server knows each front door's names: a sign-in through one gets a `Secure` cookie,
 and `https://kiln.dev` counts as one of the server's own origins.
 
@@ -100,11 +103,17 @@ A self-signed certificate is trusted once the device trusts kiln's root. Under t
 `/ca.mobileconfig` (an Apple profile), `/ca.crt` (DER) and `/ca.pem`. They are served without
 signing in, since a root certificate is public.
 
+On a phone, the easiest way is the runner itself. With HTTPS and its redirect on, **Trust it on
+your devices** lists the runner's plain-HTTP addresses, such as `http://100.107.111.49` (on your
+tailnet) and `http://192.168.1.77` (on the LAN). Open one in Safari: the page there installs the
+profile and lists what to tap. By name it couldn't: a `.dev` name opens only over HTTPS, and only once the
+device trusts the root.
+
 | Device | Steps |
 | --- | --- |
-| iPhone, iPad | 1. Open `/ca.mobileconfig` in Safari and allow it, then install the profile: Settings → General → VPN & Device Management → kiln CA → Install. 2. Settings → General → About → Certificate Trust Settings: turn on kiln CA (Enable full trust for root certificates). |
+| iPhone, iPad | 1. In Safari (Chrome can't install profiles), open the runner's address or `/ca.mobileconfig` and allow it. 2. Settings → Profile Downloaded → Install. "Not Signed" is expected: the profile is kiln's own. 3. Settings → General → About → Certificate Trust Settings: turn on kiln CA. If Safari still can't find the name, iCloud Private Relay is sending its lookups past your network: use Chrome for it, or turn off Limit IP Address Tracking for that network (Settings → Wi-Fi → ⓘ). |
 | Android | Download `/ca.crt`, then Settings → Security & privacy → More security settings → Encryption & credentials → Install a certificate → CA certificate. |
-| macOS | Open `/ca.mobileconfig`, then System Settings → Privacy & Security → Profiles → kiln CA → Install (or `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain kiln-ca.pem`). |
+| macOS | Open `/ca.mobileconfig`, then System Settings → General → Device Management (Privacy & Security → Profiles before macOS 14) → kiln CA → Install (or `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain kiln-ca.pem`). |
 | Windows | Open `/ca.crt` → Install Certificate → Local Machine → Trusted Root Certification Authorities (or, as administrator, `certutil -addstore -f Root kiln-ca.crt`). |
 | Linux | `sudo trust anchor --store kiln-ca.pem` (Arch, Fedora), or copy it to `/usr/local/share/ca-certificates/kiln-ca.crt` and run `sudo update-ca-certificates` (Debian, Ubuntu). Firefox keeps its own list: Settings → Certificates → Import. |
 
@@ -212,10 +221,10 @@ and the redirect on, and the certificate in use.
     `.dev` is signed with DNSSEC, so a validating resolver rejects the runner's unsigned answers
     unless the name is marked insecure.
 
-**5. Trust the certificate on each device** that opens `kiln.dev`. Open
-`http://192.168.1.77:7070/ca.mobileconfig` (the server's address, or Download in Trust it on your
-devices) and follow the steps in [Trusting it on your devices](#trusting-it-on-your-devices). For
-`.dev` this step is required: the browser offers no way past the warning.
+**5. Trust the certificate on each device** that opens `kiln.dev`. On a phone, open
+`http://192.168.1.77` (the runner's address; on the tailnet, its `100.x` one) in Safari and follow
+the page. Elsewhere, see [Trusting it on your devices](#trusting-it-on-your-devices). For `.dev`
+this step is required: the browser offers no way past the warning.
 
 **Check it** from any device on the LAN:
 

@@ -840,63 +840,94 @@ function Upload({ v, onView, onDone }: { v: FrontDoorView; onView: (v: FrontDoor
 
 /* ------------------------------------------------------------------ devices and setup */
 
-const DEVICES: { os: string; steps: React.ReactNode }[] = [
-  {
-    os: "iPhone, iPad",
-    steps: (
-      <ol className="fd-steps">
-        <li>
-          Open <a href="/ca.mobileconfig">ca.mobileconfig</a> in Safari and allow it, then install the profile: Settings → General → VPN &amp; Device Management → kiln CA → Install.
-        </li>
-        <li>
-          Settings → General → About → Certificate Trust Settings: turn on <b>kiln CA</b> (Enable full trust for root certificates).
-        </li>
-      </ol>
-    ),
-  },
-  {
-    os: "Android",
-    steps: (
-      <>
-        Download <a href="/ca.crt">kiln-ca.crt</a>, then Settings → Security &amp; privacy → More security settings → Encryption &amp; credentials → Install a certificate → CA
-        certificate.
-      </>
-    ),
-  },
-  {
-    os: "macOS",
-    steps: (
-      <>
-        Open <a href="/ca.mobileconfig">ca.mobileconfig</a>, then System Settings → Privacy &amp; Security → Profiles → kiln CA → Install (or{" "}
-        <code>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain kiln-ca.pem</code>).
-      </>
-    ),
-  },
-  {
-    os: "Windows",
-    steps: (
-      <>
-        Open <a href="/ca.crt">kiln-ca.crt</a> → Install Certificate → Local Machine → Trusted Root Certification Authorities (or, as administrator,{" "}
-        <code>certutil -addstore -f Root kiln-ca.crt</code>).
-      </>
-    ),
-  },
-  {
-    os: "Linux",
-    steps: (
-      <>
-        <code>sudo trust anchor --store kiln-ca.pem</code> (Arch, Fedora), or copy it to <code>/usr/local/share/ca-certificates/kiln-ca.crt</code> and run{" "}
-        <code>sudo update-ca-certificates</code> (Debian, Ubuntu). Firefox keeps its own list: Settings → Certificates → Import.
-      </>
-    ),
-  },
-];
+/**
+ * Where a device that doesn't trust kiln yet can open this runner's front door: plain HTTP at an
+ * address (the runner hands out kiln's root there, with a page saying how to trust it). By name
+ * it couldn't: a `.dev` name is HTTPS-only until the device trusts the root. Tailnet first.
+ */
+function trustPages(v: FrontDoorView): { where: string; url: string }[] {
+  const s = v.status;
+  const port = v.settings.https.http_port;
+  if (!s || !v.settings.https.enabled || port === 0 || s.http.state !== "on") return [];
+  const v4 = (a: string) => /^\d+\.\d+\.\d+\.\d+$/.test(a) && !a.startsWith("127.") && !a.startsWith("169.254.");
+  const at = (a: string) => `http://${a}${port === 80 ? "" : `:${port}`}`;
+  const tail = (s.tailscale?.addresses ?? []).filter(v4).slice(0, 1);
+  const lan = s.addresses.filter((a) => v4(a) && !tail.includes(a)).slice(0, 1);
+  return [...tail.map((a) => ({ where: "on your tailnet", url: at(a) })), ...lan.map((a) => ({ where: "on this network", url: at(a) }))];
+}
+
+/** How each kind of device trusts kiln's root. `page`: the runner's own trust page, if it serves one. */
+function devices(page: string | null, domain: string): { os: string; steps: React.ReactNode }[] {
+  const profile = page ? <a href={page}>{page}</a> : <a href="/ca.mobileconfig">ca.mobileconfig</a>;
+  return [
+    {
+      os: "iPhone, iPad",
+      steps: (
+        <>
+          <ol className="fd-steps">
+            <li>
+              In <b>Safari</b> (Chrome can&apos;t install profiles), open {profile}
+              {page ? ", tap Install the profile" : ""} and allow it.
+            </li>
+            <li>
+              Settings → <b>Profile Downloaded</b> → Install. &ldquo;Not Signed&rdquo; is expected: the profile is kiln&apos;s own.
+            </li>
+            <li>
+              Settings → General → About → Certificate Trust Settings: turn on <b>kiln CA</b>.
+            </li>
+          </ol>
+          <p className="fd-relay">
+            If Safari still can&apos;t find {domain || "the name"}, iCloud Private Relay is sending its lookups past your network: use Chrome for it, or turn Private Relay off for this network
+            (Settings → Wi-Fi → ⓘ → Limit IP Address Tracking).
+          </p>
+        </>
+      ),
+    },
+    {
+      os: "Android",
+      steps: (
+        <>
+          Download <a href={page ? `${page}/ca.crt` : "/ca.crt"}>kiln-ca.crt</a>, then Settings → Security &amp; privacy → More security settings → Encryption &amp; credentials → Install a certificate
+          → CA certificate.
+        </>
+      ),
+    },
+    {
+      os: "macOS",
+      steps: (
+        <>
+          Open <a href="/ca.mobileconfig">ca.mobileconfig</a>, then System Settings → General → Device Management (Privacy &amp; Security → Profiles before macOS 14) → kiln CA → Install (or{" "}
+          <code>sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain kiln-ca.pem</code>).
+        </>
+      ),
+    },
+    {
+      os: "Windows",
+      steps: (
+        <>
+          Open <a href="/ca.crt">kiln-ca.crt</a> → Install Certificate → Local Machine → Trusted Root Certification Authorities (or, as administrator,{" "}
+          <code>certutil -addstore -f Root kiln-ca.crt</code>).
+        </>
+      ),
+    },
+    {
+      os: "Linux",
+      steps: (
+        <>
+          <code>sudo trust anchor --store kiln-ca.pem</code> (Arch, Fedora), or copy it to <code>/usr/local/share/ca-certificates/kiln-ca.crt</code> and run <code>sudo update-ca-certificates</code>{" "}
+          (Debian, Ubuntu). Firefox keeps its own list: Settings → Certificates → Import.
+        </>
+      ),
+    },
+  ];
+}
 
 /** How a device trusts kiln's root (and so every self-signed certificate kiln makes): a quiet
  * disclosure inside the certificate part, closed until asked for. */
 function TrustDevices({ v }: { v: FrontDoorView }) {
   const [open, setOpen] = React.useState(false);
   const id = React.useId();
+  const pages = trustPages(v);
   return (
     <div className="fd-trust">
       <button type="button" className="fd-disclose" aria-expanded={open} aria-controls={id} onClick={() => setOpen(!open)}>
@@ -905,9 +936,21 @@ function TrustDevices({ v }: { v: FrontDoorView }) {
       </button>
       {open && (
         <div id={id} className="fd-trust-body">
-          <p className="fd-hint">
-            Once on each device: trust kiln&apos;s root, and the device trusts every certificate it signs, on every runner, renewals included. On the device, check that it is this root:
-          </p>
+          <p className="fd-hint">Once on each device: trust kiln&apos;s root, and the device trusts every certificate it signs, on every runner, renewals included.</p>
+          {pages.length > 0 && (
+            <div className="fd-pages">
+              <p className="fd-hint">On a phone or tablet, open this in Safari. The page there installs it and says what to tap:</p>
+              {pages.map((x) => (
+                <div key={x.url} className="fd-code fd-page">
+                  <code>
+                    <a href={x.url}>{x.url}</a>
+                    <span className="fd-where">{x.where}</span>
+                  </code>
+                  <CopyIcon text={x.url} label={`Copy ${x.url}`} />
+                </div>
+              ))}
+            </div>
+          )}
           {v.ca && (
             <p className="fd-root">
               <span className="fd-key">SHA-256</span>
@@ -926,7 +969,7 @@ function TrustDevices({ v }: { v: FrontDoorView }) {
             </a>
           </div>
           <dl className="fd-devices">
-            {DEVICES.map((x) => (
+            {devices(pages[0]?.url ?? null, v.settings.domain).map((x) => (
               <div key={x.os} className="fd-device">
                 <dt className="fd-key">{x.os}</dt>
                 <dd>{x.steps}</dd>
