@@ -20,6 +20,7 @@ import { changesetOf } from "./derive";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { useMarkSeen } from "./seen";
+import { BackgroundStrip } from "./background";
 import { Timeline } from "./timeline";
 
 type PhoneTab = "work" | InspectorTab;
@@ -65,6 +66,7 @@ export default function AgentPage() {
       target: info?.target ?? "local",
       cwd,
       harness_session: state?.harness_session ?? info?.harness_session,
+      left_behind: state?.left_behind ?? info?.left_behind,
     },
     { onGone: () => navigate("/agents") },
   );
@@ -82,6 +84,10 @@ export default function AgentPage() {
   const showTools = () => {
     setTab("tools");
     setPhoneTab("tools");
+  };
+  const showPlan = () => {
+    setTab("plan");
+    setPhoneTab("plan");
   };
 
   const stop = async () => {
@@ -109,6 +115,7 @@ export default function AgentPage() {
       )}
       <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} agentLabel={task ? "Subagent" : info?.kind_name} />
       <div className="hx-dock">
+        <BackgroundStrip state={state} onView={showPlan} />
         {approvals.length > 0 && (
           <div className="hx-dock-approvals">
             {approvals.length > 1 && <div className="hx-eyebrow px-1">{approvals.length} waiting on you</div>}
@@ -190,6 +197,7 @@ export default function AgentPage() {
         actions={actions}
         send={send}
         onUsage={showTools}
+        onBackground={showPlan}
         onSettings={() => setSettings(true)}
         onRisky={setRisky}
       />
@@ -204,7 +212,7 @@ export default function AgentPage() {
       ) : wide ? (
         <div className="hx-agent-body">
           {work}
-          <Inspector tab={tab} onTab={setTab} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} className="hx-side" />
+          <Inspector tab={tab} onTab={setTab} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} send={send} className="hx-side" />
         </div>
       ) : (
         <div className="hx-agent-phone">
@@ -223,7 +231,7 @@ export default function AgentPage() {
           {phoneTab === "work" ? (
             work
           ) : (
-            <Inspector tab={phoneTab} onTab={(t) => setPhoneTab(t)} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} hideTabs className="hx-side hx-side-phone" />
+            <Inspector tab={phoneTab} onTab={(t) => setPhoneTab(t)} events={events} changes={changes} state={state} meta={meta} store={store} cwd={cwd} onOpenTask={openTask} agentId={id} send={send} hideTabs className="hx-side hx-side-phone" />
           )}
         </div>
       )}

@@ -13,7 +13,7 @@ import { SpawnDialog } from "./spawn";
 
 type Act = "end" | "remove" | "rename" | "duplicate" | null;
 
-export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "target" | "cwd" | "harness_session">, after?: { onGone?: () => void }) {
+export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "target" | "cwd" | "harness_session" | "left_behind">, after?: { onGone?: () => void }) {
   const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
   const [name, setName] = React.useState(a.name);
@@ -69,7 +69,7 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
         open={act === "end"}
         onOpenChange={(o) => !o && setAct(null)}
         title={`End ${a.name}?`}
-        description="Its process stops on the machine and it leaves the board. Its changes stay on disk, and its conversation can be resumed from the harness later."
+        description={`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
         confirmLabel="End agent"
         danger
         onConfirm={end}

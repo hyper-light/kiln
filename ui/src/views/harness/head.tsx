@@ -100,6 +100,7 @@ export function AgentHeader({
   onUsage,
   onSettings,
   onRisky,
+  onBackground,
 }: {
   info: AgentInfo | null;
   state: State | null;
@@ -112,6 +113,8 @@ export function AgentHeader({
   onUsage: () => void;
   onSettings: () => void;
   onRisky: (mode: string) => void;
+  /** Show what it left running in the background. */
+  onBackground?: () => void;
 }) {
   const navigate = useNavigate();
   const [sheet, setSheet] = React.useState(false);
@@ -166,6 +169,11 @@ export function AgentHeader({
               <span className="ag-cost ag-wide-only" title={costText(cost, plan).title}>
                 {costText(cost, plan).text}
               </span>
+            )}
+            {(state?.left_behind ?? info?.left_behind ?? 0) > 0 && (
+              <button type="button" className="ag-left" onClick={onBackground}>
+                {state?.left_behind ?? info?.left_behind} left running
+              </button>
             )}
             <LimitBadge limits={state?.limits ?? info?.limits} onClick={onUsage} />
             {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}

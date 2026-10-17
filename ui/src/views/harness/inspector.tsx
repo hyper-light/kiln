@@ -4,7 +4,7 @@
  */
 import * as React from "react";
 import { Bot, Square } from "lucide-react";
-import type { FileChange as ServerChange, HEvent, Meta, SessionStore, State, Task } from "@/api/harness";
+import type { Command, FileChange as ServerChange, HEvent, Meta, SessionStore, State, Task } from "@/api/harness";
 import { cn } from "@/lib/utils";
 import { changesetOf, duration, money, relPath, runsOf, tokens, type FileChange, type ToolEvent } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
@@ -12,6 +12,7 @@ import { Output } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
 import { TodoList } from "./timeline";
+import { Background, isBackground } from "./background";
 
 /** Three places beside the conversation: what it changed, what it is doing (plan, subagents, commands), and what it works with (MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
@@ -147,7 +148,7 @@ function TaskRow({ t, depth, canStop, store, onOpen }: { t: Task; depth: number;
 }
 
 export function Subagents({ state, meta, store, onOpen }: { state: State | null; meta: Meta | null; store: SessionStore; onOpen?: (toolId: string) => void }) {
-  const tasks = state?.tasks ?? [];
+  const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
   if (tasks.length === 0) return <div className="hx-empty">No subagents yet.</div>;
   const canStop = meta?.features.includes("stop_task") ?? false;
   // Children under their parents.
@@ -242,7 +243,12 @@ export function Inspector({
   onOpenTask,
   className,
   hideTabs,
+  agentId,
+  send,
 }: {
+  /** The agent, and how to send it commands (background tasks: output, stop). */
+  agentId?: string;
+  send?: (c: Command) => void;
   /** The page shows its own tabs (phones). */
   hideTabs?: boolean;
   tab: InspectorTab;
@@ -260,7 +266,7 @@ export function Inspector({
   const runs = React.useMemo(() => runsOf(events), [events]);
   const todos = state?.todos ?? [];
   const done = todos.filter((t) => t.status === "completed").length;
-  const tasks = state?.tasks ?? [];
+  const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
   const mcp = state?.mcp ?? [];
   const tabs: { id: InspectorTab; label: string; count?: string }[] = [
     { id: "changes", label: "Changes", count: fileCount ? String(fileCount) : undefined },
@@ -281,6 +287,7 @@ export function Inspector({
         {tab === "changes" && <Changes events={events} changes={changes} cwd={cwd} />}
         {tab === "plan" && (
           <div className="in-secs">
+            {agentId && send && <Background state={state} agent={agentId} send={send} />}
             <section>
               <h3 className="in-sec-head">Plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
               {todos.length > 0 ? (
