@@ -66,7 +66,7 @@ console picks) and are answered with a `reply` update to that client.
 |---|---|---|
 | `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
-| `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, answers?` | |
+| `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
 | `stop_task` | `task` | the task's `status` (stopped) |
@@ -81,6 +81,23 @@ console picks) and are answered with a `reply` update to that client.
 | `skill_view` | `name, client` | `{content, path}`, `{content, builtin: true, source}` (no file), or `{error}` |
 | `skill_run` | `name, args?, id?, mode?` | delivered like `send` |
 | `skills_reload` | | `state.skills` |
+
+### Questions
+
+An approval with `tool: "question"` carries `questions`: `id` (the harness's own, Codex),
+`question`, `header`, `multi` (several may be chosen), `other` (free text is accepted; always
+for Claude Code), `secret` (mask what is typed; Codex), `options: [{label, description,
+preview}]` (`preview`: what to show while the option is focused, Claude Code). Answer with
+`approve {id, decision: "allow", choices: [{question, id?, selected: [labels], other?,
+note?}]}`, one per question: labels with commas, free text and notes reach the harness as they
+are.
+
+- Claude Code (AskUserQuestion): `answers` maps each question to the labels chosen and the free
+  text, joined with ", " (the tool's own format); a note goes in `annotations[question].notes`,
+  with the chosen option's `preview`, as its own dialog does.
+- Codex (request_user_input): each label chosen and the free text are one answer each; a note
+  rides as `user_note: …`, as Codex's terminal sends it. Codex asks only in its Plan mode.
+- The older `answers` (question → one string) still works; each string is one choice.
 
 ## The command catalog (`meta.commands`)
 
@@ -237,7 +254,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | send now | ✓ | ✓ | unit | ? |
 | interrupt | ✓ | ✓ | ✓ | ? |
 | approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? |
-| questions | unit | unit | — | — |
+| questions: previews, free text, notes, labels with commas | ✓ | unit (Codex asks only in its Plan mode, which kiln does not run) | — | — |
 | plans to approve | unit | — | — | — |
 | permission modes from the start (`meta.modes`), `set_mode` | ✓ | ✓ (from the next turn) | ✓ (the agent's modes) | ? |
 | `set_model` mid-session | ✓ | ✓ (from the next turn) | ? (sent as session/set_model) | ? |

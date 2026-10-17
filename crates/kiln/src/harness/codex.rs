@@ -16,7 +16,7 @@ use super::core::{Baseline, Core, Effect};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Known, Level, Limit, McpServer,
     McpStatus, McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
-    ToolKind, ToolStatus, OUTPUT_MAX, Route, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog, window_words,
+    ChoiceAnswer, ToolKind, ToolStatus, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog, window_words,
 };
 use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
 
@@ -529,7 +529,7 @@ impl Codex {
                     self.send(core, item, SendMode::Now);
                 }
             }
-            Command::Approve { id, decision, message, always, answers } => self.answer(core, &id, decision, message, always, answers),
+            Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
             Command::Interrupt => self.interrupt(core),
             Command::SetMode { mode } => {
                 // Takes effect from the next turn (Codex sets policy per turn): the mode's approval
@@ -1046,7 +1046,7 @@ impl Codex {
         }
     }
 
-    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, answers: Option<std::collections::BTreeMap<String, String>>) {
+    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
         let Some(approval) = core.take_approval(id) else { return };
         let Some(ask) = self.asks.remove(id) else { return };
         let feedback = message.filter(|m| !m.trim().is_empty());
@@ -1054,11 +1054,20 @@ impl Codex {
             AskKind::UserInput => {
                 let mut out = serde_json::Map::new();
                 if decision != Decision::Deny {
+                    // Each option chosen and any free text one answer, commas and all; a note as
+                    // Codex's own TUI sends it.
                     for (qid, text) in &ask.questions {
-                        if let Some(a) = answers.as_ref().and_then(|a| a.get(text)) {
-                            let list: Vec<&str> = a.split(", ").collect();
-                            out.insert(qid.clone(), json!({"answers": list}));
+                        let Some(c) = choices.as_ref().and_then(|cs| cs.iter().find(|c| c.id.as_deref() == Some(qid.as_str())).or_else(|| cs.iter().find(|c| c.question == *text))) else {
+                            continue;
+                        };
+                        let mut list: Vec<String> = c.selected.clone();
+                        if let Some(o) = c.other.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+                            list.push(o.to_owned());
                         }
+                        if let Some(n) = c.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                            list.push(format!("user_note: {n}"));
+                        }
+                        out.insert(qid.clone(), json!({"answers": list}));
                     }
                 }
                 json!({"answers": out})
@@ -1598,9 +1607,12 @@ impl Codex {
                         qs.iter()
                             .filter_map(|q| {
                                 Some(Question {
+                                    id: q.get("id").and_then(Value::as_str).unwrap_or("").to_owned(),
                                     question: q.get("question").and_then(Value::as_str)?.to_owned(),
                                     header: q.get("header").and_then(Value::as_str).unwrap_or("").to_owned(),
                                     multi: false,
+                                    other: q.get("isOther").and_then(Value::as_bool).unwrap_or(false),
+                                    secret: q.get("isSecret").and_then(Value::as_bool).unwrap_or(false),
                                     options: q
                                         .get("options")
                                         .and_then(Value::as_array)
@@ -1610,6 +1622,7 @@ impl Codex {
                                                     Some(QuestionOption {
                                                         label: x.get("label").and_then(Value::as_str)?.to_owned(),
                                                         description: x.get("description").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                                        preview: String::new(),
                                                     })
                                                 })
                                                 .collect()
@@ -2559,7 +2572,7 @@ mod tests {
         assert_eq!(w.first().and_then(|v| v.get("method")).and_then(Value::as_str), Some("turn/steer"));
         assert_eq!(w.first().and_then(|v| v.pointer("/params/expectedTurnId")).and_then(Value::as_str), Some("t1"));
         // Always allow with the exec-policy amendment.
-        c.command(&mut core, Command::Approve { id: "srv-7".into(), decision: Decision::Always, message: None, always: Some(1), answers: None });
+        c.command(&mut core, Command::Approve { id: "srv-7".into(), decision: Decision::Always, message: None, always: Some(1), answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.get("id")).and_then(Value::as_str), Some("srv-7"));
         assert!(w.first().and_then(|v| v.pointer("/result/decision/acceptWithExecpolicyAmendment")).is_some());
@@ -2638,7 +2651,7 @@ mod tests {
         // Queue while busy; deny with feedback declines and steers the feedback in.
         c.command(&mut core, Command::Send { id: "m2".into(), text: "then test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
         assert_eq!(core.state.queue.len(), 1);
-        c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None });
+        c.command(&mut core, Command::Approve { id: "44".into(), decision: Decision::Deny, message: Some("keep old".into()), always: None, answers: None, choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/decision")).and_then(Value::as_str), Some("decline"));
         assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/steer") && v.pointer("/params/input/0/text").and_then(Value::as_str) == Some("keep old")));
@@ -2654,7 +2667,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"id": "q1", "method": "item/tool/requestUserInput", "params": {"threadId": "th9", "turnId": "t2", "itemId": "i9", "isBlocking": true, "questions": [{"id": "db", "header": "DB", "question": "Which database?", "options": [{"label": "Postgres", "description": ""}, {"label": "SQLite", "description": ""}]}]}})]);
         let mut answers = std::collections::BTreeMap::new();
         answers.insert("Which database?".to_owned(), "SQLite".to_owned());
-        c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers) });
+        c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers), choices: None });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/answers/db/answers/0")).and_then(Value::as_str), Some("SQLite"));
         Ok(())
@@ -2831,6 +2844,39 @@ mod tests {
         assert_eq!(args, ["mcp", "logout", "--", "web"]);
         c.run_done(&mut core, &job, Some(1), "not signed in");
         assert!(matches!(core.effects.pop(), Some(Effect::Run { args, .. }) if args == ["mcp", "remove", "--", "web"]));
+        Ok(())
+    }
+
+    #[test]
+    fn structured_answers_keep_commas_free_text_secrets_and_notes() -> anyhow::Result<()> {
+        use super::super::model::ChoiceAnswer;
+        let (mut c, mut core, _) = opened();
+        feed(&mut c, &mut core, &[json!({"id": "q7", "method": "item/tool/requestUserInput", "params": {"threadId": "th1", "turnId": "t1", "itemId": "i7", "isBlocking": true, "questions": [
+            {"id": "db", "header": "DB", "question": "Which database?", "isOther": true, "options": [{"label": "Postgres, with replicas", "description": ""}, {"label": "SQLite", "description": ""}]},
+            {"id": "token", "header": "Token", "question": "API token?", "isOther": true, "isSecret": true, "options": null},
+            {"id": "name", "header": "Name", "question": "Name it?", "isOther": true, "options": []}
+        ]}})]);
+        let a = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no approval"))?;
+        let qs: Vec<(&str, bool, bool)> = a.questions.iter().map(|q| (q.id.as_str(), q.other, q.secret)).collect();
+        assert_eq!(qs, vec![("db", true, false), ("token", true, true), ("name", true, false)]);
+        let choices = vec![
+            ChoiceAnswer { question: "Which database?".into(), id: Some("db".into()), selected: vec!["Postgres, with replicas".into()], note: Some("keep it cheap".into()), ..ChoiceAnswer::default() },
+            ChoiceAnswer { question: "API token?".into(), id: Some("token".into()), other: Some("sk-123".into()), ..ChoiceAnswer::default() },
+            // Matched by its text when no id comes with it.
+            ChoiceAnswer { question: "Name it?".into(), other: Some("alpha, beta".into()), ..ChoiceAnswer::default() },
+        ];
+        c.command(&mut core, Command::Approve { id: "q7".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: Some(choices) });
+        let w = written(&mut core);
+        assert_eq!(
+            w.first().and_then(|v| v.pointer("/result/answers")),
+            Some(&json!({"db": {"answers": ["Postgres, with replicas", "user_note: keep it cheap"]}, "token": {"answers": ["sk-123"]}, "name": {"answers": ["alpha, beta"]}}))
+        );
+        // The older map: its text is one answer, commas and all.
+        feed(&mut c, &mut core, &[json!({"id": "q8", "method": "item/tool/requestUserInput", "params": {"threadId": "th1", "turnId": "t1", "itemId": "i8", "isBlocking": true, "questions": [{"id": "db", "header": "DB", "question": "Which database?", "options": [{"label": "Postgres, with replicas", "description": ""}]}]}})]);
+        let mut answers = std::collections::BTreeMap::new();
+        answers.insert("Which database?".to_owned(), "Postgres, with replicas".to_owned());
+        c.command(&mut core, Command::Approve { id: "q8".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers), choices: None });
+        assert_eq!(written(&mut core).first().and_then(|v| v.pointer("/result/answers/db/answers")), Some(&json!(["Postgres, with replicas"])));
         Ok(())
     }
 

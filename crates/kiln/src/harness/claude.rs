@@ -17,7 +17,7 @@ use super::core::{Core, Effect, PreviewJob};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Hunk, Known, Level, Limit, McpServer, McpStatus,
     McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall, ToolKind, ToolStatus,
-    OUTPUT_MAX, Route, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog,
+    ChoiceAnswer, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog,
 };
 
 /// Environment variables a Claude Code session sets for its children; a harness kiln starts must
@@ -573,7 +573,7 @@ impl Claude {
                     self.send(core, item.id, item.text, SendMode::Now, item.attachments, item.overrides);
                 }
             }
-            Command::Approve { id, decision, message, always, answers } => self.answer(core, &id, decision, message, always, answers),
+            Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
             Command::Interrupt => {
                 if self.busy(core) {
                     self.request(core, Pending::Interrupt, json!({"subtype": "interrupt"}));
@@ -1183,14 +1183,20 @@ impl Claude {
         self.send(core, item.id, item.text, SendMode::Queue, item.attachments, item.overrides);
     }
 
-    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, answers: Option<std::collections::BTreeMap<String, String>>) {
+    fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
         let Some(approval) = core.take_approval(id) else { return };
         let ask = self.asks.remove(id);
         let mut input = ask.as_ref().map(|a| a.input.clone()).unwrap_or_else(|| approval.input.clone());
         let response = match decision {
             Decision::Allow | Decision::Always => {
-                if let (Some(answers), Some(o)) = (answers, input.as_object_mut()) {
-                    o.insert("answers".into(), json!(answers));
+                // Answers as AskUserQuestion takes them: question → label(s), several joined
+                // with ", "; notes (and the chosen option's preview) as annotations.
+                let answered = choices.map(|c| claude_answers(&c, &approval.questions));
+                if let (Some((answers, annotations)), Some(o)) = (answered, input.as_object_mut()) {
+                    o.insert("answers".into(), answers);
+                    if !annotations.is_empty() {
+                        o.insert("annotations".into(), Value::Object(annotations));
+                    }
                     if let Some(m) = message.as_ref().filter(|m| !m.trim().is_empty()) {
                         o.insert("response".into(), json!(m));
                     }
@@ -3077,20 +3083,59 @@ fn questions(input: &Value) -> Vec<Question> {
                         question: str_of(q, "question")?.to_owned(),
                         header: str_of(q, "header").unwrap_or("").to_owned(),
                         multi: q.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+                        // Claude Code always offers "Other".
+                        other: true,
                         options: q
                             .get("options")
                             .and_then(Value::as_array)
                             .map(|o| {
                                 o.iter()
-                                    .filter_map(|x| Some(QuestionOption { label: str_of(x, "label")?.to_owned(), description: str_of(x, "description").unwrap_or("").to_owned() }))
+                                    .filter_map(|x| {
+                                        Some(QuestionOption {
+                                            label: str_of(x, "label")?.to_owned(),
+                                            description: str_of(x, "description").unwrap_or("").to_owned(),
+                                            preview: str_of(x, "preview").unwrap_or("").to_owned(),
+                                        })
+                                    })
                                     .collect()
                             })
                             .unwrap_or_default(),
+                        ..Question::default()
                     })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// AskUserQuestion's `answers` (question → the labels chosen and any free text, joined with
+/// ", ") and `annotations` (question → {notes, preview of the option chosen}).
+fn claude_answers(choices: &[ChoiceAnswer], questions: &[Question]) -> (Value, serde_json::Map<String, Value>) {
+    let mut answers = serde_json::Map::new();
+    let mut annotations = serde_json::Map::new();
+    for c in choices {
+        let mut said: Vec<&str> = c.selected.iter().map(String::as_str).collect();
+        if let Some(o) = c.other.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+            said.push(o);
+        }
+        answers.insert(c.question.clone(), json!(said.join(", ")));
+        let mut note = serde_json::Map::new();
+        if let Some(n) = c.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            note.insert("notes".into(), json!(n));
+        }
+        let preview = questions
+            .iter()
+            .find(|q| q.question == c.question)
+            .and_then(|q| q.options.iter().find(|o| c.selected.contains(&o.label) && !o.preview.is_empty()))
+            .map(|o| o.preview.clone());
+        if let Some(p) = preview {
+            note.insert("preview".into(), json!(p));
+        }
+        if !note.is_empty() {
+            annotations.insert(c.question.clone(), Value::Object(note));
+        }
+    }
+    (Value::Object(answers), annotations)
 }
 
 /// A permission suggestion as an "always allow" choice.
@@ -3303,7 +3348,7 @@ mod tests {
         assert!(core.take_writes().is_empty());
 
         // Always allow: the CLI gets allow + the suggested rule.
-        c.command(&mut core, Command::Approve { id: "f7d9".into(), decision: Decision::Always, message: None, always: Some(0), answers: None });
+        c.command(&mut core, Command::Approve { id: "f7d9".into(), decision: Decision::Always, message: None, always: Some(0), answers: None, choices: None });
         let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(resp.pointer("/response/request_id").and_then(Value::as_str), Some("f7d9"));
         assert_eq!(resp.pointer("/response/response/behavior").and_then(Value::as_str), Some("allow"));
@@ -3343,7 +3388,7 @@ mod tests {
         assert!(w.first().is_some_and(|l| l.contains("\"priority\":\"now\"")));
         // A denial with feedback lets the model continue; without feedback it stops the turn.
         c.line(&mut core, r#"{"type":"control_request","request_id":"r9","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/work/a.txt","content":"x\n"},"tool_use_id":"t9"}}"#);
-        c.command(&mut core, Command::Approve { id: "r9".into(), decision: Decision::Deny, message: Some("use b.txt".into()), always: None, answers: None });
+        c.command(&mut core, Command::Approve { id: "r9".into(), decision: Decision::Deny, message: Some("use b.txt".into()), always: None, answers: None, choices: None });
         let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(resp.pointer("/response/response/behavior").and_then(Value::as_str), Some("deny"));
         assert_eq!(resp.pointer("/response/response/interrupt").and_then(Value::as_bool), Some(false));
@@ -3419,9 +3464,36 @@ mod tests {
         assert_eq!(a.questions.first().map(|q| q.options.len()), Some(2));
         let mut answers = std::collections::BTreeMap::new();
         answers.insert("Which database?".to_owned(), "SQLite".to_owned());
-        c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers) });
+        c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers), choices: None });
         let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(resp.pointer("/response/response/updatedInput/answers/Which database?").and_then(Value::as_str), Some("SQLite"));
+        Ok(())
+    }
+
+    #[test]
+    fn structured_answers_keep_commas_free_text_and_notes() -> anyhow::Result<()> {
+        use super::super::model::ChoiceAnswer;
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        let ask = json!({"type": "control_request", "request_id": "q2", "request": {"subtype": "can_use_tool", "tool_name": "AskUserQuestion", "tool_use_id": "tq2", "input": {"questions": [
+            {"question": "Which database?", "header": "DB", "multiSelect": false, "options": [{"label": "Postgres, with replicas", "description": "relational", "preview": "<pre>pg</pre>"}, {"label": "SQLite", "description": "embedded"}]},
+            {"question": "Anything else?", "header": "More", "multiSelect": true, "options": [{"label": "Tests", "description": ""}, {"label": "Docs, too", "description": ""}]}
+        ]}}});
+        c.line(&mut core, &ask.to_string());
+        let a = core.state.approvals.first().cloned().ok_or_else(|| anyhow::anyhow!("no approval"))?;
+        let q = a.questions.first().cloned().unwrap_or_default();
+        assert!(q.other && !q.secret && q.options.first().map(|o| o.preview.as_str()) == Some("<pre>pg</pre>"));
+        let choices = vec![
+            ChoiceAnswer { question: "Which database?".into(), selected: vec!["Postgres, with replicas".into()], note: Some("keep it cheap".into()), ..ChoiceAnswer::default() },
+            ChoiceAnswer { question: "Anything else?".into(), selected: vec!["Docs, too".into()], other: Some("Benchmarks, maybe".into()), ..ChoiceAnswer::default() },
+        ];
+        c.command(&mut core, Command::Approve { id: "q2".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: Some(choices) });
+        let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        let input = resp.pointer("/response/response/updatedInput").cloned().unwrap_or_default();
+        assert_eq!(input.get("answers"), Some(&json!({"Which database?": "Postgres, with replicas", "Anything else?": "Docs, too, Benchmarks, maybe"})));
+        // Notes (and the chosen option's preview) as annotations, which 2.1.296's AskUserQuestion takes.
+        assert_eq!(input.get("annotations"), Some(&json!({"Which database?": {"notes": "keep it cheap", "preview": "<pre>pg</pre>"}})));
+        assert!(input.get("questions").is_some());
         Ok(())
     }
 
@@ -4052,7 +4124,7 @@ mod tests {
             ["t1", "t2", "t3", "t4"].map(|t| status(&core, t)),
             [Some(ToolStatus::Pending), Some(ToolStatus::Pending), Some(ToolStatus::Pending), Some(ToolStatus::Running)]
         );
-        c.command(&mut core, Command::Approve { id: "p1".into(), decision: Decision::Allow, message: None, always: None, answers: None });
+        c.command(&mut core, Command::Approve { id: "p1".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: None });
         assert_eq!(["t1", "t2", "t3"].map(|t| status(&core, t)), [Some(ToolStatus::Running), Some(ToolStatus::Pending), Some(ToolStatus::Pending)]);
         // The first is done: the next is under way (until it asks too).
         c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": false}]}, "parent_tool_use_id": null, "session_id": "s", "uuid": "r1"}).to_string());
