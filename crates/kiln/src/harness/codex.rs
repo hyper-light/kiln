@@ -503,7 +503,8 @@ impl Codex {
             core.state.mode = self.mode.clone();
             core.touch_state();
         }
-        core.meta.modes = modes(self.allow_bypass);
+        // Full access is always a choice; choosing it allows it.
+        core.meta.modes = modes(true);
         core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides"]
             .iter()
             .map(|s| (*s).to_owned())
@@ -582,7 +583,12 @@ impl Codex {
             Command::SetMode { mode } => {
                 // Takes effect from the next turn (Codex sets policy per turn): the mode's approval
                 // policy and sandbox, over any chosen one by one before.
-                if modes(true).iter().any(|m| m.id == mode) && (mode != "full-access" || self.allow_bypass) {
+                if modes(true).iter().any(|m| m.id == mode) {
+                    if mode == "full-access" && !self.allow_bypass {
+                        // Chosen, so allowed: its approval and sandbox settings come with it.
+                        self.allow_bypass = true;
+                        self.refresh_controls(core);
+                    }
                     self.approval = None;
                     self.sandbox = None;
                     let (a, s, _) = policy(&mode);
@@ -3267,9 +3273,13 @@ mod tests {
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!(start.pointer("/params/approvalPolicy").and_then(Value::as_str), Some("on-request"));
         assert_eq!(start.pointer("/params/sandboxPolicy/type").and_then(Value::as_str), Some("readOnly"));
-        // Not offered: refused, said so.
+        // Full access is always a choice: chosen, it is allowed, its sandbox with it.
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
-        assert_eq!(core.state.mode, "read-only");
+        assert_eq!(core.state.mode, "full-access");
+        assert_eq!(core.state.control_values.get("sandbox"), Some(&json!("danger-full-access")));
+        // Not a mode at all: refused.
+        c.command(&mut core, Command::SetMode { mode: "nope".into() });
+        assert_eq!(core.state.mode, "full-access");
         Ok(())
     }
 

@@ -15,7 +15,7 @@ use super::kinds::Kind;
 use super::model::{Command, ExitInfo, State, Status, ToolKind};
 
 /// What to start.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Spec {
     /// Harness id ("claude", "codex", ...).
     pub kind: String,
@@ -39,8 +39,9 @@ pub struct Spec {
     /// Environment captured from that shell (`kiln spawn`), applied over the machine's own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
-    /// Offer the harness's skip-all-permissions mode (it is never the default).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Offer the harness's skip-all-permissions mode (it is never the default, only a choice).
+    /// On unless a session says otherwise, so a person can always choose it.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub allow_bypass: bool,
     /// Run this executable instead of the harness's usual one (a custom install, tests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,6 +63,37 @@ pub struct Spec {
     /// it to quit, then kills it) rather than only waiting for it to end.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub takeover_stop: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+impl Default for Spec {
+    fn default() -> Self {
+        Self {
+            kind: String::new(),
+            cwd: None,
+            model: None,
+            mode: None,
+            resume: None,
+            prompt: None,
+            name: None,
+            shell: None,
+            env: Vec::new(),
+            allow_bypass: true,
+            program: None,
+            effort: None,
+            resume_at: None,
+            fork: false,
+            takeover_pid: None,
+            takeover_stop: false,
+        }
+    }
 }
 
 /// A pending approval, as lists show it.
@@ -668,6 +700,7 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 (files.spawn)(b);
             }
             super::core::Effect::Restart { resume_at } => restart = Some(resume_at),
+            super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
                 let cwd = s.core.lock().state.cwd.clone();
