@@ -1,0 +1,1461 @@
+/* Choices (choices.tsx): an agent's questions in hyperlight-site's voice. A quiet panel inside a
+   #2a3039 hairline, the site's prism along its top edge and a warm glow in its corner (it is
+   waiting on you, like the approval card); mono uppercase labels; options as full-width rows on
+   hairlines, the picked one lit by a drifting prism hairline; previews as the site's code blocks.
+
+   - sheet: phones. Pinned to the bottom, at most 85% of the screen; only its middle scrolls, and
+     only ever down; the actions hold at the bottom; every target is 44–48px.
+   - dialog: desktops. Centered, 680px (960px when the options have previews).
+   - inline: in place, for an approval card or the timeline.
+   Its own width decides whether a preview sits beside the list or under its option (container
+   queries), not the viewport's. Nothing in it scrolls sideways: text wraps, chips wrap, and a
+   mockup shrinks to fit before it wraps. */
+
+.ch {
+  --ch-prism: linear-gradient(100deg, #b8d9d2 0%, #a6c4ed 28%, #b8a6d5 53%, #d6a2aa 75%, #d8cbb0 100%);
+  --ch-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --ch-surface: #0a0c0f;
+  --ch-field: #0b0c0e;
+  --ch-text: #ededee;
+  --ch-bright: #f2f2f3;
+  --ch-muted: #8f929b;
+  /* the faintest text that still says something: 4.8:1 on the panel */
+  --ch-faint: #7b7e88;
+  --ch-line: #25272c;
+  --ch-edge: #303239;
+  --ch-focus: #bab0e3;
+  --ch-warn: #d8bb95;
+  /* inline padding, and the height of a row or a control */
+  --ch-pad: 24px;
+  --ch-row: 44px;
+  --ch-ctl: 36px;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid #2a3039;
+  border-radius: 9px;
+  background:
+    radial-gradient(ellipse at 0 0, #c6b08e0d, transparent 55%),
+    var(--ch-surface);
+  color: var(--ch-text);
+  font-size: 14px;
+  line-height: 1.5;
+  outline: none;
+}
+.ch::before {
+  position: absolute;
+  top: -1px;
+  right: 14%;
+  left: 14%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #9fbab866, #a7aed070, #c4a8bd59, transparent);
+  content: "";
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------ frames */
+
+.ch-overlay {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  background: rgb(0 0 0 / 58%);
+  backdrop-filter: blur(3px);
+}
+.ch-overlay[data-layout="sheet"] {
+  background: rgb(0 0 0 / 50%);
+  backdrop-filter: none;
+}
+
+.ch[data-layout="dialog"] {
+  --ch-w: 680px;
+  position: fixed;
+  z-index: 90;
+  top: max(24px, 9vh);
+  left: 50%;
+  width: min(var(--ch-w), calc(100vw - 32px));
+  max-height: calc(100dvh - 2 * max(24px, 9vh));
+  transform: translateX(-50%);
+  box-shadow: 0 24px 80px #000a;
+}
+.ch[data-layout="dialog"][data-wide] {
+  --ch-w: 960px;
+}
+
+.ch[data-layout="sheet"] {
+  --ch-pad: 16px;
+  --ch-row: 48px;
+  --ch-ctl: 44px;
+  position: fixed;
+  z-index: 90;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  /* a host can set --ch-sheet-max (a frame shorter than the screen) */
+  max-height: var(--ch-sheet-max, 85dvh);
+  border-width: 1px 0 0;
+  border-radius: 12px 12px 0 0;
+  box-shadow: 0 -16px 60px #0009;
+}
+
+/* Touch screens get touch-sized targets in any frame. */
+@media (pointer: coarse) {
+  .ch {
+    --ch-row: 48px;
+    --ch-ctl: 44px;
+  }
+}
+
+/* ------------------------------------------------------------ head */
+
+.ch-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 8px 12px 4px var(--ch-pad);
+}
+.ch-who {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.ch-title {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 450;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+.ch-agent {
+  min-width: 0;
+  overflow: hidden;
+  color: #e9ebee;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ch-ask.sg-label {
+  flex: none;
+  color: #e2cfae;
+}
+/* Short of room, the harness's name gives way before the agent's. */
+.ch-kind {
+  flex: 0 1000 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ch-head-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+.ch-icon,
+.ch-decline {
+  display: inline-grid;
+  place-items: center;
+  height: var(--ch-ctl);
+  border-radius: 5px;
+  color: #a1a4ad;
+  transition:
+    background-color 0.15s,
+    color 0.15s;
+}
+.ch-icon {
+  width: var(--ch-ctl);
+}
+.ch-decline {
+  padding: 0 10px;
+  font-size: 12.5px;
+}
+.ch-icon:hover:not(:disabled) {
+  background: #ffffff0d;
+  color: var(--ch-bright);
+}
+.ch-decline:hover:not(:disabled) {
+  background: #d1aaad14;
+  color: #ecc9cc;
+}
+.ch-icon:disabled,
+.ch-decline:disabled {
+  opacity: 0.35;
+}
+.ch-icon:focus-visible,
+.ch-decline:focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: 0;
+}
+.ch[data-layout="sheet"] .ch-head {
+  min-height: 52px;
+  padding: 4px 4px 2px var(--ch-pad);
+}
+
+/* ------------------------------------------------------------ stepper: "2 of 3" and the questions' chips, wrapping */
+
+/* The count holds its place at the left; only the chips wrap, beside it. */
+.ch-steps {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 0 var(--ch-pad) 10px;
+}
+.ch-count {
+  flex: none;
+  line-height: 22px;
+  color: var(--ch-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ch-chips-row {
+  display: flex;
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ch-step {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  height: 22px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid #26282e;
+  border-radius: 4px;
+  color: var(--ch-faint);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ch-step[data-state="done"] {
+  border-color: #2c2f36;
+  color: #a9acb4;
+}
+.ch-step[data-state="done"] > svg {
+  color: #a8c9bc;
+}
+.ch-step[data-state="current"] {
+  border-color: #4a4560;
+  background: #121119;
+  color: var(--ch-text);
+}
+.ch-step[data-state="current"]::after {
+  position: absolute;
+  right: 6px;
+  bottom: -1px;
+  left: 6px;
+  height: 1px;
+  background: var(--ch-prism);
+  content: "";
+}
+/* Phones: denser chips, so four questions' headers take two rows, not three. */
+.ch[data-layout="sheet"] .ch-steps {
+  gap: 8px;
+  padding-bottom: 8px;
+}
+.ch[data-layout="sheet"] .ch-chips-row {
+  gap: 4px;
+}
+.ch[data-layout="sheet"] .ch-step {
+  gap: 4px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+}
+.ch[data-layout="sheet"] .ch-count {
+  font-size: 9.5px;
+  line-height: 20px;
+  letter-spacing: 0.06em;
+}
+
+/* ------------------------------------------------------------ body */
+
+.ch-body {
+  container: ch-body / inline-size;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px var(--ch-pad) 20px;
+}
+.ch[data-layout="inline"] .ch-body {
+  overflow: visible;
+}
+.ch[data-layout="sheet"] .ch-body {
+  padding-block: 4px 14px;
+}
+.ch [tabindex="-1"]:focus {
+  outline: none;
+}
+
+/* ------------------------------------------------------------ a question */
+
+.ch-q-head {
+  margin-bottom: 14px;
+}
+.ch[data-layout="sheet"] .ch-q-head {
+  margin-bottom: 12px;
+}
+.ch-q-kind {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0 0 6px;
+  color: #8a8e98;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  line-height: 1.6;
+  text-transform: uppercase;
+}
+.ch-q-header {
+  color: #c4bde4;
+}
+.ch-q-text {
+  margin: 0;
+  color: var(--ch-bright);
+  font-size: 17px;
+  font-weight: 450;
+  line-height: 1.45;
+  letter-spacing: -0.015em;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* options: rows on hairlines inside one quiet frame */
+.ch-opts {
+  overflow: clip;
+  border: 1px solid #272a31;
+  border-radius: 7px;
+  background: var(--ch-field);
+}
+.ch-opt {
+  position: relative;
+}
+.ch-opt + .ch-opt {
+  border-top: 1px solid #1f2126;
+}
+/* A picked option is lit, with whatever it opened (its field, its preview): a raised surface and a
+   prism hairline along its foot, drifting like the site's tabs. */
+.ch-opt[data-checked] {
+  background: #101016;
+}
+.ch-opt[data-checked]::after {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: var(--ch-prism);
+  background-size: 250% 100%;
+  animation: ch-current 6s ease-in-out infinite alternate;
+  content: "";
+  pointer-events: none;
+}
+.ch-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  column-gap: 12px;
+  width: 100%;
+  min-height: var(--ch-row);
+  padding: 12px 14px;
+  color: var(--ch-text);
+  text-align: left;
+  transition: background-color 0.15s;
+}
+.ch-row:hover {
+  background: #0f1013;
+}
+.ch-opt[data-checked] > .ch-row:hover {
+  background: #121219;
+}
+.ch-row:focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: -2px;
+}
+
+/* the radio or checkbox */
+.ch-mark {
+  position: relative;
+  display: grid;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  place-items: center;
+  border: 1.5px solid #4a4c55;
+  border-radius: 50%;
+  transition:
+    border-color 0.15s,
+    background-color 0.15s;
+}
+.ch-mark > svg {
+  color: #08090a;
+  opacity: 0;
+}
+[role="checkbox"] > .ch-mark {
+  border-radius: 4px;
+}
+[role="radio"]:hover > .ch-mark,
+[role="checkbox"]:hover > .ch-mark {
+  border-color: #6b6e78;
+}
+[role="radio"][aria-checked="true"] > .ch-mark {
+  border-color: #cfc8ee;
+}
+[role="radio"][aria-checked="true"] > .ch-mark::after {
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--ch-prism);
+  content: "";
+}
+[role="checkbox"][aria-checked="true"] > .ch-mark {
+  border-color: transparent;
+  background: var(--ch-prism);
+}
+[role="checkbox"][aria-checked="true"] > .ch-mark > svg {
+  opacity: 1;
+}
+
+.ch-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.ch-label {
+  color: var(--ch-text);
+  font-size: 14px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.ch-row[aria-checked="true"] .ch-label {
+  color: #ffffff;
+}
+.ch-row-other .ch-label {
+  color: #c4c6cd;
+}
+.ch-desc {
+  color: var(--ch-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.ch-rec {
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  margin-left: 4px;
+  padding: 0 6px;
+  border: 1px solid #3a3550;
+  border-radius: 4px;
+  background: var(--ch-prism);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+/* The shortcut, for keyboards only: placed in a column of its own, which hidden it doesn't make. */
+.ch-key {
+  grid-column: 3;
+  display: grid;
+  min-width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  padding: 0 4px;
+  place-items: center;
+  border: 1px solid #2c2e34;
+  border-bottom-color: #34363d;
+  border-radius: 4px;
+  background: #0f1012;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+}
+.ch[data-layout="sheet"] .ch-key {
+  display: none;
+}
+@media (pointer: coarse), (hover: none) {
+  .ch-key {
+    display: none;
+  }
+}
+
+/* "Other…" opens a field under itself, lined up with the labels */
+.ch-other {
+  padding: 0 14px 14px 44px;
+}
+
+/* text */
+.ch-input {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--ch-ctl);
+  padding: 7px 11px;
+  border: 1px solid var(--ch-edge);
+  border-radius: 5px;
+  background: var(--ch-field);
+  color: var(--ch-text);
+  font-size: 14px;
+  line-height: 1.5;
+  outline: none;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.ch-input::placeholder {
+  color: var(--ch-faint);
+}
+.ch-input:focus {
+  border-color: #6b6290;
+  box-shadow: 0 0 0 3px rgb(186 176 227 / 12%);
+}
+textarea.ch-input {
+  display: block;
+  min-height: 64px;
+  max-height: 220px;
+  resize: none;
+  field-sizing: content;
+}
+textarea.ch-free {
+  min-height: 92px;
+}
+.ch-mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+/* Phones zoom into fields under 16px. */
+.ch[data-layout="sheet"] :is(.ch-input, .ch-select),
+.ch[data-layout="sheet"] .ch-mono {
+  font-size: 16px;
+}
+@media (pointer: coarse) {
+  .ch :is(.ch-input, .ch-select),
+  .ch .ch-mono {
+    font-size: 16px;
+  }
+}
+
+/* the note: a quiet disclosure under the options */
+.ch-note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.ch-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 0 4px;
+  margin-left: -4px;
+  border-radius: 4px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.ch-link:hover {
+  color: var(--ch-text);
+}
+.ch-link:focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: 0;
+}
+.ch-link > svg {
+  color: var(--ch-faint);
+}
+.ch-note > .ch-link {
+  align-self: flex-start;
+}
+.ch-note-peek {
+  min-width: 0;
+  overflow: hidden;
+  color: #7b7e88;
+  text-overflow: ellipsis;
+}
+.ch-note-peek::before {
+  content: "· ";
+}
+.ch[data-layout="sheet"] .ch-note > .ch-link {
+  min-height: 40px;
+}
+
+/* ------------------------------------------------------------ previews */
+
+/* Under its option where the panel is narrow; beside the list where it's wide. */
+.ch-side {
+  display: none;
+}
+.ch-pv {
+  container-type: inline-size;
+  min-width: 0;
+  margin: 0;
+}
+.ch-pv-under {
+  padding: 0 14px 14px 44px;
+}
+.ch-pv-cap {
+  margin-bottom: 7px;
+  overflow: hidden;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ch-pv-pre {
+  max-height: 240px;
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid #2b2e39;
+  border-radius: 6px;
+  background: #101217;
+  color: #c9ccd3;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+  white-space: pre-wrap;
+}
+/* A mockup narrower than 100 columns shrinks (to 9.5px at most) to keep its lines whole: Geist Mono
+   is 0.6em a column; the pre's padding and border are 30px. */
+.ch-pv-pre[data-fit] {
+  font-size: clamp(9.5px, calc((100cqi - 30px) / (var(--ch-cols) * 0.61)), 12px);
+}
+.ch-pv-pre:focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: 2px;
+}
+.ch-pv-empty {
+  display: grid;
+  min-height: 120px;
+  margin: 0;
+  padding: 16px;
+  place-items: center;
+  border: 1px dashed #2b2e39;
+  border-radius: 6px;
+  color: var(--ch-faint);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+@container ch-body (width >= 640px) {
+  .ch-q[data-previews] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: start;
+    column-gap: 20px;
+  }
+  .ch-q[data-previews] > .ch-q-head {
+    grid-column: 1 / -1;
+  }
+  .ch-q[data-previews] > .ch-q-main {
+    min-width: 0;
+  }
+  .ch-q[data-previews] .ch-side {
+    position: sticky;
+    top: 0;
+    display: block;
+  }
+  .ch-q[data-previews] .ch-pv-under {
+    display: none;
+  }
+  .ch-side .ch-pv-pre {
+    max-height: min(52vh, 460px);
+  }
+}
+
+/* ------------------------------------------------------------ the review */
+
+.ch-review > .ch-q-text {
+  margin-bottom: 12px;
+}
+.ch-review-list {
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--ch-line);
+  list-style: none;
+}
+.ch-review-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  padding: 12px 0 13px;
+  border-bottom: 1px solid var(--ch-line);
+}
+.ch-review-item > p {
+  grid-column: 1;
+  margin: 0;
+}
+.ch-review-q {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  color: var(--ch-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.ch-review-h {
+  color: #a9acb4;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.ch-review-a {
+  margin-top: 4px !important;
+  color: var(--ch-bright);
+  font-size: 14.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ch-review-note {
+  margin-top: 4px !important;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.ch-review-note > .ch-review-h {
+  margin-right: 4px;
+  color: var(--ch-faint);
+}
+.ch-own {
+  color: #ddd6f5;
+}
+.ch-secret {
+  color: var(--ch-muted);
+  letter-spacing: 0.1em;
+}
+.ch-missing {
+  color: var(--ch-warn);
+}
+.ch-edit {
+  grid-row: 1 / span 3;
+  grid-column: 2;
+  align-self: start;
+  margin: -4px -4px 0 0;
+  color: #c9c3d8;
+  font-size: 12px;
+}
+.ch[data-layout="sheet"] .ch-edit {
+  min-height: 44px;
+  min-width: 44px;
+  justify-content: center;
+  margin-top: -10px;
+}
+
+/* ------------------------------------------------------------ footer: held at the bottom of the frame */
+
+.ch-foot {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px 14px;
+  padding: 12px var(--ch-pad) 14px;
+  border-top: 1px solid #1d1f24;
+  border-radius: 0 0 9px 9px;
+  background: var(--ch-surface);
+}
+.ch[data-layout="sheet"] .ch-foot {
+  padding: 8px var(--ch-pad) calc(10px + env(safe-area-inset-bottom));
+  border-radius: 0;
+}
+.ch-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.ch-keys {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  min-width: 0;
+  margin: 0;
+  color: var(--ch-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+.ch-keys kbd {
+  display: inline-grid;
+  min-width: 16px;
+  height: 16px;
+  margin-right: 2px;
+  padding: 0 3px;
+  place-items: center;
+  border: 1px solid #2c2e34;
+  border-radius: 3px;
+  color: #8f929b;
+  font-family: inherit;
+  font-size: 9.5px;
+}
+.ch[data-layout="sheet"] .ch-keys {
+  display: none;
+}
+@media (pointer: coarse), (hover: none) {
+  .ch-keys {
+    display: none;
+  }
+}
+.ch-runs {
+  display: flex;
+  flex: 1 1 260px;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  margin: 0;
+  color: #c4c6cd;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+.ch-problem {
+  color: var(--ch-warn);
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+.ch[data-layout="sheet"] .ch-runs {
+  flex-basis: 100%;
+}
+/* Phones: Back is an arrow; Next, Review and Submit take the room that's left. */
+.ch[data-layout="sheet"] .ch-actions {
+  flex: 1 1 auto;
+}
+.ch[data-layout="sheet"] .ch-back-label {
+  display: none;
+}
+.ch[data-layout="sheet"] .ch-back {
+  padding-inline: 14px;
+}
+.ch[data-layout="sheet"] .ch-primary {
+  flex: 1 1 auto;
+}
+.ch[data-layout="inline"] .ch-foot {
+  background: none;
+}
+
+/* ------------------------------------------------------------ the experiment setup */
+
+.ch-x {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.ch-x-head {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ch-x-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+/* the site's eyebrow: a short prism rule before the label */
+.ch-rule {
+  flex: none;
+  width: 30px;
+  height: 2px;
+  background: var(--ch-prism);
+  background-size: 250% 100%;
+  animation: ch-current 6s ease-in-out infinite alternate;
+}
+.ch-x-sub {
+  margin: 0;
+  color: var(--ch-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.ch-x-of {
+  margin: 2px 0 0;
+  padding-left: 10px;
+  border-left: 1px solid #3a3550;
+  color: #c4c6cd;
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+/* Phones: the question it tries says enough. */
+.ch[data-layout="sheet"] .ch-x-sub {
+  display: none;
+}
+.ch-x-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.ch-x-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  color: #a1a3ab;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.09em;
+  line-height: 1.6;
+  text-transform: uppercase;
+}
+.ch-x-sec > .ch-x-label {
+  min-height: 22px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #222428;
+}
+.ch-x-label > h4 {
+  margin: 0;
+  font: inherit;
+}
+.ch-x-aside {
+  color: var(--ch-faint);
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+.ch-x-aside .ch-warn {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.ch-add {
+  min-height: 24px;
+  margin: -4px -4px -4px 0;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.ch-x-hint {
+  margin: 0;
+  color: var(--ch-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.ch-warn {
+  margin: 0;
+  color: var(--ch-warn);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.ch-dim {
+  color: var(--ch-faint);
+}
+
+/* chips: toggles that wrap */
+.ch-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ch-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-height: var(--ch-ctl);
+  padding: 4px 12px 4px 10px;
+  border: 1px solid var(--ch-edge);
+  border-radius: 5px;
+  background: var(--ch-field);
+  color: #c4c6cd;
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: left;
+  overflow-wrap: anywhere;
+  transition:
+    border-color 0.15s,
+    background-color 0.15s,
+    color 0.15s;
+}
+.ch-chip:hover {
+  border-color: #47464f;
+  color: var(--ch-text);
+}
+.ch-chip[aria-checked="true"] {
+  border-color: #5a5275;
+  background: #121119;
+  color: var(--ch-bright);
+}
+.ch-chip-n {
+  color: var(--ch-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.ch-chip[aria-checked="true"] .ch-chip-n {
+  background: var(--ch-prism);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.ch-chip[role="checkbox"][aria-checked="false"] {
+  border-style: dashed;
+  color: var(--ch-faint);
+}
+.ch-set {
+  justify-content: center;
+  min-width: 52px;
+  padding-inline: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* tiles: radio choices in a grid that wraps (two to a row on phones) */
+.ch-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 160px), 1fr));
+  gap: 6px;
+}
+.ch-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  min-height: var(--ch-ctl);
+  padding: 8px 12px;
+  border: 1px solid #2a2c33;
+  border-radius: 6px;
+  background: var(--ch-field);
+  text-align: left;
+  transition:
+    border-color 0.15s,
+    background-color 0.15s;
+}
+.ch-tile:hover:not(:disabled) {
+  border-color: #47464f;
+}
+.ch-tile[aria-checked="true"] {
+  border-color: #4a4560;
+  background: #111018;
+}
+.ch-tile[aria-checked="true"]::after {
+  position: absolute;
+  right: 10px;
+  bottom: -1px;
+  left: 10px;
+  height: 1px;
+  background: var(--ch-prism);
+  background-size: 250% 100%;
+  animation: ch-current 6s ease-in-out infinite alternate;
+  content: "";
+}
+.ch-tile:disabled {
+  border-style: dashed;
+  cursor: not-allowed;
+}
+.ch-tile:disabled .ch-tile-label {
+  color: var(--ch-faint);
+}
+.ch-tile-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.ch-tile-label {
+  min-width: 0;
+  color: var(--ch-text);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.ch-tile-n {
+  flex: none;
+  color: var(--ch-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.ch-tile[aria-checked="true"] .ch-tile-n {
+  color: #cdc6ea;
+}
+.ch-tile-desc {
+  color: #7b7e88;
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* the baseline switch */
+.ch-switch {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 10px;
+  min-height: var(--ch-ctl);
+  padding-right: 4px;
+  border-radius: 5px;
+  color: #c4c6cd;
+  font-size: 13px;
+  text-align: left;
+}
+.ch-switch-track {
+  position: relative;
+  flex: none;
+  width: 30px;
+  height: 18px;
+  border: 1px solid #47464f;
+  border-radius: 999px;
+  background: #121317;
+  transition:
+    background-color 0.15s,
+    border-color 0.15s;
+}
+.ch-switch-track::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #8f929b;
+  content: "";
+  transition:
+    transform 0.2s var(--ch-ease),
+    background-color 0.15s;
+}
+.ch-switch[aria-checked="true"] .ch-switch-track {
+  border-color: #6b6290;
+  background: #1b1828;
+}
+.ch-switch[aria-checked="true"] .ch-switch-track::after {
+  background: var(--ch-prism);
+  transform: translateX(12px);
+}
+
+/* criteria */
+.ch-crits {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.ch-crit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #24262b;
+  border-radius: 6px;
+  background: #0b0c0e;
+}
+.ch-crit-main,
+.ch-crit-more {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-width: 0;
+}
+.ch-crit-main {
+  flex-wrap: nowrap;
+}
+.ch-crit-main > .ch-grow {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.ch-thr {
+  display: inline-flex;
+  flex: 1 1 200px;
+  gap: 6px;
+  min-width: 0;
+}
+.ch-thr > .ch-input {
+  flex: 1 1 70px;
+  width: auto;
+  min-width: 70px;
+}
+.ch-thr > .ch-select {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.ch-select {
+  flex: none;
+  min-width: 0;
+  max-width: 100%;
+  height: var(--ch-ctl);
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--ch-edge);
+  border-radius: 5px;
+  /* a chevron, drawn here so the native one can go */
+  background-color: var(--ch-field);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 3.5l3 3 3-3' fill='none' stroke='%238f929b' stroke-width='1.3'/%3E%3C/svg%3E");
+  background-position: right 10px center;
+  background-repeat: no-repeat;
+  background-size: 10px;
+  color: var(--ch-text);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  appearance: none;
+  outline: none;
+}
+.ch-select:focus-visible {
+  border-color: #6b6290;
+  box-shadow: 0 0 0 3px rgb(186 176 227 / 12%);
+}
+
+/* two or three choices side by side */
+.ch-seg {
+  display: inline-flex;
+  flex: none;
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--ch-edge);
+  border-radius: 5px;
+}
+.ch-seg > button {
+  position: relative;
+  min-height: calc(var(--ch-ctl) - 2px);
+  padding: 0 11px;
+  color: #a1a4ad;
+  font-size: 12px;
+  white-space: nowrap;
+  transition:
+    background-color 0.15s,
+    color 0.15s;
+}
+.ch-seg > button + button {
+  border-left: 1px solid var(--ch-edge);
+}
+.ch-seg > button:hover {
+  color: var(--ch-text);
+}
+.ch-seg > button[aria-checked="true"] {
+  background: #17161f;
+  color: var(--ch-bright);
+  box-shadow: inset 0 -1px 0 #bab0e3;
+}
+.ch-seg > button:focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: -2px;
+}
+
+/* repetitions, parallel, budget: three across, always */
+.ch-nums {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.ch-num {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.ch-num > .ch-x-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* radio rows (the decision) */
+.ch-radios {
+  display: flex;
+  flex-direction: column;
+  overflow: clip;
+  border: 1px solid #272a31;
+  border-radius: 6px;
+}
+.ch-radio {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: var(--ch-ctl);
+  padding: 8px 12px;
+  color: #c4c6cd;
+  font-size: 13px;
+  text-align: left;
+  transition: background-color 0.15s;
+}
+.ch-radio + .ch-radio {
+  border-top: 1px solid #1f2126;
+}
+.ch-radio:hover {
+  background: #0f1013;
+}
+.ch-radio[aria-checked="true"] {
+  background: #101016;
+  color: var(--ch-bright);
+}
+.ch-radio > .ch-mark {
+  flex: none;
+  margin-top: 0;
+}
+.ch-x-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* focus for the setup's buttons */
+:is(.ch-chip, .ch-tile, .ch-switch, .ch-radio):focus-visible {
+  outline: 2px solid var(--ch-focus);
+  outline-offset: 1px;
+}
+.ch-radio:focus-visible {
+  outline-offset: -2px;
+}
+
+/* ------------------------------------------------------------ motion: CSS only, quiet */
+
+@keyframes ch-current {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 100% 50%;
+  }
+}
+@keyframes ch-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes ch-rise {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+}
+@keyframes ch-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px) scale(0.985);
+  }
+}
+@keyframes ch-up {
+  from {
+    opacity: 0;
+    transform: translateY(32px);
+  }
+}
+/* Arrivals play only while motion plays: a paused arrival would hold at its first, invisible frame. */
+@media (prefers-reduced-motion: no-preference) {
+  :root:not([data-motion="paused"]) .ch[data-layout="dialog"] {
+    animation: ch-in 0.34s var(--ch-ease);
+  }
+  :root:not([data-motion="paused"]) .ch[data-layout="sheet"] {
+    animation: ch-up 0.34s var(--ch-ease);
+  }
+  :root:not([data-motion="paused"]) .ch-overlay {
+    animation: ch-fade 0.2s ease;
+  }
+  :root:not([data-motion="paused"]) .ch-view {
+    animation: ch-rise 0.26s var(--ch-ease);
+  }
+  :root:not([data-motion="paused"]) :is(.ch-other, .ch-pv-under, .ch-side .ch-pv, .ch-note-field) {
+    animation: ch-fade 0.2s ease;
+  }
+}
+/* The lit hairlines drift; paused, they hold still. */
+:root[data-motion="paused"] .ch-opt[data-checked]::after,
+:root[data-motion="paused"] .ch-tile[aria-checked="true"]::after,
+:root[data-motion="paused"] .ch-rule {
+  animation-play-state: paused;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ch,
+  .ch *,
+  .ch *::before,
+  .ch *::after,
+  .ch-overlay {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* ------------------------------------------------------------ contrast */
+
+@media (prefers-contrast: more) {
+  .ch {
+    --ch-muted: #b9bcc5;
+    --ch-faint: #a3a6b0;
+    --ch-edge: #6b6e7a;
+  }
+  .ch-opts,
+  .ch-opt + .ch-opt,
+  .ch-tile,
+  .ch-radios {
+    border-color: #555864;
+  }
+}
+/* Clipped-gradient text and gradient fills would vanish under forced colours. */
+@media (forced-colors: active) {
+  .ch-rec,
+  .ch-chip[aria-checked="true"] .ch-chip-n {
+    background: none;
+    color: CanvasText;
+  }
+  :is(.ch-row, .ch-tile, .ch-chip, .ch-radio)[aria-checked="true"] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+  [role="radio"][aria-checked="true"] > .ch-mark::after,
+  [role="checkbox"][aria-checked="true"] > .ch-mark,
+  .ch-switch[aria-checked="true"] .ch-switch-track::after {
+    background: Highlight;
+  }
+}
