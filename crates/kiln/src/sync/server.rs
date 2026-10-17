@@ -22,8 +22,6 @@ use super::group::{self, Index, SERVER, TICK};
 use super::wire::{self, CopySpec, CopyStatus, Joiner, Msg};
 use super::{Change, STEP_CHANGES, Step, Version};
 
-/// Entries a compaction keeps for copies a little behind.
-const KEEP: u64 = 256;
 /// A log entry's bytes at the most (the log holds one up to 1 MiB).
 const ENTRY: usize = 900 << 10;
 /// A change of configuration not seen applied by then is proposed again.
@@ -493,6 +491,7 @@ impl Owner {
         self.wakeup.pending.store(false, Ordering::SeqCst);
         let now = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let ids: Vec<String> = self.groups.keys().cloned().collect();
+        let mut freed = false;
         for id in ids {
             let Some(repo) = self.repos.iter().find(|r| r.id == id).cloned() else { continue };
             let mut messages = Vec::new();
@@ -527,8 +526,15 @@ impl Owner {
                 }
             }
             Self::reconcile(g, &repo);
-            if disk::due(&g.r, g.compacted) && g.r.compact(KEEP, now, &self.waker).unwrap_or(false) {
+            if disk::due(&g.r, g.compacted) && g.r.compact(disk::keep(&g.r, g.compacted), now, &self.waker).unwrap_or(false) {
                 g.compacted = g.r.applied().index;
+                freed = true;
+            }
+        }
+        // Room in the shared log for any group stalled for it.
+        if freed {
+            for g in self.groups.values_mut() {
+                g.r.resume();
             }
         }
         if self.swept.elapsed() >= SWEEP {

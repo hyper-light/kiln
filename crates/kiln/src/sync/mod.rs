@@ -430,7 +430,18 @@ impl Copy {
             other => other,
         };
         match v {
-            None => gone(std::fs::remove_file(&full)),
+            None => {
+                gone(std::fs::remove_file(&full))?;
+                // Folders left empty go too, as git leaves none behind.
+                let mut dir = full.parent();
+                while let Some(d) = dir.filter(|d| *d != self.root && d.starts_with(&self.root)) {
+                    if std::fs::remove_dir(d).is_err() {
+                        break;
+                    }
+                    dir = d.parent();
+                }
+                Ok(())
+            }
             Some(Version::File { hash, exec }) => {
                 let src = blobs.path(hash).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a SHA-256"))?;
                 if let Some(parent) = full.parent() {
@@ -557,6 +568,8 @@ mod tests {
         t.propose('a', 3_000)?;
         t.sync()?;
         assert_eq!(Two::read(&t.b, "src/x.txt"), None, "deleted everywhere");
+        assert!(!t.b.root.join("src").exists(), "and the folder it left empty");
+        assert!(t.b.root.exists(), "never the copy's own folder");
         assert!(t.a.state.pending.is_empty() && t.b.state.pending.is_empty());
         Ok(())
     }

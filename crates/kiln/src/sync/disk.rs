@@ -20,8 +20,8 @@ const LOG_ID: u128 = u128::from_be_bytes(*b"kiln-repo-sync-1");
 const BLOCK: usize = 4096;
 /// Groups one log holds at most: repos on the server, copies on a runner.
 pub const GROUPS: usize = 32;
-/// Bytes the file may take.
-const DISK: u64 = 1 << 30;
+/// Bytes the file may take (it grows as it is used).
+const DISK: u64 = 2 << 30;
 
 /// What the log is laid out by. Every value is fixed: a log reopens with the facts it was made with.
 fn config(align: Alignment) -> anyhow::Result<Config> {
@@ -32,9 +32,9 @@ fn config(align: Alignment) -> anyhow::Result<Config> {
         largest_entry: 1 << 20,
         disk_bytes: DISK,
         max_groups: GROUPS,
-        // An owner compacts a group at least this often ([`due`]).
+        // An owner compacts a group well within this ([`due`]).
         cadence_entries: 2048,
-        cadence_bytes: 8 << 20,
+        cadence_bytes: CADENCE_BYTES,
         uncommitted_entries: 512,
         uncommitted_bytes: 4 << 20,
         cache_bytes: 8 << 20,
@@ -68,10 +68,34 @@ pub fn remove(log: &SyncLog, id: u128) -> anyhow::Result<()> {
     GroupStore::remove(log, id).map_err(|e| anyhow::anyhow!("removing group {id} of the sync log: {e:?}"))
 }
 
+/// Bytes of entries between a group's checkpoints the log is laid out for: it retains two of these
+/// and what is uncommitted, and refuses a group's writes past that until the group compacts.
+const CADENCE_BYTES: u64 = 16 << 20;
+/// Entries and bytes a compaction leaves for copies a little behind, at the most: whatever is
+/// kept stays within the log's room, so a compaction always frees some.
+const KEEP_ENTRIES: u64 = 256;
+const KEEP_BYTES: u64 = 2 << 20;
+
 /// Whether a group's log is due to be compacted: by the thesis's rule weighed against its last
-/// image, and at the latest once it holds most of what the log retains for a group.
+/// image, at the latest once it holds half of what the log retains for a group, and at once when
+/// it is stalled for room.
 pub fn due<M: hyper_durable::StateMachine>(r: &hyper_durable::Replica<Store, M>, since: u64) -> bool {
-    r.compaction_due(hyper_durable::Compaction { expansion: 4 }) || r.applied().index.saturating_sub(since) >= 1024 || r.compactable_bytes() >= 4 << 20
+    r.is_stalled()
+        || r.compaction_due(hyper_durable::Compaction { expansion: 4 })
+        || r.applied().index.saturating_sub(since) >= 1024
+        || r.compactable_bytes() >= CADENCE_BYTES / 2
+}
+
+/// How many applied entries a compaction keeps for copies a little behind (`since`: where the log
+/// was last compacted to): as many as fit [`KEEP_BYTES`] at the entries' mean size, none when the
+/// group is stalled for room, then they take an image.
+pub fn keep<M: hyper_durable::StateMachine>(r: &hyper_durable::Replica<Store, M>, since: u64) -> u64 {
+    if r.is_stalled() {
+        return 0;
+    }
+    let entries = r.applied().index.saturating_sub(since).max(1);
+    let mean = (r.compactable_bytes() / entries).max(1);
+    (KEEP_BYTES / mean).min(KEEP_ENTRIES)
 }
 
 #[cfg(test)]

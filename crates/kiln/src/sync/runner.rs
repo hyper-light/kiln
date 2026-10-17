@@ -28,8 +28,9 @@ use crate::proto::AgentMsg;
 
 /// How often each folder is looked at for what changed.
 const LOOK: Duration = Duration::from_secs(2);
-/// How often each copy says how it is doing.
+/// How often each copy says how it is doing when nothing changes, and how soon after a change.
 const STATUS: Duration = Duration::from_secs(10);
+const STATUS_SOON: Duration = Duration::from_secs(1);
 /// Steps the log hasn't brought back are sent again this often.
 const RESEND: Duration = Duration::from_secs(15);
 /// Contents moving at once, and how long a failed move waits before it is tried again.
@@ -219,6 +220,9 @@ struct Held {
     /// The newest step sent so far.
     sent: u64,
     waiting: usize,
+    /// What it last said of itself (its time left out), and when.
+    said: Option<CopyStatus>,
+    said_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,7 +475,7 @@ impl Owner {
         feed.copy.gone.clone_from(&self.gone);
         let r = Replica::open(&group::settings(spec.member, depth)?, store, feed, Unbounded).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let compacted = r.applied().index;
-        Ok(Held { spec: spec.clone(), group, r, out: Output::default(), compacted, error: None, sent: 0, waiting: 0 })
+        Ok(Held { spec: spec.clone(), group, r, out: Output::default(), compacted, error: None, sent: 0, waiting: 0, said: None, said_at: None })
     }
 
     fn state_file(&self, spec: &CopySpec) -> PathBuf {
@@ -524,6 +528,7 @@ impl Owner {
         let now = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let mut wanted: Vec<String> = Vec::new();
         let mut frames: Vec<(Msg, Vec<u8>)> = Vec::new();
+        let mut freed = false;
         for h in self.held.values_mut() {
             let mut messages = Vec::new();
             if let Err(e) = group::pump(&mut h.r, now, &self.waker, &mut h.out, &mut messages) {
@@ -543,8 +548,15 @@ impl Owner {
                 }
                 Err(e) => h.error = Some(format!("the folder: {e}")),
             }
+            // A copy serves no one: it keeps nothing it took.
             if disk::due(&h.r, h.compacted) && h.r.compact(0, now, &self.waker).unwrap_or(false) {
                 h.compacted = h.r.applied().index;
+                freed = true;
+            }
+        }
+        if freed {
+            for h in self.held.values_mut() {
+                h.r.resume();
             }
         }
         for (msg, raft) in frames {
@@ -561,10 +573,11 @@ impl Owner {
             self.resent = Instant::now();
         }
         self.send_steps(again);
-        if self.statused.elapsed() >= STATUS {
+        let every = self.statused.elapsed() >= STATUS;
+        if every {
             self.statused = Instant::now();
-            self.status();
         }
+        self.status(every);
         if self.swept.elapsed() >= SWEEP {
             self.swept = Instant::now();
             self.sweep();
@@ -665,9 +678,14 @@ impl Owner {
         }
     }
 
-    fn status(&self) {
+    /// Says how each copy is doing: soon after it changes, and `every` so often regardless.
+    fn status(&mut self, every: bool) {
+        if !self.connected {
+            return;
+        }
         let at = now_ms() / 1000;
-        for h in self.held.values() {
+        let mut out = Vec::new();
+        for h in self.held.values_mut() {
             let feed = h.r.machine();
             let (applied, behind) = feed.progress();
             let status = CopyStatus {
@@ -680,11 +698,20 @@ impl Owner {
                 conflicts: feed.conflicts().len(),
                 skipped: feed.copy.skipped.iter().take(SKIPPED).cloned().collect(),
                 error: h.error.clone().or_else(|| self.error.clone()),
-                at,
+                at: 0,
             };
+            let changed = h.said.as_ref() != Some(&status);
+            let soon = h.said_at.is_none_or(|t| t.elapsed() >= STATUS_SOON);
+            if every || (changed && soon) {
+                h.said = Some(status.clone());
+                h.said_at = Some(Instant::now());
+                out.push(CopyStatus { at, ..status });
+            }
+        }
+        for status in out {
             self.say(Msg::Status(status), Vec::new());
         }
-        if self.held.is_empty()
+        if every && self.held.is_empty()
             && let Some(error) = &self.error
         {
             for spec in &self.wanted {
