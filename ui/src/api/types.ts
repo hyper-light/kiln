@@ -542,6 +542,14 @@ export interface ReleaseBuild {
   branch?: string;
   last?: Run | null;
   error?: string;
+  /** The commit the server runs; null: it was built without knowing one (`KILN_COMMIT`). */
+  commit?: string | null;
+  /** Every other platform's binary is built from that commit. */
+  in_step?: boolean;
+  /** The platforms whose binary isn't. */
+  behind?: string[];
+  /** kiln builds them from the server's commit on its own (`[updates] in_step`). */
+  keeps_in_step?: boolean;
 }
 
 export interface ReleaseInfo {

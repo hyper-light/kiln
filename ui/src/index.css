@@ -2391,6 +2391,10 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 .upd-dim {
   color: #7f8794;
 }
+/* A binary not built from the commit the server runs. */
+.upd-behind {
+  color: #d8c8b0;
+}
 .upd-actions {
   display: flex;
   flex-wrap: wrap;

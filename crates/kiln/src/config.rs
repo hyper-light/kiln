@@ -433,10 +433,15 @@ pub struct Updates {
     pub release_pipeline: String,
     /// The branch "Build every platform" builds.
     pub release_branch: String,
+    /// Keep every platform in step with the server: whenever the other platforms' binaries
+    /// aren't built from the commit the server runs, run the pipeline on that commit
+    /// (`crate::updates::in_step_loop`), so every runner can be upgraded to what the server runs.
+    /// Needs a server built knowing its commit (`KILN_COMMIT`).
+    pub in_step: bool,
 }
 
 impl Default for Updates {
     fn default() -> Self {
-        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned() }
+        Self { release_repo: "hyper-light/kiln".to_owned(), release_pipeline: "release".to_owned(), release_branch: "main".to_owned(), in_step: true }
     }
 }

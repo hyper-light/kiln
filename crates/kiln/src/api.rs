@@ -1418,6 +1418,10 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
 /// The target triple this binary was built for (`build.rs`).
 pub const TARGET: &str = env!("KILN_TARGET");
 
+/// The commit this binary was built from (`build.rs`); empty when it was built without knowing
+/// one (a tree with changes, or a Docker build without `--build-arg KILN_COMMIT=...`).
+pub const COMMIT: &str = env!("KILN_COMMIT");
+
 /// Where the release workflow (`.github/workflows/release.yml`) publishes binaries: the asset
 /// `kiln-<version>-<target>` (`.exe` on Windows) of release `v<version>`.
 pub const RELEASES: &str = "https://github.com/hyper-light/kiln/releases/download";
@@ -1851,7 +1855,17 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
         return json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "error": format!("kiln doesn't build {} (no repository of that name)", u.release_repo) });
     };
     let last = hub.store.runs(Some(repo.id.clone()), 100, None).await.unwrap_or_default().into_iter().find(|r| r.pipeline == u.release_pipeline);
-    json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "branch": u.release_branch, "last": last })
+    let s = crate::updates::in_step(hub, COMMIT);
+    json!({
+        "repo": u.release_repo,
+        "pipeline": u.release_pipeline,
+        "branch": u.release_branch,
+        "last": last,
+        "commit": s.commit,
+        "in_step": s.in_step,
+        "behind": s.behind,
+        "keeps_in_step": u.in_step,
+    })
 }
 
 /// `POST /api/updates/build`: run the pipeline that builds kiln for every platform; when it
@@ -1859,10 +1873,15 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
 async fn build_every_platform(hub: &Hub) -> R {
     let u = &hub.cfg.updates;
     let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln doesn't build {}", u.release_repo)))?;
-    let runs = crate::gitops::manual(hub, &repo, Some(u.release_branch.clone()), Some(u.release_pipeline.clone()))
-        .await
-        .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
-    let run = runs.into_iter().next().ok_or_else(|| err(StatusCode::CONFLICT, format!("{} has no pipeline called {}", u.release_repo, u.release_pipeline)))?;
+    // The commit this server runs, when it knows it: only that build is what runners take.
+    let run = if COMMIT.is_empty() {
+        let runs = crate::gitops::manual(hub, &repo, Some(u.release_branch.clone()), Some(u.release_pipeline.clone()))
+            .await
+            .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+        runs.into_iter().next().ok_or_else(|| err(StatusCode::CONFLICT, format!("{} has no pipeline called {}", u.release_repo, u.release_pipeline)))?
+    } else {
+        crate::updates::build_commit(hub, &repo, COMMIT).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?
+    };
     hub.store.audit("admin".into(), "upgrade.build".into(), format!("{} {} #{}", u.release_repo, u.release_pipeline, run.number)).await;
     Ok(srv::json(StatusCode::ACCEPTED, &run))
 }

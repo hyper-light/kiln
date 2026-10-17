@@ -2,7 +2,7 @@
 #
 # kiln — single static binary (server, agent, supervisor, CLI) with the web UI embedded.
 #
-#   docker build -t kiln:dev .
+#   docker build --build-arg KILN_COMMIT=$(git rev-parse HEAD) -t kiln:dev .
 #   docker run --rm -p 7070:7070/tcp -p 7071:7071/udp -v kiln-data:/var/lib/kiln kiln:dev
 #
 # Stages:
@@ -35,7 +35,11 @@ COPY crates/ crates/
 COPY --from=ui /src/ui/dist ui/dist
 # The UI is already built in the `ui` stage; a build.rs must not try to run npm again.
 # The final binary must be fully static (checked below): job pods copy /kiln into arbitrary images.
+# KILN_COMMIT is the commit it's built from (the context has no .git): the server builds every
+# other platform's binary from the same one, so every runner can run what it runs.
+ARG KILN_COMMIT=""
 ENV KILN_SKIP_UI_BUILD=1 \
+    KILN_COMMIT=${KILN_COMMIT} \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_INCREMENTAL=0
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \

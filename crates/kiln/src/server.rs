@@ -124,6 +124,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     }
     child!("sync", h => h.sync_loop());
     child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
+    child!("in-step", h => crate::updates::in_step_loop(h));
     // Home-network discovery (multicast DNS): announce this server, list the kiln instances nearby.
     if cfg.discovery.enabled && (cfg.discovery.announce || cfg.discovery.browse) {
         child!("discovery", h => crate::discovery::Discovery::serve(h));

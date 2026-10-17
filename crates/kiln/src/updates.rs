@@ -254,10 +254,14 @@ pub fn store(hub: &Hub, target: &str, bytes: &[u8], origin: &str) -> anyhow::Res
 }
 
 /// Whether a run's binaries become what runners upgrade to: kiln's own release pipeline, built
-/// from a release tag or from the release branch. A manual run on any other branch (trying out a
-/// change) builds, but nothing upgrades to it.
-pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run) -> bool {
-    run.repo_name == u.release_repo && run.pipeline == u.release_pipeline && (run.event == "tag" || run.branch == u.release_branch)
+/// from a release tag or from the release branch, and from the commit this server runs (`own`;
+/// any, when it was built without knowing one), so no platform runs ahead of or behind it. A
+/// manual run on any other branch (trying out a change) builds, but nothing upgrades to it.
+pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run, own: &str) -> bool {
+    run.repo_name == u.release_repo
+        && run.pipeline == u.release_pipeline
+        && (run.event == "tag" || run.branch == u.release_branch)
+        && (own.is_empty() || run.sha.eq_ignore_ascii_case(own))
 }
 
 /// What the release pipeline's job left in its artifacts (`dist/kiln-<target>[.exe]`): kept as the
@@ -282,6 +286,134 @@ pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::st
         kept.push(keep(&dir, &target, &bytes, "built", Some((run.number, run.sha.clone())))?);
     }
     Ok(kept)
+}
+
+// ------------------------------------------------------------------ every platform in step
+
+/// How often the other platforms' binaries are checked against the server's commit.
+const IN_STEP_EVERY: Duration = Duration::from_secs(5 * 60);
+/// A build of the server's commit that failed, or couldn't start (the commit isn't in the
+/// repository yet: deployed before it was pushed), is tried again after this long.
+const IN_STEP_RETRY: Duration = Duration::from_secs(30 * 60);
+/// At most this many builds of one commit.
+const IN_STEP_TRIES: usize = 3;
+
+/// The other platforms' binaries against the commit this server runs.
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct InStep {
+    /// The commit this server is built from; None: built without one (`KILN_COMMIT`), so nothing
+    /// can be kept in step with it.
+    pub commit: Option<String>,
+    /// Every other platform's binary kept here is built from that commit.
+    pub in_step: bool,
+    /// The platforms whose binary isn't (all of them, when none is kept yet).
+    pub behind: Vec<String>,
+}
+
+/// The other platforms' binaries kept here against `commit`.
+pub fn in_step(hub: &Hub, commit: &str) -> InStep {
+    let others: Vec<&str> = crate::api::RELEASE_TARGETS.iter().copied().filter(|t| *t != crate::api::TARGET).collect();
+    let kept: Vec<Binary> = others.iter().filter_map(|t| stored(hub, t).map(|(_, b)| b)).collect();
+    in_step_of(&others, &kept, commit)
+}
+
+fn in_step_of(others: &[&str], kept: &[Binary], commit: &str) -> InStep {
+    let behind: Vec<String> = if kept.is_empty() {
+        others.iter().map(|t| (*t).to_owned()).collect()
+    } else {
+        kept.iter().filter(|b| !b.sha.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(commit))).map(|b| b.target.clone()).collect()
+    };
+    InStep { in_step: !commit.is_empty() && behind.is_empty(), commit: (!commit.is_empty()).then(|| commit.to_owned()), behind }
+}
+
+/// Builds of the server's commit that couldn't start, here (they leave no run).
+#[derive(Debug, Default)]
+struct Starts {
+    failed: usize,
+    /// Unix seconds.
+    last: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// One is on its way or done, or it was tried enough.
+    Nothing,
+    /// The last try was too recent.
+    Wait,
+    Build,
+}
+
+/// What to do about the server's commit, from the release runs of it and the starts that failed.
+fn next(runs: &[crate::store::Run], starts: &Starts, now: i64) -> Next {
+    if runs.iter().any(|r| !r.status.is_terminal() || r.status.is_success()) || runs.len() + starts.failed >= IN_STEP_TRIES {
+        return Next::Nothing;
+    }
+    let last = runs.iter().map(|r| r.finished_at.unwrap_or(r.created_at)).chain(starts.last).max();
+    let retry = i64::try_from(IN_STEP_RETRY.as_secs()).unwrap_or(i64::MAX);
+    if last.is_some_and(|t| now.saturating_sub(t) < retry) { Next::Wait } else { Next::Build }
+}
+
+fn short(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
+}
+
+/// Runs the release pipeline on `commit` of the release branch. Its binaries are what runners of
+/// every other platform upgrade to once it succeeds (`adopts`).
+pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) -> anyhow::Result<crate::store::Run> {
+    let u = &hub.cfg.updates;
+    let t = crate::gitops::Trigger { event: "manual", branch: u.release_branch.clone(), sha: commit.to_owned(), before: None, pipeline: Some(u.release_pipeline.clone()) };
+    let runs = crate::gitops::trigger(hub, repo, t).await?;
+    runs.into_iter().next().ok_or_else(|| anyhow::anyhow!("{} has no pipeline called {} at {}", u.release_repo, u.release_pipeline, short(commit)))
+}
+
+/// Keeps every platform in step with the server (`[updates] in_step`): whenever the binaries kept
+/// for the other platforms aren't built from the commit this server runs, it runs the release
+/// pipeline on that commit, so every runner can be upgraded to exactly what the server runs. A
+/// commit not in the repository yet is tried again later.
+pub async fn in_step_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
+    use futures::FutureExt as _;
+    let commit = crate::api::COMMIT;
+    if commit.is_empty() || !hub.cfg.updates.in_step {
+        hub.shutdown.cancelled().await;
+        return Ok(());
+    }
+    let mut tick = crate::rt::Interval::new(IN_STEP_EVERY);
+    let mut starts = Starts::default();
+    loop {
+        futures::select_biased! {
+            () = hub.shutdown.cancelled().fuse() => return Ok(()),
+            () = tick.tick().fuse() => {}
+        }
+        if let Err(e) = keep_in_step(&hub, commit, &mut starts).await {
+            tracing::warn!(commit = short(commit), error = %format!("{e:#}"), "couldn't build every platform from the server's commit");
+        }
+    }
+}
+
+async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::Result<()> {
+    if in_step(hub, commit).in_step {
+        return Ok(());
+    }
+    let u = &hub.cfg.updates;
+    let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| anyhow::anyhow!("kiln doesn't build {} (no repository of that name)", u.release_repo))?;
+    let runs: Vec<crate::store::Run> =
+        hub.store.runs(Some(repo.id.clone()), 200, None).await?.into_iter().filter(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit)).collect();
+    if next(&runs, starts, crate::util::now_unix()) != Next::Build {
+        return Ok(());
+    }
+    match build_commit(hub, &repo, commit).await {
+        Ok(run) => {
+            tracing::info!(run = run.number, commit = short(commit), "building every platform from the server's commit");
+            hub.store.audit("kiln".into(), "upgrade.build".into(), format!("{} {} #{} for the server's commit {}", u.release_repo, u.release_pipeline, run.number, short(commit))).await;
+            hub.emit(&serde_json::json!({ "type": "updates" }));
+            Ok(())
+        }
+        Err(e) => {
+            starts.failed += 1;
+            starts.last = Some(crate::util::now_unix());
+            Err(e)
+        }
+    }
 }
 
 /// Keeps `bytes` as the binary for `target` in `dir` (`<data>/binaries`).
@@ -1391,13 +1523,79 @@ mod tests {
             error: None,
             concurrency_group: None,
         };
-        assert!(adopts(&u, &run("release", "manual", "main")));
-        assert!(adopts(&u, &run("release", "tag", "v0.2.0")));
-        assert!(!adopts(&u, &run("release", "manual", "try-something")));
-        assert!(!adopts(&u, &run("ci", "push", "main")));
+        assert!(adopts(&u, &run("release", "manual", "main"), ""));
+        assert!(adopts(&u, &run("release", "tag", "v0.2.0"), ""));
+        assert!(!adopts(&u, &run("release", "manual", "try-something"), ""));
+        assert!(!adopts(&u, &run("ci", "push", "main"), ""));
         let mut other = run("release", "manual", "main");
         other.repo_name = "hyper-light/focal".into();
-        assert!(!adopts(&u, &other));
+        assert!(!adopts(&u, &other, ""));
+        // A server that knows its commit takes only builds of that commit: none ahead, none behind.
+        assert!(adopts(&u, &run("release", "manual", "main"), "0D21482ABCDEF"));
+        assert!(!adopts(&u, &run("release", "manual", "main"), "1111111111111"));
+        assert!(!adopts(&u, &run("release", "tag", "v0.2.0"), "1111111111111"));
+    }
+
+    #[test]
+    fn every_other_platform_is_in_step_once_its_binary_is_built_from_the_servers_commit() {
+        let others = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"];
+        let built = |target: &str, sha: Option<&str>, origin: &str| Binary {
+            target: target.into(),
+            sha256: String::new(),
+            size: 0,
+            origin: origin.into(),
+            at: 0,
+            build: String::new(),
+            run: None,
+            sha: sha.map(str::to_owned),
+        };
+        let c = "a".repeat(40);
+        // Nothing kept yet: every platform is behind.
+        let none = in_step_of(&others, &[], &c);
+        assert_eq!((none.in_step, none.behind.len()), (false, 2));
+        // One from an older commit, one uploaded (no commit): both behind.
+        let old = in_step_of(&others, &[built(others[0], Some(&"b".repeat(40)), "built"), built(others[1], None, "upload")], &c);
+        assert_eq!(old.behind, vec![others[0].to_owned(), others[1].to_owned()]);
+        // Both built from it (in any case): in step.
+        let now = in_step_of(&others, &[built(others[0], Some(&c), "built"), built(others[1], Some(&c.to_ascii_uppercase()), "built")], &c);
+        assert_eq!((now.in_step, now.behind.len(), now.commit.as_deref()), (true, 0, Some(c.as_str())));
+        // A server that doesn't know its commit is never in step with one.
+        assert!(!in_step_of(&others, &[built(others[0], Some(&c), "built")], "").in_step);
+    }
+
+    #[test]
+    fn the_servers_commit_is_built_once_retried_after_a_while_and_given_up_after_three() {
+        let run = |status: crate::store::Status, finished: Option<i64>| crate::store::Run {
+            id: String::new(),
+            repo_id: String::new(),
+            repo_name: "hyper-light/kiln".into(),
+            number: 1,
+            pipeline: "release".into(),
+            event: "manual".into(),
+            branch: "main".into(),
+            sha: "c".repeat(40),
+            message: String::new(),
+            author: String::new(),
+            status,
+            created_at: finished.unwrap_or(0),
+            started_at: None,
+            finished_at: finished,
+            error: None,
+            concurrency_group: None,
+        };
+        use crate::store::Status::{Failed, Running, Succeeded};
+        let now = 1_000_000;
+        let none = Starts::default();
+        assert_eq!(next(&[], &none, now), Next::Build);
+        assert_eq!(next(&[run(Running, None)], &none, now), Next::Nothing);
+        assert_eq!(next(&[run(Succeeded, Some(now - 10))], &none, now), Next::Nothing);
+        assert_eq!(next(&[run(Failed, Some(now - 60))], &none, now), Next::Wait);
+        assert_eq!(next(&[run(Failed, Some(now - 3600))], &none, now), Next::Build);
+        // A start that failed (the commit wasn't pushed yet) waits too, and counts as a try.
+        let started = Starts { failed: 1, last: Some(now - 60) };
+        assert_eq!(next(&[], &started, now), Next::Wait);
+        let tried = Starts { failed: 1, last: Some(now - 7200) };
+        assert_eq!(next(&[run(Failed, Some(now - 7200)), run(Failed, Some(now - 7200))], &tried, now), Next::Nothing);
     }
 
     #[test]

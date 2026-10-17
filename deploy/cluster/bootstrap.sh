@@ -325,7 +325,13 @@ build_images() {
         log "skipping image builds (--skip-build)"
     else
         log "building $KILN_IMAGE (first build compiles the whole workspace; later builds use BuildKit caches)"
-        DOCKER_BUILDKIT=1 docker build -t "$KILN_IMAGE" "$REPO_ROOT" ||
+        # The commit it's built from, when nothing tracked is changed: the server builds every
+        # other platform's binary from it ([updates] in_step).
+        local commit=""
+        if git -C "$REPO_ROOT" diff --quiet HEAD 2>/dev/null; then
+            commit=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)
+        fi
+        DOCKER_BUILDKIT=1 docker build --build-arg "KILN_COMMIT=$commit" -t "$KILN_IMAGE" "$REPO_ROOT" ||
             die "docker build of $KILN_IMAGE failed (does 'cargo build --release -p kiln' work?)"
         if uses_in_cluster_git; then
             log "building $GIT_IMAGE"

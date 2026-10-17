@@ -209,7 +209,7 @@ impl Hub {
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
     /// each other platform's runners upgrade to now.
     async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
-        if !crate::updates::adopts(&self.cfg.updates, run) {
+        if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) {
             return;
         }
         let path = crate::api::artifact_path(self, job);
