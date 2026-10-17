@@ -178,6 +178,16 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
   };
 }
 
+/**
+ * Starts loading `key` now, without suspending. A section that reads several keys calls this for
+ * each of them first, so their fetches run at once rather than one after another (each read
+ * suspends before the next one starts).
+ */
+export function preload<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions = {}) {
+  const e = entry(key, fetcher as Fetcher<unknown>, opts);
+  if (!e.snap.has && !e.snap.failed && !e.promise) void load(e);
+}
+
 /** Refreshes every key that starts with `prefix` (all of them for ""). */
 export function invalidate(prefix = "") {
   for (const e of entries.values()) if (e.key.startsWith(prefix)) refresh(e);
