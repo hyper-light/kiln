@@ -680,6 +680,8 @@ pub struct Engine {
     apps: Vec<Option<App>>,
     free_apps: Vec<AppIx>,
     app_by_id: FxHashMap<Str, AppIx>,
+    /// Apps by the name their objects' tracking metadata carries.
+    app_by_tracking: FxHashMap<Str, AppIx>,
     clusters: Vec<Cluster>,
     cluster_by_name: FxHashMap<Str, ClusterIx>,
     renders: FxHashMap<u64, RenderSlot>,
@@ -702,6 +704,7 @@ impl Engine {
             apps: Vec::new(),
             free_apps: Vec::new(),
             app_by_id: FxHashMap::default(),
+            app_by_tracking: FxHashMap::default(),
             clusters: Vec::new(),
             cluster_by_name: FxHashMap::default(),
             renders: FxHashMap::default(),
@@ -910,7 +913,14 @@ impl Engine {
                 let id = cfg.id.clone();
                 self.remove_app(&id, None);
             } else {
-                let changed = self.app(a).is_some_and(|app| app.cfg.ignore != cfg.ignore || app.cfg.namespace != cfg.namespace);
+                let changed = self.app(a).is_some_and(|app| {
+                    app.cfg.ignore != cfg.ignore || app.cfg.namespace != cfg.namespace || app.cfg.create_namespace != cfg.create_namespace
+                });
+                let old_name: Option<Str> = self.app(a).map(|app| app.cfg.tracked_as().into());
+                if let Some(old) = old_name {
+                    self.app_by_tracking.remove(&old);
+                }
+                self.app_by_tracking.insert(cfg.tracked_as().into(), a);
                 if let Some(app) = self.app_mut(a) {
                     app.cfg = Arc::new(cfg);
                 }
@@ -956,6 +966,9 @@ impl Engine {
             }
         };
         self.app_by_id.insert(id, a);
+        if let Some(name) = self.app(a).map(|app| -> Str { app.cfg.tracked_as().into() }) {
+            self.app_by_tracking.insert(name, a);
+        }
         if let Some(cl) = self.clusters.get_mut(c as usize) {
             cl.by_label.insert(label, a);
         }
@@ -965,6 +978,7 @@ impl Engine {
     fn remove_app(&mut self, id: &str, cascade: Option<Propagation>) {
         let Some(a) = self.app_by_id.remove(id) else { return };
         let Some(app) = self.apps.get_mut(a as usize).and_then(Option::take) else { return };
+        self.app_by_tracking.remove(app.cfg.tracked_as());
         let c = app.cluster;
         if let Some(cl) = self.clusters.get_mut(c as usize) {
             cl.by_label.remove(&app.label);
@@ -976,7 +990,13 @@ impl Engine {
                 res.desired = None;
                 res.state = ResState::None;
                 res.counted = None;
-                res.live.as_ref().map(|_| res.key.clone())
+                // `Delete=false` (or `confirm`, which waits for a person) keeps an object when its
+                // app goes, as Argo CD keeps it.
+                let kept = res.live.as_ref().and_then(|l| l.blob.decode().ok()).is_some_and(|v| {
+                    let o = sync::options_of(&v);
+                    o.delete == Some(false) || o.delete_confirm == Some(true)
+                });
+                res.live.as_ref().filter(|_| !kept).map(|_| res.key.clone())
             };
             if let (Some(p), Some(key)) = (cascade, live_key) {
                 let id = self.next_request_id();
@@ -1089,7 +1109,40 @@ impl Engine {
         Render { key, objects: out }
     }
 
+    /// The Namespace an app creates (`CreateNamespace=true`), as a render of its own: never
+    /// pruned nor deleted with the app, as Argo CD leaves namespaces it created.
+    fn namespace_render(&self, cfg: &AppConfig, render: &Render) -> Option<Arc<Render>> {
+        let (labels, annotations) = cfg.create_namespace.as_ref()?;
+        if cfg.namespace.is_empty() || render.objects.iter().any(|o| o.kind.as_ref() == "Namespace" && o.group.is_empty() && *o.name == *cfg.namespace) {
+            return None;
+        }
+        let mut ann: Map<String, Value> = annotations.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+        ann.insert(sync::SYNC_OPTIONS.into(), Value::String("Prune=false,Delete=false".into()));
+        ann.insert(sync::SYNC_WAVE.into(), Value::String(i32::MIN.to_string()));
+        let lab: Map<String, Value> = labels.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
+        let mut v = serde_json::json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": cfg.namespace.to_string(), "annotations": ann}});
+        if !lab.is_empty()
+            && let Some(meta) = v.get_mut("metadata").and_then(Value::as_object_mut)
+        {
+            meta.insert("labels".into(), Value::Object(lab));
+        }
+        Some(Arc::new(Render {
+            key: 0,
+            objects: vec![Rendered {
+                hash: obj::hash_value(&v),
+                group: "".into(),
+                kind: "Namespace".into(),
+                name: cfg.namespace.clone(),
+                namespace: "".into(),
+                hook: false,
+                blob: Blob::encode(&v),
+            }],
+        }))
+    }
+
     fn apply_render(&mut self, a: AppIx, render: Arc<Render>) {
+        let Some(app) = self.app(a) else { return };
+        let ns_render = self.namespace_render(&app.cfg.clone(), &render);
         let Some(app) = self.app(a) else { return };
         let c = app.cluster;
         let default_ns = app.cfg.namespace.clone();
@@ -1136,6 +1189,23 @@ impl Engine {
                 self.recompare(c, ix);
             } else {
                 self.count(c, ix);
+            }
+        }
+        if let Some(nr) = ns_render {
+            let key = ResKey { group: self.interner.intern(""), kind: self.interner.intern("Namespace"), namespace: self.interner.intern(""), name: default_ns.clone() };
+            let ix = self.res_for(c, key.clone());
+            let free = self.res(c, ix).is_none_or(|res| res.app.is_none_or(|other| other == a));
+            if free {
+                keep.insert(ix);
+                if let Some(res) = self.res_mut(c, ix) {
+                    res.app = Some(a);
+                    res.desired = Some((nr, 0));
+                }
+                self.recompare(c, ix);
+                let gk = key.group_kind();
+                if !kinds.contains(&gk) {
+                    kinds.push(gk);
+                }
             }
         }
         for ix in old {
@@ -1236,21 +1306,21 @@ impl Engine {
                     labels.insert(APP_LABEL.into(), Value::String(app.label.to_string()));
                 }
                 if let Some(ann) = obj::ensure_map(v, &["metadata", "annotations"]) {
-                    ann.insert(TRACKING.into(), Value::String(format!("{}:{}", app.cfg.id, key.tracking())));
+                    ann.insert(TRACKING.into(), Value::String(format!("{}:{}", app.cfg.tracked_as(), key.tracking())));
                 }
             }
             Tracking::ArgoLabel => {
                 if let Some(labels) = obj::ensure_map(v, &["metadata", "labels"]) {
-                    labels.insert(ARGO_INSTANCE.into(), Value::String(app.cfg.id.to_string()));
+                    labels.insert(ARGO_INSTANCE.into(), Value::String(app.cfg.tracked_as().to_owned()));
                 }
             }
             Tracking::ArgoAnnotation | Tracking::ArgoAnnotationAndLabel => {
                 if let Some(ann) = obj::ensure_map(v, &["metadata", "annotations"]) {
-                    ann.insert(ARGO_TRACKING.into(), Value::String(format!("{}:{}", app.cfg.id, key.tracking())));
+                    ann.insert(ARGO_TRACKING.into(), Value::String(format!("{}:{}", app.cfg.tracked_as(), key.tracking())));
                 }
                 if app.cfg.tracking == Tracking::ArgoAnnotationAndLabel
                     && let Some(labels) = obj::ensure_map(v, &["metadata", "labels"]) {
-                        labels.insert(ARGO_INSTANCE.into(), Value::String(app.cfg.id.to_string()));
+                        labels.insert(ARGO_INSTANCE.into(), Value::String(app.cfg.tracked_as().to_owned()));
                     }
             }
         }
@@ -1263,11 +1333,11 @@ impl Engine {
             if let Some((app_id, rest)) = obj::annotation(v, ann).and_then(|t| t.split_once(':'))
                 && rest == key.tracking()
             {
-                return self.app_by_id.get(app_id).copied();
+                return self.app_by_tracking.get(app_id).copied();
             }
         }
         let instance = obj::label(v, ARGO_INSTANCE)?;
-        let a = *self.app_by_id.get(instance)?;
+        let a = *self.app_by_tracking.get(instance)?;
         self.app(a).filter(|app| app.cfg.tracking == Tracking::ArgoLabel).map(|_| a)
     }
 
@@ -1605,7 +1675,7 @@ impl Engine {
     fn maybe_auto(&mut self, a: AppIx) {
         let now = self.now;
         let Some(app) = self.app(a) else { return };
-        if !app.cfg.sync.auto || app.op.is_some() || app.retry.is_some() || app.render_error.is_some() {
+        if !app.cfg.sync.auto || app.cfg.read_only || app.op.is_some() || app.retry.is_some() || app.render_error.is_some() {
             return;
         }
         let Some(render) = app.render.as_ref() else { return };
@@ -1668,6 +1738,8 @@ impl Engine {
         if app.op.is_some() {
             return;
         }
+        // Shadow mode compares and reports; it may dry-run, never write.
+        let request = if app.cfg.read_only { SyncRequest { dry_run: true, ..request } } else { request };
         let Some(render) = app.render.clone() else { return };
         let options = request.options.or(app.cfg.sync.options);
         let prune = request.prune.unwrap_or(false);

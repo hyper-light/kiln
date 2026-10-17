@@ -283,3 +283,53 @@ fn a_manual_sync_applies_and_a_dry_run_changes_nothing() {
     h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
     assert!(h.run_until(10_000, |h| settled(h, "web")));
 }
+
+#[test]
+fn create_namespace_makes_one_that_outlives_prunes() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.create_namespace = Some((vec![("team".into(), "web".into())], Vec::new()));
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let ns = ResKey::new("", "Namespace", "", "web");
+    let live = h.clusters.get("dev").and_then(|c| c.get(&ns));
+    assert_eq!(live.as_ref().and_then(|v| obj::label(v, "team").map(str::to_owned)), Some("web".into()));
+    h.input(Input::RemoveApp { id: "web".into(), cascade: Some(crate::model::Propagation::Foreground) });
+    h.run_for(5_000);
+    assert!(h.clusters.get("dev").and_then(|c| c.get(&ns)).is_some(), "the namespace was deleted with the app");
+}
+
+#[test]
+fn shadow_mode_compares_and_never_writes() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.read_only = true;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    h.run_for(10_000);
+    assert_eq!(status(&h, "web").map(|s| s.sync), Some(Sync::OutOfSync));
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
+    h.run_for(10_000);
+    assert_eq!(h.clusters.get("dev").map(sim::Cluster::len), Some(0));
+}
+
+#[test]
+fn objects_argo_cd_deployed_are_found_by_its_tracking_name() {
+    let (mut h, git) = harness(fast());
+    // Argo CD deployed "web" (tracking-id names the Application, not kiln's project/name id).
+    let cm = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cfg", "namespace": "web",
+        "annotations": {"argocd.argoproj.io/tracking-id": "web:/ConfigMap:web/cfg"}}, "data": {"v": "1"}});
+    if let Some(c) = h.clusters.get_mut("dev") {
+        let _ = c.apply(0, cm, "argocd-controller", false);
+    }
+    let mut a = AppConfig::new("default/web", "dev", "web");
+    a.tracking = crate::model::Tracking::ArgoAnnotation;
+    a.tracking_name = Some("web".into());
+    a.read_only = true;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "default/web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    h.run_for(5_000);
+    let s = status(&h, "default/web");
+    assert_eq!(s.map(|s| (s.sync, s.resources, s.out_of_sync)), Some((Sync::Synced, 1, 0)), "{s:?}");
+}

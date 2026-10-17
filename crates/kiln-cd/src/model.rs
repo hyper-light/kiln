@@ -371,6 +371,15 @@ pub struct AppConfig {
     pub tracking: Tracking,
     /// The field manager kiln applies as.
     pub manager: Str,
+    /// The name the app's objects carry in their tracking metadata, when not its id: an Argo CD
+    /// Application's name, for objects Argo CD deployed.
+    pub tracking_name: Option<Str>,
+    /// Compare and report, never write (shadow mode, for checking kiln against Argo CD before
+    /// taking an app over).
+    pub read_only: bool,
+    /// Create the destination namespace (`CreateNamespace=true`), with these labels and
+    /// annotations.
+    pub create_namespace: Option<(Vec<(String, String)>, Vec<(String, String)>)>,
 }
 
 impl AppConfig {
@@ -385,7 +394,15 @@ impl AppConfig {
             ignore: Vec::new(),
             tracking: Tracking::Kiln,
             manager: "kiln".into(),
+            tracking_name: None,
+            read_only: false,
+            create_namespace: None,
         }
+    }
+
+    /// The name tracking metadata uses for the app.
+    pub fn tracked_as(&self) -> &str {
+        self.tracking_name.as_deref().unwrap_or(&self.id)
     }
 }
 

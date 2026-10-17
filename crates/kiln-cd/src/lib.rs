@@ -10,6 +10,7 @@
 //! - [`apps`]: app definitions from `.kiln/deploy.yaml`, Argo CD Applications and the API.
 //! - [`git`]: mirrors, revisions, content hashes of paths, extraction (the `git` binary).
 //! - [`render`]: directories, Helm, Kustomize and plugins, with what each render reads.
+//! - [`kube`]: kubeconfig, credential plugins, discovery, request paths, watch streams.
 //! - [`obj`]: object identity, parsing, structural hashes, compressed storage.
 //! - [`model`]: app configuration, sync options and policies (Argo CD's spellings).
 //! - [`health`]: resource health, rule for rule as Argo CD assesses it.
@@ -27,6 +28,7 @@ pub mod engine;
 pub mod git;
 pub mod harness;
 pub mod health;
+pub mod kube;
 pub mod model;
 pub mod obj;
 pub mod render;

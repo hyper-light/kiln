@@ -74,6 +74,13 @@ impl AppDef {
         c.sync = self.sync;
         c.ignore = self.ignore.clone();
         c.tracking = self.tracking;
+        if self.tracking != Tracking::Kiln {
+            c.tracking_name = Some(self.name.as_str().into());
+        }
+        if self.sync.options.create_namespace == Some(true) {
+            let m = self.managed_namespace.clone().unwrap_or_default();
+            c.create_namespace = Some((m.labels.into_iter().collect(), m.annotations.into_iter().collect()));
+        }
         c
     }
 }
