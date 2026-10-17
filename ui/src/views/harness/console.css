@@ -64,11 +64,13 @@
 .ag-id {
   min-width: 0;
 }
+/* One line too: where it runs gives way (ellipsized) rather than wrap and push the page down. */
 .ag-eyebrow {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
+  min-width: 0;
   margin: 0 0 8px;
   color: #a3aab8;
   font-family: var(--font-mono);
@@ -76,6 +78,20 @@
   letter-spacing: 0.1em;
   line-height: 1.6;
   text-transform: uppercase;
+}
+.ag-eyebrow > * {
+  flex: none;
+}
+.ag-eyebrow > span:not([aria-hidden]) {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Where it runs gives way last. */
+.ag-eyebrow > span:not([aria-hidden]):last-child {
+  flex-shrink: 0.001;
 }
 .ag-back {
   display: inline-flex;
