@@ -14,9 +14,14 @@ export const TabsList = React.forwardRef<React.ComponentRef<typeof TabsPrimitive
   return (
     <TabsPrimitive.List
       ref={(el) => {
-        edges(el);
+        const done = edges(el);
         if (typeof ref === "function") ref(el);
         else if (ref) ref.current = el;
+        return () => {
+          done();
+          if (typeof ref === "function") ref(null);
+          else if (ref) ref.current = null;
+        };
       }}
       data-slot="tabs-list"
       className={cn("inline-flex min-h-11 max-w-full items-center gap-1 overflow-x-auto rounded-full border border-white/10 bg-white/[0.02] p-1", className)}

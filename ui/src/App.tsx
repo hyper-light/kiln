@@ -1,13 +1,11 @@
 import * as React from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router";
-import { api, onAuthChange } from "@/api/client";
-import { events } from "@/api/events";
-import type { Me } from "@/api/types";
 import { AppShell, RouteFallback } from "@/components/shell/app-shell";
-import { MotionProvider } from "@/components/shell/motion";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
+import { Loading } from "@/components/ui/loading";
 import { Toaster } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { checkAuth, useAuth } from "@/lib/auth";
 import { Login } from "@/views/login";
 import { BrandMark } from "@/components/shell/brand";
 
@@ -32,104 +30,75 @@ const System = React.lazy(() => import("@/views/system"));
 const Settings = React.lazy(() => import("@/views/settings"));
 const NotFound = React.lazy(() => import("@/views/not-found"));
 
-type AuthState = { kind: "loading" } | { kind: "anon"; error?: string } | { kind: "authed"; me: Me | null };
-
-function useAuth() {
-  const [state, setState] = React.useState<AuthState>({ kind: "loading" });
-
-  const check = React.useCallback(() => {
-    api
-      .me()
-      .then((me) => setState(me.authenticated ? { kind: "authed", me } : { kind: "anon" }))
-      .catch((e: unknown) => {
-        const status = (e as { status?: number }).status;
-        setState(status === 401 ? { kind: "anon" } : { kind: "anon", error: e instanceof Error ? e.message : String(e) });
-      });
-  }, []);
-
-  React.useEffect(() => {
-    check();
-    return onAuthChange((authed) => {
-      if (!authed) setState({ kind: "anon" });
-      else check();
-    });
-  }, [check]);
-
-  React.useEffect(() => {
-    if (state.kind === "authed") events.start();
-    else events.stop();
-  }, [state.kind]);
-
-  return { state, recheck: check };
-}
+// Who this is, asked as the app starts (not after its first render).
+void checkAuth();
 
 export function App() {
-  const { state, recheck } = useAuth();
+  const auth = useAuth();
 
   return (
-    <MotionProvider>
-      <TooltipProvider>
-        <BrowserRouter>
-          <ErrorBoundary label="kiln crashed">
-            {window.location.pathname.startsWith("/shared/plans/") ? (
-              // A shared plan opens for anyone with its link, signed in or not.
-              <React.Suspense fallback={<Splash />}>
-                <Routes>
-                  <Route path="shared/plans/:token" element={<SharedPlan />} />
-                </Routes>
-              </React.Suspense>
-            ) : state.kind === "loading" ? (
-              <Splash />
-            ) : state.kind === "anon" ? (
-              <Login error={state.error} onRetry={recheck} />
-            ) : (
+    <TooltipProvider>
+      <BrowserRouter>
+        <ErrorBoundary label="kiln crashed">
+          {window.location.pathname.startsWith("/shared/plans/") ? (
+            // A shared plan opens for anyone with its link, signed in or not.
+            <React.Suspense fallback={<Splash />}>
               <Routes>
-                <Route element={<AppShell me={state.me} />}>
-                  <Route index element={<Overview />} />
-                  <Route path="runs" element={<Runs />} />
-                  <Route path="runs/:id" element={<RunDetail />} />
-                  <Route path="runs/:id/jobs/:jobId" element={<RunDetail />} />
-                  <Route path="deployments" element={<Deployments />} />
-                  <Route path="deployments/plans" element={<DeployPlans />} />
-                  <Route path="deployments/apps/:project/:name" element={<DeploymentApp />} />
-                  <Route path="repos" element={<Repos />} />
-                  <Route path="sync" element={<Navigate to="/repos?show=synced" replace />} />
-                  <Route path="runners" element={<Runners />} />
-                  <Route path="runners/add" element={<AddMachines />} />
-                  <Route path="agents" element={<Mission />} />
-                  <Route path="agents/sessions" element={<FoundRedirect />} />
-                  <Route path="agents/plans" element={<Plans />} />
-                  <Route path="agents/plans/:id" element={<PlanPage />} />
-                  <Route path="agents/:id" element={<AgentPage />} />
-                  <Route path="terminal" element={null} />
-                  <Route path="telemetry" element={<Metrics />} />
-                  <Route path="system" element={<System />} />
-                  <Route path="settings" element={<Settings />} />
-                  <Route
-                    path="*"
-                    element={
-                      <React.Suspense fallback={<RouteFallback />}>
-                        <NotFound />
-                      </React.Suspense>
-                    }
-                  />
-                </Route>
+                <Route path="shared/plans/:token" element={<SharedPlan />} />
               </Routes>
-            )}
-            <Toaster />
-          </ErrorBoundary>
-        </BrowserRouter>
-      </TooltipProvider>
-    </MotionProvider>
+            </React.Suspense>
+          ) : auth.kind === "loading" ? (
+            <Splash />
+          ) : auth.kind === "anon" ? (
+            <Login error={auth.error} onRetry={() => void checkAuth()} />
+          ) : (
+            <Routes>
+              <Route element={<AppShell me={auth.me} />}>
+                <Route index element={<Overview />} />
+                <Route path="runs" element={<Runs />} />
+                <Route path="runs/:id" element={<RunDetail />} />
+                <Route path="runs/:id/jobs/:jobId" element={<RunDetail />} />
+                <Route path="deployments" element={<Deployments />} />
+                <Route path="deployments/plans" element={<DeployPlans />} />
+                <Route path="deployments/apps/:project/:name" element={<DeploymentApp />} />
+                <Route path="repos" element={<Repos />} />
+                <Route path="sync" element={<Navigate to="/repos?show=synced" replace />} />
+                <Route path="runners" element={<Runners />} />
+                <Route path="runners/add" element={<AddMachines />} />
+                <Route path="agents" element={<Mission />} />
+                <Route path="agents/sessions" element={<FoundRedirect />} />
+                <Route path="agents/plans" element={<Plans />} />
+                <Route path="agents/plans/:id" element={<PlanPage />} />
+                <Route path="agents/:id" element={<AgentPage />} />
+                <Route path="terminal" element={null} />
+                <Route path="telemetry" element={<Metrics />} />
+                <Route path="system" element={<System />} />
+                <Route path="settings" element={<Settings />} />
+                <Route
+                  path="*"
+                  element={
+                    <React.Suspense fallback={<RouteFallback />}>
+                      <NotFound />
+                    </React.Suspense>
+                  }
+                />
+              </Route>
+            </Routes>
+          )}
+          <Toaster />
+        </ErrorBoundary>
+      </BrowserRouter>
+    </TooltipProvider>
   );
 }
 
+/** The first moment, while the app asks who this is: kiln's mark and the loader. */
 function Splash() {
   return (
-    <div className="grid min-h-dvh place-items-center" aria-busy="true" aria-label="Loading kiln">
+    <div className="grid min-h-dvh place-items-center" aria-busy="true">
       <div className="flex flex-col items-center gap-5 text-[#ededee]">
         <BrandMark className="h-9 w-8 opacity-90" />
-        <span className="spectrum-rule" />
+        <Loading label="Loading kiln" />
       </div>
     </div>
   );

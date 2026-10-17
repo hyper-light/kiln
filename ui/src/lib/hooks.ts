@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { ApiError } from "@/api/client";
+import { getPref, usePref } from "./prefs";
 
 /* ------------------------------------------------------------------ */
 /* Shared ticking clock: one interval for every live timer in the app. */
@@ -33,6 +34,8 @@ export function useNow(): number {
 
 /* ------------------------------------------------------------------ */
 /* useResource: fetch with abort, refetch, optimistic local mutation.  */
+/* Legacy: the agent console's views still use it until they move to   */
+/* useSuspenseResource (lib/resource.ts) like every other page has.    */
 /* ------------------------------------------------------------------ */
 
 export interface Resource<T> {
@@ -102,36 +105,13 @@ export function errorMessage(e: unknown): string {
 /* Local storage-backed state (per-viewer conveniences only).          */
 /* ------------------------------------------------------------------ */
 
+/** A preference kept in this browser (see lib/prefs.ts): shared by every reader, kept at once. */
 export function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
-  const [value, setValue] = useState<T>(() => {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw === null ? initial : (JSON.parse(raw) as T);
-    } catch {
-      return initial;
-    }
-  });
-  const set = useCallback(
-    (v: T) => {
-      setValue(v);
-      try {
-        localStorage.setItem(key, JSON.stringify(v));
-      } catch {
-        /* private mode etc. */
-      }
-    },
-    [key],
-  );
-  return [value, set];
+  return usePref(key, initial);
 }
 
 export function readLocal<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw === null ? fallback : (JSON.parse(raw) as T);
-  } catch {
-    return fallback;
-  }
+  return getPref(key, fallback);
 }
 
 export function useMediaQuery(query: string): boolean {
@@ -146,6 +126,10 @@ export function useMediaQuery(query: string): boolean {
   );
 }
 
+/**
+ * Legacy: pages render a `<title>` element (React hoists it into the head). Kept for the agent
+ * console's views until they do the same.
+ */
 export function useDocumentTitle(title: string) {
   useEffect(() => {
     document.title = title ? `${title} · kiln` : "kiln";
@@ -157,12 +141,9 @@ export function useDocumentTitle(title: string) {
  * end or both) so the stylesheet can fade them — a scroller you can see is a scroller. Use the
  * returned callback as the element's ref.
  */
-export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => void {
-  const cleanup = useRef<(() => void) | null>(null);
+export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => () => void {
   return useCallback((el: T | null) => {
-    cleanup.current?.();
-    cleanup.current = null;
-    if (!el) return;
+    if (!el) return () => {};
     const update = () => {
       const max = el.scrollWidth - el.clientWidth;
       const start = el.scrollLeft > 2;
@@ -176,7 +157,7 @@ export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => void 
     const ro = new ResizeObserver(update);
     ro.observe(el);
     for (const c of Array.from(el.children)) ro.observe(c);
-    cleanup.current = () => {
+    return () => {
       el.removeEventListener("scroll", update);
       ro.disconnect();
     };

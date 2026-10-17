@@ -1,6 +1,12 @@
+/**
+ * The command palette: jump to a page, a repository, a run or a terminal. It opens in the header
+ * (Ctrl/⌘ K, or Search), in the page's flow under the header's bar: no overlay. Its pages and
+ * actions are there the moment it opens; repositories, recent runs and terminals join them as they
+ * arrive (asked for by the action that opens it), so what you type is never lost to a loader.
+ */
 import * as React from "react";
-import { Dialog } from "radix-ui";
 import { useNavigate } from "react-router";
+import { create } from "zustand";
 import {
   Activity,
   ArrowUpRight,
@@ -27,26 +33,44 @@ import { StatusDot } from "@/components/ui/status";
 import { relativeTime, shortSha } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
-/* tiny store so the header button and the hotkey share open state */
-let open = false;
-const subs = new Set<() => void>();
-export function setPaletteOpen(v: boolean) {
-  open = v;
-  subs.forEach((s) => s());
+interface PaletteState {
+  open: boolean;
+  repos: Repo[];
+  runs: Run[];
+  agents: Agent[];
 }
-function usePaletteOpen() {
-  return React.useSyncExternalStore(
-    (cb) => {
-      subs.add(cb);
-      return () => subs.delete(cb);
-    },
-    () => open,
-  );
+
+/** Shared by the header's Search button, the hotkey and the palette itself. */
+export const usePalette = create<PaletteState>(() => ({ open: false, repos: [], runs: [], agents: [] }));
+
+let loading: AbortController | null = null;
+
+export function setPaletteOpen(open: boolean) {
+  if (open === usePalette.getState().open) return;
+  usePalette.setState({ open });
+  loading?.abort();
+  loading = null;
+  if (!open) return;
+  // What it lists besides pages and actions, fresh each time it opens.
+  const ctl = (loading = new AbortController());
+  api.repos(ctl.signal).then((repos) => usePalette.setState({ repos }), () => undefined);
+  api.runs({ limit: 40 }, ctl.signal).then((runs) => usePalette.setState({ runs }), () => undefined);
+  api.agents(ctl.signal).then((agents) => usePalette.setState({ agents }), () => undefined);
 }
 
 /** True when keystrokes belong to a terminal (xterm) and must not be hijacked. */
 export function inTerminal(target: EventTarget | null): boolean {
   return target instanceof Element && Boolean(target.closest(".xterm, [data-terminal]"));
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("keydown", (e) => {
+    if (inTerminal(e.target)) return; // the PTY owns every key while focused
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      setPaletteOpen(!usePalette.getState().open);
+    }
+  });
 }
 
 interface Item {
@@ -74,37 +98,17 @@ function score(q: string, text: string): number {
 }
 
 export function CommandPalette() {
-  const isOpen = usePaletteOpen();
+  const open = usePalette((s) => s.open);
+  return open ? <Palette /> : null;
+}
+
+function Palette() {
   const navigate = useNavigate();
+  const repos = usePalette((s) => s.repos);
+  const runs = usePalette((s) => s.runs);
+  const agents = usePalette((s) => s.agents);
   const [q, setQ] = React.useState("");
   const [active, setActive] = React.useState(0);
-  const [repos, setRepos] = React.useState<Repo[]>([]);
-  const [runs, setRuns] = React.useState<Run[]>([]);
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const listRef = React.useRef<HTMLDivElement>(null);
-
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (inTerminal(e.target)) return; // the PTY owns every key while focused
-      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPaletteOpen(!open);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  React.useEffect(() => {
-    if (!isOpen) return;
-    setQ("");
-    setActive(0);
-    const ctl = new AbortController();
-    api.repos(ctl.signal).then(setRepos).catch(() => undefined);
-    api.runs({ limit: 40 }, ctl.signal).then(setRuns).catch(() => undefined);
-    api.agents(ctl.signal).then(setAgents).catch(() => undefined);
-    return () => ctl.abort();
-  }, [isOpen]);
 
   const go = React.useCallback(
     (to: string) => {
@@ -178,91 +182,95 @@ export function CommandPalette() {
 
   const query = q.trim().toLowerCase();
   const filtered = React.useMemo(() => {
-    const scored = items
-      .map((it) => ({ it, s: score(query, `${it.label} ${it.hint ?? ""} ${it.keywords ?? ""} ${it.group}`) }))
-      .filter((x) => x.s > 0);
+    const scored = items.map((it) => ({ it, s: score(query, `${it.label} ${it.hint ?? ""} ${it.keywords ?? ""} ${it.group}`) })).filter((x) => x.s > 0);
     if (query) scored.sort((a, b) => b.s - a.s);
     if (query) return scored.slice(0, 40).map((x) => x.it);
     // No query: everything except a long tail of runs.
     let runCount = 0;
-    return scored
-      .map((x) => x.it)
-      .filter((it) => it.group !== "Recent runs" || runCount++ < 8);
+    return scored.map((x) => x.it).filter((it) => it.group !== "Recent runs" || runCount++ < 8);
   }, [items, query]);
+  const current = Math.min(active, Math.max(0, filtered.length - 1));
 
-  React.useEffect(() => setActive(0), [query]);
-  React.useEffect(() => {
-    listRef.current?.querySelector(`[data-idx="${active}"]`)?.scrollIntoView({ block: "nearest" });
-  }, [active]);
+  /** Move the highlight, keeping it in view. */
+  const move = (to: number) => {
+    setActive(to);
+    const it = filtered[to];
+    if (it) document.getElementById(`cmdk-${it.id}`)?.scrollIntoView({ block: "nearest" });
+  };
+
+  // Closes when you press or tap anywhere outside the header (the Search button inside it toggles).
+  const away = React.useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    const header = el.closest(".site-header") ?? el;
+    const onDown = (e: PointerEvent) => {
+      if (!header.contains(e.target as Node)) setPaletteOpen(false);
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, []);
 
   let lastGroup = "";
   return (
-    <Dialog.Root open={isOpen} onOpenChange={setPaletteOpen}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="overlay" />
-        <Dialog.Content className="dialog !top-[10vh] !w-[min(640px,calc(100vw-24px))] !p-0" aria-describedby={undefined}>
-          <Dialog.Title className="sr-only">Command palette</Dialog.Title>
-          <div className="relative">
-            <Search size={17} className="absolute top-1/2 left-[18px] -translate-y-1/2 text-[#8f939e]" aria-hidden="true" />
-            <input
-              autoFocus
-              className="cmdk-input"
-              placeholder="Jump to a page, repo, run, or terminal…"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              role="combobox"
-              aria-expanded="true"
-              aria-controls="cmdk-list"
-              aria-activedescendant={filtered[active] ? `cmdk-${filtered[active].id}` : undefined}
-              onKeyDown={(e) => {
-                if (e.key === "ArrowDown") {
-                  e.preventDefault();
-                  setActive((a) => Math.min(filtered.length - 1, a + 1));
-                } else if (e.key === "ArrowUp") {
-                  e.preventDefault();
-                  setActive((a) => Math.max(0, a - 1));
-                } else if (e.key === "Enter") {
-                  e.preventDefault();
-                  filtered[active]?.run();
-                }
-              }}
-            />
-          </div>
-          <div ref={listRef} id="cmdk-list" role="listbox" className="max-h-[52vh] overflow-y-auto p-2">
-            {filtered.length === 0 && <div className="px-4 py-10 text-center text-[13px] text-[#8f939e]">No matches.</div>}
-            {filtered.map((it, i) => {
-              const header = it.group !== lastGroup ? it.group : null;
-              lastGroup = it.group;
-              return (
-                <React.Fragment key={it.id}>
-                  {header && <div className="label px-3.5 pt-3 pb-1.5">{header}</div>}
-                  <div
-                    id={`cmdk-${it.id}`}
-                    data-idx={i}
-                    role="option"
-                    aria-selected={i === active}
-                    className="cmdk-item"
-                    onMouseMove={() => setActive(i)}
-                    onClick={() => it.run()}
-                  >
-                    <span className="grid w-4 place-items-center text-[#9a9da6]">{it.icon}</span>
-                    <span className="min-w-0 truncate">{it.label}</span>
-                    {it.hint && <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-[#7f838d]">{it.hint}</span>}
-                    <span className={cn("ml-auto text-[#8f939e]", i === active ? "opacity-100" : "opacity-0")}>
-                      {it.group === "Repositories" ? <ArrowUpRight size={14} /> : <CornerDownLeft size={13} />}
-                    </span>
-                  </div>
-                </React.Fragment>
-              );
-            })}
-          </div>
-          <div className="flex items-center gap-4 border-t border-[#22262d] px-4 py-2.5 font-mono text-[9px] tracking-[0.08em] text-[#7f838d] uppercase">
-            <span>↑↓ navigate</span>
-            <span>↵ open</span>
-            <span>esc close</span>
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    <div ref={away} className="header-band palette-band" role="search" aria-label="Command palette">
+      <div className="palette-inner">
+        <div className="relative">
+          <Search size={17} className="absolute top-1/2 left-[18px] -translate-y-1/2 text-[#8f939e]" aria-hidden="true" />
+          <input
+            autoFocus
+            className="cmdk-input"
+            placeholder="Jump to a page, repo, run, or terminal…"
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value);
+              setActive(0);
+            }}
+            role="combobox"
+            aria-expanded="true"
+            aria-controls="cmdk-list"
+            aria-activedescendant={filtered[current] ? `cmdk-${filtered[current].id}` : undefined}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                move(Math.min(filtered.length - 1, current + 1));
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                move(Math.max(0, current - 1));
+              } else if (e.key === "Enter") {
+                e.preventDefault();
+                filtered[current]?.run();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                setPaletteOpen(false);
+              }
+            }}
+          />
+        </div>
+        <div id="cmdk-list" role="listbox" className="palette-list">
+          {filtered.length === 0 && <div className="px-4 py-10 text-center text-[13px] text-[#8f939e]">No matches.</div>}
+          {filtered.map((it, i) => {
+            const header = it.group !== lastGroup ? it.group : null;
+            lastGroup = it.group;
+            return (
+              <React.Fragment key={it.id}>
+                {header && <div className="label px-3.5 pt-3 pb-1.5">{header}</div>}
+                <div id={`cmdk-${it.id}`} role="option" aria-selected={i === current} className="cmdk-item" onMouseMove={() => i !== current && setActive(i)} onClick={() => it.run()}>
+                  <span className="grid w-4 place-items-center text-[#9a9da6]">{it.icon}</span>
+                  <span className="min-w-0 truncate">{it.label}</span>
+                  {it.hint && <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-[#7f838d]">{it.hint}</span>}
+                  <span className={cn("ml-auto text-[#8f939e]", i === current ? "opacity-100" : "opacity-0")}>
+                    {it.group === "Repositories" ? <ArrowUpRight size={14} /> : <CornerDownLeft size={13} />}
+                  </span>
+                </div>
+              </React.Fragment>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-4 border-t border-[#22262d] px-4 py-2.5 font-mono text-[9px] tracking-[0.08em] text-[#7f838d] uppercase">
+          <span>↑↓ navigate</span>
+          <span>↵ open</span>
+          <span>esc close</span>
+        </div>
+      </div>
+    </div>
   );
 }
