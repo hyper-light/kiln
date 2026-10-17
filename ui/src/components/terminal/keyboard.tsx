@@ -1,5 +1,6 @@
 import * as React from "react";
-import { ChevronDown, Keyboard as KeyboardIcon, Smartphone } from "lucide-react";
+import { ChevronDown, ChevronUp, Keyboard as KeyboardIcon, Smartphone } from "lucide-react";
+import { useLocalStorage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { charKey, namedKey, strokeBytes, type Mods, type NamedKey } from "./keys";
 import { PRESETS, presetFor } from "./presets";
@@ -8,20 +9,23 @@ type Latch = "off" | "once" | "lock";
 type Layer = "abc" | "sym" | "sym2";
 
 export type KeyboardMode = "keys" | "full";
+/** open: every row; shrunk: just the shortcuts (while reading or scrolling); closed: just the bar. */
+export type KeyboardFold = "open" | "shrunk" | "closed";
 
 interface Props {
   /** Send bytes to the session (as if typed). */
   send: (bytes: string) => void;
   /** The terminal's application-cursor mode, read at key time. */
   appCursor: () => boolean;
-  /** What the session runs (its command and window title), used to pick the shortcut preset. */
-  hints: string;
+  /** The preset picked automatically from what the session runs. */
+  autoPresetId: string;
   /** The user's preset for this session (null: automatic). */
   presetId: string | null;
   onPreset: (id: string | null) => void;
   mode: KeyboardMode;
   onMode: (m: KeyboardMode) => void;
-  onHide: () => void;
+  fold: KeyboardFold;
+  onFold: (f: "open" | "closed") => void;
 }
 
 const ROWS: Record<Layer, string[][]> = {
@@ -41,6 +45,12 @@ const ROWS: Record<Layer, string[][]> = {
     [".", ",", "?", "!", "'", "`"],
   ],
 };
+
+/** Key heights the resize grip allows, in px. */
+const KEY_MIN = 26;
+const KEY_MAX = 64;
+/** Grip travel before a press counts as a resize drag rather than a tap. */
+const DRAG_SLOP_PX = 4;
 
 /** Press-and-hold repeat for keys like Backspace and the arrows. */
 function useRepeat() {
@@ -72,23 +82,33 @@ const buzz = () => {
   }
 };
 
-export function TerminalKeyboard({ send, appCursor, hints, presetId, onPreset, mode, onMode, onHide }: Props) {
+function KeyboardImpl({ send, appCursor, autoPresetId, presetId, onPreset, mode, onMode, fold, onFold }: Props) {
   const [ctrl, setCtrl] = React.useState<Latch>("off");
   const [alt, setAlt] = React.useState<Latch>("off");
   const [shift, setShift] = React.useState<Latch>("off");
   const [layer, setLayer] = React.useState<Layer>("abc");
   const [presetOpen, setPresetOpen] = React.useState(false);
+  // Per device: how tall the keys are (null: the default for the screen).
+  const [keyHeight, setKeyHeight] = useLocalStorage<number | null>("kiln.term.keyboardKeyHeight", null);
+  const open = fold === "open";
+  /** Fold away when open; otherwise bring every row back. */
+  const toggleFold = () => onFold(open ? "closed" : "open");
+  const rootRef = React.useRef<HTMLDivElement>(null);
   const { start, stop } = useRepeat();
-  const preset = presetFor(hints, presetId);
+  const preset = presetFor("", presetId ?? autoPresetId);
+  const autoName = presetFor("", autoPresetId).name;
 
-  const mods = (): Mods => ({ ctrl: ctrl !== "off", alt: alt !== "off", shift: shift !== "off" });
+  const mods = (): Mods => ({
+    ctrl: ctrl !== "off",
+    alt: alt !== "off",
+    shift: shift !== "off",
+  });
   const consume = () => {
     if (ctrl === "once") setCtrl("off");
     if (alt === "once") setAlt("off");
     if (shift === "once") setShift("off");
   };
-  const cycle = (set: React.Dispatch<React.SetStateAction<Latch>>) =>
-    set((v) => (v === "off" ? "once" : v === "once" ? "lock" : "off"));
+  const cycle = (set: React.Dispatch<React.SetStateAction<Latch>>) => set((v) => (v === "off" ? "once" : v === "once" ? "lock" : "off"));
 
   const fireNamed = (k: NamedKey) => {
     send(namedKey(k, mods(), appCursor()));
@@ -113,6 +133,59 @@ export function TerminalKeyboard({ send, appCursor, hints, presetId, onPreset, m
     onContextMenu: (e: React.MouseEvent) => e.preventDefault(),
   });
 
+  /**
+   * The grip: drag up for bigger keys, down for smaller ones; a tap folds the keyboard away or
+   * brings it back, and so does pulling it up while folded. The height is applied straight to the
+   * element while dragging (no re-render per move) and saved when the finger lifts.
+   */
+  const grip = {
+    onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.preventDefault();
+      const root = rootRef.current;
+      if (!root) return;
+      const el = e.currentTarget;
+      el.setPointerCapture(e.pointerId);
+      const y0 = e.clientY;
+      const key = root.querySelector<HTMLElement>(".vk-key");
+      const h0 = key?.offsetHeight ?? 40;
+      const rows = Math.max(1, root.querySelectorAll(".vk > .vk-row, .vk-full > .vk-row").length);
+      let dragging = false;
+      let h = h0;
+      const move = (ev: PointerEvent) => {
+        const dy = y0 - ev.clientY;
+        if (!dragging && Math.abs(dy) < DRAG_SLOP_PX) return;
+        dragging = true;
+        if (!open) return;
+        h = Math.round(Math.min(KEY_MAX, Math.max(KEY_MIN, h0 + dy / rows)));
+        root.style.setProperty("--vk-key-h", `${h}px`);
+      };
+      const end = (ev: PointerEvent) => {
+        el.removeEventListener("pointermove", move);
+        el.removeEventListener("pointerup", end);
+        el.removeEventListener("pointercancel", end);
+        if (el.hasPointerCapture(ev.pointerId)) el.releasePointerCapture(ev.pointerId);
+        if (!dragging) {
+          if (ev.type === "pointerup") toggleFold();
+        } else if (!open) {
+          if (y0 - ev.clientY > 24) onFold("open");
+        } else {
+          setKeyHeight(h);
+        }
+      };
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", end);
+      el.addEventListener("pointercancel", end);
+    },
+    onKeyDown: (e: React.KeyboardEvent) => {
+      // Keyboard access to the same control: arrows resize, Enter/Space folds.
+      const cur = keyHeight ?? rootRef.current?.querySelector<HTMLElement>(".vk-key")?.offsetHeight ?? 40;
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        setKeyHeight(Math.min(KEY_MAX, Math.max(KEY_MIN, cur + (e.key === "ArrowUp" ? 2 : -2))));
+      }
+    },
+  };
+
   const latchKey = (label: string, v: Latch, set: React.Dispatch<React.SetStateAction<Latch>>) => (
     <button type="button" className="vk-key vk-mod" data-latch={v} aria-pressed={v !== "off"} {...press(() => cycle(set))}>
       {label}
@@ -125,100 +198,160 @@ export function TerminalKeyboard({ send, appCursor, hints, presetId, onPreset, m
     </button>
   );
 
+  const style = keyHeight ? ({ "--vk-key-h": `${keyHeight}px` } as React.CSSProperties) : undefined;
+
   return (
-    <div className="vk" role="group" aria-label="Terminal keyboard" data-mode={mode}>
-      {presetOpen && (
-        <div className="vk-menu" role="listbox" aria-label="Shortcut set">
-          <button type="button" role="option" aria-selected={presetId === null} className="vk-menu-item" {...press(() => { onPreset(null); setPresetOpen(false); })}>
-            Auto ({presetFor(hints).name})
+    <div ref={rootRef} className="vk" role="group" aria-label="Terminal keyboard" data-mode={mode} data-fold={fold} style={style}>
+      {/* Always on screen: resize/fold grip, device-keyboard switch, fold button. */}
+      <div className="vk-bar">
+        <button
+          type="button"
+          className="vk-grip"
+          aria-label={open ? "Resize keyboard: drag, or tap to fold it away" : "Show keyboard"}
+          aria-expanded={open}
+          {...grip}
+          onClick={(e) => {
+            // Pointer taps are handled on pointerup; this is for keyboard and assistive activation.
+            if (e.detail === 0) toggleFold();
+          }}
+        >
+          <span aria-hidden="true" />
+        </button>
+        <div className="vk-bar-end">
+          <button
+            type="button"
+            className="vk-bar-btn"
+            aria-label={mode === "full" ? "Use the device keyboard" : "Use the kiln keyboard"}
+            title={mode === "full" ? "Device keyboard" : "kiln keyboard"}
+            {...press(() => onMode(mode === "full" ? "keys" : "full"))}
+          >
+            {mode === "full" ? <Smartphone size={15} /> : <KeyboardIcon size={15} />}
           </button>
-          {PRESETS.map((p) => (
-            <button key={p.id} type="button" role="option" aria-selected={presetId === p.id} className="vk-menu-item" {...press(() => { onPreset(p.id); setPresetOpen(false); })}>
-              {p.name}
-            </button>
-          ))}
+          <button type="button" className="vk-bar-btn" aria-label={open ? "Fold keyboard away" : "Show keyboard"} aria-expanded={open} {...press(toggleFold)}>
+            {open ? <ChevronDown size={15} /> : <ChevronUp size={15} />}
+          </button>
         </div>
-      )}
-      {/* Shortcuts for the program in this session. */}
-      <div className="vk-row vk-scroll">
-        <button type="button" className="vk-key vk-chip vk-preset" aria-haspopup="listbox" aria-expanded={presetOpen} {...press(() => setPresetOpen((o) => !o))}>
-          {preset.name} <ChevronDown size={12} />
-        </button>
-        {preset.shortcuts.map((s) => (
-          <button key={s.label} type="button" className="vk-key vk-chip" title={s.hint} aria-label={`${s.label}: ${s.hint}`} {...press(() => send(s.strokes.map((st) => strokeBytes(st, appCursor())).join("")))}>
-            {s.label}
-          </button>
-        ))}
       </div>
 
-      {/* Keys a phone keyboard lacks. */}
-      <div className="vk-row vk-scroll">
-        {navKey("Esc", "Escape")}
-        {navKey("Tab", "Tab")}
-        {latchKey("Ctrl", ctrl, setCtrl)}
-        {latchKey("Alt", alt, setAlt)}
-        {latchKey("⇧", shift, setShift)}
-        {navKey("←", "ArrowLeft", true, "Left")}
-        {navKey("↓", "ArrowDown", true, "Down")}
-        {navKey("↑", "ArrowUp", true, "Up")}
-        {navKey("→", "ArrowRight", true, "Right")}
-        {navKey("Home", "Home")}
-        {navKey("End", "End")}
-        {navKey("PgUp", "PageUp", true)}
-        {navKey("PgDn", "PageDown", true)}
-        {["|", "~", "/", "-", "_"].map((c) => (
-          <button key={c} type="button" className="vk-key" {...press(() => fireChar(c))}>
-            {c}
-          </button>
-        ))}
-        <span className="vk-spacer" />
-        <button type="button" className="vk-key vk-icon" aria-label={mode === "full" ? "Use the device keyboard" : "Use the kiln keyboard"} title={mode === "full" ? "Device keyboard" : "kiln keyboard"} {...press(() => onMode(mode === "full" ? "keys" : "full"))}>
-          {mode === "full" ? <Smartphone size={15} /> : <KeyboardIcon size={15} />}
-        </button>
-        <button type="button" className="vk-key vk-icon" aria-label="Hide keyboard" {...press(onHide)}>
-          <ChevronDown size={15} />
-        </button>
-      </div>
-
-      {mode === "full" && (
-        <div className="vk-full">
-          {ROWS[layer].map((row, i) => (
-            <div key={i} className="vk-row vk-keys">
-              {i === 2 && (
-                layer === "abc" ? (
-                  latchKey("⇧", shift, setShift)
-                ) : (
-                  <button type="button" className="vk-key vk-wide" {...press(() => setLayer(layer === "sym" ? "sym2" : "sym"))}>
-                    {layer === "sym" ? "#+=" : "123"}
-                  </button>
-                )
-              )}
-              {row.map((c) => (
-                <button key={c} type="button" className="vk-key vk-char" {...press(() => fireChar(c))}>
-                  {shift !== "off" && layer === "abc" ? c.toUpperCase() : c}
+      {fold !== "closed" && (
+        <>
+          {presetOpen && (
+            <div className="vk-menu" role="listbox" aria-label="Shortcut set">
+              <button
+                type="button"
+                role="option"
+                aria-selected={presetId === null}
+                className="vk-menu-item"
+                {...press(() => {
+                  onPreset(null);
+                  setPresetOpen(false);
+                })}
+              >
+                Auto ({autoName})
+              </button>
+              {PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  role="option"
+                  aria-selected={presetId === p.id}
+                  className="vk-menu-item"
+                  {...press(() => {
+                    onPreset(p.id);
+                    setPresetOpen(false);
+                  })}
+                >
+                  {p.name}
                 </button>
               ))}
-              {i === 2 && (
-                <button type="button" className="vk-key vk-wide" aria-label="Backspace" {...press(() => fireNamed("Backspace"), true)}>
-                  ⌫
-                </button>
-              )}
             </div>
-          ))}
-          <div className="vk-row vk-keys">
-            <button type="button" className="vk-key vk-wide" {...press(() => setLayer(layer === "abc" ? "sym" : "abc"))}>
-              {layer === "abc" ? "123" : "ABC"}
+          )}
+          {/* Shortcuts for the program in this session. */}
+          <div className="vk-row vk-scroll">
+            <button type="button" className="vk-key vk-chip vk-preset" aria-haspopup="listbox" aria-expanded={presetOpen} {...press(() => setPresetOpen((o) => !o))}>
+              {preset.name} <ChevronDown size={12} />
             </button>
-            {latchKey("Ctrl", ctrl, setCtrl)}
-            <button type="button" className={cn("vk-key vk-space")} aria-label="Space" {...press(() => fireChar(" "), true)}>
-              space
-            </button>
-            <button type="button" className="vk-key vk-wide vk-enter" aria-label="Enter" {...press(() => fireNamed("Enter"))}>
-              ⏎
-            </button>
+            {preset.shortcuts.map((s) => (
+              <button
+                key={s.label}
+                type="button"
+                className="vk-key vk-chip"
+                title={s.hint}
+                aria-label={`${s.label}: ${s.hint}`}
+                {...press(() => send(s.strokes.map((st) => strokeBytes(st, appCursor())).join("")))}
+              >
+                {s.label}
+              </button>
+            ))}
           </div>
-        </div>
+
+          {/* Keys a phone keyboard lacks. */}
+          {open && (
+            <div className="vk-row vk-scroll">
+              {navKey("Esc", "Escape")}
+              {navKey("Tab", "Tab")}
+              {latchKey("Ctrl", ctrl, setCtrl)}
+              {latchKey("Alt", alt, setAlt)}
+              {latchKey("⇧", shift, setShift)}
+              {navKey("←", "ArrowLeft", true, "Left")}
+              {navKey("↓", "ArrowDown", true, "Down")}
+              {navKey("↑", "ArrowUp", true, "Up")}
+              {navKey("→", "ArrowRight", true, "Right")}
+              {navKey("Home", "Home")}
+              {navKey("End", "End")}
+              {navKey("PgUp", "PageUp", true)}
+              {navKey("PgDn", "PageDown", true)}
+              {["|", "~", "/", "-", "_"].map((c) => (
+                <button key={c} type="button" className="vk-key" {...press(() => fireChar(c))}>
+                  {c}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {open && mode === "full" && (
+            <div className="vk-full">
+              {ROWS[layer].map((row, i) => (
+                <div key={i} className="vk-row vk-keys">
+                  {i === 2 &&
+                    (layer === "abc" ? (
+                      latchKey("⇧", shift, setShift)
+                    ) : (
+                      <button type="button" className="vk-key vk-wide" {...press(() => setLayer(layer === "sym" ? "sym2" : "sym"))}>
+                        {layer === "sym" ? "#+=" : "123"}
+                      </button>
+                    ))}
+                  {row.map((c) => (
+                    <button key={c} type="button" className="vk-key vk-char" {...press(() => fireChar(c))}>
+                      {shift !== "off" && layer === "abc" ? c.toUpperCase() : c}
+                    </button>
+                  ))}
+                  {i === 2 && (
+                    <button type="button" className="vk-key vk-wide" aria-label="Backspace" {...press(() => fireNamed("Backspace"), true)}>
+                      ⌫
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="vk-row vk-keys">
+                <button type="button" className="vk-key vk-wide" {...press(() => setLayer(layer === "abc" ? "sym" : "abc"))}>
+                  {layer === "abc" ? "123" : "ABC"}
+                </button>
+                {latchKey("Ctrl", ctrl, setCtrl)}
+                <button type="button" className={cn("vk-key vk-space")} aria-label="Space" {...press(() => fireChar(" "), true)}>
+                  space
+                </button>
+                <button type="button" className="vk-key vk-wide vk-enter" aria-label="Enter" {...press(() => fireNamed("Enter"))}>
+                  ⏎
+                </button>
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
 }
+
+/** Re-renders only for its own state and props (the session's output and title never touch it). */
+export const TerminalKeyboard = React.memo(KeyboardImpl);

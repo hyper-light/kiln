@@ -174,6 +174,8 @@ export const api = {
     post<TerminalSessionInfo>("/api/terminal/sessions", body),
 
   aiSessions: (signal?: AbortSignal) => get<AiSession[]>("/api/ai-sessions", signal),
+  /** Connected runners too old to report AI sessions. */
+  aiSilent: (signal?: AbortSignal) => get<{ machines: string[] }>("/api/ai-sessions/silent", signal),
   aiTranscript: (machine: string, pid: number, signal?: AbortSignal) =>
     get<AiTranscriptEntry[]>(`/api/ai-sessions/${enc(machine)}/${pid}/transcript`, signal),
   audit: (limit = 200, signal?: AbortSignal) => get<AuditEntry[]>(`/api/audit${qs({ limit })}`, signal),

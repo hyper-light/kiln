@@ -220,6 +220,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::DELETE, ["api", "settings", "password"]) => clear_password(&hub).await,
         (&Method::GET, ["api", "events"]) => events_ws(hub.clone(), req),
         (&Method::GET, ["api", "ai-sessions"]) => Ok(ai_sessions(&hub)),
+        (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
@@ -277,6 +278,21 @@ fn ai_sessions(hub: &Hub) -> Response {
     }
     out.sort_by_key(|v| std::cmp::Reverse(v.get("last_activity").and_then(serde_json::Value::as_i64).unwrap_or(0)));
     srv::json(StatusCode::OK, &out)
+}
+
+/// Connected runners that have never reported AI sessions (an older kiln): what they run can't
+/// be listed. A current runner reports right after it connects, even when it has none.
+fn ai_silent(hub: &Hub) -> Response {
+    let reporting: std::collections::HashSet<String> = hub.ai_sessions.lock().keys().cloned().collect();
+    let mut machines: Vec<String> = hub
+        .agents
+        .lock()
+        .values()
+        .filter(|a| a.connected && !a.ephemeral && !reporting.contains(&a.name))
+        .map(|a| a.name.clone())
+        .collect();
+    machines.sort();
+    srv::json(StatusCode::OK, &json!({ "machines": machines }))
 }
 
 /// The recent messages of one session, read from its machine.
@@ -1235,10 +1251,11 @@ async fn terminal_attach(
             }
         }
     };
-    tx.send(ws::text(json!({"type": "session", "session": session.info()}).to_string())).await?;
     let attachment = session.attach();
     let mut live = attachment.live;
     let result: anyhow::Result<()> = async {
+        // Read after subscribing: a resize from here on also arrives as a live size frame.
+        tx.send(ws::text(json!({"type": "session", "session": session.info()}).to_string())).await?;
         if !attachment.replay.is_empty() {
             tx.send(ws::binary(attachment.replay)).await?;
         }
@@ -1254,6 +1271,7 @@ async fn terminal_attach(
             futures::select_biased! {
                 f = live.recv().fuse() => match f {
                     Ok(Frame::Data(d)) => tx.send(ws::binary(d)).await?,
+                    Ok(Frame::Size { cols, rows }) => tx.send(ws::text(json!({"type": "size", "cols": cols, "rows": rows}).to_string())).await?,
                     Ok(Frame::Exit { error: Some(e), .. }) if e == "__reconnect__" => {
                         tx.send(ws::text(json!({"type": "reconnect"}).to_string())).await.ok();
                         return Ok(());

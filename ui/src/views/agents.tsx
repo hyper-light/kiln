@@ -66,6 +66,7 @@ export default function Agents() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const sessions = useResource((s) => api.aiSessions(s), [], { pollMs: 20_000 });
+  const silent = useResource((s) => api.aiSilent(s), [], { pollMs: 30_000 });
   const [filter, setFilter] = React.useState<Filter>("all");
   const [q, setQ] = React.useState("");
   const selected = params.get("session");
@@ -76,9 +77,12 @@ export default function Agents() {
   }, [params, navigate]);
 
   const reload = useThrottled(sessions.reload, 1000);
+  const reloadSilent = useThrottled(silent.reload, 2000);
   useServerEvents((ev) => {
     if (ev.type === "ai_sessions" || (ev.type === "agent" && !ev.agent.connected)) reload();
+    if (ev.type === "ai_sessions" || ev.type === "agent") reloadSilent();
   });
+  const quiet = silent.data?.machines ?? [];
 
   const all = sessions.data ?? [];
   const counts: Record<Filter, number> = {
@@ -134,6 +138,12 @@ export default function Agents() {
         />
         <SearchField className="ml-auto w-full min-w-0 sm:w-64" label="Search sessions" placeholder="Title, folder, machine…" value={q} onChange={setQ} />
       </div>
+      {quiet.length > 0 && (
+        <p className="mb-5 text-[12px] leading-relaxed text-[#8f939e]">
+          Not reporting sessions: <span className="font-mono text-[#c8cad0]">{quiet.join(", ")}</span>. {quiet.length === 1 ? "It runs" : "They run"} an older
+          kiln; {quiet.length === 1 ? "its" : "their"} sessions show up here once {quiet.length === 1 ? "it is" : "they are"} updated.
+        </p>
+      )}
 
       {sessions.error && !sessions.data ? (
         <ErrorState error={sessions.error} onRetry={sessions.reload} />
