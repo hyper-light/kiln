@@ -231,6 +231,15 @@
 .ms-actions .ms-link {
   margin: 0 4px;
 }
+.ms-decide,
+.ms-tail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ms-decide:empty {
+  display: none;
+}
 .ms-go {
   display: grid;
   width: 32px;
@@ -391,9 +400,10 @@ a.ms-why:hover {
   color: #8f939e;
   font-size: 12.5px;
 }
+/* One height whatever it holds, so a transcript filling in pushes nothing below it. */
 .ms-watch-log {
   display: flex;
-  max-height: min(56dvh, 520px);
+  height: min(56dvh, 520px);
   flex-direction: column;
   gap: 8px;
   padding-right: 4px;
@@ -596,6 +606,22 @@ a.ms-why:hover {
   .ms-meta-2 {
     min-width: 0;
     overflow: hidden;
+  }
+  /* An agent's answers take the meta line's place (its line above says what it asks), so the row's
+     corner — its menu and arrow — keeps one width as agents come to need you and stop. */
+  .ms-row:not(.ms-found-row) .ms-actions {
+    display: contents;
+  }
+  .ms-decide {
+    grid-area: meta;
+    justify-self: start;
+  }
+  .ms-tail {
+    grid-area: actions;
+  }
+  .ms-row[data-stand="needs"] .ms-meta,
+  .ms-row[data-stand="crashed"] .ms-meta {
+    display: none;
   }
   /* The row's arrow opens it; one less word beside Allow and Deny. */
   .ms-actions .ms-link {

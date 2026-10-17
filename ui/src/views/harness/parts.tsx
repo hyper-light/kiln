@@ -4,8 +4,16 @@ import "./harness.css";
 import "./console.css";
 import { Bot, FilePen, FileText, Globe, ListChecks, Map as MapIcon, MessageCircleQuestion, Plug, Search, Sparkles, SquareTerminal, Wrench, type LucideIcon } from "lucide-react";
 import type { Status, ToolKind } from "@/api/harness";
+import { relativeTime } from "@/lib/format";
+import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/views/terminal/clipboard";
+
+/** "12s ago" (`ts` in unix seconds), kept current by the shared clock: only this text re-renders as it counts, not the row around it. */
+export function Ago({ ts, className }: { ts: number; className?: string }) {
+  const now = useNow();
+  return <span className={className}>{relativeTime(ts, now)}</span>;
+}
 
 /** A neutral two-letter mark per harness (never a vendor's logo). */
 const MARKS: Record<string, { code: string; hue: string }> = {

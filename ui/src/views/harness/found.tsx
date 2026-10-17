@@ -14,10 +14,9 @@ import type { AiSession, AiTranscriptEntry } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
-import { relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { tildify } from "./derive";
-import { HarnessMark } from "./parts";
+import { Ago, HarnessMark } from "./parts";
 
 const TOOL: Record<string, string> = { claude: "Claude Code", codex: "Codex", gemini: "Gemini CLI" };
 const toolLabel = (tool: string) => TOOL[tool] ?? tool;
@@ -140,7 +139,8 @@ function Transcript({ s }: { s: AiSession }) {
   );
 }
 
-const Row = React.memo(function Row({ s, now, focused }: { s: AiSession; now: number; focused: boolean }) {
+/** Re-renders only when its session changes; its clock counts by itself. */
+const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boolean }) {
   const navigate = useNavigate();
   const [reading, setReading] = React.useState(focused);
   const [confirming, setConfirming] = React.useState(false);
@@ -183,7 +183,7 @@ const Row = React.memo(function Row({ s, now, focused }: { s: AiSession; now: nu
       <span className="ms-meta">
         <span>
           <span className="ms-tool">{toolLabel(s.tool)} · </span>
-          {s.machine} · <span className="ms-time">{relativeTime(s.last_activity, now)}</span>
+          {s.machine} · <Ago className="ms-time" ts={s.last_activity} />
         </span>
         <span title={s.cwd}>{s.terminal ? tildify(s.cwd) : "outside kiln"}</span>
       </span>
@@ -222,7 +222,7 @@ const Row = React.memo(function Row({ s, now, focused }: { s: AiSession; now: nu
 });
 
 /** Mission control's section of found sessions; folds like Ended. */
-export function FoundSessions({ sessions, quiet, now }: { sessions: AiSession[]; quiet: string[]; now: number }) {
+export function FoundSessions({ sessions, quiet }: { sessions: AiSession[]; quiet: string[] }) {
   const [params] = useSearchParams();
   const { hash } = useLocation();
   const focus = params.get("session");
@@ -246,7 +246,7 @@ export function FoundSessions({ sessions, quiet, now }: { sessions: AiSession[];
           {sessions.length > 0 && (
             <ul className="ms-list">
               {sessions.map((s) => (
-                <Row key={sessionKey(s)} s={s} now={now} focused={focus === sessionKey(s)} />
+                <Row key={sessionKey(s)} s={s} focused={focus === sessionKey(s)} />
               ))}
             </ul>
           )}

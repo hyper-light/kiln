@@ -15,12 +15,11 @@ import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { ErrorState, PageIntro, SkeletonRows } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { errorMessage, useDocumentTitle, useLocalStorage, useNow } from "@/lib/hooks";
-import { relativeTime } from "@/lib/format";
+import { errorMessage, useDocumentTitle, useLocalStorage } from "@/lib/hooks";
 import { plain } from "./derive";
 import { AgentMenu } from "./actions";
 import { byStart, FoundSessions, sessionKey } from "./found";
-import { machineName } from "./parts";
+import { Ago, machineName } from "./parts";
 import { useSeen } from "./seen";
 import { SpawnDialog } from "./spawn";
 import { useAgents } from "./use-agents";
@@ -99,7 +98,8 @@ function Decide({ a, ap }: { a: AgentInfo; ap: ApprovalBrief }) {
   );
 }
 
-const Row = React.memo(function Row({ a, stand, selected, onSelect, now }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void; now: number }) {
+/** A row re-renders only when its own agent changes (or is selected); its clock counts by itself. */
+const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: AgentInfo; stand: Stand; selected: boolean; onSelect: (id: string, on: boolean) => void }) {
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
   const ap = a.approvals[0];
@@ -120,7 +120,7 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, now }: { a: 
       </button>
       <span className="ms-meta">
         <span>
-          {machineName(a.target)} · <span className="ms-time">{relativeTime(Math.floor(a.last_activity / 1000), now)}</span>
+          {machineName(a.target)} · <Ago className="ms-time" ts={Math.floor(a.last_activity / 1000)} />
         </span>
         <span className="ms-meta-2">
           {(a.files_changed ?? 0) > 0 && (
@@ -132,16 +132,21 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect, now }: { a: 
         </span>
       </span>
       <span className="ms-actions">
-        {stand === "needs" && ap && <Decide a={a} ap={ap} />}
-        {stand === "crashed" && (
-          <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "restart" }).catch((e: unknown) => toast.error("Couldn't restart", errorMessage(e)))}>
-            Restart
-          </Button>
-        )}
-        <AgentMenu a={a} />
-        <button type="button" className="ms-go" onClick={open} aria-label={`Open ${a.name}`}>
-          <ArrowUpRight size={16} />
-        </button>
+        {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
+        <span className="ms-decide">
+          {stand === "needs" && ap && <Decide a={a} ap={ap} />}
+          {stand === "crashed" && (
+            <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "restart" }).catch((e: unknown) => toast.error("Couldn't restart", errorMessage(e)))}>
+              Restart
+            </Button>
+          )}
+        </span>
+        <span className="ms-tail">
+          <AgentMenu a={a} />
+          <button type="button" className="ms-go" onClick={open} aria-label={`Open ${a.name}`}>
+            <ArrowUpRight size={16} />
+          </button>
+        </span>
       </span>
     </li>
   );
@@ -214,7 +219,6 @@ export default function Mission() {
   const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
   const [spawn, setSpawn] = React.useState(false);
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
-  const now = useNow();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   // ?new=1 (links from elsewhere): open New agents.
@@ -234,7 +238,12 @@ export default function Mission() {
     api.aiSessions().then((list) => {
       const m = kept.current;
       const here = new Set(list.map(sessionKey));
-      for (const s of list) m.set(sessionKey(s), { s, missed: 0 });
+      // An unchanged session keeps its object, so its row doesn't re-render.
+      for (const s of list) {
+        const k = sessionKey(s);
+        const was = m.get(k)?.s;
+        m.set(k, { s: was && JSON.stringify(was) === JSON.stringify(s) ? was : s, missed: 0 });
+      }
       for (const [k, v] of m) if (!here.has(k) && ++v.missed >= 2) m.delete(k);
       setFound([...m.values()].map((v) => v.s).sort(byStart));
     }, () => undefined);
@@ -311,7 +320,7 @@ export default function Mission() {
       ) : live.length > 0 ? (
         <ul className="ms-list">
           {live.map(({ a, stand }) => (
-            <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} now={now} />
+            <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />
           ))}
         </ul>
       ) : (
@@ -319,7 +328,7 @@ export default function Mission() {
       )}
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
-      {list && <FoundSessions sessions={elsewhere} quiet={quiet} now={now} />}
+      {list && <FoundSessions sessions={elsewhere} quiet={quiet} />}
 
       {ended.length > 0 && (
         <section className="ms-ended">
@@ -335,7 +344,7 @@ export default function Mission() {
           {showEnded && (
             <ul className="ms-list">
               {ended.map(({ a, stand }) => (
-                <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} now={now} />
+                <Row key={a.id} a={a} stand={stand} selected={selected.has(a.id)} onSelect={select} />
               ))}
             </ul>
           )}
