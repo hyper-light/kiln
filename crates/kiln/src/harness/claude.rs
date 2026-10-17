@@ -127,6 +127,10 @@ enum Run {
 /// and when the CLI reports a rate-limit change).
 const USAGE_EVERY_MS: i64 = 180_000;
 
+/// The effort levels Claude Code knows (its settings schema), offered until initialize says which
+/// the model in use has, and for a model it does not list.
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
 #[derive(Debug, Clone)]
@@ -323,11 +327,24 @@ impl Claude {
         c.push(ctl("background", "Subagents", "Move to background", "Let running commands and subagents continue in the background", ControlKind::Action));
         // MCP servers and skills have their own state and commands (State::mcp, State::skills).
         core.meta.controls = c;
-        // Effort levels of the model in use.
-        let model = core.state.model.clone();
-        let levels = self.efforts.get(&model).or_else(|| self.efforts.iter().find(|(k, _)| model.contains(k.as_str())).map(|(_, v)| v)).or_else(|| self.efforts.get("default"));
-        core.meta.efforts = levels.map(|l| l.iter().map(|e| opt(e, &capitalize(e), "")).collect()).unwrap_or_default();
+        // Effort levels of the model in use (by its id, an alias in it, or the default model's),
+        // else the ones the CLI knows.
+        core.meta.efforts = self.effort_levels(&core.state.model).iter().map(|e| opt(e, &capitalize(e), "")).collect();
         core.touch_meta();
+    }
+
+    /// The effort levels of `model` as initialize listed them: by its id or alias, an alias it
+    /// contains ("opus[1m]"), the default model's; the CLI's known levels when none matches.
+    fn effort_levels(&self, model: &str) -> Vec<String> {
+        let mut keys: Vec<&String> = self.efforts.keys().filter(|k| !k.is_empty() && model.contains(k.as_str())).collect();
+        // The longest match is the most specific ("claude-opus-5-5" over "opus").
+        keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        self.efforts
+            .get(model)
+            .or_else(|| keys.first().and_then(|k| self.efforts.get(*k)))
+            .or_else(|| self.efforts.get("default"))
+            .cloned()
+            .unwrap_or_else(|| EFFORTS.iter().map(|e| (*e).to_owned()).collect())
     }
 
     /// Set a control or run an action.
@@ -452,6 +469,8 @@ impl Claude {
     pub fn start(&mut self, core: &mut Core) {
         self.started_at = Core::now();
         core.meta.modes = modes(self.allow_bypass);
+        // Effort can be set from the start (initialize narrows the levels to the model's).
+        core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
         core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images"]
             .iter()
             .map(|s| (*s).to_owned())
@@ -1430,6 +1449,7 @@ impl Claude {
         }
         if let Some(tid) = tool_id.as_deref() {
             set_tool_status(core, tid, ToolStatus::Pending);
+            self.queue_behind(core, tid);
         }
         core.state.doing = Some(match tool {
             ToolKind::Question => "Asking you a question".to_owned(),
@@ -1493,6 +1513,8 @@ impl Claude {
                 }
                 self.rebuild_skills(core);
                 core.touch_state();
+                // The model in use is known now: its effort levels.
+                self.refresh_controls(core);
             }
             "commands_changed" => {
                 if let Some(cmds) = v.get("commands").and_then(Value::as_array) {
@@ -1759,7 +1781,11 @@ impl Claude {
                         core.state.todos = todos.clone();
                         core.touch_state();
                     }
-                    let status = if core.state.approvals.iter().any(|a| a.tool_id.as_deref() == Some(tid.as_str())) { ToolStatus::Pending } else { ToolStatus::Running };
+                    // Asked about, or waiting behind a call that is (calls that change things run one
+                    // at a time; read-only ones run alongside).
+                    let asked = core.state.approvals.iter().any(|a| a.tool_id.as_deref() == Some(tid.as_str()));
+                    let behind = !alongside(tool) && core.state.approvals.iter().any(|a| a.tool_id.is_some() && a.agent.is_none());
+                    let status = if asked || behind { ToolStatus::Pending } else { ToolStatus::Running };
                     let call = ToolCall {
                         tool_id: tid.clone(),
                         name: name.clone(),
@@ -1947,9 +1973,56 @@ impl Claude {
             );
         }
         self.tools.remove(tid);
+        let parent = core.get(tid).and_then(|e| e.parent.clone());
+        self.next_in_line(core, parent.as_deref());
         if self.tools.is_empty() && self.turn && core.state.approvals.is_empty() {
             core.state.doing = Some("Thinking".to_owned());
             core.touch_state();
+        }
+    }
+
+    /// A permission prompt for `asking`: the calls after it (in the same agent) that change things
+    /// wait their turn (the CLI runs those one at a time), so they read as pending, not running.
+    fn queue_behind(&self, core: &mut Core, asking: &str) {
+        let parent = core.get(asking).and_then(|e| e.parent.clone());
+        let mut after = false;
+        let waiting: Vec<String> = core
+            .events()
+            .filter_map(|e| match &e.body {
+                Body::Tool(t) if self.tools.contains_key(&e.id) && e.parent == parent => {
+                    if e.id == asking {
+                        after = true;
+                        return None;
+                    }
+                    (after && t.status == ToolStatus::Running && !alongside(t.tool)).then(|| e.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for id in waiting {
+            set_tool_status(core, &id, ToolStatus::Pending);
+        }
+    }
+
+    /// A call ended: in its agent, the first one waiting its turn (pending, not asked about) is
+    /// next. If it needs permission, its prompt follows and it reads as pending again.
+    fn next_in_line(&self, core: &mut Core, parent: Option<&str>) {
+        let asked = |id: &str| core.state.approvals.iter().any(|a| a.tool_id.as_deref() == Some(id));
+        let mut next = None;
+        for e in core.events().filter(|e| e.parent.as_deref() == parent && self.tools.contains_key(&e.id)) {
+            if let Body::Tool(t) = &e.body
+                && t.status == ToolStatus::Pending
+            {
+                // Still asked about: the line has not moved.
+                if asked(&e.id) {
+                    return;
+                }
+                next = Some(e.id.clone());
+                break;
+            }
+        }
+        if let Some(id) = next {
+            set_tool_status(core, &id, ToolStatus::Running);
         }
     }
 
@@ -2069,6 +2142,11 @@ impl Claude {
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
+}
+
+/// A call that runs alongside others (read-only), rather than one at a time.
+fn alongside(tool: ToolKind) -> bool {
+    matches!(tool, ToolKind::Read | ToolKind::Search | ToolKind::Web | ToolKind::Agent | ToolKind::Todo)
 }
 
 /// Answer the client that asked, or say it in the timeline when no one is waiting.
@@ -3353,5 +3431,80 @@ mod tests {
         let reqs = requests(&mut core);
         reply_to(&mut c, &mut core, &reqs, "set_permission_mode", json!({"mode": "default"}));
         assert_eq!(core.state.mode, "default");
+    }
+
+    #[test]
+    fn effort_levels_from_the_start_and_a_change_mid_session() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let ids = |core: &Core| core.meta.efforts.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&core), ["low", "medium", "high", "xhigh", "max"]);
+        let reqs = requests(&mut core);
+        reply_to(
+            &mut c,
+            &mut core,
+            &reqs,
+            "initialize",
+            json!({"commands": [], "models": [
+                {"value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default", "description": "", "supportsEffort": true, "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]},
+                {"value": "sonnet", "resolvedModel": "claude-sonnet-5-5", "displayName": "Sonnet", "description": "", "supportsEffort": true, "supportedEffortLevels": ["low", "medium", "high"]},
+                {"value": "haiku", "resolvedModel": "claude-haiku-5-5", "displayName": "Haiku", "description": ""}
+            ]}),
+        );
+        // No model yet: the default model's levels.
+        assert_eq!(ids(&core).len(), 5);
+        // An alias with a context suffix finds its model; one without effort has none.
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s", "model": "sonnet[1m]", "permissionMode": "default"}).to_string());
+        assert_eq!(ids(&core), ["low", "medium", "high"]);
+        let _ = requests(&mut core);
+        c.command(&mut core, Command::SetModel { model: "claude-haiku-5-5".into() });
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "set_model", json!({}));
+        assert!(core.meta.efforts.is_empty());
+        // Set mid-session the way the CLI takes it, shown at once and confirmed from its settings.
+        c.command(&mut core, Command::SetEffort { effort: "max".into() });
+        assert_eq!(core.state.effort, "max");
+        let reqs = requests(&mut core);
+        assert!(reqs.iter().any(|r| r.1 == "apply_flag_settings" && r.2.pointer("/settings/effortLevel") == Some(&json!("max"))));
+        reply_to(&mut c, &mut core, &reqs, "apply_flag_settings", json!({}));
+        let reqs = requests(&mut core);
+        reply_to(&mut c, &mut core, &reqs, "get_settings", json!({"effective": {}, "applied": {"effort": "high"}}));
+        assert_eq!(core.state.effort, "high");
+        // A CLI that lists no models: the levels it knows.
+        let mut c2 = Claude::new(false);
+        let mut core2 = Core::new();
+        c2.start(&mut core2);
+        let reqs = requests(&mut core2);
+        reply_to(&mut c2, &mut core2, &reqs, "initialize", json!({"commands": []}));
+        assert_eq!(ids(&core2).len(), 5);
+    }
+
+    #[test]
+    fn calls_waiting_behind_a_permission_prompt_read_as_pending() {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let write = |id: &str, n: u32| json!({"type": "tool_use", "id": id, "name": "Write", "input": {"file_path": format!("/w/f{n}.txt"), "content": "x"}});
+        c.line(
+            &mut core,
+            &json!({"type": "assistant", "message": {"id": "m", "type": "message", "role": "assistant", "model": "x", "content": [write("t1", 1), write("t2", 2), write("t3", 3), {"type": "tool_use", "id": "t4", "name": "Read", "input": {"file_path": "/w/a.txt"}}]}, "parent_tool_use_id": null, "session_id": "s", "uuid": "a"})
+                .to_string(),
+        );
+        let status = |core: &Core, id: &str| tool(core, id).map(|t| t.status);
+        assert_eq!(status(&core, "t2"), Some(ToolStatus::Running));
+        c.line(&mut core, &json!({"type": "control_request", "request_id": "p1", "request": {"subtype": "can_use_tool", "tool_name": "Write", "input": {"file_path": "/w/f1.txt", "content": "x"}, "tool_use_id": "t1"}}).to_string());
+        assert_eq!(
+            ["t1", "t2", "t3", "t4"].map(|t| status(&core, t)),
+            [Some(ToolStatus::Pending), Some(ToolStatus::Pending), Some(ToolStatus::Pending), Some(ToolStatus::Running)]
+        );
+        c.command(&mut core, Command::Approve { id: "p1".into(), decision: Decision::Allow, message: None, always: None, answers: None });
+        assert_eq!(["t1", "t2", "t3"].map(|t| status(&core, t)), [Some(ToolStatus::Running), Some(ToolStatus::Pending), Some(ToolStatus::Pending)]);
+        // The first is done: the next is under way (until it asks too).
+        c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok", "is_error": false}]}, "parent_tool_use_id": null, "session_id": "s", "uuid": "r1"}).to_string());
+        assert_eq!(["t1", "t2", "t3"].map(|t| status(&core, t)), [Some(ToolStatus::Done), Some(ToolStatus::Running), Some(ToolStatus::Pending)]);
+        c.line(&mut core, &json!({"type": "control_request", "request_id": "p2", "request": {"subtype": "can_use_tool", "tool_name": "Write", "input": {"file_path": "/w/f2.txt", "content": "x"}, "tool_use_id": "t2"}}).to_string());
+        assert_eq!(["t2", "t3"].map(|t| status(&core, t)), [Some(ToolStatus::Pending), Some(ToolStatus::Pending)]);
+        assert_eq!(core.state.approvals.len(), 1);
     }
 }

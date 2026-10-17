@@ -93,6 +93,10 @@ enum Run {
 /// during turns).
 const USAGE_EVERY_MS: i64 = 180_000;
 
+/// Reasoning efforts every Codex reasoning model takes, offered until model/list says which the
+/// model in use has, and for a model it does not list.
+const EFFORTS: &[&str] = &["low", "medium", "high"];
+
 /// An approval request Codex is waiting on.
 #[derive(Debug, Clone)]
 struct Ask {
@@ -293,11 +297,10 @@ impl Codex {
         // MCP servers and skills have their own state and commands (State::mcp, State::skills).
         core.meta.controls = c;
         let model = core.state.model.clone();
-        core.meta.efforts = self
-            .efforts
-            .get(&model)
-            .map(|l| l.iter().map(|(e, d)| opt(e, &capitalize(e), d, false)).collect())
-            .unwrap_or_default();
+        core.meta.efforts = match self.efforts.get(&model).or_else(|| self.efforts.get("")) {
+            Some(l) => l.iter().map(|(e, d)| opt(e, &capitalize(e), d, false)).collect(),
+            None => EFFORTS.iter().map(|e| opt(e, &capitalize(e), "", false)).collect(),
+        };
         core.touch_meta();
     }
 
@@ -381,6 +384,10 @@ impl Codex {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        // Effort can be set from the start (model/list narrows the levels to the model's).
+        if core.meta.efforts.is_empty() {
+            core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
+        }
         if !modes(self.allow_bypass).iter().any(|m| m.id == core.state.mode) {
             core.state.mode = self.mode.clone();
             core.touch_state();
@@ -1152,6 +1159,9 @@ impl Codex {
                         .unwrap_or_default();
                     for key in [m.get("model"), m.get("id")].into_iter().flatten().filter_map(Value::as_str) {
                         self.efforts.insert(key.to_owned(), levels.clone());
+                    }
+                    if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
+                        self.efforts.insert(String::new(), levels.clone());
                     }
                     if m.get("isDefault").and_then(Value::as_bool) == Some(true)
                         && core.state.effort.is_empty()
@@ -2599,6 +2609,53 @@ mod tests {
         // Not offered: refused, said so.
         c.command(&mut core, Command::SetMode { mode: "full-access".into() });
         assert_eq!(core.state.mode, "read-only");
+        Ok(())
+    }
+
+    #[test]
+    fn effort_levels_and_per_turn_overrides() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        let ids = |core: &Core| core.meta.efforts.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&core), ["low", "medium", "high"]);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+        let w = written(&mut core);
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "model/list",
+            json!({"data": [
+                {"id": "gpt-5", "model": "gpt-5", "displayName": "GPT-5", "description": "", "isDefault": true, "defaultReasoningEffort": "medium", "supportedReasoningEfforts": [{"reasoningEffort": "minimal", "description": ""}, {"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "medium", "description": ""}, {"reasoningEffort": "high", "description": ""}]},
+                {"id": "o-mini", "model": "o-mini", "displayName": "o mini", "description": "", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "high", "description": ""}]}
+            ]}),
+        );
+        respond(&mut c, &mut core, &w, "thread/start", json!({"thread": {"id": "th1", "turns": []}, "model": "gpt-5", "cwd": "/work"}));
+        assert_eq!(ids(&core), ["minimal", "low", "medium", "high"]);
+        assert_eq!(core.state.effort, "medium");
+        // A model model/list does not name: the default model's levels.
+        c.command(&mut core, Command::SetModel { model: "custom-model".into() });
+        c.command(&mut core, Command::Control { id: "reasoning_summary".into(), value: Some(json!("auto")) });
+        assert_eq!(ids(&core).len(), 4);
+        // Effort and model for the session, and for one message.
+        c.command(&mut core, Command::SetEffort { effort: "high".into() });
+        assert_eq!(core.state.effort, "high");
+        let _ = written(&mut core);
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let w = written(&mut core);
+        let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
+        assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("high"), Some("custom-model")));
+        respond(&mut c, &mut core, &w, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress", "items": []}}));
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed", "items": []}}})]);
+        let _ = written(&mut core);
+        let o = super::super::model::Overrides { model: Some("o-mini".into()), effort: Some("low".into()) };
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) });
+        let w = written(&mut core);
+        let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
+        assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
         Ok(())
     }
 }
