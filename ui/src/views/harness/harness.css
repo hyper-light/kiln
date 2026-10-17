@@ -916,6 +916,106 @@ textarea.hx-input {
   font-weight: 600;
   color: var(--color-bright);
 }
+.hx-prose ul ul,
+.hx-prose ol ul {
+  list-style: circle;
+}
+.hx-prose li > ul,
+.hx-prose li > ol {
+  margin-top: 0.25em;
+}
+.hx-prose .contains-task-list {
+  padding-left: 0.1em;
+  list-style: none;
+}
+.hx-prose .task-list-item input {
+  margin: 0 8px 0 0;
+  vertical-align: -1px;
+  accent-color: #cdc6ea;
+}
+.hx-prose del {
+  color: var(--color-secondary);
+}
+/* A rule, the site's way: a spectral hairline. */
+.hx-prose hr {
+  height: 1px;
+  margin: 1em 0;
+  border: 0;
+  background: linear-gradient(90deg, transparent, rgba(205, 198, 234, 0.45), rgba(150, 205, 235, 0.35), transparent);
+}
+.hx-table {
+  container-type: inline-size;
+}
+.hx-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.hx-prose th {
+  padding: 0 14px 6px 0;
+  border-bottom: 1px solid #2c2f36;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-align: left;
+  text-transform: uppercase;
+  vertical-align: bottom;
+  color: #8f929b;
+}
+.hx-prose td {
+  padding: 7px 14px 7px 0;
+  border-bottom: 1px solid #1d1f24;
+  vertical-align: top;
+  font-variant-numeric: tabular-nums;
+}
+.hx-prose tr > :last-child {
+  padding-right: 0;
+}
+/* Narrow: a table of three or more columns reads row by row: the first cell names the row, and the
+   others follow it as "LABEL value", wrapping as they need, so nothing scrolls sideways. */
+@container (max-width: 520px) {
+  .hx-prose table[data-wide],
+  .hx-prose table[data-wide] tbody {
+    display: block;
+  }
+  .hx-prose table[data-wide] thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .hx-prose table[data-wide] tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 16px;
+    padding: 8px 0;
+    border-bottom: 1px solid #1d1f24;
+  }
+  .hx-prose table[data-wide] td {
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    text-align: left !important;
+  }
+  .hx-prose table[data-wide] td:first-child {
+    flex-basis: 100%;
+    font-weight: 600;
+    color: var(--color-bright);
+  }
+  .hx-prose table[data-wide] td:not(:first-child)::before {
+    content: attr(data-label);
+    margin-right: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #8f929b;
+  }
+}
 .hx-pre {
   overflow-x: auto;
   padding: 10px 12px;
@@ -2553,6 +2653,14 @@ textarea.hx-input {
   background: #191b22;
   color: #cdc4e0;
   font-size: 0.82em;
+}
+.hx-prose pre code {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font-size: inherit;
 }
 .hx-pre,
 .hx-out {

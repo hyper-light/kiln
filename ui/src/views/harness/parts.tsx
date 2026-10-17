@@ -2,8 +2,11 @@
 import * as React from "react";
 import "./harness.css";
 import "./console.css";
+import type { Element, Root, RootContent } from "hast";
 import { Bot, FilePen, FileText, Globe, ListChecks, Map as MapIcon, MessageCircleQuestion, Plug, Search, Sparkles, SquareTerminal, Wrench, type LucideIcon } from "lucide-react";
 import type { Status, ToolKind } from "@/api/harness";
+import Markdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { relativeTime } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -118,100 +121,85 @@ export function CopyBlock({ text, className }: { text: string; className?: strin
 
 /* ------------------------------------------------------------------ prose */
 
-/** Inline markdown: `code`, **bold**, *em*, [links](url). Text only; nothing is injected as HTML. */
-function inline(text: string, key: string): React.ReactNode[] {
-  const out: React.ReactNode[] = [];
-  const re = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|\[[^\]]+\]\((https?:\/\/[^)\s]+)\))/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let i = 0;
-  while ((m = re.exec(text))) {
-    if (m.index > last) out.push(text.slice(last, m.index));
-    const t = m[0];
-    const k = `${key}-${i++}`;
-    if (t.startsWith("`")) out.push(<code key={k}>{t.slice(1, -1)}</code>);
-    else if (t.startsWith("**")) out.push(<strong key={k}>{t.slice(2, -2)}</strong>);
-    else if (t.startsWith("[")) {
-      const label = t.slice(1, t.indexOf("]"));
-      out.push(
-        <a key={k} href={m[2]} target="_blank" rel="noopener noreferrer">
-          {label}
-        </a>,
-      );
-    } else out.push(<em key={k}>{t.slice(1, -1)}</em>);
-    last = m.index + t.length;
-  }
-  if (last < text.length) out.push(text.slice(last));
-  return out;
+/** Marks tables for the narrow layout: each body cell carries its column's heading
+ *  (`data-label`), and a table of three or more columns is `data-wide`. */
+function labelTables() {
+  const text = (n: RootContent): string => (n.type === "text" ? n.value : "children" in n ? n.children.map(text).join("") : "");
+  const kids = (n: Element | undefined, tag: string): Element[] =>
+    (n?.children ?? []).filter((c): c is Element => c.type === "element" && c.tagName === tag);
+  const walk = (n: Root | Element) => {
+    if (n.type === "element" && n.tagName === "table") {
+      const labels = kids(kids(kids(n, "thead")[0], "tr")[0], "th").map(text);
+      if (labels.length >= 3) n.properties = { ...n.properties, dataWide: "" };
+      for (const row of kids(kids(n, "tbody")[0], "tr")) {
+        kids(row, "td").forEach((td, i) => {
+          td.properties = { ...td.properties, dataLabel: labels[i] ?? "" };
+        });
+      }
+    }
+    for (const c of n.children) if (c.type === "element") walk(c);
+  };
+  return (tree: Root) => walk(tree);
 }
 
-/** The agent's prose: paragraphs, headings, lists, quotes and code blocks. */
+const REMARK = [remarkGfm];
+const REHYPE = [labelTables];
+
+const heading =
+  (level: number) =>
+  ({ children }: { children?: React.ReactNode }) => (
+    <p className="hx-h" data-level={level}>
+      {children}
+    </p>
+  );
+
+const MARKDOWN: Components = {
+  a: ({ href, children }) => (
+    <a href={href} target="_blank" rel="noopener noreferrer">
+      {children}
+    </a>
+  ),
+  h1: heading(1),
+  h2: heading(2),
+  h3: heading(3),
+  h4: heading(4),
+  h5: heading(5),
+  h6: heading(6),
+  pre: ({ children }) => {
+    const code = React.isValidElement<{ className?: string; children?: React.ReactNode }>(children) ? children : null;
+    const body = String(code?.props.children ?? "").replace(/\n$/, "");
+    return (
+      <div className="hx-pre-wrap">
+        <CopyBlock text={body} />
+        <pre className="hx-pre" data-lang={/language-(\S+)/.exec(code?.props.className ?? "")?.[1]}>
+          {children}
+        </pre>
+      </div>
+    );
+  },
+  table: ({ children, ...props }) => (
+    <div className="hx-table">
+      <table data-wide={"data-wide" in props || undefined}>{children}</table>
+    </div>
+  ),
+  // Shown as a link: nothing loads from elsewhere on its own.
+  img: ({ src, alt }) => (
+    <a href={typeof src === "string" ? src : undefined} target="_blank" rel="noopener noreferrer">
+      {alt || "image"}
+    </a>
+  ),
+};
+
+/** The agent's prose: GitHub-flavored markdown (tables, lists, task lists, quotes, code), drawn the
+ *  console's way. Text only: HTML in it is never injected. */
 export const Prose = React.memo(function Prose({ text, className }: { text: string; className?: string }) {
-  const blocks = React.useMemo(() => {
-    const lines = text.replace(/\r\n/g, "\n").split("\n");
-    const out: React.ReactNode[] = [];
-    let i = 0;
-    let n = 0;
-    while (i < lines.length) {
-      const l = lines[i] ?? "";
-      const key = `b${n++}`;
-      const fence = l.match(/^\s*```(\S*)/);
-      if (fence) {
-        const body: string[] = [];
-        i++;
-        while (i < lines.length && !/^\s*```/.test(lines[i] ?? "")) body.push(lines[i++] ?? "");
-        i++;
-        out.push(
-          <div key={key} className="hx-pre-wrap">
-            <CopyBlock text={body.join("\n")} />
-            <pre className="hx-pre" data-lang={fence[1] || undefined}>
-              <code>{body.join("\n")}</code>
-            </pre>
-          </div>,
-        );
-        continue;
-      }
-      if (/^\s*$/.test(l)) {
-        i++;
-        continue;
-      }
-      const h = l.match(/^(#{1,4})\s+(.*)$/);
-      if (h) {
-        out.push(
-          <p key={key} className="hx-h">
-            {inline(h[2] ?? "", key)}
-          </p>,
-        );
-        i++;
-        continue;
-      }
-      if (/^\s*([-*]|\d+[.)])\s+/.test(l)) {
-        const ordered = /^\s*\d/.test(l);
-        const items: string[] = [];
-        while (i < lines.length && /^\s*([-*]|\d+[.)])\s+/.test(lines[i] ?? "")) items.push((lines[i++] ?? "").replace(/^\s*([-*]|\d+[.)])\s+/, ""));
-        const List = ordered ? "ol" : "ul";
-        out.push(
-          <List key={key}>
-            {items.map((it, j) => (
-              <li key={j}>{inline(it, `${key}-${j}`)}</li>
-            ))}
-          </List>,
-        );
-        continue;
-      }
-      if (/^\s*>/.test(l)) {
-        const q: string[] = [];
-        while (i < lines.length && /^\s*>/.test(lines[i] ?? "")) q.push((lines[i++] ?? "").replace(/^\s*>\s?/, ""));
-        out.push(<blockquote key={key}>{inline(q.join(" "), key)}</blockquote>);
-        continue;
-      }
-      const para: string[] = [];
-      while (i < lines.length && !/^\s*$/.test(lines[i] ?? "") && !/^\s*(```|#{1,4}\s|[-*]\s|\d+[.)]\s|>)/.test(lines[i] ?? "")) para.push(lines[i++] ?? "");
-      out.push(<p key={key}>{inline(para.join(" "), key)}</p>);
-    }
-    return out;
-  }, [text]);
-  return <div className={cn("hx-prose", className)}>{blocks}</div>;
+  return (
+    <div className={cn("hx-prose", className)}>
+      <Markdown remarkPlugins={REMARK} rehypePlugins={REHYPE} components={MARKDOWN}>
+        {text}
+      </Markdown>
+    </div>
+  );
 });
 
 /** Output a command printed: the end matters most, so long output opens at its tail. */
