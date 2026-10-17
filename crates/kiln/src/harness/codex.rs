@@ -94,10 +94,24 @@ enum Run {
 /// How often the plan's rate limits are read while a session runs (Codex also pushes them
 /// during turns).
 const USAGE_EVERY_MS: i64 = 180_000;
-/// How often kiln opens a thread Codex is not ready to fork yet (once a tick).
-const OPEN_TRIES: u32 = 6;
+/// How often kiln opens a thread Codex cannot open yet (once a tick, two minutes in all): it
+/// refuses to fork a thread whose history it is still writing out, and to resume one its
+/// app-server daemon still holds for a terminal that just quit (for about a minute).
+const OPEN_TRIES: u32 = 24;
 /// What the console shows meanwhile.
 const CATCHING_UP: &str = "Waiting for Codex to catch up with the conversation";
+const LETTING_GO: &str = "Waiting for Codex to let go of the conversation (it still holds it for the terminal it ran in)";
+
+/// Why Codex cannot open a thread yet, when that passes.
+fn not_yet(msg: &str) -> Option<&'static str> {
+    if msg.contains("behind durable rollout") {
+        Some(CATCHING_UP)
+    } else if msg.contains("already has an active writer") {
+        Some(LETTING_GO)
+    } else {
+        None
+    }
+}
 
 /// Reasoning efforts every Codex reasoning model takes, offered until model/list says which the
 /// model in use has, and for a model it does not list.
@@ -1122,6 +1136,7 @@ impl Codex {
         let result = v.get("result").cloned().unwrap_or(Value::Null);
         if let Some(err) = v.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("request failed").to_owned();
+            let wait = not_yet(&msg).filter(|_| self.open_tries < OPEN_TRIES);
             match kind {
                 Pending::Suggest(client) => core.reply(client, json!({"error": msg})),
                 Pending::Turn(id) | Pending::Steer(id) => {
@@ -1129,11 +1144,10 @@ impl Codex {
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
                 }
-                // Codex writes a thread's history out a moment after a turn ends, and refuses to
-                // fork it until then: tried again at the next tick, a few times.
-                Pending::Thread if msg.contains("behind durable rollout") && self.open_tries < OPEN_TRIES => {
+                // Not yet: tried again at the next tick.
+                Pending::Thread if wait.is_some() => {
                     self.reopen = true;
-                    core.state.doing = Some(CATCHING_UP.to_owned());
+                    core.state.doing = wait.map(str::to_owned);
                     core.touch_state();
                 }
                 Pending::Thread => {
@@ -1214,7 +1228,7 @@ impl Codex {
                 }
             }
             Pending::Thread => {
-                if core.state.doing.as_deref() == Some(CATCHING_UP) {
+                if core.state.doing.as_deref().is_some_and(|d| d == CATCHING_UP || d == LETTING_GO) {
                     core.state.doing = None;
                 }
                 let thread = result.get("thread").cloned().unwrap_or(Value::Null);
@@ -2841,6 +2855,19 @@ mod tests {
         assert_eq!(again.get("params"), fork.get("params"));
         respond(&mut c, &mut core, &w, "thread/fork", json!({"thread": {"id": "th2", "turns": []}, "model": "gpt-5", "cwd": "/work"}));
         assert!(core.state.doing.is_none() && core.state.harness_session.as_deref() == Some("th2"));
+        // A resume the daemon still holds for a terminal waits too.
+        let mut core = Core::new();
+        let held = super::super::session::Spec { kind: "codex".into(), resume: Some("th1".into()), ..Default::default() };
+        let mut c = Codex::from_spec(&held);
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1 (Linux)"}));
+        let w = written(&mut core);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/resume"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32600, "message": "thread th1 already has an active writer"}})]);
+        assert_eq!(core.state.doing.as_deref(), Some(LETTING_GO));
+        c.tick(&mut core);
+        assert!(written(&mut core).iter().any(|v| v.get("method") == Some(&json!("thread/resume"))));
         // Other refusals are said at once.
         let mut core = Core::new();
         let mut c = Codex::from_spec(&spec);

@@ -203,8 +203,13 @@ their `server` and `tool_short`; skill calls their `skill`.
   (the last 256 KiB). Codex has no way to stop one from outside: `stop_task` stops the process
   itself (the newest under Codex running that command, with what it started).
 - **Codex** refuses to fork a thread for a moment after a turn ends (it is still writing the
-  thread's history out): kiln opens the branch again at the next tick, up to six times, with
-  `state.doing` saying so meanwhile.
+  thread's history out), and to resume one its app-server daemon still holds for a terminal
+  that just quit (about a minute after a take-over ends the TUI): kiln opens it again at each
+  tick, for up to two minutes, with `state.doing` saying so meanwhile.
+- **Codex** TUIs are matched to their rollout by the thread they began after they started (or
+  the id `codex resume <id>` names). One resumed from Codex's own menu writes to an older
+  rollout that could be another session's: it is listed without a conversation (`no_id`) and
+  cannot be taken over.
 - **Codex**: stdio servers are added with `codex mcp add`; http servers are written to its
   configuration through its own API (the CLI would sign in at once, in a browser on the agent's
   machine). Removing an http server signs it out first. Effort and model are set per turn.
