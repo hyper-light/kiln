@@ -4,9 +4,10 @@ import { Link } from "react-router";
 import { ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronRight, Copy, RotateCcw } from "lucide-react";
 import type { InstallOs, JoinInfo, JoinRequest } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { ErrorState, SectionHeading, Skeleton } from "@/components/ui/misc";
+import { SectionHeading } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
-import { useNow, type Resource } from "@/lib/hooks";
+import { useNow } from "@/lib/hooks";
+import type { SuspenseResource } from "@/lib/resource";
 import { Optic } from "@/views/harness/signals";
 import { installCommand, jumpTo, listWords, type Arrival } from "./data";
 import { CodeLine, OsWords, Wrapped, useCopy } from "./parts";
@@ -31,7 +32,7 @@ export function InstallSection({
   index: string;
   os: InstallOs;
   onOs: (os: InstallOs) => void;
-  info: Resource<JoinInfo>;
+  info: SuspenseResource<JoinInfo>;
   /** Runners that connected since the page opened. */
   arrived: Arrival[];
   /** Join requests that arrived since the page opened. */
@@ -40,41 +41,30 @@ export function InstallSection({
   rowOf: (r: JoinRequest) => string;
 }) {
   const data = info.data;
-  const command = data ? installCommand(data, os) : "";
+  const command = installCommand(data, os);
   const [copied, copy] = useCopy();
 
   return (
     <section className="am-section am-install" aria-labelledby="am-add">
       <SectionHeading index={index} label="One command" title={<span id="am-add">Add a machine</span>} />
-      {info.error && !data ? (
-        <ErrorState error={info.error} onRetry={info.reload} compact />
-      ) : (
-        <div className="am-cmd">
-          <div className="am-cmd-bar">
-            <OsWords value={os} onChange={onOs} label="The machine's system" />
-            <Button size="xs" className="shrink-0" disabled={!command} onClick={() => copy(command)}>
-              {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-              <span aria-live="polite">{copied ? "Copied" : "Copy"}</span>
-            </Button>
-          </div>
-          {data ? (
-            <pre className="am-cmd-text">
-              <span className="am-prompt" aria-hidden="true">
-                {os === "windows" ? "PS> " : "$ "}
-              </span>
-              <Wrapped text={command} />
-            </pre>
-          ) : (
-            <div className="am-cmd-text" aria-busy="true" aria-label="Loading the command">
-              <Skeleton className="h-3.5 w-11/12" />
-              <Skeleton className="mt-2.5 h-3.5 w-7/12" />
-            </div>
-          )}
+      <div className="am-cmd">
+        <div className="am-cmd-bar">
+          <OsWords value={os} onChange={onOs} label="The machine's system" />
+          <Button size="xs" className="shrink-0" disabled={!command} onClick={() => copy(command)}>
+            {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+            <span aria-live="polite">{copied ? "Copied" : "Copy"}</span>
+          </Button>
         </div>
-      )}
+        <pre className="am-cmd-text">
+          <span className="am-prompt" aria-hidden="true">
+            {os === "windows" ? "PS> " : "$ "}
+          </span>
+          <Wrapped text={command} />
+        </pre>
+      </div>
       <p className="am-note">
         {os === "windows" ? "In PowerShell on the machine: downloads" : "On the machine: downloads"} kiln from this server, installs it as {SERVICE[os]} and joins as a runner.
-        {data && <Expiry at={data.expires_at} onRenew={info.reload} />}
+        <Expiry at={data.expires_at} onRenew={info.reload} />
       </p>
       <Status arrived={arrived} asking={asking} rowOf={rowOf} />
       <Alternatives info={data} os={os} />
