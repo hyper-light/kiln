@@ -1010,6 +1010,9 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  /* Centred, not on the baseline: a segment that starts with its glyph would otherwise sit on
+     the glyph's bottom edge, higher than one that starts with the separator. */
+  vertical-align: middle;
 }
 .al-sep {
   margin: 0 8px;
