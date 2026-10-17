@@ -127,6 +127,14 @@ pub struct Info {
     /// Unix ms the current turn started (None when idle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started: Option<i64>,
+    /// The plan limits of the account it runs on (as `State::limits`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<super::model::Limit>,
+    /// That account, as `State::account` (never an address).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
 }
 
 impl Info {
@@ -164,6 +172,9 @@ impl Info {
             _ => None,
         };
         self.turn_started = s.turn_started;
+        self.limits.clone_from(&s.limits);
+        self.account.clone_from(&s.account);
+        self.plan.clone_from(&s.plan);
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -241,7 +252,7 @@ async fn prepare(files: &Files, c: Command) -> Command {
 }
 
 enum Ctl {
-    Cmd(Command),
+    Cmd(Box<Command>),
     Close,
 }
 
@@ -265,7 +276,7 @@ impl Session {
     }
 
     pub fn command(&self, c: Command) -> bool {
-        self.ctl.try_send(Ctl::Cmd(c)).is_ok()
+        self.ctl.try_send(Ctl::Cmd(Box::new(c))).is_ok()
     }
 
     pub fn close(&self) {
@@ -295,6 +306,9 @@ impl Session {
         }
         if !core.state.mode.is_empty() {
             s.mode = Some(core.state.mode.clone());
+        }
+        if !core.state.model.is_empty() {
+            s.model = Some(core.state.model.clone());
         }
         s
     }
@@ -354,6 +368,9 @@ pub fn start(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() + Send 
         lines_removed: 0,
         context_pct: None,
         turn_started: None,
+        limits: Vec::new(),
+        account: None,
+        plan: None,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -413,12 +430,224 @@ enum Ev {
     Ctl(Option<Ctl>),
     Preview(Option<(String, Vec<super::model::FileDiff>)>),
     Exit(Option<i32>),
+    Fx(Option<Done>),
+    Tick,
+}
+
+/// What an effect carried out off the event loop came back with.
+enum Done {
+    /// A run (or a fetch) ended.
+    Run { job: String, code: Option<i32>, output: String },
+    /// The answer for one client.
+    Reply { client: String, value: serde_json::Value },
+}
+
+/// Longest a run of the harness's CLI may take.
+const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Most of a run's output handed back.
+const RUN_OUTPUT_MAX: usize = 32 * 1024;
+/// Largest file a read hands back.
+const READ_MAX: u64 = 512 * 1024;
+/// How often the adapter gets a tick while the process runs.
+const TICK: Duration = Duration::from_secs(5);
+
+impl Done {
+    fn apply(self, adapter: &mut super::kinds::Adapter, core: &mut Core) {
+        match self {
+            Self::Run { job, code, output } => adapter.run_done(core, &job, code, &output),
+            Self::Reply { client, value } => core.reply(client, value),
+        }
+    }
+}
+
+/// Carry out what the adapter asked for. A branch starts another session; runs, reads and fetches
+/// go off the event loop and come back on `done`. A restart is the caller's: its point (the
+/// harness's own resume point, if any) is returned.
+fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_channel::Sender<Done>) -> Option<Option<String>> {
+    let effects = std::mem::take(&mut s.core.lock().effects);
+    let mut restart = None;
+    for e in effects {
+        match e {
+            super::core::Effect::Branch { resume, resume_at } => {
+                let mut b = s.resume_spec();
+                b.resume = Some(resume);
+                b.resume_at = resume_at;
+                b.fork = true;
+                b.name = Some(format!("{} (branch)", s.info().name));
+                (files.spawn)(b);
+            }
+            super::core::Effect::Restart { resume_at } => restart = Some(resume_at),
+            super::core::Effect::Run { job, args } => {
+                let mut spec = s.spec.lock().clone();
+                let cwd = s.core.lock().state.cwd.clone();
+                if !cwd.is_empty() {
+                    spec.cwd = Some(cwd);
+                }
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let (code, output) = match kind.cli(&spec, &args) {
+                        Err(e) => (None, format!("{e:#}")),
+                        Ok(cmd) => match crate::proc::output(cmd, RUN_TIMEOUT).await {
+                            Ok(o) => {
+                                let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+                                let err = String::from_utf8_lossy(&o.stderr);
+                                if !err.trim().is_empty() {
+                                    if !text.is_empty() && !text.ends_with('\n') {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(&err);
+                                }
+                                (o.status.code(), super::model::clip_middle(text.trim(), RUN_OUTPUT_MAX).0)
+                            }
+                            Err(e) => (None, format!("{e:#}")),
+                        },
+                    };
+                    let _ = tx.send(Done::Run { job, code, output }).await;
+                });
+            }
+            super::core::Effect::Read { client, paths } => {
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let value = crate::rt::blocking(move || read_first(&paths)).await.unwrap_or_else(|e| serde_json::json!({"error": format!("{e:#}")}));
+                    let _ = tx.send(Done::Reply { client, value }).await;
+                });
+            }
+            super::core::Effect::Fetch { job, url } => {
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let (code, output) = crate::rt::blocking(move || fetch_loopback(&url)).await.unwrap_or_else(|e| (None, format!("{e:#}")));
+                    let _ = tx.send(Done::Run { job, code, output }).await;
+                });
+            }
+        }
+    }
+    restart
+}
+
+/// A path with `*` components, matched against the directories there (the most recently changed
+/// first); a path without them, as it is.
+fn expand(path: &str) -> Vec<String> {
+    let p = std::path::Path::new(path);
+    let mut out: Vec<std::path::PathBuf> = vec![std::path::PathBuf::new()];
+    for part in p.components() {
+        if part.as_os_str() == "*" {
+            let mut next = Vec::new();
+            for base in &out {
+                let Ok(entries) = std::fs::read_dir(base) else { continue };
+                let mut dirs: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path()))
+                    .collect();
+                dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
+                next.extend(dirs.into_iter().take(64).map(|(_, d)| d));
+            }
+            out = next;
+        } else {
+            for o in &mut out {
+                o.push(part);
+            }
+        }
+    }
+    out.into_iter().map(|p| p.to_string_lossy().into_owned()).collect()
+}
+
+/// The first of these Markdown files (skills, commands) that can be read: `{"content", "path"}`,
+/// else `{"error"}`. `*` stands for any directory (see `expand`). Blocking.
+fn read_first(paths: &[String]) -> serde_json::Value {
+    for p in paths.iter().flat_map(|p| expand(p)) {
+        let p = &p;
+        let path = std::path::Path::new(p);
+        if !path.is_absolute() || path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() != Some("md") {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.len() > READ_MAX {
+            return serde_json::json!({"error": format!("{p} is too large to show here"), "path": p});
+        }
+        if let Ok(bytes) = std::fs::read(path) {
+            return serde_json::json!({"content": String::from_utf8_lossy(&bytes), "path": p});
+        }
+    }
+    serde_json::json!({"error": "The file is not on this machine (any more)."})
+}
+
+/// GET a URL on this machine's loopback (a sign-in callback a harness waits for): the HTTP status
+/// and the start of the answer, or None and why it failed. Nothing but loopback is fetched.
+/// Blocking.
+fn fetch_loopback(url: &str) -> (Option<i32>, String) {
+    use std::io::{Read as _, Write as _};
+    let Some((host, port, target)) = loopback_target(url) else {
+        return (None, "Only an http://localhost or http://127.0.0.1 address can be completed on the agent's machine.".to_owned());
+    };
+    let addrs: Vec<std::net::SocketAddr> = match host.as_str() {
+        "::1" => vec![std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))],
+        "127.0.0.1" => vec![std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))],
+        _ => vec![std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)), std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))],
+    };
+    let mut last = String::from("nothing is listening there");
+    for addr in addrs {
+        let mut conn = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(c) => c,
+            Err(e) => {
+                last = e.to_string();
+                continue;
+            }
+        };
+        let _ = conn.set_read_timeout(Some(Duration::from_secs(15)));
+        let _ = conn.set_write_timeout(Some(Duration::from_secs(5)));
+        let host_header = if host == "::1" { format!("[::1]:{port}") } else { format!("{host}:{port}") };
+        let req = format!("GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: kiln\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+        if let Err(e) = conn.write_all(req.as_bytes()) {
+            last = e.to_string();
+            continue;
+        }
+        let mut answer = Vec::new();
+        let _ = conn.take(64 * 1024).read_to_end(&mut answer);
+        let text = String::from_utf8_lossy(&answer);
+        let code = text.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<i32>().ok());
+        let body = text.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+        return (code, super::model::clip_middle(body.trim(), 2000).0);
+    }
+    (None, format!("Could not reach {host}:{port} on the agent's machine: {last}"))
+}
+
+/// (host, port, request target) of an http URL on loopback; None for anything else.
+fn loopback_target(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.trim().strip_prefix("http://")?;
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, target) = rest.split_at(split);
+    let target = target.split('#').next().unwrap_or("");
+    let target = match target {
+        "" => "/".to_owned(),
+        t if t.starts_with('?') => format!("/{t}"),
+        t => t.to_owned(),
+    };
+    if !target.bytes().all(|b| b.is_ascii_graphic()) || authority.contains('@') {
+        return None;
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => {
+            let (h, p) = v6.split_once(']')?;
+            (h.to_owned(), p.strip_prefix(':').map_or(Some(80), |p| p.parse().ok())?)
+        }
+        None => match authority.split_once(':') {
+            Some((h, p)) => (h.to_owned(), p.parse().ok()?),
+            None => (authority.to_owned(), 80),
+        },
+    };
+    let host = host.to_ascii_lowercase();
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1").then_some((host, port, target))
 }
 
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) {
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
     let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
+    let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
     // A resumed Claude Code session starts from its transcript (its history), not empty.
     if kind.protocol == super::kinds::Protocol::ClaudeStreamJson {
         let (resume, env, upto) = {
@@ -483,6 +712,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut err_open = true;
                 let mut last_session = s.core.lock().state.harness_session.clone();
                 let mut last_queue = 0usize;
+                let mut next_tick = Instant::now() + TICK;
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -506,7 +736,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         e = p.stderr.recv().fuse() => if err_open { Ev::Err(e.ok()) } else { Ev::Err(None) },
                         d = pv_rx.recv().fuse() => Ev::Preview(d.ok()),
                         c = ch_rx.recv().fuse() => Ev::Change(c.ok()),
+                        f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
                         x = (&mut p.exit).fuse() => Ev::Exit(x.ok().flatten()),
+                        _ = crate::rt::sleep_until(next_tick).fuse() => Ev::Tick,
                     };
                     match ev {
                         Ev::Out(Some(chunk)) => {
@@ -541,17 +773,19 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 break;
                             }
                         }
-                        Ev::Ctl(Some(Ctl::Cmd(Command::Restart))) => {}
-                        Ev::Ctl(Some(Ctl::Cmd(Command::Snapshot))) => {
-                            for u in s.snapshot() {
-                                let _ = sink.send((s.id.clone(), u)).await;
+                        Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
+                            Command::Restart => {}
+                            Command::Snapshot => {
+                                for u in s.snapshot() {
+                                    let _ = sink.send((s.id.clone(), u)).await;
+                                }
                             }
-                        }
-                        Ev::Ctl(Some(Ctl::Cmd(c))) => {
-                            let c = prepare(&files, c).await;
-                            let mut core = s.core.lock();
-                            adapter.command(&mut core, c);
-                        }
+                            c => {
+                                let c = prepare(&files, c).await;
+                                let mut core = s.core.lock();
+                                adapter.command(&mut core, c);
+                            }
+                        },
                         Ev::Ctl(Some(Ctl::Close)) | Ev::Ctl(None) => {
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
@@ -570,6 +804,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         Ev::Change(Some((abs, (change, resolved)))) => {
                             s.core.lock().set_change(&abs, change, resolved);
                         }
+                        Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
+                        Ev::Fx(None) => {}
+                        Ev::Tick => {}
                         Ev::Exit(c) => {
                             code = c;
                             // Read what is left on stdout (the last lines often explain the exit).
@@ -586,20 +823,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             break;
                         }
                     }
+                    // Polls the harness only answers when asked: every few seconds, however busy.
+                    if Instant::now() >= next_tick {
+                        next_tick = Instant::now() + TICK;
+                        adapter.tick(&mut s.core.lock());
+                    }
                     jobs = flush(&s, &sink, Some(&p.stdin)).await;
-                    let effects = std::mem::take(&mut s.core.lock().effects);
-                    for e in effects {
-                        match e {
-                            super::core::Effect::Branch { resume, resume_at } => {
-                                let mut b = s.resume_spec();
-                                b.resume = Some(resume);
-                                b.resume_at = resume_at;
-                                b.fork = true;
-                                b.name = Some(format!("{} (branch)", s.info().name));
-                                (files.spawn)(b);
-                            }
-                            super::core::Effect::Restart { resume_at } => rewind_to = Some(resume_at),
-                        }
+                    if let Some(at) = effects(&s, kind, &files, &fx_tx) {
+                        rewind_to = Some(at);
                     }
                     if rewind_to.is_some() {
                         p.terminate(Duration::from_secs(2));
@@ -645,30 +876,38 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             continue;
         }
         // Down: a restart, or a message (which restarts it and is then delivered), brings it back.
+        // Other commands still get answers (a skill's file, an MCP server added with the CLI).
         loop {
-            match ctl_rx.recv().await {
-                Ok(Ctl::Cmd(Command::Restart)) => break,
-                Ok(Ctl::Cmd(Command::Snapshot)) => {
-                    for u in s.snapshot() {
-                        let _ = sink.send((s.id.clone(), u)).await;
+            let ev = futures::select_biased! {
+                c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
+                f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),
+            };
+            match ev {
+                Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
+                    Command::Restart => break,
+                    Command::Snapshot => {
+                        for u in s.snapshot() {
+                            let _ = sink.send((s.id.clone(), u)).await;
+                        }
                     }
-                }
-                Ok(Ctl::Cmd(c @ Command::Send { .. })) => {
-                    carry.push(prepare(&files, c).await);
-                    break;
-                }
-                Ok(Ctl::Cmd(c)) => {
-                    {
-                        let mut core = s.core.lock();
-                        adapter.command(&mut core, c);
+                    c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
+                        carry.push(prepare(&files, c).await);
+                        break;
                     }
-                    flush(&s, &sink, None).await;
-                }
-                Ok(Ctl::Close) | Err(_) => {
+                    c => adapter.command(&mut s.core.lock(), c),
+                },
+                Ev::Ctl(Some(Ctl::Close) | None) => {
                     let _ = sink.send((s.id.clone(), Update::Closed)).await;
                     on_change();
                     return;
                 }
+                Ev::Fx(Some(d)) => d.apply(&mut adapter, &mut s.core.lock()),
+                _ => {}
+            }
+            flush(&s, &sink, None).await;
+            if let Some(at) = effects(&s, kind, &files, &fx_tx) {
+                rewind_to = Some(at);
+                break;
             }
         }
     }
@@ -721,6 +960,9 @@ mod tests {
             lines_removed: 0,
             context_pct: None,
             turn_started: None,
+            limits: vec![],
+            account: None,
+            plan: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };
@@ -731,5 +973,69 @@ mod tests {
         let mut later = i.clone();
         later.last_activity = 99;
         assert!(!later.differs(&i));
+    }
+
+    #[test]
+    fn only_loopback_is_fetched() {
+        assert_eq!(loopback_target("http://localhost:41234/callback?code=a&state=b"), Some(("localhost".into(), 41234, "/callback?code=a&state=b".into())));
+        assert_eq!(loopback_target("http://127.0.0.1:9/?x=1#frag"), Some(("127.0.0.1".into(), 9, "/?x=1".into())));
+        assert_eq!(loopback_target("http://[::1]:7/cb"), Some(("::1".into(), 7, "/cb".into())));
+        assert_eq!(loopback_target("http://LOCALHOST?code=1"), Some(("localhost".into(), 80, "/?code=1".into())));
+        for bad in ["https://localhost/cb", "http://example.com/cb", "http://localhost.example.com/cb", "http://user@localhost/cb", "http://localhost:1/a b", "http://localhost:99999/", "file:///etc/passwd", "http://10.0.0.1/"] {
+            assert_eq!(loopback_target(bad), None, "{bad}");
+        }
+        assert_eq!(fetch_loopback("http://example.com/").0, None);
+    }
+
+    #[test]
+    fn a_callback_on_loopback_is_fetched() -> anyhow::Result<()> {
+        use std::io::{BufRead as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = std::thread::spawn(move || -> Option<String> {
+            let (conn, _) = listener.accept().ok()?;
+            let mut reader = std::io::BufReader::new(conn.try_clone().ok()?);
+            let mut first = String::new();
+            reader.read_line(&mut first).ok()?;
+            let mut conn = conn;
+            conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nsigned in").ok()?;
+            Some(first)
+        });
+        let (code, body) = fetch_loopback(&format!("http://127.0.0.1:{port}/callback?code=abc&state=s"));
+        assert_eq!((code, body.as_str()), (Some(200), "signed in"));
+        let first = server.join().map_err(|_| anyhow::anyhow!("server thread"))?.unwrap_or_default();
+        assert_eq!(first.trim_end(), "GET /callback?code=abc&state=s HTTP/1.1");
+        Ok(())
+    }
+
+    #[test]
+    fn reads_are_markdown_files_only() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("kiln-read-{}", crate::util::new_id()));
+        std::fs::create_dir_all(dir.join("skill"))?;
+        let md = dir.join("skill").join("SKILL.md");
+        std::fs::write(&md, "# hi")?;
+        let secret = dir.join("secret.txt");
+        std::fs::write(&secret, "no")?;
+        let p = |x: &std::path::Path| x.to_string_lossy().into_owned();
+        let missing = dir.join("missing").join("SKILL.md");
+        assert_eq!(read_first(&[p(&missing), p(&md)]).get("content").and_then(serde_json::Value::as_str), Some("# hi"));
+        assert!(read_first(&[p(&secret)]).get("error").is_some());
+        assert!(read_first(&["relative/SKILL.md".to_owned()]).get("error").is_some());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_star_matches_the_newest_directory_first() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("kiln-expand-{}", crate::util::new_id()));
+        for (bucket, text) in [("old", "old"), ("new", "new")] {
+            std::fs::create_dir_all(dir.join("synced").join(bucket).join("docs"))?;
+            std::fs::write(dir.join("synced").join(bucket).join("docs").join("SKILL.md"), text)?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pattern = dir.join("synced").join("*").join("docs").join("SKILL.md").to_string_lossy().into_owned();
+        assert_eq!(read_first(&[pattern]).get("content").and_then(serde_json::Value::as_str), Some("new"));
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

@@ -151,6 +151,38 @@ pub struct ToolCall {
     pub started: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<i64>,
+    /// For an MCP tool: its server, and the tool's own name (`mcp__github__search` → "github",
+    /// "search").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_short: Option<String>,
+    /// For a skill run: the skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+}
+
+impl ToolCall {
+    /// Fill in what the harness's naming says: an MCP tool's server and own name, a skill's name.
+    pub fn annotate(&mut self) {
+        if self.server.is_none()
+            && let Some((server, tool)) = self.name.strip_prefix("mcp__").and_then(|rest| rest.split_once("__"))
+            && !server.is_empty()
+        {
+            self.server = Some(server.to_owned());
+            self.tool_short = Some(tool.to_owned());
+            if self.tool == ToolKind::Other {
+                self.tool = ToolKind::Mcp;
+            }
+        }
+        if self.skill.is_none() && (self.tool == ToolKind::Skill || self.name == "Skill") {
+            self.skill = ["skill", "command", "name"]
+                .iter()
+                .find_map(|k| self.input.get(*k).and_then(serde_json::Value::as_str))
+                .map(|s| s.trim_start_matches('/').to_owned())
+                .filter(|s| !s.is_empty());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,6 +409,170 @@ pub struct Usage {
     pub context_window: Option<u64>,
 }
 
+/// One window of the plan limits of the account a session runs on (what the harness's own
+/// /usage shows): how much of it is used and when it starts over.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Limit {
+    /// Stable for the harness: "five_hour", "seven_day", "seven_day_opus", "codex.primary", ...
+    pub id: String,
+    /// "Session (5h)", "Weekly", "Weekly · Opus", ...
+    pub label: String,
+    /// How much of it is used, 0–100 (None: not a percentage, see `used` and `limit`).
+    pub used_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    /// What `used` and `limit` count ("credits", "USD").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Unix ms the window starts over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    /// The window's length in short words: "5h", "7d", "month".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// The account it belongs to (as `State::account`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// "allowed", "warning" (close to the limit) or "rejected" (reached), when the harness says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Whether the harness has said what it has: an empty list reads as "none" only once it did.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Known {
+    /// Not reported yet (the harness is starting, or has not answered).
+    #[default]
+    Loading,
+    /// Reported: an empty list means there are none.
+    Ready,
+    /// The harness has no way to report it.
+    Unsupported,
+}
+
+/// What is known so far of each of the session's inventories (`State::mcp`, `State::skills`,
+/// `State::plugins`, `State::limits`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Inventory {
+    #[serde(default)]
+    pub mcp: Known,
+    #[serde(default)]
+    pub skills: Known,
+    #[serde(default)]
+    pub plugins: Known,
+    #[serde(default)]
+    pub limits: Known,
+}
+
+/// One line of the harness's status (its own /status), for the inspector.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StatusItem {
+    pub group: String,
+    /// Empty for a line that is a sentence on its own.
+    #[serde(default)]
+    pub label: String,
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tone: Option<Tone>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Tone {
+    Ok,
+    Warn,
+    Error,
+}
+
+/// An MCP server the session can use, as the harness reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpServer {
+    pub name: String,
+    /// Where it is configured: "user", "project", "local", "config", "plugin", "dynamic", ...
+    pub scope: String,
+    /// "stdio", "http", "sse", "ws", ...
+    pub transport: String,
+    pub status: McpStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub tools: Vec<McpTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<u32>,
+    /// Its command line (never its environment) or its URL (never credentials or the query).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// What the server calls itself, with its version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// How kiln's harness is signed in to it, where the harness says: "oauth", "bearer",
+    /// "signed out".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpStatus {
+    Connected,
+    Pending,
+    Failed,
+    NeedsAuth,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A skill the harness can use.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Skill {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// "user", "project", "plugin", "builtin", "system", "admin", ...
+    pub source: String,
+    /// Its SKILL.md on the machine, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_hint: Option<String>,
+    /// A person can run it (`skill_run`); otherwise only the model uses it.
+    pub user_invocable: bool,
+    /// Switched on (one that is off is listed, not offered to the model).
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A plugin the harness has installed (read-only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Plugin {
+    pub name: String,
+    #[serde(default)]
+    pub source: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 /// A permission mode the harness offers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModeOption {
@@ -559,6 +755,31 @@ pub struct State {
     /// The live value of each control (`Meta::controls`), by id.
     #[serde(default)]
     pub control_values: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The account it runs on, as "<harness>:<plan>[:<short hash of the account>]" (never the
+    /// address itself), so one account's limits show once across sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The plan, in words ("Max", "Pro", "API key").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// The account's plan limits, window by window, when the harness reports them.
+    #[serde(default)]
+    pub limits: Vec<Limit>,
+    /// The harness's own status lines (version, account, model, servers, ...).
+    #[serde(default)]
+    pub harness_status: Vec<StatusItem>,
+    /// Its MCP servers, live.
+    #[serde(default)]
+    pub mcp: Vec<McpServer>,
+    /// Its skills (and the commands it treats as skills).
+    #[serde(default)]
+    pub skills: Vec<Skill>,
+    /// Its plugins, read-only.
+    #[serde(default)]
+    pub plugins: Vec<Plugin>,
+    /// Which of those lists the harness has reported yet (loading / ready / unsupported).
+    #[serde(default)]
+    pub inventory: Inventory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -680,6 +901,71 @@ pub enum Command {
     },
     /// Announce the session again with its whole state (a server that lost track of it).
     Snapshot,
+    /// Switch an MCP server on or off.
+    McpEnable {
+        name: String,
+        enabled: bool,
+    },
+    McpReconnect {
+        name: String,
+    },
+    /// Ask the harness for every MCP server's state again.
+    McpRefresh,
+    /// Sign in to an MCP server, the harness's own way. Answered to `client` with
+    /// `{"url": ...}` to open. When the sign-in ends on a page that does not load (the harness
+    /// waits for it on its own machine), send that page's address back as `redirect`.
+    McpAuth {
+        name: String,
+        #[serde(default)]
+        client: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redirect: Option<String>,
+    },
+    /// Add an MCP server with the harness's own CLI (answered to `client`, when given, with
+    /// `{"ok": bool, "message": ...}`).
+    McpAdd {
+        #[serde(default)]
+        scope: String,
+        name: String,
+        #[serde(default)]
+        transport: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        env: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        headers: std::collections::BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client: Option<String>,
+    },
+    McpRemove {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client: Option<String>,
+    },
+    /// A skill's SKILL.md, answered to `client` as `{"content": ..., "path": ...}`.
+    SkillView {
+        name: String,
+        client: String,
+    },
+    /// Run a skill the harness's way; delivered like a message (`id` and `mode` as for Send).
+    SkillRun {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default)]
+        mode: SendMode,
+    },
+    /// Read the skills from disk again.
+    SkillsReload,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -688,6 +974,70 @@ pub enum Decision {
     Allow,
     Always,
     Deny,
+}
+
+/// The id of the account a session runs on: "<harness>:<plan>", and a short hash of who it is
+/// when known (an address or an organization), never the thing itself.
+pub fn account_id(harness: &str, plan: &str, who: Option<&str>) -> String {
+    use sha2::Digest as _;
+    let plan: String = plan.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    match who.map(|w| w.trim().to_lowercase()).filter(|w| !w.is_empty()) {
+        Some(w) => {
+            let h = sha2::Sha256::digest(w.as_bytes());
+            format!("{harness}:{plan}:{}", hex::encode(h.get(..5).unwrap_or_default()))
+        }
+        None => format!("{harness}:{plan}"),
+    }
+}
+
+/// Plan words for the UI: "max" → "Max", "self_serve_business_prolite" → "Self serve business prolite".
+pub fn plan_label(plan: &str) -> String {
+    let words = plan.replace(['_', '-'], " ");
+    let mut c = words.trim().chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// Email addresses in `s`, shortened to their first letter and domain ("a…@example.com").
+pub fn mask_emails(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, word) in s.split(' ').enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        match word.split_once('@') {
+            Some((user, domain)) if !user.is_empty() && domain.contains('.') && !user.contains('/') && !user.contains(':') => {
+                let lead: String = user.chars().take(1).collect();
+                out.push_str(&format!("{lead}…@{domain}"));
+            }
+            _ => out.push_str(word),
+        }
+    }
+    out
+}
+
+/// A server URL safe to show: no credentials, query or fragment.
+pub fn safe_url(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or("");
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (host, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+            let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+            if path.is_empty() { format!("{scheme}://{host}") } else { format!("{scheme}://{host}/{path}") }
+        }
+        None => url.to_owned(),
+    }
+}
+
+/// A limit window's length in short words: 300 → "5h", 10080 → "7d".
+pub fn window_words(minutes: i64) -> String {
+    match minutes {
+        m if m > 0 && m % 1440 == 0 => format!("{}d", m / 1440),
+        m if m > 0 && m % 60 == 0 => format!("{}h", m / 60),
+        m => format!("{m}m"),
+    }
 }
 
 /// Shorten `s` to at most `max` bytes, keeping its head and tail (a char boundary each).
@@ -738,6 +1088,49 @@ mod tests {
     }
 
     #[test]
+    fn accounts_and_urls_are_shown_without_secrets() {
+        let a = account_id("claude", "max", Some("Someone@Example.com"));
+        assert!(a.starts_with("claude:max:") && a.len() == "claude:max:".len() + 10 && !a.contains("example"));
+        assert_eq!(a, account_id("claude", "max", Some("someone@example.com ")));
+        assert_eq!(account_id("codex", "API key", None), "codex:api-key");
+        assert_eq!(plan_label("self_serve_business_prolite"), "Self serve business prolite");
+        assert_eq!(mask_emails("Email: someone@example.com (pro)"), "Email: s…@example.com (pro)");
+        assert_eq!(mask_emails("uds:/run/x.sock no@mail"), "uds:/run/x.sock no@mail");
+        assert_eq!(safe_url("https://user:pw@mcp.example.com/v1/mcp?token=abc#x"), "https://mcp.example.com/v1/mcp");
+        assert_eq!(safe_url("http://127.0.0.1:27190"), "http://127.0.0.1:27190");
+        assert_eq!((window_words(300), window_words(10080), window_words(90)), ("5h".to_owned(), "7d".to_owned(), "90m".to_owned()));
+    }
+
+    #[test]
+    fn tool_calls_name_their_server_and_skill() {
+        let mut t = ToolCall {
+            tool_id: "t".into(),
+            name: "mcp__github__search_issues".into(),
+            tool: ToolKind::Other,
+            title: String::new(),
+            detail: None,
+            input: serde_json::json!({}),
+            status: ToolStatus::Running,
+            output: None,
+            truncated: false,
+            diffs: vec![],
+            todos: vec![],
+            task: None,
+            exit_code: None,
+            started: 0,
+            ended: None,
+            server: None,
+            tool_short: None,
+            skill: None,
+        };
+        t.annotate();
+        assert_eq!((t.server.as_deref(), t.tool_short.as_deref(), t.tool), (Some("github"), Some("search_issues"), ToolKind::Mcp));
+        let mut s = ToolCall { name: "Skill".into(), tool: ToolKind::Skill, input: serde_json::json!({"skill": "/review", "args": "x"}), server: None, tool_short: None, ..t };
+        s.annotate();
+        assert_eq!((s.skill.as_deref(), s.server.as_deref()), (Some("review"), None));
+    }
+
+    #[test]
     fn events_serialize_flat_with_a_kind_tag() -> anyhow::Result<()> {
         let e = Event {
             id: "e1".into(),
@@ -758,6 +1151,12 @@ mod tests {
         assert!(matches!(c, Command::Send { ref attachments, ref overrides, .. } if attachments.len() == 1 && attachments.first().is_some_and(Attachment::is_image) && overrides.as_ref().and_then(|o| o.effort.as_deref()) == Some("high")));
         let c: Command = serde_json::from_str(r#"{"type":"interrupt"}"#)?;
         assert_eq!(c, Command::Interrupt);
+        let c: Command = serde_json::from_str(r#"{"type":"mcp_add","scope":"user","name":"echo","transport":"stdio","command":"python3","args":["-I","echo.py"],"env":{"K":"v"}}"#)?;
+        assert!(matches!(c, Command::McpAdd { ref name, ref args, ref env, .. } if name == "echo" && args.len() == 2 && env.get("K").map(String::as_str) == Some("v")));
+        let c: Command = serde_json::from_str(r#"{"type":"mcp_auth","name":"gh","client":"c1"}"#)?;
+        assert_eq!(c, Command::McpAuth { name: "gh".into(), client: "c1".into(), redirect: None });
+        let c: Command = serde_json::from_str(r#"{"type":"skill_run","name":"review","args":"src"}"#)?;
+        assert_eq!(c, Command::SkillRun { name: "review".into(), args: Some("src".into()), id: None, mode: SendMode::Queue });
         Ok(())
     }
 }

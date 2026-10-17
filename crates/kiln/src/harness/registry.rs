@@ -457,6 +457,9 @@ impl Registry {
                         lines_removed: 0,
                         context_pct: None,
                         turn_started: None,
+                        limits: Vec::new(),
+                        account: None,
+                        plan: None,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);
