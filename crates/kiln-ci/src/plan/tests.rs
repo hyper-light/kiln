@@ -166,6 +166,11 @@ fn dead_spec() -> LegSpec {
     }
 }
 
+/// A JSON value by pointer (`/a/b/0`), null when absent.
+fn at(v: &serde_json::Value, p: &str) -> serde_json::Value {
+    v.pointer(p).cloned().unwrap_or_default()
+}
+
 const S: Conclusion = Conclusion::Success;
 const F: Conclusion = Conclusion::Failure;
 
@@ -243,7 +248,7 @@ fn a_timeout_is_a_failure_to_dependents() {
     let mut r = Run::gha(&jobs("  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    needs: a\n    if: failure()\n    runs-on: x\n    steps: [{run: b}]\n"));
     r.finish("a", Conclusion::TimedOut);
     assert!(r.queued.contains(&"b".to_owned()));
-    assert_eq!(r.spec("b").needs["a"]["result"], "failure");
+    assert_eq!(at(&r.spec("b").needs, "/a/result"), "failure");
 }
 
 #[test]
@@ -262,7 +267,7 @@ fn fail_fast_and_max_parallel() {
     assert_eq!(r.queued, vec!["t (1)"]);
     r.finish("t (1)", S);
     assert_eq!(r.queued, vec!["t (1)", "t (2)"]);
-    assert_eq!(r.spec("t (2)").strategy["max-parallel"], 1.0);
+    assert_eq!(at(&r.spec("t (2)").strategy, "/max-parallel"), 1.0);
     // max-parallel: the held legs are cancelled by fail-fast without being queued.
     let mut r = Run::gha(&jobs("  t:\n    runs-on: x\n    strategy:\n      max-parallel: 1\n      matrix:\n        v: [1, 2, 3]\n    steps: [{run: t}]\n"));
     r.finish("t (1)", F);
@@ -289,7 +294,7 @@ fn strategy_context_and_leg_names() {
     let s = r.spec("build (windows-latest)");
     assert_eq!(s.name, "Build windows-latest");
     assert_eq!(s.runs_on.labels, vec!["windows-latest"]);
-    assert_eq!((s.strategy["job-index"].as_f64(), s.strategy["job-total"].as_f64()), (Some(1.0), Some(2.0)));
+    assert_eq!((at(&s.strategy, "/job-index").as_f64(), at(&s.strategy, "/job-total").as_f64()), (Some(1.0), Some(2.0)));
 }
 
 /// W04-S01: GitHub's documented example.
@@ -311,7 +316,7 @@ fn w04_s02_a_matrix_from_outputs() {
     assert_eq!(r.queued, vec!["plan"]);
     r.outputs("plan", &[("shards", r#"["core","cli","ui"]"#)]);
     assert_eq!(r.queued, vec!["plan", "test (core)", "test (cli)", "test (ui)"]);
-    assert_eq!(r.spec("test (cli)").needs["plan"]["outputs"]["shards"], r#"["core","cli","ui"]"#);
+    assert_eq!(at(&r.spec("test (cli)").needs, "/plan/outputs/shards"), r#"["core","cli","ui"]"#);
 }
 
 #[test]
@@ -381,8 +386,8 @@ fn w04_ac04_inputs_outputs_secrets_permissions() {
     assert_eq!((inner.permissions.level("contents"), inner.permissions.level("issues")), (perms::Level::Read, perms::Level::None));
     r.outputs("call / inner", &[("x", "42")]);
     assert_eq!(r.queued, vec!["call / inner", "after"]);
-    assert_eq!(r.spec("after").needs["call"]["outputs"]["out"], "42");
-    assert_eq!(r.spec("after").needs["call"]["result"], "success");
+    assert_eq!(at(&r.spec("after").needs, "/call/outputs/out"), "42");
+    assert_eq!(at(&r.spec("after").needs, "/call/result"), "success");
     r.finish("after", S);
     assert_eq!(r.finished, Some(S));
 }
@@ -442,7 +447,7 @@ fn w04_ac05_where_and_when() {
     let r = Run::kiln(src);
     let removed = r.plan.removed().get("t").cloned().unwrap_or_default();
     assert_eq!(removed.len(), 2);
-    assert!(removed.iter().all(|(m, why)| m["profile"] == "asan" && why == "removed by where"));
+    assert!(removed.iter().all(|(m, why)| at(m, "/profile") == "asan" && why == "removed by where"));
     // 7 legs: windows' two are skipped by when, the rest queued.
     assert_eq!(r.queued.len(), 5);
     assert!(r.logged("t (windows, dev) skipped: skipped by when"), "{:?}", r.log);
@@ -455,7 +460,7 @@ fn w04_ac05_platforms_and_emulation() {
     assert_eq!(r.queued, vec!["b (linux/amd64, linux, amd64, release)", "b (linux/arm64, linux, arm64, release)", "b (darwin/arm64, darwin, arm64, release)"]);
     let mac = r.spec("b (darwin/arm64, darwin, arm64, release)");
     assert_eq!(mac.requires, vec!["os == 'macos' && arch == 'aarch64'"]);
-    assert_eq!(mac.matrix["os"], "darwin");
+    assert_eq!(at(&mac.matrix, "/os"), "darwin");
     let arm = r.spec("b (linux/arm64, linux, arm64, release)");
     assert!(arm.emulated && arm.requires.first().is_some_and(|q| q.contains("binfmt contains 'linux/arm64'")));
 }
@@ -494,7 +499,7 @@ fn w04_ac05_shard_and_chunk() {
     assert_eq!(r.queued.len(), 3);
     let items: Vec<Vec<String>> = r.queued.iter().map(|k| r.spec(k).items).collect();
     assert_eq!(items.iter().map(Vec::len).sum::<usize>(), 8);
-    assert_eq!(r.spec(r.queued.first().map_or("", String::as_str)).matrix["shard"], serde_json::json!({"index": 0.0, "total": 3.0}));
+    assert_eq!(at(&r.spec(r.queued.first().map_or("", String::as_str)).matrix, "/shard"), serde_json::json!({"index": 0.0, "total": 3.0}));
     // chunk: 10 items, 4 a leg.
     let chunk = "name: k\non: push\njobs:\n  t:\n    strategy:\n      chunk: { items: '${{ fromJSON(''[1,2,3,4,5,6,7,8,9,10]'') }}', size: 4 }\n    steps: [{run: t}]\n";
     let r = Run::kiln(chunk);
@@ -538,9 +543,9 @@ fn w04_ac06_last_writer_and_legs() {
     r.outputs("m (b)", &[("x", "b")]);
     r.outputs("m (a)", &[("x", "a")]);
     let after = r.spec("after");
-    assert_eq!(after.needs["m"]["outputs"]["x"], "a", "the leg that finished last wins");
-    assert_eq!(after.needs["m"]["legs"].as_array().map(Vec::len), Some(2));
-    assert_eq!(after.needs["m"]["legs"][1]["outputs"]["x"], "b");
+    assert_eq!(at(&after.needs, "/m/outputs/x"), "a", "the leg that finished last wins");
+    assert_eq!(at(&after.needs, "/m/legs").as_array().map(Vec::len), Some(2));
+    assert_eq!(at(&after.needs, "/m/legs/1/outputs/x"), "b");
 }
 
 #[test]
@@ -549,7 +554,7 @@ fn w04_ac06_limits_typed_env_and_secret_outputs() {
     let mut r = Run::gha(&jobs("  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    needs: a\n    runs-on: x\n    steps: [{run: b}]\n"));
     r.outputs("a", &[("big", &"x".repeat(MAX_JOB_OUTPUTS + 1))]);
     assert!(r.warnings.iter().any(|w| w.contains("1 MiB")));
-    assert_eq!(r.spec("b").needs["a"]["outputs"], serde_json::json!({}));
+    assert_eq!(at(&r.spec("b").needs, "/a/outputs"), serde_json::json!({}));
     // Typed outputs: kiln consumers see the JSON value, GitHub's its text.
     let src = "name: k\non: push\njobs:\n  a:\n    steps: [{run: a}]\n  b:\n    needs: a\n    env-from: [a]\n    steps: [{run: b}]\n  c:\n    needs: b\n    steps: [{run: c}]\n";
     let mut r = Run::kiln(src);
@@ -564,19 +569,19 @@ fn w04_ac06_limits_typed_env_and_secret_outputs() {
         },
     );
     let b = r.spec("b");
-    assert_eq!(b.needs["a"]["outputs"]["n"], 3.0);
-    assert_eq!(b.needs["a"]["env"]["IMAGE_TAG"], "abc");
+    assert_eq!(at(&b.needs, "/a/outputs/n"), 3.0);
+    assert_eq!(at(&b.needs, "/a/env/IMAGE_TAG"), "abc");
     // W04-S05: env-from.
     assert_eq!(b.env_from, vec![("IMAGE_TAG".to_owned(), "abc".to_owned())]);
     assert_eq!(b.run_env, vec![("RELEASE".to_owned(), "1".to_owned())]);
     assert_eq!(b.secret_outputs, vec![SecretOutput { job: "a".into(), name: "token".into(), leg: "a".into() }]);
-    assert!(b.needs["a"]["outputs"].get("token").is_none(), "secret outputs never enter contexts");
+    assert!(at(&b.needs, "/a/outputs").get("token").is_none(), "secret outputs never enter contexts");
     r.finish("b", S);
     assert_eq!(r.spec("c").run_env, vec![("RELEASE".to_owned(), "1".to_owned())], "run.env reaches later jobs that need the writer");
     // A GitHub consumer sees the typed output as JSON text.
     let mut r = Run::gha(&jobs("  a:\n    runs-on: x\n    steps: [{run: a}]\n  b:\n    needs: a\n    runs-on: x\n    steps: [{run: b}]\n"));
     r.report("a", LegReport { json_outputs: vec![("n".into(), serde_json::json!({"k": [1]}))], ..LegReport::of(S) });
-    assert_eq!(r.spec("b").needs["a"]["outputs"]["n"], r#"{"k":[1]}"#);
+    assert_eq!(at(&r.spec("b").needs, "/a/outputs/n"), r#"{"k":[1]}"#);
 }
 
 #[test]

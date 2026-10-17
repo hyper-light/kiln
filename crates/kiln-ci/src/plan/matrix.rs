@@ -179,7 +179,7 @@ impl Platform {
 
 /// How many legs keep each under `target` seconds for work of `total` seconds (`count: auto`).
 pub fn shard_count(total: f64, target: f64) -> usize {
-    if !(target > 0.0) || !(total > 0.0) {
+    if target.is_nan() || total.is_nan() || target <= 0.0 || total <= 0.0 {
         return 1;
     }
     let n = (total / target).ceil();

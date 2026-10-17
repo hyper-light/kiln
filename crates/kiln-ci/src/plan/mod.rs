@@ -1047,7 +1047,7 @@ impl RunPlan {
             };
             let display = if names_matrix || (combo.is_empty() && items.is_empty()) { base_name.clone() } else { matrix::leg_name(&base_name, &combo) };
             let prefix = self.scope_of(n).map(|s| s.prefix.clone()).unwrap_or_default();
-            let key = if names_matrix { format!("{prefix}{}", matrix::leg_name(&job.id, &combo)) } else { format!("{prefix}{}", matrix::leg_name(&job.id, &combo)) };
+            let key = format!("{prefix}{}", matrix::leg_name(&job.id, &combo));
             let key = self.unique_key(key);
             let spec = self.leg_spec(n, &job, dialect, &lcx, &combo, strategy, key.clone(), base_name, format!("{prefix}{display}"), items, requires, emulated);
             match spec {
@@ -1723,9 +1723,7 @@ fn aggregate(cs: impl Iterator<Item = Conclusion>) -> Conclusion {
         Conclusion::Failure
     } else if all.contains(&Conclusion::Cancelled) {
         Conclusion::Cancelled
-    } else if !all.is_empty() && all.iter().all(|c| *c == Conclusion::Skipped) {
-        Conclusion::Skipped
-    } else if all.is_empty() {
+    } else if all.iter().all(|c| *c == Conclusion::Skipped) {
         Conclusion::Skipped
     } else {
         Conclusion::Success
