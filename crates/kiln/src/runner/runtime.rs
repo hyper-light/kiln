@@ -187,9 +187,36 @@ struct State {
     posts: Vec<Post>,
     /// The index the next pre or post step gets (after the job's own steps).
     next_idx: u32,
+    /// `GITHUB_SERVER_URL` as the leg reaches it, which [`NOT_GHES`] stands in for.
+    server_url: String,
+}
+
+/// The `GITHUB_SERVER_URL` actions that refuse GitHub Enterprise Server see (docs/ci.md
+/// W08-R08). The toolkit counts every server but github.com, `*.ghe.com` and `*.localhost` as
+/// GHES. On GHES, `@actions/artifact` v2 and later (so `upload-artifact@v4`,
+/// `download-artifact@v4` and every newer version) throw `GHESNotSupportedError`. kiln serves
+/// those actions' protocol, so they run with this URL instead, and what they print or output
+/// gets the real one back. Their requests go to `ACTIONS_RESULTS_URL` and `GITHUB_API_URL`,
+/// never to this one.
+pub const NOT_GHES: &str = "http://kiln.localhost";
+
+/// Whether any of an action's scripts carry the toolkit's GHES refusal.
+fn refuses_ghes(dir: &Path, scripts: &[&str]) -> bool {
+    const NEEDLE: &[u8] = b"GHESNotSupportedError";
+    scripts.iter().any(|f| std::fs::read(dir.join(f)).is_ok_and(|b| b.windows(NEEDLE.len()).any(|w| w == NEEDLE)))
 }
 
 impl State {
+    /// `s` with [`NOT_GHES`] put back to the real server.
+    fn unfake(&self, s: &str) -> String {
+        s.replace(NOT_GHES, &self.server_url)
+    }
+
+    fn unfake_bytes(&self, b: Vec<u8>) -> Vec<u8> {
+        let needle = NOT_GHES.as_bytes();
+        if b.windows(needle.len()).any(|w| w == needle) { self.unfake(&String::from_utf8_lossy(&b)).into_bytes() } else { b }
+    }
+
     fn cx(&self) -> Cx<'_> {
         let mut values = self.base.clone();
         values.push(("github", self.github.clone()));
@@ -379,7 +406,11 @@ impl Leg {
         set("ACTIONS_RUNTIME_TOKEN", rt.runtime_token.clone());
         set("ACTIONS_RESULTS_URL", rt.results_url.clone());
         set("ACTIONS_CACHE_URL", rt.cache_url.clone());
-        set("ACTIONS_CACHE_SERVICE_V2", "True".into());
+        // The toolkit takes any server but github.com for GitHub Enterprise Server, and uses its
+        // cache protocol (`ACTIONS_CACHE_URL`), which kiln serves (W08-R07).
+        if let Some(m) = &rt.cache_mode {
+            set("ACTIONS_CACHE_MODE", m.clone());
+        }
         if let (Some(u), Some(t)) = (&rt.id_token_url, &rt.id_token_request_token) {
             set("ACTIONS_ID_TOKEN_REQUEST_URL", u.clone());
             set("ACTIONS_ID_TOKEN_REQUEST_TOKEN", t.clone());
@@ -461,6 +492,7 @@ impl Leg {
             groups: Vec::new(),
             posts: Vec::new(),
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
+            server_url: a.runtime.facade_url.clone(),
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -797,7 +829,7 @@ impl Leg {
             }
         }
         match envfiles::pairs(&out_t) {
-            Ok(pairs) => outputs.extend(pairs),
+            Ok(pairs) => outputs.extend(pairs.into_iter().map(|(k, v)| (k, st.unfake(&v)))),
             Err(e) => {
                 self.annotate(idx, "error", &e).await;
                 failed_files = true;
@@ -808,7 +840,7 @@ impl Leg {
         }
         if !sum_t.is_empty() {
             match envfiles::summary(&sum_t) {
-                Ok(md) => self.event(&JobEventV2::Summary { idx, markdown: st.masker.mask(md) }).await,
+                Ok(md) => self.event(&JobEventV2::Summary { idx, markdown: st.masker.mask(&st.unfake(md)) }).await,
                 Err(e) => self.annotate(idx, "warning", &e).await,
             }
         }
@@ -827,7 +859,7 @@ impl Leg {
         for &b in chunk {
             line.push(b);
             if b == b'\n' {
-                let whole = std::mem::take(line);
+                let whole = st.unfake_bytes(std::mem::take(line));
                 let text = String::from_utf8_lossy(&whole).to_string();
                 match proc.line(&text) {
                     Line::Text | Line::Unknown => self.text(st, idx, &whole).await,
@@ -848,7 +880,7 @@ impl Leg {
         if t.starts_with("::") || t.starts_with("##") || t.is_empty() || ":#".starts_with(t) {
             return;
         }
-        let rest = std::mem::take(line);
+        let rest = st.unfake_bytes(std::mem::take(line));
         self.text(st, idx, &rest).await;
     }
 
@@ -1128,6 +1160,10 @@ impl Leg {
                 let node = self.node(&action.runs.using).await?;
                 let main = action.runs.main.as_deref().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.main`"))?;
                 let script = loc.dir.join(main);
+                let (dir, scripts) = (loc.dir.clone(), [Some(main.to_owned()), action.runs.post.clone()].into_iter().flatten().collect::<Vec<_>>());
+                if crate::rt::blocking(move || refuses_ghes(&dir, &scripts.iter().map(String::as_str).collect::<Vec<_>>())).await.unwrap_or(false) {
+                    aenv.insert("GITHUB_SERVER_URL".into(), NOT_GHES.into());
+                }
                 let ran = self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![script.to_string_lossy().to_string()] }, wd, aenv.clone(), deadline).await?;
                 if let Some(post) = &action.runs.post {
                     let mut penv = aenv;
@@ -1233,6 +1269,10 @@ impl Leg {
             env.insert("GITHUB_ACTION_PATH".into(), loc.dir.to_string_lossy().to_string());
             env.insert("GITHUB_ACTION_REPOSITORY".into(), loc.repo.clone());
             env.insert("GITHUB_ACTION_REF".into(), loc.git_ref.clone());
+            let (dir, script) = (loc.dir.clone(), pre.clone());
+            if crate::rt::blocking(move || refuses_ghes(&dir, &[script.as_str()])).await.unwrap_or(false) {
+                env.insert("GITHUB_SERVER_URL".into(), NOT_GHES.into());
+            }
             let r = match self.node(&action.runs.using).await {
                 Ok(node) => self.exec(st, idx, Run::Program { prog: node.to_string_lossy().to_string(), args: vec![loc.dir.join(pre).to_string_lossy().to_string()] }, &st.layout.workspace.clone(), env, deadline).await,
                 Err(e) => Err(e),

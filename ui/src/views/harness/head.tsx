@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { Link, useNavigate } from "react-router";
-import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
+import { ArrowLeft, MoreHorizontal, Pause, PencilLine, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
 import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
 import { useListener } from "./dom";
@@ -96,8 +96,19 @@ export function AgentHeader({
             <NameField value={hasOwnName(info) ? info.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ag-title-field" label="Agent name" />
           ) : (
             <h1 className="ag-title">
-              <button type="button" className="ag-title-btn" onClick={actions.startRenaming} disabled={!info} title="Rename">
-                {label}
+              {/* Says it can be renamed: a pencil after the name, and "Name it" while it has none of its own. */}
+              <button
+                type="button"
+                className="ag-title-btn"
+                onClick={actions.startRenaming}
+                disabled={!info}
+                aria-label={info && hasOwnName(info) ? `Rename ${label}` : `Name this agent (shown as ${label})`}
+              >
+                <span className={info && !hasOwnName(info) ? "ag-title-unnamed" : undefined}>{label}</span>
+                <span className="ag-rename" aria-hidden="true">
+                  <PencilLine size={13} />
+                  {info && !hasOwnName(info) && <span>Name it</span>}
+                </span>
               </button>
             </h1>
           )}

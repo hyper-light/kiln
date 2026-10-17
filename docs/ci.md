@@ -178,13 +178,13 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host executor; background steps, matchers, containers left |
 | W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local; `actions/checkout@v4` unmodified; Docker, `$/`, policy left |
-| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | ready | |
+| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | ready | |
 | W10 | Identity, tokens, OIDC issuer | none | ready | |
 | W11 | Integrations and credential broker | W10 | blocked (W10) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | ready (facts, docker) | |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade's git (smart HTTP at the root, leg tokens); REST, hosting, review left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (artifacts, 501s); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | blocked (W04) | |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
 | W17 | Debugging | W06, W13 | blocked (W06) | |
@@ -450,18 +450,19 @@ CREATE TABLE ci_summaries (            -- $GITHUB_STEP_SUMMARY, markdown
 
 -- 2: blobs, caches, artifacts (W08)
 CREATE TABLE cas_objects (             -- content-addressed objects: chunk lists
-  digest TEXT PRIMARY KEY, size INTEGER NOT NULL, chunks TEXT NOT NULL,  -- JSON [chunk digest]
-  created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL, refs INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE cas_chunks (digest TEXT PRIMARY KEY, size INTEGER NOT NULL, path TEXT NOT NULL);
+  digest TEXT PRIMARY KEY, size INTEGER NOT NULL,                   -- SHA-256 of the content
+  chunks TEXT NOT NULL,                                             -- JSON [[chunk digest, size]]
+  created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL);     -- references are found at collection
+CREATE TABLE cas_chunks (digest TEXT PRIMARY KEY, size INTEGER NOT NULL);  -- <data>/cas/chunks/ab/cd/<digest>
 CREATE TABLE ci_caches (
   id INTEGER PRIMARY KEY AUTOINCREMENT, repo_id TEXT NOT NULL, scope TEXT NOT NULL,  -- ref or 'repo' or 'global'
-  key TEXT NOT NULL, version TEXT NOT NULL, object TEXT,      -- cas_objects.digest; NULL while uploading
+  key TEXT NOT NULL COLLATE NOCASE, version TEXT NOT NULL, object TEXT,  -- cas_objects.digest; NULL while uploading
   size INTEGER, created_at INTEGER NOT NULL, last_used_at INTEGER, created_by_leg TEXT,
   UNIQUE (repo_id, scope, key, version));
 CREATE TABLE ci_artifacts (
   id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-  leg_id TEXT, name TEXT NOT NULL, object TEXT, size INTEGER, digest TEXT,
-  created_at INTEGER NOT NULL, expires_at INTEGER, finalized INTEGER NOT NULL DEFAULT 0,
+  leg_id TEXT, name TEXT NOT NULL, object TEXT, size INTEGER, digest TEXT,  -- digest: sha256:<hex>
+  mime_type TEXT, created_at INTEGER NOT NULL, expires_at INTEGER, finalized INTEGER NOT NULL DEFAULT 0,
   UNIQUE (run_id, name));
 CREATE TABLE ci_reuse (                -- W08 job-result reuse
   input_hash TEXT PRIMARY KEY, leg_id TEXT NOT NULL, outputs TEXT, created_at INTEGER NOT NULL);
@@ -597,13 +598,14 @@ wait reason says so (W05).
 | Prefix | What | Auth |
 | --- | --- | --- |
 | `/api/ci/…` | The CI API (§4) | session, PAT, agent token |
-| `/_kiln/results/twirp/…`, `/_kiln/blob/…`, `/_apis/artifactcache/…` | GHA runtime services (W08) | the leg's `ACTIONS_RUNTIME_TOKEN`; blob URLs are signed |
+| `/twirp/…` (the toolkit keeps only `ACTIONS_RESULTS_URL`'s origin), `/_apis/artifactcache/…`, `/_kiln/blob/…` | GHA runtime services (W08) | the leg's `ACTIONS_RUNTIME_TOKEN`; blob URLs are signed |
 | `/_kiln/oidc/token` | ID tokens for jobs (W10) | the leg's `ACTIONS_ID_TOKEN_REQUEST_TOKEN` |
 | `<issuer>/.well-known/openid-configuration`, `<issuer>/jwks` (issuer default `<public_url>/oidc`) | The issuer's discovery and keys (W10) | open (the only parts that must be reachable from the internet for some providers; W10-R12) |
 | `/_kiln/actions/…` | Action tarballs at pinned SHAs (W07) | job token |
 | `/v2/…` | The built-in OCI registry (W12) | registry tokens (W12) |
 | `/_kiln/proxy/<ecosystem>/…` | Package registry proxies (W12) | job token or PAT |
 | `/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`, `/api/v3/…`, `/api/graphql` | The facade: GitHub-compatible git and REST for jobs (W14) | job token as `GITHUB_TOKEN` |
+| `/<owner>/<repo>/actions/runs/<id>…` | GitHub-shaped page links that actions print, redirected to kiln's pages (W14) | open (the pages ask for a session) |
 | `/git/<owner>/<repo>.git` | Native git hosting (W14) | PAT, agent token |
 
 The facade lives at the **root** of the server's origin, because `actions/checkout` builds its
@@ -2045,29 +2047,58 @@ reusing the results of jobs whose inputs have not changed.
 - **W08-R04 Runtime token.** `ACTIONS_RUNTIME_TOKEN` is a JWT signed by kiln (HS256, server key)
   whose `scp` claim carries `Actions.GenericRead:<run> Actions.UploadArtifacts:<run>:<leg>
   Actions.Results:<run>:<leg>`, which the toolkit parses for its backend ids; it expires with the
-  leg plus one hour.
-- **W08-R05 Results service.** `ACTIONS_RESULTS_URL = <server>/_kiln/results/` serves Twirp JSON at
-  `twirp/github.actions.results.api.v1.CacheService/{CreateCacheEntry, FinalizeCacheEntryUpload,
-  GetCacheEntryDownloadURL, DeleteCacheEntry}` and
-  `twirp/github.actions.results.api.v1.ArtifactService/{CreateArtifact, FinalizeArtifact,
-  ListArtifacts, GetSignedArtifactURL, DeleteArtifact, MigrateArtifact}`, with the request and
-  response fields the current toolkit sends and reads (the vendored toolkit sources are the
-  reference).
+  leg plus one hour. It also carries GitHub's `ac` claim (the cache scopes, with read and write
+  permissions, in lookup order) and the leg's cache mode. Until W10's job tokens, the same token is
+  the leg's `GITHUB_TOKEN`.
+- **W08-R05 Results service.** `ACTIONS_RESULTS_URL = <server>/`.
+  - The toolkit keeps only that URL's origin, so Twirp is served at the origin's root:
+    `/twirp/github.actions.results.api.v1.ArtifactService/{CreateArtifact, FinalizeArtifact,
+    ListArtifacts, GetSignedArtifactURL, DeleteArtifact}`.
+  - The JSON follows protobuf's mapping, as the toolkit uses it:
+    - snake_case field names;
+    - int64 values as strings;
+    - wrapper types as bare values;
+    - RFC 3339 times.
+  - Errors are Twirp's `{code, msg}`, because the client parses every response as JSON.
+  - The toolkit's `CacheService` (cache v2) is used only on github.com, `*.ghe.com` and
+    `*.localhost`. It isn't needed for caches on kiln (R07). BuildKit's v2 client may want it
+    later (R11).
 - **W08-R06 Cache semantics**, GitHub-exact: the client's `version` (a hash of paths and
   compression) must match; lookup tries the exact key, then each restore key as a prefix (newest
   first), in scope order: the current ref, then the pull request's base ref, then the default
   branch; entries are immutable (creating an existing key and version in a scope answers "already
   exists"); unused entries expire after 7 days (configurable); over quota, least recently used
   go first.
-- **W08-R07 Legacy cache API.** `ACTIONS_CACHE_URL` also serves the older `_apis/artifactcache`
-  protocol (`GET cache?keys=&version=`, `POST caches`, `PATCH caches/:id` with `Content-Range`,
-  `POST caches/:id`) so pinned old versions of `actions/cache` and setup actions work.
-  **Deviation:** GitHub has retired it.
+- **W08-R07 The cache protocol.** `ACTIONS_CACHE_URL = <server>/` serves `_apis/artifactcache`:
+  - `GET cache?keys=&version=`: a hit, or 204 for a miss;
+  - `POST caches`, then `PATCH caches/:id` with `Content-Range` (parts arrive in parallel), then
+    `POST caches/:id`;
+  - `GET caches?key=`.
+
+  The toolkit treats every server but github.com, `*.ghe.com` and `*.localhost` as GitHub
+  Enterprise Server, and uses this protocol with it whatever `ACTIONS_CACHE_SERVICE_V2` says. So
+  this protocol is what every version of `actions/cache`, the setup actions' caches and BuildKit's
+  v1 client talk to on kiln.
+
+  A refusal by the cache mode starts with "cache read denied:" or "cache write denied:", so the
+  toolkit warns instead of failing the step. GitHub retired this protocol on github.com only; GHES
+  still serves it.
 - **W08-R08 Artifacts**, GitHub-exact (v4): unique names per run, immutable after finalize, zip
   uploads, `retention-days` (default `ci.artifact_retention_days`, 90), download by name or id
   within the run, and across runs through the facade's REST endpoints
   (`/repos/{o}/{r}/actions/runs/{id}/artifacts`, `/actions/artifacts/{id}/zip`). v1's `artifacts:`
   tarballs become an artifact named `artifacts`, and `GET /api/jobs/:id/artifacts` keeps working.
+  - **GitHub Enterprise Server's refusal.** `@actions/artifact` v2 and later throw
+    `GHESNotSupportedError` when `GITHUB_SERVER_URL`'s host is not github.com, `*.ghe.com` or
+    `*.localhost`. That covers `upload-artifact@v4` and `download-artifact@v4` and every later
+    version.
+    - Actions whose scripts carry that refusal get `GITHUB_SERVER_URL=http://kiln.localhost`
+      from the runner.
+    - They call only `ACTIONS_RESULTS_URL` and `GITHUB_API_URL`.
+    - The runner puts the real server back in what they print and output, so `artifact-url`
+      links to kiln.
+  - **Unzipped files.** A file uploaded with `archive: false` downloads raw, under its own name
+    (`Content-Disposition`).
 
 **Requirements: kiln's improvements** (G-10, G-19)
 
@@ -2156,7 +2187,33 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
   save there. A reusable workflow asking for more than its caller allows doesn't start.
   *Integration test.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - `kiln_ci::store`, pure code:
+    - `cdc`: FastCDC with normalized chunking, streaming (R01);
+    - `cache`: modes by event, caps, lookup, immutability, key validation, eviction (R06, R14,
+      AC07).
+  - `crates/kiln/src/ci/services/`:
+    - `cas.rs`: the store, with chunks stored once, ranged reads and collection (R01, AC05 on
+      48 MiB);
+    - `blob.rs`: signed URLs and the Azure Blob subset (R03, AC04);
+    - `cache_v1.rs`: the cache protocol, with quotas and idle expiry (R06, R07);
+    - `twirp.rs`: `ArtifactService` (R05, R08);
+    - hourly upkeep.
+  - Leg tokens are JWTs carrying GitHub's `scp` and `ac` claims and `ACTIONS_CACHE_MODE` (R04,
+    R14).
+  - The GHES workaround for `@actions/artifact` (R08). Across runs: W14's REST half.
+  - End to end on a local server (part of AC02), with checks that match GitHub's messages:
+    - `actions/cache@v4` and `@v3`: save, exact restore, prefix restore, two legs racing for one
+      key, and a refused read-only save;
+    - `upload-artifact@v4` and `@v7` (zipped and `archive: false`);
+    - `download-artifact@v4` and `@v8`: by name, by pattern, raw, and across runs with `run-id`.
+- *Left.*
+  - R02 (S3), R09 (tiers), R10 (reuse), R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
+  - R14's cap for called workflows.
+  - v1's `artifacts:` as an artifact.
+  - AC01 (the toolkit harness: 1,000 files, 2 GiB), AC03, AC06, AC09.
 
 ### W09 Secrets and variables
 
@@ -2811,7 +2868,7 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** In progress: so far, only the facade's git half.
+**Progress.** In progress: the facade's git half, and the start of its REST half.
 
 - *Done.* R11's git half, in `crates/kiln/src/ci/facade.rs`:
   - smart HTTP over the server's mirror, served by `git http-backend` (protocols v0 to v2,
@@ -2819,8 +2876,13 @@ adapts [review.md](review.md), which it replaces.
   - served at the root of the server's origin (§2.6);
   - open to a leg's token only, and each token reads only its own run's repository.
   - `actions/checkout@v4` with default settings runs unmodified.
-- *Left.* Everything else: R11's REST subset and GraphQL, hosting (R01, R02), review, landing,
-  the App, the schema, and AC01 to AC07.
+- *REST so far.* `crates/kiln/src/ci/rest.rs`, at `/api/v3`:
+  - the artifact endpoints (`download-artifact` across runs);
+  - 501 "not implemented by kiln" with a warning on the leg for everything else;
+  - GraphQL answering the same;
+  - GitHub-shaped run links redirected to kiln's pages.
+- *Left.* Everything else: the rest of R11's REST subset and GraphQL, hosting (R01, R02), review,
+  landing, the App, the schema, and AC01 to AC07.
 
 ### W15 Environments and deployments
 
@@ -3668,10 +3730,18 @@ forms, `KILN_OUTPUT_JSON`, `KILN_RUN_ENV`, `KILN_METRICS`: **K**.
 
 ### A.5 Runtime services
 
-Cache service v2 (Twirp + Azure-compatible blobs) and the v1 `_apis/artifactcache` protocol
-(**S\***: kept although GitHub retired it), artifacts v4, `ACTIONS_RUNTIME_TOKEN` scopes, OIDC
-`ACTIONS_ID_TOKEN_REQUEST_*`, the tool cache, `GITHUB_TOKEN` with `permissions`, BuildKit
-`type=gha`: **S** (W08, W10, W14).
+Supported (**S**, from W08, W10 and W14):
+- the cache as GitHub Enterprise Server serves it (`_apis/artifactcache`), which the toolkit uses on
+  every server but github.com;
+- artifacts v4 (Twirp plus Azure-compatible blobs), within and across runs; actions that refuse
+  GHES see a `.localhost` server URL (W08-R08);
+- `ACTIONS_RUNTIME_TOKEN` scopes;
+- OIDC `ACTIONS_ID_TOKEN_REQUEST_*`;
+- the tool cache;
+- `GITHUB_TOKEN` with `permissions`;
+- BuildKit `type=gha`.
+
+The cache service v2 isn't needed: the toolkit uses it only on github.com.
 
 ### A.6 Events
 
