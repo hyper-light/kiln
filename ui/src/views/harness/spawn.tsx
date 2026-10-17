@@ -16,6 +16,7 @@ import { relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { HarnessMark } from "./parts";
 import { tildify } from "./derive";
+import { InlinePath } from "./inline-path";
 
 interface ModeChoice {
   id: string;
@@ -430,7 +431,7 @@ export function SpawnDialog({
                   }}
                   options={where.map((t) => ({ value: t, label: machineName(t) }))}
                 />
-                <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : shell ? "this shell" : undefined} />
+                {shell && <FolderChip value={cwd} onChange={setCwd} recent={recent} shellLabel={shellInfo ? shellInfo.title || "this shell" : "this shell"} />}
                 <Chip title="How many" label={`×${count}`} value={count} onPick={(n) => setCount(n)} options={COUNTS.map((n) => ({ value: n, label: n === 1 ? "1 agent" : `${n} agents` }))} />
                 {modes.length > 0 && (
                   <Chip
@@ -474,6 +475,7 @@ export function SpawnDialog({
               </div>
             )}
 
+            {!shell && target && <InlinePath target={target} value={cwd} onChange={setCwd} recent={recent} className="sp-path" />}
             {!noHarness && upgradeHint}
             {modeInfo && <div className="sp-hint">{modeInfo.hint}.</div>}
             {error && <div className="sp-error">{error}</div>}
