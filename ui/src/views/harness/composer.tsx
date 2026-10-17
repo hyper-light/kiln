@@ -138,7 +138,8 @@ export function Composer({
   React.useEffect(() => {
     setPalIndex(0);
     setPalClosed(false);
-    setNote(null);
+    // A new command name replaces an old note; clearing the field after one keeps it in view.
+    if (slash?.name) setNote(null);
   }, [slash?.name]);
   const typed = slash && !slash.typingName ? findCommand(commands, slash.name) : undefined;
 
