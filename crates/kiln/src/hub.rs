@@ -309,6 +309,11 @@ impl Hub {
         self.ai_ask(machine, move |req| ServerMsg::HarnessTaskOutput { req, session, task, since }).await
     }
 
+    /// A machine's past sessions (JSON `[PastSession]`).
+    pub async fn harness_history(&self, machine: &str, kind: Option<String>, limit: u32) -> anyhow::Result<Option<String>> {
+        self.ai_ask(machine, move |req| ServerMsg::HarnessHistory { req, kind, limit }).await
+    }
+
     async fn ai_ask(&self, machine: &str, msg: impl FnOnce(u64) -> ServerMsg) -> anyhow::Result<Option<String>> {
         let req = self.ai_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -568,7 +573,7 @@ impl Hub {
                     let _ = tx.send(json);
                 }
             }
-            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } => {
+            AgentMsg::AiView { req, json } | AgentMsg::HarnessTaskOutput { req, json } | AgentMsg::HarnessHistory { req, json } => {
                 if let Some(tx) = self.ai_requests.lock().remove(&req) {
                     let _ = tx.send(json);
                 }

@@ -256,6 +256,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "command"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -1351,6 +1352,25 @@ fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
     match q.get("target") {
         Some(t) => srv::json(StatusCode::OK, &all.get(t).cloned().unwrap_or_default()),
         None => srv::json(StatusCode::OK, &all),
+    }
+}
+
+/// A machine's past conversations to continue (`?target=local|agent:<name>`, `kind=claude|codex`,
+/// `limit=`): newest first; resume one with `spec.resume = id`.
+async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let target = q.get("target").map_or("local", String::as_str);
+    if target != "local" && target.strip_prefix("agent:").is_none_or(str::is_empty) {
+        return Err(err(StatusCode::BAD_REQUEST, "target is \"local\" or \"agent:<name>\""));
+    }
+    let kind = q.get("kind").filter(|k| !k.is_empty()).cloned();
+    if kind.as_deref().is_some_and(|k| k != "claude" && k != "codex") {
+        return Err(err(StatusCode::BAD_REQUEST, "kind is \"claude\" or \"codex\""));
+    }
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(50);
+    match hub.harness.history(hub, target, kind, limit).await {
+        Ok(Some(v)) => Ok(srv::json(StatusCode::OK, &v)),
+        Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
 }
 

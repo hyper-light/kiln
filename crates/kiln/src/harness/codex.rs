@@ -52,6 +52,8 @@ fn policy(mode: &str) -> (&'static str, &'static str, Value) {
 enum Pending {
     Initialize,
     Thread,
+    /// thread/turns/list: a resumed thread's history, page by page.
+    History,
     Turn(String),
     /// turn/steer for a message; the message itself (to send it as the next turn should the
     /// running one end first), unless kiln wrote it (feedback).
@@ -103,6 +105,9 @@ const OPEN_TRIES: u32 = 24;
 /// What the console shows meanwhile.
 const CATCHING_UP: &str = "Waiting for Codex to catch up with the conversation";
 const LETTING_GO: &str = "Waiting for Codex to let go of the conversation (it still holds it for the terminal it ran in)";
+
+/// Turns of a resumed thread's history loaded (the latest).
+const HISTORY_TURNS: u32 = 100;
 
 /// Why Codex cannot open a thread yet, when that passes.
 fn not_yet(msg: &str) -> Option<&'static str> {
@@ -1046,6 +1051,31 @@ impl Codex {
         self.show_sent(core, &m, d);
     }
 
+    /// Turns of a thread's history, as items.
+    fn replay(&mut self, core: &mut Core, turns: &[Value]) {
+        for turn in turns {
+            let tid = turn.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
+            for item in turn.get("items").and_then(Value::as_array).into_iter().flatten() {
+                if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+                    let key = item.get("clientId").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("").to_owned();
+                    self.turns.insert(key, tid.clone());
+                }
+                self.item(core, item, true);
+            }
+        }
+    }
+
+    /// The thread is open (with its history): ready for messages.
+    fn ready(&mut self, core: &mut Core) {
+        self.refresh_controls(core);
+        core.touch_state();
+        core.set_status(Status::Idle);
+        // The thread's own MCP connections (their runtime state).
+        self.ask_mcp(core);
+        self.compose_status(core);
+        self.next(core);
+    }
+
     /// The turn has its id: the queued messages to steer into it go in.
     fn steer_waiting(&mut self, core: &mut Core) {
         if self.turn.is_none() {
@@ -1204,6 +1234,10 @@ impl Codex {
                     self.notice(core, Level::Error, format!("Codex could not open the conversation: {msg}"));
                     core.set_status(Status::Idle);
                 }
+                Pending::History => {
+                    self.notice(core, Level::Warn, format!("Codex could not list the conversation's history: {msg}"));
+                    self.ready(core);
+                }
                 Pending::Models | Pending::Interrupt | Pending::Hooks | Pending::Account | Pending::RateLimits => {}
                 Pending::Skills => {
                     core.state.inventory.skills = Known::Ready;
@@ -1249,9 +1283,11 @@ impl Codex {
                 }
                 match (self.resume.clone(), self.fork_at.take()) {
                     // A branch: a new thread with that one's turns up to `at`.
+                    // (Its history comes after, page by page: thread/turns/list.)
                     (Some(t), Some(at)) => {
                         if let Some(o) = params.as_object_mut() {
                             o.insert("threadId".into(), json!(t));
+                            o.insert("excludeTurns".into(), json!(true));
                             if let Some(at) = at {
                                 o.insert("lastTurnId".into(), json!(at));
                             }
@@ -1261,6 +1297,7 @@ impl Codex {
                     (Some(t), None) => {
                         if let Some(o) = params.as_object_mut() {
                             o.insert("threadId".into(), json!(t));
+                            o.insert("excludeTurns".into(), json!(true));
                         }
                         self.open_thread(core, "thread/resume", params);
                     }
@@ -1305,24 +1342,28 @@ impl Codex {
                 if let Some(n) = thread.get("name").and_then(Value::as_str) {
                     core.state.title = n.to_owned();
                 }
-                // A resumed thread: its history, as items.
-                for turn in thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default() {
-                    let tid = turn.get("id").and_then(Value::as_str).unwrap_or("").to_owned();
-                    for item in turn.get("items").and_then(Value::as_array).cloned().unwrap_or_default() {
-                        if item.get("type").and_then(Value::as_str) == Some("userMessage") {
-                            let key = item.get("clientId").or_else(|| item.get("id")).and_then(Value::as_str).unwrap_or("").to_owned();
-                            self.turns.insert(key, tid.clone());
-                        }
-                        self.item(core, &item, true);
+                // A resumed thread's history: inline from a Codex that still sends it so, else
+                // its latest turns, listed (the session is ready once they are in).
+                let turns = thread.get("turns").and_then(Value::as_array).cloned().unwrap_or_default();
+                match (self.resume.is_some() && turns.is_empty(), thread.get("id").and_then(Value::as_str)) {
+                    (true, Some(id)) => {
+                        let id = id.to_owned();
+                        self.request(core, Pending::History, "thread/turns/list", json!({"threadId": id, "itemsView": "full", "sortDirection": "desc", "limit": HISTORY_TURNS}));
+                    }
+                    _ => {
+                        self.replay(core, &turns);
+                        self.ready(core);
                     }
                 }
-                self.refresh_controls(core);
-                core.touch_state();
-                core.set_status(Status::Idle);
-                // The thread's own MCP connections (their runtime state).
-                self.ask_mcp(core);
-                self.compose_status(core);
-                self.next(core);
+            }
+            Pending::History => {
+                let mut turns = result.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                turns.reverse();
+                if result.get("nextCursor").is_some_and(|c| !c.is_null()) {
+                    self.notice(core, Level::Info, format!("Earlier turns are not shown: the last {HISTORY_TURNS}."));
+                }
+                self.replay(core, &turns);
+                self.ready(core);
             }
             Pending::Turn(id) => {
                 if let Some(t) = result.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -2887,6 +2928,58 @@ mod tests {
         assert_eq!(args, ["mcp", "logout", "--", "web"]);
         c.run_done(&mut core, &job, Some(1), "not signed in");
         assert!(matches!(core.effects.pop(), Some(Effect::Run { args, .. }) if args == ["mcp", "remove", "--", "web"]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_resumed_thread_loads_its_latest_turns() -> anyhow::Result<()> {
+        let spec = super::super::session::Spec { kind: "codex".into(), resume: Some("th9".into()), ..Default::default() };
+        let mut c = Codex::from_spec(&spec);
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1 (Linux)"}));
+        let w = written(&mut core);
+        // Resumed without its history inline (Codex deprecates that for paginated threads).
+        let resume = w.iter().find(|v| v.get("method") == Some(&json!("thread/resume"))).cloned().unwrap_or_default();
+        assert_eq!(resume.pointer("/params/excludeTurns"), Some(&json!(true)));
+        respond(&mut c, &mut core, &w, "thread/resume", json!({"thread": {"id": "th9", "turns": []}, "model": "gpt-5", "cwd": "/work"}));
+        // Not ready until its history is in.
+        assert_eq!(core.state.status, Status::Starting);
+        let w = written(&mut core);
+        let list = w.iter().find(|v| v.get("method") == Some(&json!("thread/turns/list"))).cloned().unwrap_or_default();
+        assert_eq!(list.get("params"), Some(&json!({"threadId": "th9", "itemsView": "full", "sortDirection": "desc", "limit": 100})));
+        let turn = |t: &str, said: &str, reply: &str| json!({"id": t, "status": "completed", "items": [
+            {"type": "userMessage", "id": format!("u-{t}"), "content": [{"type": "text", "text": said}]},
+            {"type": "agentMessage", "id": format!("a-{t}"), "text": reply}
+        ]});
+        // Newest first, and more before them.
+        respond(&mut c, &mut core, &w, "thread/turns/list", json!({"data": [turn("t2", "second", "two"), turn("t1", "first", "one")], "nextCursor": "c1"}));
+        let said: Vec<String> = core
+            .events()
+            .filter_map(|e| match &e.body {
+                Body::User { text, .. } | Body::Assistant { text, .. } => Some(text.clone()),
+                Body::Notice { text, .. } => Some(format!("notice: {text}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said, vec!["notice: Earlier turns are not shown: the last 100.", "first", "one", "second", "two"]);
+        assert_eq!(core.state.status, Status::Idle);
+        // A rewind knows the listed turns.
+        assert_eq!(c.turns.get("u-t1").map(String::as_str), Some("t1"));
+        // A Codex that cannot list them: the session goes on without.
+        let mut c = Codex::from_spec(&spec);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1 (Linux)"}));
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "thread/resume", json!({"thread": {"id": "th9", "turns": []}, "model": "gpt-5", "cwd": "/work"}));
+        let w = written(&mut core);
+        let id = w.iter().find(|v| v.get("method") == Some(&json!("thread/turns/list"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"id": id, "error": {"code": -32601, "message": "unknown method"}})]);
+        assert_eq!(core.state.status, Status::Idle);
         Ok(())
     }
 

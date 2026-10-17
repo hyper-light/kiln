@@ -28,6 +28,7 @@ browsers watching it.
 | WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it) and `takeover` |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); see below |
+| GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,
 `events {events}` (upserts by id), `stream {id, text}` (text appended to a streaming event),
@@ -56,6 +57,31 @@ model, and answers with its `Info[]` (status `starting`). The machine starts the
 the old process has ended (up to 15 s; meanwhile `state.doing` says it is waiting); the session's
 history is loaded from the conversation. Errors: 404 (not found: it may have ended), 409
 (`outside`, `no_id`), 400 (`unsupported`).
+
+### Continuing a past session
+
+`GET /api/harness/history?target=local|agent:<name>&kind=claude|codex&limit=50` lists the
+conversations a machine keeps that are not running, read on that machine from its own
+transcripts (Claude Code's `projects/` in `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `sessions/`
+in `CODEX_HOME` or `~/.codex`): newest first, `kind` for one harness, `limit` up to 200 (50 by
+default). Each: `kind`, `id` (the harness's session or thread id), `title` (Claude Code's
+`/rename` or generated title, Codex's thread name; else the last prompt's first line), `cwd`,
+`branch?`, `model?`, `last_activity` (unix seconds of the transcript's last write),
+`last_prompt?` (clipped).
+
+Not listed: sessions running in a terminal (they are in `/api/ai-sessions`), Claude Code sessions
+with a live session record of any kind, and the conversations kiln's own agent sessions on that
+machine hold (running or not: they are in the agents list). A Codex thread's forks and later
+parts count once. Only the head and the tail of each transcript are read, again only when it
+changed. Errors: 400 (a bad `target` or `kind`), 404 (an ephemeral runner, which keeps none), 502
+(the machine is not connected or did not answer).
+
+Continue one with `POST /api/harness/sessions` and `spec: {kind, cwd, resume: id}` on the same
+target. Leave `model` unset: both harnesses keep the conversation's own. Its history is in the
+timeline when the session turns idle (Codex's latest 100 turns, listed with
+`thread/turns/list`; a notice says when earlier ones are not shown). Claude Code writes a
+`/rename` into its transcript with the next exchange: a name given just before the session ends
+is not kept.
 
 ## Commands
 
@@ -248,7 +274,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | | Claude Code | Codex | ACP (claude-agent-acp) | Gemini / opencode / Goose / Amp |
 |---|---|---|---|---|
 | start | ✓ | ✓ | ✓ | ? |
-| resume, with the history | ✓ | unit | unit (when the agent loads sessions) | ? |
+| resume, with the history | ✓ | ✓ (latest 100 turns, paged) | unit (when the agent loads sessions) | ? |
 | survives server and runner restarts | ✓ | ? | ? | ? |
 | send, queue | ✓ | ✓ | ✓ | ? |
 | steer into a running turn | ✓ | ✓ | — (waits for the turn) | — |
@@ -285,6 +311,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | monitors: events counted, the latest kept | unit (not offered to API-key sessions) | — | — | — |
 | pause / resume a task | — | — | — | — |
 | take over a session found running in a kiln terminal | ✓ | ✓ | — | — |
+| past sessions listed (`/api/harness/history`), continued with their history and model | ✓ | ✓ | — | — |
 | command catalog: every command with its route, aliases | ✓ | ✓ | ✓ | ? |
 | catalog commands kiln runs, answered to the asking console | ✓ (/btw /cost /export /plan /permissions /memory /git-diff) | ✓ (/goal /export /rollout /pwd) | ✓ (/export) | — |
 | /branch, /fork, /undo from the catalog | ✓ (/branch) | ✓ (/fork, /undo) | — | — |

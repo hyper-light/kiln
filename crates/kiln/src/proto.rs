@@ -63,6 +63,9 @@ pub enum AgentMsg {
     /// `None` when this machine has no such session. Appended last: postcard encodes variants by
     /// index.
     HarnessTaskOutput { req: u64, json: Option<String> },
+    /// Answer to [`ServerMsg::HarnessHistory`]: JSON `[`[`crate::aisessions::PastSession`]`]`,
+    /// `None` when this machine does not look. Appended last: postcard encodes variants by index.
+    HarnessHistory { req: u64, json: Option<String> },
 }
 
 /// A terminal session kept by an agent.
@@ -137,6 +140,10 @@ pub enum ServerMsg {
     /// one); answered by [`AgentMsg::HarnessTaskOutput`]. Appended last: postcard encodes
     /// variants by index.
     HarnessTaskOutput { req: u64, session: String, task: String, since: Option<u64> },
+    /// List this machine's past sessions (of one `kind`, or all), newest first, at most `limit`;
+    /// answered by [`AgentMsg::HarnessHistory`]. Appended last: postcard encodes variants by
+    /// index.
+    HarnessHistory { req: u64, kind: Option<String>, limit: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -580,6 +580,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             h.close(&session);
                         }
                     }
+                    ServerMsg::HarnessHistory { req, kind, limit } => match &ai {
+                        Some(ai) => {
+                            // Kiln's own sessions here are running, not past.
+                            let running = harness.as_ref().map(|h| h.list().into_iter().filter_map(|i| i.harness_session).collect()).unwrap_or_default();
+                            ai.history(req, kind, usize::try_from(limit).unwrap_or(usize::MAX), running, uplink.0.clone());
+                        }
+                        None => {
+                            uplink.0.send(Up::Term(AgentMsg::HarnessHistory { req, json: None })).await.ok();
+                        }
+                    },
                     ServerMsg::HarnessTaskOutput { req, session, task, since } => {
                         let s = harness.as_ref().and_then(|h| h.get(&session));
                         let up = uplink.0.clone();
