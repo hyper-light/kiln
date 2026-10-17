@@ -77,13 +77,21 @@ export interface AlwaysOption {
 export interface QuestionOption {
   label: string;
   description?: string;
+  /** Shown while the option is focused or picked (a mockup, a snippet). */
+  preview?: string;
 }
 
 export interface Question {
+  /** The harness's own id for it (Codex). */
+  id?: string;
   question: string;
   header?: string;
   multi?: boolean;
   options: QuestionOption[];
+  /** An answer in your own words is allowed (Claude always; Codex says). */
+  other?: boolean;
+  /** Mask what's typed. */
+  secret?: boolean;
 }
 
 export interface Approval {
