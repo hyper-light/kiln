@@ -52,6 +52,7 @@ pub fn token_path(cfg: &Config) -> PathBuf {
 }
 
 pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
+    crate::os::start_reaper();
     let cfg = Arc::new(cfg);
     std::fs::create_dir_all(&cfg.server.data_dir)
         .with_context(|| format!("create data dir {}", cfg.server.data_dir.display()))?;
