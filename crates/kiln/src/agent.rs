@@ -801,10 +801,54 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             fd.push(json);
                         }
                     }
-                    // CI (docs/ci.md §2.5). This runner announces none of the CI capabilities yet, so
-                    // a server never sends these; W06, W13 and W17 handle them when they land.
-                    ServerMsg::AssignV2 { .. }
-                    | ServerMsg::SecretsFor { .. }
+                    // A leg of the CI engine (docs/ci.md W06): this runner announces `CAP_CI2`.
+                    ServerMsg::AssignV2 { json } => {
+                        let mut a: kiln_ci::wire::AssignmentV2 = match serde_json::from_str(&json) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "an assignment this runner can't read");
+                                continue;
+                            }
+                        };
+                        let id = a.job_id.clone();
+                        let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
+                        if draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
+                            let reason = if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
+                            uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
+                            continue;
+                        }
+                        // Server-relative URLs go through the address this runner reached the server
+                        // at (NAT, NodePorts and cluster DNS all differ).
+                        let base = o.server_url.trim_end_matches('/').to_owned();
+                        let rt = &mut a.runtime;
+                        for u in [&mut rt.results_url, &mut rt.cache_url, &mut rt.facade_url, &mut rt.api_url, &mut rt.graphql_url] {
+                            if u == "/" {
+                                // The server itself (`GITHUB_SERVER_URL` has no trailing slash).
+                                u.clone_from(&base);
+                            } else if u.starts_with('/') {
+                                *u = format!("{base}{u}");
+                            }
+                        }
+                        if let Some(u) = rt.id_token_url.as_mut().filter(|u| u.starts_with('/')) {
+                            *u = format!("{base}{u}");
+                        }
+                        for act in a.actions.values_mut() {
+                            if act.url.starts_with('/') {
+                                act.url = format!("{base}{}", act.url);
+                            }
+                        }
+                        let cancel = Shutdown::new();
+                        jobs.insert(id.clone(), Running { cancel: cancel.clone() });
+                        tracing::info!(job = %id, leg = %a.leg.name, "running leg");
+                        let leg = crate::runner::runtime::Leg { a, work_dir: o.work_dir.clone(), runner_name: name.clone(), up: uplink.clone(), cancel, http: http.clone() };
+                        let done = done_tx.clone();
+                        crate::rt::spawn(async move {
+                            let result = leg.run().await;
+                            let _ = done.send(result).await;
+                        });
+                    }
+                    // The rest of CI's messages (W13, W17) land with their workstreams.
+                    ServerMsg::SecretsFor { .. }
                     | ServerMsg::JobTerminalOpen { .. }
                     | ServerMsg::KeepRelease { .. }
                     | ServerMsg::ProbeFacts => {

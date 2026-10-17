@@ -1,20 +1,27 @@
 /**
  * A plan's steps, written one by one: each a piece of the work with its description, examples,
- * acceptance criteria (when it's done; as goals, what its /goal checks) and testing (examples,
- * scenarios, criteria). One step open at a time; the others read as a line each, with which of
+ * acceptance criteria (each in words or a measure; as goals, what its /goal checks) and tests (each
+ * a scenario and what it passes by). One step open at a time; the others read as a line each, with which of
  * their parts are filled. In the page's flow; the console's own fields.
  */
 import * as React from "react";
 import { ArrowDown, ArrowUp, Plus } from "lucide-react";
 import { emptyItem, type PlanItem } from "@/api/plans";
+import { CriteriaEditor, TestsEditor } from "./criteria";
 import "./plans.css";
 
-const PARTS: { key: Exclude<keyof PlanItem, "title">; label: string; hint: string; rows: number }[] = [
+const PARTS: { key: "description" | "examples"; label: string; hint: string; rows: number }[] = [
   { key: "description", label: "Description", hint: "What to do. Markdown.", rows: 3 },
   { key: "examples", label: "Examples", hint: "What's meant, shown: inputs and outputs, before and after.", rows: 2 },
-  { key: "acceptance", label: "Acceptance criteria", hint: "When it's done. Run as goals, this is what each /goal checks.", rows: 2 },
-  { key: "testing", label: "Testing", hint: "How it's tested: examples, scenarios, criteria.", rows: 2 },
 ];
+
+/** Which of a step's parts are filled, as its line says them. */
+function filledParts(it: PlanItem): string[] {
+  const out = PARTS.filter((p) => it[p.key].trim()).map((p) => p.label.toLowerCase());
+  if (it.acceptance.length) out.push(`${it.acceptance.length} criteri${it.acceptance.length === 1 ? "on" : "a"}`);
+  if (it.testing.length) out.push(`${it.testing.length} test${it.testing.length === 1 ? "" : "s"}`);
+  return out;
+}
 
 export function PlanItemsEditor({ items, onChange, idPrefix }: { items: PlanItem[]; onChange: (items: PlanItem[]) => void; idPrefix: string }) {
   const [open, setOpen] = React.useState<number | null>(null);
@@ -42,7 +49,7 @@ export function PlanItemsEditor({ items, onChange, idPrefix }: { items: PlanItem
       {items.length > 0 && (
         <ol className="pi-list">
           {items.map((it, i) => {
-            const filled = PARTS.filter((p) => it[p.key].trim()).map((p) => p.label.toLowerCase());
+            const filled = filledParts(it);
             const isOpen = open === i;
             return (
               <li key={i} className="pi-item" data-open={isOpen ? "" : undefined}>
@@ -82,6 +89,16 @@ export function PlanItemsEditor({ items, onChange, idPrefix }: { items: PlanItem
                         <div className="field-hint">{p.hint}</div>
                       </div>
                     ))}
+                    <div>
+                      <div className="field-label">Acceptance criteria</div>
+                      <CriteriaEditor criteria={it.acceptance} onChange={(acceptance) => set(i, { acceptance })} idPrefix={`${idPrefix}-${i}-ac`} />
+                      <div className="field-hint">When it&rsquo;s done: each in words, or a measure against a threshold. Run as goals, this is what each /goal checks.</div>
+                    </div>
+                    <div>
+                      <div className="field-label">Tests</div>
+                      <TestsEditor tests={it.testing} onChange={(testing) => set(i, { testing })} idPrefix={`${idPrefix}-${i}-ts`} />
+                      <div className="field-hint">Each a scenario, and what it passes by.</div>
+                    </div>
                     <div className="pi-actions">
                       <button type="button" className="pi-text" onClick={() => setOpen(null)}>
                         Done
