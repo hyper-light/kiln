@@ -8,7 +8,7 @@ import { Link, useNavigate } from "react-router";
 import { ArrowLeft, ChevronDown, MoreHorizontal, Pause, Power, RotateCcw, SlidersHorizontal, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
 import { cn } from "@/lib/utils";
-import { money, tildify } from "./derive";
+import { costText, modelLabel, tildify } from "./derive";
 import { RoundButton } from "./figure/figure";
 import { LimitBadge } from "./limits";
 import { machineName, StateWord } from "./parts";
@@ -23,13 +23,27 @@ interface Option {
 }
 
 /** A chip that shows a setting and opens the native picker to change it. */
-function Chip({ label, value, options, onPick, empty }: { label: string; value: string; options: Option[]; onPick: (id: string, dangerous: boolean) => void; empty?: string }) {
+function Chip({
+  label,
+  value,
+  options,
+  onPick,
+  empty,
+  pretty = (v) => v,
+}: {
+  label: string;
+  value: string;
+  options: Option[];
+  onPick: (id: string, dangerous: boolean) => void;
+  empty?: string;
+  pretty?: (v: string) => string;
+}) {
   const cur = options.find((o) => o.id === value);
   const disabled = options.length === 0;
   return (
     <label className={cn("ag-chip", disabled && "ag-chip-off")} title={disabled ? empty : cur?.description}>
       <span className="ag-chip-label">{label}</span>
-      <span className="ag-chip-value">{cur?.label ?? (value || "—")}</span>
+      <span className="ag-chip-value">{cur?.label ?? (value ? pretty(value) : "—")}</span>
       {!disabled && <ChevronDown size={12} aria-hidden="true" />}
       <select
         aria-label={label}
@@ -40,7 +54,7 @@ function Chip({ label, value, options, onPick, empty }: { label: string; value: 
           if (o) onPick(o.id, Boolean(o.dangerous));
         }}
       >
-        {!options.some((o) => o.id === value) && <option value={value}>{value || "—"}</option>}
+        {!options.some((o) => o.id === value) && <option value={value}>{value ? pretty(value) : "—"}</option>}
         {options.map((o) => (
           <option key={o.id} value={o.id}>
             {o.label}
@@ -111,7 +125,11 @@ export function AgentHeader({
             <span className="ag-cwd" title={cwd}>
               {tildify(cwd)}
             </span>
-            {cost > 0 && <span className="ag-cost">{money(cost)}</span>}
+            {cost > 0 && (
+              <span className="ag-cost" title={costText(cost, state?.plan ?? info?.plan).title}>
+                {costText(cost, state?.plan ?? info?.plan).text}
+              </span>
+            )}
             <LimitBadge limits={state?.limits ?? info?.limits} onClick={onUsage} />
             {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
           </div>
@@ -148,7 +166,9 @@ export function AgentHeader({
           {features.includes("set_mode") && (
             <Chip label="Permissions" value={state?.mode ?? info?.mode ?? ""} options={meta?.modes ?? []} onPick={(m, dangerous) => (dangerous ? onRisky(m) : send({ type: "set_mode", mode: m }))} />
           )}
-          {features.includes("set_model") && <Chip label="Model" value={state?.model ?? info?.model ?? ""} options={meta?.models ?? []} onPick={(m) => send({ type: "set_model", model: m })} />}
+          {features.includes("set_model") && (
+            <Chip label="Model" value={state?.model ?? info?.model ?? ""} options={meta?.models ?? []} pretty={modelLabel} onPick={(m) => send({ type: "set_model", model: m })} />
+          )}
           {showEffort && (
             <Chip
               label="Effort"

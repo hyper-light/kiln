@@ -245,6 +245,9 @@ export interface State {
   mcp?: McpServer[];
   skills?: Skill[];
   plugins?: Plugin[];
+  /** The account's plan as the harness reports it ("Max", "Pro", "API key", …) and a stable account id. */
+  plan?: string;
+  account?: string;
   /** Which of those lists the harness has reported yet (servers that predate it omit this). */
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
 }

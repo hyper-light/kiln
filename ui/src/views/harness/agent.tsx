@@ -107,7 +107,7 @@ export default function AgentPage() {
           </button>
         </div>
       )}
-      <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} />
+      <Timeline events={events} state={state} meta={meta} cwd={cwd} parent={task ?? undefined} onOpenTask={openTask} onCommand={send} agentLabel={task ? "Subagent" : info?.kind_name} />
       <div className="hx-dock">
         {approvals.length > 0 && (
           <div className="hx-dock-approvals">

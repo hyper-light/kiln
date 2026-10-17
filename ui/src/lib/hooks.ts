@@ -151,3 +151,34 @@ export function useDocumentTitle(title: string) {
     document.title = title ? `${title} · kiln` : "kiln";
   }, [title]);
 }
+
+/**
+ * For a row that has to scroll sideways: marks which edges hide more (`data-scroll-edge` = start,
+ * end or both) so the stylesheet can fade them — a scroller you can see is a scroller. Use the
+ * returned callback as the element's ref.
+ */
+export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => void {
+  const cleanup = useRef<(() => void) | null>(null);
+  return useCallback((el: T | null) => {
+    cleanup.current?.();
+    cleanup.current = null;
+    if (!el) return;
+    const update = () => {
+      const max = el.scrollWidth - el.clientWidth;
+      const start = el.scrollLeft > 2;
+      const end = el.scrollLeft < max - 2;
+      const v = max <= 2 ? "" : start && end ? "both" : start ? "start" : end ? "end" : "";
+      if (v) el.dataset.scrollEdge = v;
+      else delete el.dataset.scrollEdge;
+    };
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    for (const c of Array.from(el.children)) ro.observe(c);
+    cleanup.current = () => {
+      el.removeEventListener("scroll", update);
+      ro.disconnect();
+    };
+  }, []);
+}
