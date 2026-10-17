@@ -97,13 +97,32 @@ const BEAM_LABELS: Record<BeamStatus, string> = {
 };
 
 /** A tool call's 30px signal: a prism rule with a travelling bead while running, collapsing into an outcome chip. */
+// hyperlight's mark (hyperlight-site lib/brand.ts): the open loop of light, and the refraction where it leaves.
+const LOOP = "M6.4 22.5C2.4 17.1 7.1 6.2 14 4.5C21.4 2.7 27.4 10.1 25.1 16.5C22.8 22.9 13.1 28.8 8.8 26.6";
+const TAIL = "M8.8 26.6C6.9 25.6 5.6 23.6 5.2 21.3";
+const PRISM = ["#b8d9d2", "#a6c4ed", "#b8a6d5", "#d6a2aa", "#d8cbb0"];
+
+/**
+ * A tool call's state, drawn as hyperlight's mark. While it runs, a short spectral segment travels
+ * the loop, changing hue as it goes, and leaves through the refraction. Once settled, the loop is
+ * drawn whole in the outcome's tone: broken for an error, dashed when denied, faint while pending.
+ */
 export function Beam({ status, className }: { status: BeamStatus; className?: string }) {
+  // One gradient per glyph; useId's punctuation isn't safe inside url(#…).
+  const gradient = `sg-trace-${React.useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
   return (
-    <span className={cn("sg-beam", className)} data-status={status} role="img" aria-label={BEAM_LABELS[status]}>
-      <span className="sg-beam-rule" />
-      <span className="sg-beam-dot" />
-      <span className="sg-beam-chip" />
-    </span>
+    <svg className={cn("sg-trace", className)} data-status={status} viewBox="0 0 32 32" role="img" aria-label={BEAM_LABELS[status]}>
+      <defs>
+        <linearGradient id={gradient} x1="5" y1="27" x2="27" y2="5" gradientUnits="userSpaceOnUse">
+          {PRISM.map((c, i) => (
+            <stop key={c} offset={i / (PRISM.length - 1)} stopColor={c} />
+          ))}
+        </linearGradient>
+      </defs>
+      <path className="sg-trace-loop" d={LOOP} pathLength={100} />
+      <path className="sg-trace-light" d={LOOP} pathLength={100} stroke={`url(#${gradient})`} />
+      <path className="sg-trace-tail" d={TAIL} />
+    </svg>
   );
 }
 
