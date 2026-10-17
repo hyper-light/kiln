@@ -1,15 +1,14 @@
 import * as React from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
-import { DropdownMenu, Switch } from "radix-ui";
-import { LayoutGrid, List, MoreHorizontal, Plus, Server, SquareTerminal, Trash2 } from "lucide-react";
+import { Switch } from "radix-ui";
+import { Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, HostSample, Job, RunnerInstance, RunnerUpdate } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
-import { EmptyState, ErrorState, Facts, Meter, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
+import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
+import { EmptyState, ErrorState, Facts, Meter, PageIntro, SelectField, Skeleton, SkeletonRows } from "@/components/ui/misc";
 import { Chips, StatusDot } from "@/components/ui/status";
-import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
@@ -21,7 +20,16 @@ import { useJoinData } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct, upsert } from "./shared";
 
-type Filter = "all" | "connected" | "draining";
+/** The facets runners are filtered by, with each runner's values. */
+function facetValues(a: Agent): Record<string, string[]> {
+  return { state: [agentStateLabel(a)], labels: a.labels, platform: [`${a.os}/${a.arch}`] };
+}
+
+const FACETS: { id: string; label: string }[] = [
+  { id: "state", label: "State" },
+  { id: "labels", label: "Labels" },
+  { id: "platform", label: "Platform" },
+];
 
 export function agentStatus(a: Agent) {
   return !a.connected ? "cancelled" : a.draining ? "timed_out" : a.busy > 0 ? "running" : "succeeded";
@@ -38,9 +46,8 @@ export default function Runners() {
   const agents = useResource((s) => api.agents(s), [], { pollMs: 30_000 });
   const [history, setHistory] = React.useState<Record<string, HostSample[]>>({});
   const [view, setView] = useLocalStorage<"table" | "cards">("kiln.agents.view", "table");
-  const [filter, setFilter] = React.useState<Filter>("all");
   const [q, setQ] = React.useState("");
-  const [forget, setForget] = React.useState<Agent | null>(null);
+  const [chosen, setChosen] = React.useState<Chosen>({});
   const selected = params.get("agent");
   const { requests: joinRequests, discovery } = useJoinData();
 
@@ -78,20 +85,43 @@ export default function Runners() {
   };
 
   const all = (agents.data ?? []).filter((a) => !a.ephemeral);
-  const counts: Record<Filter, number> = {
-    all: all.length,
-    connected: all.filter((a) => a.connected).length,
-    draining: all.filter((a) => a.draining).length,
-  };
+  const counts = { all: all.length, connected: all.filter((a) => a.connected).length };
   const ql = q.trim().toLowerCase();
+  const matches = (a: Agent) => {
+    const v = facetValues(a);
+    return Object.entries(chosen).every(([f, want]) => want.length === 0 || (v[f] ?? []).some((x) => want.includes(x)));
+  };
   const list = all
-    .filter((a) => (filter === "connected" ? a.connected : filter === "draining" ? a.draining : true))
+    .filter(matches)
     .filter((a) => !ql || `${a.name} ${a.hostname} ${a.labels.join(" ")}`.toLowerCase().includes(ql))
     .sort((a, b) => Number(b.connected) - Number(a.connected) || a.name.localeCompare(b.name));
+  const facets: Facet[] = FACETS.map((f) => {
+    const n = new Map<string, number>();
+    for (const a of all) for (const v of facetValues(a)[f.id] ?? []) n.set(v, (n.get(v) ?? 0) + 1);
+    return { id: f.id, label: f.label, options: [...n.entries()].sort((x, y) => x[0].localeCompare(y[0])).map(([id, count]) => ({ id, label: id, count })) };
+  }).filter((f) => f.options.length > 0);
 
   const slots = all.filter((a) => a.connected).reduce((s, a) => s + a.slots, 0);
   const busy = all.filter((a) => a.connected).reduce((s, a) => s + a.busy, 0);
-  const selAgent = all.find((a) => a.name === selected) ?? null;
+  const forget = async (a: Agent) => {
+    try {
+      await api.forgetAgent(a.name);
+      agents.setData((l) => l?.filter((x) => x.name !== a.name));
+      if (selected === a.name) openAgent(null);
+      toast({ title: `${a.name} forgotten`, tone: "info" });
+    } catch (e) {
+      toast.error("Forget failed", errorMessage(e));
+    }
+  };
+  const details = (a: Agent) => (
+    <AgentDetails
+      agent={a}
+      onClose={() => openAgent(null)}
+      onDrain={drain}
+      onForget={forget}
+      onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
+    />
+  );
 
   const openAgent = (name: string | null) => {
     const n = new URLSearchParams(params);
@@ -127,29 +157,19 @@ export default function Runners() {
       <JoinNotice requests={joinRequests.data} discovery={discovery.data} />
       <Upgrades />
 
-      <div className="mb-5 flex flex-wrap items-center gap-3">
-        <Segmented
-          label="Filter runners"
-          value={filter}
-          onChange={setFilter}
+      <div className="runners-tools">
+        <FacetBox className="runners-filter" label="Filter runners" placeholder="Filter by name, state, label, platform…" query={q} onQuery={setQ} facets={facets} chosen={chosen} onChosen={setChosen} />
+        <SelectField
+          className="runners-layout"
+          label="Layout"
+          hideLabel
+          value={view}
+          onChange={(v) => setView(v as "table" | "cards")}
           options={[
-            { value: "all", label: "All", count: counts.all },
-            { value: "connected", label: "Connected", count: counts.connected },
-            { value: "draining", label: "Draining", count: counts.draining },
+            { value: "table", label: "Table" },
+            { value: "cards", label: "Cards" },
           ]}
         />
-        <div className="ml-auto flex w-full items-center gap-2 sm:w-auto">
-          <SearchField className="min-w-0 flex-1 sm:w-56" label="Search runners" placeholder="Name, host, label…" value={q} onChange={setQ} />
-          <Segmented
-            label="Layout"
-            value={view}
-            onChange={setView}
-            options={[
-              { value: "table", label: <List size={14} aria-label="Table" /> },
-              { value: "cards", label: <LayoutGrid size={14} aria-label="Cards" /> },
-            ]}
-          />
-        </div>
       </div>
 
       {agents.error && !agents.data ? (
@@ -171,11 +191,14 @@ export default function Runners() {
           Run the join command on a machine to enroll it as a runner. With Kubernetes configured, kiln also launches a pod per job.
         </EmptyState>
       ) : list.length === 0 ? (
-        <EmptyState title="No runners match." action={<Button variant="secondary" onClick={() => { setFilter("all"); setQ(""); }}>Clear filters</Button>} />
+        <EmptyState title="No runners match." action={<Button variant="secondary" onClick={() => { setChosen({}); setQ(""); }}>Clear filters</Button>} />
       ) : view === "cards" ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
           {list.map((a) => (
-            <AgentMiniCard key={a.name} agent={a} history={history[a.name] ?? []} onOpen={() => openAgent(a.name)} />
+            <React.Fragment key={a.name}>
+              <AgentMiniCard agent={a} history={history[a.name] ?? []} onOpen={() => openAgent(a.name === selected ? null : a.name)} />
+              {selected === a.name && <div className="col-span-full">{details(a)}</div>}
+            </React.Fragment>
           ))}
         </div>
       ) : (
@@ -192,16 +215,25 @@ export default function Runners() {
                 <th className="num hidden xl:table-cell">Disk</th>
                 <th className="num hidden xl:table-cell">Load</th>
                 <th className="hidden md:table-cell">Drain</th>
-                <th className="w-0">
-                  <span className="sr-only">Actions</span>
+                <th className="hidden w-0 sm:table-cell">
+                  <span className="sr-only">Terminal</span>
                 </th>
               </tr>
             </thead>
             <tbody>
               {list.map((a) => {
                 const s = a.sample;
+                const open = selected === a.name;
+                const toggle = () => openAgent(open ? null : a.name);
                 return (
-                  <tr key={a.name} data-href tabIndex={0} onClick={(e) => !(e.target as HTMLElement).closest("button,a,[role=switch]") && openAgent(a.name)} onKeyDown={(e) => e.key === "Enter" && openAgent(a.name)}>
+                  <React.Fragment key={a.name}>
+                  <tr
+                    data-href
+                    tabIndex={0}
+                    aria-expanded={open}
+                    onClick={(e) => !(e.target as HTMLElement).closest("button,a,[role=switch]") && toggle()}
+                    onKeyDown={(e) => e.key === "Enter" && toggle()}
+                  >
                     <td>
                       <StatusDot status={agentStatus(a)} title={agentStateLabel(a)} />
                     </td>
@@ -231,10 +263,27 @@ export default function Runners() {
                     <td className="hidden md:table-cell">
                       <DrainSwitch agent={a} onChange={(v) => drain(a, v)} />
                     </td>
-                    <td className="text-right whitespace-nowrap">
-                      <AgentActions agent={a} onForget={() => setForget(a)} onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)} />
+                    <td className="hidden text-right whitespace-nowrap sm:table-cell">
+                      <Tip content={a.connected ? "Open terminal" : "Runner offline"}>
+                        <button
+                          className="icon-btn"
+                          data-variant="bare"
+                          data-size="sm"
+                          aria-label={`Open terminal on ${a.name}`}
+                          disabled={!a.connected}
+                          onClick={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
+                        >
+                          <SquareTerminal size={14} />
+                        </button>
+                      </Tip>
                     </td>
                   </tr>
+                  {open && (
+                    <tr className="runner-detail-row">
+                      <td colSpan={10}>{details(a)}</td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 );
               })}
             </tbody>
@@ -244,27 +293,6 @@ export default function Runners() {
 
       {agents.data && all.length > 0 && <FrontDoorSection agents={all} index="02" />}
 
-      <AgentDrawer agent={selAgent} onClose={() => openAgent(null)} onDrain={drain} onForget={(a) => setForget(a)} />
-      {forget && (
-        <ConfirmDialog
-          open
-          onOpenChange={(o) => !o && setForget(null)}
-          title={`Forget ${forget.name}?`}
-          description={forget.connected ? "The runner is connected; it will be disconnected and must re-enroll to come back." : "Removes the runner and its enrollment. It must re-enroll to come back."}
-          confirmLabel="Forget runner"
-          danger
-          onConfirm={async () => {
-            try {
-              await api.forgetAgent(forget.name);
-              agents.setData((l) => l?.filter((x) => x.name !== forget.name));
-              if (selected === forget.name) openAgent(null);
-              toast({ title: `${forget.name} forgotten`, tone: "info" });
-            } catch (e) {
-              toast.error("Forget failed", errorMessage(e));
-            }
-          }}
-        />
-      )}
     </div>
   );
 }
@@ -334,43 +362,21 @@ function DrainSwitch({ agent, onChange }: { agent: Agent; onChange: (v: boolean)
   );
 }
 
-function AgentActions({ agent, onForget, onTerminal }: { agent: Agent; onForget: () => void; onTerminal: () => void }) {
-  return (
-    <div className="inline-flex items-center">
-      <Tip content={agent.connected ? "Open terminal" : "Runner offline"}>
-        <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`Open terminal on ${agent.name}`} disabled={!agent.connected} onClick={onTerminal}>
-          <SquareTerminal size={14} />
-        </button>
-      </Tip>
-      <DropdownMenu.Root>
-        <DropdownMenu.Trigger asChild>
-          <button className="icon-btn" data-variant="bare" data-size="sm" aria-label={`More actions for ${agent.name}`}>
-            <MoreHorizontal size={15} />
-          </button>
-        </DropdownMenu.Trigger>
-        <DropdownMenu.Portal>
-          <DropdownMenu.Content className="popover" align="end" sideOffset={4}>
-            <DropdownMenu.Item className="menu-item" data-danger onSelect={onForget}>
-              <Trash2 size={14} /> Forget runner…
-            </DropdownMenu.Item>
-          </DropdownMenu.Content>
-        </DropdownMenu.Portal>
-      </DropdownMenu.Root>
-    </div>
-  );
-}
-
-function AgentDrawer({
+/** One runner in depth, open in the page under its row: what it is, what it runs, its last hour. */
+function AgentDetails({
   agent,
   onClose,
   onDrain,
   onForget,
+  onTerminal,
 }: {
-  agent: Agent | null;
+  agent: Agent;
   onClose: () => void;
   onDrain: (a: Agent, v: boolean) => void;
-  onForget: (a: Agent) => void;
+  onForget: (a: Agent) => Promise<void>;
+  onTerminal: () => void;
 }) {
+  const [forgetting, setForgetting] = React.useState(false);
   const [samples, setSamples] = React.useState<HostSample[] | null>(null);
   const [err, setErr] = React.useState<string | null>(null);
   const [jobs, setJobs] = React.useState<Job[]>([]);
@@ -405,27 +411,53 @@ function AgentDrawer({
     if (ev.type === "sample" && ev.agent === name) setSamples((s) => (s ? [...s, ev.sample].slice(-720) : s));
   });
 
-  const s = agent?.sample;
+  const s = agent.sample;
   return (
-    <Dialog open={Boolean(agent)} onOpenChange={(o) => !o && onClose()}>
-      {agent && (
-        <DialogContent variant="drawer" title={agent.name} eyebrow={`Runner · ${agentStateLabel(agent)}`} description={`${agent.hostname} · ${agent.os}/${agent.arch} · kiln v${agent.version}`}>
+    <section className="runner-details" aria-label={`${agent.name} in depth`}>
+      <div className="runner-details-head">
+        <div className="min-w-0">
+          <div className="runner-details-eyebrow">Runner · {agentStateLabel(agent)}</div>
+          <h3>{agent.name}</h3>
+          <p>
+            {agent.hostname} · {agent.os}/{agent.arch} · kiln v{agent.version}
+          </p>
+        </div>
+        <Button size="xs" variant="ghost" onClick={onClose} aria-label={`Close ${agent.name}`}>
+          <X /> Close
+        </Button>
+      </div>
           <div className="flex flex-wrap items-center gap-2">
             <Chips labels={agent.labels} max={12} />
           </div>
-          <div className="mt-5 flex flex-wrap gap-2">
-            <Button asChild variant="secondary" size="sm" aria-disabled={!agent.connected}>
-              <Link to={`/terminal?open=${encodeURIComponent(`agent:${agent.name}`)}`}>
-                <SquareTerminal /> Open terminal
-              </Link>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal}>
+              <SquareTerminal /> Open terminal
             </Button>
-            <Button variant="ghost" size="sm" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
+            <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
               {agent.draining ? "Resume scheduling" : "Drain"}
             </Button>
-            <Button variant="ghost" size="sm" className="text-[#d1aaad]" onClick={() => onForget(agent)}>
-              <Trash2 /> Forget
-            </Button>
+            {!forgetting && (
+              <Button variant="ghost" size="xs" className="text-[#d1aaad]" onClick={() => setForgetting(true)}>
+                <Trash2 /> Forget
+              </Button>
+            )}
           </div>
+          {forgetting && (
+            <div className="runner-up-confirm mt-3" role="group" aria-label={`Forget ${agent.name}`}>
+              <p>
+                Forget {agent.name}?{" "}
+                {agent.connected ? "It is connected: it will be disconnected and must enroll again to come back." : "Its enrollment is removed: it must enroll again to come back."}
+              </p>
+              <div className="runner-up-actions">
+                <Button size="xs" variant="danger" onClick={() => void onForget(agent).finally(() => setForgetting(false))}>
+                  Forget runner
+                </Button>
+                <Button size="xs" variant="ghost" onClick={() => setForgetting(false)}>
+                  Keep it
+                </Button>
+              </div>
+            </div>
+          )}
 
           <UpgradeNote agent={agent} detailed />
 
@@ -465,11 +497,9 @@ function AgentDrawer({
 
           <div className="mt-8">
             <div className="label mb-3">Last hour · 5 s resolution</div>
-            {err ? <ErrorState error={err} compact /> : !samples ? <Skeleton className="h-64 w-full" /> : samples.length < 2 ? <p className="text-[12.5px] text-[#8f939e]">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={1} />}
+            {err ? <ErrorState error={err} compact /> : !samples ? <Skeleton className="h-64 w-full" /> : samples.length < 2 ? <p className="text-[12.5px] text-[#8f939e]">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={2} />}
           </div>
-        </DialogContent>
-      )}
-    </Dialog>
+    </section>
   );
 }
 
