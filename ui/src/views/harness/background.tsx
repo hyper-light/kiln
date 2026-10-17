@@ -10,7 +10,7 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { duration, tildify } from "./derive";
-import { Optic } from "./signals";
+import { glyphKind, KindGlyph, type GlyphKind } from "./kind-glyph";
 
 const BACKGROUND = new Set(["shell", "monitor", "mcp"]);
 /** What a task is; machines from before `class` only say the harness's own task type. */
@@ -174,12 +174,25 @@ export function ActivityLine({ state, agent, onOpenTask }: { state: State | null
   const shells = bg.filter((t) => classOf(t) === "shell").length;
   const monitors = bg.filter((t) => classOf(t) === "monitor").length;
   const other = bg.length - shells - monitors;
-  const summary = [count(subs.length, "subagent"), count(shells, "shell"), count(monitors, "monitor"), count(other, "background call")].filter(Boolean).join(" · ");
+  // One glyph per kind, so the line says what is running at a glance.
+  const segments: { kind: GlyphKind; text: string; live: boolean }[] = [
+    { kind: "agent" as const, text: count(subs.length, "subagent"), live: subs.some((t) => t.status === "running") },
+    { kind: "shell" as const, text: count(shells, "shell"), live: true },
+    { kind: "monitor" as const, text: count(monitors, "monitor"), live: true },
+    { kind: "mcp" as const, text: count(other, "background call"), live: true },
+  ].filter((s) => s.text);
   return (
     <div className="al" data-open={open || undefined}>
       <button type="button" className="al-line" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <Optic state="tool" />
-        <span className="al-summary">{summary}</span>
+        <span className="al-summary">
+          {segments.map((s, i) => (
+            <span key={s.kind} className="al-seg">
+              {i > 0 && <span className="al-sep">·</span>}
+              <KindGlyph kind={s.kind} live={s.live} />
+              {s.text}
+            </span>
+          ))}
+        </span>
         <ChevronRight size={12} className={cn("al-chev", open && "rotate-90")} aria-hidden="true" />
       </button>
       {open && (
@@ -199,7 +212,7 @@ export function ActivityLine({ state, agent, onOpenTask }: { state: State | null
                     else setShown(shown === t.id ? null : t.id);
                   }}
                 >
-                  <Optic state={t.status === "pending" ? "thinking" : "tool"} />
+                  <KindGlyph kind={isSub ? "agent" : glyphKind(classOf(t))} live={t.status === "running"} pending={t.status === "pending"} />
                   <span className="al-what">
                     {mixed && <span className="al-kind">{isSub ? "Subagent" : (WORD[classOf(t)] ?? classOf(t))}</span>}
                     <span className="al-desc">{t.description || t.command || t.id}</span>

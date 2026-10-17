@@ -1002,8 +1002,18 @@
   padding: 8px max(16px, env(safe-area-inset-right)) 8px 4px;
   text-align: left;
 }
-.al-row > .sg-optic {
+.al-row > .sg-optic,
+.al-row > .kg {
   grid-area: glyph;
+}
+.al-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.al-sep {
+  margin: 0 8px;
+  color: #6d7078;
 }
 .al-what {
   grid-area: what;
