@@ -153,25 +153,28 @@ export function SpawnDialog({
             <span className="hx-eyebrow">Agent</span>
             <div className="hx-kinds">
               {byTarget === null && <span className="hx-dim text-[12px]">Looking at your machines…</span>}
-              {byTarget !== null && all.length === 0 && (
+              {byTarget !== null && !all.some((k) => k.available) && (
                 <span className="hx-dim text-[12px]">No connected machine has a coding agent installed. Install Claude Code or Codex on any machine running kiln, then try again.</span>
               )}
-              {all.map((k) => (
-                <button
-                  key={k.id}
-                  type="button"
-                  className="hx-kind"
-                  aria-pressed={kind === k.id}
-                  disabled={!k.available}
-                  onClick={() => setKind(k.id)}
-                  title={k.available ? undefined : "Not installed on any connected machine"}
-                >
-                  <HarnessMark kind={k.id} name={k.name} size={20} />
-                  <span>{k.name}</span>
-                  {!k.verified && <span className="hx-tag">untested</span>}
-                </button>
-              ))}
+              {all
+                .filter((k) => k.available)
+                .map((k) => (
+                  <button key={k.id} type="button" className="hx-kind" aria-pressed={kind === k.id} onClick={() => setKind(k.id)}>
+                    <HarnessMark kind={k.id} name={k.name} size={20} />
+                    <span>{k.name}</span>
+                    {!k.verified && <span className="hx-tag">untested</span>}
+                  </button>
+                ))}
             </div>
+            {all.some((k) => !k.available) && (
+              <span className="hx-dim text-[11px]">
+                Not installed on any connected machine:{" "}
+                {all
+                  .filter((k) => !k.available)
+                  .map((k) => k.name)
+                  .join(", ")}
+              </span>
+            )}
           </div>
 
           {where.length > 0 && (
