@@ -66,6 +66,7 @@ console picks) and are answered with a `reply` update to that client.
 |---|---|---|
 | `send` | `id, text, mode: "queue"\|"steer"\|"now", attachments?, overrides?: {model?, effort?}` | `state.delivery[id]`: queued → sent → started → completed / cancelled |
 | `queue_edit` / `queue_remove` / `queue_move` / `queue_send_now` | `id` (+ `text` / `index`) | |
+| `queue_steer` | `id` | the queued message goes into the running turn as steering, without interrupting it (sent as the next turn when none runs); feature `"queue_steer"` (Claude Code, Codex; ACP cannot steer) |
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, choices?` (or the older `answers?`) | see "Questions" below |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
@@ -251,6 +252,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | survives server and runner restarts | ✓ | ? | ? | ? |
 | send, queue | ✓ | ✓ | ✓ | ? |
 | steer into a running turn | ✓ | ✓ | — (waits for the turn) | — |
+| a queued message steered in (`queue_steer`) | ✓ | ✓ | — | — |
 | send now | ✓ | ✓ | unit | ? |
 | interrupt | ✓ | ✓ | ✓ | ? |
 | approvals, always-allow, deny with feedback | ✓ | ✓ | ✓ (allow) | ? |
