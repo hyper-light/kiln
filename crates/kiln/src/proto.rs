@@ -20,6 +20,9 @@ pub const LANE_LOGS: u32 = 2;
 /// Repo sync's lane (`crate::sync`): a queue of its own, so a burst of sync never sheds a job's or a
 /// terminal's frames.
 pub const LANE_SYNC: u32 = 3;
+/// Reach's lane (`crate::reach`): links between runners, relayed by the server. Interactive class:
+/// a remote command's output must not queue behind job logs.
+pub const LANE_REACH: u32 = 4;
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -104,6 +107,18 @@ pub enum AgentMsg {
     /// when asked ([`ServerMsg::ProbeFacts`]); only from runners announcing [`CAP_FACTS`].
     /// Appended last: postcard encodes variants by index.
     Facts { json: String },
+    /// Reach (`crate::reach`, on [`LANE_REACH`]): a frame of a link to runner `to`, for the server
+    /// to relay. `data` is the link's ciphertext; `open` on a link's first frame; `close` ends the
+    /// link (with why). Only from runners announcing [`CAP_REACH`]. Appended last: postcard
+    /// encodes variants by index.
+    Reach { to: String, link: String, open: bool, data: Vec<u8>, close: Option<String> },
+    /// Reach: this runner's identity and whether it takes links (JSON
+    /// [`crate::reach::relay::Announce`]). Sent on every (re)connect. Appended last: postcard
+    /// encodes variants by index.
+    ReachHello { json: String },
+    /// Reach: a question for the server (JSON `{"op": "directory"}`), answered by
+    /// [`ServerMsg::ReachAnswer`]. Appended last: postcard encodes variants by index.
+    ReachAsk { req: u64, json: String },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -140,6 +155,8 @@ pub const CAP_SHARDS: u32 = 1 << 14;
 pub const CAP_FACTS: u32 = 1 << 15;
 /// The runner opens terminals into legs ([`ServerMsg::JobTerminalOpen`], docs/ci.md W17).
 pub const CAP_JOB_TTY: u32 = 1 << 16;
+/// The runner takes reach links ([`ServerMsg::Reach`], `crate::reach`).
+pub const CAP_REACH: u32 = 1 << 17;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -265,6 +282,13 @@ pub enum ServerMsg {
     /// CI: send [`AgentMsg::Facts`] now. Only to runners announcing [`CAP_FACTS`]. Appended last:
     /// postcard encodes variants by index.
     ProbeFacts,
+    /// Reach (`crate::reach`, on [`LANE_REACH`]): a frame of a link from runner `from` (the name
+    /// its certificate carries), as [`AgentMsg::Reach`]. Only to runners announcing [`CAP_REACH`].
+    /// Appended last: postcard encodes variants by index.
+    Reach { from: String, link: String, open: bool, data: Vec<u8>, close: Option<String> },
+    /// Reach: the answer to [`AgentMsg::ReachAsk`] (JSON). Appended last: postcard encodes
+    /// variants by index.
+    ReachAnswer { req: u64, json: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -801,6 +801,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
+                    ServerMsg::Reach { .. } | ServerMsg::ReachAnswer { .. } => {}
                     ServerMsg::Sync { json, raft } => {
                         if let Some(s) = &sync {
                             s.heard(&json, raft);

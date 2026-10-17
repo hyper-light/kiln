@@ -799,6 +799,7 @@ impl Hub {
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable runner facts"),
             },
+            AgentMsg::Reach { .. } | AgentMsg::ReachHello { .. } | AgentMsg::ReachAsk { .. } => {}
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
