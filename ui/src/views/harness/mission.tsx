@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import "./harness.css";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate, useSearchParams } from "react-router";
 import { Check, CheckSquare, Plus, Send, Square, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
@@ -252,6 +252,15 @@ export default function Mission() {
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const now = useNow();
   const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
+  // ?new=1 (links from elsewhere): open New agents.
+  React.useEffect(() => {
+    if (params.get("new") !== "1") return;
+    setSpawn(true);
+    const n = new URLSearchParams(params);
+    n.delete("new");
+    setParams(n, { replace: true });
+  }, [params, setParams]);
 
   React.useEffect(() => {
     api.aiSessions().then(setFound, () => undefined);
@@ -288,7 +297,7 @@ export default function Mission() {
   return (
     <div className="container-console page hx-mission">
       <PageIntro
-        index={4}
+        index={5}
         label="Agents"
         title="Mission control"
         lead={

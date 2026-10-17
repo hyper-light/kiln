@@ -3,14 +3,14 @@ import { Link, useNavigate, useSearchParams } from "react-router";
 import { Bot, FileText, Plus, SquareTerminal } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, AiSession, AiTranscriptEntry } from "@/api/types";
+import type { AiSession, AiTranscriptEntry } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { EmptyState, ErrorState, Facts, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
 import { absoluteTime } from "@/lib/format";
-import { errorMessage, useDocumentTitle, useLocalStorage, useResource } from "@/lib/hooks";
+import { errorMessage, useDocumentTitle, useResource } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { RelTime } from "./shared";
 
@@ -36,15 +36,6 @@ const terminalLink = (s: AiSession) =>
 /** A home directory as "~". */
 function tildify(path: string) {
   return path.replace(/^\/(?:home|Users)\/[^/]+(?=\/|$)/, "~");
-}
-
-/** What a new agent's terminal runs: the tool in its folder, then a login shell once it exits. */
-function launchCommand(command: string, dir: string, windows: boolean) {
-  if (windows) return command;
-  const d = dir.trim() || "~";
-  const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-  const cd = d === "~" ? "cd ~" : d.startsWith("~/") ? `cd ~/${quote(d.slice(2))}` : `cd ${quote(d)}`;
-  return `${cd} && ${command}; exec $SHELL -l`;
 }
 
 /** Call `fn` at most once per `ms`, trailing. */
@@ -77,21 +68,12 @@ export default function Agents() {
   const sessions = useResource((s) => api.aiSessions(s), [], { pollMs: 20_000 });
   const [filter, setFilter] = React.useState<Filter>("all");
   const [q, setQ] = React.useState("");
-  const [newOpen, setNewOpen] = React.useState(params.get("new") === "1");
   const selected = params.get("session");
 
   // Links from before CI machines were called runners.
   React.useEffect(() => {
     if (params.has("agent") || params.has("join")) navigate(`/runners?${params.toString()}`, { replace: true });
   }, [params, navigate]);
-  React.useEffect(() => {
-    if (params.get("new") === "1") {
-      setNewOpen(true);
-      const n = new URLSearchParams(params);
-      n.delete("new");
-      setParams(n, { replace: true });
-    }
-  }, [params, setParams]);
 
   const reload = useThrottled(sessions.reload, 1000);
   useServerEvents((ev) => {
@@ -124,17 +106,17 @@ export default function Agents() {
       <PageIntro
         index={5}
         label="Agents"
-        title="Live sessions"
+        title="Sessions on your machines"
         lead={
           <>
             {sessions.data ? `${all.length} running · ${working} working · ${waiting} waiting for you. ` : ""}
-            Claude Code, Codex and Gemini sessions on your machines. Ones started in kiln can be driven from any device; ones started elsewhere show a
-            live, read-only transcript.
+            Claude Code, Codex and Gemini sessions running in terminals on your machines, found automatically, with a live read-only transcript. Agents kiln
+            runs itself are in Mission control.
           </>
         }
         actions={
-          <Button onClick={() => setNewOpen(true)}>
-            <Plus /> New agent
+          <Button onClick={() => navigate("/agents?new=1")}>
+            <Plus /> New agents
           </Button>
         }
       />
@@ -162,13 +144,13 @@ export default function Agents() {
           icon={<Bot size={24} />}
           title="No AI sessions are running."
           action={
-            <Button variant="secondary" onClick={() => setNewOpen(true)}>
-              <Plus /> New agent
+            <Button variant="secondary" onClick={() => navigate("/agents?new=1")}>
+              <Plus /> New agents
             </Button>
           }
         >
-          Start Claude Code, Codex or Gemini here and drive it from any device. Sessions you start in your own terminals on a machine with a kiln runner
-          show up here too.
+          Sessions you start in your own terminals, on any machine with a kiln runner, show up here. To start agents kiln runs and you steer from any
+          device, use New agents.
         </EmptyState>
       ) : list.length === 0 ? (
         <EmptyState
@@ -193,7 +175,6 @@ export default function Agents() {
         </div>
       )}
 
-      <NewAgentDialog open={newOpen} onOpenChange={setNewOpen} />
       <TranscriptDrawer session={open} onClose={() => select(null)} />
     </div>
   );
@@ -362,126 +343,5 @@ function EntryView({ e }: { e: AiTranscriptEntry }) {
       {user && <div className="label mb-1">Prompt</div>}
       {e.text}
     </div>
-  );
-}
-
-function NewAgentDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
-  const navigate = useNavigate();
-  const [machines, setMachines] = React.useState<Agent[] | null>(null);
-  const [machine, setMachine] = useLocalStorage<string>("kiln.agents.new.machine", "");
-  const [toolId, setToolId] = useLocalStorage<string>("kiln.agents.new.tool", CLAUDE.id);
-  const [dirs, setDirs] = useLocalStorage<Record<string, string>>("kiln.agents.new.dirs", {});
-  const [busy, setBusy] = React.useState(false);
-  const [err, setErr] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    if (!open) return;
-    setErr(null);
-    const ctl = new AbortController();
-    api
-      .agents(ctl.signal)
-      .then((l) => setMachines(l.filter((a) => a.connected && !a.ephemeral)))
-      .catch((e) => !ctl.signal.aborted && setErr(errorMessage(e)));
-    return () => ctl.abort();
-  }, [open]);
-
-  const target = machines?.find((m) => m.name === machine) ?? machines?.[0] ?? null;
-  const tool = TOOLS.find((t) => t.id === toolId) ?? CLAUDE;
-  const windows = target?.os === "windows";
-  const dir = target ? (dirs[target.name] ?? "~") : "~";
-
-  const start = async () => {
-    if (!target) return;
-    setBusy(true);
-    setErr(null);
-    try {
-      const info = await api.createTerminalSession({ target: `agent:${target.name}`, cmd: launchCommand(tool.command, dir, windows) });
-      onOpenChange(false);
-      navigate(`/terminal?session=${encodeURIComponent(info.id)}&target=${encodeURIComponent(info.target)}`);
-    } catch (e) {
-      setErr(errorMessage(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        title="New agent"
-        eyebrow="Agents / New"
-        description="Runs in a persistent kiln terminal: it keeps going when you close the tab or lose the connection, and any device can pick it up again."
-        className="!w-[min(560px,calc(100vw-24px))]"
-      >
-        {machines === null && !err ? (
-          <Skeleton className="h-40 w-full" />
-        ) : machines !== null && machines.length === 0 ? (
-          <p className="text-[12.5px] leading-relaxed text-[#8f939e]">
-            No runner is connected. Agents run on runners;{" "}
-            <Link to="/runners?join=1" className="text-link" onClick={() => onOpenChange(false)}>
-              add one
-            </Link>{" "}
-            first.
-          </p>
-        ) : (
-          <form
-            className="space-y-5"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void start();
-            }}
-          >
-            <div>
-              <span className="field-label label">Agent</span>
-              <Segmented label="Agent" value={tool.id} onChange={setToolId} options={TOOLS.map((t) => ({ value: t.id, label: t.label }))} />
-            </div>
-            <label className="block">
-              <span className="field-label label">Machine</span>
-              <span className="field">
-                <select
-                  className="min-h-[38px] w-full min-w-0 bg-transparent pr-3 text-[12.5px] text-[#e3e4e9] outline-none"
-                  value={target?.name ?? ""}
-                  onChange={(e) => setMachine(e.target.value)}
-                >
-                  {(machines ?? []).map((m) => (
-                    <option key={m.name} value={m.name} className="bg-[#101217]">
-                      {m.name} · {m.hostname} · {m.os}/{m.arch}
-                    </option>
-                  ))}
-                </select>
-              </span>
-            </label>
-            {!windows && (
-              <label className="block">
-                <span className="field-label label">Folder</span>
-                <span className="field">
-                  <input
-                    value={dir}
-                    onChange={(e) => target && setDirs({ ...dirs, [target.name]: e.target.value })}
-                    placeholder="~ or /path/to/project"
-                    autoCapitalize="off"
-                    autoCorrect="off"
-                    spellCheck={false}
-                    className="font-mono"
-                  />
-                </span>
-                <span className="mt-1.5 block text-[11.5px] leading-relaxed text-[#8f939e]">
-                  Where {tool.label} works. When it exits, the terminal stays open there.
-                </span>
-              </label>
-            )}
-            {err && <ErrorState error={err} compact />}
-            <div className="flex justify-end gap-2">
-              <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={busy || !target}>
-                <Bot /> {busy ? "Starting…" : `Start ${tool.label}`}
-              </Button>
-            </div>
-          </form>
-        )}
-      </DialogContent>
-    </Dialog>
   );
 }
