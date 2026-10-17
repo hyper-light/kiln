@@ -4,13 +4,21 @@
 #
 #   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Token <join-token> [-Labels windows] [-Name box1] [-Slots 4]
 #   $env:KILN_JOIN_TOKEN = '<join-token>'; irm @@KILN_SERVER@@/install.ps1 | iex
+#
+# Without a token (or with -Join) it asks the server to take this machine instead (`kiln join`):
+# it prints a verification code, an admin approves the machine in the UI (Agents -> Waiting to
+# join) after comparing it, and the agent is installed the same way.
+#
+#   irm @@KILN_SERVER@@/install.ps1 | iex
+#   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Join [-Labels windows] [-Name box1]
 param(
   [string]$Token = $env:KILN_JOIN_TOKEN,
   [string]$Server = $(if ($env:KILN_SERVER) { $env:KILN_SERVER } else { '@@KILN_SERVER@@' }),
   [string]$Labels = $env:KILN_LABELS,
   [string]$Name = $env:KILN_AGENT_NAME,
   [string]$Slots = $env:KILN_SLOTS,
-  [string]$Quic = $env:KILN_QUIC
+  [string]$Quic = $env:KILN_QUIC,
+  [switch]$Join = ($env:KILN_JOIN -eq '1')
 )
 $ErrorActionPreference = 'Stop'
 # Invoke-WebRequest's progress bar makes downloads very slow in Windows PowerShell 5.1.
@@ -46,6 +54,17 @@ try {
   if (Test-Path $tmp) { Remove-Item -Force $tmp }
 }
 Write-Host "kiln ($target) installed to $exe"
+
+if ($Join -or -not $Token) {
+  # No token: ask to join; it waits for an admin to approve the code it prints, then installs.
+  $joinArgs = @('join', '--server', $Server)
+  if ($Labels) { $joinArgs += @('--labels', $Labels) }
+  if ($Name) { $joinArgs += @('--name', $Name) }
+  if ($Slots) { $joinArgs += @('--slots', $Slots) }
+  & $exe @joinArgs
+  if ($LASTEXITCODE -ne 0) { throw "kiln join failed (exit code $LASTEXITCODE)" }
+  return
+}
 
 $installArgs = @('install', '--agent', '--unattended', '--server', $Server)
 if ($Token) { $installArgs += @('--token', $Token) }

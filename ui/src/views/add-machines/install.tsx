@@ -86,7 +86,7 @@ export function InstallSection({
 function Alternatives({ info, os }: { info: JoinInfo | undefined; os: InstallOs }) {
   const [open, setOpen] = React.useState<"k8s" | "ask" | null>(null);
   const id = React.useId();
-  const ask = info ? [os !== "windows" ? info.join : undefined, info.join_manual].filter((c): c is string => Boolean(c)) : [];
+  const ask = info ? [os === "windows" ? info.join_windows : info.join, info.join_manual].filter((c): c is string => Boolean(c)) : [];
   const trigger = (key: "k8s" | "ask", label: string) => (
     <button type="button" className="am-fold" aria-expanded={open === key} aria-controls={`${id}-${key}`} onClick={() => setOpen(open === key ? null : key)}>
       <ChevronRight size={13} aria-hidden="true" />
