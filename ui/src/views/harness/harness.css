@@ -550,11 +550,20 @@ textarea.hx-input {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 16px;
+  /* One line, the same height whatever the subagent's description: it alone gives way. */
+  min-height: 44px;
+  padding: 6px 16px;
   border-bottom: 1px solid #1d1f23;
   background: #0d0c12;
   font-size: 12px;
   color: var(--color-secondary);
+}
+.hx-crumbs > * {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.hx-crumbs > .hx-trunc {
+  flex: 1 1 0;
 }
 
 /* Find in the conversation: a bar over it, in its flow like the crumbs; the matches are painted in
