@@ -15,6 +15,7 @@ import { DiffStat, FileDiffView } from "./diff";
 import { TurnMenu } from "./controls";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
+import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { Beam, PrismLabel, ThinkingBody, ThinkingHead, type BeamStatus } from "./signals";
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
@@ -138,11 +139,18 @@ function PlanBody({ calls }: { calls: ToolEvent[] }) {
   if (!last) return null;
   if (last.tool === "plan") {
     const plan = (last.input as { plan?: string } | null)?.plan ?? last.output ?? last.title;
-    return <Prose text={plan} className="hx-plan-text" ev={last.id} />;
+    return (
+      <>
+        <Prose text={plan} className="hx-plan-text" ev={last.id} />
+        <SavePlan body={plan} />
+      </>
+    );
   }
+  const todos = last.todos ?? [];
   return (
     <div data-ev={last.id}>
-      <TodoList todos={last.todos ?? []} />
+      <TodoList todos={todos} />
+      {todos.length > 0 && <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />}
     </div>
   );
 }

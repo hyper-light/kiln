@@ -17,6 +17,9 @@ const RunDetail = React.lazy(() => import("@/views/run-detail/index"));
 const Deployments = React.lazy(() => import("@/views/deployments/index"));
 const DeploymentApp = React.lazy(() => import("@/views/deployments/app"));
 const Repos = React.lazy(() => import("@/views/repos"));
+const Plans = React.lazy(() => import("@/views/plans/index"));
+const PlanPage = React.lazy(() => import("@/views/plans/plan"));
+const SharedPlan = React.lazy(() => import("@/views/plans/shared"));
 const Runners = React.lazy(() => import("@/views/runners"));
 const AddMachines = React.lazy(() => import("@/views/add-machines"));
 // Found sessions live in Mission control now; their old page sends you there.
@@ -67,7 +70,14 @@ export function App() {
       <TooltipProvider>
         <BrowserRouter>
           <ErrorBoundary label="kiln crashed">
-            {state.kind === "loading" ? (
+            {window.location.pathname.startsWith("/shared/plans/") ? (
+              // A shared plan opens for anyone with its link, signed in or not.
+              <React.Suspense fallback={<Splash />}>
+                <Routes>
+                  <Route path="shared/plans/:token" element={<SharedPlan />} />
+                </Routes>
+              </React.Suspense>
+            ) : state.kind === "loading" ? (
               <Splash />
             ) : state.kind === "anon" ? (
               <Login error={state.error} onRetry={recheck} />
@@ -86,6 +96,8 @@ export function App() {
                   <Route path="runners/add" element={<AddMachines />} />
                   <Route path="agents" element={<Mission />} />
                   <Route path="agents/sessions" element={<FoundRedirect />} />
+                  <Route path="agents/plans" element={<Plans />} />
+                  <Route path="agents/plans/:id" element={<PlanPage />} />
                   <Route path="agents/:id" element={<AgentPage />} />
                   <Route path="terminal" element={null} />
                   <Route path="telemetry" element={<Metrics />} />

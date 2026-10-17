@@ -32,6 +32,7 @@ pub mod os;
 pub mod password;
 pub mod pipeline;
 pub mod pki;
+pub mod plans;
 pub mod proc;
 pub mod proto;
 pub mod runner;

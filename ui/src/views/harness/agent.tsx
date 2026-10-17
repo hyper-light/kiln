@@ -23,6 +23,7 @@ import { Inspector, type InspectorTab } from "./inspector";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
 import { Timeline } from "./timeline";
+import { PlanSourceContext } from "@/views/plans/save";
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -188,7 +189,8 @@ export default function AgentPage() {
           </button>
         </div>
       )}
-      <Timeline
+      <PlanSourceContext.Provider value={info ? { session: info.id, harness: info.kind, machine: info.target === "local" ? null : info.target.replace(/^agent:/, ""), cwd, agent: info.name } : null}>
+        <Timeline
         events={events}
         state={state}
         meta={meta}
@@ -211,6 +213,7 @@ export default function AgentPage() {
           ) : undefined
         }
       />
+      </PlanSourceContext.Provider>
       <div className="hx-dock">
         <ActivityLine state={state} agent={id} onOpenTask={openTask} />
         {status === "exited" && state?.exit?.error && events.length === 0 ? (

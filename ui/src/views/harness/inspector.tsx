@@ -8,11 +8,12 @@ import type { Command, FileChange as ServerChange, HEvent, Meta, SessionStore, S
 import { cn } from "@/lib/utils";
 import { changesetOf, duration, money, relPath, runsOf, tokens, type FileChange, type ToolEvent } from "./derive";
 import { DiffStat, FileDiffView } from "./diff";
-import { Output } from "./parts";
+import { Output, Prose } from "./parts";
 import { LimitMeter, StatusList } from "./limits";
 import { McpPanel, SkillsPanel } from "./tools";
 import { TodoList } from "./timeline";
 import { Background, isBackground } from "./background";
+import { PlanSourceContext, RunSavedPlan, SavePlan, todosAsPlan } from "@/views/plans/save";
 
 /** Three places beside the conversation: what it changed, what it is doing (plan, subagents, commands), and what it works with (MCP, skills, usage). */
 export type InspectorTab = "changes" | "plan" | "tools";
@@ -266,6 +267,11 @@ export function Inspector({
   const runs = React.useMemo(() => runsOf(events), [events]);
   const todos = state?.todos ?? [];
   const done = todos.filter((t) => t.status === "completed").length;
+  // The plan it last proposed (plan mode), to read and keep.
+  const proposed = React.useMemo(() => {
+    const e = events.findLast((e) => e.kind === "tool" && e.tool === "plan");
+    return e?.kind === "tool" ? ((e.input as { plan?: string } | null)?.plan ?? e.output ?? "") : "";
+  }, [events]);
   const tasks = (state?.tasks ?? []).filter((t) => !isBackground(t));
   const mcp = state?.mcp ?? [];
   const tabs: { id: InspectorTab; label: string; count?: string }[] = [
@@ -287,20 +293,41 @@ export function Inspector({
         {tab === "changes" && <Changes events={events} changes={changes} cwd={cwd} />}
         {tab === "plan" && (
           <div className="in-secs">
-            {agentId && send && <Background state={state} agent={agentId} send={send} />}
-            <section>
-              <h3 className="in-sec-head">Plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
-              {todos.length > 0 ? (
-                <div className="hx-stack">
-                  <div className="hx-progress">
-                    <span style={{ width: `${(done / todos.length) * 100}%` }} />
+            <PlanSourceContext.Provider value={agentId ? { session: agentId } : null}>
+              {agentId && send && <Background state={state} agent={agentId} send={send} />}
+              <section>
+                <h3 className="in-sec-head">Plan{todos.length > 0 && <span>{done} of {todos.length} done</span>}</h3>
+                {todos.length > 0 ? (
+                  <div className="hx-stack">
+                    <div className="hx-progress">
+                      <span style={{ width: `${(done / todos.length) * 100}%` }} />
+                    </div>
+                    <TodoList todos={todos} />
+                    <SavePlan body={todosAsPlan(todos)} title={todos[0]?.text.slice(0, 80)} />
                   </div>
-                  <TodoList todos={todos} />
-                </div>
-              ) : (
-                <p className="in-none">No plan yet. It appears here when the agent writes one.</p>
+                ) : proposed ? (
+                  <div className="hx-stack">
+                    <Prose text={proposed} className="hx-plan-text" />
+                    <SavePlan body={proposed} />
+                  </div>
+                ) : (
+                  <p className="in-none">No plan yet. It appears here when the agent writes one.</p>
+                )}
+              </section>
+              {todos.length > 0 && proposed && (
+                <section>
+                  <h3 className="in-sec-head">Proposed plan</h3>
+                  <Prose text={proposed} className="hx-plan-text" />
+                  <SavePlan body={proposed} />
+                </section>
               )}
-            </section>
+              {agentId && (
+                <section>
+                  <h3 className="in-sec-head">Run a saved plan</h3>
+                  <RunSavedPlan session={agentId} />
+                </section>
+              )}
+            </PlanSourceContext.Provider>
             {tasks.length > 0 && (
               <section>
                 <h3 className="in-sec-head">Subagents<span>{tasks.length}</span></h3>
