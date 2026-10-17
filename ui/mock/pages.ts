@@ -338,9 +338,15 @@ const PLANS = [
     title: "Cut the 0.2 release",
     body: "Everything that has to happen before 0.2 ships.",
     items: [
-      { title: "Freeze main", description: "Stop merging features; only fixes from here.", examples: "", acceptance: "Branch protection requires a release label.", testing: "" },
-      { title: "Run the full bench", description: "Compare against 0.1 on the metal runners.", examples: "", acceptance: "No regression above 3%.", testing: "kiln run bench --all" },
-      { title: "Tag and publish", description: "", examples: "", acceptance: "", testing: "" },
+      { title: "Freeze main", description: "Stop merging features; only fixes from here.", examples: "", acceptance: [{ kind: "qualitative", text: "Branch protection requires a release label." }], testing: [] },
+      {
+        title: "Run the full bench",
+        description: "Compare against 0.1 on the metal runners.",
+        examples: "",
+        acceptance: [{ kind: "quantitative", target: "p99 latency", op: "rises_at_most", value: "3", unit: "%", baseline: "0.1", measured: "kiln run bench --all" }],
+        testing: [{ scenario: "The full bench on metal-epyc-01", criteria: [{ kind: "qualitative", text: "Every case runs to the end." }] }],
+      },
+      { title: "Tag and publish", description: "", examples: "", acceptance: [], testing: [] },
     ],
     tags: ["release"],
     source: null,

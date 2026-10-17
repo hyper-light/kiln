@@ -20,10 +20,19 @@ function set(next: AuthState) {
 
 let checking: Promise<void> | null = null;
 
+/**
+ * The console's two typefaces, loaded (or half a second gone by): the first screen shows in them,
+ * not in a fallback that the header and figures then jump out of.
+ */
+const fontsReady: Promise<unknown> =
+  typeof document === "undefined" || !document.fonts
+    ? Promise.resolve()
+    : Promise.race([Promise.all([document.fonts.load('450 15px "Geist Variable"'), document.fonts.load('400 10px "Geist Mono Variable"')]).catch(() => undefined), new Promise((r) => setTimeout(r, 500))]);
+
 /** Ask the server who this is (at most one question at a time). */
 export function checkAuth(): Promise<void> {
-  checking ??= api
-    .me()
+  checking ??= Promise.all([api.me(), fontsReady])
+    .then(([me]) => me)
     .then(
       (me) => set(me.authenticated ? { kind: "authed", me } : { kind: "anon" }),
       (e: unknown) => {

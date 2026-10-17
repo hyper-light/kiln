@@ -92,7 +92,8 @@ export function AppShell({ me }: { me: Me | null }) {
         Skip to content
       </a>
       <header className="site-header">
-        <div className={onTerminal ? "header-inner px-4 sm:px-6" : "header-inner container-console"}>
+        {/* The same on every page (the terminal's too), so nothing in it moves between pages. */}
+        <div className="header-inner container-console">
           <Link
             to="/"
             aria-label="kiln overview"
@@ -159,7 +160,7 @@ export function AppShell({ me }: { me: Me | null }) {
               if (e.key === "Escape") closeMenu();
             }}
           >
-            <nav className={onTerminal ? "px-4 pb-6 sm:px-6" : "container-console pb-6"} aria-label="Mobile navigation">
+            <nav className="container-console pb-6" aria-label="Mobile navigation">
               {[...NAV, { to: "/settings", label: "Settings", end: false }].map((n, i) => (
                 <NavLink
                   key={n.to}
