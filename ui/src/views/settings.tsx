@@ -149,7 +149,9 @@ function PasswordPanel() {
   return (
     <PasswordFrame
       description={
-        isSet ? "On. Any device that can reach this server can sign in with it; the admin token keeps working too." : "Off. Choose a password so your phone or another computer can sign in without the admin token."
+        isSet
+          ? "On. Any device that can reach this server can sign in with it; the admin token keeps working too."
+          : "Off. Choose a password so your phone or another computer can sign in without the admin token."
       }
       actions={
         isSet ? (

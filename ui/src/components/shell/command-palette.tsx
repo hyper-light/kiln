@@ -53,9 +53,18 @@ export function setPaletteOpen(open: boolean) {
   if (!open) return;
   // What it lists besides pages and actions, fresh each time it opens.
   const ctl = (loading = new AbortController());
-  api.repos(ctl.signal).then((repos) => usePalette.setState({ repos }), () => undefined);
-  api.runs({ limit: 40 }, ctl.signal).then((runs) => usePalette.setState({ runs }), () => undefined);
-  api.agents(ctl.signal).then((agents) => usePalette.setState({ agents }), () => undefined);
+  api.repos(ctl.signal).then(
+    (repos) => usePalette.setState({ repos }),
+    () => undefined,
+  );
+  api.runs({ limit: 40 }, ctl.signal).then(
+    (runs) => usePalette.setState({ runs }),
+    () => undefined,
+  );
+  api.agents(ctl.signal).then(
+    (agents) => usePalette.setState({ agents }),
+    () => undefined,
+  );
 }
 
 /** True when keystrokes belong to a terminal (xterm) and must not be hijacked. */

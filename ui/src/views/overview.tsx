@@ -68,11 +68,21 @@ function Kpis({ d }: { d: OverviewData | null }) {
   return (
     <section className="kpi-row" aria-label="Key metrics">
       <Kpi label="Runs · 24h" value={stats?.runs_24h} foot={stats ? `${stats.runs_succeeded_24h} passed · ${stats.runs_failed_24h} failed` : undefined} />
-      <Kpi label="Success rate" value={!stats ? undefined : success === null ? "—" : success.toFixed(1)} unit={success === null ? undefined : "%"} foot={stats ? `${finished} finished runs` : undefined} />
+      <Kpi
+        label="Success rate"
+        value={!stats ? undefined : success === null ? "—" : success.toFixed(1)}
+        unit={success === null ? undefined : "%"}
+        foot={stats ? `${finished} finished runs` : undefined}
+      />
       <Kpi label="Median job" value={stats ? formatDuration(stats.median_job_seconds) : undefined} foot="p50 · last 24h" />
       <Kpi label="Queue depth" value={d?.queue.queued} foot={d ? (d.queue.queued ? "jobs waiting for a slot" : "nothing waiting") : undefined} />
       <Kpi label="Running" value={d?.queue.running} foot={d && stats ? `${stats.jobs_by_status.running ?? d.queue.running} jobs in flight` : undefined} live={Boolean(d?.queue.running)} />
-      <Kpi label="Slots busy" value={d ? `${d.agents.busy}` : undefined} unit={d ? `/ ${d.agents.slots}` : undefined} foot={d ? `${d.agents.connected}/${d.agents.total} runners connected` : undefined} />
+      <Kpi
+        label="Slots busy"
+        value={d ? `${d.agents.busy}` : undefined}
+        unit={d ? `/ ${d.agents.slots}` : undefined}
+        foot={d ? `${d.agents.connected}/${d.agents.total} runners connected` : undefined}
+      />
     </section>
   );
 }

@@ -5,7 +5,28 @@
  * methods. Deterministic (seeded), so screenshots and layout measurements repeat.
  */
 import type http from "node:http";
-import type { Agent, CdApp, CdAppDetail, CdDeployment, CdDiff, CdEvent, CdHealth, CdNode, CdOperation, CdPlan, CdPlanRepo, CdResourceDetail, CdSummary, CdSync, CdTree, FrontDoorView, Run, SyncView, TailscaleView, UpdatesOverview } from "../src/api/types.ts";
+import type {
+  Agent,
+  CdApp,
+  CdAppDetail,
+  CdDeployment,
+  CdDiff,
+  CdEvent,
+  CdHealth,
+  CdNode,
+  CdOperation,
+  CdPlan,
+  CdPlanRepo,
+  CdResourceDetail,
+  CdSummary,
+  CdSync,
+  CdTree,
+  FrontDoorView,
+  Run,
+  SyncView,
+  TailscaleView,
+  UpdatesOverview,
+} from "../src/api/types.ts";
 import { hashStr, mulberry32, pick } from "./data.ts";
 
 export interface PagesCtx {
@@ -53,7 +74,16 @@ const apps = new Map<string, MockApp>();
       const running = r() < 0.06;
       const op: CdOperation | null = running
         ? { id: 7, phase: "Running", trigger: "auto", attempt: 1, message: "waiting for healthy state of apps/Deployment/" + name, started_ms: Date.now() - 40_000, finished_ms: null }
-        : { id: 6, phase: health === "Degraded" && r() < 0.5 ? "Failed" : "Succeeded", trigger: pick(r, ["manual", "auto", "self-heal"] as const), attempt: 1, message: "successfully synced (all tasks run)", by: r() < 0.5 ? "ada" : null, started_ms: Date.now() - Math.floor(r() * 86_400_000), finished_ms: Date.now() - Math.floor(r() * 80_000_000) };
+        : {
+            id: 6,
+            phase: health === "Degraded" && r() < 0.5 ? "Failed" : "Succeeded",
+            trigger: pick(r, ["manual", "auto", "self-heal"] as const),
+            attempt: 1,
+            message: "successfully synced (all tasks run)",
+            by: r() < 0.5 ? "ada" : null,
+            started_ms: Date.now() - Math.floor(r() * 86_400_000),
+            finished_ms: Date.now() - Math.floor(r() * 80_000_000),
+          };
       const app: CdApp = {
         app: id,
         name,
@@ -82,7 +112,14 @@ const apps = new Map<string, MockApp>();
         },
         commits: [revision],
         children: [],
-        revision_info: { sha: revision, author: pick(r, ["ada", "mira.k", "jonas", "ines"]), email: "dev@example.com", at_ms: Date.now() - Math.floor(r() * 5 * 86_400_000), subject: pick(r, ["Bump api to 1.42.0", "Raise worker memory limit", "Add canary for checkout", "Roll indexer back to v3 settings", "Tune HPA thresholds"]), body: "" },
+        revision_info: {
+          sha: revision,
+          author: pick(r, ["ada", "mira.k", "jonas", "ines"]),
+          email: "dev@example.com",
+          at_ms: Date.now() - Math.floor(r() * 5 * 86_400_000),
+          subject: pick(r, ["Bump api to 1.42.0", "Raise worker memory limit", "Add canary for checkout", "Roll indexer back to v3 settings", "Tune HPA thresholds"]),
+          body: "",
+        },
       };
       const history: CdDeployment[] = Array.from({ length: 6 }, (_, i) => ({
         app: id,
@@ -175,7 +212,18 @@ function tree(id: string): CdTree | null {
   const nodes: CdNode[] = [];
   const managed = (kind: string, name: string, group = "", extra: Partial<CdNode> = {}) => {
     const uid = `uid-${kind}-${name}`;
-    const n = node(r, { kind, name, namespace: ns, group, uid, id: uid, managed: true, sync: a.sync === "OutOfSync" && kind === "Deployment" ? "OutOfSync" : "Synced", why: a.sync === "OutOfSync" && kind === "Deployment" ? ".spec.replicas differs" : null, ...extra });
+    const n = node(r, {
+      kind,
+      name,
+      namespace: ns,
+      group,
+      uid,
+      id: uid,
+      managed: true,
+      sync: a.sync === "OutOfSync" && kind === "Deployment" ? "OutOfSync" : "Synced",
+      why: a.sync === "OutOfSync" && kind === "Deployment" ? ".spec.replicas differs" : null,
+      ...extra,
+    });
     nodes.push(n);
     return n;
   };
@@ -188,7 +236,19 @@ function tree(id: string): CdTree | null {
   for (let rs = 0; rs < 2; rs++) {
     const rsUid = `uid-rs-${a.name}-${rs}`;
     const hash = hex(r, 9);
-    nodes.push(node(r, { kind: "ReplicaSet", name: `${a.name}-${hash}`, namespace: ns, group: "apps", uid: rsUid, id: rsUid, parents: [dep.uid!], info: [{ name: "Revision", value: String(7 - rs) }], ready: rs === 0 ? "3/3" : "0/0" }));
+    nodes.push(
+      node(r, {
+        kind: "ReplicaSet",
+        name: `${a.name}-${hash}`,
+        namespace: ns,
+        group: "apps",
+        uid: rsUid,
+        id: rsUid,
+        parents: [dep.uid!],
+        info: [{ name: "Revision", value: String(7 - rs) }],
+        ready: rs === 0 ? "3/3" : "0/0",
+      }),
+    );
     if (rs > 0) continue;
     for (let p = 0; p < 3; p++) {
       const podUid = `uid-pod-${a.name}-${p}`;
@@ -208,12 +268,35 @@ function tree(id: string): CdTree | null {
           restarts: bad ? 14 : 0,
           node: pick(r, ["node-a1", "node-a2", "node-b1"]),
           images: [`ghcr.io/hyper-light/${a.name}:1.42.0`],
-          containers: [{ name: a.name, image: `ghcr.io/hyper-light/${a.name}:1.42.0`, init: false, ready: !bad, restarts: bad ? 14 : 0, state: bad ? "waiting" : "running", reason: bad ? "CrashLoopBackOff" : null, last: bad ? "Error (exit 1)" : null }],
+          containers: [
+            {
+              name: a.name,
+              image: `ghcr.io/hyper-light/${a.name}:1.42.0`,
+              init: false,
+              ready: !bad,
+              restarts: bad ? 14 : 0,
+              state: bad ? "waiting" : "running",
+              reason: bad ? "CrashLoopBackOff" : null,
+              last: bad ? "Error (exit 1)" : null,
+            },
+          ],
         }),
       );
     }
   }
-  nodes.push(node(r, { kind: "EndpointSlice", name: `${a.name}-${hex(r, 5)}`, namespace: ns, group: "discovery.k8s.io", uid: `uid-eps-${a.name}`, id: `uid-eps-${a.name}`, parents: [`uid-Service-${a.name}`], health: null, ready: "3" }));
+  nodes.push(
+    node(r, {
+      kind: "EndpointSlice",
+      name: `${a.name}-${hex(r, 5)}`,
+      namespace: ns,
+      group: "discovery.k8s.io",
+      uid: `uid-eps-${a.name}`,
+      id: `uid-eps-${a.name}`,
+      parents: [`uid-Service-${a.name}`],
+      health: null,
+      ready: "3",
+    }),
+  );
   return { app: id, cluster: a.cluster, namespace: ns, nodes, truncated: false, errors: [], at_ms: Date.now() };
 }
 
@@ -245,10 +328,29 @@ function resourceDetail(id: string, key: string): CdResourceDetail | null {
     node: n,
     live: yamlOf(n, false),
     desired: n.managed ? yamlOf(n, true) : null,
-    diff: n.managed ? { key: { group: n.group, kind: n.kind, namespace: n.namespace, name: n.name }, why: n.why, live: "", predicted: "", hunks: n.sync === "OutOfSync" ? [{ old_start: 9, old_lines: 1, new_start: 9, new_lines: 1, lines: ["-  replicas: 2", "+  replicas: 3"] }] : [] } : null,
+    diff: n.managed
+      ? {
+          key: { group: n.group, kind: n.kind, namespace: n.namespace, name: n.name },
+          why: n.why,
+          live: "",
+          predicted: "",
+          hunks: n.sync === "OutOfSync" ? [{ old_start: 9, old_lines: 1, new_start: 9, new_lines: 1, lines: ["-  replicas: 2", "+  replicas: 3"] }] : [],
+        }
+      : null,
     labels: { "app.kubernetes.io/name": n.name, "app.kubernetes.io/part-of": t.app.split("/")[0] ?? "" },
     annotations: n.kind === "Deployment" ? { "deployment.kubernetes.io/revision": "7" } : {},
-    conditions: n.kind === "Deployment" || n.kind === "Pod" ? [{ type: "Available", status: n.health === "Degraded" ? "False" : "True", reason: "MinimumReplicasAvailable", message: "Deployment has minimum availability.", last: new Date(Date.now() - 3_600_000).toISOString() }] : [],
+    conditions:
+      n.kind === "Deployment" || n.kind === "Pod"
+        ? [
+            {
+              type: "Available",
+              status: n.health === "Degraded" ? "False" : "True",
+              reason: "MinimumReplicasAvailable",
+              message: "Deployment has minimum availability.",
+              last: new Date(Date.now() - 3_600_000).toISOString(),
+            },
+          ]
+        : [],
     finalizers: [],
     owners: owners.map((o) => ({ group: o.group, kind: o.kind, namespace: o.namespace, name: o.name, id: o.id, uid: o.uid })),
     errors: [],
@@ -266,7 +368,11 @@ function events(): CdEvent[] {
 
 function logs(name: string) {
   const r = mulberry32(hashStr(name));
-  const lines = Array.from({ length: 80 }, (_, i) => ({ pod: `${name}-pod`, ts: new Date(Date.now() - (80 - i) * 4000).toISOString(), text: `${pick(r, ["INFO", "INFO", "INFO", "WARN", "DEBUG"])} ${pick(r, ["request served", "cache hit", "connected to db", "flushed 120 rows", "health check ok", "retrying upstream"])} id=${hex(r, 8)} took=${Math.floor(r() * 90)}ms` }));
+  const lines = Array.from({ length: 80 }, (_, i) => ({
+    pod: `${name}-pod`,
+    ts: new Date(Date.now() - (80 - i) * 4000).toISOString(),
+    text: `${pick(r, ["INFO", "INFO", "INFO", "WARN", "DEBUG"])} ${pick(r, ["request served", "cache hit", "connected to db", "flushed 120 rows", "health check ok", "retrying upstream"])} id=${hex(r, 8)} took=${Math.floor(r() * 90)}ms`,
+  }));
   return { pods: [`${name}-pod`], more_pods: 0, container: null, containers: [name], lines, errors: [] };
 }
 
@@ -312,7 +418,22 @@ function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
     error: null,
     problems: ok ? [] : ["Deployment payments-checkout/checkout: spec.template.spec.containers[0].image: Required value"],
     notes: [],
-    own: { added: 0, changed: 1, removed: 0, objects: [{ key: { group: "apps", kind: "Deployment", namespace: `payments-${name}`, name }, change: "changed" as const, why: ".spec.replicas differs", hook: false, added_lines: 1, removed_lines: 1, hunks: [{ old_start: 7, old_lines: 2, new_start: 7, new_lines: 2, lines: [" spec:", "-  replicas: 2", "+  replicas: 3"] }] }] },
+    own: {
+      added: 0,
+      changed: 1,
+      removed: 0,
+      objects: [
+        {
+          key: { group: "apps", kind: "Deployment", namespace: `payments-${name}`, name },
+          change: "changed" as const,
+          why: ".spec.replicas differs",
+          hook: false,
+          added_lines: 1,
+          removed_lines: 1,
+          hunks: [{ old_start: 7, old_lines: 2, new_start: 7, new_lines: 2, lines: [" spec:", "-  replicas: 2", "+  replicas: 3"] }],
+        },
+      ],
+    },
     stack: { added: 0, changed: 1, removed: 0, objects: [] },
     sync: { create: 0, update: 1, prune: 0, hooks: 0, unchanged: 6, unread: 0, held: [], taken: [], steps: [] },
   });
@@ -325,7 +446,11 @@ function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
     notes: [],
     diffs: [
       { commit: { sha: "d4e5f60718293a4b5c6d7e8f90123456789012ab", author: "ada", at_ms: Date.now() - 5_400_000, subject: "Raise checkout replicas" }, ok: true, apps: [app("checkout")] },
-      { commit: { sha: "e5f60718293a4b5c6d7e8f90123456789012abcd", author: "ada", at_ms: Date.now() - 3_600_000, subject: `Ledger on ${target}` }, ok: !target.includes("fail"), apps: [app("ledger", !target.includes("fail"))] },
+      {
+        commit: { sha: "e5f60718293a4b5c6d7e8f90123456789012abcd", author: "ada", at_ms: Date.now() - 3_600_000, subject: `Ledger on ${target}` },
+        ok: !target.includes("fail"),
+        apps: [app("ledger", !target.includes("fail"))],
+      },
     ],
   };
 }
@@ -338,7 +463,13 @@ const PLANS = [
     title: "Cut the 0.2 release",
     body: "Everything that has to happen before 0.2 ships.",
     items: [
-      { title: "Freeze main", description: "Stop merging features; only fixes from here.", examples: "", acceptance: [{ kind: "qualitative", text: "Branch protection requires a release label." }], testing: [] },
+      {
+        title: "Freeze main",
+        description: "Stop merging features; only fixes from here.",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "Branch protection requires a release label." }],
+        testing: [],
+      },
       {
         title: "Run the full bench",
         description: "Compare against 0.1 on the metal runners.",
@@ -467,7 +598,23 @@ function frontDoor(a: Agent): FrontDoorView {
           http: on ? listener("on", ["[::]:80"]) : listener("off", []),
           mdns: listener("off", []),
           cert: on
-            ? { mode: "kiln", state: "on", info: { subject: "kiln.dev", issuer: "kiln CA", names: ["kiln.dev", "*.kiln.dev", "ci.home"], not_before: T0 - 86_400 * 20, not_after: T0 + 86_400 * 70, sha256: "3f".repeat(32), server_auth: true }, kiln: true, missing: [], error: null, renewing: false }
+            ? {
+                mode: "kiln",
+                state: "on",
+                info: {
+                  subject: "kiln.dev",
+                  issuer: "kiln CA",
+                  names: ["kiln.dev", "*.kiln.dev", "ci.home"],
+                  not_before: T0 - 86_400 * 20,
+                  not_after: T0 + 86_400 * 70,
+                  sha256: "3f".repeat(32),
+                  server_auth: true,
+                },
+                kiln: true,
+                missing: [],
+                error: null,
+                renewing: false,
+              }
             : { mode: "kiln", state: "off", info: null, kiln: true, missing: [], error: null, renewing: false },
           want: [],
           asked: T0 - 30,
@@ -480,10 +627,27 @@ function frontDoor(a: Agent): FrontDoorView {
   };
 }
 
-const TAILSCALE: TailscaleView = { configured: false, kind: null, id: null, mode: null, exit_nodes: null, want: {}, pending: [], owned: {}, synced_at: null, ok: true, error: null, routes: {}, replaced: {} };
+const TAILSCALE: TailscaleView = {
+  configured: false,
+  kind: null,
+  id: null,
+  mode: null,
+  exit_nodes: null,
+  want: {},
+  pending: [],
+  owned: {},
+  synced_at: null,
+  ok: true,
+  error: null,
+  routes: {},
+  replaced: {},
+};
 
 function syncView(ctx: PagesCtx): SyncView {
-  const names = ctx.agents().filter((a) => !a.ephemeral).map((a) => a.name);
+  const names = ctx
+    .agents()
+    .filter((a) => !a.ephemeral)
+    .map((a) => a.name);
   const copy = (member: number, machine: string, path: string, state: SyncView["repos"][number]["copies"][number]["state"]) => ({
     member,
     machine,
@@ -495,8 +659,26 @@ function syncView(ctx: PagesCtx): SyncView {
   return {
     error: null,
     repos: [
-      { id: "sy_kiln", name: "kiln", created: T0 - 86_400 * 9, exclude: ["dist"], files: 1834, index: 41, conflicts: [], copies: [copy(1, names[0] ?? "server", "/home/ada/src/kiln", "in step"), copy(2, names[1] ?? "server", "/home/ada/src/kiln", "catching up")] },
-      { id: "sy_notes", name: "notes", created: T0 - 86_400 * 30, exclude: [], files: 212, index: 9, conflicts: [{ path: "todo.sync-conflict-ryzen.md", beside: "todo.md" }], copies: [copy(1, names[0] ?? "server", "/home/ada/notes", "in step"), copy(2, names[3] ?? "server", "/Users/ada/notes", "offline")] },
+      {
+        id: "sy_kiln",
+        name: "kiln",
+        created: T0 - 86_400 * 9,
+        exclude: ["dist"],
+        files: 1834,
+        index: 41,
+        conflicts: [],
+        copies: [copy(1, names[0] ?? "server", "/home/ada/src/kiln", "in step"), copy(2, names[1] ?? "server", "/home/ada/src/kiln", "catching up")],
+      },
+      {
+        id: "sy_notes",
+        name: "notes",
+        created: T0 - 86_400 * 30,
+        exclude: [],
+        files: 212,
+        index: 9,
+        conflicts: [{ path: "todo.sync-conflict-ryzen.md", beside: "todo.md" }],
+        copies: [copy(1, names[0] ?? "server", "/home/ada/notes", "in step"), copy(2, names[3] ?? "server", "/Users/ada/notes", "offline")],
+      },
     ],
   };
 }
@@ -508,29 +690,51 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
   const { json, err } = ctx;
   let mm: RegExpMatchArray | null;
 
-  if (p === "/api/auth/methods") return void json(res, 200, { password: false, token: true }), true;
-  if (p === "/api/sync" && m === "GET") return void json(res, 200, syncView(ctx)), true;
-  if (p === "/api/terminal/sessions" && m === "GET") return void json(res, 200, []), true;
-  if (p === "/api/ai-sessions" && m === "GET") return void json(res, 200, []), true;
-  if (p === "/api/updates" && m === "GET") return void json(res, 200, updates(ctx)), true;
-  if (p === "/api/updates/check" && m === "POST") return void json(res, 200, updates(ctx)), true;
-  if (p === "/api/front-doors" && m === "GET") return void json(res, 200, ctx.agents().filter((a) => !a.ephemeral).map(frontDoor)), true;
+  if (p === "/api/auth/methods") return (void json(res, 200, { password: false, token: true }), true);
+  if (p === "/api/sync" && m === "GET") return (void json(res, 200, syncView(ctx)), true);
+  if (p === "/api/terminal/sessions" && m === "GET") return (void json(res, 200, []), true);
+  if (p === "/api/ai-sessions" && m === "GET") return (void json(res, 200, []), true);
+  if (p === "/api/updates" && m === "GET") return (void json(res, 200, updates(ctx)), true);
+  if (p === "/api/updates/check" && m === "POST") return (void json(res, 200, updates(ctx)), true);
+  if (p === "/api/front-doors" && m === "GET")
+    return (
+      void json(
+        res,
+        200,
+        ctx
+          .agents()
+          .filter((a) => !a.ephemeral)
+          .map(frontDoor),
+      ),
+      true
+    );
   if ((mm = p.match(/^\/api\/runners\/([^/]+)\/front-door$/)) && m === "GET") {
     const a = ctx.agents().find((x) => x.name === decodeURIComponent(mm![1]!));
-    return a ? json(res, 200, frontDoor(a)) : err(res, 404, "no such runner"), true;
+    return (a ? json(res, 200, frontDoor(a)) : err(res, 404, "no such runner"), true);
   }
-  if (p === "/api/tailscale" && m === "GET") return void json(res, 200, TAILSCALE), true;
+  if (p === "/api/tailscale" && m === "GET") return (void json(res, 200, TAILSCALE), true);
   if (p === "/api/harness/kinds" && m === "GET") {
     const kinds = [
       { id: "claude", name: "Claude Code", verified: true, available: true },
       { id: "codex", name: "Codex", verified: true, available: true },
     ];
-    return void json(res, 200, { local: kinds, ...Object.fromEntries(ctx.agents().filter((a) => a.connected && !a.ephemeral).map((a) => [`agent:${a.name}`, kinds])) }), true;
+    return (
+      void json(res, 200, {
+        local: kinds,
+        ...Object.fromEntries(
+          ctx
+            .agents()
+            .filter((a) => a.connected && !a.ephemeral)
+            .map((a) => [`agent:${a.name}`, kinds]),
+        ),
+      }),
+      true
+    );
   }
 
   // Deployments
-  if (p === "/api/cd/summary") return void json(res, 200, summary()), true;
-  if (p === "/api/cd/facets") return void json(res, 200, facets(url.searchParams)), true;
+  if (p === "/api/cd/summary") return (void json(res, 200, summary()), true);
+  if (p === "/api/cd/facets") return (void json(res, 200, facets(url.searchParams)), true);
   if (p === "/api/cd/apps" && m === "GET") {
     const { all, match } = listApps(url.searchParams);
     const sort = url.searchParams.get("sort") ?? "name";
@@ -545,48 +749,64 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
               ? (y.operation?.finished_ms ?? 0) - (x.operation?.finished_ms ?? 0)
               : x.app.localeCompare(y.app),
       );
-    return void json(res, 200, { apps: list, next: null }), true;
+    return (void json(res, 200, { apps: list, next: null }), true);
   }
-  if (p === "/api/cd/plans/repos") return void json(res, 200, { repos: PLAN_REPOS }), true;
+  if (p === "/api/cd/plans/repos") return (void json(res, 200, { repos: PLAN_REPOS }), true);
   if (p === "/api/cd/plans" && m === "POST") {
     const ask = await ctx.body<{ head?: string; commit?: string; pr?: number }>(req);
     await new Promise((r) => setTimeout(r, 400));
-    return void json(res, 200, plan(ask)), true;
+    return (void json(res, 200, plan(ask)), true);
   }
   if ((mm = p.match(/^\/api\/cd\/apps\/([^/]+)\/([^/]+)(\/.*)?$/))) {
     const id = `${decodeURIComponent(mm[1]!)}/${decodeURIComponent(mm[2]!)}`;
     const rest = mm[3] ?? "";
     const a = apps.get(id);
-    if (!a) return err(res, 404, `no app ${id}`), true;
-    if (m !== "GET") return void json(res, 200, {}), true;
-    if (rest === "") return void json(res, 200, a.detail), true;
-    if (rest === "/tree") return void json(res, 200, tree(id)), true;
-    if (rest === "/history") return void json(res, 200, { history: a.history }), true;
-    if (rest === "/diff") return void json(res, 200, { diffs: diffOf(id) }), true;
-    if (rest === "/resources") return void json(res, 200, { resources: [] }), true;
+    if (!a) return (err(res, 404, `no app ${id}`), true);
+    if (m !== "GET") return (void json(res, 200, {}), true);
+    if (rest === "") return (void json(res, 200, a.detail), true);
+    if (rest === "/tree") return (void json(res, 200, tree(id)), true);
+    if (rest === "/history") return (void json(res, 200, { history: a.history }), true);
+    if (rest === "/diff") return (void json(res, 200, { diffs: diffOf(id) }), true);
+    if (rest === "/resources") return (void json(res, 200, { resources: [] }), true);
     let rm: RegExpMatchArray | null;
     if ((rm = rest.match(/^\/resources\/([^/]+)(\/events|\/logs)?$/))) {
       const key = decodeURIComponent(rm[1]!);
-      if (rm[2] === "/events") return void json(res, 200, { events: events() }), true;
-      if (rm[2] === "/logs") return void json(res, 200, logs(key.split("~")[3] ?? "pod")), true;
+      if (rm[2] === "/events") return (void json(res, 200, { events: events() }), true);
+      if (rm[2] === "/logs") return (void json(res, 200, logs(key.split("~")[3] ?? "pod")), true);
       const d = resourceDetail(id, key);
-      return d ? json(res, 200, d) : err(res, 404, "no such object"), true;
+      return (d ? json(res, 200, d) : err(res, 404, "no such object"), true);
     }
-    return err(res, 404, `no route for ${p}`), true;
+    return (err(res, 404, `no route for ${p}`), true);
   }
 
   // Plans
-  if (p === "/api/plans" && m === "GET") return void json(res, 200, PLANS), true;
+  if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
   if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
     const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
-    if (!pl) return err(res, 404, "no such plan"), true;
-    if (mm[2] === "/versions") return void json(res, 200, Array.from({ length: pl.version }, (_, i) => ({ version: pl.version - i, title: pl.title, body: pl.body, at: pl.updated_at - i * 86_400, by: "ada" }))), true;
-    if (mm[2] === "/runs") return void json(res, 200, Array.from({ length: pl.runs }, (_, i) => ({ id: `pr_${i}`, version: pl.version, session: `h_${i}abcdef`, mode: i ? "steps" : "message", at: pl.updated_at - i * 3_600, by: "ada" }))), true;
-    return void json(res, 200, pl), true;
+    if (!pl) return (err(res, 404, "no such plan"), true);
+    if (mm[2] === "/versions")
+      return (
+        void json(
+          res,
+          200,
+          Array.from({ length: pl.version }, (_, i) => ({ version: pl.version - i, title: pl.title, body: pl.body, at: pl.updated_at - i * 86_400, by: "ada" })),
+        ),
+        true
+      );
+    if (mm[2] === "/runs")
+      return (
+        void json(
+          res,
+          200,
+          Array.from({ length: pl.runs }, (_, i) => ({ id: `pr_${i}`, version: pl.version, session: `h_${i}abcdef`, mode: i ? "steps" : "message", at: pl.updated_at - i * 3_600, by: "ada" })),
+        ),
+        true
+      );
+    return (void json(res, 200, pl), true);
   }
   if ((mm = p.match(/^\/api\/shared\/plans\/([^/]+)$/))) {
     const pl = PLANS.find((x) => x.share === decodeURIComponent(mm![1]!));
-    return pl ? json(res, 200, { title: pl.title, body: pl.body, items: pl.items, steps: pl.steps, version: pl.version, updated_at: pl.updated_at }) : err(res, 404, "not shared"), true;
+    return (pl ? json(res, 200, { title: pl.title, body: pl.body, items: pl.items, steps: pl.steps, version: pl.version, updated_at: pl.updated_at }) : err(res, 404, "not shared"), true);
   }
   return false;
 }

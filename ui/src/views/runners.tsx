@@ -558,7 +558,11 @@ function Upgrades() {
   const live = useUpdateJobs();
   const [asking, setAsking] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
-  const upgrading = new Set(mergeJobs(data, live).filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
+  const upgrading = new Set(
+    mergeJobs(data, live)
+      .filter((j) => j.kind === "runner" && j.state === "running")
+      .map((j) => j.target),
+  );
   const behind = data.runners.filter((r) => r.connected && !r.up_to_date);
   if (behind.length === 0) return null;
   const ready = behind.filter((r) => r.target_build && !upgrading.has(r.name) && !(r.method === "terminal" && !r.terminal));

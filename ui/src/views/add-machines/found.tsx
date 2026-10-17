@@ -41,7 +41,10 @@ export function FoundSection({ index, discovery, requests, onRequestsChanged }: 
   // What a probe found is shown under the address field; the list below leaves it out meanwhile.
   const probed = probe?.state === "done" ? probe.found.map((i) => byId.get(i.id) ?? i) : [];
   const probedIds = new Set(probed.map((i) => i.id));
-  const sorted = sortInstances(d.instances.filter((i) => !probedIds.has(i.id)), selfId);
+  const sorted = sortInstances(
+    d.instances.filter((i) => !probedIds.has(i.id)),
+    selfId,
+  );
   const fresh = sorted.filter((x) => STAND_RANK[x.stand] < STAND_RANK.here);
   const here = sorted.filter((x) => STAND_RANK[x.stand] >= STAND_RANK.here);
   const heard = d.instances.filter((i) => i.id !== selfId).length;

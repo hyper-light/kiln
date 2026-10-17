@@ -1646,7 +1646,21 @@ function handleTerminal(ws: WebSocket, params: URLSearchParams) {
   ws.send(
     JSON.stringify({
       type: "session",
-      session: { id: params.get("session") ?? rid("ts_"), target, command: null, title: "", name: null, created_at: now(), attached: 1, cols, rows, idle_seconds: 0, exited: false, exit_code: null, error: null },
+      session: {
+        id: params.get("session") ?? rid("ts_"),
+        target,
+        command: null,
+        title: "",
+        name: null,
+        created_at: now(),
+        attached: 1,
+        cols,
+        rows,
+        idle_seconds: 0,
+        exited: false,
+        exit_code: null,
+        error: null,
+      },
     }),
   );
 

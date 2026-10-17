@@ -343,18 +343,7 @@ function useReadLog(appId: string, node: CdNode, q: CdLogQuery) {
 function ReadLog({ appId, node, q, o, set }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void }) {
   const read = useReadLog(appId, node, q);
   const r = read.data;
-  return (
-    <LogView
-      node={node}
-      o={o}
-      set={set}
-      known={r}
-      lines={r.lines}
-      errors={r.errors}
-      state={read.refreshing ? "Reading…" : `${r.lines.length.toLocaleString()} lines`}
-      again={read.reload}
-    />
-  );
+  return <LogView node={node} o={o} set={set} known={r} lines={r.lines} errors={r.errors} state={read.refreshing ? "Reading…" : `${r.lines.length.toLocaleString()} lines`} again={read.reload} />;
 }
 
 type FollowState = "loading" | "live" | "ended";

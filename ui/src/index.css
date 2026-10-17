@@ -368,23 +368,23 @@
 }
 /* What opens in the header (the phones' menu, the command palette): under its bar, in its flow,
    on the page's own ground (no veil over the page). */
-.header-band {
-  max-height: calc(100dvh - var(--header-h));
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  border-top: 1px solid rgb(255 255 255 / 7%);
-  background: #08090a;
-}
-.palette-inner {
-  width: min(720px, calc(100% - 32px));
-  margin-inline: auto;
-}
-.palette-list {
-  max-height: min(52dvh, 480px);
-  overflow-y: auto;
-  padding: 4px 0 8px;
-}
-/* A page fills the window at least, so the footer sits below the fold and never jumps in view
+  .header-band {
+    max-height: calc(100dvh - var(--header-h));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-top: 1px solid rgb(255 255 255 / 7%);
+    background: #08090a;
+  }
+  .palette-inner {
+    width: min(720px, calc(100% - 32px));
+    margin-inline: auto;
+  }
+  .palette-list {
+    max-height: min(52dvh, 480px);
+    overflow-y: auto;
+    padding: 4px 0 8px;
+  }
+  /* A page fills the window at least, so the footer sits below the fold and never jumps in view
    while the page loads. */
 .page-main {
   min-height: calc(100dvh - var(--header-h));

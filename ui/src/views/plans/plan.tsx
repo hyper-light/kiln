@@ -45,7 +45,15 @@ export default function PlanPage() {
 }
 
 function PlanCrumbs() {
-  return <Crumbs index={6} items={[{ label: "Agents", to: "/agents" }, { label: "Plans", to: "/agents/plans" }]} />;
+  return (
+    <Crumbs
+      index={6}
+      items={[
+        { label: "Agents", to: "/agents" },
+        { label: "Plans", to: "/agents/plans" },
+      ]}
+    />
+  );
 }
 
 /** The plan while it loads: the way back, its title's and text's space. */
@@ -285,7 +293,12 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
         {where === "new" && (
           <>
             <SelectField label="Machine" value={target} onChange={setTarget} options={(targets.length ? targets : ["local"]).map((t) => ({ value: t, label: machineOf(t) }))} />
-            <SelectField label="Harness" value={kind} onChange={setKind} options={offered.length ? offered.map((k) => ({ value: k.id, label: k.name })) : [{ value: "", label: "None on that machine" }]} />
+            <SelectField
+              label="Harness"
+              value={kind}
+              onChange={setKind}
+              options={offered.length ? offered.map((k) => ({ value: k.id, label: k.name })) : [{ value: "", label: "None on that machine" }]}
+            />
             <TextField label="Folder" value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="Its home folder when empty" spellCheck={false} />
           </>
         )}
@@ -312,7 +325,8 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
         {error && <span className="plan-error">{error}</span>}
         {ran && (
           <span className="plan-ok">
-            {mode === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`} · <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
+            {mode === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`} ·{" "}
+            <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
           </span>
         )}
       </div>

@@ -83,7 +83,12 @@ export function useMetricsHistory() {
 export function useRecentRuns(limit: number) {
   const runs = useRes(recentRunsRes(limit));
   useServerEvents((ev) => {
-    if (ev.type === "run") runs.setData((list) => upsert<Run>(list, ev.run, (r) => r.id).sort((a, b) => b.created_at - a.created_at).slice(0, limit));
+    if (ev.type === "run")
+      runs.setData((list) =>
+        upsert<Run>(list, ev.run, (r) => r.id)
+          .sort((a, b) => b.created_at - a.created_at)
+          .slice(0, limit),
+      );
   });
   return runs;
 }

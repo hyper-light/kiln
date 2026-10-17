@@ -60,7 +60,23 @@ export default function Plans() {
   );
 }
 
-function PlansTools({ q, onQ, facets, chosen, onChosen, sort, onSort }: { q: string; onQ: (v: string) => void; facets: Facet[]; chosen: Chosen; onChosen: (c: Chosen) => void; sort: string; onSort: (v: string) => void }) {
+function PlansTools({
+  q,
+  onQ,
+  facets,
+  chosen,
+  onChosen,
+  sort,
+  onSort,
+}: {
+  q: string;
+  onQ: (v: string) => void;
+  facets: Facet[];
+  chosen: Chosen;
+  onChosen: (c: Chosen) => void;
+  sort: string;
+  onSort: (v: string) => void;
+}) {
   return (
     <div className="plans-tools">
       <FacetBox className="plans-filter" label="Filter plans" placeholder="Filter by title, text, tag…" query={q} onQuery={onQ} facets={facets} chosen={chosen} onChosen={onChosen} />

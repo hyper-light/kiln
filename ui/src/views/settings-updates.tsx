@@ -719,7 +719,9 @@ function Binaries({
                   </>
                 }
               >
-                <p>Remove the {b.target} binary? Build {b.build} is no longer handed to machines of that platform until kiln builds every platform again or one is uploaded.</p>
+                <p>
+                  Remove the {b.target} binary? Build {b.build} is no longer handed to machines of that platform until kiln builds every platform again or one is uploaded.
+                </p>
               </Confirm>
             )}
           </li>

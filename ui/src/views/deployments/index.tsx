@@ -492,4 +492,3 @@ const AppRow = React.memo(function AppRow({
     </div>
   );
 });
-

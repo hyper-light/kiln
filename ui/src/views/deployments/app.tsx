@@ -269,7 +269,13 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <Button size="xs" variant="secondary" onClick={() => act("Comparing it with git again.", () => cdApi.refresh(id, false))} disabled={busy}>
             <RefreshCw aria-hidden="true" /> Refresh
           </Button>
-          <Button size="xs" variant="secondary" onClick={() => act("Rendering it from git again, then comparing.", () => cdApi.refresh(id, true))} disabled={busy} title="Render the app from git again, not only compare">
+          <Button
+            size="xs"
+            variant="secondary"
+            onClick={() => act("Rendering it from git again, then comparing.", () => cdApi.refresh(id, true))}
+            disabled={busy}
+            title="Render the app from git again, not only compare"
+          >
             Hard refresh
           </Button>
           <Button size="xs" variant="secondary" onClick={() => toggle("diff")} aria-expanded={ask === "diff"}>

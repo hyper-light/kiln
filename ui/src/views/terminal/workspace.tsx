@@ -173,7 +173,10 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     const tab = tabs.find((t) => t.sessionId === sessionId);
     setActiveId(tab ? tab.id : sessionId);
     dropped.current.delete(sessionId);
-    if (!tab) setTabs((cur) => (cur.some((t) => t.sessionId === sessionId) ? cur : [...cur, { id: sessionId, sessionId, target, title: targetLabel(target), hints: "", auto: "shell", state: { kind: "connecting" } }]));
+    if (!tab)
+      setTabs((cur) =>
+        cur.some((t) => t.sessionId === sessionId) ? cur : [...cur, { id: sessionId, sessionId, target, title: targetLabel(target), hints: "", auto: "shell", state: { kind: "connecting" } }],
+      );
   };
 
   /** The server named this tab's session: remember it, and drop any duplicate view of it. */

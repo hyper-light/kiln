@@ -27,7 +27,10 @@ let checking: Promise<void> | null = null;
 const fontsReady: Promise<unknown> =
   typeof document === "undefined" || !document.fonts
     ? Promise.resolve()
-    : Promise.race([Promise.all([document.fonts.load('450 15px "Geist Variable"'), document.fonts.load('400 10px "Geist Mono Variable"')]).catch(() => undefined), new Promise((r) => setTimeout(r, 500))]);
+    : Promise.race([
+        Promise.all([document.fonts.load('450 15px "Geist Variable"'), document.fonts.load('400 10px "Geist Mono Variable"')]).catch(() => undefined),
+        new Promise((r) => setTimeout(r, 500)),
+      ]);
 
 /** Ask the server who this is (at most one question at a time). */
 export function checkAuth(): Promise<void> {
