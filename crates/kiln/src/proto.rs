@@ -79,6 +79,9 @@ pub enum AgentMsg {
     /// Answer to [`ServerMsg::DirList`]: JSON [`crate::dirs::Listing`]. Appended last: postcard
     /// encodes variants by index.
     DirList { req: u64, json: String },
+    /// Answer to [`ServerMsg::HarnessHistory`]: JSON `[`[`crate::aisessions::PastSession`]`]`,
+    /// `None` when this machine does not look. Appended last: postcard encodes variants by index.
+    HarnessHistory { req: u64, json: Option<String> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -184,6 +187,10 @@ pub enum ServerMsg {
     /// [`AgentMsg::DirList`]. Only sent to runners that announced [`CAP_DIRS`]. Appended last:
     /// postcard encodes variants by index.
     DirList { req: u64, path: String },
+    /// List this machine's past sessions (of one `kind`, or all), newest first, at most `limit`;
+    /// answered by [`AgentMsg::HarnessHistory`]. Appended last: postcard encodes variants by
+    /// index.
+    HarnessHistory { req: u64, kind: Option<String>, limit: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

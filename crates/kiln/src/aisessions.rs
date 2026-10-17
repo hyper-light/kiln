@@ -41,6 +41,16 @@ const MAX_SESSIONS: usize = 32;
 const MAX_DEPTH: usize = 16;
 /// A transcript untouched this long while mid-turn counts as waiting rather than working.
 const STALLED: Duration = Duration::from_secs(120);
+/// Most past sessions one listing returns.
+const HISTORY_MAX: usize = 200;
+/// Bytes read from the start and the end of a past session's transcript.
+const HISTORY_HEAD: u64 = 32 * 1024;
+const HISTORY_TAIL: u64 = 64 * 1024;
+/// Past sessions remembered between listings (by transcript, with its length and mtime).
+const HISTORY_CACHE: usize = 4096;
+/// How far back from the end the last reply (and so the model) is looked for, when the tail
+/// holds none (attachments can be large).
+const HISTORY_MODEL_TAIL: u64 = 2 * 1024 * 1024;
 /// Codex subcommands that are not an interactive session.
 const CODEX_BATCH: &[&str] = &[
     "exec", "e", "app-server", "mcp", "mcp-server", "login", "logout", "completion", "debug", "apply", "a", "proto", "cloud",
@@ -62,6 +72,30 @@ impl Tool {
             Tool::Gemini => "gemini",
         }
     }
+}
+
+/// A conversation on a machine that is not running: one to continue (`Spec::resume = id`; the
+/// harness keeps its model). Every field has a default, as for [`AiSession`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PastSession {
+    /// "claude" or "codex".
+    pub kind: String,
+    /// The harness's own id: Claude Code's session, Codex's thread.
+    pub id: String,
+    /// Its name (Claude Code's custom or generated title, Codex's thread name), else its last
+    /// prompt's first line.
+    pub title: String,
+    pub cwd: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub branch: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// Unix seconds of the last write to its transcript.
+    pub last_activity: i64,
+    /// The last prompt (clipped).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub last_prompt: String,
 }
 
 /// One live session, as runners report it and the API lists it. Every field has a default so
@@ -241,6 +275,17 @@ impl Reporter {
         });
     }
 
+    /// Answer the server's request for this machine's past sessions (`running`: the harness ids
+    /// of kiln's own sessions here).
+    pub fn history(&self, req: u64, kind: Option<String>, limit: usize, running: HashSet<String>, up: async_channel::Sender<crate::exec::Up>) {
+        let scanner = Arc::clone(&self.scanner);
+        crate::rt::spawn(async move {
+            let past = crate::rt::blocking(move || scanner.lock().history(kind.as_deref(), limit, &running)).await.ok();
+            let json = past.and_then(|p| serde_json::to_string(&p).ok());
+            let _ = up.send(crate::exec::Up::Term(crate::proto::AgentMsg::HarnessHistory { req, json })).await;
+        });
+    }
+
     /// Answer the server's request for a session's recent messages.
     pub fn transcript(&self, req: u64, pid: u32, up: async_channel::Sender<crate::exec::Up>) {
         let scanner = Arc::clone(&self.scanner);
@@ -299,6 +344,9 @@ pub struct Scanner {
     codex_meta: HashMap<PathBuf, CodexHead>,
     /// Each reported session's transcript by pid, for [`Scanner::transcript`].
     open: HashMap<u32, (Tool, PathBuf)>,
+    /// Past sessions by transcript, with the length and mtime they were read at (`None`: not a
+    /// conversation, e.g. nothing was ever asked).
+    past: HashMap<PathBuf, (u64, SystemTime, Option<PastSession>)>,
 }
 
 impl Scanner {
@@ -313,6 +361,7 @@ impl Scanner {
             codex_files: HashMap::new(),
             codex_meta: HashMap::new(),
             open: HashMap::new(),
+            past: HashMap::new(),
         }
     }
 
@@ -502,6 +551,85 @@ impl Scanner {
         Some(s)
     }
 
+    /// This machine's conversations that are not running, most recently active first, at most
+    /// `limit`: Claude Code's (`projects/*/*.jsonl`) and Codex's (`sessions/**/rollout-*.jsonl`),
+    /// or one `kind`'s. Running: those found in terminals (a scan), Claude Code's with a live
+    /// session record (of any kind), and `running` (the harness ids of kiln's own sessions).
+    /// Only the head and the tail of each transcript are read, once per change.
+    pub fn history(&mut self, kind: Option<&str>, limit: usize, running: &HashSet<String>) -> Vec<PastSession> {
+        let found = self.scan(&HashMap::new());
+        let open: HashSet<PathBuf> = self.open.values().map(|(_, f)| f.clone()).collect();
+        let mut skip: HashSet<String> = running.clone();
+        skip.extend(found.into_iter().map(|s| s.id).filter(|id| !id.is_empty()));
+        for r in claude_records(&self.claude.join("sessions")) {
+            if self.sys.process(Pid::from_u32(r.pid)).is_some_and(|p| tool_of(p) == Some(Tool::Claude)) {
+                skip.insert(r.session_id);
+            }
+        }
+        let want = |k: &str| kind.is_none_or(|w| w == k);
+        let mut files: Vec<(SystemTime, Tool, PathBuf)> = Vec::new();
+        let mut stat = |tool: Tool, paths: Vec<PathBuf>| {
+            for f in paths {
+                if let Ok(m) = std::fs::metadata(&f).and_then(|m| m.modified()) {
+                    files.push((m, tool, f));
+                }
+            }
+        };
+        if want("claude") {
+            let mut paths = Vec::new();
+            for d in std::fs::read_dir(self.claude.join("projects")).into_iter().flatten().flatten() {
+                // Sessions only: subagents' transcripts live below them, or as agent-*.jsonl.
+                walk_jsonl(&d.path(), 0, &mut |f| !f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("agent-")), &mut paths);
+            }
+            stat(Tool::Claude, paths);
+        }
+        if want("codex") {
+            let mut paths = Vec::new();
+            walk_jsonl(&self.codex.join("sessions"), 3, &mut |_| true, &mut paths);
+            stat(Tool::Codex, paths);
+        }
+        files.sort_by_key(|(m, _, _)| std::cmp::Reverse(*m));
+        let names = if want("codex") { codex_names(&self.codex) } else { HashMap::new() };
+        let limit = limit.clamp(1, HISTORY_MAX);
+        let mut out: Vec<PastSession> = Vec::new();
+        let mut seen = HashSet::new();
+        for (modified, tool, f) in files {
+            if out.len() >= limit {
+                break;
+            }
+            if open.contains(&f) {
+                continue;
+            }
+            let Some(mut p) = self.past_session(tool, &f, modified) else { continue };
+            // A thread's forks and later parts share its id: the newest stands for it.
+            if skip.contains(&p.id) || !seen.insert(p.id.clone()) {
+                continue;
+            }
+            if let Some(n) = names.get(&p.id) {
+                p.title.clone_from(n);
+            }
+            out.push(p);
+        }
+        if self.past.len() > HISTORY_CACHE {
+            self.past.clear();
+        }
+        out
+    }
+
+    /// A transcript as a past session, reread only when it changed.
+    fn past_session(&mut self, tool: Tool, f: &Path, modified: SystemTime) -> Option<PastSession> {
+        let len = std::fs::metadata(f).ok()?.len();
+        if let Some((l, m, p)) = self.past.get(f)
+            && *l == len
+            && *m == modified
+        {
+            return p.clone();
+        }
+        let p = read_past(tool, f, len, modified);
+        self.past.insert(f.to_owned(), (len, modified, p.clone()));
+        p
+    }
+
     /// A Claude Code session's transcript: `projects/<dir>/<id>.jsonl`, where `<dir>` is the
     /// working directory with every other character than letters and digits turned into `-`
     /// (looked for in every project when the directory was shortened or moved).
@@ -621,6 +749,81 @@ fn claude_records(dir: &Path) -> Vec<ClaudeRecord> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| serde_json::from_slice::<ClaudeRecord>(&std::fs::read(e.path()).ok()?).ok())
         .collect()
+}
+
+/// A transcript's head and tail (the whole of a small one) as one past session.
+fn read_past(tool: Tool, f: &Path, len: u64, modified: SystemTime) -> Option<PastSession> {
+    let mut lines = Vec::new();
+    if len > HISTORY_HEAD + HISTORY_TAIL {
+        let file = std::fs::File::open(f).ok()?;
+        let mut buf = Vec::new();
+        file.take(HISTORY_HEAD).read_to_end(&mut buf).ok()?;
+        let head = String::from_utf8_lossy(&buf);
+        // (Its last line is cut short.)
+        let mut head_lines: Vec<&str> = head.lines().collect();
+        head_lines.pop();
+        lines.extend(head_lines.into_iter().filter(|l| !l.trim().is_empty()).map(str::to_owned));
+        lines.extend(tail_lines(f, HISTORY_TAIL)?);
+    } else {
+        lines = tail_lines(f, len.max(1))?;
+    }
+    let (mut meta, entries) = parse(tool, &lines);
+    if meta.model.is_empty() && len > HISTORY_HEAD + HISTORY_TAIL {
+        let (more, _) = parse(tool, &tail_lines(f, HISTORY_MODEL_TAIL.min(len)).unwrap_or_default());
+        meta.model = more.model;
+    }
+    let summary = summarize(meta, &entries);
+    let meta = &summary.meta;
+    let id = match tool {
+        // The file's name is the session's (the thread's, for Codex: a fork's or later part's
+        // first id).
+        Tool::Claude => f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        _ => codex_thread_of(f).unwrap_or_else(|| meta.id.clone()),
+    };
+    if id.is_empty() || (summary.last_prompt.trim().is_empty() && meta.title.is_empty()) {
+        return None;
+    }
+    // Codex's header (the first line) can outgrow the head read: its folder and branch.
+    let (cwd, branch) = if tool == Tool::Codex && (meta.cwd.is_empty() || meta.branch.is_empty()) {
+        let (head, _) = parse_codex(&head_line(f).into_iter().collect::<Vec<_>>());
+        (if meta.cwd.is_empty() { head.cwd } else { meta.cwd.clone() }, if meta.branch.is_empty() { head.branch } else { meta.branch.clone() })
+    } else {
+        (meta.cwd.clone(), meta.branch.clone())
+    };
+    Some(PastSession {
+        kind: tool.name().to_owned(),
+        id,
+        title: if meta.title.is_empty() { first_line(&summary.last_prompt, 80) } else { meta.title.clone() },
+        cwd,
+        branch,
+        model: meta.model.clone(),
+        last_activity: unix_secs(modified),
+        last_prompt: clip(&summary.last_prompt, SNIPPET),
+    })
+}
+
+/// The thread a Codex rollout belongs to, from its name: `rollout-<time>-<thread>[_<part>].jsonl`.
+fn codex_thread_of(f: &Path) -> Option<String> {
+    let name = f.file_name()?.to_str()?.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    // The time is "YYYY-MM-DDThh-mm-ss", then "-".
+    let rest = name.get(20..)?;
+    let thread = rest.split('_').next()?;
+    (thread.len() >= 32).then(|| thread.to_owned())
+}
+
+/// Codex's thread names (`session_index.jsonl`; the latest per thread).
+fn codex_names(home: &Path) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Some(lines) = tail_lines(&home.join("session_index.jsonl"), 1024 * 1024) else { return names };
+    for l in lines {
+        let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
+        if let (Some(id), Some(n)) = (str_at(&v, "id"), str_at(&v, "thread_name"))
+            && !n.trim().is_empty()
+        {
+            names.insert(id.to_owned(), n.to_owned());
+        }
+    }
+    names
 }
 
 fn args_of(p: &Process) -> Vec<String> {
@@ -842,13 +1045,24 @@ fn entry(role: &str, text: &str, at: &str) -> Entry {
 fn parse_claude(lines: &[String]) -> (Meta, Vec<Entry>) {
     let mut meta = Meta::default();
     let mut entries = Vec::new();
+    let mut custom = false;
     for line in lines {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         let kind = str_at(&v, "type").unwrap_or("");
         match kind {
             "ai-title" => {
-                if let Some(t) = str_at(&v, "aiTitle") {
+                if let Some(t) = str_at(&v, "aiTitle")
+                    && !custom
+                {
                     meta.title = t.to_owned();
+                }
+                continue;
+            }
+            // Named by the user (/rename): over any generated title.
+            "custom-title" => {
+                if let Some(t) = str_at(&v, "customTitle").filter(|t| !t.trim().is_empty()) {
+                    meta.title = t.to_owned();
+                    custom = true;
                 }
                 continue;
             }
@@ -1131,6 +1345,63 @@ mod tests {
         // Resumed by id: that one.
         let r = Proc { pid: 4444, start, cwd: "/work".into(), args: vec!["codex".into(), "resume".into(), "other-1".into()] };
         assert!(sc.codex_file(&r, &HashSet::new()).is_some_and(|f| f.to_string_lossy().ends_with("other-1.jsonl")));
+        Ok(())
+    }
+
+    #[test]
+    fn past_sessions_newest_first_without_the_running_ones() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (claude, codex) = (dir.path().join("claude"), dir.path().join("codex"));
+        let write = |f: &Path, lines: &[serde_json::Value], age: u64| -> anyhow::Result<()> {
+            if let Some(p) = f.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::write(f, lines.iter().map(|l| format!("{l}\n")).collect::<String>())?;
+            std::fs::File::options().write(true).open(f)?.set_modified(SystemTime::now() - Duration::from_secs(age))?;
+            Ok(())
+        };
+        let user = |id: &str, said: &str| serde_json::json!({"type": "user", "sessionId": id, "cwd": "/work/a", "gitBranch": "main", "timestamp": "t", "message": {"role": "user", "content": said}});
+        let reply = |id: &str| serde_json::json!({"type": "assistant", "sessionId": id, "cwd": "/work/a", "timestamp": "t", "message": {"role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "done"}]}});
+        let proj = claude.join("projects").join("-work-a");
+        // Named with /rename; then one with no name; then one kiln runs now; an empty one; a
+        // subagent's.
+        write(&proj.join("c-named.jsonl"), &[user("c-named", "fix the build"), reply("c-named"), serde_json::json!({"type": "custom-title", "customTitle": "Build fix", "sessionId": "c-named"})], 300)?;
+        write(&proj.join("c-plain.jsonl"), &[user("c-plain", "write the docs\nall of them"), reply("c-plain")], 200)?;
+        write(&proj.join("c-running.jsonl"), &[user("c-running", "busy"), reply("c-running")], 10)?;
+        write(&proj.join("c-empty.jsonl"), &[serde_json::json!({"type": "queue-operation", "operation": "enqueue"})], 5)?;
+        write(&proj.join("agent-sub.jsonl"), &[user("agent-sub", "sub task")], 1)?;
+        // Codex: a thread (its session_meta, a turn's context, a prompt) and a later part of it;
+        // its name from the index.
+        let day = codex.join("sessions/2026/10/16");
+        let thread = "01a14829-db2b-7e00-a770-67aa7bf6d977";
+        let meta = serde_json::json!({"timestamp": "t", "type": "session_meta", "payload": {"id": thread, "cwd": "/work/b", "originator": "codex-tui", "git": {"branch": "dev"}}});
+        let ctx = serde_json::json!({"timestamp": "t", "type": "turn_context", "payload": {"cwd": "/work/b", "model": "gpt-5.5"}});
+        let said = serde_json::json!({"timestamp": "t", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ship it"}]}});
+        write(&day.join(format!("rollout-2026-10-16T21-41-05-{thread}.jsonl")), &[meta.clone(), ctx.clone(), said.clone()], 100)?;
+        write(&day.join(format!("rollout-2026-10-16T21-41-07-{thread}_01a14829-e32a-79c2-8581-3ab5a4b9d221.jsonl")), &[meta, ctx, said], 50)?;
+        std::fs::write(codex.join("session_index.jsonl"), format!("{}\n", serde_json::json!({"id": thread, "thread_name": "Ship", "updated_at": "t"})))?;
+        let mut sc = Scanner::new(dir.path().to_owned());
+        sc.claude = claude;
+        sc.codex = codex;
+        let running: HashSet<String> = HashSet::from(["c-running".to_owned()]);
+        let past = sc.history(None, 50, &running);
+        let got: Vec<(&str, &str, &str, &str, &str, &str)> = past.iter().map(|p| (p.kind.as_str(), p.id.as_str(), p.title.as_str(), p.cwd.as_str(), p.branch.as_str(), p.model.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("codex", thread, "Ship", "/work/b", "dev", "gpt-5.5"),
+                ("claude", "c-plain", "write the docs", "/work/a", "main", "claude-opus-5-5"),
+                ("claude", "c-named", "Build fix", "/work/a", "main", "claude-opus-5-5"),
+            ]
+        );
+        assert!(past.windows(2).all(|w| w.first().map(|p| p.last_activity) >= w.get(1).map(|p| p.last_activity)));
+        assert_eq!(past.get(1).map(|p| p.last_prompt.as_str()), Some("write the docs\nall of them"));
+        // One kind, a limit.
+        assert_eq!(sc.history(Some("claude"), 1, &running).iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["c-plain"]);
+        assert!(sc.history(Some("codex"), 50, &running).iter().all(|p| p.kind == "codex"));
+        // Written to since: read again.
+        write(&proj.join("c-plain.jsonl"), &[user("c-plain", "write the docs"), reply("c-plain"), user("c-plain", "and the changelog")], 1)?;
+        assert_eq!(sc.history(Some("claude"), 1, &running).first().map(|p| p.last_prompt.as_str()), Some("and the changelog"));
         Ok(())
     }
 

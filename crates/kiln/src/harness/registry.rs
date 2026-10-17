@@ -160,6 +160,8 @@ pub struct Registry {
     /// where agents started "in this shell" begin).
     local_shells: Mutex<HashMap<String, u32>>,
     dir: std::path::PathBuf,
+    /// The server machine's transcripts, for its past sessions (made on first use).
+    scanner: Arc<Mutex<Option<crate::aisessions::Scanner>>>,
 }
 
 impl Registry {
@@ -175,6 +177,7 @@ impl Registry {
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
             dir,
+            scanner: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -242,6 +245,24 @@ impl Registry {
                 Ok(Some(crate::rt::blocking(move || s.task_output(&task, since)).await?))
             }
             Some(Location::Machine(m)) => Ok(hub.harness_task_output(&m, id, task, since).await?.and_then(|j| serde_json::from_str(&j).ok())),
+        }
+    }
+
+    /// A machine's past sessions, newest first, as JSON (`None`: that machine does not look, e.g.
+    /// an ephemeral runner). The server's own skip what its sessions are running.
+    pub async fn history(&self, hub: &Hub, target: &str, kind: Option<String>, limit: usize) -> anyhow::Result<Option<Value>> {
+        match Location::of_target(target) {
+            Location::Local => {
+                let running: std::collections::HashSet<String> = self.local.list().into_iter().filter_map(|i| i.harness_session).collect();
+                let scanner = Arc::clone(&self.scanner);
+                let past = crate::rt::blocking(move || {
+                    let mut g = scanner.lock();
+                    g.get_or_insert_with(|| crate::aisessions::Scanner::new(crate::os::home_dir())).history(kind.as_deref(), limit, &running)
+                })
+                .await?;
+                Ok(Some(serde_json::to_value(past)?))
+            }
+            Location::Machine(m) => Ok(hub.harness_history(&m, kind, u32::try_from(limit).unwrap_or(u32::MAX)).await?.and_then(|j| serde_json::from_str(&j).ok())),
         }
     }
 
