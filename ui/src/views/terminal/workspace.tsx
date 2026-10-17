@@ -1,7 +1,7 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
 import { Link, useLocation, useNavigate } from "react-router";
-import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Eye, Keyboard, Maximize2, Minimize2, Minus, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
+import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Eye, Keyboard, Maximize2, Minimize2, Minus, PencilLine, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, AiSession, TerminalSessionInfo } from "@/api/types";
@@ -521,6 +521,19 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
                 </span>
               )}
               {t.state.kind === "exited" && <span className="font-mono text-[9px] text-[#8c8f98] uppercase">exited{t.state.code !== null ? ` ${t.state.code}` : ""}</span>}
+              {t.id === activeId && t.sessionId && renaming !== t.id && (
+                <button
+                  className="grid size-7 place-items-center rounded-full text-[#7f838d] hover:bg-white/[0.06] hover:text-white"
+                  aria-label={`Rename ${t.title}`}
+                  title="Rename"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setRenaming(t.id);
+                  }}
+                >
+                  <PencilLine size={12} />
+                </button>
+              )}
               <button
                 className="grid size-7 place-items-center rounded-full text-[#7f838d] hover:bg-white/[0.06] hover:text-white"
                 aria-label={`Close ${t.title}`}

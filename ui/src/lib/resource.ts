@@ -51,9 +51,19 @@ interface Entry {
   /** Out of date while not shown: refreshed when it's shown again. */
   stale: boolean;
   listeners: Set<() => void>;
+  /** Its subscribe function, one per key: a new one each render would make React unsubscribe and
+   * subscribe again after every render, and each new subscription refresh it. */
+  sub: (l: () => void) => () => void;
   poll: number | null;
   used: number;
 }
+
+/**
+ * Already settled, for React: `use()` reads its status and doesn't wait. A read must call `use()`
+ * on every render, not only while loading: React replays the render that suspended and needs the
+ * same calls (react.dev/warnings/conditional-use-of-use).
+ */
+const SETTLED: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
 /** At most this many keys are kept once nothing shows them. */
 const KEEP = 200;
@@ -71,9 +81,12 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       again: false,
       stale: false,
       listeners: new Set(),
+      sub: () => () => undefined,
       poll: null,
       used: Date.now(),
     };
+    const made = e;
+    e.sub = (l) => subscribe(made, l);
     entries.set(key, e);
     prune();
   }
@@ -162,14 +175,12 @@ function subscribe(e: Entry, l: () => void) {
 export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: ResourceOptions = {}): SuspenseResource<T> {
   const e = entry(key, fetcher as Fetcher<unknown>, opts);
   const snap = useSyncExternalStore(
-    (l) => subscribe(e, l),
+    e.sub,
     () => e.snap,
     () => e.snap,
   );
-  if (!snap.has) {
-    if (snap.failed) throw snap.error;
-    use(e.promise ?? load(e));
-  }
+  if (!snap.has && snap.failed) throw snap.error;
+  use(snap.has ? SETTLED : (e.promise ?? load(e)));
   return {
     data: snap.data as T,
     refreshing: snap.refreshing,
