@@ -19,6 +19,7 @@ pub enum Method {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
 }
 
@@ -28,6 +29,7 @@ impl Method {
             Self::Get => http::Method::GET,
             Self::Post => http::Method::POST,
             Self::Put => http::Method::PUT,
+            Self::Patch => http::Method::PATCH,
             Self::Delete => http::Method::DELETE,
         }
     }
