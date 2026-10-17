@@ -91,6 +91,16 @@ enum Cmd {
     Agents(kiln::harness::cli::AgentsArgs),
     /// Deployments: apps, syncs, clusters, imports from Argo CD, the fleet benchmark.
     Cd(kiln::cd::cli::CdArgs),
+    /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
+    Mcp {
+        #[command(flatten)]
+        server: ServerArgs,
+        /// Print an MCP token for an agent with this label (calls are audited as `agent:<label>`)
+        /// instead of serving: `claude mcp add --transport http kiln <url>/api/mcp --header
+        /// "Authorization: Bearer $(kiln mcp --print-token my-agent)"`.
+        #[arg(long)]
+        print_token: Option<String>,
+    },
 }
 
 /// Which server a CLI command talks to. By default kiln finds it: the cluster bootstrap's
@@ -414,6 +424,17 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Cd(a) => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             kiln::cd::cli::run(a, &cfg).await
+        }
+        Cmd::Mcp { server, print_token } => {
+            let cfg = config::Config::load(&config_path).unwrap_or_default();
+            let t = server.resolve(&cfg).await?;
+            match print_token {
+                Some(label) => {
+                    println!("{}", kiln::mcp::token(&t.token, &label));
+                    Ok(())
+                }
+                None => kiln::mcp::stdio(t.url, t.token).await,
+            }
         }
         Cmd::Status { server } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();

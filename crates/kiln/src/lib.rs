@@ -21,6 +21,7 @@ pub mod instances;
 pub mod join;
 pub mod k8s;
 pub mod logs;
+pub mod mcp;
 pub mod metrics;
 pub mod net;
 pub mod os;

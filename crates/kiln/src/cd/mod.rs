@@ -13,6 +13,7 @@
 pub mod api;
 pub mod cli;
 pub mod kube;
+pub mod ops;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -145,10 +146,7 @@ impl Cd {
     pub fn register(&self, def: AppDef) {
         let id = def.id();
         let mut cfg = def.config();
-        // Apps adopted from Argo CD start in shadow mode until they are taken over.
-        if matches!(def.origin, Origin::Argo { .. }) && def.labels.get("kiln.dev/take-over").map(String::as_str) != Some("true") {
-            cfg.read_only = true;
-        }
+        cfg.read_only = is_shadow(&def);
         {
             let mut apps = self.apps.write();
             let entry = apps.entry(id.clone()).or_insert_with(|| AppEntry {
@@ -714,6 +712,11 @@ impl Cd {
     }
 }
 
+/// Apps adopted from Argo CD are shadowed (compared, never written) until they are taken over.
+pub fn is_shadow(def: &AppDef) -> bool {
+    matches!(def.origin, Origin::Argo { .. }) && def.labels.get("kiln.dev/take-over").map(String::as_str) != Some("true")
+}
+
 /// An app's status as the API and events show it.
 pub fn summary_json(s: &Summary) -> Value {
     json!({
@@ -862,6 +865,11 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
                 }
             }
         });
+    }
+    // Agents kiln starts on this machine get its MCP server and skills.
+    let port = hub.cfg.server.http_addr.rsplit_once(':').map(|(_, p)| p.to_owned()).unwrap_or_else(|| "7070".into());
+    if let Err(e) = crate::mcp::init_kit(&hub, &format!("http://127.0.0.1:{port}")) {
+        tracing::warn!(error = %format!("{e:#}"), "agents won't be given kiln's MCP server and skills");
     }
     tracing::info!(apps = cd.apps.read().len(), "deployments ready");
     let _ = hub.shutdown.cancelled().await;
