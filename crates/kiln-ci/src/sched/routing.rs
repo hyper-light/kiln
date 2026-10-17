@@ -839,7 +839,7 @@ mod tests {
         assert!(why.iter().any(|c| c.requirement == "os == linux" && c.value == "os = macos" && !c.pass), "{why:?}");
         // Repository and job matches, and executors.
         let rule = Rule { matches: RuleMatch { job: Some("job.id == 'build'".into()), repos: vec!["acme/*".into()], ..RuleMatch::default() }, require: vec!["virt.kvm".into()], executor: vec!["firecracker".into()], ..Rule::default() };
-        let req = resolve(&leg, &[rule.clone()])?;
+        let req = resolve(&leg, std::slice::from_ref(&rule))?;
         assert_eq!((req.rules.clone(), req.executors.clone()), (vec![0], vec!["firecracker".to_owned()]));
         let other = LegRoute { repo: "other/x".into(), ..leg.clone() };
         assert!(resolve(&other, &[rule])?.rules.is_empty());
