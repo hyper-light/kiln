@@ -6,7 +6,6 @@
 import * as React from "react";
 import { ChevronRight, Square } from "lucide-react";
 import { harnessApi, type Command, type State, type Task } from "@/api/harness";
-import { ConfirmDialog } from "@/components/ui/dialog";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { duration, tildify } from "./derive";
@@ -107,37 +106,55 @@ function Row({ t, agent, send }: { t: Task; agent: string; send: (c: Command) =>
 /** The inspector's section: everything in the background, running first. */
 export function Background({ state, agent, send }: { state: State | null; agent: string; send: (c: Command) => void }) {
   const [confirm, setConfirm] = React.useState(false);
+  const [ended, setEnded] = React.useState(false);
   const tasks = backgroundOf(state);
   if (tasks.length === 0) return null;
   const live = tasks.filter(isLive);
-  const ordered = [...live, ...tasks.filter((t) => !isLive(t)).reverse()];
+  const done = tasks.filter((t) => !isLive(t)).reverse();
   return (
     <section>
       <h3 className="in-sec-head">
         In the background
         <span>
           {live.length} running
-          {live.length > 1 && (
+          {live.length > 1 && !confirm && (
             <button type="button" className="bg-all" onClick={() => setConfirm(true)}>
               Stop all
             </button>
           )}
         </span>
       </h3>
+      {confirm && (
+        <div className="bg-confirm" role="group" aria-label="Stop everything in the background">
+          <span>Stop the {live.length} shells and monitors it left running? The agent keeps going.</span>
+          <button
+            type="button"
+            className="bg-all"
+            onClick={() => {
+              setConfirm(false);
+              send({ type: "stop_tasks" });
+            }}
+          >
+            Stop all
+          </button>
+          <button type="button" className="bg-all" onClick={() => setConfirm(false)}>
+            Keep them
+          </button>
+        </div>
+      )}
       <ul className="bg-list">
-        {ordered.map((t) => (
+        {live.map((t) => (
           <Row key={t.id} t={t} agent={agent} send={send} />
         ))}
+        {done.length > 0 && (
+          <li className="bg-ended">
+            <button type="button" className="bg-all" onClick={() => setEnded(!ended)}>
+              {ended ? "Hide the finished ones" : `${done.length} finished`}
+            </button>
+          </li>
+        )}
+        {ended && done.map((t) => <Row key={t.id} t={t} agent={agent} send={send} />)}
       </ul>
-      <ConfirmDialog
-        open={confirm}
-        onOpenChange={setConfirm}
-        title={`Stop ${live.length} background tasks?`}
-        description="The shells and monitors this agent left running are stopped on its machine. The agent keeps going."
-        confirmLabel="Stop all"
-        danger
-        onConfirm={() => send({ type: "stop_tasks" })}
-      />
     </section>
   );
 }
