@@ -723,3 +723,15 @@ a.ms-why:hover {
   margin-left: auto;
   font-size: 12.5px;
 }
+
+/* A row's name, renamed in place: the field keeps the name's size. */
+.name-field.ms-name-field {
+  margin-left: -9px;
+  font-size: 18px;
+  line-height: 30px;
+  letter-spacing: -0.02em;
+}
+/* The harness, under a name of its own. */
+.ms-kind {
+  color: #8c8f98;
+}

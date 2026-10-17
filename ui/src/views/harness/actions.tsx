@@ -4,8 +4,7 @@ import { useNavigate } from "react-router";
 import { DropdownMenu } from "radix-ui";
 import { MoreHorizontal } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command } from "@/api/harness";
-import { Button } from "@/components/ui/button";
-import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage } from "@/lib/hooks";
 import { copyText } from "@/views/terminal/clipboard";
@@ -16,7 +15,8 @@ type Act = "end" | "remove" | "rename" | "duplicate" | null;
 export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "target" | "cwd" | "harness_session" | "left_behind">, after?: { onGone?: () => void }) {
   const navigate = useNavigate();
   const [act, setAct] = React.useState<Act>(null);
-  const [name, setName] = React.useState(a.name);
+  // Renaming from the menu: the menu mustn't hand focus back to its button, the name field takes it.
+  const renameNext = React.useRef(false);
   const live = a.status !== "exited";
   const command = async (c: Command, what: string) => {
     try {
@@ -36,7 +36,13 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
   const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean }[] = [
     { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
     { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
-    { label: "Rename…", onSelect: () => setAct("rename") },
+    {
+      label: "Rename…",
+      onSelect: () => {
+        renameNext.current = true;
+        setAct("rename");
+      },
+    },
     { label: "Duplicate…", onSelect: () => setAct("duplicate") },
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },
@@ -51,7 +57,18 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
         )}
       </DropdownMenu.Trigger>
       <DropdownMenu.Portal>
-        <DropdownMenu.Content className="popover w-56" sideOffset={6} align="end" collisionPadding={12}>
+        <DropdownMenu.Content
+          className="popover w-56"
+          sideOffset={6}
+          align="end"
+          collisionPadding={12}
+          onCloseAutoFocus={(e) => {
+            if (renameNext.current) {
+              renameNext.current = false;
+              e.preventDefault();
+            }
+          }}
+        >
           {[...extra, ...items]
             .filter((i) => !("hidden" in i && i.hidden))
             .map((i) => (
@@ -74,26 +91,6 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
         danger
         onConfirm={end}
       />
-      <Dialog open={act === "rename"} onOpenChange={(o) => !o && setAct(null)}>
-        {act === "rename" && (
-          <DialogContent title="Rename agent" eyebrow="Agent">
-            <form
-              className="flex gap-2"
-              onSubmit={(e) => {
-                e.preventDefault();
-                const n = name.trim();
-                if (n) void command({ type: "control", id: "rename", value: n }, "rename it");
-                setAct(null);
-              }}
-            >
-              <input className="hx-input" autoFocus value={name} onChange={(e) => setName(e.target.value)} aria-label="Name" />
-              <Button size="sm" type="submit">
-                Rename
-              </Button>
-            </form>
-          </DialogContent>
-        )}
-      </Dialog>
       {act === "duplicate" && (
         <SpawnDialog
           open
@@ -107,16 +104,18 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
       )}
     </>
   );
-  return { menu, dialogs, end: () => (live ? setAct("end") : void end()), live };
+  return {
+    menu,
+    dialogs,
+    end: () => (live ? setAct("end") : void end()),
+    live,
+    /** Its name is being edited where it shows (`NameField`). */
+    renaming: act === "rename",
+    startRenaming: () => setAct("rename"),
+    stopRenaming: () => setAct(null),
+    /** Names it in kiln (and in its harness, which names conversations too); "" gives it back its harness's name. */
+    rename: (n: string) => command({ type: "control", id: "rename", value: n }, "rename it"),
+  };
 }
 
-/** The ⋯ menu on an agent's card. */
-export function AgentMenu({ a }: { a: AgentInfo }) {
-  const { menu, dialogs } = useAgentActions(a);
-  return (
-    <>
-      {menu()}
-      {dialogs}
-    </>
-  );
-}
+export { NameField } from "@/components/ui/name-field";

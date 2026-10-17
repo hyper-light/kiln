@@ -96,6 +96,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     let hub = Hub::new(cfg.clone(), store, logs, net, pki.clone(), admin, join, shutdown.clone());
     // The CI engine (docs/ci.md), when turned on.
     crate::ci::dispatch::spawn(hub.clone());
+    // Terminal sessions' names, kept across restarts.
+    hub.terminals.keep_names_in(cfg.server.data_dir.join("terminal-names.json"));
     // Runners' front doors: what the UI set, sent to each runner when it connects.
     hub.front_doors.load(&hub.store).await?;
     // The tailnet's DNS for them: the Tailscale credential given in the UI, the routes kiln set.

@@ -16,8 +16,8 @@ import { Button } from "@/components/ui/button";
 import { ErrorState, PageIntro, SkeletonRows } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useLocalStorage } from "@/lib/hooks";
-import { plain } from "./derive";
-import { AgentMenu } from "./actions";
+import { agentLabel, hasOwnName, plain } from "./derive";
+import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
 import { DEFAULT_VIEW, isFiltered, ListBar, useShownList, type ListView } from "./list-tools";
 import { byStart, FoundSessions, sessionKey } from "./found";
@@ -113,26 +113,41 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
   const navigate = useNavigate();
   const open = () => navigate(`/agents/${a.id}`);
   const ap = a.approvals[0];
+  const actions = useAgentActions(a);
+  const label = agentLabel(a);
+  // The harness, said under a label that isn't its own name.
+  const kind = label.toLowerCase() !== a.kind_name.toLowerCase();
+  const line = (
+    <span className="ms-line">
+      <span className="ms-word">
+        <i aria-hidden="true" />
+        {WORD[stand]}
+      </span>
+      <span className="ms-text">{lineOf(a, stand)}</span>
+    </span>
+  );
   return (
     <li className="ms-row" data-stand={stand} data-selected={selected || undefined}>
       <label className="ms-check">
-        <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${a.name}`} />
+        <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(a.id, e.target.checked)} aria-label={`Select ${label}`} />
       </label>
-      <button type="button" className="ms-main" onClick={open}>
-        <span className="ms-name">{a.name}</span>
-        <span className="ms-line">
-          <span className="ms-word">
-            <i aria-hidden="true" />
-            {WORD[stand]}
-          </span>
-          <span className="ms-text">{lineOf(a, stand)}</span>
-        </span>
-      </button>
+      {actions.renaming ? (
+        <div className="ms-main">
+          <NameField value={hasOwnName(a) ? a.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ms-name-field" label="Agent name" />
+          {line}
+        </div>
+      ) : (
+        <button type="button" className="ms-main" onClick={open}>
+          <span className="ms-name">{label}</span>
+          {line}
+        </button>
+      )}
       <span className="ms-meta">
         <span>
           {machineName(a.target)} · <Ago className="ms-time" ts={Math.floor(a.last_activity / 1000)} />
         </span>
         <span className="ms-meta-2">
+          {kind && <span className="ms-kind">{a.kind_name}</span>}
           {(a.files_changed ?? 0) > 0 && (
             <span className="ms-changes">
               {a.files_changed} file{a.files_changed === 1 ? "" : "s"} <b>+{a.lines_added ?? 0}</b> <i>−{a.lines_removed ?? 0}</i>
@@ -152,8 +167,9 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
           )}
         </span>
         <span className="ms-tail">
-          <AgentMenu a={a} />
-          <button type="button" className="ms-go" onClick={open} aria-label={`Open ${a.name}`}>
+          {actions.menu()}
+          {actions.dialogs}
+          <button type="button" className="ms-go" onClick={open} aria-label={`Open ${label}`}>
             <ArrowUpRight size={16} />
           </button>
         </span>
