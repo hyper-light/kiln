@@ -7,7 +7,7 @@ import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { api } from "@/api/client";
 import { harnessApi } from "@/api/harness";
-import { planHref, plansApi, shareUrl, type Plan, type PlanRan } from "@/api/plans";
+import { planHref, plansApi, shareUrl, type Plan, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { CopyButton, ErrorState, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
@@ -179,7 +179,7 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
   const [target, setTarget] = React.useState("local");
   const [kind, setKind] = React.useState("");
   const [cwd, setCwd] = React.useState("");
-  const [mode, setMode] = React.useState<"message" | "steps">("message");
+  const [mode, setMode] = React.useState<PlanMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -234,10 +234,15 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
         <SelectField
           label="As"
           value={mode}
-          onChange={(v) => setMode(v as "message" | "steps")}
+          onChange={(v) => setMode(v as PlanMode)}
           options={[
             { value: "message", label: "One message" },
-            ...(plan.steps.length ? [{ value: "steps", label: `Step by step (${plan.steps.length} messages, each after the last turn ends)` }] : []),
+            ...(plan.steps.length
+              ? [
+                  { value: "steps", label: `Step by step (${plan.steps.length} messages, each after the last turn ends)` },
+                  { value: "goals", label: `Goals (${plan.steps.length}, each a /goal once the one before is met)` },
+                ]
+              : []),
           ]}
         />
       </div>
@@ -249,7 +254,8 @@ function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: ()
         {error && <span className="plan-error">{error}</span>}
         {ran && (
           <span className="plan-ok">
-            Sent {ran.sent === 1 ? "the plan" : `${ran.sent} messages`} · <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
+            {mode === "goals" ? `${ran.sent} goals lined up` : `Sent ${ran.sent === 1 ? "the plan" : `${ran.sent} messages`}`} ·{" "}
+            <Link to={`/agents/${encodeURIComponent(ran.session)}`}>open the agent</Link>
           </span>
         )}
       </div>

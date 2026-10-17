@@ -115,6 +115,9 @@ pub enum Mode {
     Message,
     /// Each step its own message, each sent once the turn before it ends.
     Steps,
+    /// Each step a goal in the agent's goal stack (`crate::goals`): the next goes once the one
+    /// before is met (its harness's own /goal where it has one).
+    Goals,
 }
 
 impl Mode {
@@ -122,6 +125,7 @@ impl Mode {
         match self {
             Self::Message => "message",
             Self::Steps => "steps",
+            Self::Goals => "goals",
         }
     }
 }
@@ -451,8 +455,11 @@ pub async fn share(hub: &Hub, id: &str, on: bool) -> R<Plan> {
 /// Runs a plan on an agent: an existing one, or a new one started with it.
 pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R<Ran> {
     let p = get(hub, id).await?;
+    if mode == Mode::Goals {
+        return run_goals(hub, &p, target, by).await;
+    }
     let messages: Vec<String> = match mode {
-        Mode::Message => vec![message(&p)],
+        Mode::Message | Mode::Goals => vec![message(&p)],
         Mode::Steps => {
             let steps: Vec<&String> = p.steps.iter().take(STEPS).collect();
             if steps.is_empty() {
@@ -488,6 +495,41 @@ pub async fn run(hub: &Hub, id: &str, target: Target, mode: Mode, by: &str) -> R
             c.execute(
                 "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![run_c, plan_id, version, session_c, mode_s, now, by_s],
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(Ran { session, sent, run })
+}
+
+/// A plan's steps as goals, after the agent's others (a new agent is started for them), and the
+/// stack running.
+async fn run_goals(hub: &Hub, p: &Plan, target: Target, by: &str) -> R<Ran> {
+    let goals: Vec<String> = p.steps.iter().take(STEPS).cloned().collect();
+    if goals.is_empty() {
+        return Err(Error::Bad("this plan has no steps (no list in it) to make goals of".into()));
+    }
+    let session = match target {
+        Target::Session(s) => s,
+        Target::New { target, kind, cwd } => {
+            let spec = Spec { kind, cwd: cwd.filter(|c| !c.trim().is_empty()), name: Some(p.title.clone()), ..Spec::default() };
+            let infos = hub.harness.open(hub, &target, spec, 1).await?;
+            infos.into_iter().next().ok_or_else(|| Error::Bad("the agent did not start".into()))?.id
+        }
+    };
+    let sent = goals.len();
+    crate::goals::add(hub, &session, goals, true).await.map_err(|e| match e {
+        crate::goals::Error::NoAgent => Error::Bad("no such agent".into()),
+        crate::goals::Error::Bad(m) => Error::Bad(m),
+        crate::goals::Error::Other(e) => Error::Other(e),
+    })?;
+    let (run, now, by_s, version, plan_id, session_c) = (crate::util::new_id(), crate::util::now_unix(), by.to_owned(), p.version, p.id.clone(), session.clone());
+    let run_c = run.clone();
+    hub.store
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO plan_runs (id, plan_id, version, session, mode, at, by) VALUES (?1, ?2, ?3, ?4, 'goals', ?5, ?6)",
+                params![run_c, plan_id, version, session_c, now, by_s],
             )?;
             Ok(())
         })

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use super::core::{Baseline, Core, Effect};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Known, Level, Limit, McpServer,
-    McpStatus, McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
+    McpStatus, McpTool, ModeOption, ModelOption, Objective, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
     ChoiceAnswer, ToolKind, ToolStatus, OUTPUT_MAX, Route, account_id, choices_of, clip_json, clip_middle, mask_emails, plan_label, safe_url, sort_catalog, window_words,
 };
 use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
@@ -1948,6 +1948,27 @@ impl Codex {
                 core.state.usage.context_window = u.get("modelContextWindow").and_then(Value::as_u64);
                 core.touch_state();
             }
+            // The thread's goal (/goal): Codex works toward it until it says it's complete.
+            "thread/goal/updated" => {
+                let Some(g) = p.get("goal").filter(|g| g.is_object()) else { return };
+                let text = g.get("objective").and_then(Value::as_str).unwrap_or("");
+                let (status, reason) = match g.get("status").and_then(Value::as_str).unwrap_or("active") {
+                    "complete" => ("met", None),
+                    "paused" => ("paused", None),
+                    "blocked" => ("unmet", Some("Codex is blocked on it.")),
+                    "usageLimited" => ("unmet", Some("Codex reached its usage limit.")),
+                    "budgetLimited" => ("unmet", Some("Codex used the goal's token budget.")),
+                    _ => ("active", None),
+                };
+                core.state.objective = Some(Objective::new(text, status, reason.map(str::to_owned)));
+                core.touch_state();
+            }
+            "thread/goal/cleared" => {
+                if let Some(o) = core.state.objective.as_ref().filter(|o| o.status != "cleared") {
+                    core.state.objective = Some(Objective::new(&o.text, "cleared", None));
+                    core.touch_state();
+                }
+            }
             "thread/name/updated" => {
                 if let Some(n) = p.get("name").or_else(|| p.get("threadName")).and_then(Value::as_str) {
                     core.state.title = n.to_owned();
@@ -2413,6 +2434,7 @@ fn codex_catalog() -> Vec<SlashCommand> {
         v("new", "Start a new conversation (another agent)", "Kiln", "new_agent"),
         v("terminal", "A shell in this agent's folder, on its machine", "Kiln", "terminal").aka(&["shell"]),
         v("screen", "Codex's own screen, in this agent's folder", "Kiln", "screen"),
+        v("goals", "Goals one after another: each a /goal, the next once it's complete", "Kiln", "goals"),
         v("clear", "Start a new conversation (another agent)", "Kiln", "new_agent"),
         no("resume", "Resume a saved chat", "Session", "continue another conversation from kiln's agents list"),
         no("plan", "Switch to Plan mode", "Model & mode", "Codex's Plan mode is not offered through its app-server"),
@@ -3218,6 +3240,22 @@ mod tests {
         c.command(&mut core, Command::Control { id: "export".into(), value: Some(json!({"client": "k5"})) });
         assert!(replies(&mut core).iter().any(|(cl, v)| cl == "k5" && v.get("format") == Some(&json!("markdown"))));
         Ok(())
+    }
+
+    #[test]
+    fn the_threads_goal_is_followed_to_complete() {
+        let mut c = Codex::new(None, None, None, false);
+        let mut core = Core::new();
+        let goal = |status: &str| json!({"threadId": "th1", "goal": {"threadId": "th1", "objective": "ship it", "status": status, "tokensUsed": 5, "timeUsedSeconds": 1, "createdAt": 1, "updatedAt": 2}});
+        let status = |core: &Core| core.state.objective.as_ref().map(|o| (o.text.clone(), o.status.clone(), o.reason.clone()));
+        c.notification(&mut core, "thread/goal/updated", goal("active"));
+        assert_eq!(status(&core), Some(("ship it".into(), "active".into(), None)));
+        c.notification(&mut core, "thread/goal/updated", goal("complete"));
+        assert_eq!(status(&core), Some(("ship it".into(), "met".into(), None)));
+        c.notification(&mut core, "thread/goal/updated", goal("budgetLimited"));
+        assert!(matches!(status(&core), Some((_, s, Some(r))) if s == "unmet" && r.contains("budget")));
+        c.notification(&mut core, "thread/goal/cleared", json!({"threadId": "th1"}));
+        assert_eq!(status(&core), Some(("ship it".into(), "cleared".into(), None)));
     }
 
     #[test]
