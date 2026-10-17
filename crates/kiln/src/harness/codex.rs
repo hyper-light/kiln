@@ -14,10 +14,11 @@ use serde_json::{Value, json};
 
 use super::core::{Baseline, Core, Effect};
 use super::model::{
-    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Level, ModeOption,
-    ModelOption, Question, SlashCommand,
-    QuestionOption, QueueItem, SendMode, Status, Task, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle,
+    AlwaysOption, Approval, Body, Command, Control, ControlKind, ControlOption, ControlScope, Decision, Delivery, ExitInfo, FileDiff, HookInfo, Known, Level, Limit, McpServer,
+    McpStatus, McpTool, ModeOption, ModelOption, Plugin, Question, QuestionOption, QueueItem, SendMode, Skill, SlashCommand, Status, StatusItem, Task, Todo, Tone, ToolCall,
+    ToolKind, ToolStatus, OUTPUT_MAX, account_id, clip_json, clip_middle, mask_emails, plan_label, safe_url, window_words,
 };
+use super::claude::{McpAdd, mcp_status_words, safe_command, valid_server_name};
 
 /// How kiln starts Codex.
 pub fn args() -> Vec<String> {
@@ -63,7 +64,38 @@ enum Pending {
     Revert(String),
     /// A request that just needs to succeed (its failure is shown).
     Plain(String),
+    Account,
+    RateLimits,
+    /// config/read: the MCP servers' configuration.
+    Config,
+    Plugins,
+    /// A change to the MCP configuration (what, for a failure): the servers are reloaded after.
+    McpConfig(String),
+    /// config/mcpServer/reload: the servers are asked for again after.
+    McpReload,
+    McpAuth { client: String, name: String },
+    /// An http server written into the configuration (answered to `client`).
+    McpAdded { name: String, client: Option<String> },
 }
+
+/// A run of the CLI (or a fetch) kiln is waiting on.
+#[derive(Debug, Clone)]
+enum Run {
+    McpAdd { name: String, client: Option<String> },
+    McpRemove { name: String, client: Option<String> },
+    /// Forgetting an http server's sign-in before removing it (as Claude Code does).
+    McpLogout { name: String, client: Option<String> },
+    /// The last page of an MCP sign-in, fetched on Codex's machine.
+    Callback { name: String, client: String },
+}
+
+/// How often the plan's rate limits are read while a session runs (Codex also pushes them
+/// during turns).
+const USAGE_EVERY_MS: i64 = 180_000;
+
+/// Reasoning efforts every Codex reasoning model takes, offered until model/list says which the
+/// model in use has, and for a model it does not list.
+const EFFORTS: &[&str] = &["low", "medium", "high"];
 
 /// An approval request Codex is waiting on.
 #[derive(Debug, Clone)]
@@ -116,10 +148,35 @@ pub struct Codex {
     turns: HashMap<String, String>,
     /// Skills (custom commands): name → path.
     skills: HashMap<String, String>,
-    /// MCP servers: (name, status).
-    mcp: Vec<(String, String)>,
     /// A new thread branched off `resume` at this turn (instead of resuming it).
     fork_at: Option<Option<String>>,
+    /// The MCP servers as Codex reports them (mcpServerStatus/list).
+    mcp_rows: Vec<Value>,
+    /// Their configuration (config/read), by name.
+    mcp_config: serde_json::Map<String, Value>,
+    /// Their start-up state as Codex pushes it: name → (state, error).
+    mcp_startup: HashMap<String, (String, Option<String>)>,
+    /// The account's rate-limit snapshots by limit id (rolling updates merged in).
+    rate_limits: std::collections::BTreeMap<String, Value>,
+    /// How the session is signed in ("chatgpt", "apiKey", ...) and as whom (masked).
+    account_kind: Option<String>,
+    account_email: Option<String>,
+    /// The model provider the thread runs on.
+    provider: Option<String>,
+    /// Installed plugins as plugin/installed lists them (marketplace name, plugin).
+    plugins_raw: Vec<(String, Value)>,
+    runs: HashMap<String, Run>,
+    next_run: u64,
+    usage_at: i64,
+    mcp_at: i64,
+    /// The MCP configuration and the servers' status have each been read once.
+    mcp_config_seen: bool,
+    mcp_status_seen: bool,
+    /// The servers were asked for again while an answer was on its way (it may be from before a
+    /// reload): ask once more when it comes.
+    mcp_again: bool,
+    /// Terminals kiln is stopping: their end reads as stopped, not failed.
+    stopping: std::collections::HashSet<String>,
 }
 
 impl Codex {
@@ -154,8 +211,23 @@ impl Codex {
             efforts: HashMap::new(),
             turns: HashMap::new(),
             skills: HashMap::new(),
-            mcp: Vec::new(),
             fork_at: None,
+            mcp_rows: Vec::new(),
+            mcp_config: serde_json::Map::new(),
+            mcp_startup: HashMap::new(),
+            rate_limits: std::collections::BTreeMap::new(),
+            account_kind: None,
+            account_email: None,
+            provider: None,
+            plugins_raw: Vec::new(),
+            runs: HashMap::new(),
+            next_run: 0,
+            usage_at: 0,
+            mcp_at: 0,
+            mcp_config_seen: false,
+            mcp_status_seen: false,
+            mcp_again: false,
+            stopping: std::collections::HashSet::new(),
         }
     }
 
@@ -225,18 +297,13 @@ impl Codex {
         let mut t = ctl("branch", "Session", "Branch from here", "A new session with the conversation up to the end of this turn", ControlKind::Action);
         t.scope = ControlScope::Turn;
         c.push(t);
-        for (name, status) in &self.mcp {
-            c.push(ctl(&format!("mcp_info:{name}"), "MCP", name, &format!("MCP server ({status})"), ControlKind::Text));
-        }
-        c.push(ctl("mcp_refresh", "MCP", "Refresh servers", "Ask for every server's status again", ControlKind::Action));
-        c.push(ctl("mcp_reload", "MCP", "Reload configuration", "Reload the MCP servers from Codex's configuration", ControlKind::Action));
+        // MCP servers and skills have their own state and commands (State::mcp, State::skills).
         core.meta.controls = c;
         let model = core.state.model.clone();
-        core.meta.efforts = self
-            .efforts
-            .get(&model)
-            .map(|l| l.iter().map(|(e, d)| opt(e, &capitalize(e), d, false)).collect())
-            .unwrap_or_default();
+        core.meta.efforts = match self.efforts.get(&model).or_else(|| self.efforts.get("")) {
+            Some(l) => l.iter().map(|(e, d)| opt(e, &capitalize(e), d, false)).collect(),
+            None => EFFORTS.iter().map(|e| opt(e, &capitalize(e), "", false)).collect(),
+        };
         core.touch_meta();
     }
 
@@ -291,13 +358,12 @@ impl Codex {
                 };
                 core.effects.push(Effect::Branch { resume: thread, resume_at: Some(turn) });
             }
-            "mcp_refresh" => self.request(core, Pending::Mcp, "mcpServerStatus/list", json!({})),
-            "mcp_reload" => {
-                self.request(core, Pending::Plain("reload MCP servers".into()), "config/mcpServer/reload", json!({}));
-                self.request(core, Pending::Mcp, "mcpServerStatus/list", json!({}));
-            }
+            // Older consoles' MCP controls (now commands of their own).
+            "mcp_refresh" => self.command(core, Command::McpRefresh),
+            "mcp_reload" => self.mcp_reload(core),
             _ => {}
         }
+        self.compose_status(core);
     }
 
     fn request(&mut self, core: &mut Core, kind: Pending, method: &str, params: Value) {
@@ -321,6 +387,10 @@ impl Codex {
     }
 
     pub fn start(&mut self, core: &mut Core) {
+        // Effort can be set from the start (model/list narrows the levels to the model's).
+        if core.meta.efforts.is_empty() {
+            core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
+        }
         if !modes(self.allow_bypass).iter().any(|m| m.id == core.state.mode) {
             core.state.mode = self.mode.clone();
             core.touch_state();
@@ -340,6 +410,10 @@ impl Codex {
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
+        for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+            t.status = "stopped".into();
+            t.ended.get_or_insert_with(Core::now);
+        }
         self.turn = None;
         self.pending.clear();
         self.asks.clear();
@@ -385,10 +459,18 @@ impl Codex {
             Command::Approve { id, decision, message, always, answers } => self.answer(core, &id, decision, message, always, answers),
             Command::Interrupt => self.interrupt(core),
             Command::SetMode { mode } => {
-                // Takes effect from the next turn (Codex sets policy per turn).
+                // Takes effect from the next turn (Codex sets policy per turn): the mode's approval
+                // policy and sandbox, over any chosen one by one before.
                 if modes(true).iter().any(|m| m.id == mode) && (mode != "full-access" || self.allow_bypass) {
+                    self.approval = None;
+                    self.sandbox = None;
+                    let (a, s, _) = policy(&mode);
+                    core.set_control("approval_policy", json!(a));
+                    core.set_control("sandbox", json!(s));
                     core.state.mode = mode;
                     core.touch_state();
+                } else {
+                    self.notice(core, Level::Warn, format!("{mode}: not a mode this session offers"));
                 }
             }
             Command::SetModel { model } => {
@@ -407,7 +489,350 @@ impl Codex {
                 core.touch_state();
             }
             Command::Control { id, value } => self.control(core, &id, value),
-            Command::StopTask { .. } | Command::Restart | Command::Snapshot => {}
+            Command::Restart | Command::Snapshot => {}
+            // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
+            // the process itself (the newest one under Codex running that command).
+            Command::StopTask { task } => self.stop_terminal(core, &task),
+            Command::StopTasks => {
+                let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).map(|t| t.id.clone()).collect();
+                for task in live {
+                    self.stop_terminal(core, &task);
+                }
+            }
+            Command::McpEnable { name, enabled } => {
+                if !valid_server_name(&name) {
+                    self.notice(core, Level::Warn, format!("{name}: not a server kiln can change"));
+                    return;
+                }
+                let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
+                self.request(core, Pending::McpConfig(what), "config/value/write", json!({"keyPath": format!("mcp_servers.{name}.enabled"), "value": enabled, "mergeStrategy": "replace"}));
+                // Shown at once; the reloaded servers settle it.
+                if let Some(cfg) = self.mcp_config.get_mut(&name).and_then(Value::as_object_mut) {
+                    cfg.insert("enabled".into(), json!(enabled));
+                }
+                self.mcp_startup.remove(&name);
+                self.compose_mcp(core);
+            }
+            // Codex reloads its servers all at once.
+            Command::McpReconnect { name } => {
+                self.mcp_startup.insert(name, ("starting".to_owned(), None));
+                self.compose_mcp(core);
+                self.mcp_reload(core);
+            }
+            Command::McpRefresh => {
+                self.request(core, Pending::Config, "config/read", json!({"cwd": core.state.cwd.clone()}));
+                self.ask_mcp(core);
+            }
+            Command::McpAuth { name, client, redirect } => match redirect.filter(|r| !r.trim().is_empty()) {
+                None => {
+                    let mut params = json!({"name": name});
+                    if let (Some(t), Some(o)) = (&self.thread, params.as_object_mut()) {
+                        o.insert("threadId".into(), json!(t));
+                    }
+                    self.request(core, Pending::McpAuth { client, name }, "mcpServer/oauth/login", params);
+                }
+                // The sign-in's last page could not reach Codex (another device): open it on its machine.
+                Some(url) => {
+                    self.next_run += 1;
+                    let job = format!("fetch-{}", self.next_run);
+                    self.runs.insert(job.clone(), Run::Callback { name, client });
+                    core.effects.push(Effect::Fetch { job, url: url.trim().to_owned() });
+                }
+            },
+            Command::McpAdd { scope, name, transport, command, args, env, url, headers, client } => {
+                let add = McpAdd { scope, name, transport, command, args, env, url, headers };
+                if self.mcp_config.contains_key(&add.name) {
+                    answer(core, client, json!({"ok": false, "error": format!("There is already a server named {}.", add.name)}));
+                    return;
+                }
+                match (codex_add_args(&add), add.transport().as_str()) {
+                    (Err(e), _) => answer(core, client, json!({"ok": false, "error": e})),
+                    // `codex mcp add --url` signs in at once (opening a browser on Codex's machine and
+                    // waiting for it): the server goes into Codex's configuration through its own
+                    // API instead, and signing in is kiln's (McpAuth), from wherever the person is.
+                    (Ok(_), "http") => {
+                        let mut server = json!({"url": add.url.clone().unwrap_or_default().trim()});
+                        if !add.headers.is_empty()
+                            && let Some(o) = server.as_object_mut()
+                        {
+                            o.insert("http_headers".into(), json!(add.headers));
+                        }
+                        let key = format!("mcp_servers.{}", add.name);
+                        self.request(core, Pending::McpAdded { name: add.name, client }, "config/value/write", json!({"keyPath": key, "value": server, "mergeStrategy": "replace"}));
+                    }
+                    (Ok(a), _) => self.run(core, Run::McpAdd { name: add.name.clone(), client }, a),
+                }
+            }
+            Command::McpRemove { name, client, .. } => {
+                if !valid_server_name(&name) {
+                    answer(core, client, json!({"ok": false, "error": "That is not a server name."}));
+                    return;
+                }
+                // An http server's sign-in is forgotten first (`codex mcp remove` keeps it).
+                if self.mcp_config.get(&name).is_some_and(|c| c.get("url").is_some()) {
+                    self.run(core, Run::McpLogout { name: name.clone(), client }, vec!["mcp".into(), "logout".into(), "--".into(), name]);
+                } else {
+                    self.run(core, Run::McpRemove { name: name.clone(), client }, vec!["mcp".into(), "remove".into(), "--".into(), name]);
+                }
+            }
+            Command::SkillView { name, client } => match core.state.skills.iter().find(|s| s.name == name).and_then(|s| s.path.clone()) {
+                Some(path) => core.effects.push(Effect::Read { client, paths: vec![path] }),
+                None => core.reply(client, json!({"error": format!("This session has no skill named {name}.")})),
+            },
+            Command::SkillRun { name, args, id, mode } => {
+                let name = name.trim().trim_start_matches(['/', '$']).to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                let text = match args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                    Some(a) => format!("/{name} {a}"),
+                    None => format!("/{name}"),
+                };
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None }, mode);
+            }
+            Command::SkillsReload => {
+                let cwd = core.state.cwd.clone();
+                self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
+            }
+        }
+        self.compose_status(core);
+    }
+
+    fn stop_terminal(&mut self, core: &mut Core, task: &str) {
+        let Some(t) = core.state.tasks.iter().find(|t| t.id == task && t.live()) else { return };
+        match t.command.clone().filter(|_| t.process.is_some()) {
+            Some(command) => {
+                self.stopping.insert(task.to_owned());
+                core.effects.push(Effect::Kill { job: format!("stop:{task}"), command });
+            }
+            None => self.notice(core, Level::Warn, format!("{}: Codex has no way to stop it", t.description)),
+        }
+    }
+
+    fn run(&mut self, core: &mut Core, what: Run, args: Vec<String>) {
+        self.next_run += 1;
+        let job = format!("run-{}", self.next_run);
+        self.runs.insert(job.clone(), what);
+        core.effects.push(Effect::Run { job, args });
+    }
+
+    /// A run of the CLI (or a fetch) ended.
+    pub fn run_done(&mut self, core: &mut Core, job: &str, code: Option<i32>, output: &str) {
+        // A terminal kiln stopped.
+        if let Some(task) = job.strip_prefix("stop:") {
+            self.stopping.remove(task);
+            let stopped = code == Some(0);
+            if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == task && t.live()) {
+                t.status = "stopped".into();
+                t.ended = Some(Core::now());
+                if !stopped {
+                    t.summary = Some(format!("Not running any more ({output})"));
+                }
+                core.touch_state();
+            }
+            set_status(core, task, ToolStatus::Cancelled);
+            return;
+        }
+        let Some(run) = self.runs.remove(job) else { return };
+        let out = super::claude::strip_ansi(output).trim().to_owned();
+        match run {
+            Run::McpAdd { name, client } => {
+                if code != Some(0) {
+                    answer(core, client, json!({"ok": false, "error": if out.is_empty() { "codex mcp add failed".to_owned() } else { out }}));
+                    return;
+                }
+                answer(core, client, json!({"ok": true, "message": if out.is_empty() { format!("Added MCP server {name}") } else { out }}));
+                self.mcp_reload(core);
+            }
+            // Signed out or never signed in: either way, on to removing it.
+            Run::McpLogout { name, client } => self.run(core, Run::McpRemove { name: name.clone(), client }, vec!["mcp".into(), "remove".into(), "--".into(), name]),
+            Run::McpRemove { name, client } => {
+                if code == Some(0) {
+                    answer(core, client, json!({"ok": true, "message": if out.is_empty() { format!("Removed MCP server {name}") } else { out }}));
+                    self.mcp_config.remove(&name);
+                    self.mcp_reload(core);
+                } else {
+                    answer(core, client, json!({"ok": false, "error": if out.is_empty() { "codex mcp remove failed".to_owned() } else { out }}));
+                }
+            }
+            Run::Callback { name, client } => match code {
+                Some(c) if (200..400).contains(&c) => {
+                    core.reply(client, json!({"ok": true, "message": format!("Finishing the sign-in to {name}.")}));
+                    self.ask_mcp(core);
+                }
+                Some(c) => core.reply(client, json!({"ok": false, "error": format!("Codex answered {c}: {out}")})),
+                None => core.reply(client, json!({"ok": false, "error": out})),
+            },
+        }
+    }
+
+    /// Every few seconds: servers still starting; the plan's rate limits now and then.
+    pub fn tick(&mut self, core: &mut Core) {
+        if matches!(core.state.status, Status::Starting | Status::Exited) {
+            return;
+        }
+        let now = Core::now();
+        if core.state.mcp.iter().any(|m| m.status == McpStatus::Pending) && now - self.mcp_at > 4_000 {
+            self.ask_mcp(core);
+        }
+        if self.account_kind.as_deref() == Some("chatgpt") && now - self.usage_at > USAGE_EVERY_MS && !self.pending.values().any(|p| matches!(p, Pending::RateLimits)) {
+            self.usage_at = now;
+            self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
+        }
+    }
+
+    fn ask_mcp(&mut self, core: &mut Core) {
+        if self.pending.values().any(|p| matches!(p, Pending::Mcp)) {
+            self.mcp_again = true;
+            return;
+        }
+        self.mcp_at = Core::now();
+        let params = match &self.thread {
+            Some(t) => json!({"threadId": t}),
+            None => json!({}),
+        };
+        self.request(core, Pending::Mcp, "mcpServerStatus/list", params);
+    }
+
+    /// Codex starts its MCP servers again from its configuration.
+    fn mcp_reload(&mut self, core: &mut Core) {
+        self.request(core, Pending::McpReload, "config/mcpServer/reload", json!({}));
+    }
+
+    /// State::mcp from Codex's status rows, its start-up pushes and the configuration.
+    fn compose_mcp(&mut self, core: &mut Core) {
+        let mut names: Vec<String> = self.mcp_rows.iter().filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
+        for n in self.mcp_config.keys() {
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        let servers: Vec<McpServer> = names
+            .into_iter()
+            .map(|name| {
+                let row = self.mcp_rows.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(name.as_str()));
+                let cfg = self.mcp_config.get(&name);
+                let startup = self.mcp_startup.get(&name);
+                codex_server(&name, row, cfg, startup)
+            })
+            .collect();
+        if core.state.mcp != servers {
+            core.state.mcp = servers;
+            core.touch_state();
+        }
+        // Known once both the configuration and the servers' status have been read.
+        if self.mcp_config_seen && self.mcp_status_seen && core.state.inventory.mcp != Known::Ready {
+            core.state.inventory.mcp = Known::Ready;
+            core.touch_state();
+        }
+        self.compose_status(core);
+    }
+
+    /// State::limits from the rate-limit snapshots.
+    fn apply_limits(&mut self, core: &mut Core) {
+        let account = core.state.account.clone();
+        let mut limits = Vec::new();
+        for (id, snap) in &self.rate_limits {
+            let suffix = match snap.get("limitName").and_then(Value::as_str).filter(|n| !n.is_empty()) {
+                Some(n) if id != "codex" => format!(" · {n}"),
+                _ => String::new(),
+            };
+            let reached = snap.get("rateLimitReachedType").is_some_and(|r| !r.is_null());
+            for (slot, fallback) in [("primary", "Session"), ("secondary", "Weekly")] {
+                let Some(w) = snap.get(slot).filter(|w| w.is_object()) else { continue };
+                let mins = w.get("windowDurationMins").and_then(Value::as_i64);
+                let used = w.get("usedPercent").and_then(Value::as_f64);
+                limits.push(Limit {
+                    id: format!("{id}.{slot}"),
+                    label: format!("{}{suffix}", window_label(mins, fallback)),
+                    used_percent: used,
+                    resets_at: w.get("resetsAt").and_then(Value::as_i64).map(|s| s.saturating_mul(1000)),
+                    window: mins.map(window_words),
+                    account: account.clone(),
+                    status: (reached && used.is_some_and(|u| u >= 100.0)).then(|| "rejected".to_owned()),
+                    ..Limit::default()
+                });
+            }
+            if let Some(l) = snap.get("individualLimit").filter(|l| l.is_object()) {
+                let num = |k: &str| l.get(k).and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().trim_start_matches('$').parse().ok())));
+                limits.push(Limit {
+                    id: format!("{id}.spend"),
+                    label: format!("Spend limit{suffix}"),
+                    used_percent: l.get("remainingPercent").and_then(Value::as_f64).map(|r| (100.0 - r).max(0.0)),
+                    used: num("used"),
+                    limit: num("limit"),
+                    resets_at: l.get("resetsAt").and_then(Value::as_i64).map(|s| s.saturating_mul(1000)),
+                    account: account.clone(),
+                    status: (snap.get("spendControlReached").and_then(Value::as_bool) == Some(true)).then(|| "rejected".to_owned()),
+                    ..Limit::default()
+                });
+            }
+            if core.state.plan.is_none()
+                && let Some(p) = snap.get("planType").and_then(Value::as_str)
+            {
+                core.state.plan = Some(plan_label(p));
+            }
+        }
+        if core.state.limits != limits {
+            core.state.limits = limits;
+            core.touch_state();
+        }
+        self.compose_status(core);
+    }
+
+    /// Codex has no /status of its own to read: kiln puts its lines together.
+    fn compose_status(&self, core: &mut Core) {
+        let (approval, sandbox, _) = self.policies(core);
+        let st = &core.state;
+        let mut rows = Vec::new();
+        let mut push = |group: &str, label: &str, value: String, tone: Option<Tone>| {
+            if !value.is_empty() {
+                rows.push(StatusItem { group: group.to_owned(), label: label.to_owned(), value, tone });
+            }
+        };
+        push("Codex", "Version", core.meta.version.clone(), None);
+        push("Codex", "Thread", st.harness_session.clone().unwrap_or_default(), None);
+        push("Codex", "Directory", st.cwd.clone(), None);
+        push("Model", "Provider", self.provider.clone().unwrap_or_default(), None);
+        push("Model", "Model", st.model.clone(), None);
+        push("Model", "Reasoning effort", st.effort.clone(), None);
+        push("Model", "Reasoning summaries", self.summary.clone().unwrap_or_default(), None);
+        push("Permissions", "Approvals", approval, None);
+        push("Permissions", "Sandbox", sandbox, None);
+        let how = match self.account_kind.as_deref() {
+            Some("chatgpt") => "ChatGPT".to_owned(),
+            Some("apiKey") => "API key".to_owned(),
+            Some("amazonBedrock") => "Amazon Bedrock".to_owned(),
+            Some(other) => other.to_owned(),
+            None => self.provider.clone().filter(|p| p != "openai").map(|p| format!("Model provider {p}")).unwrap_or_default(),
+        };
+        push("Account", "Signed in with", how, None);
+        push("Account", "Email", self.account_email.clone().unwrap_or_default(), None);
+        push("Account", "Plan", st.plan.clone().unwrap_or_default(), None);
+        for (id, snap) in &self.rate_limits {
+            let Some(c) = snap.get("credits").filter(|c| c.is_object()) else { continue };
+            let label = if id == "codex" { "Credits".to_owned() } else { format!("Credits · {id}") };
+            let v = if c.get("unlimited").and_then(Value::as_bool) == Some(true) {
+                "Unlimited".to_owned()
+            } else if c.get("hasCredits").and_then(Value::as_bool) == Some(true) {
+                c.get("balance").and_then(Value::as_str).map_or_else(|| "Yes".to_owned(), str::to_owned)
+            } else {
+                "None".to_owned()
+            };
+            push("Account", &label, v, None);
+        }
+        for m in &st.mcp {
+            let tone = match m.status {
+                McpStatus::Connected => Some(Tone::Ok),
+                McpStatus::Failed => Some(Tone::Error),
+                McpStatus::NeedsAuth | McpStatus::Pending => Some(Tone::Warn),
+                McpStatus::Disabled => None,
+            };
+            push("MCP servers", &m.name, mcp_status_words(m.status).to_owned(), tone);
+        }
+        if core.state.harness_status != rows {
+            core.state.harness_status = rows;
+            core.touch_state();
         }
     }
 
@@ -434,12 +859,8 @@ impl Codex {
         let busy = self.busy(core);
         match (busy, mode, self.turn.clone()) {
             (true, SendMode::Steer, Some(turn)) => {
-                self.request(
-                    core,
-                    Pending::Steer(m.id.clone()),
-                    "turn/steer",
-                    json!({"threadId": thread, "expectedTurnId": turn, "input": input(&m.text, &m.attachments), "clientUserMessageId": m.id}),
-                );
+                let items = self.items(&m);
+                self.request(core, Pending::Steer(m.id.clone()), "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": items, "clientUserMessageId": m.id}));
                 self.turn_messages.push(m.id.clone());
                 self.show_sent(core, &m, Delivery::Sent);
             }
@@ -457,11 +878,10 @@ impl Codex {
         }
     }
 
-    fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
-        let (approval, _, sandbox) = self.policies(core);
-        // "/skill words": the skill, then the words.
+    /// A message's input items: "/skill words" (or "$skill words") is the skill, then the words.
+    fn items(&self, m: &QueueItem) -> Value {
         let mut items = input(&m.text, &m.attachments);
-        if let Some(rest) = m.text.strip_prefix('/')
+        if let Some(rest) = m.text.strip_prefix(['/', '$'])
             && let Some(name) = rest.split_whitespace().next()
             && let Some(path) = self.skills.get(name).cloned()
             && let Some(list) = items.as_array_mut()
@@ -473,6 +893,12 @@ impl Codex {
                 list.insert(1, json!({"type": "text", "text": words}));
             }
         }
+        items
+    }
+
+    fn start_turn(&mut self, core: &mut Core, thread: &str, m: QueueItem) {
+        let (approval, _, sandbox) = self.policies(core);
+        let items = self.items(&m);
         let mut params = json!({
             "threadId": thread,
             "input": items,
@@ -634,7 +1060,33 @@ impl Codex {
                     self.notice(core, Level::Error, format!("Codex could not open the conversation: {msg}"));
                     core.set_status(Status::Idle);
                 }
-                Pending::Models | Pending::Interrupt | Pending::Skills | Pending::Hooks | Pending::Mcp => {}
+                Pending::Models | Pending::Interrupt | Pending::Hooks | Pending::Account | Pending::RateLimits => {}
+                Pending::Skills => {
+                    core.state.inventory.skills = Known::Ready;
+                    core.touch_state();
+                }
+                Pending::Plugins => {
+                    core.state.inventory.plugins = Known::Unsupported;
+                    core.touch_state();
+                }
+                Pending::Mcp | Pending::Config => {
+                    if matches!(kind, Pending::Mcp) {
+                        self.mcp_status_seen = true;
+                    } else {
+                        self.mcp_config_seen = true;
+                    }
+                    self.compose_mcp(core);
+                }
+                Pending::McpAuth { client, .. } => core.reply(client, json!({"error": msg})),
+                Pending::McpAdded { client, .. } => answer(core, client, json!({"ok": false, "error": msg})),
+                Pending::McpConfig(what) => {
+                    self.notice(core, Level::Warn, format!("{what}: {msg}"));
+                    self.request(core, Pending::Config, "config/read", json!({"cwd": core.state.cwd.clone()}));
+                }
+                Pending::McpReload => {
+                    self.notice(core, Level::Warn, format!("Reloading the MCP servers: {msg}"));
+                    self.ask_mcp(core);
+                }
                 Pending::Revert(_) => self.notice(core, Level::Warn, format!("Could not rewind: {msg}")),
                 Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
                 Pending::Initialize => self.notice(core, Level::Error, format!("Codex did not start: {msg}")),
@@ -671,9 +1123,11 @@ impl Codex {
                     (None, _) => self.request(core, Pending::Thread, "thread/start", params),
                 }
                 self.request(core, Pending::Models, "model/list", json!({}));
-                self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd]}));
-                self.request(core, Pending::Hooks, "hooks/list", json!({"cwds": [core.state.cwd.clone()]}));
-                self.request(core, Pending::Mcp, "mcpServerStatus/list", json!({}));
+                self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd.clone()]}));
+                self.request(core, Pending::Hooks, "hooks/list", json!({"cwds": [cwd.clone()]}));
+                self.request(core, Pending::Config, "config/read", json!({"cwd": cwd.clone()}));
+                self.request(core, Pending::Account, "account/read", json!({}));
+                self.request(core, Pending::Plugins, "plugin/installed", json!({"cwds": [cwd]}));
                 if let Some(ua) = result.get("userAgent").and_then(Value::as_str) {
                     core.meta.version = ua.split_whitespace().next().unwrap_or(ua).to_owned();
                     core.touch_meta();
@@ -690,6 +1144,9 @@ impl Codex {
                 }
                 if let Some(c) = result.get("cwd").and_then(Value::as_str) {
                     core.state.cwd = c.to_owned();
+                }
+                if let Some(p) = result.get("modelProvider").and_then(Value::as_str) {
+                    self.provider = Some(p.to_owned());
                 }
                 if let Some(v) = thread.get("cliVersion").and_then(Value::as_str) {
                     core.meta.version = v.to_owned();
@@ -712,6 +1169,9 @@ impl Codex {
                 self.refresh_controls(core);
                 core.touch_state();
                 core.set_status(Status::Idle);
+                // The thread's own MCP connections (their runtime state).
+                self.ask_mcp(core);
+                self.compose_status(core);
                 self.next(core);
             }
             Pending::Turn(id) => {
@@ -741,6 +1201,9 @@ impl Codex {
                         .unwrap_or_default();
                     for key in [m.get("model"), m.get("id")].into_iter().flatten().filter_map(Value::as_str) {
                         self.efforts.insert(key.to_owned(), levels.clone());
+                    }
+                    if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
+                        self.efforts.insert(String::new(), levels.clone());
                     }
                     if m.get("isDefault").and_then(Value::as_bool) == Some(true)
                         && core.state.effort.is_empty()
@@ -774,23 +1237,126 @@ impl Codex {
             }
             Pending::Skills => {
                 let mut cmds = Vec::new();
+                let mut all = Vec::new();
+                self.skills.clear();
                 for entry in result.get("data").and_then(Value::as_array).cloned().unwrap_or_default() {
                     for sk in entry.get("skills").and_then(Value::as_array).cloned().unwrap_or_default() {
-                        if sk.get("enabled").and_then(Value::as_bool) == Some(false) {
+                        let (Some(name), Some(path)) = (sk.get("name").and_then(Value::as_str), sk.get("path").and_then(Value::as_str)) else { continue };
+                        if all.iter().any(|s: &Skill| s.name == name) {
                             continue;
                         }
-                        let (Some(name), Some(path)) = (sk.get("name").and_then(Value::as_str), sk.get("path").and_then(Value::as_str)) else { continue };
-                        self.skills.insert(name.to_owned(), path.to_owned());
-                        cmds.push(SlashCommand {
+                        let enabled = sk.get("enabled").and_then(Value::as_bool) != Some(false);
+                        let short = sk
+                            .get("shortDescription")
+                            .or_else(|| sk.pointer("/interface/shortDescription"))
+                            .and_then(Value::as_str)
+                            .filter(|d| !d.is_empty())
+                            .or_else(|| sk.get("description").and_then(Value::as_str))
+                            .unwrap_or("")
+                            .to_owned();
+                        let source = match (sk.get("pluginId").and_then(Value::as_str), sk.get("scope").and_then(Value::as_str)) {
+                            (Some(_), _) => "plugin",
+                            (None, Some("repo")) => "project",
+                            (None, Some(s)) => s,
+                            (None, None) => "user",
+                        };
+                        all.push(Skill {
                             name: name.to_owned(),
-                            description: sk.get("shortDescription").or_else(|| sk.get("description")).and_then(Value::as_str).unwrap_or("").to_owned(),
-                            hint: String::new(),
+                            description: clip_middle(sk.get("description").and_then(Value::as_str).unwrap_or(&short), 1200).0,
+                            source: source.to_owned(),
+                            path: Some(path.to_owned()),
+                            args_hint: None,
+                            user_invocable: true,
+                            enabled,
                         });
+                        if !enabled {
+                            continue;
+                        }
+                        self.skills.insert(name.to_owned(), path.to_owned());
+                        cmds.push(SlashCommand { name: name.to_owned(), description: short, hint: String::new() });
                     }
                 }
                 core.meta.commands = cmds;
                 core.touch_meta();
+                core.state.skills = all;
+                core.state.plugins = self.plugins();
+                core.state.inventory.skills = Known::Ready;
+                core.touch_state();
             }
+            Pending::Account => {
+                let acct = result.get("account").filter(|a| a.is_object());
+                let kind = acct.and_then(|a| a.get("type")).and_then(Value::as_str).map(str::to_owned);
+                let email = acct.and_then(|a| a.get("email")).and_then(Value::as_str).map(str::to_owned);
+                let plan = match kind.as_deref() {
+                    Some("chatgpt") => Some(acct.and_then(|a| a.get("planType")).and_then(Value::as_str).filter(|p| *p != "unknown").map_or_else(|| "ChatGPT".to_owned(), plan_label)),
+                    Some("apiKey") => Some("API key".to_owned()),
+                    Some("amazonBedrock") => Some("Amazon Bedrock".to_owned()),
+                    Some(other) => Some(plan_label(other)),
+                    None if result.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true) => Some("Signed out".to_owned()),
+                    // A model provider of its own (no OpenAI account).
+                    None => None,
+                };
+                core.state.account = plan.as_deref().filter(|p| *p != "Signed out").map(|p| account_id("codex", p, email.as_deref()));
+                core.state.plan = plan;
+                self.account_email = email.as_deref().map(mask_emails);
+                if kind.as_deref() == Some("chatgpt") {
+                    self.usage_at = Core::now();
+                    self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
+                }
+                self.account_kind = kind;
+                core.state.inventory.limits = Known::Ready;
+                core.touch_state();
+                self.apply_limits(core);
+            }
+            Pending::RateLimits => {
+                if let Some(by) = result.get("rateLimitsByLimitId").and_then(Value::as_object) {
+                    for (k, snap) in by {
+                        self.rate_limits.insert(k.clone(), snap.clone());
+                    }
+                } else if let Some(snap) = result.get("rateLimits").filter(|r| r.is_object()) {
+                    let id = snap.get("limitId").and_then(Value::as_str).unwrap_or("codex").to_owned();
+                    self.rate_limits.insert(id, snap.clone());
+                }
+                self.apply_limits(core);
+            }
+            Pending::Config => {
+                self.mcp_config = result.pointer("/config/mcp_servers").and_then(Value::as_object).cloned().unwrap_or_default();
+                self.mcp_config_seen = true;
+                self.compose_mcp(core);
+            }
+            Pending::Plugins => {
+                self.plugins_raw = result
+                    .get("marketplaces")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|m| {
+                        let market = m.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+                        m.get("plugins").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(move |p| (market.clone(), p))
+                    })
+                    .filter(|(_, p)| p.get("installed").and_then(Value::as_bool) == Some(true))
+                    .collect();
+                core.state.plugins = self.plugins();
+                core.state.inventory.plugins = Known::Ready;
+                core.touch_state();
+            }
+            Pending::McpConfig(_) => self.mcp_reload(core),
+            Pending::McpAdded { name, client } => {
+                answer(core, client, json!({"ok": true, "message": format!("Added MCP server {name} to Codex's configuration")}));
+                self.mcp_reload(core);
+            }
+            Pending::McpReload => {
+                self.request(core, Pending::Config, "config/read", json!({"cwd": core.state.cwd.clone()}));
+                self.ask_mcp(core);
+            }
+            Pending::McpAuth { client, name } => match result.get("authorizationUrl").and_then(Value::as_str) {
+                // Codex waits for the sign-in's redirect on its own machine's loopback.
+                Some(url) => core.reply(client, json!({"url": url, "callback": true, "redirect": "localhost"})),
+                None => {
+                    core.reply(client, json!({"ok": true, "message": format!("{name} needs no sign-in.")}));
+                    self.ask_mcp(core);
+                }
+            },
             Pending::Hooks => {
                 core.meta.hooks = result
                     .get("data")
@@ -812,19 +1378,20 @@ impl Codex {
                 core.touch_meta();
             }
             Pending::Mcp => {
-                self.mcp = result
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .map(|d| {
-                        d.iter()
-                            .filter_map(|m| Some((m.get("name")?.as_str()?.to_owned(), m.get("runtimeStatus").and_then(Value::as_str).unwrap_or("unknown").to_owned())))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for (name, status) in self.mcp.clone() {
-                    core.set_control(&format!("mcp_info:{name}"), json!(status));
+                self.mcp_rows = result.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+                self.mcp_status_seen = true;
+                if std::mem::take(&mut self.mcp_again) {
+                    self.ask_mcp(core);
                 }
-                self.refresh_controls(core);
+                // What the list says about a server's runtime replaces what start-up pushed.
+                for r in &self.mcp_rows {
+                    if r.get("runtimeStatus").is_some_and(|s| !s.is_null())
+                        && let Some(n) = r.get("name").and_then(Value::as_str)
+                    {
+                        self.mcp_startup.remove(n);
+                    }
+                }
+                self.compose_mcp(core);
             }
             Pending::Revert(ev) => {
                 // Those turns are gone: so is their part of the timeline.
@@ -1017,11 +1584,16 @@ impl Codex {
                         core.state.delivery.insert(id, done);
                     }
                 }
-                // Calls the turn left open were cut off with it.
+                // Calls the turn left open were cut off with it; terminals still running were left
+                // behind (they go on after the turn).
+                let terminals: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).filter_map(|t| t.tool_id.clone()).collect();
+                for t in core.state.tasks.iter_mut().filter(|t| t.live() && t.process.is_some()) {
+                    t.background = true;
+                }
                 let open: Vec<String> = core
                     .events()
                     .filter_map(|e| match &e.body {
-                        Body::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Pending) => Some(e.id.clone()),
+                        Body::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Pending) && !terminals.contains(&e.id) => Some(e.id.clone()),
                         _ => None,
                     })
                     .collect();
@@ -1065,6 +1637,10 @@ impl Codex {
             }
             "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
+                // A terminal's whole output is kept (the call shows only its start).
+                if let Some(task) = core.state.tasks.iter().find(|t| t.tool_id.as_deref() == Some(id) && t.process.is_some()).map(|t| t.id.clone()) {
+                    core.task_output.entry(task).or_default().append(d.as_bytes());
+                }
                 if let Some(e) = core.get_mut(id)
                     && let Body::Tool(t) = &mut e.body
                 {
@@ -1139,8 +1715,108 @@ impl Codex {
                 self.notice(core, Level::Warn, msg);
             }
             "thread/compacted" => self.notice(core, Level::Info, "Conversation compacted"),
+            "account/rateLimits/updated" => {
+                // Sparse: what a rolling update leaves out (or sends as null) stays as it was.
+                let Some(snap) = p.get("rateLimits").and_then(Value::as_object) else { return };
+                let id = snap.get("limitId").and_then(Value::as_str).unwrap_or("codex").to_owned();
+                let entry = self.rate_limits.entry(id).or_insert_with(|| json!({}));
+                if let Some(e) = entry.as_object_mut() {
+                    for (k, v) in snap {
+                        if !v.is_null() {
+                            e.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                self.apply_limits(core);
+            }
+            "account/updated" => self.request(core, Pending::Account, "account/read", json!({})),
+            "mcpServer/startupStatus/updated" => {
+                let Some(name) = p.get("name").and_then(Value::as_str) else { return };
+                let mut state = p.get("status").and_then(Value::as_str).unwrap_or("starting").to_owned();
+                if p.get("failureReason").and_then(Value::as_str) == Some("reauthenticationRequired") {
+                    state = "authenticationRequired".to_owned();
+                }
+                self.mcp_startup.insert(name.to_owned(), (state, p.get("error").and_then(Value::as_str).map(str::to_owned)));
+                self.compose_mcp(core);
+            }
+            "mcpServer/oauthLogin/completed" => {
+                let name = p.get("name").and_then(Value::as_str).unwrap_or("the server").to_owned();
+                if p.get("success").and_then(Value::as_bool) == Some(true) {
+                    self.notice(core, Level::Info, format!("Signed in to {name}"));
+                    self.mcp_startup.remove(&name);
+                } else {
+                    let err = p.get("error").and_then(Value::as_str).unwrap_or("it did not finish");
+                    self.notice(core, Level::Warn, format!("Signing in to {name} failed: {err}"));
+                }
+                self.mcp_reload(core);
+            }
+            "skills/changed" => {
+                let cwd = core.state.cwd.clone();
+                self.request(core, Pending::Skills, "skills/list", json!({"cwds": [cwd], "forceReload": true}));
+            }
             _ => {}
         }
+    }
+
+    /// A terminal Codex runs (its process outlives the call that started it) as a task: running
+    /// until its item completes.
+    #[allow(clippy::too_many_arguments)]
+    fn terminal(&mut self, core: &mut Core, item_id: &str, process: &str, command: &str, item: &Value, done: bool, exit: Option<i32>) {
+        let task_id = format!("terminal-{item_id}");
+        let status = match (done, item.get("status").and_then(Value::as_str)) {
+            (false, _) => "running",
+            (true, _) if self.stopping.remove(&task_id) => "stopped",
+            (true, Some("failed")) => "failed",
+            (true, _) if exit.unwrap_or(0) != 0 => "failed",
+            (true, _) => "completed",
+        };
+        match core.state.tasks.iter_mut().find(|t| t.id == task_id) {
+            Some(t) => {
+                if t.live() {
+                    t.status = status.to_owned();
+                }
+                t.exit_code = exit.or(t.exit_code);
+                if done {
+                    t.ended.get_or_insert_with(Core::now);
+                }
+            }
+            None => core.state.tasks.push(Task {
+                id: task_id,
+                tool_id: Some(item_id.to_owned()),
+                description: clip_middle(command, 300).0,
+                kind: "terminal".into(),
+                status: status.to_owned(),
+                class: Some("shell".into()),
+                command: Some(command.to_owned()),
+                cwd: item.get("cwd").and_then(Value::as_str).map(str::to_owned),
+                process: Some(process.to_owned()),
+                exit_code: exit,
+                stoppable: cfg!(unix),
+                started: Core::now(),
+                ended: done.then(Core::now),
+                ..Task::default()
+            }),
+        }
+        core.touch_state();
+    }
+
+    /// The installed plugins, with the skills each brings.
+    fn plugins(&self) -> Vec<Plugin> {
+        self.plugins_raw
+            .iter()
+            .map(|(market, p)| {
+                let id = p.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = p.pointer("/interface/displayName").and_then(Value::as_str).or_else(|| p.get("name").and_then(Value::as_str)).unwrap_or(id).to_owned();
+                Plugin {
+                    name,
+                    source: market.clone(),
+                    enabled: p.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                    skills: Vec::new(),
+                    commands: Vec::new(),
+                    version: p.get("localVersion").and_then(Value::as_str).map(str::to_owned),
+                }
+            })
+            .collect()
     }
 
     /// One thread item, started or completed (`done`), into the timeline.
@@ -1253,10 +1929,17 @@ impl Codex {
                     exit_code: exit,
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
+                    server: None,
+                    tool_short: None,
+                    skill: None,
                 };
                 if !done {
                     core.state.doing = Some(super::claude::doing(&call));
                     core.touch_state();
+                }
+                // A terminal (unified exec): it can go on after its call and the turn.
+                if let Some(process) = item.get("processId").and_then(Value::as_str) {
+                    self.terminal(core, &id, process, &command, item, done, exit);
                 }
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -1300,6 +1983,9 @@ impl Codex {
                     exit_code: None,
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
+                    server: None,
+                    tool_short: None,
+                    skill: None,
                 };
                 if !done {
                     core.state.doing = Some(super::claude::doing(&call));
@@ -1337,6 +2023,9 @@ impl Codex {
                     exit_code: None,
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
+                    server: None,
+                    tool_short: None,
+                    skill: None,
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -1358,6 +2047,9 @@ impl Codex {
                     exit_code: None,
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
+                    server: None,
+                    tool_short: None,
+                    skill: None,
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -1406,6 +2098,9 @@ impl Codex {
                     exit_code: None,
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
+                    server: None,
+                    tool_short: None,
+                    skill: None,
                 };
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -1415,6 +2110,129 @@ impl Codex {
             _ => {}
         }
         self.settle(core);
+    }
+}
+
+/// Answer the client that asked, or say it in the timeline when no one is waiting.
+fn answer(core: &mut Core, client: Option<String>, value: Value) {
+    match client.filter(|c| !c.is_empty()) {
+        Some(c) => core.reply(c, value),
+        None => {
+            let ok = value.get("ok").and_then(Value::as_bool) == Some(true);
+            let text = value.get("message").or_else(|| value.get("error")).and_then(Value::as_str).unwrap_or(if ok { "Done." } else { "That did not work." }).to_owned();
+            let n = core.events().count();
+            core.upsert(&format!("notice-run-{n}-{}", Core::now()), None, Body::Notice { level: if ok { Level::Info } else { Level::Warn }, text });
+        }
+    }
+}
+
+/// `codex mcp add` arguments (Codex speaks stdio and streamable HTTP; an http server is written to
+/// the configuration instead, see `Command::McpAdd`).
+fn codex_add_args(add: &McpAdd) -> Result<Vec<String>, String> {
+    add.check()?;
+    let mut a: Vec<String> = vec!["mcp".into(), "add".into(), add.name.clone()];
+    match add.transport().as_str() {
+        "stdio" => {
+            for (k, v) in &add.env {
+                a.extend(["--env".into(), format!("{k}={v}")]);
+            }
+            a.push("--".into());
+            a.push(add.command.clone().unwrap_or_default().trim().to_owned());
+            a.extend(add.args.iter().cloned());
+        }
+        "http" => a.extend(["--url".into(), add.url.clone().unwrap_or_default().trim().to_owned()]),
+        other => return Err(format!("Codex connects to MCP servers over stdio or streamable HTTP, not {other}.")),
+    }
+    Ok(a)
+}
+
+/// A limit window's name from its length.
+fn window_label(mins: Option<i64>, fallback: &str) -> String {
+    match mins {
+        Some(m) if m > 0 && m <= 1440 => "Session".to_owned(),
+        Some(m) if (10_000..=10_200).contains(&m) => "Weekly".to_owned(),
+        Some(m) if m >= 40_000 => "Monthly".to_owned(),
+        Some(m) if m > 0 => format!("{} window", window_words(m)),
+        _ => fallback.to_owned(),
+    }
+}
+
+/// One MCP server from what Codex says about it: its status row, its start-up state and its
+/// configuration.
+fn codex_server(name: &str, row: Option<&Value>, cfg: Option<&Value>, startup: Option<&(String, Option<String>)>) -> McpServer {
+    let enabled = cfg.and_then(|c| c.get("enabled")).and_then(Value::as_bool) != Some(false);
+    let auth_status = row.and_then(|r| r.get("authStatus")).and_then(Value::as_str);
+    let runtime = row.and_then(|r| r.get("runtimeStatus")).and_then(Value::as_str);
+    let tools: Vec<McpTool> = {
+        let mut t: Vec<McpTool> = row
+            .and_then(|r| r.get("tools"))
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| McpTool {
+                        name: v.get("name").and_then(Value::as_str).unwrap_or(k).to_owned(),
+                        description: v.get("description").and_then(Value::as_str).map(|d| clip_middle(d, 600).0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        t.sort_by(|a, b| a.name.cmp(&b.name));
+        t
+    };
+    let state = runtime.map(str::to_owned).or_else(|| startup.map(|s| s.0.clone()));
+    let status = if !enabled {
+        McpStatus::Disabled
+    } else {
+        match state.as_deref() {
+            Some("connected" | "ready") => McpStatus::Connected,
+            Some("starting" | "notStarted") => McpStatus::Pending,
+            Some("authenticationRequired") => McpStatus::NeedsAuth,
+            Some("failed" | "cancelled") => McpStatus::Failed,
+            Some("disabled") => McpStatus::Disabled,
+            _ if auth_status == Some("notLoggedIn") => McpStatus::NeedsAuth,
+            _ if row.is_some_and(|r| r.get("toolsError").is_some_and(|e| !e.is_null())) => McpStatus::Failed,
+            _ if !tools.is_empty() => McpStatus::Connected,
+            _ => McpStatus::Pending,
+        }
+    };
+    let error = row
+        .and_then(|r| r.get("toolsError"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| startup.and_then(|s| s.1.clone()))
+        .filter(|_| matches!(status, McpStatus::Failed | McpStatus::NeedsAuth));
+    let transport = match cfg {
+        Some(c) if c.get("url").is_some() => "http",
+        Some(c) if c.get("command").is_some() => "stdio",
+        _ if row.and_then(|r| r.get("httpOrigin")).is_some_and(|o| !o.is_null()) => "http",
+        _ => "",
+    };
+    let target = cfg
+        .and_then(|c| match (c.get("url").and_then(Value::as_str), c.get("command").and_then(Value::as_str)) {
+            (Some(u), _) => Some(safe_url(u)),
+            (None, Some(cmd)) => Some(safe_command(cmd, c.get("args").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default())),
+            _ => None,
+        })
+        .or_else(|| row.and_then(|r| r.get("httpOrigin")).and_then(Value::as_str).map(safe_url));
+    let count = |k: &str| row.and_then(|r| r.get(k)).and_then(Value::as_array).map_or(0, Vec::len);
+    McpServer {
+        name: name.to_owned(),
+        scope: if row.and_then(|r| r.get("pluginId")).is_some_and(|p| !p.is_null()) { "plugin".to_owned() } else { "user".to_owned() },
+        transport: transport.to_owned(),
+        status,
+        error,
+        enabled,
+        tools,
+        resources: row.map(|_| u32::try_from(count("resources") + count("resourceTemplates")).unwrap_or(u32::MAX)),
+        prompts: None,
+        target,
+        server: row.and_then(|r| r.get("serverInfo")).and_then(|i| Some(format!("{} {}", i.get("name")?.as_str()?, i.get("version").and_then(Value::as_str).unwrap_or("")).trim().to_owned())),
+        auth: match auth_status {
+            Some("oAuth") => Some("oauth".to_owned()),
+            Some("bearerToken") => Some("bearer".to_owned()),
+            Some("notLoggedIn") => Some("signed out".to_owned()),
+            _ => None,
+        },
     }
 }
 
@@ -1530,7 +2348,7 @@ mod tests {
         feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
         let w = written(&mut core);
         let methods: Vec<&str> = w.iter().filter_map(|v| v.get("method").and_then(Value::as_str)).collect();
-        assert_eq!(methods, vec!["initialized", "thread/start", "model/list", "skills/list", "hooks/list", "mcpServerStatus/list"]);
+        assert_eq!(methods, vec!["initialized", "thread/start", "model/list", "skills/list", "hooks/list", "config/read", "account/read", "plugin/installed"]);
         assert_eq!(w.get(1).and_then(|v| v.pointer("/params/sandbox")).and_then(Value::as_str), Some("workspace-write"));
         feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th1", "cliVersion": "0.162.1", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
         let w = written(&mut core);
@@ -1658,6 +2476,313 @@ mod tests {
         c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers) });
         let w = written(&mut core);
         assert_eq!(w.first().and_then(|v| v.pointer("/result/answers/db/answers/0")).and_then(Value::as_str), Some("SQLite"));
+        Ok(())
+    }
+
+    /// The response to the request kiln wrote for `method` (the latest one).
+    fn respond(c: &mut Codex, core: &mut Core, w: &[Value], method: &str, result: Value) {
+        let id = w.iter().rev().find(|v| v.get("method").and_then(Value::as_str) == Some(method)).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(c, core, &[json!({"id": id, "result": result})]);
+    }
+
+    fn replies(core: &mut Core) -> Vec<(String, Value)> {
+        core.take_out()
+            .into_iter()
+            .filter_map(|u| match u {
+                super::super::core::Update::Reply { client, value } => Some((client, value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A Codex session with its thread open.
+    fn opened() -> (Codex, Core, Vec<Value>) {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1 (Linux)"}));
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "thread/start", json!({"thread": {"id": "th1", "cliVersion": "0.162.1", "turns": []}, "model": "gpt-5", "modelProvider": "openai", "cwd": "/work"}));
+        let mut all = w;
+        all.extend(written(&mut core));
+        (c, core, all)
+    }
+
+    #[test]
+    fn account_plan_limits_and_status() -> anyhow::Result<()> {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": {"type": "chatgpt", "email": "someone@example.com", "planType": "pro"}, "requiresOpenaiAuth": true}));
+        assert_eq!(core.state.plan.as_deref(), Some("Pro"));
+        let account = core.state.account.clone().unwrap_or_default();
+        assert!(account.starts_with("codex:pro:") && !account.contains("someone"), "{account}");
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("account/rateLimits/read")));
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "account/rateLimits/read",
+            json!({"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 37, "windowDurationMins": 300, "resetsAt": 1_792_220_725}, "secondary": {"usedPercent": 12, "windowDurationMins": 10080, "resetsAt": 1_792_807_525}, "credits": {"hasCredits": true, "unlimited": false, "balance": "120"}, "planType": "pro"},
+                "rateLimitsByLimitId": {"codex": {"limitId": "codex", "primary": {"usedPercent": 37, "windowDurationMins": 300, "resetsAt": 1_792_220_725}, "secondary": {"usedPercent": 12, "windowDurationMins": 10080, "resetsAt": 1_792_807_525}, "credits": {"hasCredits": true, "unlimited": false, "balance": "120"}},
+                    "codex_spark": {"limitId": "codex_spark", "limitName": "Spark", "primary": {"usedPercent": 5, "windowDurationMins": 300}, "secondary": null}}}),
+        );
+        let l: Vec<(&str, &str, Option<f64>, Option<&str>)> = core.state.limits.iter().map(|l| (l.id.as_str(), l.label.as_str(), l.used_percent, l.window.as_deref())).collect();
+        assert_eq!(
+            l,
+            vec![
+                ("codex.primary", "Session", Some(37.0), Some("5h")),
+                ("codex.secondary", "Weekly", Some(12.0), Some("7d")),
+                ("codex_spark.primary", "Session · Spark", Some(5.0), Some("5h"))
+            ]
+        );
+        assert_eq!(core.state.limits.first().and_then(|l| l.resets_at), Some(1_792_220_725_000));
+        assert!(core.state.limits.iter().all(|l| l.account.as_deref() == Some(account.as_str())));
+        // A rolling update is sparse: what it leaves out stays.
+        feed(&mut c, &mut core, &[json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 1_792_220_725}, "secondary": null, "credits": null, "planType": null}}})]);
+        let used: Vec<Option<f64>> = core.state.limits.iter().take(2).map(|l| l.used_percent).collect();
+        assert_eq!(used, vec![Some(40.0), Some(12.0)]);
+        let st = &core.state.harness_status;
+        assert!(st.iter().any(|r| r.label == "Email" && r.value == "s…@example.com"));
+        assert!(st.iter().any(|r| r.label == "Credits" && r.value == "120"));
+        assert!(st.iter().any(|r| r.label == "Model" && r.value == "gpt-5"));
+        assert!(!serde_json::to_string(&core.state).unwrap_or_default().contains("someone@"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_custom_provider_has_no_account_and_rate_limit_pushes_still_count() -> anyhow::Result<()> {
+        let (mut c, mut core, w) = opened();
+        respond(&mut c, &mut core, &w, "account/read", json!({"account": null, "requiresOpenaiAuth": false}));
+        assert_eq!((core.state.plan.as_deref(), core.state.account.as_deref()), (None, None));
+        assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("account/rateLimits/read")));
+        feed(&mut c, &mut core, &[json!({"method": "account/rateLimits/updated", "params": {"rateLimits": {"limitId": "codex", "limitName": null, "primary": {"usedPercent": 37, "windowDurationMins": 300, "resetsAt": 1_792_220_725}, "secondary": {"usedPercent": 12, "windowDurationMins": 10080, "resetsAt": 1_792_807_525}, "credits": null}}})]);
+        assert_eq!(core.state.limits.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_servers_from_status_startup_and_configuration_and_their_commands() -> anyhow::Result<()> {
+        let (mut c, mut core, w) = opened();
+        assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("mcpServerStatus/list") && v.pointer("/params/threadId").and_then(Value::as_str) == Some("th1")));
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "config/read",
+            json!({"config": {"mcp_servers": {"echo": {"command": "python3", "args": ["srv.py", "--token", "abc"], "env": {"SECRET": "x"}}, "web": {"url": "https://u:p@mcp.example.com/mcp?k=1", "enabled": false}}}, "origins": {}}),
+        );
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "mcpServerStatus/list",
+            json!({"data": [{"name": "echo", "authStatus": "unsupported", "tools": {"echo": {"name": "echo", "description": "Echo it", "inputSchema": {}}, "shout": {"name": "shout", "inputSchema": {}}}, "resources": [{"name": "r", "uri": "x://r"}], "resourceTemplates": [], "runtimeStatus": "connected", "serverInfo": {"name": "kiln-echo", "version": "1.0.0"}}], "nextCursor": null}),
+        );
+        let m = core.state.mcp.clone();
+        let echo = m.iter().find(|s| s.name == "echo").cloned().ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!((echo.status, echo.transport.as_str(), echo.tools.len(), echo.resources, echo.server.as_deref()), (McpStatus::Connected, "stdio", 2, Some(1), Some("kiln-echo 1.0.0")));
+        assert_eq!(echo.target.as_deref(), Some("python3 srv.py --token …"));
+        let web = m.iter().find(|s| s.name == "web").cloned().ok_or_else(|| anyhow::anyhow!("missing"))?;
+        assert_eq!((web.status, web.enabled, web.target.as_deref()), (McpStatus::Disabled, false, Some("https://mcp.example.com/mcp")));
+        assert!(!serde_json::to_string(&core.state).unwrap_or_default().contains("SECRET"));
+        // Start-up pushes.
+        feed(&mut c, &mut core, &[json!({"method": "mcpServer/startupStatus/updated", "params": {"name": "web", "status": "failed", "error": "401", "failureReason": "reauthenticationRequired"}})]);
+        // (still off in the configuration)
+        assert_eq!(core.state.mcp.iter().find(|s| s.name == "web").map(|s| s.status), Some(McpStatus::Disabled));
+        // Switching one on: written to the configuration, then the servers are reloaded and listed.
+        c.command(&mut core, Command::McpEnable { name: "web".into(), enabled: true });
+        let w = written(&mut core);
+        let wr = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("config/value/write")).cloned().unwrap_or_default();
+        assert_eq!((wr.pointer("/params/keyPath").and_then(Value::as_str), wr.pointer("/params/value")), (Some("mcp_servers.web.enabled"), Some(&json!(true))));
+        respond(&mut c, &mut core, &w, "config/value/write", json!({"status": "ok"}));
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("config/mcpServer/reload")));
+        respond(&mut c, &mut core, &w, "config/mcpServer/reload", json!({}));
+        let methods: Vec<String> = written(&mut core).iter().filter_map(|v| v.get("method").and_then(Value::as_str).map(str::to_owned)).collect();
+        assert!(methods.contains(&"config/read".to_owned()) && methods.contains(&"mcpServerStatus/list".to_owned()), "{methods:?}");
+        // Signing in: the page to open, then the redirect is fetched on Codex's machine.
+        c.command(&mut core, Command::McpAuth { name: "web".into(), client: "c1".into(), redirect: None });
+        let w = written(&mut core);
+        assert!(w.iter().any(|v| v.get("method").and_then(Value::as_str) == Some("mcpServer/oauth/login") && v.pointer("/params/threadId").and_then(Value::as_str) == Some("th1")));
+        respond(&mut c, &mut core, &w, "mcpServer/oauth/login", json!({"authorizationUrl": "https://auth.example.com/a?x=1", "loginId": "l1"}));
+        assert!(replies(&mut core).iter().any(|(c, v)| c == "c1" && v.get("url").and_then(Value::as_str) == Some("https://auth.example.com/a?x=1")));
+        c.command(&mut core, Command::McpAuth { name: "web".into(), client: "c2".into(), redirect: Some(" http://127.0.0.1:5555/callback?code=x ".into()) });
+        let Some(Effect::Fetch { job, url }) = core.effects.pop() else { anyhow::bail!("no fetch") };
+        assert_eq!(url, "http://127.0.0.1:5555/callback?code=x");
+        c.run_done(&mut core, &job, Some(200), "ok");
+        assert!(replies(&mut core).iter().any(|(c, v)| c == "c2" && v.get("ok") == Some(&json!(true))));
+        feed(&mut c, &mut core, &[json!({"method": "mcpServer/oauthLogin/completed", "params": {"name": "web", "success": true}})]);
+        assert!(written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("config/mcpServer/reload")));
+        // Adding: the CLI, then its headers into the configuration, then a reload.
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("X-Team".to_owned(), "a".to_owned());
+        c.command(
+            &mut core,
+            Command::McpAdd { scope: String::new(), name: "docs".into(), transport: String::new(), command: None, args: vec![], env: Default::default(), url: Some("https://docs.example.com/mcp".into()), headers, client: Some("c3".into()) },
+        );
+        // (written to the configuration: the CLI would start signing in on its machine)
+        assert!(core.effects.is_empty());
+        let w = written(&mut core);
+        let wr = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("config/value/write")).cloned().unwrap_or_default();
+        assert_eq!(
+            (wr.pointer("/params/keyPath").and_then(Value::as_str), wr.pointer("/params/value/url"), wr.pointer("/params/value/http_headers/X-Team")),
+            (Some("mcp_servers.docs"), Some(&json!("https://docs.example.com/mcp")), Some(&json!("a")))
+        );
+        respond(&mut c, &mut core, &w, "config/value/write", json!({"status": "ok"}));
+        assert!(replies(&mut core).iter().any(|(c, v)| c == "c3" && v.get("ok") == Some(&json!(true))));
+        assert!(written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("config/mcpServer/reload")));
+        c.command(&mut core, Command::McpAdd { scope: String::new(), name: "echo".into(), transport: "stdio".into(), command: Some("x".into()), args: vec![], env: Default::default(), url: None, headers: Default::default(), client: Some("c6".into()) });
+        assert!(replies(&mut core).iter().any(|(c, v)| c == "c6" && v.get("ok") == Some(&json!(false))));
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("K".to_owned(), "v".to_owned());
+        c.command(&mut core, Command::McpAdd { scope: String::new(), name: "local".into(), transport: "stdio".into(), command: Some("node".into()), args: vec!["s.js".into()], env, url: None, headers: Default::default(), client: None });
+        assert!(matches!(core.effects.pop(), Some(Effect::Run { args, .. }) if args == ["mcp", "add", "local", "--env", "K=v", "--", "node", "s.js"]));
+        c.command(&mut core, Command::McpAdd { scope: String::new(), name: "old".into(), transport: "sse".into(), command: None, args: vec![], env: Default::default(), url: Some("https://x.example.com/sse".into()), headers: Default::default(), client: Some("c5".into()) });
+        assert!(core.effects.is_empty());
+        assert!(replies(&mut core).iter().any(|(c, v)| c == "c5" && v.get("ok") == Some(&json!(false))));
+        c.command(&mut core, Command::McpRemove { scope: None, name: "echo".into(), client: None });
+        assert!(matches!(core.effects.pop(), Some(Effect::Run { args, .. }) if args == ["mcp", "remove", "--", "echo"]));
+        // An http server: its sign-in is forgotten, then it is removed.
+        c.command(&mut core, Command::McpRemove { scope: None, name: "web".into(), client: Some("c7".into()) });
+        let Some(Effect::Run { job, args }) = core.effects.pop() else { anyhow::bail!("no logout") };
+        assert_eq!(args, ["mcp", "logout", "--", "web"]);
+        c.run_done(&mut core, &job, Some(1), "not signed in");
+        assert!(matches!(core.effects.pop(), Some(Effect::Run { args, .. }) if args == ["mcp", "remove", "--", "web"]));
+        Ok(())
+    }
+
+    #[test]
+    fn skills_and_plugins_are_listed_viewed_and_run() -> anyhow::Result<()> {
+        let (mut c, mut core, w) = opened();
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "skills/list",
+            json!({"data": [{"cwd": "/work", "errors": [], "skills": [
+                {"name": "imagegen", "description": "Generate images.", "shortDescription": null, "interface": {"shortDescription": "Images"}, "path": "/codex/skills/.system/imagegen/SKILL.md", "scope": "system", "enabled": true, "pluginId": null},
+                {"name": "review", "description": "Review code.", "path": "/work/.codex/skills/review/SKILL.md", "scope": "repo", "enabled": true},
+                {"name": "deploy", "description": "Deploy it.", "path": "/p/deploy/SKILL.md", "scope": "user", "enabled": true, "pluginId": "ops@market"},
+                {"name": "off", "description": "Off.", "path": "/u/off/SKILL.md", "scope": "user", "enabled": false}
+            ]}]}),
+        );
+        let sk: Vec<(&str, &str, bool)> = core.state.skills.iter().map(|s| (s.name.as_str(), s.source.as_str(), s.enabled)).collect();
+        assert_eq!(sk, vec![("imagegen", "system", true), ("review", "project", true), ("deploy", "plugin", true), ("off", "user", false)]);
+        assert_eq!(core.meta.commands.len(), 3);
+        respond(&mut c, &mut core, &w, "plugin/installed", json!({"marketplaces": [{"name": "market", "plugins": [{"id": "ops@market", "name": "ops", "installed": true, "enabled": true, "localVersion": "2.0.0", "interface": {"displayName": "Ops"}}, {"id": "x@market", "name": "x", "installed": false, "enabled": false}]}], "marketplaceLoadErrors": []}));
+        assert_eq!(core.state.plugins.iter().map(|p| (p.name.as_str(), p.source.as_str(), p.version.as_deref())).collect::<Vec<_>>(), vec![("Ops", "market", Some("2.0.0"))]);
+        c.command(&mut core, Command::SkillView { name: "review".into(), client: "v1".into() });
+        assert!(matches!(core.effects.pop(), Some(Effect::Read { client, paths }) if client == "v1" && paths == ["/work/.codex/skills/review/SKILL.md"]));
+        c.command(&mut core, Command::SkillView { name: "nope".into(), client: "v2".into() });
+        assert!(replies(&mut core).iter().any(|(c, v)| c == "v2" && v.get("error").is_some()));
+        c.command(&mut core, Command::SkillRun { name: "review".into(), args: Some("the diff".into()), id: Some("m1".into()), mode: SendMode::Queue });
+        let w = written(&mut core);
+        let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().unwrap_or_default();
+        assert_eq!(start.pointer("/params/input/0"), Some(&json!({"type": "skill", "name": "review", "path": "/work/.codex/skills/review/SKILL.md"})));
+        assert_eq!(start.pointer("/params/input/1/text").and_then(Value::as_str), Some("the diff"));
+        assert_eq!(start.pointer("/params/clientUserMessageId").and_then(Value::as_str), Some("m1"));
+        feed(&mut c, &mut core, &[json!({"method": "skills/changed", "params": {}})]);
+        assert!(written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("skills/list") && v.pointer("/params/forceReload") == Some(&json!(true))));
+        Ok(())
+    }
+
+    #[test]
+    fn a_mode_change_applies_from_the_next_turn() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        assert!(core.meta.modes.iter().any(|m| m.id == "read-only"));
+        // An approval policy chosen on its own, then a mode: the mode's policies win.
+        c.command(&mut core, Command::Control { id: "approval_policy".into(), value: Some(json!("untrusted")) });
+        c.command(&mut core, Command::SetMode { mode: "read-only".into() });
+        assert_eq!(core.state.mode, "read-only");
+        assert_eq!(core.state.control_values.get("approval_policy"), Some(&json!("on-request")));
+        let _ = written(&mut core);
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let w = written(&mut core);
+        let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
+        assert_eq!(start.pointer("/params/approvalPolicy").and_then(Value::as_str), Some("on-request"));
+        assert_eq!(start.pointer("/params/sandboxPolicy/type").and_then(Value::as_str), Some("readOnly"));
+        // Not offered: refused, said so.
+        c.command(&mut core, Command::SetMode { mode: "full-access".into() });
+        assert_eq!(core.state.mode, "read-only");
+        Ok(())
+    }
+
+    #[test]
+    fn effort_levels_and_per_turn_overrides() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        let ids = |core: &Core| core.meta.efforts.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&core), ["low", "medium", "high"]);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
+        let w = written(&mut core);
+        respond(
+            &mut c,
+            &mut core,
+            &w,
+            "model/list",
+            json!({"data": [
+                {"id": "gpt-5", "model": "gpt-5", "displayName": "GPT-5", "description": "", "isDefault": true, "defaultReasoningEffort": "medium", "supportedReasoningEfforts": [{"reasoningEffort": "minimal", "description": ""}, {"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "medium", "description": ""}, {"reasoningEffort": "high", "description": ""}]},
+                {"id": "o-mini", "model": "o-mini", "displayName": "o mini", "description": "", "supportedReasoningEfforts": [{"reasoningEffort": "low", "description": ""}, {"reasoningEffort": "high", "description": ""}]}
+            ]}),
+        );
+        respond(&mut c, &mut core, &w, "thread/start", json!({"thread": {"id": "th1", "turns": []}, "model": "gpt-5", "cwd": "/work"}));
+        assert_eq!(ids(&core), ["minimal", "low", "medium", "high"]);
+        assert_eq!(core.state.effort, "medium");
+        // A model model/list does not name: the default model's levels.
+        c.command(&mut core, Command::SetModel { model: "custom-model".into() });
+        c.command(&mut core, Command::Control { id: "reasoning_summary".into(), value: Some(json!("auto")) });
+        assert_eq!(ids(&core).len(), 4);
+        // Effort and model for the session, and for one message.
+        c.command(&mut core, Command::SetEffort { effort: "high".into() });
+        assert_eq!(core.state.effort, "high");
+        let _ = written(&mut core);
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "one".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let w = written(&mut core);
+        let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
+        assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("high"), Some("custom-model")));
+        respond(&mut c, &mut core, &w, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress", "items": []}}));
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed", "items": []}}})]);
+        let _ = written(&mut core);
+        let o = super::super::model::Overrides { model: Some("o-mini".into()), effort: Some("low".into()) };
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "two".into(), mode: SendMode::Queue, attachments: vec![], overrides: Some(o) });
+        let w = written(&mut core);
+        let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
+        assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
+        Ok(())
+    }
+
+    #[test]
+    fn terminals_codex_leaves_running() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        let item = |status: &str, exit: Value| json!({"type": "commandExecution", "id": "call_4", "command": "/usr/bin/bash -lc 'for i in $(seq 1 120); do echo tick $i; sleep 1; done'", "cwd": "/work", "processId": "91122", "source": "unifiedExecStartup", "status": status, "exitCode": exit, "commandActions": []});
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"turn": {"id": "t1"}}}), json!({"method": "item/started", "params": {"turnId": "t1", "item": item("inProgress", Value::Null)}})]);
+        let t = core.state.tasks.iter().find(|t| t.process.as_deref() == Some("91122")).cloned().ok_or_else(|| anyhow::anyhow!("no terminal"))?;
+        assert_eq!((t.class.as_deref(), t.command.as_deref(), t.cwd.as_deref(), t.status.as_str()), (Some("shell"), Some("for i in $(seq 1 120); do echo tick $i; sleep 1; done"), Some("/work"), "running"));
+        feed(&mut c, &mut core, &[json!({"method": "item/commandExecution/outputDelta", "params": {"itemId": "call_4", "delta": "tick 1\n"}}), json!({"method": "item/commandExecution/outputDelta", "params": {"itemId": "call_4", "delta": "tick 2\n"}})]);
+        let (bytes, offset, _) = core.task_output.get(&t.id).map(|o| o.since(0)).unwrap_or_default();
+        assert_eq!((String::from_utf8_lossy(&bytes).as_ref(), offset), ("tick 1\ntick 2\n", 14));
+        // The turn ends; the terminal goes on, left behind (not cut off).
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed", "items": []}}})]);
+        core.set_status(Status::Idle);
+        assert!(core.state.tasks.iter().any(|x| x.id == t.id && x.live() && x.background));
+        assert_eq!(core.state.count_left_behind(), 1);
+        assert!(core.get("call_4").is_some_and(|e| matches!(&e.body, Body::Tool(x) if x.status == ToolStatus::Running)));
+        // Stopping it: kiln stops the process (Codex cannot).
+        c.command(&mut core, Command::StopTask { task: t.id.clone() });
+        let Some(Effect::Kill { job, command }) = core.effects.pop() else { anyhow::bail!("no kill") };
+        assert_eq!(command, "for i in $(seq 1 120); do echo tick $i; sleep 1; done");
+        c.run_done(&mut core, &job, Some(0), "");
+        assert_eq!(core.state.tasks.iter().find(|x| x.id == t.id).map(|x| x.status.clone()).as_deref(), Some("stopped"));
+        // One that ends on its own: its exit code.
+        let (mut c2, mut core2, _) = opened();
+        feed(&mut c2, &mut core2, &[json!({"method": "item/started", "params": {"item": item("inProgress", Value::Null)}}), json!({"method": "item/completed", "params": {"item": item("completed", json!(3))}})]);
+        let done = core2.state.tasks.first().cloned().unwrap_or_default();
+        assert_eq!((done.status.as_str(), done.exit_code), ("failed", Some(3)));
         Ok(())
     }
 }

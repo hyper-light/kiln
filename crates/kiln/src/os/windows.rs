@@ -120,6 +120,9 @@ pub fn pid_alive(_pid: u32) -> bool {
     false
 }
 
+/// Process trees are job objects on Windows; nothing to stop one by one.
+pub fn stop_processes(_pids: &[u32], _keep: Option<u32>, _grace: std::time::Duration) {}
+
 pub fn try_reap(_pid: u32) -> io::Result<Option<(Option<i32>, String)>> {
     Err(io::Error::other("unsupported on Windows"))
 }

@@ -64,7 +64,25 @@ pub enum AgentMsg {
     /// until they end); runners from before this never send it and count as "legacy".
     /// Appended last: postcard encodes variants by index (an older server skips the frame).
     Instance(InstanceHello),
+    /// The build this runner runs (a short hash of its binary) and what it can do ([`CAP_UPGRADE`]:
+    /// it takes [`ServerMsg::Upgrade`]). Sent after Hello; runners from before this never send it.
+    /// Appended last: postcard encodes variants by index (an older server skips the frame).
+    Build { build: String, caps: u32 },
+    /// A line of output from an upgrade this runner is doing ([`ServerMsg::Upgrade`]).
+    UpgradeLog { job: String, line: String },
+    /// That upgrade finished (`ok`), or failed with `error`.
+    UpgradeDone { job: String, ok: bool, error: Option<String> },
+    /// Answer to [`ServerMsg::HarnessTaskOutput`]: JSON `{data, offset, live, ...}` or `{error}`,
+    /// `None` when this machine has no such session. Appended last: postcard encodes variants by
+    /// index.
+    HarnessTaskOutput { req: u64, json: Option<String> },
 }
+
+/// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
+pub const CAP_UPGRADE: u32 = 1;
+/// [`AgentMsg::Build`] capability: the runner waits for a taken-over session's process to end
+/// before it resumes the conversation (`Spec::takeover_pid`). Without it, take-over would race.
+pub const CAP_TAKEOVER: u32 = 2;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,6 +166,15 @@ pub enum ServerMsg {
     /// that never announced itself), has nothing left to run (no terminals, agent sessions or
     /// jobs) and can be stopped. Appended last: postcard encodes variants by index.
     Retire { instance: String },
+    /// Upgrade this machine's runner without a restart: fetch the binary at `path` on the server
+    /// (it must match `sha256` and `size`), then run its `install --agent --upgrade`, reporting
+    /// with UpgradeLog / UpgradeDone under `job`. Only sent to runners that announced
+    /// [`CAP_UPGRADE`]. Appended last: postcard encodes variants by index.
+    Upgrade { job: String, path: String, sha256: String, size: u64 },
+    /// Read the output of one of an agent session's tasks after byte `since` (its tail without
+    /// one); answered by [`AgentMsg::HarnessTaskOutput`]. Appended last: postcard encodes
+    /// variants by index.
+    HarnessTaskOutput { req: u64, session: String, task: String, since: Option<u64> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -214,6 +241,12 @@ mod tests {
         let c = encode(&ServerMsg::HarnessClose { session: String::new() })?;
         assert!(r.first() > c.first(), "Retire must be appended after HarnessClose");
         assert_eq!(decode::<ServerMsg>(&r)?, ServerMsg::Retire { instance: "legacy".into() });
+        let b = encode(&AgentMsg::Build { build: "abc".into(), caps: CAP_UPGRADE })?;
+        assert!(b.first() > i.first(), "Build must be appended after Instance");
+        let d = encode(&AgentMsg::UpgradeDone { job: "j".into(), ok: true, error: None })?;
+        assert!(d.first() > b.first());
+        let u = encode(&ServerMsg::Upgrade { job: "j".into(), path: "/dl/kiln/x".into(), sha256: "00".into(), size: 1 })?;
+        assert!(u.first() > r.first(), "Upgrade must be appended after Retire");
         Ok(())
     }
 }

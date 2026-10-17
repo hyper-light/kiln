@@ -181,6 +181,10 @@ export interface RunnerInstance {
   terminals: number;
   agents: number;
   jobs: number;
+  /** The build it runs (start of its binary's SHA-256); null for runners too old to say. */
+  build?: string | null;
+  /** It takes upgrade commands; older runners are upgraded through a terminal instead. */
+  can_upgrade?: boolean;
 }
 
 export type ChildState = "starting" | "running" | "restarting" | "stopped" | "finished";
@@ -341,7 +345,103 @@ export type ServerEvent =
   /** An agent session kiln runs appeared or changed. */
   | { type: "harness"; info: AgentInfo }
   /** An agent session kiln ran is gone. */
-  | { type: "harness_closed"; id: string };
+  | { type: "harness_closed"; id: string }
+  /** Settings → Updates changed: refetch GET /api/updates. */
+  | { type: "updates" }
+  /** An upgrade moved on (new output, or it finished). */
+  | { type: "update_job"; job: UpdateJob };
+
+/* ---------------------------- updates (Settings → Updates) ---------------------------- */
+
+export interface UpdateJob {
+  id: string;
+  kind: "runner" | "server";
+  /** The machine, or "server". */
+  target: string;
+  /** native: the runner's own upgrade command · terminal: through a terminal on an older runner ·
+   * restart: Kubernetes rollout restart · replace: the server's binary replaced. */
+  method: "native" | "terminal" | "restart" | "replace";
+  state: "running" | "done" | "failed";
+  started_at: number;
+  ended_at: number | null;
+  from_build: string | null;
+  to_build: string | null;
+  /** The machine reported running to_build. */
+  reached: boolean;
+  log: string[];
+  error: string | null;
+}
+
+/** A kiln binary the server can hand out. */
+export interface KilnBinary {
+  target: string;
+  sha256: string;
+  size: number;
+  build: string;
+  /** server: the server's own · upload: uploaded here · release: fetched from GitHub. */
+  origin: "server" | "upload" | "release";
+  at: number;
+}
+
+export interface ReleaseInfo {
+  latest: string | null;
+  newer: boolean;
+  url: string | null;
+  error: string | null;
+  /** 0 until GitHub was asked. */
+  checked_at: number;
+}
+
+/** Which build the server's image holds on its node (Kubernetes). */
+export interface ImageCheck {
+  image: string;
+  node: string | null;
+  build: string | null;
+  newer: boolean;
+  error: string | null;
+  checked_at: number;
+}
+
+export interface ServerUpdate {
+  version: string;
+  build: string;
+  target: string;
+  mode: "kubernetes" | "service" | "standalone";
+  deployment: string | null;
+  namespace: string | null;
+  image: ImageCheck | null;
+  checking: boolean;
+  newer: boolean;
+  action: "restart" | "replace" | null;
+  replacement: { origin: "upload" | "release"; build: string | null; version: string | null } | null;
+  release: ReleaseInfo;
+  note: string;
+}
+
+export interface RunnerUpdate {
+  name: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  connected: boolean;
+  version: string;
+  target: string | null;
+  /** The build it would be upgraded to; null when kiln has no binary for its platform yet. */
+  target_build: string | null;
+  build: string | null;
+  up_to_date: boolean;
+  method: "native" | "terminal";
+  terminal: boolean;
+  instances: RunnerInstance[];
+}
+
+export interface UpdatesOverview {
+  server: ServerUpdate;
+  runners: RunnerUpdate[];
+  jobs: UpdateJob[];
+  binaries: KilnBinary[];
+  targets: string[];
+}
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };
 

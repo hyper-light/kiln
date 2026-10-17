@@ -95,6 +95,53 @@ pub struct AiSession {
     pub transcript: bool,
 }
 
+/// Whether a found session can be taken over: continued as a kiln agent session (its kiln
+/// terminal is ended, the harness resumes it in the same folder).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeOver {
+    Ready,
+    /// It runs outside kiln: quit it there first (an ended session is resumed with `spec.resume`).
+    Outside,
+    /// It has no session id to continue yet (still starting).
+    NoId,
+    /// kiln cannot run that harness as an agent session.
+    Unsupported,
+    /// The machine's runner predates take-over (it would not wait for the session to end):
+    /// upgrade it first.
+    Upgrade,
+}
+
+impl AiSession {
+    /// Whether it can be taken over; `held`: kiln holds the terminal it runs in.
+    pub fn takeover(&self, held: bool) -> TakeOver {
+        let structured = crate::harness::kinds::Kind::get(&self.tool).is_some_and(crate::harness::kinds::Kind::structured);
+        if !structured {
+            TakeOver::Unsupported
+        } else if self.id.trim().is_empty() || self.cwd.trim().is_empty() {
+            TakeOver::NoId
+        } else if !held || self.terminal.is_none() {
+            TakeOver::Outside
+        } else {
+            TakeOver::Ready
+        }
+    }
+
+    /// The agent session that continues it: the same harness, folder, conversation and model,
+    /// started once its process (ended with its terminal) is gone. `None` unless it is `Ready`.
+    pub fn takeover_spec(&self, held: bool) -> Option<crate::harness::session::Spec> {
+        (self.takeover(held) == TakeOver::Ready).then(|| crate::harness::session::Spec {
+            kind: self.tool.clone(),
+            cwd: Some(self.cwd.clone()),
+            resume: Some(self.id.clone()),
+            model: Some(self.model.clone()).filter(|m| !m.is_empty()),
+            name: [&self.name, &self.title].into_iter().find(|n| !n.trim().is_empty()).map(|n| n.chars().take(80).collect()),
+            takeover_pid: Some(self.pid),
+            ..crate::harness::session::Spec::default()
+        })
+    }
+}
+
 /// One message of an opened transcript.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -228,7 +275,10 @@ impl Proc {
 /// Finds the sessions. Keeps the process table and parsed transcripts between scans, so a scan
 /// only rereads transcripts that changed.
 pub struct Scanner {
-    home: PathBuf,
+    /// Claude Code's configuration directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and Codex's
+    /// (`CODEX_HOME`, else `~/.codex`), as the sessions this machine starts use them.
+    claude: PathBuf,
+    codex: PathBuf,
     sys: System,
     /// Summaries by transcript, with the length and mtime they were read at.
     summaries: HashMap<PathBuf, (u64, SystemTime, Summary)>,
@@ -244,8 +294,10 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(home: PathBuf) -> Self {
+        let dir = |var: &str, default: &str| std::env::var_os(var).filter(|v| !v.is_empty()).map_or_else(|| home.join(default), PathBuf::from);
         Self {
-            home,
+            claude: dir("CLAUDE_CONFIG_DIR", ".claude"),
+            codex: dir("CODEX_HOME", ".codex"),
             sys: System::new(),
             summaries: HashMap::new(),
             claude_files: HashMap::new(),
@@ -266,14 +318,18 @@ impl Scanner {
         );
         let tools: Vec<Pid> = self.sys.processes().iter().filter(|(_, p)| tool_of(p).is_some()).map(|(pid, _)| *pid).collect();
         if !tools.is_empty() {
-            self.sys.refresh_processes_specifics(ProcessesToUpdate::Some(&tools), false, ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always).without_tasks());
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&tools),
+                false,
+                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always).with_environ(UpdateKind::OnlyIfNotSet).without_tasks(),
+            );
         }
         let mut out = Vec::new();
         let mut open = HashMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
 
         // Claude Code: one record per running session.
-        let records_dir = self.home.join(".claude").join("sessions");
+        let records_dir = self.claude.join("sessions");
         let have_records = records_dir.is_dir();
         for r in claude_records(&records_dir) {
             // The pid may since belong to something else.
@@ -446,7 +502,7 @@ impl Scanner {
         {
             return Some(f.clone());
         }
-        let projects = self.home.join(".claude").join("projects");
+        let projects = self.claude.join("projects");
         let name = format!("{id}.jsonl");
         let direct = projects.join(claude_dir_name(cwd)).join(&name);
         let found = if direct.is_file() {
@@ -466,7 +522,7 @@ impl Scanner {
         if p.cwd.is_empty() {
             return None;
         }
-        let dir = self.home.join(".claude").join("projects").join(claude_dir_name(&p.cwd));
+        let dir = self.claude.join("projects").join(claude_dir_name(&p.cwd));
         let mut files = Vec::new();
         walk_jsonl(&dir, 0, &mut |f| born_since(f, p.start), &mut files);
         files
@@ -484,7 +540,7 @@ impl Scanner {
         if let Some(f) = self.codex_files.get(&key) {
             return Some(f.clone());
         }
-        let root = self.home.join(".codex").join("sessions");
+        let root = self.codex.join("sessions");
         let resume = p.args.iter().position(|a| a == "resume").and_then(|i| p.args.get(i + 1)).filter(|a| !a.starts_with('-'));
         let mut files = Vec::new();
         match resume {
@@ -593,19 +649,25 @@ fn interactive(tool: Tool, args: &[String]) -> bool {
     }
 }
 
-/// The kiln terminal a process runs in: the nearest ancestor that is a terminal's shell.
+/// The kiln terminal a process runs in: the nearest ancestor that is one of this runner's
+/// terminal shells, else the `KILN_TERM_SESSION` every kiln terminal's shell exports. The
+/// variable finds terminals another runner process of this machine holds (an older one keeps its
+/// shells across an upgrade, and only the newest reports); the server drops ids it no longer has.
 fn terminal_of(sys: &System, pid: Pid, terminals: &HashMap<u32, String>) -> Option<String> {
-    if terminals.is_empty() {
-        return None;
-    }
     let mut cur = pid;
     for _ in 0..MAX_DEPTH {
         if let Some(id) = terminals.get(&cur.as_u32()) {
             return Some(id.clone());
         }
-        cur = sys.process(cur)?.parent()?;
+        let Some(parent) = sys.process(cur).and_then(Process::parent) else { break };
+        cur = parent;
     }
-    None
+    sys.process(pid).and_then(|p| term_session_in(p.environ()))
+}
+
+/// The kiln terminal session an environment names.
+fn term_session_in(env: &[std::ffi::OsString]) -> Option<String> {
+    env.iter().find_map(|kv| kv.to_str()?.strip_prefix("KILN_TERM_SESSION=").filter(|v| !v.is_empty()).map(str::to_owned))
 }
 
 /// Created at or after `since` (unix seconds). Where the filesystem keeps no creation time,
@@ -972,5 +1034,69 @@ mod tests {
         let found = s.scan(&HashMap::new());
         assert!(found.len() <= MAX_SESSIONS);
         assert!(s.transcript(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn terminal_from_the_environment() {
+        let env = |vars: &[&str]| vars.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(term_session_in(&env(&["HOME=/home/ada", "KILN_TERM_SESSION=t-41", "TERM=xterm"])), Some("t-41".into()));
+        assert_eq!(term_session_in(&env(&["KILN_TERM_SESSION="])), None);
+        assert_eq!(term_session_in(&env(&["XKILN_TERM_SESSION=t-1", "KILN_TERM_SESSIONS=t-2"])), None);
+        assert_eq!(term_session_in(&[]), None);
+    }
+
+    /// A harness started in a terminal another runner process holds (so it isn't in `terminals`)
+    /// is still linked to that terminal, by the variable its shell exported.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn harness_in_another_runners_terminal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (Ok(home), Ok(bin)) = (tempfile::tempdir(), tempfile::tempdir()) else { return };
+        // A script is named for itself in the process table; it waits on sleep rather than exec it.
+        let claude = bin.path().join("claude");
+        if std::fs::write(&claude, "#!/bin/sh\nsleep 30\n").is_err() || std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).is_err() {
+            return;
+        }
+        let Ok(mut child) = std::process::Command::new(&claude).env("KILN_TERM_SESSION", "t-elsewhere").spawn() else { return };
+        let pid = child.id();
+        let mut s = Scanner::new(home.path().to_owned());
+        let mut found = None;
+        for _ in 0..50 {
+            found = s.scan(&HashMap::new()).into_iter().find(|x| x.pid == pid);
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = found.map(|f| (f.tool, f.terminal));
+        assert_eq!(found, Some(("claude".to_owned(), Some("t-elsewhere".to_owned()))));
+    }
+
+    #[test]
+    fn found_sessions_are_taken_over_only_from_a_kiln_terminal() {
+        let s = AiSession {
+            tool: "claude".into(),
+            id: "8b2c".into(),
+            pid: 4242,
+            name: "fix the build".into(),
+            cwd: "/work".into(),
+            model: "claude-opus-5-5".into(),
+            terminal: Some("term1".into()),
+            ..AiSession::default()
+        };
+        assert_eq!(s.takeover(true), TakeOver::Ready);
+        let spec = s.takeover_spec(true).unwrap_or_default();
+        assert_eq!((spec.kind.as_str(), spec.cwd.as_deref(), spec.resume.as_deref(), spec.takeover_pid), ("claude", Some("/work"), Some("8b2c"), Some(4242)));
+        assert_eq!((spec.model.as_deref(), spec.name.as_deref()), (Some("claude-opus-5-5"), Some("fix the build")));
+        // kiln does not hold its terminal (any more), or it runs outside kiln: quit it first.
+        assert_eq!(s.takeover(false), TakeOver::Outside);
+        assert_eq!(AiSession { terminal: None, ..s.clone() }.takeover(true), TakeOver::Outside);
+        assert!(s.takeover_spec(false).is_none());
+        // Nothing to continue yet; a harness kiln cannot run as an agent session.
+        assert_eq!(AiSession { id: String::new(), ..s.clone() }.takeover(true), TakeOver::NoId);
+        assert_eq!(AiSession { tool: "antigravity".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
+        assert_eq!(serde_json::to_value(TakeOver::NoId).ok(), Some(serde_json::json!("no_id")));
     }
 }

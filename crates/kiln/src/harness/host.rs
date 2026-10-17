@@ -348,6 +348,10 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         lines_removed: 0,
         context_pct: None,
         turn_started: None,
+        limits: Vec::new(),
+        account: None,
+        plan: None,
+        left_behind: 0,
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]

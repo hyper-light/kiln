@@ -66,6 +66,50 @@ pub enum Effect {
     Restart { resume_at: Option<String> },
     /// Start a new session that branches off this one at `resume_at`.
     Branch { resume: String, resume_at: Option<String> },
+    /// Run the harness's own CLI beside the session (`mcp add ...`), in its directory and
+    /// environment. Its exit and output come back to the adapter (`run_done`) under `job`.
+    Run { job: String, args: Vec<String> },
+    /// Answer `client` with the first of these files that can be read (`{"content", "path"}`),
+    /// or `{"error"}`.
+    Read { client: String, paths: Vec<String> },
+    /// Make a GET request to a sign-in callback the harness listens for on this machine's
+    /// loopback (a browser on another device cannot reach it). Only loopback addresses are
+    /// fetched. Its result comes back as a run's end (`run_done`) under `job`.
+    Fetch { job: String, url: String },
+    /// Stop a process the harness started and cannot stop itself (a terminal Codex left
+    /// running): the newest process under the harness whose command line runs `command`, with
+    /// everything it started. The outcome comes back as a run's end (`run_done`, code 0: stopped).
+    Kill { job: String, command: String },
+}
+
+/// The output of a task kiln keeps itself (a harness that streams it rather than writing a
+/// file): the last `TASK_OUTPUT_MAX` bytes, and how many there have been.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskOutput {
+    pub data: VecDeque<u8>,
+    /// Bytes appended so far (the offset just past the newest).
+    pub total: u64,
+}
+
+/// Most output kept per task.
+pub const TASK_OUTPUT_MAX: usize = 256 * 1024;
+
+impl TaskOutput {
+    pub fn append(&mut self, bytes: &[u8]) {
+        self.data.extend(bytes);
+        let excess = self.data.len().saturating_sub(TASK_OUTPUT_MAX);
+        self.data.drain(..excess);
+        self.total = self.total.saturating_add(bytes.len() as u64);
+    }
+
+    /// What came after `since` (all that is kept when `since` is older than that), and the offset
+    /// to ask from next.
+    pub fn since(&self, since: u64) -> (Vec<u8>, u64, bool) {
+        let first = self.total.saturating_sub(self.data.len() as u64);
+        let from = since.max(first);
+        let skip = usize::try_from(from - first).unwrap_or(usize::MAX);
+        (self.data.iter().skip(skip).copied().collect(), self.total, since < first)
+    }
 }
 
 /// Work the brain does off the event loop and feeds back: e.g. reading a file to show what an
@@ -105,6 +149,8 @@ pub struct Core {
     changes_dirty: bool,
     /// What the session has to do for the adapter (restart, branch).
     pub effects: Vec<Effect>,
+    /// Output of tasks kiln keeps itself, by task id (not sent with the state).
+    pub task_output: HashMap<String, TaskOutput>,
     /// The timeline was cut (a rewind): viewers start over from a snapshot.
     reset: bool,
 }
@@ -135,6 +181,7 @@ impl Core {
             changes: std::collections::BTreeMap::new(),
             changes_dirty: false,
             effects: Vec::new(),
+            task_output: HashMap::new(),
             reset: false,
         }
     }
@@ -147,6 +194,8 @@ impl Core {
                 self.index.remove(&e.id);
             }
         }
+        // Sequence numbers stay contiguous: an event's place is found from its number.
+        self.next_seq = seq;
         self.changed.clear();
         self.stream.clear();
         self.reset = true;
@@ -228,7 +277,10 @@ impl Core {
     }
 
     /// Add an event, or replace the one with the same id (keeping its place and time).
-    pub fn upsert(&mut self, id: &str, parent: Option<String>, body: Body) {
+    pub fn upsert(&mut self, id: &str, parent: Option<String>, mut body: Body) {
+        if let Body::Tool(t) = &mut body {
+            t.annotate();
+        }
         if let Some(e) = self.get_mut(id) {
             e.body = body;
             if parent.is_some() {
@@ -357,6 +409,7 @@ impl Core {
         }
         if self.state_dirty {
             self.state_dirty = false;
+            self.state.left_behind = self.state.count_left_behind();
             self.out.push(Update::State { state: Box::new(self.state.clone()) });
         }
     }
@@ -436,5 +489,39 @@ mod tests {
         let total: usize = snap.iter().map(|u| if let Update::Events { events } = u { events.len() } else { 0 }).sum();
         assert_eq!(total, MAX_EVENTS);
         assert!(snap.len() > 4);
+    }
+
+    #[test]
+    fn events_after_a_rewind_go_out() {
+        let mut c = Core::new();
+        for id in ["one", "reply one", "two", "reply two"] {
+            c.upsert(id, None, Body::Assistant { text: id.into(), streaming: false });
+        }
+        c.take_out();
+        c.truncate_from("two");
+        let out = c.take_out();
+        assert!(matches!(out.first(), Some(Update::Reset)));
+        c.upsert("three", None, Body::Assistant { text: "three".into(), streaming: true });
+        c.append("three", "!");
+        let out = c.take_out();
+        assert!(matches!(out.first(), Some(Update::Events { events }) if events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>() == ["three"]));
+        c.append("three", "?");
+        assert_eq!(c.take_out(), vec![Update::Stream { id: "three".into(), text: "?".into() }]);
+        assert_eq!(c.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["one", "reply one", "three"]);
+        assert!(c.get("three").is_some_and(|e| matches!(&e.body, Body::Assistant { text, .. } if text == "three!?")));
+    }
+
+    #[test]
+    fn kept_task_output_reads_from_an_offset() {
+        let mut o = TaskOutput::default();
+        o.append(b"hello ");
+        o.append(b"world");
+        assert_eq!(o.since(0), (b"hello world".to_vec(), 11, false));
+        assert_eq!(o.since(6), (b"world".to_vec(), 11, false));
+        assert_eq!(o.since(11), (Vec::new(), 11, false));
+        let big = vec![b'x'; TASK_OUTPUT_MAX + 10];
+        o.append(&big);
+        let (bytes, offset, truncated) = o.since(0);
+        assert_eq!((bytes.len(), offset, truncated), (TASK_OUTPUT_MAX, 11 + TASK_OUTPUT_MAX as u64 + 10, true));
     }
 }

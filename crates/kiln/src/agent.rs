@@ -216,6 +216,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // directory, never a file).
     let own_dir = crate::upgrade::own_dir(&o.state_dir, o.instance.as_deref());
     let _ = std::fs::create_dir_all(&own_dir);
+    crate::updates::clean_leftovers(&own_dir);
     let instance_id = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
     let instance_hello = proto::InstanceHello {
         id: instance_id.clone(),
@@ -402,6 +403,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 let msg = AgentMsg::Hello(hello(jobs.keys().cloned().collect()));
                 if let Ok(b) = proto::encode(&msg) {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
+                // Which build this is and that it takes upgrade commands (an older server skips it).
+                if !o.ephemeral
+                    && let Ok(b) = proto::encode(&crate::updates::runner_build())
+                {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 connected = true;
@@ -667,6 +674,36 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             h.close(&session);
                         }
+                    }
+                    ServerMsg::Upgrade { job, path, sha256, size } => {
+                        // Fetch the new binary from the server and install it beside or over this
+                        // runner (`install --agent --upgrade`); nothing running here is stopped.
+                        tracing::info!(%job, %path, "upgrading this runner");
+                        let up = Uplink(uplink.0.clone());
+                        let http = Arc::clone(&http);
+                        let server_url = o.server_url.clone();
+                        let own = own_dir.clone();
+                        let service = crate::updates::runner_service(&o.state_dir, o.instance.as_deref());
+                        crate::rt::spawn(async move {
+                            let order = crate::updates::Order { job: &job, path: &path, sha256: &sha256, size };
+                            let res = crate::updates::run_on_runner(&http, &server_url, &order, &own, &service, &up).await;
+                            if let Err(e) = &res {
+                                tracing::warn!(%job, error = %format!("{e:#}"), "upgrade failed");
+                            }
+                            let error = res.err().map(|e| format!("{e:#}"));
+                            up.msg(AgentMsg::UpgradeDone { job, ok: error.is_none(), error }).await;
+                        });
+                    }
+                    ServerMsg::HarnessTaskOutput { req, session, task, since } => {
+                        let s = harness.as_ref().and_then(|h| h.get(&session));
+                        let up = uplink.0.clone();
+                        crate::rt::spawn(async move {
+                            let json = match s {
+                                Some(s) => crate::rt::blocking(move || s.task_output(&task, since).to_string()).await.ok(),
+                                None => None,
+                            };
+                            let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
+                        });
                     }
                 }
             }

@@ -162,7 +162,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
         (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
-        (&Method::GET, ["dl", "kiln", target]) => return download_for(target).await,
+        (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
         (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
         (&Method::GET, ["install.ps1"]) => return Ok(install_powershell(&hub)),
         _ => {}
@@ -180,6 +180,17 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
+        (&Method::GET, ["api", "updates"]) => Ok(updates_overview(&hub, false).await),
+        (&Method::POST, ["api", "updates", "check"]) => Ok(updates_overview(&hub, true).await),
+        (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
+        (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name).await,
+        (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
+        (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
+        (&Method::DELETE, ["api", "updates", "binaries", target]) => delete_binary(&hub, target).await,
+        (&Method::GET, ["api", "updates", "jobs", id]) => match hub.updates.job(id) {
+            Some(j) => Ok(srv::json(StatusCode::OK, &j)),
+            None => Err(err(StatusCode::NOT_FOUND, "no such upgrade")),
+        },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
         (&Method::GET, ["api", "repos"]) => Ok(srv::json(StatusCode::OK, &hub.store.repos().await?)),
         (&Method::POST, ["api", "repos"]) => add_repo(&hub, req).await,
@@ -224,7 +235,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "ai-sessions", "silent"]) => Ok(ai_silent(&hub)),
         (&Method::GET, ["api", "ai-sessions", machine, pid, "transcript"]) => ai_transcript(&hub, machine, pid).await,
         (&Method::GET, ["api", "ai-sessions", machine, pid, "view"]) => ai_view(&hub, machine, pid).await,
-        (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.list())),
+        (&Method::POST, ["api", "ai-sessions", machine, pid, "takeover"]) => ai_takeover(&hub, machine, pid).await,
+        (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.visible())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
             if let Some(s) = hub.terminals.get(id) {
@@ -257,6 +269,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "command"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
+            let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
+            match hub.harness.task_output(&hub, id, task, since).await {
+                Ok(Some(v)) => Ok(srv::json(StatusCode::OK, &v)),
+                Ok(None) => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
+                Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+            }
+        }
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
 }
@@ -272,15 +292,23 @@ fn ai_sessions(hub: &Hub) -> Response {
             if let Some(o) = v.as_object_mut() {
                 o.insert("machine".into(), json!(machine));
                 // Attachable only while kiln holds that terminal.
-                if s.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_none()) {
+                let held = s.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_some());
+                if s.terminal.is_some() && !held {
                     o.insert("terminal".into(), serde_json::Value::Null);
                 }
+                o.insert("takeover".into(), json!(takeover_on(hub, machine, s.takeover(held))));
             }
             out.push(v);
         }
     }
     out.sort_by_key(|v| std::cmp::Reverse(v.get("last_activity").and_then(serde_json::Value::as_i64).unwrap_or(0)));
     srv::json(StatusCode::OK, &out)
+}
+
+/// Take-over needs the machine's runner to wait for the old process; an older one would race it.
+fn takeover_on(hub: &Hub, machine: &str, t: crate::aisessions::TakeOver) -> crate::aisessions::TakeOver {
+    use crate::aisessions::TakeOver;
+    if t == TakeOver::Ready && hub.runner_caps(machine) & crate::proto::CAP_TAKEOVER == 0 { TakeOver::Upgrade } else { t }
 }
 
 /// Connected runners that have never reported AI sessions (an older kiln): what they run can't
@@ -296,6 +324,36 @@ fn ai_silent(hub: &Hub) -> Response {
         .collect();
     machines.sort();
     srv::json(StatusCode::OK, &json!({ "machines": machines }))
+}
+
+/// Continue a session found running on a machine as a kiln agent session: the kiln terminal it
+/// runs in is ended, and the harness resumes it there, in the same folder, once its process is
+/// gone (the machine waits for it). One running outside kiln is refused: quit it there first, or
+/// resume an ended one with `POST /api/harness/sessions` and `spec.resume`.
+async fn ai_takeover(hub: &Hub, machine: &str, pid: &str) -> R {
+    use crate::aisessions::TakeOver;
+    let pid: u32 = pid.parse().map_err(|_| err(StatusCode::BAD_REQUEST, "bad pid"))?;
+    let found = hub.ai_sessions.lock().get(machine).and_then(|l| l.iter().find(|s| s.pid == pid).cloned());
+    let Some(found) = found else {
+        return Err(err(StatusCode::NOT_FOUND, "no such session on that machine (it may have ended: resume it with spec.resume)"));
+    };
+    let held = found.terminal.as_deref().is_some_and(|t| hub.terminals.get(t).is_some());
+    let spec = match (takeover_on(hub, machine, found.takeover(held)), found.takeover_spec(held)) {
+        (TakeOver::Ready, Some(spec)) => spec,
+        (TakeOver::Upgrade, _) => {
+            return Err(err(StatusCode::CONFLICT, format!("{machine}'s runner is older than take-over and wouldn't wait for the session to end: upgrade it in Settings → Updates first")));
+        }
+        (TakeOver::Outside, _) => return Err(err(StatusCode::CONFLICT, format!("it runs outside kiln (process {pid}): quit it there first, then continue it"))),
+        (TakeOver::NoId, _) => return Err(err(StatusCode::CONFLICT, "it has no conversation to continue yet")),
+        _ => return Err(err(StatusCode::BAD_REQUEST, format!("kiln cannot run {} as an agent session", found.tool))),
+    };
+    if let Some(t) = found.terminal.as_deref().and_then(|t| hub.terminals.get(t)) {
+        t.close();
+        hub.store.audit("admin".into(), "terminal.close".into(), t.target.clone()).await;
+    }
+    hub.store.audit("admin".into(), "agent.takeover".into(), format!("{} (process {pid}) on {machine}", found.tool)).await;
+    let infos = hub.harness.open(hub, &format!("agent:{machine}"), spec, 1).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &infos))
 }
 
 /// The recent messages of one session, read from its machine.
@@ -1086,11 +1144,16 @@ async fn download_binary() -> R {
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 
-/// The binary for `target`: this server's own when it was built for that target, otherwise a
-/// redirect to the release build of the same version on GitHub.
-async fn download_for(target: &str) -> R {
+/// The binary for `target`: this server's own when it was built for that target, one uploaded
+/// or fetched here (Settings → Updates), otherwise a redirect to the release build of the same
+/// version on GitHub.
+async fn download_for(hub: &Hub, target: &str) -> R {
     if target == TARGET {
         return download_binary().await;
+    }
+    if let Some((path, _)) = crate::updates::stored(hub, target) {
+        let body = crate::rt::file_source(path)?;
+        return Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)));
     }
     if !RELEASE_TARGETS.contains(&target) {
         return Err(err(
@@ -1100,6 +1163,93 @@ async fn download_for(target: &str) -> R {
     }
     let r = srv::with_header(srv::status(StatusCode::FOUND), header::LOCATION, &release_url(target));
     Ok(srv::with_header(r, header::CACHE_CONTROL, "no-store"))
+}
+
+// ------------------------------------------------------------------ updates (Settings → Updates)
+
+/// `GET /api/updates`: this server and how it is upgraded, every machine's runner, the latest
+/// upgrades and the binaries kiln can hand out. `POST /api/updates/check` asks GitHub (and, in
+/// Kubernetes, the image on the node) again; an `updates` event follows when that is done.
+async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
+    let runners = crate::updates::runners(hub).await;
+    let mut targets: Vec<&str> = RELEASE_TARGETS.to_vec();
+    if !targets.contains(&TARGET) {
+        targets.insert(0, TARGET);
+    }
+    let jobs: Vec<crate::updates::Job> = hub.updates.jobs().into_iter().take(12).collect();
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "server": crate::updates::server(hub, force),
+            "runners": runners,
+            "jobs": jobs,
+            "binaries": crate::updates::binaries(hub),
+            "targets": targets,
+        }),
+    )
+}
+
+/// `POST /api/updates/runners/{name}`: upgrade that machine's runner (nothing it runs stops).
+async fn upgrade_runner(hub: &Arc<Hub>, name: &str) -> R {
+    match crate::updates::upgrade_runner(hub, name).await {
+        Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
+        Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
+    }
+}
+
+/// `POST /api/updates/runners`: upgrade every connected runner that isn't up to date.
+async fn upgrade_all_runners(hub: &Arc<Hub>) -> Response {
+    let mut jobs = Vec::new();
+    let mut errors = Vec::new();
+    for r in crate::updates::upgrade_all(hub).await {
+        match r {
+            Ok(j) => jobs.push(j),
+            Err(e) => errors.push(e),
+        }
+    }
+    srv::json(StatusCode::ACCEPTED, &json!({ "jobs": jobs, "errors": errors }))
+}
+
+#[derive(Deserialize)]
+struct ServerUpgrade {
+    action: String,
+}
+
+/// `POST /api/updates/server` `{action: "restart" | "replace"}`.
+async fn upgrade_server(hub: &Arc<Hub>, req: Request) -> R {
+    let b: ServerUpgrade = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    match crate::updates::upgrade_server(hub, &b.action).await {
+        Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
+        Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
+    }
+}
+
+/// `POST /api/updates/binaries?target=<platform>`: a kiln binary for that platform (the raw
+/// file as the body), handed to its machines and, for this server's platform, installable here.
+async fn upload_binary(hub: &Arc<Hub>, q: &HashMap<String, String>, req: Request) -> R {
+    let target = q.get("target").cloned().unwrap_or_default();
+    if !crate::updates::known_target(&target) {
+        return Err(err(StatusCode::BAD_REQUEST, format!("unknown platform {target:?}: one of {TARGET}, {}", RELEASE_TARGETS.join(", "))));
+    }
+    let bytes = srv::body_bytes(req.into_body(), crate::updates::MAX_BINARY).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
+    let (h, t) = (Arc::clone(hub), target.clone());
+    let b = crate::rt::blocking(move || crate::updates::store(&h, &t, &bytes, "upload"))
+        .await
+        .and_then(|r| r)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    hub.store.audit("admin".into(), "upgrade.binary".into(), format!("uploaded build {} for {target}", b.build)).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::json(StatusCode::OK, &b))
+}
+
+/// `DELETE /api/updates/binaries/{target}`.
+async fn delete_binary(hub: &Hub, target: &str) -> R {
+    if !crate::updates::unstore(hub, target) {
+        return Err(err(StatusCode::NOT_FOUND, format!("no binary is kept for {target}")));
+    }
+    hub.store.audit("admin".into(), "upgrade.binary".into(), format!("removed the binary for {target}")).await;
+    hub.emit(&json!({ "type": "updates" }));
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// An install script with this server's URL and build target filled in.

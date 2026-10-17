@@ -1,10 +1,10 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { useLocation, useNavigate } from "react-router";
-import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Keyboard, Maximize2, Minimize2, Minus, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
+import { Link, useLocation, useNavigate } from "react-router";
+import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Eye, Keyboard, Maximize2, Minimize2, Minus, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, TerminalSessionInfo } from "@/api/types";
+import type { Agent, AiSession, TerminalSessionInfo } from "@/api/types";
 import { TerminalKeyboard, type KeyboardFold, type KeyboardMode } from "@/components/terminal/keyboard";
 import { PRESETS, presetFor } from "@/components/terminal/presets";
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,7 @@ import { Chips } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
 import { useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+import { HarnessMark } from "@/views/harness/parts";
 import { SpawnHereButton } from "@/views/harness/spawn-here";
 import { SpawnDialog } from "@/views/harness/spawn";
 import { DesktopNew, MobileBar } from "./switcher";
@@ -50,6 +51,22 @@ const stickyHarness = (prev: string, hints: string) => {
   const now = presetFor(hints).id;
   return now === "shell" ? prev : now;
 };
+
+/** "Claude Code", "Codex", … for a reported AI session's tool. */
+const harnessLabel = (tool: string) => PRESETS.find((p) => p.id === tool)?.name ?? tool;
+
+/** A tab's mark for the AI session running in its terminal, if any. */
+function RunningHere({ session }: { session: AiSession | undefined }) {
+  if (!session) return null;
+  const label = `${harnessLabel(session.tool)} is running here`;
+  return (
+    <Tip content={label}>
+      <span className="grid place-items-center" aria-label={label}>
+        <HarnessMark kind={session.tool} size={14} />
+      </span>
+    </Tip>
+  );
+}
 
 const tabTitle = (target: string, title: string) => (title ? `${targetLabel(target)} · ${title}` : targetLabel(target));
 
@@ -140,18 +157,24 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     if (ev.type === "terminals" && visible) syncSessions();
   });
 
-  /** Which AI harness each terminal session runs, as the machines report it (terminal id → preset id). */
-  const [aiTools, setAiTools] = React.useState<Record<string, string>>({});
+  /** The AI session each terminal session runs, as the machines report it (terminal id → session). */
+  const [aiHere, setAiHere] = React.useState<Record<string, AiSession>>({});
   const loadAiTools = React.useCallback(() => {
     api
       .aiSessions()
       .then((list) => {
-        const next: Record<string, string> = {};
-        for (const s of list) if (s.terminal && PRESETS.some((p) => p.id === s.tool)) next[s.terminal] = s.tool;
-        setAiTools((cur) => (JSON.stringify(cur) === JSON.stringify(next) ? cur : next));
+        const next: Record<string, AiSession> = {};
+        for (const s of list) if (s.terminal && !next[s.terminal]) next[s.terminal] = s;
+        setAiHere((cur) => (JSON.stringify(cur) === JSON.stringify(next) ? cur : next));
       })
       .catch(() => undefined);
   }, []);
+  /** Which AI harness each terminal session runs (terminal id → preset id). */
+  const aiTools = React.useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const [term, s] of Object.entries(aiHere)) if (PRESETS.some((p) => p.id === s.tool)) out[term] = s.tool;
+    return out;
+  }, [aiHere]);
   React.useEffect(() => {
     if (visible) loadAiTools();
   }, [visible, loadAiTools]);
@@ -273,6 +296,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   // The program in the session picks the shortcuts: an AI session the machine reports running in
   // this terminal first, else the harness its titles last showed.
   const linked = activeSession ? aiTools[activeSession] : undefined;
+  const activeAi = activeSession ? aiHere[activeSession] : undefined;
   const autoPresetId = linked ?? active?.auto ?? "shell";
 
   // The keyboard's callbacks act on whichever tab is selected when a key is pressed; they stay the
@@ -454,6 +478,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
                 aria-hidden="true"
               />
               <span className="font-mono text-[9px] text-[#6d7078]">{String(i + 1).padStart(2, "0")}</span>
+              <RunningHere session={t.sessionId ? aiHere[t.sessionId] : undefined} />
               <span className="max-w-[180px] truncate">{t.title}</span>
               {t.state.kind === "exited" && <span className="font-mono text-[9px] text-[#8c8f98] uppercase">exited{t.state.code !== null ? ` ${t.state.code}` : ""}</span>}
               <button
@@ -587,6 +612,17 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
             onRenderer={setRenderer}
           />
         ))}
+
+        {activeAi && active?.state.kind === "open" && (
+          <Link
+            to={`/agents/sessions?session=${encodeURIComponent(`${activeAi.machine}:${activeAi.pid}`)}`}
+            className="absolute top-3 right-4 z-10 flex items-center gap-2 rounded-full border border-white/10 bg-[#111215]/95 py-1 pr-3 pl-1.5 font-mono text-[10px] tracking-[0.06em] text-[#a1a4ad] uppercase shadow-2xl backdrop-blur hover:text-white"
+          >
+            <HarnessMark kind={activeAi.tool} size={16} />
+            <span className="hidden sm:inline">{harnessLabel(activeAi.tool)} running here ·</span>
+            <Eye size={12} /> Watch
+          </Link>
+        )}
 
         {active && active.state.kind === "reconnecting" && (
           <div className="pointer-events-none absolute top-3 right-4 z-10 rounded-full border border-white/10 bg-[#111215]/95 px-3 py-1 font-mono text-[10px] tracking-[0.06em] text-[#a1a4ad] uppercase shadow-2xl backdrop-blur">

@@ -17,8 +17,33 @@ use serde_json::{Value, json};
 use super::core::{Baseline, Core};
 use super::model::{
     AlwaysOption, Approval, Body, Command, Decision, Delivery, ExitInfo, FileDiff, Level, ModeOption, ModelOption, QueueItem, SendMode,
-    SlashCommand, Status, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle,
+    Inventory, Known, SlashCommand, Status, StatusItem, Todo, ToolCall, ToolKind, ToolStatus, OUTPUT_MAX, clip_json, clip_middle,
 };
+
+/// What an ACP agent cannot do from kiln.
+const UNSUPPORTED: &str = "This agent's protocol (ACP) has no way to manage its MCP servers or skills from kiln.";
+
+/// The agent's own status, from what initialize says: who it is, its protocol and what it can do.
+fn status_rows(init: &Value) -> Vec<StatusItem> {
+    let mut rows = Vec::new();
+    let mut push = |group: &str, label: &str, value: String| {
+        if !value.is_empty() {
+            rows.push(StatusItem { group: group.to_owned(), label: label.to_owned(), value, tone: None });
+        }
+    };
+    let s = |p: &str| init.pointer(p).and_then(Value::as_str).unwrap_or("").to_owned();
+    let yes = |p: &str| if init.pointer(p).and_then(Value::as_bool) == Some(true) { "yes".to_owned() } else { "no".to_owned() };
+    push("Agent", "Name", if s("/agentInfo/title").is_empty() { s("/agentInfo/name") } else { s("/agentInfo/title") });
+    push("Agent", "Version", s("/agentInfo/version"));
+    push("Agent", "Protocol", init.get("protocolVersion").map(|v| format!("ACP {v}")).unwrap_or_default());
+    push("Capabilities", "Resume sessions", yes("/agentCapabilities/loadSession"));
+    push("Capabilities", "Images", yes("/agentCapabilities/promptCapabilities/image"));
+    push("Capabilities", "Audio", yes("/agentCapabilities/promptCapabilities/audio"));
+    push("Capabilities", "MCP over HTTP", yes("/agentCapabilities/mcpCapabilities/http"));
+    let auth: Vec<String> = init.get("authMethods").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get("name").or_else(|| m.get("id")).and_then(Value::as_str).map(str::to_owned)).collect();
+    push("Account", "Sign-in methods", auth.join(", "));
+    rows
+}
 
 #[derive(Debug, Clone)]
 enum Pending {
@@ -118,6 +143,9 @@ impl Acp {
     pub fn start(&mut self, core: &mut Core) {
         core.meta.features = ["send_now", "queue", "interrupt", "set_mode", "resume", "attachments"].iter().map(|s| (*s).to_owned()).collect();
         core.touch_meta();
+        // ACP has no way to report MCP servers, skills, plugins or plan limits.
+        core.state.inventory = Inventory { mcp: Known::Unsupported, skills: Known::Unsupported, plugins: Known::Unsupported, limits: Known::Unsupported };
+        core.touch_state();
         self.request(
             core,
             Pending::Initialize,
@@ -188,9 +216,32 @@ impl Acp {
             Command::Suggest { client, .. } => core.reply(client, json!({"suggestions": []})),
             // ACP has no effort setting and no other controls than modes and models.
             Command::SetEffort { .. } | Command::Control { .. } => {}
-            Command::StopTask { .. } | Command::Restart | Command::Snapshot => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::Snapshot => {}
+            // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
+            // servers when the session opens); its commands run as "/name args" messages.
+            Command::SkillRun { name, args, id, mode } => {
+                let name = name.trim().trim_start_matches('/').to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                let text = match args.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                    Some(a) => format!("/{name} {a}"),
+                    None => format!("/{name}"),
+                };
+                self.send(core, QueueItem { id: id.unwrap_or_else(crate::util::new_id), text, at: Core::now(), attachments: Vec::new(), overrides: None }, mode);
+            }
+            Command::SkillView { client, .. } | Command::McpAuth { client, .. } => core.reply(client, json!({"error": UNSUPPORTED})),
+            Command::McpAdd { client, .. } | Command::McpRemove { client, .. } => match client.filter(|c| !c.is_empty()) {
+                Some(c) => core.reply(c, json!({"ok": false, "error": UNSUPPORTED})),
+                None => self.notice(core, Level::Warn, UNSUPPORTED),
+            },
+            Command::McpEnable { .. } | Command::McpReconnect { .. } => self.notice(core, Level::Warn, UNSUPPORTED),
+            Command::McpRefresh | Command::SkillsReload => {}
         }
     }
+
+    /// Nothing runs beside an ACP agent.
+    pub fn run_done(&mut self, _core: &mut Core, _job: &str, _code: Option<i32>, _output: &str) {}
 
     fn cancel(&mut self, core: &mut Core) {
         let Some(s) = self.session.clone() else { return };
@@ -367,6 +418,8 @@ impl Acp {
                     core.meta.version = info.get("version").and_then(Value::as_str).unwrap_or("").to_owned();
                     core.touch_meta();
                 }
+                core.state.harness_status = status_rows(&result);
+                core.touch_state();
                 let cwd = core.state.cwd.clone();
                 match self.resume.clone().filter(|_| self.can_load) {
                     Some(sid) => {
@@ -695,6 +748,9 @@ fn merge(known: Option<ToolCall>, u: &Value, cwd: &str) -> ToolCall {
         exit_code: None,
         started: Core::now(),
         ended: None,
+        server: None,
+        tool_short: None,
+        skill: None,
     });
     if let Some(k) = u.get("kind").and_then(Value::as_str) {
         t.name = k.to_owned();
