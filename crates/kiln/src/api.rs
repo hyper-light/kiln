@@ -280,11 +280,12 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
                 Err(err(StatusCode::NOT_FOUND, "no such agent session"))
             }
         }
+        (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "sessions", id, "command"]) => {
             let id = (*id).to_owned();
             harness_command(&hub, &id, req).await
         }
-        (&Method::POST, ["api", "harness", "command"]) => harness_broadcast(&hub, req).await,
+        (&Method::POST, ["api", "harness", "command"]) => harness_command_many(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
         (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
@@ -1866,6 +1867,16 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     Ok(srv::json(StatusCode::OK, &infos))
 }
 
+/// One thing to many agents at once: a prompt or slash command, a command, or answers to every
+/// tool call waiting on you (see `crate::harness::broadcast`). Each agent's outcome comes back.
+async fn harness_broadcast(hub: &Arc<Hub>, req: Request) -> R {
+    let b: crate::harness::broadcast::Broadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let report = crate::harness::broadcast::run(hub, &b).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let what = b.text.as_deref().map_or_else(|| b.approvals.as_deref().map_or_else(|| "a command".to_owned(), |a| format!("{a} what waits")), |t| t.chars().take(80).collect());
+    hub.store.audit("admin".into(), "agent.broadcast".into(), format!("{} to {} agents ({} sent, {} skipped, {} failed): {what}", report.id, report.results.len(), report.sent, report.skipped, report.failed)).await;
+    Ok(srv::json(StatusCode::OK, &report))
+}
+
 async fn harness_command(hub: &Hub, id: &str, req: Request) -> R {
     let c: crate::harness::model::Command = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     match hub.harness.command(hub, id, c).await {
@@ -1896,28 +1907,19 @@ struct HarnessBroadcast {
     command: crate::harness::model::Command,
 }
 
-/// One command for several sessions (a message to a selection, interrupt all, ...). Each send
-/// gets its own message id.
-async fn harness_broadcast(hub: &Hub, req: Request) -> R {
-    use crate::harness::model::Command;
+/// `POST /api/harness/command`: one command for the sessions listed, through the same sending as
+/// `/api/harness/broadcast` (each send its own message id); `sent` lists those it reached, and the
+/// rest of the report says why the others weren't.
+async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
+    use crate::harness::broadcast::{Broadcast, To};
     let b: HarnessBroadcast = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let mut done = Vec::new();
-    for id in b.ids.iter().take(256) {
-        let c = match &b.command {
-            Command::Send { text, mode, attachments, overrides, .. } => Command::Send {
-                id: crate::util::new_id(),
-                text: text.clone(),
-                mode: *mode,
-                attachments: attachments.clone(),
-                overrides: overrides.clone(),
-            },
-            other => other.clone(),
-        };
-        if hub.harness.command(hub, id, c).await == crate::harness::registry::Sent::Ok {
-            done.push(id.clone());
-        }
-    }
-    Ok(srv::json(StatusCode::OK, &json!({ "sent": done })))
+    let command = serde_json::to_value(&b.command).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let to = To { ids: b.ids, ..To::default() };
+    let report = crate::harness::broadcast::run(hub, &Broadcast { to, text: None, mode: None, command: Some(command), approvals: None })
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let sent: Vec<&str> = report.results.iter().filter(|o| o.result == "sent").map(|o| o.id.as_str()).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "report": report })))
 }
 
 fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {

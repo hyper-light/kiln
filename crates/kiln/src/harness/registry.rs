@@ -231,6 +231,11 @@ impl Registry {
         self.kinds.lock().clone()
     }
 
+    /// A session's meta as last reported (its harness's catalog: slash commands, models, modes).
+    pub fn meta(&self, id: &str) -> Option<Value> {
+        self.mirrors.lock().get(id).map(|m| m.meta.clone())
+    }
+
     pub fn location(&self, id: &str) -> Option<Location> {
         self.mirrors.lock().get(id).map(|m| m.location.clone())
     }

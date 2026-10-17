@@ -22,7 +22,8 @@ browsers watching it.
 | POST | `/api/harness/sessions` | `{target: "local" \| "agent:<name>", spec: Spec, count?}` → `Info[]` |
 | GET / DELETE | `/api/harness/sessions/:id` | one session / close it for good |
 | POST | `/api/harness/sessions/:id/command` | a `Command` → 204 |
-| POST | `/api/harness/command` | `{ids, command}`: one command for several sessions |
+| POST | `/api/harness/broadcast` | one thing to many agents on every machine: a prompt or slash command, a command, or answers to what waits on you; see below |
+| POST | `/api/harness/command` | `{ids, command}`: one command for the sessions listed → `{sent, report}` (the same sending as `/broadcast`) |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
 | GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
 | WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
@@ -69,6 +70,37 @@ found: it may have ended), 409 (`stop` without `{"stop": true}`, `outside`, `upg
 that continues a copy of the conversation (Claude Code's `--fork-session`, Codex's
 `thread/fork`), named `<name> (branch)`, leaving the found session running as it is. Errors: 404,
 409 (no conversation yet, or a runner too old to branch), 400 (a harness that can't branch).
+
+### Messaging many agents at once
+
+`POST /api/harness/broadcast` sends one thing to the agents picked, on every machine at once:
+
+```json
+{
+  "to": { "all": true },
+  "text": "/compact keep the test plan",
+  "mode": "queue"
+}
+```
+
+- `to`: `ids` (exactly those, ended or not), or `all`, or filters that must all match:
+  `machines` (names; `local` or `server` for the server's own), `kinds` (`claude`, `codex`, ...)
+  and `status` (`starting`, `idle`, `running`, `waiting`, `exited`). Without `status`, agents that
+  have ended are left out. With none of these, nothing is picked.
+- What to send, exactly one of:
+  - `text`: a prompt, or `/name args`, read in each agent's own catalog as its console would: a
+    prompt route sends its words, a control sends its command, a panel (`/model`) or a command the
+    harness can't run from kiln is skipped, saying why; a name not in its catalog goes as typed
+    (its harness may know it, as a skill). `mode` for a prompt: `queue` (after the current turn,
+    the default), `steer` (into it) or `now` (stopping it).
+  - `command`: a command as the console sends one (`{"type": "interrupt"}`,
+    `{"type": "set_mode", "mode": "plan"}`, `{"type": "restart"}`, ...). A `send` gets its own
+    message id per agent.
+  - `approvals`: `"allow"` or `"deny"`: answers every tool call waiting on you on each agent
+    (questions are left: they need answers).
+
+→ `{id, sent, skipped, failed, results: [{id, name, machine, kind, result, reason?}]}`, `result`
+being `sent`, `skipped` or `failed`. Each broadcast is in the audit log.
 
 ### Signing harnesses in and out
 
