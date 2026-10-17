@@ -18,7 +18,7 @@ import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, 
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession } from "./accounts.ts";
-import { handleLongSession } from "./conversation.ts";
+import { handleLongSession, setLongEmit } from "./conversation.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -456,6 +456,7 @@ function emit(ev: ServerEvent) {
   const msg = JSON.stringify(ev);
   for (const ws of eventClients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
+setLongEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;

@@ -696,6 +696,9 @@ export interface Snapshot {
   ready: boolean;
 }
 
+/** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
+const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
+
 const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /** A snapshot that doesn't end with the server's "synced" (a machine sending its sessions again) is complete once its frames pause this long… */
@@ -705,7 +708,7 @@ const QUIET_FIRST_MS = 1500;
 /** What's shown is never held longer than this while a snapshot comes. */
 const HOLD_MS = 5000;
 /** A session the server doesn't know (yet) is tried this many times before it's taken as ended… */
-const UNKNOWN_TRIES = 4;
+const UNKNOWN_TRIES = 6;
 /** …or, when it was here before (the server restarted and its machine isn't back yet), for this long. */
 const UNKNOWN_KNOWN_MS = 60_000;
 /** An ended session is looked for again this often, in case it was only away. */
@@ -830,9 +833,12 @@ export class SessionStore {
 
   get = () => this.snap;
 
-  /** Resolves once the first snapshot is in (what Suspense waits on); connects if nothing has yet. */
+  /**
+   * Resolves once the first snapshot is in (what Suspense waits on); connects if nothing has yet.
+   * The same promise while it waits, and one already settled after (React reads it at once).
+   */
   ready(): Promise<void> {
-    if (this.snap.ready) return Promise.resolve();
+    if (this.snap.ready) return READY;
     this.want();
     // Nothing shows it yet: it closes again unless something does soon.
     if (this.listeners.size === 0) this.leave();
@@ -1256,8 +1262,9 @@ export function useSession<T>(store: SessionStore, pick: (s: Snapshot) => T): T 
 
 /** Waits (Suspense) until the session's first snapshot is in. */
 export function useSessionReady(store: SessionStore) {
-  const ready = useSession(store, (s) => s.ready);
-  if (!ready) React.use(store.ready());
+  // Read on every render (settled once it's in), as React expects of what a render suspended on.
+  useSession(store, (s) => s.ready);
+  React.use(store.ready());
 }
 
 /* ------------------------------------------------------------------ accounts */

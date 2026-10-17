@@ -255,8 +255,18 @@ async function readFound(signal: AbortSignal): Promise<AiSession[]> {
   for (const [k, v] of kept) if (!here.has(k) && ++v.missed >= 2) kept.delete(k);
   return [...kept.values()].map((v) => v.s).sort(byStart);
 }
-/** The found sessions and the machines that can't say what runs on them, read together. */
-const readAll = (signal: AbortSignal) => Promise.all([readFound(signal), api.aiSilent(signal).then((r) => r.machines)]);
+/**
+ * The found sessions and the machines that can't say what runs on them, read together. A read that
+ * fails leaves what was found (a server without these says nothing here).
+ */
+const readAll = (signal: AbortSignal) =>
+  Promise.all([
+    readFound(signal).catch(() => [...kept.values()].map((v) => v.s).sort(byStart)),
+    api.aiSilent(signal).then(
+      (r) => r.machines,
+      (): string[] => [],
+    ),
+  ]);
 const FOUND = { on: ["ai_sessions"], pollMs: 20_000 } as const;
 
 /**

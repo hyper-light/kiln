@@ -8,6 +8,9 @@
  *
  *   MOCK_NO_SYNCED=1   its socket doesn't end the snapshot with {"t":"synced"} (servers before it)
  *   MOCK_SLOW_SNAPSHOT=ms   frames of the snapshot are sent this far apart (a slow link)
+ *   MOCK_LATE_SESSION=ms   for this long after the mock starts, it doesn't know the session (as a
+ *                          restarted server before the session's machine reconnects): its socket
+ *                          says {"t":"closed"}; then the session is announced on /api/events
  */
 import type { WebSocket } from "ws";
 import type { AgentInfo, HEvent, Meta, State } from "../src/api/harness.ts";
@@ -200,8 +203,24 @@ function tick() {
   timer = setTimeout(tick, 140);
 }
 
+/** The server's event stream (set by the mock's server). */
+let emit: (ev: { type: "harness"; info: AgentInfo }) => void = () => {};
+export function setLongEmit(fn: typeof emit) {
+  emit = fn;
+}
+
+const late = Number(process.env.MOCK_LATE_SESSION ?? 0);
+const knownAt = Date.now() + late;
+if (late > 0) setTimeout(() => emit({ type: "harness", info: longInfo() }), late);
+
 export function handleLongSession(ws: WebSocket, id: string): boolean {
   if (id !== ID) return false;
+  if (Date.now() < knownAt) {
+    // Not known here yet (its machine hasn't reconnected): what the server says, then it hangs up.
+    send(ws, { t: "closed" });
+    ws.close();
+    return true;
+  }
   const slow = Number(process.env.MOCK_SLOW_SNAPSHOT ?? 0);
   const frames: unknown[] = [{ t: "open", info }, { t: "meta", meta }, { t: "state", state: state() }];
   // Events in batches, as the server cuts them (by size); the last frame says it's complete.
