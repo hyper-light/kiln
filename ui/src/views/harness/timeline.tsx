@@ -108,6 +108,8 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
     () => setOpen(true),
   );
   const failed = c.status === "error" || (c.exit_code !== undefined && c.exit_code !== 0);
+  // Nothing to show while it runs without output yet: the dot and the clock say it's running.
+  const out = c.output ? c.output : c.status === "running" ? null : "(no output)";
   return (
     <div className="hx-cmd" data-failed={failed || undefined} data-ev={c.id}>
       <button type="button" className="hx-cmd-head" aria-expanded={open} onClick={() => setOpen(!open)}>
@@ -119,7 +121,7 @@ function CommandRow({ c, open: initial }: { c: ToolEvent; open?: boolean }) {
         </span>
       </button>
       {c.detail && <div className="hx-cmd-why">{c.detail}</div>}
-      {open && <Output text={c.output ?? (c.status === "running" ? "" : "(no output)")} truncated={c.truncated} error={failed} />}
+      {open && out !== null && <Output text={out} truncated={c.truncated} error={failed} />}
     </div>
   );
 }
