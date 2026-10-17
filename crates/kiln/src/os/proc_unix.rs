@@ -102,7 +102,11 @@ pub async fn wait_pid_exit<S>(pid: u32, mut try_wait: impl FnMut() -> io::Result
             return Ok(status);
         }
         match &pidfd {
-            Some(fd) => ready(fd, false).await,
+            // At least once a second whatever the readiness says: a wake-up missed must cost a
+            // second, not leave the exited child unreaped (a zombie) for good.
+            Some(fd) => {
+                let _ = crate::rt::timeout(Duration::from_secs(1), ready(fd, false)).await;
+            }
             None => crate::rt::sleep(Duration::from_millis(50)).await,
         }
     }
@@ -227,6 +231,23 @@ pub async fn terminate_group(running: &mut Running, grace: Duration) {
     let group = Pid::from_raw(running.pgid);
     let _ = killpg(group, Signal::SIGTERM);
     if crate::rt::timeout(grace, running.wait()).await.is_err() {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+}
+
+/// GitHub's cancel (docs/ci.md W05-R18): SIGINT to the group, SIGTERM after `int_grace`, SIGKILL
+/// after `term_grace` more.
+pub async fn interrupt_group(running: &mut Running, int_grace: Duration, term_grace: Duration) {
+    if running.pgid <= 0 {
+        return;
+    }
+    let group = Pid::from_raw(running.pgid);
+    let _ = killpg(group, Signal::SIGINT);
+    if crate::rt::timeout(int_grace, running.wait()).await.is_ok() {
+        return;
+    }
+    let _ = killpg(group, Signal::SIGTERM);
+    if crate::rt::timeout(term_grace, running.wait()).await.is_err() {
         let _ = killpg(group, Signal::SIGKILL);
     }
 }

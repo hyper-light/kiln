@@ -24,6 +24,15 @@ fn id_of(v: &Value) -> Result<String, Fail> {
     v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned).ok_or_else(|| (StatusCode::BAD_REQUEST, "`id` is required".into()))
 }
 
+/// A step's criteria, for agents: each in words, or a measure against a threshold.
+fn criteria_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Criteria: {kind: \"qualitative\", text} in words, or {kind: \"quantitative\", target (what's measured, e.g. \"p99.9 latency\"), op (lt, le, eq, ne, ge, gt, between, within, rises_at_least, falls_at_least, rises_at_most, falls_at_most), value (a number; for rises/falls a percentage), value2 (between: the upper bound; within: the tolerance), unit (\"ms\", \"%\"), baseline (rises/falls: compared with what), measured (how it's measured)}.",
+        "items": {"type": "object", "properties": {"kind": {"type": "string", "enum": ["qualitative", "quantitative"]}}, "required": ["kind"]}
+    })
+}
+
 fn schema(props: Value, required: &[&str]) -> Value {
     json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
@@ -110,7 +119,7 @@ pub fn list_ops() -> Vec<Op> {
                     json!({
                         "title": {"type": "string", "description": "Short; taken from the first heading when left out."},
                         "body": {"type": "string", "description": "The plan's text, in markdown (optional with items)."},
-                        "items": {"type": "array", "description": "The plan's steps: each its title, what to do, examples, when it's done (acceptance) and how it's tested.", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "examples": {"type": "string"}, "acceptance": {"type": "string"}, "testing": {"type": "string"}}, "required": ["title"]}},
+                        "items": {"type": "array", "description": "The plan's steps: each its title, what to do, examples, its acceptance criteria and its tests.", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "examples": {"type": "string"}, "acceptance": criteria_schema(), "testing": {"type": "array", "description": "Tests: each a scenario and the criteria it passes by.", "items": {"type": "object", "properties": {"scenario": {"type": "string"}, "criteria": criteria_schema()}}}}, "required": ["title"]}},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "source": {"type": "object", "description": "Where it came from: {session, harness, machine, cwd, agent}."}
                     }),
@@ -124,7 +133,7 @@ pub fn list_ops() -> Vec<Op> {
             summary: "Change a plan's title, text or tags; a new title or text is a new version.",
             read_only: false,
             destructive: false,
-            input: || schema(json!({"id": {"type": "string", "description": ID}, "title": {"type": "string"}, "body": {"type": "string"}, "items": {"type": "array", "description": "The plan's steps: each its title, what to do, examples, when it's done (acceptance) and how it's tested.", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "examples": {"type": "string"}, "acceptance": {"type": "string"}, "testing": {"type": "string"}}, "required": ["title"]}}, "tags": {"type": "array", "items": {"type": "string"}}}), &["id"]),
+            input: || schema(json!({"id": {"type": "string", "description": ID}, "title": {"type": "string"}, "body": {"type": "string"}, "items": {"type": "array", "description": "The plan's steps: each its title, what to do, examples, its acceptance criteria and its tests.", "items": {"type": "object", "properties": {"title": {"type": "string"}, "description": {"type": "string"}, "examples": {"type": "string"}, "acceptance": criteria_schema(), "testing": {"type": "array", "description": "Tests: each a scenario and the criteria it passes by.", "items": {"type": "object", "properties": {"scenario": {"type": "string"}, "criteria": criteria_schema()}}}}, "required": ["title"]}}, "tags": {"type": "array", "items": {"type": "string"}}}), &["id"]),
             run: |cx, v| Box::pin(update(cx, v)),
         },
         Op {

@@ -308,3 +308,27 @@ export function plain(md: string): string {
     .replace(/\s+/g, " ")
     .trim();
 }
+
+type Labelled = { name: string; kind_name: string; title?: string; goal?: string };
+
+/** Whether a person (or a launch) gave the agent a name of its own, not just its harness's. */
+export function hasOwnName(a: Pick<Labelled, "name" | "kind_name">): boolean {
+  const n = a.name.trim();
+  return n !== "" && n.toLowerCase() !== a.kind_name.trim().toLowerCase();
+}
+
+/**
+ * What an agent is called: the name it was given; else its conversation's own title; else the
+ * first line of what it was first asked; else its harness ("Claude Code"). Agents nobody named
+ * still read apart.
+ */
+export function agentLabel(a: Labelled): string {
+  if (hasOwnName(a)) return a.name.trim();
+  const title = a.title?.trim();
+  if (title) return title;
+  const first = (a.goal ?? "")
+    .split("\n")
+    .map((l) => l.trim())
+    .find(Boolean);
+  return first || a.name || a.kind_name;
+}

@@ -7,9 +7,18 @@ any harness kiln runs (Claude Code, Codex, Gemini CLI, opencode, Goose, Amp, ...
 ## Keeping one
 
 - **In an agent's Plan tab**, under **Your plans**: **New plan**, then its steps one at a time,
-  each with its own **description**, **examples**, **acceptance criteria** (when it's done) and
-  **testing** (examples, scenarios, criteria); an optional overview for what every step should
-  know. Save it, change it (**Edit**), and run it on that agent, without leaving it.
+  each with its own **description**, **examples**, **acceptance criteria** and **tests**; an
+  optional overview for what every step should know. Save it, change it (**Edit**), and run it on
+  that agent, without leaving it.
+
+  A step's **acceptance criteria** are as many as it needs, each **in words** or **a measure**: a
+  target ("p99.9 latency"), how it compares (is at most, less than, at least, more than, exactly,
+  not, between two values, within a tolerance of one; or rises or falls by at least, or by no more
+  than, a percentage compared with a baseline you name), the threshold and its unit, and,
+  optionally, what it's measured by. A measure reads as one sentence, shown under it as you write
+  it and sent to the agent as written: "p99.9 latency is at most 200 ms, measured by the soak
+  test". Its **tests** are as many as it needs too: each a scenario and the criteria it passes by
+  (in words or measures, the same way).
 - **Agents → Plans → New plan**: the same, with tags, and the plan's text in markdown as well.
 - **Save plan** under a plan an agent proposes: a plan-mode plan waiting for approval, the plan an
   agent laid out, or its todo list. The plan keeps where it came from (agent, harness, machine,
@@ -57,7 +66,7 @@ the plan**, for keeping it in another kiln.
 
 ## API
 
-A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing}]` (up to 100, each part up to 16 KiB); `steps` is what runs, one string a step.
+A plan's written steps are `items` in the API: `[{title, description, examples, acceptance, testing}]` (up to 100). `acceptance` is a list of criteria: `{kind: "qualitative", text}` or `{kind: "quantitative", target, op, value, value2?, unit?, baseline?, measured?}`, `op` one of `lt`, `le`, `eq`, `ne`, `ge`, `gt`, `between` (`value2` the upper bound), `within` (`value2` the tolerance), `rises_at_least`, `falls_at_least`, `rises_at_most`, `falls_at_most` (`value` a percentage against `baseline`). `testing` is a list of `{scenario, criteria}`. A threshold is a number. `steps` is what runs, one string a step, the criteria and tests as sentences.
 
 
 | Method | Path | |

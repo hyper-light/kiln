@@ -243,7 +243,7 @@ impl Evaluator<'_> {
             }
             Func::Success => {
                 let s = self.cx.status();
-                Value::Bool(!s.failed && !s.cancelled)
+                Value::Bool(!s.failed && !s.cancelled && !s.skipped)
             }
             Func::Always => Value::Bool(true),
             Func::Cancelled => Value::Bool(self.cx.status().cancelled),

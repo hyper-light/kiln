@@ -493,3 +493,96 @@ a.plan-row-main:hover {
 .plan-items-label {
   margin-top: 14px;
 }
+
+/* A step's criteria and tests (criteria.tsx): each a quiet card; a measure's fields on one line that
+   wraps; under each, the sentence the agent reads. */
+.cr-wrap {
+  display: grid;
+  gap: 8px;
+}
+.cr-list,
+.ts-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.cr,
+.ts {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #23272e;
+  border-radius: 8px;
+  background: #0a0c0f;
+}
+.ts {
+  background: #0c0e12;
+}
+.cr-top,
+.ts-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ts-top .field-label {
+  margin: 0;
+}
+.cr-kind {
+  min-width: 140px;
+}
+.cr-measure {
+  display: grid;
+  gap: 8px;
+}
+.cr-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+.cr-label {
+  margin-bottom: 5px;
+}
+.cr-op {
+  flex: 1 1 190px;
+  min-width: 0;
+}
+.cr-num {
+  flex: 0 1 110px;
+  min-width: 80px;
+}
+.cr-unit {
+  flex: 0 1 100px;
+  min-width: 80px;
+}
+.cr-base {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+.cr-word {
+  padding-bottom: 12px;
+  color: #8d9099;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.cr-reads {
+  margin: 0;
+  color: #9fb3c8;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.cr .cr-reads:empty {
+  display: none;
+}
+.cr-adds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.ts-pass {
+  margin: 2px 0 -2px;
+}

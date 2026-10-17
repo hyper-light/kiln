@@ -347,6 +347,23 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
   const p = url.pathname;
   const m = req.method ?? "GET";
 
+  // An agent's command: only renaming does anything here (the "rename" control).
+  const cm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/command$/);
+  if (cm && m === "POST") {
+    const d = demos.get(decodeURIComponent(cm[1] ?? ""));
+    if (!d) {
+      json(res, 404, { error: "no such agent" });
+      return true;
+    }
+    const c = await body<{ type?: string; id?: string; value?: unknown }>(req);
+    if (c.type === "control" && c.id === "rename") {
+      const n = typeof c.value === "string" ? c.value.trim() : "";
+      d.info.name = n || d.info.kind_name;
+    }
+    json(res, 200, {});
+    return true;
+  }
+
   if (p === "/api/harness/sessions" && m === "GET") {
     json(
       res,

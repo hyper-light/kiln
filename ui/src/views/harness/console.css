@@ -1250,3 +1250,32 @@
   padding: 8px 0 2px;
   list-style: none;
 }
+
+/* The agent's name: tap it to rename it, in place. */
+.ag-title-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: text;
+}
+.ag-title-btn:hover:not(:disabled) {
+  text-decoration: underline dotted #6b6e78;
+  text-underline-offset: 5px;
+}
+.name-field.ag-title-field {
+  margin-left: -9px;
+  font-size: 22px;
+  font-weight: 450;
+  line-height: 1.25;
+  letter-spacing: -0.025em;
+}
+@media (max-width: 640px) {
+  .name-field.ag-title-field {
+    font-size: 18px;
+  }
+}

@@ -343,6 +343,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "machines", target, "dirs"]) => machine_dirs(&hub, target, &q).await,
         (&Method::GET, ["api", "terminal", "sessions"]) => Ok(srv::json(StatusCode::OK, &hub.terminals.visible())),
         (&Method::POST, ["api", "terminal", "sessions"]) => create_terminal(&hub, req).await,
+        (&Method::PUT, ["api", "terminal", "sessions", id, "name"]) => rename_terminal(&hub, id, req).await,
         (&Method::DELETE, ["api", "terminal", "sessions", id]) => {
             if let Some(s) = hub.terminals.get(id) {
                 s.close();
@@ -2073,6 +2074,23 @@ struct NewTerminal {
 
 /// Start a terminal session without attaching to it (an AI agent launched from the Agents page);
 /// any device then attaches by its id.
+#[derive(serde::Deserialize)]
+struct TerminalName {
+    #[serde(default)]
+    name: String,
+}
+
+/// Names a terminal session (`{"name": ""}` takes its name away).
+async fn rename_terminal(hub: &Arc<Hub>, id: &str, req: Request) -> R {
+    let t: TerminalName = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let (h, sid) = (Arc::clone(hub), id.to_owned());
+    if !crate::rt::blocking(move || h.terminals.rename(&sid, &t.name)).await.unwrap_or(false) {
+        return Err(err(StatusCode::NOT_FOUND, "no such terminal session"));
+    }
+    hub.emit_terminals();
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 async fn create_terminal(hub: &Arc<Hub>, req: Request) -> R {
     if !hub.cfg.terminal.enabled {
         return Err(err(StatusCode::FORBIDDEN, "terminal disabled in config"));
