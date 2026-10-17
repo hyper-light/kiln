@@ -523,13 +523,17 @@ new bits in `AgentMsg::Build.caps`:
 
 | Bit | Name | Means the runner |
 | --- | --- | --- |
-| 16 | `CAP_CI2` | takes `AssignV2`, sends `JobEvent`, implements W06 |
-| 32 | `CAP_ACTIONS` | runs `uses:` actions (W07) |
-| 64 | `CAP_DOCKER` | has a working Docker or Podman (job containers, services, Docker actions) |
-| 128 | `CAP_FIRECRACKER` | can boot Firecracker microVMs (KVM, firecracker, jailer present) |
-| 256 | `CAP_SHARDS` | can run shards microVMs (`shards version` works) |
-| 512 | `CAP_FACTS` | sends `Facts` (W13) |
-| 1024 | `CAP_JOB_TTY` | can open a terminal into a running or kept leg (W17) |
+| `1 << 10` | `CAP_CI2` | takes `AssignV2`, sends `JobEvent`, implements W06 |
+| `1 << 11` | `CAP_ACTIONS` | runs `uses:` actions (W07) |
+| `1 << 12` | `CAP_DOCKER` | has a working Docker or Podman (job containers, services, Docker actions) |
+| `1 << 13` | `CAP_FIRECRACKER` | can boot Firecracker microVMs (KVM, firecracker, jailer present) |
+| `1 << 14` | `CAP_SHARDS` | can run shards microVMs (`shards version` works) |
+| `1 << 15` | `CAP_FACTS` | sends `Facts` (W13) |
+| `1 << 16` | `CAP_JOB_TTY` | can open a terminal into a running or kept leg (W17) |
+
+Bits below `1 << 10` belong to the rest of kiln (1, 2, 4, 8, 16 and 64 are taken on `main` as of
+2026-10-17); CI's bits start at `1 << 10` so the two never collide. The variants below are on
+`main` (`proto.rs`): `ServerMsg` 23–27 and `AgentMsg` 27–28 on the wire.
 
 Appended variants (after every existing one, in this order):
 
