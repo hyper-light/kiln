@@ -1,7 +1,7 @@
 //! Repo sync (`docs/sync.md`): one repository kept on several machines. This is the engine one
-//! copy runs: noticing what changed here (a step to propose), and applying committed steps in log
+//! copy runs: noticing what changed here (steps to propose), and applying committed steps in log
 //! order under the rule that makes every copy converge on the same files without losing a change.
-//! Ordering the steps (the repo's Raft group) and moving blobs between machines are elsewhere.
+//! The repo's Raft group orders the steps ([`group`]).
 //!
 //! The rule: every copy applies the same steps in the same order. A change made from the version
 //! the log has is applied; one made from an older version (another machine's change committed
@@ -10,6 +10,7 @@
 //! proposed yet: that change is proposed from the version it was made from, and meets the rule.
 
 pub mod blobs;
+pub mod group;
 pub mod scan;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,20 +40,97 @@ pub struct Change {
     pub base: Option<Version>,
 }
 
+/// Changes in one step at the most: a look that finds more proposes several, each small enough for
+/// one log entry and one message.
+pub const STEP_CHANGES: usize = 512;
+
 /// One entry of a repo's log: the changes one machine saw together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
+    /// The machine, as conflict copies are named.
     pub by: String,
+    /// The member of the repo's group that proposed it, and its number there: a member's steps are
+    /// taken in order, each once.
+    #[serde(default)]
+    pub member: u64,
+    #[serde(default)]
+    pub seq: u64,
     /// Unix milliseconds.
     pub at: i64,
     pub changes: Vec<Change>,
 }
 
+/// The repo as the log makes it, alike on every member: each path's version, and the last step
+/// taken from each member.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tree {
+    pub files: BTreeMap<String, Version>,
+    #[serde(default)]
+    pub seqs: BTreeMap<u64, u64>,
+}
+
+/// What a committed change did to the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// The path holds the change's version now.
+    Take,
+    /// The tree held that version already.
+    Same,
+    /// A conflict: the tree keeps what it holds, and the change's version is beside it under this
+    /// name (none: a delete, dropped).
+    Beside(Option<String>),
+    /// Not a path kiln writes: dropped.
+    Refuse,
+}
+
+impl Tree {
+    /// Takes a committed step: what it decided for each change, or none when the step was taken
+    /// before (a member's step proposed twice). A step numbered 0 is taken whatever came before.
+    pub fn take(&mut self, step: &Step) -> Option<Vec<Decision>> {
+        if step.seq != 0 {
+            let last = self.seqs.entry(step.member).or_default();
+            if step.seq <= *last {
+                return None;
+            }
+            *last = step.seq;
+        }
+        let decide = |files: &mut BTreeMap<String, Version>, c: &Change| {
+            if !safe_path(&c.path) {
+                return Decision::Refuse;
+            }
+            let now = files.get(&c.path);
+            if c.base.as_ref() == now {
+                set(files, &c.path, c.to.clone());
+                return Decision::Take;
+            }
+            if c.to.as_ref() == now {
+                return Decision::Same;
+            }
+            let name = c.to.as_ref().map(|_| conflict_name(&c.path, &step.by, step.at)).filter(|n| safe_path(n));
+            if let (Some(name), Some(v)) = (&name, &c.to) {
+                files.insert(name.clone(), v.clone());
+            }
+            Decision::Beside(name)
+        };
+        Some(step.changes.iter().map(|c| decide(&mut self.files, c)).collect())
+    }
+
+    /// The step that turns this tree into `to`, each change made from what this tree holds.
+    pub fn diff(&self, to: &BTreeMap<String, Version>) -> Vec<Change> {
+        let paths: BTreeSet<&String> = self.files.keys().chain(to.keys()).collect();
+        paths
+            .into_iter()
+            .filter(|p| self.files.get(*p) != to.get(*p))
+            .map(|p| Change { path: p.clone(), to: to.get(p).cloned(), base: self.files.get(p).cloned() })
+            .collect()
+    }
+}
+
 /// A copy's state, kept between runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
-    /// The repo as the log has made it so far: each path's version.
-    pub log: BTreeMap<String, Version>,
+    /// The repo as the log has made it so far.
+    pub tree: Tree,
     /// What this copy's files held when they were last in step with the log: a file that differs
     /// was changed here.
     pub synced: BTreeMap<String, Version>,
@@ -60,6 +138,9 @@ pub struct State {
     pub pending: BTreeMap<String, Option<Version>>,
     /// The last scan, so unchanged files aren't read again.
     pub seen: BTreeMap<String, Entry>,
+    /// Steps proposed here that the log hasn't brought back, oldest first: sent again until it does.
+    #[serde(default)]
+    pub sent: Vec<Step>,
 }
 
 /// What applying a change did here.
@@ -80,6 +161,8 @@ pub struct Copy {
     pub root: PathBuf,
     /// This machine, as steps name it.
     pub me: String,
+    /// This copy's member of the repo's group.
+    pub member: u64,
     pub limits: Limits,
     pub state: State,
 }
@@ -126,8 +209,8 @@ fn set(map: &mut BTreeMap<String, Version>, path: &str, v: Option<Version>) {
 }
 
 impl Copy {
-    pub fn new(root: &Path, me: &str, limits: Limits, state: State) -> Self {
-        Self { root: root.to_owned(), me: me.to_owned(), limits, state }
+    pub fn new(root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
+        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state }
     }
 
     /// What this copy's file at `path` holds now (none: no file).
@@ -165,8 +248,9 @@ impl Copy {
     }
 
     /// What changed here since the log last brought this copy in step (or since it last proposed):
-    /// a step for the log, with the new contents put in `blobs`. None: nothing changed.
-    pub fn propose(&mut self, blobs: &Blobs, at: i64) -> io::Result<Option<Step>> {
+    /// steps for the log, numbered on from the last this member sent, each of at most
+    /// [`STEP_CHANGES`] changes, with the new contents put in `blobs`. Empty: nothing changed.
+    pub fn propose(&mut self, blobs: &Blobs, at: i64) -> io::Result<Vec<Step>> {
         let (found, _skipped) = scan::scan(&self.root, &self.state.seen, &self.limits)?;
         let mut paths: BTreeSet<String> = found.keys().cloned().collect();
         paths.extend(self.state.synced.keys().cloned());
@@ -195,13 +279,24 @@ impl Copy {
             changes.push(Change { path, to: here, base: expected });
         }
         self.state.seen = found;
-        if changes.is_empty() {
-            return Ok(None);
-        }
         for c in &changes {
             self.state.pending.insert(c.path.clone(), c.to.clone());
         }
-        Ok(Some(Step { by: self.me.clone(), at, changes }))
+        let mut steps = Vec::new();
+        let mut rest = changes.into_iter().peekable();
+        while rest.peek().is_some() {
+            let step = Step { by: self.me.clone(), member: self.member, seq: self.next_seq(), at, changes: rest.by_ref().take(STEP_CHANGES).collect() };
+            self.state.sent.push(step.clone());
+            steps.push(step);
+        }
+        Ok(steps)
+    }
+
+    /// The number of this member's next step: one past what it sent, or past what the log took
+    /// from it (a copy whose state was started again).
+    fn next_seq(&self) -> u64 {
+        let taken = self.state.tree.seqs.get(&self.member).copied().unwrap_or(0);
+        self.state.sent.last().map_or(taken, |s| s.seq.max(taken)).saturating_add(1)
     }
 
     /// The blobs applying `step` here needs: its new contents, and the log's version of any change
@@ -212,8 +307,8 @@ impl Copy {
             if let Some(Version::File { hash, .. }) = &c.to {
                 out.push(hash.clone());
             }
-            let log_now = self.state.log.get(&c.path);
-            if step.by == self.me
+            let log_now = self.state.tree.files.get(&c.path);
+            if self.ours(step)
                 && c.base.as_ref() != log_now
                 && let Some(Version::File { hash, .. }) = log_now
             {
@@ -225,59 +320,80 @@ impl Copy {
         out
     }
 
-    /// Applies a committed step, in log order (`needs` says which blobs it reads).
+    /// Whether this copy proposed `step`.
+    fn ours(&self, step: &Step) -> bool {
+        step.member != 0 && step.member == self.member
+    }
+
+    /// Applies a committed step, in log order (`needs` says which blobs it reads). A step taken
+    /// before changes nothing.
     pub fn apply(&mut self, step: &Step, blobs: &Blobs) -> io::Result<Vec<Outcome>> {
-        let ours = step.by == self.me;
+        let ours = self.ours(step);
+        if ours {
+            // The log has it: it isn't sent again.
+            self.state.sent.retain(|s| s.seq > step.seq);
+        }
+        let before: Vec<Option<Version>> = step.changes.iter().map(|c| self.state.tree.files.get(&c.path).cloned()).collect();
+        let Some(decisions) = self.state.tree.take(step) else { return Ok(Vec::new()) };
         let mut out = Vec::new();
-        for c in &step.changes {
-            if !safe_path(&c.path) || !self.parents_real(&c.path) {
-                out.push(Outcome::Refused { path: c.path.clone(), why: "not a path kiln writes".to_owned() });
-                continue;
-            }
-            let log_now = self.state.log.get(&c.path).cloned();
-            let latest_ours = ours && self.state.pending.get(&c.path) == Some(&c.to);
-            if latest_ours {
+        for ((c, log_now), decision) in step.changes.iter().zip(before).zip(decisions) {
+            if ours && self.state.pending.get(&c.path) == Some(&c.to) {
                 self.state.pending.remove(&c.path);
             }
-            if c.base == log_now {
-                set(&mut self.state.log, &c.path, c.to.clone());
-                if ours {
-                    // This copy made it: its file holds it, or has moved on from it.
-                    set(&mut self.state.synced, &c.path, c.to.clone());
-                    out.push(Outcome::Applied { path: c.path.clone() });
-                } else if self.state.pending.contains_key(&c.path) || self.now(&c.path)? != self.state.synced.get(&c.path).cloned() {
-                    // Changed here: its proposal (made or to come) meets this version in the log.
-                    out.push(Outcome::Kept { path: c.path.clone() });
-                } else {
-                    self.write(&c.path, c.to.as_ref(), blobs)?;
+            match decision {
+                Decision::Refuse => out.push(Outcome::Refused { path: c.path.clone(), why: "not a path kiln writes".to_owned() }),
+                // This copy made it: its file holds it, or has moved on from it.
+                Decision::Take | Decision::Same if ours => {
                     set(&mut self.state.synced, &c.path, c.to.clone());
                     out.push(Outcome::Applied { path: c.path.clone() });
                 }
-                continue;
-            }
-            // A conflict: the log keeps what it has; the step's version goes beside it, on every copy.
-            let copy = c.to.as_ref().map(|_| conflict_name(&c.path, &step.by, step.at));
-            if let (Some(name), Some(v)) = (&copy, &c.to) {
-                set(&mut self.state.log, name, Some(v.clone()));
-                if safe_path(name) && self.parents_real(name) {
-                    self.write(name, Some(v), blobs)?;
-                    set(&mut self.state.synced, name, Some(v.clone()));
+                Decision::Take | Decision::Same => out.push(self.bring(&c.path, c.to.as_ref(), blobs)?),
+                // A conflict: the log keeps what it has; the step's version goes beside it, on every copy.
+                Decision::Beside(copy) => {
+                    if let (Some(name), Some(v)) = (&copy, &c.to)
+                        && self.parents_real(name)
+                    {
+                        self.write(name, Some(v), blobs)?;
+                        set(&mut self.state.synced, name, Some(v.clone()));
+                    }
+                    if ours {
+                        if self.now(&c.path)? == c.to {
+                            // Ours, unchanged since: it is beside the name now, and the name takes the log's.
+                            if self.parents_real(&c.path) {
+                                self.write(&c.path, log_now.as_ref(), blobs)?;
+                            }
+                            set(&mut self.state.synced, &c.path, log_now);
+                        } else {
+                            // Changed again since: kept, and proposed as a change of what lost, so it can't
+                            // silently undo what won.
+                            set(&mut self.state.synced, &c.path, c.to.clone());
+                        }
+                    }
+                    out.push(Outcome::Conflict { path: c.path.clone(), copy });
                 }
             }
-            if ours {
-                if self.now(&c.path)? == c.to {
-                    // Ours, unchanged since: it is beside the name now, and the name takes the log's.
-                    self.write(&c.path, log_now.as_ref(), blobs)?;
-                    set(&mut self.state.synced, &c.path, log_now);
-                } else {
-                    // Changed again since: kept, and proposed as a change of what lost, so it can't
-                    // silently undo what won.
-                    set(&mut self.state.synced, &c.path, c.to.clone());
-                }
-            }
-            out.push(Outcome::Conflict { path: c.path.clone(), copy });
         }
         Ok(out)
+    }
+
+    /// Brings another member's version of `path` here, unless the file changed here (its own
+    /// proposal, made or to come, meets that version in the log).
+    fn bring(&mut self, path: &str, to: Option<&Version>, blobs: &Blobs) -> io::Result<Outcome> {
+        if !self.parents_real(path) {
+            return Ok(Outcome::Refused { path: path.to_owned(), why: "a folder on its way is a link".to_owned() });
+        }
+        let here = self.now(path)?;
+        if here.as_ref() == to {
+            // Here already (the same file on both machines).
+            set(&mut self.state.synced, path, to.cloned());
+            return Ok(Outcome::Applied { path: path.to_owned() });
+        }
+        if self.state.pending.contains_key(path) || here != self.state.synced.get(path).cloned() {
+            return Ok(Outcome::Kept { path: path.to_owned() });
+        }
+        self.write(path, to, blobs)?;
+        set(&mut self.state.synced, path, to.cloned());
+        Ok(Outcome::Applied { path: path.to_owned() })
     }
 
     /// Makes this copy's `path` hold `v` (none: removes it), atomically for a file.
@@ -358,8 +474,8 @@ mod tests {
             std::fs::create_dir_all(&ra)?;
             std::fs::create_dir_all(&rb)?;
             let blobs = Blobs::new(&dir.path().join("blobs"))?;
-            let a = Copy::new(&ra, "a", Limits::default(), State::default());
-            let b = Copy::new(&rb, "b", Limits::default(), State::default());
+            let a = Copy::new(&ra, "a", 2, Limits::default(), State::default());
+            let b = Copy::new(&rb, "b", 3, Limits::default(), State::default());
             Ok(Self { _dir: dir, a, b, blobs, log: Vec::new(), applied: (0, 0) })
         }
         fn write(c: &Copy, path: &str, body: &str) -> io::Result<()> {
@@ -375,9 +491,7 @@ mod tests {
         /// `who` proposes what changed on it; the log takes it.
         fn propose(&mut self, who: char, at: i64) -> anyhow::Result<()> {
             let c = if who == 'a' { &mut self.a } else { &mut self.b };
-            if let Some(step) = c.propose(&self.blobs, at)? {
-                self.log.push(step);
-            }
+            self.log.extend(c.propose(&self.blobs, at)?);
             Ok(())
         }
         /// Both copies apply what they haven't.
@@ -501,7 +615,7 @@ mod tests {
         #[cfg(unix)]
         evil.push(Change { path: "door".into(), to: Some(Version::Link { target: outside.to_string_lossy().into_owned() }), base: None });
         evil.push(file("door/x"));
-        let out = t.a.apply(&Step { by: "b".into(), at: 1, changes: evil }, &t.blobs)?;
+        let out = t.a.apply(&Step { by: "b".into(), member: 3, seq: 0, at: 1, changes: evil }, &t.blobs)?;
         let refused = out.iter().filter(|o| matches!(o, Outcome::Refused { .. })).count();
         assert!(refused >= 6, "{out:?}");
         assert!(std::fs::read_dir(&outside)?.next().is_none(), "nothing written outside");
