@@ -59,6 +59,10 @@ pub enum AgentMsg {
     /// Answer to [`ServerMsg::AiView`]: the session's normalized view (JSON: events, state,
     /// changes), `None` when there is none. Appended last: postcard encodes variants by index.
     AiView { req: u64, json: Option<String> },
+    /// Answer to [`ServerMsg::HarnessTaskOutput`]: JSON `{data, offset, live, ...}` or `{error}`,
+    /// `None` when this machine has no such session. Appended last: postcard encodes variants by
+    /// index.
+    HarnessTaskOutput { req: u64, json: Option<String> },
 }
 
 /// A terminal session kept by an agent.
@@ -129,6 +133,10 @@ pub enum ServerMsg {
     /// are not): written at `offset`; `done` on the last piece. The message refers to it by `file`.
     /// Appended last: postcard encodes variants by index.
     HarnessFile { session: String, file: String, offset: u64, data: Vec<u8>, done: bool },
+    /// Read the output of one of an agent session's tasks after byte `since` (its tail without
+    /// one); answered by [`AgentMsg::HarnessTaskOutput`]. Appended last: postcard encodes
+    /// variants by index.
+    HarnessTaskOutput { req: u64, session: String, task: String, since: Option<u64> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

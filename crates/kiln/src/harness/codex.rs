@@ -175,6 +175,8 @@ pub struct Codex {
     /// The servers were asked for again while an answer was on its way (it may be from before a
     /// reload): ask once more when it comes.
     mcp_again: bool,
+    /// Terminals kiln is stopping: their end reads as stopped, not failed.
+    stopping: std::collections::HashSet<String>,
 }
 
 impl Codex {
@@ -225,6 +227,7 @@ impl Codex {
             mcp_config_seen: false,
             mcp_status_seen: false,
             mcp_again: false,
+            stopping: std::collections::HashSet::new(),
         }
     }
 
@@ -407,6 +410,10 @@ impl Codex {
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
+        for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+            t.status = "stopped".into();
+            t.ended.get_or_insert_with(Core::now);
+        }
         self.turn = None;
         self.pending.clear();
         self.asks.clear();
@@ -482,7 +489,16 @@ impl Codex {
                 core.touch_state();
             }
             Command::Control { id, value } => self.control(core, &id, value),
-            Command::StopTask { .. } | Command::Restart | Command::Snapshot => {}
+            Command::Restart | Command::Snapshot => {}
+            // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
+            // the process itself (the newest one under Codex running that command).
+            Command::StopTask { task } => self.stop_terminal(core, &task),
+            Command::StopTasks => {
+                let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).map(|t| t.id.clone()).collect();
+                for task in live {
+                    self.stop_terminal(core, &task);
+                }
+            }
             Command::McpEnable { name, enabled } => {
                 if !valid_server_name(&name) {
                     self.notice(core, Level::Warn, format!("{name}: not a server kiln can change"));
@@ -582,6 +598,17 @@ impl Codex {
         self.compose_status(core);
     }
 
+    fn stop_terminal(&mut self, core: &mut Core, task: &str) {
+        let Some(t) = core.state.tasks.iter().find(|t| t.id == task && t.live()) else { return };
+        match t.command.clone().filter(|_| t.process.is_some()) {
+            Some(command) => {
+                self.stopping.insert(task.to_owned());
+                core.effects.push(Effect::Kill { job: format!("stop:{task}"), command });
+            }
+            None => self.notice(core, Level::Warn, format!("{}: Codex has no way to stop it", t.description)),
+        }
+    }
+
     fn run(&mut self, core: &mut Core, what: Run, args: Vec<String>) {
         self.next_run += 1;
         let job = format!("run-{}", self.next_run);
@@ -591,6 +618,21 @@ impl Codex {
 
     /// A run of the CLI (or a fetch) ended.
     pub fn run_done(&mut self, core: &mut Core, job: &str, code: Option<i32>, output: &str) {
+        // A terminal kiln stopped.
+        if let Some(task) = job.strip_prefix("stop:") {
+            self.stopping.remove(task);
+            let stopped = code == Some(0);
+            if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == task && t.live()) {
+                t.status = "stopped".into();
+                t.ended = Some(Core::now());
+                if !stopped {
+                    t.summary = Some(format!("Not running any more ({output})"));
+                }
+                core.touch_state();
+            }
+            set_status(core, task, ToolStatus::Cancelled);
+            return;
+        }
         let Some(run) = self.runs.remove(job) else { return };
         let out = super::claude::strip_ansi(output).trim().to_owned();
         match run {
@@ -1542,11 +1584,16 @@ impl Codex {
                         core.state.delivery.insert(id, done);
                     }
                 }
-                // Calls the turn left open were cut off with it.
+                // Calls the turn left open were cut off with it; terminals still running were left
+                // behind (they go on after the turn).
+                let terminals: Vec<String> = core.state.tasks.iter().filter(|t| t.live() && t.process.is_some()).filter_map(|t| t.tool_id.clone()).collect();
+                for t in core.state.tasks.iter_mut().filter(|t| t.live() && t.process.is_some()) {
+                    t.background = true;
+                }
                 let open: Vec<String> = core
                     .events()
                     .filter_map(|e| match &e.body {
-                        Body::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Pending) => Some(e.id.clone()),
+                        Body::Tool(t) if matches!(t.status, ToolStatus::Running | ToolStatus::Pending) && !terminals.contains(&e.id) => Some(e.id.clone()),
                         _ => None,
                     })
                     .collect();
@@ -1590,6 +1637,10 @@ impl Codex {
             }
             "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
                 let (Some(id), Some(d)) = (p.get("itemId").and_then(Value::as_str), p.get("delta").and_then(Value::as_str)) else { return };
+                // A terminal's whole output is kept (the call shows only its start).
+                if let Some(task) = core.state.tasks.iter().find(|t| t.tool_id.as_deref() == Some(id) && t.process.is_some()).map(|t| t.id.clone()) {
+                    core.task_output.entry(task).or_default().append(d.as_bytes());
+                }
                 if let Some(e) = core.get_mut(id)
                     && let Body::Tool(t) = &mut e.body
                 {
@@ -1705,6 +1756,48 @@ impl Codex {
             }
             _ => {}
         }
+    }
+
+    /// A terminal Codex runs (its process outlives the call that started it) as a task: running
+    /// until its item completes.
+    #[allow(clippy::too_many_arguments)]
+    fn terminal(&mut self, core: &mut Core, item_id: &str, process: &str, command: &str, item: &Value, done: bool, exit: Option<i32>) {
+        let task_id = format!("terminal-{item_id}");
+        let status = match (done, item.get("status").and_then(Value::as_str)) {
+            (false, _) => "running",
+            (true, _) if self.stopping.remove(&task_id) => "stopped",
+            (true, Some("failed")) => "failed",
+            (true, _) if exit.unwrap_or(0) != 0 => "failed",
+            (true, _) => "completed",
+        };
+        match core.state.tasks.iter_mut().find(|t| t.id == task_id) {
+            Some(t) => {
+                if t.live() {
+                    t.status = status.to_owned();
+                }
+                t.exit_code = exit.or(t.exit_code);
+                if done {
+                    t.ended.get_or_insert_with(Core::now);
+                }
+            }
+            None => core.state.tasks.push(Task {
+                id: task_id,
+                tool_id: Some(item_id.to_owned()),
+                description: clip_middle(command, 300).0,
+                kind: "terminal".into(),
+                status: status.to_owned(),
+                class: Some("shell".into()),
+                command: Some(command.to_owned()),
+                cwd: item.get("cwd").and_then(Value::as_str).map(str::to_owned),
+                process: Some(process.to_owned()),
+                exit_code: exit,
+                stoppable: cfg!(unix),
+                started: Core::now(),
+                ended: done.then(Core::now),
+                ..Task::default()
+            }),
+        }
+        core.touch_state();
     }
 
     /// The installed plugins, with the skills each brings.
@@ -1843,6 +1936,10 @@ impl Codex {
                 if !done {
                     core.state.doing = Some(super::claude::doing(&call));
                     core.touch_state();
+                }
+                // A terminal (unified exec): it can go on after its call and the turn.
+                if let Some(process) = item.get("processId").and_then(Value::as_str) {
+                    self.terminal(core, &id, process, &command, item, done, exit);
                 }
                 core.upsert(&id, None, Body::Tool(Box::new(call)));
             }
@@ -2656,6 +2753,36 @@ mod tests {
         let w = written(&mut core);
         let start = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).cloned().ok_or_else(|| anyhow::anyhow!("no turn"))?;
         assert_eq!((start.pointer("/params/effort").and_then(Value::as_str), start.pointer("/params/model").and_then(Value::as_str)), (Some("low"), Some("o-mini")));
+        Ok(())
+    }
+
+    #[test]
+    fn terminals_codex_leaves_running() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        let item = |status: &str, exit: Value| json!({"type": "commandExecution", "id": "call_4", "command": "/usr/bin/bash -lc 'for i in $(seq 1 120); do echo tick $i; sleep 1; done'", "cwd": "/work", "processId": "91122", "source": "unifiedExecStartup", "status": status, "exitCode": exit, "commandActions": []});
+        feed(&mut c, &mut core, &[json!({"method": "turn/started", "params": {"turn": {"id": "t1"}}}), json!({"method": "item/started", "params": {"turnId": "t1", "item": item("inProgress", Value::Null)}})]);
+        let t = core.state.tasks.iter().find(|t| t.process.as_deref() == Some("91122")).cloned().ok_or_else(|| anyhow::anyhow!("no terminal"))?;
+        assert_eq!((t.class.as_deref(), t.command.as_deref(), t.cwd.as_deref(), t.status.as_str()), (Some("shell"), Some("for i in $(seq 1 120); do echo tick $i; sleep 1; done"), Some("/work"), "running"));
+        feed(&mut c, &mut core, &[json!({"method": "item/commandExecution/outputDelta", "params": {"itemId": "call_4", "delta": "tick 1\n"}}), json!({"method": "item/commandExecution/outputDelta", "params": {"itemId": "call_4", "delta": "tick 2\n"}})]);
+        let (bytes, offset, _) = core.task_output.get(&t.id).map(|o| o.since(0)).unwrap_or_default();
+        assert_eq!((String::from_utf8_lossy(&bytes).as_ref(), offset), ("tick 1\ntick 2\n", 14));
+        // The turn ends; the terminal goes on, left behind (not cut off).
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"turn": {"id": "t1", "status": "completed", "items": []}}})]);
+        core.set_status(Status::Idle);
+        assert!(core.state.tasks.iter().any(|x| x.id == t.id && x.live() && x.background));
+        assert_eq!(core.state.count_left_behind(), 1);
+        assert!(core.get("call_4").is_some_and(|e| matches!(&e.body, Body::Tool(x) if x.status == ToolStatus::Running)));
+        // Stopping it: kiln stops the process (Codex cannot).
+        c.command(&mut core, Command::StopTask { task: t.id.clone() });
+        let Some(Effect::Kill { job, command }) = core.effects.pop() else { anyhow::bail!("no kill") };
+        assert_eq!(command, "for i in $(seq 1 120); do echo tick $i; sleep 1; done");
+        c.run_done(&mut core, &job, Some(0), "");
+        assert_eq!(core.state.tasks.iter().find(|x| x.id == t.id).map(|x| x.status.clone()).as_deref(), Some("stopped"));
+        // One that ends on its own: its exit code.
+        let (mut c2, mut core2, _) = opened();
+        feed(&mut c2, &mut core2, &[json!({"method": "item/started", "params": {"item": item("inProgress", Value::Null)}}), json!({"method": "item/completed", "params": {"item": item("completed", json!(3))}})]);
+        let done = core2.state.tasks.first().cloned().unwrap_or_default();
+        assert_eq!((done.status.as_str(), done.exit_code), ("failed", Some(3)));
         Ok(())
     }
 }

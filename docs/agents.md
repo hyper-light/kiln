@@ -24,6 +24,7 @@ browsers watching it.
 | POST | `/api/harness/sessions/:id/command` | a `Command` → 204 |
 | POST | `/api/harness/command` | `{ids, command}`: one command for several sessions |
 | POST | `/api/harness/files?name=&mime=` | a file for a later message → `{file_id, size}` |
+| GET | `/api/harness/sessions/:id/tasks/:task/output?since=` | a task's output, read on its machine: `{data, offset, live, truncated, path?, gone?}` or `{error}`; without `since` the last 64 KiB, with it what came after that byte (up to 256 KiB); ask again from `offset` to follow it |
 | WS | `/api/harness/sessions/:id/ws` | updates (below); commands may be sent on it too |
 | GET | `/api/ai-sessions` | the sessions found running on the machines (Claude Code, Codex, Gemini CLI started by hand), each with `machine`, `pid`, `tool`, `id`, `cwd`, `terminal` (the kiln terminal it runs in, while kiln holds it) and `takeover` |
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); see below |
@@ -68,7 +69,8 @@ console picks) and are answered with a `reply` update to that client.
 | `approve` | `id, decision: "allow"\|"always"\|"deny", message?, always?, answers?` | |
 | `interrupt`, `restart`, `snapshot` | | |
 | `set_mode` / `set_model` / `set_effort` | `mode` / `model` / `effort` | `state.mode` / `state.model` / `state.effort` |
-| `stop_task` | `task` | |
+| `stop_task` | `task` | the task's `status` (stopped) |
+| `stop_tasks` | | every live task stopped |
 | `suggest` | `client, query` | `{suggestions: [{path}], cwd}` |
 | `control` | `id, value?` (a `meta.controls` entry) | |
 | `mcp_enable` | `name, enabled` | `state.mcp` |
@@ -101,7 +103,33 @@ Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`,
 - `inventory` — for `mcp`, `skills`, `plugins` and `limits`: `"loading"` (not reported yet),
   `"ready"` (an empty list means none) or `"unsupported"` (the harness cannot report it).
 
-`Info` (the lists) carries `limits`, `account` and `plan` too.
+`Info` (the lists) carries `limits`, `account`, `plan` and `left_behind` too.
+
+### Tasks: shells, monitors and other work an agent leaves running
+
+`state.tasks` holds every task a harness runs beside its turns: subagents, and also commands it
+sends to the background, monitors and workflows. Besides `id`, `description`, `status`
+("running", "pending", "paused", "completed", "failed", "stopped", "killed"), `background`,
+`started`/`ended`:
+
+- `class`: "shell" (a command left running), "monitor" (a watch: each event it sees wakes the
+  agent), "agent" (a subagent), "workflow", "mcp" (an MCP call moved to the background).
+- `command`, `cwd`: what a shell or monitor runs, and where.
+- `output`: where its output is written on its machine (Claude Code, while it runs). Read it with
+  the task output endpoint, whatever the harness: Codex's terminals are kept by kiln itself.
+- `process`: the harness's own handle for its process (Codex). `exit_code` once it has ended.
+- `events`, `last_event`: a monitor's events so far and the latest (one line). `wakes`: who they
+  wake, "agent" or the subagent task that started the monitor.
+- `stoppable`: `stop_task` can stop it.
+
+`state.left_behind` counts the tasks left running while no turn is under way (the agent idle or
+exited): shells, monitors, workflows, background calls and subagents sent to the background.
+
+Ending an agent (`DELETE /api/harness/sessions/:id`) stops what it left running: each live task
+through the harness (`stop_task`), then anything still under the harness process (commands that
+left its process group included), then the harness. A console can warn first with `left_behind`.
+No harness offers pausing a task: Claude Code reports a workflow it restored as "paused", with no
+way to resume it from outside.
 
 A tool call reads `pending` while it is asked about (an approval in `state.approvals` names its
 `tool_id`) or while it waits its turn behind one; `running` once it is under way. MCP calls name
@@ -110,10 +138,15 @@ their `server` and `tool_short`; skill calls their `skill`.
 ## Notes per harness
 
 - **Claude Code** reads its MCP configuration when it starts: after `mcp_add` / `mcp_remove`
-  (`claude mcp add/remove`) it starts again between turns, continuing the conversation. A
+  (`claude mcp add/remove`) it starts again between turns, continuing the conversation (and not
+  while it has tasks left running, which starting again would end). A
   sign-in finished through kiln (`redirect`) is handed to the CLI and the server reconnected.
   Skills are listed before the first turn (skill commands and the /skills menu) and completed
   with init's list after it.
+- **Codex** runs commands that outlive their call in terminals of its own (unified exec): kiln
+  shows each as a "shell" task, kept running when the turn ends, with its output kept by kiln
+  (the last 256 KiB). Codex has no way to stop one from outside: `stop_task` stops the process
+  itself (the newest under Codex running that command, with what it started).
 - **Codex**: stdio servers are added with `codex mcp add`; http servers are written to its
   configuration through its own API (the CLI would sign in at once, in a browser on the agent's
   machine). Removing an http server signs it out first. Effort and model are set per turn.
@@ -163,5 +196,11 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | plugins | ✓ | ✓ | — | — |
 | MCP server and skill named on tool calls | ✓ | unit (MCP) | — | — |
 | inventories known vs loading (`inventory`) | ✓ | ✓ | unit (unsupported) | ? |
+| shells it leaves running as tasks (command, folder, left behind) | ✓ | ✓ (terminals) | — | — |
+| task output, read on its machine, followed from an offset | ✓ | ✓ | — | — |
+| stop a task / all tasks | ✓ (`stop_task`) | ✓ (kiln stops the process) | — | — |
+| ending the agent stops what it left running | ✓ | ✓ | — | — |
+| monitors: events counted, the latest kept | unit (not offered to API-key sessions) | — | — | — |
+| pause / resume a task | — | — | — | — |
 | take over a session found running in a kiln terminal | ✓ | ✓ | — | — |
 | refuse one running outside kiln | ✓ | ✓ | — | — |

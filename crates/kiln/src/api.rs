@@ -256,6 +256,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "command"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "files"]) => harness_upload(&hub, &q, req).await,
         (&Method::GET, ["api", "harness", "sessions", id, "ws"]) => harness_ws(hub.clone(), (*id).to_owned(), req),
+        (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
+            let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
+            match hub.harness.task_output(&hub, id, task, since).await {
+                Ok(Some(v)) => Ok(srv::json(StatusCode::OK, &v)),
+                Ok(None) => Err(err(StatusCode::NOT_FOUND, "no such agent session")),
+                Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+            }
+        }
         _ => Err(err(StatusCode::NOT_FOUND, "not found")),
     }
 }

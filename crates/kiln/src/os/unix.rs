@@ -124,6 +124,39 @@ pub fn reexec(exe: &Path, args: &[std::ffi::OsString], env: &[(&str, String)]) -
     cmd.exec()
 }
 
+/// Stop these processes and the process groups they lead or belong to (never `keep`'s, nor this
+/// process's own): SIGTERM now, SIGKILL to whatever is left after `grace`. Blocking.
+pub fn stop_processes(pids: &[u32], keep: Option<u32>, grace: std::time::Duration) {
+    use nix::sys::signal::{Signal, kill, killpg};
+    use nix::unistd::{Pid, getpgid};
+    let ours = getpgid(None).ok();
+    let keep = keep.and_then(|k| i32::try_from(k).ok()).map(Pid::from_raw);
+    let mut groups = std::collections::HashSet::new();
+    let pids: Vec<Pid> = pids.iter().filter_map(|p| i32::try_from(*p).ok()).filter(|p| *p > 1).map(Pid::from_raw).collect();
+    for p in &pids {
+        if let Ok(g) = getpgid(Some(*p))
+            && Some(g) != ours
+            && Some(g) != keep
+        {
+            groups.insert(g);
+        }
+        let _ = kill(*p, Signal::SIGTERM);
+    }
+    for g in &groups {
+        let _ = killpg(*g, Signal::SIGTERM);
+    }
+    let end = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < end && pids.iter().any(|p| kill(*p, None).is_ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for p in &pids {
+        let _ = kill(*p, Signal::SIGKILL);
+    }
+    for g in &groups {
+        let _ = killpg(*g, Signal::SIGKILL);
+    }
+}
+
 /// Whether `pid` is still running (and signalable by us).
 pub fn pid_alive(pid: u32) -> bool {
     i32::try_from(pid).is_ok_and(|p| nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), None).is_ok())

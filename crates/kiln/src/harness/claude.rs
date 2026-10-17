@@ -201,6 +201,11 @@ pub struct Claude {
     /// The MCP configuration changed (what changed): Claude Code reads it when it starts, so it
     /// starts again, continuing the conversation, as soon as it is not in the middle of a turn.
     reload: Option<String>,
+    /// That restart waits for tasks left running (said once).
+    reload_waits: bool,
+    /// Where a background command's output goes, by the tool call that started it, until its
+    /// task is known: (task id, file).
+    bg_files: HashMap<String, (String, String)>,
 }
 
 impl Claude {
@@ -235,6 +240,8 @@ impl Claude {
             runs: HashMap::new(),
             next_run: 0,
             reload: None,
+            reload_waits: false,
+            bg_files: HashMap::new(),
         }
     }
 
@@ -489,6 +496,11 @@ impl Claude {
         for id in self.tools.keys().cloned().collect::<Vec<_>>() {
             finish_tool(core, &id, ToolStatus::Cancelled, None);
         }
+        // What it ran ends with it.
+        for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+            t.status = "stopped".into();
+            t.ended.get_or_insert_with(Core::now);
+        }
         core.state.exit = Some(ExitInfo { code, error });
         core.state.activity = None;
         core.state.turn_started = None;
@@ -541,6 +553,12 @@ impl Claude {
             }
             Command::StopTask { task } => {
                 self.request(core, Pending::StopTask, json!({"subtype": "stop_task", "task_id": task}));
+            }
+            Command::StopTasks => {
+                let live: Vec<String> = core.state.tasks.iter().filter(|t| t.live()).map(|t| t.id.clone()).collect();
+                for task in live {
+                    self.request(core, Pending::StopTask, json!({"subtype": "stop_task", "task_id": task}));
+                }
             }
             Command::SetEffort { effort } => {
                 self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
@@ -653,6 +671,17 @@ impl Claude {
         if self.reload.is_none() || self.busy(core) || core.state.status == Status::Starting {
             return;
         }
+        // Starting again would end the shells and monitors it left running: it waits for them.
+        let left = core.state.tasks.iter().filter(|t| t.left_running()).count();
+        if left > 0 && core.state.status != Status::Exited {
+            if !self.reload_waits {
+                self.reload_waits = true;
+                let what = self.reload.clone().unwrap_or_default();
+                self.notice(core, Level::Info, format!("{what}: Claude Code loads it when it starts again, once the {left} task(s) it left running end (or restart it yourself)"), None);
+            }
+            return;
+        }
+        self.reload_waits = false;
         let Some(what) = self.reload.take() else { return };
         // Not running, or nothing to resume: its next start reads the configuration anyway.
         if core.state.status == Status::Exited || core.state.harness_session.is_none() {
@@ -1592,7 +1621,11 @@ impl Claude {
             }
             "task_started" => {
                 let Some(id) = str_of(v, "task_id") else { return };
-                let task = Task {
+                let tool_id = str_of(v, "tool_use_id").map(str::to_owned);
+                let (tool_name, tool_input) = tool_id.as_deref().and_then(|t| self.tools.get(t).cloned()).unwrap_or_default();
+                let class = task_class(str_of(v, "task_type"), &tool_name, str_of(v, "subagent_type").is_some());
+                let output = tool_id.as_deref().and_then(|t| self.bg_files.remove(t)).map(|(_, f)| f);
+                let mut task = Task {
                     id: id.to_owned(),
                     tool_id: str_of(v, "tool_use_id").map(str::to_owned),
                     description: str_of(v, "description").unwrap_or("").to_owned(),
@@ -1605,6 +1638,12 @@ impl Claude {
                     started: Core::now(),
                     ..Task::default()
                 };
+                task.command = task_command(&tool_name, &tool_input);
+                task.cwd = matches!(class.as_deref(), Some("shell" | "monitor")).then(|| core.state.cwd.clone());
+                task.wakes = (class.as_deref() == Some("monitor")).then(|| task.parent_task.clone().unwrap_or_else(|| "agent".to_owned()));
+                task.class = class;
+                task.output = output;
+                task.stoppable = true;
                 if let Some(tid) = task.tool_id.clone()
                     && let Some(ev) = core.get_mut(&tid)
                     && let Body::Tool(t) = &mut ev.body
@@ -1633,6 +1672,34 @@ impl Claude {
                     core.touch_state();
                 }
             }
+            // Every live background task (replace semantics): ones kiln missed (before a restart,
+            // or a dropped line) join.
+            "background_tasks_changed" => {
+                for b in v.get("tasks").and_then(Value::as_array).into_iter().flatten() {
+                    let Some(id) = str_of(b, "task_id") else { continue };
+                    match core.state.tasks.iter_mut().find(|t| t.id == id) {
+                        Some(t) => t.background = true,
+                        None => {
+                            let class = task_class(str_of(b, "task_type"), "", str_of(b, "subagent_type").is_some());
+                            core.state.tasks.push(Task {
+                                id: id.to_owned(),
+                                description: str_of(b, "description").unwrap_or("").to_owned(),
+                                kind: str_of(b, "subagent_type").or_else(|| str_of(b, "task_type")).unwrap_or("task").to_owned(),
+                                status: "running".into(),
+                                background: true,
+                                parent_task: str_of(b, "parent_task_id").map(str::to_owned),
+                                started: Core::now(),
+                                wakes: (class.as_deref() == Some("monitor")).then(|| str_of(b, "parent_task_id").unwrap_or("agent").to_owned()),
+                                class,
+                                stoppable: true,
+                                ..Task::default()
+                            });
+                        }
+                    }
+                }
+                prune_tasks(core);
+                core.touch_state();
+            }
             "task_updated" => {
                 let Some(id) = str_of(v, "task_id") else { return };
                 let patch = v.get("patch").cloned().unwrap_or(Value::Null);
@@ -1660,7 +1727,11 @@ impl Claude {
                 if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == id) {
                     t.status = str_of(v, "status").unwrap_or("completed").to_owned();
                     t.ended.get_or_insert_with(Core::now);
+                    if let Some(f) = str_of(v, "output_file").filter(|f| !f.is_empty()) {
+                        t.output = Some(f.to_owned());
+                    }
                     if let Some(s) = str_of(v, "summary") {
+                        t.exit_code = t.exit_code.or_else(|| exit_code_in(s));
                         t.summary = Some(clip_middle(s, 8000).0);
                     }
                     if let Some(u) = v.get("usage") {
@@ -1866,11 +1937,16 @@ impl Claude {
             self.notice(core, Level::Info, "Interrupted", parent);
             return;
         }
-        // Context the CLI injects (reminders, command wrappers) is not something anyone said.
+        // Context the CLI injects (reminders, command wrappers) is not something anyone said; a
+        // monitor's event in it counts for its task.
         if v.get("isSynthetic").and_then(Value::as_bool) == Some(true) || (t.starts_with('<') && !t.starts_with("<task-notification")) {
+            if t.contains("<task-notification>") {
+                self.monitor_event(core, t);
+            }
             return;
         }
         if t.starts_with("<task-notification") {
+            self.monitor_event(core, t);
             return; // shown through the task's own state
         }
         let id = if uuid.is_empty() { format!("user-{}", Core::now()) } else { uuid.to_owned() };
@@ -1899,10 +1975,34 @@ impl Claude {
         );
     }
 
+    /// A `<task-notification>` (as the CLI tells the model): for a monitor, one more event.
+    fn monitor_event(&mut self, core: &mut Core, text: &str) {
+        for part in text.split("<task-notification>").skip(1) {
+            let Some(id) = between(part, "<task-id>", "</task-id>") else { continue };
+            let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == id.trim() && t.class.as_deref() == Some("monitor")) else { continue };
+            let what = between(part, "<event>", "</event>").or_else(|| between(part, "<summary>", "</summary>")).unwrap_or("").trim();
+            t.events += 1;
+            t.last_event = Some(clip_middle(what.lines().last().unwrap_or(""), 300).0).filter(|e| !e.is_empty());
+            core.touch_state();
+        }
+    }
+
     fn tool_result(&mut self, core: &mut Core, tid: &str, block: &Value, structured: &Value) {
         let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let mut text = content_text(block.get("content"));
         let (name, input) = self.tools.get(tid).cloned().unwrap_or_default();
+        // A command now running in the background: its task's output file.
+        if let Some((task, file)) = background_of(&text, structured) {
+            match core.state.tasks.iter_mut().find(|t| t.id == task || t.tool_id.as_deref() == Some(tid)) {
+                Some(t) => {
+                    t.output = Some(file);
+                    core.touch_state();
+                }
+                None => {
+                    self.bg_files.insert(tid.to_owned(), (task, file));
+                }
+            }
+        }
         let mut diffs = Vec::new();
         let mut exit_code = None;
         if let Some(o) = structured.as_object() {
@@ -2142,6 +2242,58 @@ impl Claude {
 
 fn str_of<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
+}
+
+/// What a task is, from Claude Code's `task_type` and the tool that started it.
+fn task_class(task_type: Option<&str>, tool: &str, subagent: bool) -> Option<String> {
+    let class = match task_type.unwrap_or("") {
+        "local_bash" if tool == "Monitor" => "monitor",
+        "local_bash" => "shell",
+        t if t.starts_with("monitor") => "monitor",
+        "local_agent" | "remote_agent" | "in_process_teammate" => "agent",
+        "local_workflow" => "workflow",
+        "mcp_task" => "mcp",
+        _ if tool == "Monitor" => "monitor",
+        _ if subagent || matches!(tool, "Task" | "Agent") => "agent",
+        _ => return None,
+    };
+    Some(class.to_owned())
+}
+
+/// The command a shell or monitor task runs, from its tool call.
+fn task_command(tool: &str, input: &Value) -> Option<String> {
+    match tool {
+        "Bash" | "Monitor" => str_of(input, "command").map(str::to_owned).or_else(|| input.pointer("/ws/url").and_then(Value::as_str).map(|u| format!("websocket {}", safe_url(u)))),
+        _ => None,
+    }
+}
+
+/// A background command's task id and output file, from its call's result ("… with ID: x.
+/// Output is being written to: /tmp/…/tasks/x.output").
+fn background_of(text: &str, structured: &Value) -> Option<(String, String)> {
+    let file = text.split("Output is being written to: ").nth(1).and_then(|r| r.split_whitespace().next()).map(|f| f.trim_end_matches(['.', ',', ';']).to_owned())?;
+    let id = structured
+        .get("backgroundTaskId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| text.split("ID: ").nth(1).map(|r| r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect::<String>()))
+        .filter(|i| !i.is_empty())
+        .or_else(|| std::path::Path::new(&file).file_stem().and_then(|s| s.to_str()).map(str::to_owned))?;
+    Some((id, file))
+}
+
+/// The text between two markers.
+fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = s.find(open)? + open.len();
+    let end = s.get(start..)?.find(close)? + start;
+    s.get(start..end)
+}
+
+/// "… (exit code 3)" → 3.
+fn exit_code_in(s: &str) -> Option<i32> {
+    let rest = s.split("exit code").nth(1)?;
+    let digits: String = rest.trim_start_matches([' ', ':']).chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+    digits.parse().ok()
 }
 
 /// A call that runs alongside others (read-only), rather than one at a time.
@@ -3506,5 +3658,51 @@ mod tests {
         c.line(&mut core, &json!({"type": "control_request", "request_id": "p2", "request": {"subtype": "can_use_tool", "tool_name": "Write", "input": {"file_path": "/w/f2.txt", "content": "x"}, "tool_use_id": "t2"}}).to_string());
         assert_eq!(["t2", "t3"].map(|t| status(&core, t)), [Some(ToolStatus::Pending), Some(ToolStatus::Pending)]);
         assert_eq!(core.state.approvals.len(), 1);
+    }
+
+    #[test]
+    fn shells_and_monitors_it_leaves_running() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        // A background command: its call, its task, its output file.
+        c.line(&mut core, &json!({"type": "assistant", "message": {"id": "m1", "type": "message", "role": "assistant", "model": "x", "content": [
+            {"type": "tool_use", "id": "tb", "name": "Bash", "input": {"command": "npm run dev", "description": "dev server", "run_in_background": true}},
+            {"type": "tool_use", "id": "tm", "name": "Monitor", "input": {"command": "tail -f app.log | grep ERROR", "description": "errors in the log"}}
+        ]}, "parent_tool_use_id": null, "session_id": "s", "uuid": "a"}).to_string());
+        c.line(&mut core, &json!({"type": "system", "subtype": "task_started", "task_id": "b7", "tool_use_id": "tb", "description": "dev server", "task_type": "local_bash", "is_backgrounded": true, "uuid": "u", "session_id": "s"}).to_string());
+        c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tb", "content": "Command running in background with ID: b7. Output is being written to: /tmp/claude-1000/-work/s/tasks/b7.output", "is_error": false}]}, "parent_tool_use_id": null, "session_id": "s", "uuid": "r"}).to_string());
+        c.line(&mut core, &json!({"type": "system", "subtype": "task_started", "task_id": "m9", "tool_use_id": "tm", "description": "errors in the log", "task_type": "local_bash", "uuid": "u", "session_id": "s"}).to_string());
+        let shell = core.state.tasks.iter().find(|t| t.id == "b7").cloned().ok_or_else(|| anyhow::anyhow!("no shell"))?;
+        assert_eq!((shell.class.as_deref(), shell.command.as_deref(), shell.cwd.as_deref()), (Some("shell"), Some("npm run dev"), Some("/work")));
+        assert_eq!(shell.output.as_deref(), Some("/tmp/claude-1000/-work/s/tasks/b7.output"));
+        assert!(shell.stoppable && shell.background);
+        let mon = core.state.tasks.iter().find(|t| t.id == "m9").cloned().ok_or_else(|| anyhow::anyhow!("no monitor"))?;
+        assert_eq!((mon.class.as_deref(), mon.command.as_deref(), mon.wakes.as_deref()), (Some("monitor"), Some("tail -f app.log | grep ERROR"), Some("agent")));
+        // Its events wake the agent: counted, the latest kept.
+        c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": "<system-reminder>\n<task-notification>\n<task-id>m9</task-id>\n<status>running</status>\n<summary>ERROR db down</summary>\n</task-notification>\n</system-reminder>"}, "parent_tool_use_id": null, "session_id": "s", "uuid": "e1"}).to_string());
+        let mon = core.state.tasks.iter().find(|t| t.id == "m9").cloned().unwrap_or_default();
+        assert_eq!((mon.events, mon.last_event.as_deref()), (1, Some("ERROR db down")));
+        // The turn is over; both are left running.
+        c.line(&mut core, r#"{"type":"system","subtype":"session_state_changed","state":"idle","uuid":"u","session_id":"s"}"#);
+        core.set_status(Status::Idle);
+        let _ = core.take_out();
+        assert_eq!(core.state.count_left_behind(), 2);
+        // Stopping them all.
+        let _ = core.take_writes();
+        c.command(&mut core, Command::StopTasks);
+        let w = core.take_writes();
+        assert!(w.iter().any(|l| l.contains("\"stop_task\"") && l.contains("b7")) && w.iter().any(|l| l.contains("m9")), "{w:?}");
+        c.line(&mut core, &json!({"type": "system", "subtype": "task_notification", "task_id": "b7", "tool_use_id": "tb", "status": "stopped", "output_file": "/tmp/claude-1000/-work/s/tasks/b7.output", "summary": "Background command \"dev server\" was stopped (exit code 143)", "uuid": "u", "session_id": "s"}).to_string());
+        let shell = core.state.tasks.iter().find(|t| t.id == "b7").cloned().unwrap_or_default();
+        assert_eq!((shell.status.as_str(), shell.exit_code), ("stopped", Some(143)));
+        assert_eq!(core.state.count_left_behind(), 1);
+        // What a background_tasks_changed lists and kiln had missed joins.
+        c.line(&mut core, &json!({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "w3", "task_type": "local_workflow", "description": "nightly"}], "uuid": "u", "session_id": "s"}).to_string());
+        assert_eq!(core.state.tasks.iter().find(|t| t.id == "w3").and_then(|t| t.class.clone()).as_deref(), Some("workflow"));
+        // The process ends: so do they.
+        c.exited(&mut core, Some(0), None);
+        assert!(core.state.tasks.iter().all(|t| !t.live()));
+        Ok(())
     }
 }

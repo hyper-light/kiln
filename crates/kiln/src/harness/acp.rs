@@ -216,7 +216,7 @@ impl Acp {
             Command::Suggest { client, .. } => core.reply(client, json!({"suggestions": []})),
             // ACP has no effort setting and no other controls than modes and models.
             Command::SetEffort { .. } | Command::Control { .. } => {}
-            Command::StopTask { .. } | Command::Restart | Command::Snapshot => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::Snapshot => {}
             // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
             // servers when the session opens); its commands run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {
