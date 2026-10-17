@@ -152,6 +152,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let id = (*id).to_owned();
             return poll_join(&hub, &id, req.headers()).await;
         }
+        (&Method::GET, ["api", "join", "invited"]) => return Ok(join_invited(&hub, &req)),
         (&Method::GET, ["api", "jobs", id, "source"]) => return job_source(&hub, id, req.headers()).await,
         (&Method::PUT, ["api", "jobs", id, "artifacts", "upload"]) => {
             let id = (*id).to_owned();
@@ -217,6 +218,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &hub.agent_list().await)),
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
+        (&Method::POST, ["api", "discovery", "scan"]) => discovery_scan(&hub, req).await,
+        (&Method::POST, ["api", "discovery", "probe"]) => discovery_probe(&hub, req).await,
+        (&Method::POST, ["api", "discovery", "invite"]) => discovery_invite(&hub, req).await,
+        (&Method::DELETE, ["api", "discovery", "invite", id]) => Ok(discovery_uninvite(&hub, id).await),
         (&Method::GET, ["api", "join-requests"]) => Ok(srv::json(StatusCode::OK, &hub.joins.list(Instant::now(), &hub.pki.ca_der))),
         (&Method::POST, ["api", "join-requests", id, "approve"]) => {
             let id = (*id).to_owned();
@@ -502,6 +507,15 @@ fn logout() -> Response {
 }
 
 fn me(hub: &Hub, headers: &HeaderMap) -> Response {
+    // What discovery announces anyway (when it does), so a probe can tell which instance answers.
+    let d = &hub.discovery;
+    let announced = d.announcing().then(|| {
+        let a = d.advert.lock();
+        json!({
+            "id": a.id, "instance": a.instance_label(), "name": a.name, "role": a.role, "version": a.version,
+            "port": a.port, "quic": a.quic, "ca": a.ca, "os": a.os, "arch": a.arch,
+        })
+    });
     srv::json(
         StatusCode::OK,
         &json!({
@@ -509,6 +523,7 @@ fn me(hub: &Hub, headers: &HeaderMap) -> Response {
             "public_url": hub.cfg.server.public_url,
             "version": env!("CARGO_PKG_VERSION"),
             "hostname": crate::config::Config::hostname(),
+            "discovery": announced,
         }),
     )
 }
@@ -849,6 +864,15 @@ fn join_info(hub: &Hub) -> Response {
             // No token: the machine asks to join and an admin approves it (verification code).
             "join": format!("curl -fsSL {url}/install.sh | sh -s -- --join"),
             "join_manual": format!("kiln join --server {url}"),
+            // One line per OS that downloads kiln from this server and installs the agent with the
+            // join token (`install.sh` passes `--token`/`--labels` to `kiln install --agent`).
+            "install": {
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,linux"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token {token} --labels baremetal,macos"),
+                "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'baremetal,windows'"),
+            },
+            // The join token is kept in <data>/join.token and does not expire.
+            "expires_at": serde_json::Value::Null,
         }),
     )
 }
@@ -929,31 +953,57 @@ pub fn release_url(target: &str) -> String {
 
 // ------------------------------------------------------------------ discovery & joining
 
-/// The kiln instances heard on the network, each marked with whether it already is one of this
-/// server's agents and the command that would make it one.
-async fn discovery(hub: &Hub) -> Response {
+/// Instances as the API lists them: each marked with whether it already is one of this server's
+/// agents, the command that would make it one, whether this server invited it and its pending join
+/// request.
+async fn render_instances(hub: &Hub, list: &[crate::discovery::Instance]) -> Vec<serde_json::Value> {
     let d = &hub.discovery;
     let agents = hub.agent_list().await;
     let ours = crate::discovery::ca_fingerprint(&hub.pki.ca_der);
-    let me = d.advert.lock().clone();
-    let instances: Vec<serde_json::Value> = d
-        .table
-        .snapshot()
-        .into_iter()
+    let now = Instant::now();
+    let all = d.table.snapshot();
+    let requests = hub.joins.list(now, &hub.pki.ca_der);
+    list.iter()
         .map(|i| {
-            let agent = joined_as(&agents, &i, &ours);
-            let url = our_url_for(hub, &i);
-            let mut v = serde_json::to_value(&i).unwrap_or_default();
+            let agent = joined_as(&agents, i, &ours);
+            let url = our_url_for(hub, i);
+            let mut v = serde_json::to_value(i).unwrap_or_default();
             if let Some(o) = v.as_object_mut() {
                 o.insert("url".into(), json!(i.url()));
                 o.insert("joined".into(), json!(agent.is_some()));
                 o.insert("agent".into(), json!(agent));
                 o.insert("same_ca".into(), json!(i.ca.as_deref() == Some(ours.as_str())));
                 o.insert("join_command".into(), json!(format!("kiln join --server {url}")));
+                o.insert("invited".into(), json!(d.invites.invited(&i.id, now)));
+                o.insert("request".into(), json!(crate::discovery::invite::request_for(i, &all, &requests)));
             }
             v
         })
-        .collect();
+        .collect()
+}
+
+/// The kiln instances found, how each way of finding them is doing, what is wrong, the latest
+/// scan, and unicast DNS-SD's domains, publishing and zone-file lines.
+async fn discovery(hub: &Hub) -> Response {
+    let d = &hub.discovery;
+    let me = d.advert.lock().clone();
+    let instances = render_instances(hub, &d.table.snapshot()).await;
+    let health = d.health.lock().clone();
+    // Until the first browse ran: what it is going to browse.
+    let domains = if health.dns_sd.ran {
+        health.dns_sd.domains.clone()
+    } else {
+        let search = crate::discovery::unicast::system_resolver().1;
+        let mut v: Vec<String> = Vec::new();
+        for s in d.settings.domains.iter().chain(&search) {
+            if let Some(n) = crate::discovery::unicast::browsable(s).map(|n| n.to_zone(false))
+                && !v.contains(&n)
+            {
+                v.push(n);
+            }
+        }
+        v
+    };
     srv::json(
         StatusCode::OK,
         &json!({
@@ -971,7 +1021,109 @@ async fn discovery(hub: &Hub) -> Response {
                 "version": me.version,
             },
             "instances": instances,
+            "methods": d.methods(),
+            "problems": d.problems(),
+            "subnets": crate::discovery::subnets(&d.settings.interfaces),
+            "scan": d.probes.scan(),
+            "dns_sd": {
+                "domains": domains,
+                "publish": health.publish,
+                "records": crate::discovery::publish::manual_records(d),
+            },
         }),
+    )
+}
+
+/// Tells UI clients that discovery changed (scans run on after their request).
+fn discovery_events(hub: &Arc<Hub>) -> Arc<dyn Fn() + Send + Sync> {
+    let weak = Arc::downgrade(hub);
+    Arc::new(move || {
+        if let Some(h) = weak.upgrade() {
+            h.emit(&json!({ "type": "discovery" }));
+        }
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct ScanRequest {
+    #[serde(default)]
+    cidrs: Option<Vec<String>>,
+}
+
+/// `POST /api/discovery/scan`: probe every address of the given ranges (default: the LAN subnets,
+/// each at most a /22) in the background; 202 with the scan's state, progress as events.
+async fn discovery_scan(hub: &Arc<Hub>, req: Request) -> R {
+    let body: ScanRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    let state = crate::discovery::probe::start_scan(&hub.discovery, body.cidrs, discovery_events(hub)).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    hub.store.audit("admin".into(), "discovery.scan".into(), state.cidrs.join(", ")).await;
+    hub.emit(&json!({ "type": "discovery" }));
+    Ok(srv::json(StatusCode::ACCEPTED, &state))
+}
+
+#[derive(Deserialize)]
+struct ProbeRequest {
+    address: String,
+}
+
+/// `POST /api/discovery/probe`: one address or host name (optionally `:port`), by unicast multicast
+/// DNS and `GET /api/me`.
+async fn discovery_probe(hub: &Arc<Hub>, req: Request) -> R {
+    let body: ProbeRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let events = discovery_events(hub);
+    let found = crate::discovery::probe::probe(&hub.discovery, &body.address, &*events).await.map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    Ok(srv::json(StatusCode::OK, &json!({ "found": render_instances(hub, &found).await })))
+}
+
+#[derive(Deserialize)]
+struct InviteRequest {
+    instance: String,
+}
+
+/// `POST /api/discovery/invite`: let a machine found on the network know it may ask to join (for 30
+/// minutes); it still needs approving.
+async fn discovery_invite(hub: &Hub, req: Request) -> R {
+    if !hub.cfg.discovery.join_requests {
+        return Err(err(StatusCode::CONFLICT, "this server does not accept join requests ([discovery] join_requests = false)"));
+    }
+    let body: InviteRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if !hub.discovery.invites.invite(&body.instance, Instant::now()) {
+        return Err(err(StatusCode::BAD_REQUEST, "not an instance id"));
+    }
+    let who = hub.discovery.table.get(&body.instance).map(|i| i.instance).unwrap_or_else(|| body.instance.clone());
+    hub.store.audit("admin".into(), "discovery.invite".into(), who).await;
+    hub.emit(&json!({ "type": "discovery" }));
+    Ok(srv::json(StatusCode::OK, &json!({ "invited": true })))
+}
+
+/// `DELETE /api/discovery/invite/:instance`.
+async fn discovery_uninvite(hub: &Hub, id: &str) -> Response {
+    if hub.discovery.invites.revoke(id) {
+        hub.store.audit("admin".into(), "discovery.uninvite".into(), id.to_owned()).await;
+        hub.emit(&json!({ "type": "discovery" }));
+    }
+    srv::status(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/join/invited?instance=<id>` (open, rate-limited): whether this server invited that
+/// machine, and its CA fingerprint (what it announces), for a machine waiting to be invited.
+fn join_invited(hub: &Hub, req: &Request) -> Response {
+    if !hub.cfg.discovery.join_requests {
+        return srv::json(StatusCode::NOT_FOUND, &json!({ "error": "this server does not accept join requests" }));
+    }
+    let from = srv::remote_ip(req).unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let now = Instant::now();
+    if let Err(wait) = hub.discovery.invites.allow(from, now) {
+        let r = srv::json(StatusCode::TOO_MANY_REQUESTS, &json!({ "error": "too many questions; ask again later" }));
+        return srv::with_header(r, header::RETRY_AFTER, &wait.as_secs().max(1).to_string());
+    }
+    let q = srv::query(req);
+    let id = q.get("instance").map(String::as_str).unwrap_or_default();
+    if !crate::discovery::invite::valid_id(id) {
+        return srv::json(StatusCode::BAD_REQUEST, &json!({ "error": "instance must be an instance id" }));
+    }
+    srv::json(
+        StatusCode::OK,
+        &json!({ "invited": hub.discovery.invites.invited(id, now), "ca": crate::discovery::ca_fingerprint(&hub.pki.ca_der) }),
     )
 }
 
@@ -1031,6 +1183,8 @@ async fn create_join(hub: &Hub, req: Request) -> R {
     let name = hub.joins.get(&id, Instant::now(), &hub.pki.ca_der).map(|l| l.name).unwrap_or_default();
     tracing::info!(%id, agent = %name, %from, "join request received; waiting for an admin");
     hub.emit(&json!({ "type": "join_requests" }));
+    // The machine's entry under discovery now has a pending request.
+    hub.emit(&json!({ "type": "discovery" }));
     Ok(srv::json(
         StatusCode::CREATED,
         &crate::join::Created {
@@ -1062,6 +1216,7 @@ async fn poll_join(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
             if confirmed {
                 tracing::info!(%id, "join request confirmed by its machine");
                 hub.emit(&json!({ "type": "join_requests" }));
+                hub.emit(&json!({ "type": "discovery" }));
             }
             Ok(srv::json(StatusCode::OK, &polled))
         }
@@ -1099,6 +1254,11 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
         Ok(c) => c,
         Err(r) => return Ok(refused(&r)),
     };
+    // The discovered machine that asked, if it is listed (its invitation is used up).
+    let asked = hub.joins.get(id, Instant::now(), &hub.pki.ca_der).ok().and_then(|listed| {
+        let all = hub.discovery.table.snapshot();
+        all.iter().find(|i| crate::discovery::invite::request_for(i, &all, std::slice::from_ref(&listed)).is_some()).map(|i| i.id.clone())
+    });
     let wanted = decision.name.as_deref().map(crate::pki::sanitize_name).unwrap_or_else(|| c.name.clone());
     let name = free_agent_name(hub, &wanted, &c.hostname).await;
     let labels = decision.labels.as_deref().map(crate::join::clean_labels).filter(|l| !l.is_empty()).unwrap_or(c.labels);
@@ -1120,7 +1280,11 @@ async fn approve_join(hub: &Hub, id: &str, req: Request) -> R {
     hub.net.command(crate::net::Out::Unrevoke { name: name.clone() }).await;
     hub.store.audit("admin".into(), "agent.join.approve".into(), format!("{name} ({})", c.hostname)).await;
     tracing::info!(agent = %name, host = %c.hostname, "join request approved");
+    if let Some(instance) = asked {
+        hub.discovery.invites.revoke(&instance);
+    }
     hub.emit(&json!({ "type": "join_requests" }));
+    hub.emit(&json!({ "type": "discovery" }));
     Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "approved", "name": name, "labels": labels })))
 }
 
@@ -1131,6 +1295,7 @@ async fn deny_join(hub: &Hub, id: &str) -> R {
             hub.store.audit("admin".into(), "agent.join.deny".into(), name.clone()).await;
             tracing::info!(agent = %name, "join request denied");
             hub.emit(&json!({ "type": "join_requests" }));
+            hub.emit(&json!({ "type": "discovery" }));
             Ok(srv::json(StatusCode::OK, &json!({ "id": id, "status": "denied", "name": name })))
         }
         Err(r) => Ok(refused(&r)),
