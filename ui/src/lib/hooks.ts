@@ -163,3 +163,19 @@ export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => () =>
     };
   }, []);
 }
+
+/**
+ * An element's width, kept as it changes: `[ref, width]`. Measured as the ref attaches (before
+ * paint), so a layout chosen by width never shows a frame of the wrong one; 0 until then.
+ */
+export function useElementWidth<T extends HTMLElement>(): [(el: T | null) => (() => void) | undefined, number] {
+  const [width, setWidth] = useState(0);
+  const ref = useCallback((el: T | null) => {
+    if (!el) return;
+    setWidth(el.clientWidth);
+    const ro = new ResizeObserver(() => setWidth(el.clientWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width];
+}

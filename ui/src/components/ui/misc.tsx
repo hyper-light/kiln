@@ -248,6 +248,19 @@ export function ErrorState({ error, onRetry, compact }: { error: Error | string;
   );
 }
 
+/**
+ * A question asked in place, under what it acts on: what will happen, then the act and a way out.
+ * Nothing opens over the page.
+ */
+export function Confirm({ label, tone, children, actions, className }: { label: string; tone?: "danger"; children: React.ReactNode; actions: React.ReactNode; className?: string }) {
+  return (
+    <div className={cn("confirm", className)} role="group" aria-label={label} data-tone={tone}>
+      {children}
+      <div className="confirm-actions">{actions}</div>
+    </div>
+  );
+}
+
 export function Skeleton({ className, style }: { className?: string; style?: React.CSSProperties }) {
   return <div className={cn("skeleton", className)} style={style} aria-hidden="true" />;
 }

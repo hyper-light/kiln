@@ -1268,6 +1268,32 @@
   max-width: 420px;
   line-height: 1.7;
 }
+/* A question asked in place (misc.tsx Confirm): every page's confirmations look alike. */
+.confirm {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  max-width: 72ch;
+  padding: 12px 14px;
+  border: 1px solid #2b2d32;
+  border-left: 2px solid var(--color-accent);
+  border-radius: 6px;
+  background: var(--color-surface);
+  color: #c8cad0;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.confirm[data-tone="danger"] {
+  border-left-color: var(--color-fail);
+}
+.confirm p {
+  margin: 0;
+}
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .skeleton {
   position: relative;
   overflow: hidden;
@@ -1547,6 +1573,32 @@
     border-color 0.2s,
     background 0.2s;
   overflow: hidden;
+}
+/* Stacked (dag.tsx, where the graph doesn't fit): each column a row of its jobs, one under the other. */
+.dag-node[data-flow] {
+  position: relative;
+  min-height: 60px;
+}
+.dag-stages {
+  display: grid;
+  gap: 22px;
+  margin: 0;
+  padding: 4px 20px 6px;
+  list-style: none;
+}
+.dag-stage {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+.dag-stage + .dag-stage::before {
+  content: "";
+  position: absolute;
+  left: 20px;
+  top: -22px;
+  height: 22px;
+  border-left: 1px solid #343a45;
 }
 .dag-node:hover {
   border-color: #47464f;

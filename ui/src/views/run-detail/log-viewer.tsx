@@ -24,8 +24,6 @@ export default function LogViewer({
   live: boolean;
   onStepStatus?: (idx: number, status: Status) => void;
 }) {
-  const wrapRef = React.useRef<HTMLDivElement>(null);
-  const hostRef = React.useRef<HTMLDivElement>(null);
   const kRef = React.useRef<KilnTerminal | null>(null);
   const [follow, setFollow] = React.useState(true);
   const followRef = React.useRef(true);
@@ -39,120 +37,127 @@ export default function LogViewer({
   const cb = React.useRef(onStepStatus);
   cb.current = onStepStatus;
 
-  React.useEffect(() => {
-    const host = hostRef.current;
-    if (!host) return;
-    let disposed = false;
-    let ws: WebSocket | null = null;
-    let total = 0;
-    let gotAny = false;
-    let growRaf = 0;
-    const subs: { dispose(): void }[] = [];
+  // The terminal and its stream live as long as the element they draw into (and the step).
+  const hostRef = React.useCallback(
+    (host: HTMLDivElement | null) => {
+      if (!host) return;
+      let disposed = false;
+      let ws: WebSocket | null = null;
+      let total = 0;
+      let gotAny = false;
+      let growRaf = 0;
+      const subs: { dispose(): void }[] = [];
 
-    const grow = (k: KilnTerminal) => {
-      cancelAnimationFrame(growRaf);
-      growRaf = requestAnimationFrame(() => {
-        const buf = k.term.buffer.active;
-        const want = Math.max(MIN_ROWS, Math.min(MAX_ROWS, buf.length + 1));
-        setRows((r) => (want > r ? want : r));
-        if (followRef.current) k.term.scrollToBottom();
-      });
-    };
-
-    void ensureFont().then(() => {
-      if (disposed) return;
-      const k = createTerminal(host, {
-        disableStdin: true,
-        convertEol: true,
-        cursorBlink: false,
-        cursorStyle: "bar",
-        cursorInactiveStyle: "none",
-        scrollback: 100_000,
-        fontSize: 12,
-        lineHeight: 1.18,
-      }, false);
-      kRef.current = k;
-      // Hide the cursor entirely: this is a log, not a prompt.
-      k.term.write("\x1b[?25l");
-      safeFit(k, host);
-
-      subs.push(
-        k.term.onScroll(() => {
-          const b = k.term.buffer.active;
-          const atBottom = b.viewportY >= b.baseY;
-          if (atBottom !== followRef.current) setFollow(atBottom);
-        }),
-        k.search.onDidChangeResults((r) => setMatches(r ? { idx: r.resultIndex, count: r.resultCount } : null)),
-      );
-
-      const write = (data: Uint8Array | string) => {
-        total += typeof data === "string" ? data.length : data.byteLength;
-        gotAny = true;
-        k.term.write(data, () => grow(k));
-        setBytes(total);
+      // The box grows with the log up to MAX_ROWS (the observer below fits the terminal to it).
+      const grow = (k: KilnTerminal) => {
+        cancelAnimationFrame(growRaf);
+        growRaf = requestAnimationFrame(() => {
+          const buf = k.term.buffer.active;
+          const want = Math.max(MIN_ROWS, Math.min(MAX_ROWS, buf.length + 1));
+          setRows((r) => (want > r ? want : r));
+          if (followRef.current) k.term.scrollToBottom();
+        });
       };
 
-      const fallback = () => {
-        api
-          .jobLogs(jobId, step)
-          .then((text) => {
-            if (disposed || gotAny) return;
-            write(text);
-            setEnded(true);
-          })
-          .catch(() => {
-            if (!disposed && !gotAny) k.term.write("\x1b[38;2;151;153;159m(no output)\x1b[0m");
-          });
-      };
+      void ensureFont().then(() => {
+        if (disposed) return;
+        const k = createTerminal(
+          host,
+          {
+            disableStdin: true,
+            convertEol: true,
+            cursorBlink: false,
+            cursorStyle: "bar",
+            cursorInactiveStyle: "none",
+            scrollback: 100_000,
+            fontSize: 12,
+            lineHeight: 1.18,
+          },
+          false,
+        );
+        kRef.current = k;
+        // Hide the cursor entirely: this is a log, not a prompt.
+        k.term.write("\x1b[?25l");
+        safeFit(k, host);
 
-      try {
-        ws = new WebSocket(wsUrl(`/api/jobs/${encodeURIComponent(jobId)}/logs/ws?step=${step}`));
-        ws.binaryType = "arraybuffer";
-        ws.onmessage = (ev) => {
-          if (typeof ev.data === "string") {
-            try {
-              const msg = JSON.parse(ev.data) as LogControlFrame;
-              if (msg.type === "end") setEnded(true);
-              else if (msg.type === "step") cb.current?.(msg.idx, msg.status);
-            } catch {
-              write(ev.data);
+        subs.push(
+          k.term.onScroll(() => {
+            const b = k.term.buffer.active;
+            const atBottom = b.viewportY >= b.baseY;
+            if (atBottom !== followRef.current) setFollow(atBottom);
+          }),
+          k.search.onDidChangeResults((r) => setMatches(r ? { idx: r.resultIndex, count: r.resultCount } : null)),
+        );
+
+        const write = (data: Uint8Array | string) => {
+          total += typeof data === "string" ? data.length : data.byteLength;
+          gotAny = true;
+          k.term.write(data, () => grow(k));
+          setBytes(total);
+        };
+
+        const fallback = () => {
+          api
+            .jobLogs(jobId, step)
+            .then((text) => {
+              if (disposed || gotAny) return;
+              write(text);
+              setEnded(true);
+            })
+            .catch(() => {
+              if (!disposed && !gotAny) k.term.write("\x1b[38;2;151;153;159m(no output)\x1b[0m");
+            });
+        };
+
+        try {
+          ws = new WebSocket(wsUrl(`/api/jobs/${encodeURIComponent(jobId)}/logs/ws?step=${step}`));
+          ws.binaryType = "arraybuffer";
+          ws.onmessage = (ev) => {
+            if (typeof ev.data === "string") {
+              try {
+                const msg = JSON.parse(ev.data) as LogControlFrame;
+                if (msg.type === "end") setEnded(true);
+                else if (msg.type === "step") cb.current?.(msg.idx, msg.status);
+              } catch {
+                write(ev.data);
+              }
+              return;
             }
-            return;
-          }
-          write(new Uint8Array(ev.data as ArrayBuffer));
-        };
-        ws.onclose = () => {
-          if (disposed) return;
-          if (!gotAny) fallback();
-          setEnded(true);
-        };
-      } catch {
-        fallback();
-      }
-    });
+            write(new Uint8Array(ev.data as ArrayBuffer));
+          };
+          ws.onclose = () => {
+            if (disposed) return;
+            if (!gotAny) fallback();
+            setEnded(true);
+          };
+        } catch {
+          fallback();
+        }
+      });
 
-    const ro = new ResizeObserver(() => {
-      if (kRef.current) safeFit(kRef.current, host);
-    });
-    ro.observe(host);
+      // The box's height changes as it grows: the terminal fits it once a frame.
+      let fitRaf = 0;
+      const ro = new ResizeObserver(() => {
+        cancelAnimationFrame(fitRaf);
+        fitRaf = requestAnimationFrame(() => {
+          if (kRef.current) safeFit(kRef.current, host);
+        });
+      });
+      ro.observe(host);
 
-    return () => {
-      disposed = true;
-      cancelAnimationFrame(growRaf);
-      ro.disconnect();
-      subs.forEach((s) => s.dispose());
-      ws?.close();
-      kRef.current?.dispose();
-      kRef.current = null;
-    };
-  }, [jobId, step]);
-
-  // Rows changed → refit
-  React.useEffect(() => {
-    const k = kRef.current;
-    const host = hostRef.current;
-    if (k && host) requestAnimationFrame(() => safeFit(k, host));
-  }, [rows]);
+      return () => {
+        disposed = true;
+        cancelAnimationFrame(growRaf);
+        cancelAnimationFrame(fitRaf);
+        ro.disconnect();
+        subs.forEach((s) => s.dispose());
+        ws?.close();
+        kRef.current?.dispose();
+        kRef.current = null;
+      };
+    },
+    [jobId, step],
+  );
 
   const runSearch = (dir: "next" | "prev", q = query) => {
     const k = kRef.current;
@@ -170,7 +175,7 @@ export default function LogViewer({
   const height = rows * lineH + 20;
 
   return (
-    <div ref={wrapRef} className="border-t border-[#1d2128]">
+    <div className="border-t border-[#1d2128]">
       <div className="flex flex-wrap items-center gap-1 px-3 py-1.5">
         <span className="label mr-auto flex items-center gap-2">
           {live && !ended ? (
