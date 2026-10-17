@@ -217,6 +217,8 @@ impl Acp {
                     self.send(core, item, SendMode::Now);
                 }
             }
+            // ACP cannot steer a turn: it stays queued.
+            Command::QueueSteer { .. } => {}
             Command::Approve { id, decision, message, always, .. } => self.answer(core, &id, decision, message, always),
             Command::Interrupt => self.cancel(core),
             Command::SetMode { mode } => {

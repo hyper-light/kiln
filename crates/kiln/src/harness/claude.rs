@@ -512,7 +512,7 @@ impl Claude {
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(claude_catalog());
         }
-        core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images"]
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -571,6 +571,15 @@ impl Claude {
                     let item = core.state.queue.remove(pos);
                     core.touch_state();
                     self.send(core, item.id, item.text, SendMode::Now, item.attachments, item.overrides);
+                }
+            }
+            // Written now, without priority: the CLI folds it into the running turn (or starts
+            // one with it when none runs).
+            Command::QueueSteer { id } => {
+                if let Some(pos) = core.state.queue.iter().position(|q| q.id == id) {
+                    let item = core.state.queue.remove(pos);
+                    core.touch_state();
+                    self.send(core, item.id, item.text, SendMode::Steer, item.attachments, item.overrides);
                 }
             }
             Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
@@ -3467,6 +3476,28 @@ mod tests {
         c.command(&mut core, Command::Approve { id: "q1".into(), decision: Decision::Allow, message: None, always: None, answers: Some(answers), choices: None });
         let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
         assert_eq!(resp.pointer("/response/response/updatedInput/answers/Which database?").and_then(Value::as_str), Some("SQLite"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_queued_message_is_steered_into_the_running_turn() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = started();
+        assert!(core.meta.features.iter().any(|f| f == "queue_steer"));
+        let send = |c: &mut Claude, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        send(&mut c, &mut core, "m1", "build it");
+        send(&mut c, &mut core, "m2", "tests too, please");
+        core.take_writes();
+        assert_eq!(core.state.queue.len(), 1);
+        // Written at once without priority (no interrupt): the CLI folds it into the turn.
+        c.command(&mut core, Command::QueueSteer { id: "m2".into() });
+        let w: Vec<Value> = core.take_writes().iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let msg = w.iter().find(|v| str_of(v, "type") == Some("user")).cloned().unwrap_or_default();
+        assert_eq!((msg.pointer("/message/content"), msg.get("uuid"), msg.get("priority")), (Some(&json!("tests too, please")), Some(&json!("m2")), None));
+        assert!(core.state.queue.is_empty() && core.state.delivery.get("m2") == Some(&Delivery::Sent));
+        assert!(!w.iter().any(|v| v.pointer("/request/subtype") == Some(&json!("interrupt"))));
+        // Unknown: nothing happens.
+        c.command(&mut core, Command::QueueSteer { id: "nope".into() });
+        assert!(core.take_writes().is_empty());
         Ok(())
     }
 

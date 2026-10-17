@@ -53,7 +53,9 @@ enum Pending {
     Initialize,
     Thread,
     Turn(String),
-    Steer(String),
+    /// turn/steer for a message; the message itself (to send it as the next turn should the
+    /// running one end first), unless kiln wrote it (feedback).
+    Steer(String, Option<QueueItem>),
     Interrupt,
     Models,
     Suggest(String),
@@ -197,6 +199,8 @@ pub struct Codex {
     mcp_again: bool,
     /// Terminals kiln is stopping: their end reads as stopped, not failed.
     stopping: std::collections::HashSet<String>,
+    /// Queued messages to steer into the turn about to start, once it has (it has no id yet).
+    steer_on_start: Vec<String>,
     /// The thread's rollout file.
     rollout: Option<String>,
     /// The thread open kiln sent (method, params), how often, and whether to send it again at
@@ -255,6 +259,7 @@ impl Codex {
             mcp_status_seen: false,
             mcp_again: false,
             stopping: std::collections::HashSet::new(),
+            steer_on_start: Vec::new(),
             rollout: None,
             opening: None,
             open_tries: 0,
@@ -469,7 +474,7 @@ impl Codex {
             core.touch_state();
         }
         core.meta.modes = modes(self.allow_bypass);
-        core.meta.features = ["steer", "send_now", "queue", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides"]
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -528,6 +533,19 @@ impl Codex {
                     core.touch_state();
                     self.send(core, item, SendMode::Now);
                 }
+            }
+            Command::QueueSteer { id } => {
+                let Some(pos) = core.state.queue.iter().position(|q| q.id == id) else { return };
+                // A turn about to start has no id to steer into yet: once it has.
+                if self.busy(core) && self.turn.is_none() {
+                    if !self.steer_on_start.contains(&id) {
+                        self.steer_on_start.push(id);
+                    }
+                    return;
+                }
+                let item = core.state.queue.remove(pos);
+                core.touch_state();
+                self.send(core, item, SendMode::Steer);
             }
             Command::Approve { id, decision, message, always, answers, choices } => self.answer(core, &id, decision, message, always, choices_of(answers, choices)),
             Command::Interrupt => self.interrupt(core),
@@ -947,7 +965,7 @@ impl Codex {
         match (busy, mode, self.turn.clone()) {
             (true, SendMode::Steer, Some(turn)) => {
                 let items = self.items(&m);
-                self.request(core, Pending::Steer(m.id.clone()), "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": items, "clientUserMessageId": m.id}));
+                self.request(core, Pending::Steer(m.id.clone(), Some(m.clone())), "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": items, "clientUserMessageId": m.id}));
                 self.turn_messages.push(m.id.clone());
                 self.show_sent(core, &m, Delivery::Sent);
             }
@@ -1028,11 +1046,27 @@ impl Codex {
         self.show_sent(core, &m, d);
     }
 
+    /// The turn has its id: the queued messages to steer into it go in.
+    fn steer_waiting(&mut self, core: &mut Core) {
+        if self.turn.is_none() {
+            return;
+        }
+        for id in std::mem::take(&mut self.steer_on_start) {
+            if let Some(pos) = core.state.queue.iter().position(|q| q.id == id) {
+                let item = core.state.queue.remove(pos);
+                core.touch_state();
+                self.send(core, item, SendMode::Steer);
+            }
+        }
+    }
+
     /// Between turns: the next waiting message, then kiln's queue.
     fn next(&mut self, core: &mut Core) {
         if self.busy(core) || core.state.status == Status::Exited {
             return;
         }
+        // No turn to steer into: what was to be steered goes out in order.
+        self.steer_on_start.clear();
         let Some(thread) = self.thread.clone() else { return };
         if !self.waiting.is_empty() {
             let m = self.waiting.remove(0);
@@ -1103,7 +1137,7 @@ impl Codex {
             match (ask.can_decline, self.thread.clone(), self.turn.clone()) {
                 // The turn goes on: the feedback joins it.
                 (true, Some(thread), Some(turn)) => {
-                    self.request(core, Pending::Steer(mid.clone()), "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": [{"type": "text", "text": f}], "clientUserMessageId": mid}));
+                    self.request(core, Pending::Steer(mid.clone(), None), "turn/steer", json!({"threadId": thread, "expectedTurnId": turn, "input": [{"type": "text", "text": f}], "clientUserMessageId": mid}));
                     self.turn_messages.push(mid.clone());
                     self.note(core, &mid, &f, Delivery::Sent);
                 }
@@ -1148,7 +1182,14 @@ impl Codex {
             let wait = not_yet(&msg).filter(|_| self.open_tries < OPEN_TRIES);
             match kind {
                 Pending::Suggest(client) => core.reply(client, json!({"error": msg})),
-                Pending::Turn(id) | Pending::Steer(id) => {
+                // The turn ended before the steer reached it: the message starts the next one.
+                Pending::Steer(id, Some(m)) if self.turn.is_none() => {
+                    self.turn_messages.retain(|x| *x != id);
+                    self.show_sent(core, &m, Delivery::Queued);
+                    self.waiting.insert(0, m);
+                    self.next(core);
+                }
+                Pending::Turn(id) | Pending::Steer(id, _) => {
                     core.state.delivery.insert(id, Delivery::Cancelled);
                     self.notice(core, Level::Error, format!("Codex refused the message: {msg}"));
                     core.touch_state();
@@ -1289,8 +1330,9 @@ impl Codex {
                 }
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
+                self.steer_waiting(core);
             }
-            Pending::Steer(id) => {
+            Pending::Steer(id, _) => {
                 core.state.delivery.insert(id, Delivery::Started);
                 core.touch_state();
             }
@@ -1691,6 +1733,7 @@ impl Codex {
                 if let Some(t) = p.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
                     self.turn = Some(t.to_owned());
                 }
+                self.steer_waiting(core);
                 if core.state.turn_started.is_none() {
                     core.state.turn_started = Some(Core::now());
                 }
@@ -2844,6 +2887,38 @@ mod tests {
         assert_eq!(args, ["mcp", "logout", "--", "web"]);
         c.run_done(&mut core, &job, Some(1), "not signed in");
         assert!(matches!(core.effects.pop(), Some(Effect::Run { args, .. }) if args == ["mcp", "remove", "--", "web"]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_queued_message_is_steered_into_the_running_turn() -> anyhow::Result<()> {
+        let (mut c, mut core, _) = opened();
+        assert!(core.meta.features.iter().any(|f| f == "queue_steer"));
+        let send = |c: &mut Codex, core: &mut Core, id: &str, text: &str| c.command(core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        // A turn is starting (no id yet); a message waits behind it.
+        send(&mut c, &mut core, "m1", "build it");
+        let w = written(&mut core);
+        send(&mut c, &mut core, "m2", "tests too, please");
+        assert_eq!(core.state.queue.len(), 1);
+        // Steered before the turn has an id: it goes in once it has, without interrupting.
+        c.command(&mut core, Command::QueueSteer { id: "m2".into() });
+        assert!(written(&mut core).is_empty() && core.state.queue.len() == 1);
+        respond(&mut c, &mut core, &w, "turn/start", json!({"turn": {"id": "t1", "status": "inProgress", "items": []}}));
+        let w = written(&mut core);
+        let steer = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).cloned().unwrap_or_default();
+        assert_eq!((steer.pointer("/params/expectedTurnId"), steer.pointer("/params/input/0/text")), (Some(&json!("t1")), Some(&json!("tests too, please"))));
+        assert!(core.state.queue.is_empty() && !w.iter().any(|v| v.get("method") == Some(&json!("turn/interrupt"))));
+        // Another, steered at once, but the turn ends before Codex takes it: it starts the next.
+        send(&mut c, &mut core, "m3", "and docs, too");
+        c.command(&mut core, Command::QueueSteer { id: "m3".into() });
+        let w = written(&mut core);
+        let sid = w.iter().find(|v| v.get("method") == Some(&json!("turn/steer"))).and_then(|v| v.get("id")).cloned().unwrap_or_default();
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed", "items": []}}})]);
+        feed(&mut c, &mut core, &[json!({"id": sid, "error": {"code": -32600, "message": "no active turn to steer"}})]);
+        let w = written(&mut core);
+        let start = w.iter().find(|v| v.get("method") == Some(&json!("turn/start"))).cloned().unwrap_or_default();
+        assert_eq!(start.pointer("/params/input/0/text"), Some(&json!("and docs, too")));
+        assert_ne!(core.state.delivery.get("m3"), Some(&Delivery::Cancelled));
         Ok(())
     }
 

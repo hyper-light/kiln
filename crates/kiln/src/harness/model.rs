@@ -1055,6 +1055,11 @@ pub enum Command {
     QueueSendNow {
         id: String,
     },
+    /// Deliver this queued message into the running turn as steering (no interrupt); with no
+    /// turn running it is sent as the next one. (Feature "queue_steer".)
+    QueueSteer {
+        id: String,
+    },
     Approve {
         /// The approval's id.
         id: String,
