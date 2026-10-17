@@ -147,6 +147,12 @@ function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text:
   );
 }
 
+/** What the page asks of the composer. */
+export interface ComposerHandle {
+  /** Adds words after what's written (from the terminal beside it), and goes back to writing. */
+  insert: (text: string) => void;
+}
+
 export function Composer({
   store,
   state,
@@ -156,7 +162,7 @@ export function Composer({
   toMain,
   onView,
   onTerminal,
-  insert,
+  ref,
 }: {
   store: SessionStore;
   state: State | null;
@@ -169,8 +175,7 @@ export function Composer({
   onView?: (view: string) => void;
   /** Open a terminal beside the agent: its shell (`!command`), or its harness's own screen (a command only that screen does). */
   onTerminal?: (open: { what: "shell" | "screen"; command?: string }) => void;
-  /** Words to add to what's being written (from the terminal beside it), once per `seq`. */
-  insert?: { text: string; seq: number } | null;
+  ref?: React.Ref<ComposerHandle>;
 }) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
@@ -210,13 +215,16 @@ export function Composer({
   const [reply, setReply] = React.useState<Reply | "loading" | null>(null);
   const [note, setNote] = React.useState<string | null>(null);
   // What the terminal beside it hands over goes after what's written.
-  const insertSeq = insert?.seq;
-  React.useEffect(() => {
-    if (!insert) return;
-    setText((t) => (t.trim() ? `${t.replace(/\s+$/, "")}\n\n${insert.text}` : insert.text));
-    ta.current?.focus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per insert
-  }, [insertSeq]);
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      insert: (words) => {
+        setText((t) => (t.trim() ? `${t.replace(/\s+$/, "")}\n\n${words}` : words));
+        ta.current?.focus();
+      },
+    }),
+    [],
+  );
   const palItems = React.useMemo(() => (slash?.typingName && !palClosed ? matchCommands(commands, slash.name) : []), [slash?.typingName, slash?.name, palClosed, commands]);
   React.useEffect(() => {
     setPalIndex(0);

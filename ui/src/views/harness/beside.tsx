@@ -2,8 +2,9 @@
  * Terminals beside an agent, in its folder on its machine, under the conversation: its shell
  * (/terminal, or `!command` in the composer) for what the agent can't or won't run, and its
  * harness's own screen for what only that screen does (/permissions, /doctor, /screen …). kiln
- * keeps them, so they are here again after a reload or on another device. When the harness's own
- * screen closes, the agent starts again once it's idle, to load what was changed there.
+ * keeps them, so they are here again after a reload or on another device, and the list follows
+ * the server's word on terminals. When the harness's own screen closes, the agent starts again
+ * once it's idle, to load what was changed there.
  *
  * In the page's flow, never over it: one terminal shown, a select to switch when there are more,
  * what's on its screen added to the message, and on touch screens the keys a phone lacks.
@@ -13,18 +14,13 @@ import { CornerDownLeft, X } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type BesideTerminal } from "@/api/harness";
 import { charKey, namedKey, type NamedKey } from "@/components/terminal/keys";
+import { Loadable } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { TerminalSession, type SessionHandle, type SessionState } from "@/views/terminal/session";
 import { machineName } from "./parts";
 import "./beside.css";
-
-/** A terminal asked for (a new `seq` each time). */
-export interface BesideRequest {
-  what: "shell" | "screen";
-  command?: string;
-  seq: number;
-}
 
 /** Keys a phone's keyboard lacks, for shells and full-screen programs. */
 const KEYS: { label: string; aria: string; key?: NamedKey; ctrl?: string; shift?: boolean }[] = [
@@ -42,90 +38,92 @@ const KEYS: { label: string; aria: string; key?: NamedKey; ctrl?: string; shift?
 /** How many lines of what's on screen go into the message. */
 const HAND_LINES = 60;
 
-export function BesideTerminals({
-  agent,
-  info,
-  request,
-  onTaken,
-  onInsert,
-}: {
-  agent: string;
-  info: AgentInfo | null;
-  /** What was asked for; `onTaken` once it's on its way (so it's asked for once). */
-  request: BesideRequest | null;
-  onTaken: () => void;
-  onInsert: (text: string) => void;
-}) {
-  const [list, setList] = React.useState<BesideTerminal[]>([]);
-  const [current, setCurrent] = React.useState<string | null>(null);
+/** Beside one agent, here: the terminal picked, the last one opened, and what to say. */
+interface Here {
+  current: string | null;
+  /** The last one opened, and when: brought into view once it's shown. */
+  opened: { id: string; at: number } | null;
+  /** Why the last one asked for didn't open. */
+  error: string | null;
+  /** What happens now the harness's own screen has closed. */
+  said: string | null;
+}
+
+const NONE: Here = { current: null, opened: null, error: null, said: null };
+let here: Record<string, Here> = {};
+const subs = new Set<() => void>();
+
+function put(agent: string, patch: Partial<Here>) {
+  here = { ...here, [agent]: { ...(here[agent] ?? NONE), ...patch } };
+  subs.forEach((s) => s());
+}
+
+const subscribe = (cb: () => void) => {
+  subs.add(cb);
+  return () => void subs.delete(cb);
+};
+const useHere = (agent: string) => React.useSyncExternalStore(subscribe, () => here[agent] ?? NONE);
+
+const besideKey = (agent: string) => `beside/${agent}`;
+
+/**
+ * Opens a terminal beside `agent`: its shell (the one open, with `command` run in it), or its
+ * harness's own screen. It shows once the list has it.
+ */
+export async function openBeside(agent: string, o: { what: "shell" | "screen"; command?: string }) {
+  put(agent, { error: null, said: null });
+  // About the width it will have; it fits itself once it's shown.
+  const width = document.querySelector<HTMLElement>(".bt")?.clientWidth || Math.min(window.innerWidth, 760);
+  try {
+    const b = await harnessApi.openTerminal(agent, { what: o.what, command: o.command, cols: Math.max(40, Math.floor((width - 28) / 7.8)), rows: 26 });
+    put(agent, { current: b.terminal.id, opened: { id: b.terminal.id, at: Date.now() } });
+    invalidate(besideKey(agent));
+  } catch (e) {
+    put(agent, { error: errorMessage(e) });
+  }
+}
+
+export function BesideTerminals(props: { agent: string; info: AgentInfo | null; onInsert: (text: string) => void }) {
+  return (
+    <Loadable label="Loading the terminals beside it" fallback={null}>
+      <Terminals key={props.agent} {...props} />
+    </Loadable>
+  );
+}
+
+function Terminals({ agent, info, onInsert }: { agent: string; info: AgentInfo | null; onInsert: (text: string) => void }) {
+  // The ones open beside it, here earlier or on another device.
+  const res = useSuspenseResource(besideKey(agent), () => harnessApi.terminals(agent), { on: ["terminals"] });
+  const { current, opened, error, said } = useHere(agent);
   const [states, setStates] = React.useState<Record<string, SessionState>>({});
-  const [error, setError] = React.useState<string | null>(null);
-  const [said, setSaid] = React.useState<string | null>(null);
   const handle = React.useRef<SessionHandle | null>(null);
-  const root = React.useRef<HTMLDivElement>(null);
   const [fontSize] = useLocalStorage("kiln.term.fontSize", 13);
   const [copyOnSelect] = useLocalStorage("kiln.term.copyOnSelect", false);
   const touch = useMediaQuery("(pointer: coarse)");
   const harness = info?.kind_name ?? "The harness";
 
-  // The ones already open beside it (here earlier, or on another device).
-  React.useEffect(() => {
-    let live = true;
-    harnessApi.terminals(agent).then(
-      (l) => {
-        if (!live) return;
-        const open = l.filter((b) => !b.terminal.exited);
-        setList(open);
-        setCurrent((c) => c ?? open[0]?.terminal.id ?? null);
-      },
-      () => undefined,
-    );
-    return () => {
-      live = false;
-    };
-  }, [agent]);
-
-  // What was asked for: its shell (again, with a command run in it), or its own screen.
-  const seq = request?.seq;
-  React.useEffect(() => {
-    if (!request) return;
-    let live = true;
-    setError(null);
-    setSaid(null);
-    const width = root.current?.clientWidth || 760;
-    onTaken();
-    harnessApi.openTerminal(agent, { what: request.what, command: request.command, cols: Math.max(40, Math.floor((width - 28) / 7.8)), rows: 26 }).then(
-      (b) => {
-        if (!live) return;
-        setList((l) => [b, ...l.filter((x) => x.terminal.id !== b.terminal.id)]);
-        setCurrent(b.terminal.id);
-        requestAnimationFrame(() => root.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
-      },
-      (e: unknown) => live && setError(errorMessage(e)),
-    );
-    return () => {
-      live = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- each request once, by its seq
-  }, [seq]);
-
-  const shown = list.find((b) => b.terminal.id === current) ?? list[0] ?? null;
+  const open = res.data.filter((b) => !b.terminal.exited);
+  // The one picked stays shown when it ends, with how it ended, until it's closed.
+  const picked = res.data.find((b) => b.terminal.id === current);
+  const shown = picked ?? open[0] ?? null;
+  const list = picked?.terminal.exited ? [picked, ...open] : open;
   const st = shown ? states[shown.terminal.id] : undefined;
+  const ended = Boolean(shown?.terminal.exited) || st?.kind === "exited";
 
-  const onState = React.useCallback((id: string, s: SessionState) => setStates((m) => ({ ...m, [id]: s })), []);
-  const noop = React.useCallback(() => undefined, []);
-  /** It ended (here, on another device, or by itself): it goes; a screen says what happens next. */
-  const onClosed = React.useCallback(
-    (id: string) => {
-      setList((l) => {
-        const gone = l.find((b) => b.terminal.id === id);
-        if (gone?.what === "screen") setSaid(`${harness}'s own screen closed. The agent starts again once it's idle, to load what you changed; the conversation continues.`);
-        return l.filter((b) => b.terminal.id !== id);
-      });
-      setCurrent((c) => (c === id ? null : c));
+  // A terminal just opened comes into view once it's shown (and again when it's picked).
+  const bringIn = React.useCallback(
+    (el: HTMLElement | null) => {
+      if (el && opened) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
     },
-    [harness],
+    [opened],
   );
+
+  /** It ended on purpose (here or on another device): it goes; a screen says what happens next. */
+  const gone = (id: string) => {
+    if (res.data.find((b) => b.terminal.id === id)?.what === "screen")
+      put(agent, { said: `${harness}'s own screen closed. The agent starts again once it's idle, to load what you changed; the conversation continues.` });
+    res.setData((l) => l.filter((b) => b.terminal.id !== id));
+  };
 
   const close = async (b: BesideTerminal) => {
     try {
@@ -133,7 +131,7 @@ export function BesideTerminals({
     } catch {
       /* already gone */
     }
-    onClosed(b.terminal.id);
+    gone(b.terminal.id);
   };
 
   /** The end of what's on its screen, as a block for the message. */
@@ -157,7 +155,7 @@ export function BesideTerminals({
   const labelOf = (b: BesideTerminal) => (b.what === "shell" ? "Shell" : `${harness}${b.command ? ` · ${b.command}` : ""}`);
 
   return (
-    <section ref={root} className="bt" aria-label="Terminal beside the agent">
+    <section ref={shown && opened?.id === shown.terminal.id ? bringIn : undefined} className="bt" aria-label="Terminal beside the agent">
       {error && <p className="bt-error">{error}</p>}
       {said && !shown && <p className="bt-said">{said}</p>}
       {shown && (
@@ -168,7 +166,7 @@ export function BesideTerminals({
               <span className="bt-where">{where}</span>
             </div>
             <div className="bt-actions">
-              <button type="button" className="bt-btn" onClick={hand} disabled={st?.kind !== "open"}>
+              <button type="button" className="bt-btn" onClick={hand} disabled={st?.kind !== "open" && st?.kind !== "exited"}>
                 <CornerDownLeft size={13} aria-hidden="true" /> Add to message
               </button>
               <button type="button" className="bt-btn bt-close" aria-label={`Close ${labelOf(shown)}`} onClick={() => void close(shown)}>
@@ -177,16 +175,29 @@ export function BesideTerminals({
             </div>
           </div>
           {list.length > 1 && (
-            <SelectField className="bt-pick" label="Terminal" hideLabel value={shown.terminal.id} onChange={setCurrent} options={list.map((b) => ({ value: b.terminal.id, label: labelOf(b) }))} />
+            <SelectField
+              className="bt-pick"
+              label="Terminal"
+              hideLabel
+              value={shown.terminal.id}
+              onChange={(id) => put(agent, { current: id })}
+              options={list.map((b) => ({ value: b.terminal.id, label: labelOf(b) }))}
+            />
           )}
           {shown.what === "screen" && (
             <p className="bt-note">
-              {shown.to_type && shown.command ? (
+              {ended ? (
+                "It has closed: the agent starts again once it's idle, to load what you changed; the conversation continues."
+              ) : (
                 <>
-                  Type <code>{shown.command}</code> in it.{" "}
+                  {shown.to_type && shown.command ? (
+                    <>
+                      Type <code>{shown.command}</code> in it.{" "}
+                    </>
+                  ) : null}
+                  When you quit it, the agent starts again once it&rsquo;s idle, to load what you changed; the conversation continues.
                 </>
-              ) : null}
-              When you quit it, the agent starts again once it&rsquo;s idle, to load what you changed; the conversation continues.
+              )}
             </p>
           )}
           <div className="bt-screen">
@@ -200,15 +211,15 @@ export function BesideTerminals({
               fontSize={fontSize}
               copyOnSelect={copyOnSelect}
               deviceKeyboard
-              onState={onState}
-              onTitle={noop}
-              onSession={noop}
-              onClosed={onClosed}
+              onState={(id, s) => setStates((m) => ({ ...m, [id]: s }))}
+              onTitle={() => undefined}
+              onSession={() => undefined}
+              onClosed={gone}
             />
           </div>
           {st?.kind === "reconnecting" && <p className="bt-note">Reconnecting…</p>}
           {st?.kind === "error" && <p className="bt-error">{st.message}</p>}
-          {touch && (
+          {touch && !ended && (
             <div className="bt-keys" role="group" aria-label="Keys">
               {KEYS.map((k) => (
                 <button key={k.aria} type="button" className="bt-key" aria-label={k.aria} onPointerDown={(e) => e.preventDefault()} onClick={() => key(k)}>

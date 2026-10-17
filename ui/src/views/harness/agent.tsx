@@ -13,7 +13,7 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useMediaQuery } from "@/lib/hooks";
 import { AccountCard } from "./account-card";
-import { Composer } from "./composer";
+import { Composer, type ComposerHandle } from "./composer";
 import { useAgentActions } from "./actions";
 import { SettingsSheet, useAttachments } from "./controls";
 import { changesetOf } from "./derive";
@@ -23,7 +23,7 @@ import { Inspector, type InspectorTab } from "./inspector";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
 import { Timeline } from "./timeline";
-import { BesideTerminals, type BesideRequest } from "./beside";
+import { BesideTerminals, openBeside } from "./beside";
 import { PlanSourceContext } from "@/views/plans/save";
 
 type PhoneTab = "work" | InspectorTab;
@@ -42,16 +42,18 @@ export default function AgentPage() {
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
   const [account, setAccount] = React.useState<"login" | "logout" | null>(null);
-  /** A terminal beside it (its shell, its harness's own screen), asked for from the composer. */
-  const [beside, setBeside] = React.useState<BesideRequest | null>(null);
-  /** What the terminal hands to the composer. */
-  const [handed, setHanded] = React.useState<{ text: string; seq: number } | null>(null);
-  const openBeside = React.useCallback((o: { what: "shell" | "screen"; command?: string }) => {
-    setBeside({ ...o, seq: Date.now() });
-    setPhoneTab("work");
-  }, []);
-  const hand = React.useCallback((text: string) => setHanded({ text, seq: Date.now() }), []);
-  const taken = React.useCallback(() => setBeside(null), []);
+  /** A terminal beside it (its shell, its harness's own screen), asked for from the composer: shown under the main thread. */
+  const showBeside = React.useCallback(
+    (o: { what: "shell" | "screen"; command?: string }) => {
+      void openBeside(id, o);
+      setTask(null);
+      setPhoneTab("work");
+    },
+    [id],
+  );
+  /** What the terminal beside it hands to the composer. */
+  const composer = React.useRef<ComposerHandle>(null);
+  const hand = React.useCallback((text: string) => composer.current?.insert(text), []);
   // /login and /logout open the account in the conversation, below what was said: brought into view once.
   const showAccount = React.useCallback((el: HTMLDivElement | null) => el?.scrollIntoView({ block: "nearest", behavior: "smooth" }), []);
   // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown.
@@ -165,8 +167,8 @@ export default function AgentPage() {
     if (view === "settings") setSettings(true);
     else if (view === "login" || view === "logout") setAccount(view);
     else if (view === "model" || view === "effort" || view === "permissions") openSetting(view === "model" ? "Model" : view === "effort" ? "Effort" : "Permissions");
-    else if (view === "terminal") openBeside({ what: "shell" });
-    else if (view === "screen") openBeside({ what: "screen" });
+    else if (view === "terminal") showBeside({ what: "shell" });
+    else if (view === "screen") showBeside({ what: "screen" });
     else if (view === "goals") showPlan();
     else if (view === "tasks") showTools();
     else if (view === "changes") {
@@ -234,7 +236,7 @@ export default function AgentPage() {
                 <AccountCard key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />
               </div>
             )}
-            {!task && <BesideTerminals agent={id} info={info ?? null} request={beside} onTaken={taken} onInsert={hand} />}
+            {!task && <BesideTerminals agent={id} info={info ?? null} onInsert={hand} />}
           </>
         }
       />
@@ -263,7 +265,7 @@ export default function AgentPage() {
             )}
           </div>
         ) : null}
-        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} onView={openView} onTerminal={openBeside} insert={handed} />
+        <Composer store={store} state={state} meta={meta} disabled={conn !== "open"} attachments={attachments} toMain={task !== null} onView={openView} onTerminal={showBeside} ref={composer} />
       </div>
     </div>
   );
