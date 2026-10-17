@@ -464,6 +464,8 @@ export const harnessApi = {
   /** Every connected machine's harnesses, by target ("local", "agent:<name>"). */
   kindsAll: () => call<Record<string, KindInfo[]>>("GET", "/api/harness/kinds"),
   list: () => call<AgentInfo[]>("GET", "/api/harness/sessions"),
+  /** End the terminal a found session runs in and continue its conversation as an agent here. */
+  takeover: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/takeover`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** A command without opening the session's socket (inbox answers). */

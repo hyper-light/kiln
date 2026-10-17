@@ -1,11 +1,13 @@
 import * as React from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
-import { Bot, FileText, Plus, SquareTerminal } from "lucide-react";
+import { ArrowRightLeft, Bot, FileText, Plus, SquareTerminal } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { AiSession, AiTranscriptEntry } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
+import { toast } from "@/components/ui/toast";
+import { harnessApi } from "@/api/harness";
 import { EmptyState, ErrorState, Facts, PageIntro, SearchField, Skeleton, SkeletonRows } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { Segmented } from "@/components/ui/tabs";
@@ -190,6 +192,43 @@ export default function Agents() {
   );
 }
 
+/** Continue a session found in a kiln terminal as an agent kiln runs (its terminal ends). */
+function TakeOver({ s }: { s: AiSession }) {
+  const navigate = useNavigate();
+  const [confirm, setConfirm] = React.useState(false);
+  if (!s.takeover || s.takeover === "unsupported") return null;
+  const why =
+    s.takeover === "outside"
+      ? "Runs outside kiln: quit it there first"
+      : s.takeover === "no_id"
+        ? "Still starting"
+        : s.takeover === "upgrade"
+          ? `Upgrade ${s.machine}'s runner first (Settings → Updates)`
+          : undefined;
+  return (
+    <>
+      <Button size="sm" disabled={s.takeover !== "ready"} title={why} onClick={() => setConfirm(true)}>
+        <ArrowRightLeft /> Take over
+      </Button>
+      <ConfirmDialog
+        open={confirm}
+        onOpenChange={setConfirm}
+        title="Take over this session?"
+        description={`Ends its terminal on ${s.machine} and continues the conversation here as an agent — same folder, history and model.`}
+        confirmLabel="Take over"
+        onConfirm={async () => {
+          try {
+            const [a] = await harnessApi.takeover(s.machine, s.pid);
+            if (a) navigate(`/agents/${a.id}`);
+          } catch (e) {
+            toast.error("Couldn't take it over", errorMessage(e));
+          }
+        }}
+      />
+    </>
+  );
+}
+
 function SessionCard({ s, onTranscript }: { s: AiSession; onTranscript: () => void }) {
   return (
     <article className="card flex min-w-0 flex-col" data-live={s.state === "working" ? "true" : undefined}>
@@ -217,8 +256,9 @@ function SessionCard({ s, onTranscript }: { s: AiSession; onTranscript: () => vo
       )}
       {s.last_reply && <p className="mt-1.5 line-clamp-3 px-4 text-[12.5px] leading-relaxed break-words text-[#a1a4ad]">{s.last_reply}</p>}
       <div className="mt-auto flex flex-wrap items-center gap-2 px-4 pt-4 pb-4">
+        <TakeOver s={s} />
         {s.terminal ? (
-          <Button asChild size="sm">
+          <Button asChild size="sm" variant={s.takeover === "ready" ? "secondary" : undefined}>
             <Link to={terminalLink(s)}>
               <SquareTerminal /> Open terminal
             </Link>

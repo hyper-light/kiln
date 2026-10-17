@@ -367,6 +367,8 @@ export interface AiSession {
   last_reply: string;
   /** The kiln terminal session it runs in: attach to drive it. Null when started outside kiln. */
   terminal: string | null;
+  /** Whether kiln can take it over as an agent: ready (it runs in a kiln terminal), outside (quit it there first), no_id (still starting), upgrade (its machine's runner is too old to do it safely), unsupported. Older servers omit it. */
+  takeover?: "ready" | "outside" | "no_id" | "unsupported" | "upgrade";
   /** Its transcript can be opened. */
   transcript: boolean;
 }
