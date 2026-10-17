@@ -41,10 +41,22 @@ const LINE_MAX: usize = 16 << 10;
 /// Most requests one tree has in flight at once, so reading it never floods a cluster.
 const IN_FLIGHT: usize = 8;
 
-/// Runs `futs` at most [`IN_FLIGHT`] at a time; their results in any order. (Made into a list
-/// first, as `join_all` does, so no iterator's closure is held across an await.)
-fn bounded<T, F: std::future::Future<Output = T>>(futs: Vec<F>) -> impl std::future::Future<Output = Vec<T>> {
-    futures::stream::iter(futs).buffer_unordered(IN_FLIGHT).collect()
+/// Runs `futs` [`IN_FLIGHT`] at a time, a batch after another; their results in order.
+///
+/// Batches of `join_all`, not `buffer_unordered`: hyper-rt's sockets know the task polling them by
+/// its waker, and `FuturesUnordered` polls each future with a waker of its own, so a request that
+/// had to dial a new connection failed with "not on a shard thread" (`join_all` of fewer than 30
+/// futures polls them with the task's own).
+async fn bounded<T, F: std::future::Future<Output = T>>(futs: Vec<F>) -> Vec<T> {
+    let mut out = Vec::with_capacity(futs.len());
+    let mut rest = futs.into_iter();
+    loop {
+        let batch: Vec<F> = rest.by_ref().take(IN_FLIGHT).collect();
+        if batch.is_empty() {
+            return out;
+        }
+        out.extend(futures::future::join_all(batch).await);
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
