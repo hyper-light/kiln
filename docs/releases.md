@@ -31,7 +31,8 @@ it, the server runs the release pipeline on that commit. When the run succeeds, 
 runner can be upgraded to exactly what the server runs, so platforms don't drift apart.
 
 - The commit must be in the repository kiln builds from (`release_repo`). A commit deployed
-  before it was pushed fails to start; it's tried again after 30 minutes, at most 3 times.
+  before it was pushed can't start; it's tried again every 10 minutes until it's there. A build
+  that fails is tried again after 30 minutes, at most 3 times.
 - An uploaded binary isn't built from any commit, so the next build replaces it.
 - `[updates] in_step = false` turns this off. Settings → Updates shows the commit, and which
   platforms are behind it.

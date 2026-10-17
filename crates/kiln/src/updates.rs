@@ -292,11 +292,13 @@ pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::st
 
 /// How often the other platforms' binaries are checked against the server's commit.
 const IN_STEP_EVERY: Duration = Duration::from_secs(5 * 60);
-/// A build of the server's commit that failed, or couldn't start (the commit isn't in the
-/// repository yet: deployed before it was pushed), is tried again after this long.
+/// A build of the server's commit that failed is tried again after this long.
 const IN_STEP_RETRY: Duration = Duration::from_secs(30 * 60);
 /// At most this many builds of one commit.
 const IN_STEP_TRIES: usize = 3;
+/// A build that couldn't start, because the commit isn't in the repository yet (deployed before
+/// it was pushed), is started again after this long, for as long as it takes.
+const IN_STEP_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// The other platforms' binaries against the commit this server runs.
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
@@ -326,31 +328,32 @@ fn in_step_of(others: &[&str], kept: &[Binary], commit: &str) -> InStep {
     InStep { in_step: !commit.is_empty() && behind.is_empty(), commit: (!commit.is_empty()).then(|| commit.to_owned()), behind }
 }
 
-/// Builds of the server's commit that couldn't start, here (they leave no run).
+/// The last build of the server's commit that couldn't start, here (it leaves no run).
 #[derive(Debug, Default)]
 struct Starts {
-    failed: usize,
     /// Unix seconds.
     last: Option<i64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Next {
-    /// One is on its way or done, or it was tried enough.
+    /// One is on its way or done, or builds of it failed enough.
     Nothing,
     /// The last try was too recent.
     Wait,
     Build,
 }
 
-/// What to do about the server's commit, from the release runs of it and the starts that failed.
+/// What to do about the server's commit, from the release runs of it and the last start that
+/// failed. Only builds that ran and failed count against it: a commit that isn't pushed yet is
+/// waited for.
 fn next(runs: &[crate::store::Run], starts: &Starts, now: i64) -> Next {
-    if runs.iter().any(|r| !r.status.is_terminal() || r.status.is_success()) || runs.len() + starts.failed >= IN_STEP_TRIES {
+    if runs.iter().any(|r| !r.status.is_terminal() || r.status.is_success()) || runs.len() >= IN_STEP_TRIES {
         return Next::Nothing;
     }
-    let last = runs.iter().map(|r| r.finished_at.unwrap_or(r.created_at)).chain(starts.last).max();
-    let retry = i64::try_from(IN_STEP_RETRY.as_secs()).unwrap_or(i64::MAX);
-    if last.is_some_and(|t| now.saturating_sub(t) < retry) { Next::Wait } else { Next::Build }
+    let within = |at: Option<i64>, d: Duration| at.is_some_and(|t| now.saturating_sub(t) < i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let ran = runs.iter().map(|r| r.finished_at.unwrap_or(r.created_at)).max();
+    if within(ran, IN_STEP_RETRY) || within(starts.last, IN_STEP_WAIT) { Next::Wait } else { Next::Build }
 }
 
 fn short(commit: &str) -> &str {
@@ -409,7 +412,6 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
             Ok(())
         }
         Err(e) => {
-            starts.failed += 1;
             starts.last = Some(crate::util::now_unix());
             Err(e)
         }
@@ -1564,7 +1566,7 @@ mod tests {
     }
 
     #[test]
-    fn the_servers_commit_is_built_once_retried_after_a_while_and_given_up_after_three() {
+    fn the_servers_commit_is_built_once_waited_for_until_pushed_and_given_up_after_three_failed_builds() {
         let run = |status: crate::store::Status, finished: Option<i64>| crate::store::Run {
             id: String::new(),
             repo_id: String::new(),
@@ -1591,11 +1593,13 @@ mod tests {
         assert_eq!(next(&[run(Succeeded, Some(now - 10))], &none, now), Next::Nothing);
         assert_eq!(next(&[run(Failed, Some(now - 60))], &none, now), Next::Wait);
         assert_eq!(next(&[run(Failed, Some(now - 3600))], &none, now), Next::Build);
-        // A start that failed (the commit wasn't pushed yet) waits too, and counts as a try.
-        let started = Starts { failed: 1, last: Some(now - 60) };
-        assert_eq!(next(&[], &started, now), Next::Wait);
-        let tried = Starts { failed: 1, last: Some(now - 7200) };
-        assert_eq!(next(&[run(Failed, Some(now - 7200)), run(Failed, Some(now - 7200))], &tried, now), Next::Nothing);
+        // A start that failed (the commit wasn't pushed yet) waits 10 minutes, then tries again, for
+        // as long as it takes: only builds that ran and failed count.
+        assert_eq!(next(&[], &Starts { last: Some(now - 60) }, now), Next::Wait);
+        assert_eq!(next(&[], &Starts { last: Some(now - 11 * 60) }, now), Next::Build);
+        assert_eq!(next(&[run(Failed, Some(now - 7200))], &Starts { last: Some(now - 11 * 60) }, now), Next::Build);
+        let failed3 = [run(Failed, Some(now - 9000)), run(Failed, Some(now - 8000)), run(Failed, Some(now - 7200))];
+        assert_eq!(next(&failed3, &none, now), Next::Nothing);
     }
 
     #[test]
