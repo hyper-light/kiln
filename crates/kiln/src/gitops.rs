@@ -223,6 +223,11 @@ pub struct Trigger {
 
 /// Turn a trigger into runs: one per matching pipeline file.
 pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<Run>> {
+    // A push to the branch kiln builds itself from: the server's own commit may have just arrived.
+    let u = &hub.cfg.updates;
+    if t.event == "push" && repo.name == u.release_repo && t.branch == u.release_branch {
+        hub.updates.wake_in_step();
+    }
     // The CI engine's GitHub workflows (docs/ci.md W03), when it is on; v1 keeps `.kiln/`.
     let github = match crate::ci::events::on_trigger(hub, repo, &t).await {
         Ok(ran) => ran,

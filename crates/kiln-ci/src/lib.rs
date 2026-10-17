@@ -10,6 +10,7 @@
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
+//! - [`store`]: chunking and GitHub's cache rules for the runtime store (W08).
 //! - [`stats`]: bootstrap intervals for benchmarks and experiments (W16, W20).
 //! - [`facts`]: what runners report about themselves (W13).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
@@ -21,6 +22,7 @@ pub mod results;
 pub mod runner;
 pub mod sched;
 pub mod stats;
+pub mod store;
 pub mod trigger;
 pub mod wf;
 pub mod wire;

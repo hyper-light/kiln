@@ -55,6 +55,13 @@ interface Entry {
   used: number;
 }
 
+/**
+ * Already settled, for React: `use()` reads its status and doesn't wait. A read must call `use()`
+ * on every render, not only while loading: React replays the render that suspended and needs the
+ * same calls (react.dev/warnings/conditional-use-of-use).
+ */
+const SETTLED: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
+
 /** At most this many keys are kept once nothing shows them. */
 const KEEP = 200;
 const entries = new Map<string, Entry>();
@@ -166,10 +173,8 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
     () => e.snap,
     () => e.snap,
   );
-  if (!snap.has) {
-    if (snap.failed) throw snap.error;
-    use(e.promise ?? load(e));
-  }
+  if (!snap.has && snap.failed) throw snap.error;
+  use(snap.has ? SETTLED : (e.promise ?? load(e)));
   return {
     data: snap.data as T,
     refreshing: snap.refreshing,

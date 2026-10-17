@@ -920,6 +920,9 @@ pub struct State {
     pub mode: String,
     #[serde(default)]
     pub title: String,
+    /// The session's name as a person last gave it (empty: the one it started with).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// What the person first asked for (the session's goal), shortened.
     #[serde(default)]
     pub goal: String,

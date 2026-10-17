@@ -176,15 +176,15 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; push, tag, PR, manual from polling |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit); preview and fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` steps GitHub-exact on the host executor; `uses:` with W07 |
-| W07 | Actions | W06 | blocked (W06) | |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host executor; background steps, matchers, containers left |
+| W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local; `actions/checkout@v4` unmodified; Docker, `$/`, policy left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | ready | |
 | W09 | Secrets and variables | W01 | ready | |
 | W10 | Identity, tokens, OIDC issuer | none | ready | |
 | W11 | Integrations and credential broker | W10 | blocked (W10) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | ready (facts, docker) | |
-| W14 | Code hosting, stacks, review, landing | W03 | ready (git hosting) | |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade's git (smart HTTP at the root, leg tokens); REST, hosting, review left |
 | W15 | Environments and deployments | W04, W09 | blocked (W04) | |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
 | W17 | Debugging | W06, W13 | blocked (W06) | |
@@ -603,12 +603,19 @@ wait reason says so (W05).
 | `/_kiln/actions/…` | Action tarballs at pinned SHAs (W07) | job token |
 | `/v2/…` | The built-in OCI registry (W12) | registry tokens (W12) |
 | `/_kiln/proxy/<ecosystem>/…` | Package registry proxies (W12) | job token or PAT |
-| facade origin (own port or host name) `/<owner>/<repo>.git`, `/api/v3/…`, `/api/graphql` | GitHub-compatible git and REST for jobs (W14) | job token as `GITHUB_TOKEN` |
+| `/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`, `/api/v3/…`, `/api/graphql` | The facade: GitHub-compatible git and REST for jobs (W14) | job token as `GITHUB_TOKEN` |
 | `/git/<owner>/<repo>.git` | Native git hosting (W14) | PAT, agent token |
 
-The facade needs its own **origin** (scheme, host and port), because `actions/checkout` builds its
-URLs from the origin of `GITHUB_SERVER_URL` and drops any path. kiln serves it on
-`[ci.facade] listen` (default `:7073`) and advertises `[ci.facade] public_url`.
+The facade lives at the **root** of the server's origin, because `actions/checkout` builds its
+URLs from the origin of `GITHUB_SERVER_URL` and drops any path. Its paths can't collide with
+kiln's own:
+- the server and the UI never use a path ending in `info/refs` or `git-upload-pack`;
+- `/api/v3` and `/api/graphql` are GitHub Enterprise Server's API paths, which kiln's API doesn't use.
+
+So `GITHUB_SERVER_URL` is the server's `public_url`. Jobs reach the facade through the same front
+door and certificate as everything else, and no second listener is needed. (The first draft gave
+the facade its own origin. Sharing one is simpler and just as safe, because the facade accepts
+only a job's token and ignores cookies.)
 
 ---
 
@@ -1868,9 +1875,9 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     - GitHub's cancel sequence (W05-R18);
     - job outputs (R10, one holding a secret is dropped);
     - a step's background processes kept until the leg ends.
-  - Runners announce `CAP_CI2`.
+  - `uses:` steps (W07), with pre and post steps (R11).
+  - Runners announce `CAP_CI2` and `CAP_ACTIONS`.
 - *Left.*
-  - `uses:` (W07), with pre and post steps (R11).
   - Background steps (R17), problem matchers, `KILN_OUTPUT_JSON` and `exports`.
   - Job containers and services (W13), debug (R13).
   - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.
@@ -1974,7 +1981,37 @@ Gives step execution for `uses:`.
   fails the plan with `KCI4040` when the pipeline lacks the secret and runs when it has it (with
   W09). *Integration test.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - `crates/kiln/src/ci/actions.rs`, on the server:
+    - R02: every remote `uses:` a run can reach is pinned when the run starts, including those of
+      composite actions (up to 10 deep). The pins are saved with the run's plan input, so a run
+      replayed after a restart keeps them.
+    - R03: a bare mirror per action repository (`<data>/actions/<owner>__<repo>.git`). A ref
+      resolves as a tag, then a branch, then a SHA. A known pin still resolves when the source is
+      unreachable. Each pinned commit is served as a tarball (`git archive`) at
+      `/_kiln/actions/<owner>/<repo>/<sha>.tar.gz`, for a leg's token.
+  - `crates/kiln/src/runner/runtime.rs`, on the runner:
+    - R01: `./path` and `owner/repo[/path]@ref`.
+    - R05:
+      - Node: `node24` runs on Node 24; `node20`, `node16` and `node12` run on Node 20. Builds
+        come from nodejs.org, are checked against `SHASUMS256.txt`, and are kept in
+        `<work>/_externals`.
+      - Inputs: `INPUT_*`, with defaults evaluated, and GitHub's "Unexpected input(s)" warning.
+      - `GITHUB_ACTION_PATH`, `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF`.
+      - `pre`, `post`, `pre-if`, `post-if` and `STATE_*` (W06-R11).
+    - R07: composite actions, with their own `steps` context, inputs, outputs and nesting.
+    - R08: outputs.
+  - `actions/checkout@v4` runs unmodified end to end against the git facade (W14).
+- *Left.*
+  - R01's `$/path`, `docker://`, `kiln://` and `kiln/*`.
+  - R06 Docker actions, with W13.
+  - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
+    tarballs in W08's store (today they are files under `<data>/actions/tar`).
+  - R04, R09 beyond checkout (with W14's REST facade), R10, R11, R12.
+  - musl Node for Alpine job containers, with W13.
+  - AC01 to AC06.
 
 ### W08 Runtime services: store, caches, artifacts, reuse
 
@@ -2774,7 +2811,16 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** Not started.
+**Progress.** In progress: so far, only the facade's git half.
+
+- *Done.* R11's git half, in `crates/kiln/src/ci/facade.rs`:
+  - smart HTTP over the server's mirror, served by `git http-backend` (protocols v0 to v2,
+    gzipped requests, fetches by SHA, filters);
+  - served at the root of the server's origin (§2.6);
+  - open to a leg's token only, and each token reads only its own run's repository.
+  - `actions/checkout@v4` with default settings runs unmodified.
+- *Left.* Everything else: R11's REST subset and GraphQL, hosting (R01, R02), review, landing,
+  the App, the schema, and AC01 to AC07.
 
 ### W15 Environments and deployments
 
