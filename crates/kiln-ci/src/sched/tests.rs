@@ -284,3 +284,14 @@ fn restart_adopts_running_legs() {
     assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, .. } if leg == "run1")));
     assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "next")));
 }
+
+#[test]
+fn a_rejected_assignment_goes_elsewhere_on_the_same_attempt() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("x", "acme/x", 60))), 0);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "a")));
+    s.handle(Input::RunnerUp(Box::new(linux("b", 1))), 1);
+    let c = s.handle(Input::Rejected { leg: "x".into() }, 2);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { runner, attempt: 1, .. } if runner == "b")), "{c:?}");
+}

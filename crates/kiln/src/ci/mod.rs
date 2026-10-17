@@ -3,7 +3,10 @@
 //! adds one line here and one arm in [`api`].
 
 pub mod api;
+pub mod dispatch;
+pub mod events;
 pub mod load;
+pub mod runs;
 pub mod workflows;
 
 /// A failure: an HTTP status and why (as `cd::ops::Fail`).

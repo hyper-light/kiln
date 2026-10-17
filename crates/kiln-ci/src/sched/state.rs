@@ -118,6 +118,9 @@ pub enum Input {
     /// The plan cancelled a leg (fail-fast, the run cancelled).
     LegCancelled { leg: String, reason: String },
     AttemptFinished { leg: String, attempt: u32, outcome: Outcome },
+    /// The runner refused the assignment (no free slot, draining): the leg goes back to its queue,
+    /// the same attempt, and not to that runner.
+    Rejected { leg: String },
     RunnerUp(Box<RunnerIn>),
     RunnerChanged(Box<RunnerIn>),
     RunnerLost { runner: String },
@@ -246,6 +249,15 @@ impl Scheduler {
             Input::LegRunning { leg, runner, attempt } => self.adopt(*leg, runner, attempt),
             Input::LegCancelled { leg, reason } => self.cancel(&leg, reason, now, &mut out),
             Input::AttemptFinished { leg, attempt, outcome } => self.finished(&leg, attempt, outcome, now, &mut out),
+            Input::Rejected { leg } => {
+                if let Some(runner) = self.release(&leg) {
+                    if let Some(l) = self.legs.get_mut(&leg) {
+                        l.avoid = Some(runner.clone());
+                    }
+                    self.enqueue(&leg, now, &mut out);
+                    self.try_runner(&runner, now, &mut out);
+                }
+            }
             Input::RunnerUp(r) | Input::RunnerChanged(r) => self.runner_up(*r, now, &mut out),
             Input::RunnerLost { runner } => self.runner_lost(&runner, now, &mut out),
             Input::RunnerDraining { runner } => {

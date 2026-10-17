@@ -98,6 +98,8 @@ pub struct Hub {
     pub net: NetHandle,
     pub pki: Arc<crate::pki::Pki>,
     pub agents: Mutex<HashMap<String, AgentLive>>,
+    /// The CI engine's dispatcher (docs/ci.md W05): its runs, legs and their messages.
+    pub ci: crate::ci::dispatch::Handle,
     peers: Mutex<HashMap<PeerId, String>>,
     pending_peers: Mutex<HashMap<PeerId, String>>,
     /// Runners' HTTP tunnels, and which QUIC connections they carry (see `crate::tunnel`).
@@ -172,6 +174,7 @@ impl Hub {
             net,
             pki,
             agents: Mutex::new(HashMap::new()),
+            ci: crate::ci::dispatch::Handle::default(),
             peers: Mutex::new(HashMap::new()),
             pending_peers: Mutex::new(HashMap::new()),
             tunnels: Arc::default(),
@@ -638,7 +641,10 @@ impl Hub {
                 None => vec![],
             }
         };
-        for j in jobs {
+        if jobs.iter().any(|j| self.ci.is_leg(j)) {
+            self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.to_owned() });
+        }
+        for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
             match self.store.requeue_job(j.clone(), format!("{reason} ({name})")).await {
                 Ok(true) => tracing::info!(job = %j, agent = name, "job requeued"),
                 Ok(false) => tracing::warn!(job = %j, agent = name, "job failed: out of retries"),
@@ -694,7 +700,16 @@ impl Hub {
             AgentMsg::JobSample { .. } => {}
             AgentMsg::JobFinished(r) => {
                 if self.owns_job(peer, &r.job) {
-                    self.job_done(&agent, r).await?;
+                    if self.ci.is_leg(&r.job) {
+                        self.ci.send(crate::ci::dispatch::Msg::Finished { agent: agent.clone(), result: r });
+                    } else {
+                        self.job_done(&agent, r).await?;
+                    }
+                }
+            }
+            AgentMsg::Reject { job, .. } if self.ci.is_leg(&job) => {
+                if self.owns_job(peer, &job) {
+                    self.ci.send(crate::ci::dispatch::Msg::Rejected { agent: agent.clone(), leg: job });
                 }
             }
             AgentMsg::Reject { job, reason } => {
@@ -758,11 +773,17 @@ impl Hub {
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
                 }
+                // What it can do decides which legs it may take.
+                self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
             }
             AgentMsg::Sync { json, raft } => self.sync.from_runner(&agent, &json, raft),
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
-            // CI (docs/ci.md §2.5): handled by the dispatcher (W05/W06) and facts (W13) when they land.
-            AgentMsg::JobEvent { job, .. } => tracing::debug!(agent = %agent, job = %job, "CI job event before the CI dispatcher exists"),
+            // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
+            AgentMsg::JobEvent { job, json } => {
+                if self.owns_job(peer, &job) {
+                    self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json });
+                }
+            }
             AgentMsg::Facts { .. } => tracing::debug!(agent = %agent, "runner facts before CI facts are stored"),
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
@@ -972,6 +993,7 @@ impl Hub {
         )
         .await;
         tracing::info!(agent = %name, labels = ?live.labels, slots = live.slots, "agent connected");
+        self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: name.clone(), running: h.running.clone() });
         // Older processes of this machine take no new jobs; what they run, they keep.
         for p in &joined.drain {
             tracing::info!(agent = %name, peer = p, "a newer runner process of this machine connected; the older one keeps what it runs and takes nothing new");
@@ -1100,7 +1122,7 @@ impl Hub {
         }
     }
 
-    fn release_slot(&self, agent: &str, job: &str) {
+    pub(crate) fn release_slot(&self, agent: &str, job: &str) {
         self.instances.lock().disown(&crate::instances::Owned::Job(job.to_owned()));
         let mut g = self.agents.lock();
         if let Some(a) = g.get_mut(agent) {
@@ -1157,6 +1179,11 @@ impl Hub {
     // ------------------------------------------------------------ runs
 
     pub async fn cancel_run(&self, run_id: &str, reason: &str) -> anyhow::Result<()> {
+        // The CI engine's runs are cancelled through their plans.
+        if self.ci.is_run(run_id) {
+            self.ci.send(crate::ci::dispatch::Msg::Cancel { run: run_id.to_owned(), reason: reason.to_owned() });
+            return Ok(());
+        }
         let running = self.store.cancel_run(run_id.to_owned(), reason.to_owned()).await?;
         for (job, agent) in running {
             if let Some(agent) = agent {
@@ -1196,6 +1223,11 @@ impl Hub {
                 self.check_lost_agents().await;
             }
         }
+    }
+
+    /// The server's secrets, for the CI engine's trusted runs (docs/ci.md W09 narrows them).
+    pub fn ci_secrets(&self) -> Vec<(String, String)> {
+        self.secrets()
     }
 
     fn secrets(&self) -> Vec<(String, String)> {
@@ -1472,7 +1504,10 @@ impl Hub {
             peers.into_iter().filter_map(|p| g.remove(&p)).map(|(name, _, jobs)| (name, jobs)).collect()
         };
         for (name, jobs) in expired {
-            for j in jobs {
+            if jobs.iter().any(|j| self.ci.is_leg(j)) {
+                self.ci.send(crate::ci::dispatch::Msg::RunnerLost { agent: name.clone() });
+            }
+            for j in jobs.into_iter().filter(|j| !self.ci.is_leg(j)) {
                 let still = self.agents.lock().get(&name).is_some_and(|a| a.running.contains(&j));
                 if !still {
                     continue;
