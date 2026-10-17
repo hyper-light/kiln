@@ -408,7 +408,9 @@ function JobPanel({ job, onJobPatch }: { job: Job; onJobPatch: (j: Job) => void 
             </span>
           </button>
           {specOpen && (
-            <pre className="mt-3 max-h-96 overflow-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 text-[11px] leading-relaxed text-[#bcc3d1]">{JSON.stringify(spec, null, 2)}</pre>
+            <pre className="mt-3 max-h-96 overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 text-[11px] leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap text-[#bcc3d1]">
+              {JSON.stringify(spec, null, 2)}
+            </pre>
           )}
         </div>
       )}
@@ -448,7 +450,7 @@ function StepRow({
       {open && (
         <div>
           {command && (
-            <pre className="mx-5 mb-2 overflow-x-auto rounded border border-[#22262d] bg-[#0d0f13] px-3 py-2 font-mono text-[11px] text-[#a6b2c6]">
+            <pre className="mx-5 mb-2 rounded border border-[#22262d] bg-[#0d0f13] px-3 py-2 font-mono text-[11px] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#a6b2c6]">
               <span className="text-[#6d7078] select-none">$ </span>
               {command}
             </pre>

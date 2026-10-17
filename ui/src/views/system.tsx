@@ -45,7 +45,7 @@ function JsonView({ value }: { value: unknown }) {
       <div className="absolute top-3 right-3">
         <CopyButton text={text} label="Copy" />
       </div>
-      <pre className="max-h-[560px] overflow-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11.5px] leading-[1.7] text-[#bcc3d1]">{parts}</pre>
+      <pre className="max-h-[560px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11.5px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#bcc3d1]">{parts}</pre>
     </div>
   );
 }
@@ -185,7 +185,7 @@ function SystemBody() {
               <i className="dot" data-status="succeeded" /> No crashes recorded.
             </div>
           ) : (
-            <pre className="max-h-[420px] overflow-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] whitespace-pre-wrap text-[#d8c8b0]">
+            <pre className="max-h-[420px] overflow-y-auto rounded-md border border-[#2b2e39] bg-[#101217] p-4 font-mono text-[11px] leading-[1.7] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#d8c8b0]">
               {d.crash_log.join("\n")}
             </pre>
           )}

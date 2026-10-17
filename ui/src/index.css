@@ -1974,12 +1974,15 @@
 }
 
 @layer components {
-/* Live connection indicator */
+/* Live connection indicator: one width whatever it says, so the header never shifts. */
 .conn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 7px;
+  min-width: 104px;
   min-height: 32px;
+  font-variant-numeric: tabular-nums;
   padding: 0 10px;
   border-radius: 999px;
   border: 1px solid rgb(255 255 255 / 8%);

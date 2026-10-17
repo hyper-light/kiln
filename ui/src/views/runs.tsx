@@ -214,7 +214,7 @@ function RunsBody() {
                   </td>
                   <td className="whitespace-nowrap">
                     <Link to={`/runs/${r.id}`} className="hover:text-white">
-                      <span className="text-[#8c8f98]">{r.repo_name.split("/")[0]}/</span>
+                      <span className="text-[#8c8f98] max-sm:hidden">{r.repo_name.split("/")[0]}/</span>
                       <span className="text-[#e4e5e7]">{r.repo_name.split("/").slice(1).join("/")}</span>
                       <span className="ml-1.5 font-mono text-[11px] text-[#a1a4ad]">#{r.number}</span>
                     </Link>

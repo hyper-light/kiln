@@ -217,7 +217,7 @@ function RunnersBody() {
                       <td>
                         <StatusDot status={agentStatus(a)} title={agentStateLabel(a)} />
                       </td>
-                      <td className="max-w-[260px]">
+                      <td className="max-w-[260px] max-sm:w-full max-sm:max-w-0">
                         <div className="truncate text-[#e4e5e7]">{a.name}</div>
                         <div className="truncate font-mono text-[10px] text-[#7b7e88]">
                           {a.connected ? (
