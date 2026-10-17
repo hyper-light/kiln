@@ -360,18 +360,21 @@ async fn list(cx: Cx, q: Value) -> Out {
     let limit = q.get("limit").and_then(Value::as_u64).unwrap_or(200).clamp(1, 1000) as usize;
     let apps = cx.cd.apps.read();
     let statuses = cx.cd.statuses.read();
+    // The cursor is the last app a page gave: the next page starts after it.
     let start = str_in(&q, "cursor").map(str::to_owned);
     let mut items = Vec::new();
     let mut next = None;
+    let mut last: Option<&String> = None;
     for (id, e) in apps.range(start.clone().unwrap_or_default()..) {
         if start.as_deref() == Some(id.as_str()) || !selects(&q, e, statuses.get(id.as_str())) {
             continue;
         }
         if items.len() == limit {
-            next = Some(id.clone());
+            next = last.cloned();
             break;
         }
         items.push(app_row(e, statuses.get(id.as_str()), pins.get(id.as_str())));
+        last = Some(id);
     }
     Ok(json!({"apps": items, "next": next}))
 }

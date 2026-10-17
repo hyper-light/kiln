@@ -1,11 +1,11 @@
 # Repo sync
 
 > **Phases 1 and 2 are built:** the engine, each repo's Raft group, the server and runner sides,
-> the API and the Sync page. Git refs (phase 3) and voters on machines (phase 4) are not yet.
+> the API and the synced folders on the Repositories page. Git refs (phase 3) and voters on machines (phase 4) are not yet.
 
 ## Using it
 
-**Sync** in the console's menu: *Sync a folder*, name it, and pick a machine and a folder for each
+**Repositories** in the console's menu: *Sync a folder*, name it, and pick a machine and a folder for each
 copy. A folder that doesn't exist yet is made; one that holds files already keeps them, and they
 meet the others' by the rule below (a file the same on both is no conflict). Each copy shows how it
 is doing (*in step*, *catching up*, *fetching*, *sending*, *offline*, *error*) and what it left out;

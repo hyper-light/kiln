@@ -474,18 +474,22 @@
 .cd-resources-section {
   margin-top: 30px;
 }
+/* The view, the filter, the sort or grouping, and whether children show: one row on a wide screen. */
 .cd-viewbar {
   display: grid;
   grid-template-columns: 150px minmax(0, 1fr) auto auto;
   align-items: start;
   gap: 10px;
 }
+.cd-view-sort {
+  min-width: 190px;
+}
 .cd-view-select {
   min-width: 0;
 }
 .cd-view-opt {
   min-height: 40px;
-  padding: 0 4px;
+  padding: 0 2px 0 4px;
   white-space: nowrap;
 }
 .cd-viewhead {
@@ -500,19 +504,47 @@
   min-width: 0;
 }
 @container (max-width: 760px) {
+  /* The filter on top; under it the view with what goes beside it: "Live children" for the tree,
+     the sort for the list (children under them), the grouping for pods. */
   .cd-viewbar {
     grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "filter filter"
+      "view opt";
+  }
+  .cd-viewbar[data-view="list"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "filter filter"
+      "view sort"
+      "opt opt";
+  }
+  .cd-viewbar[data-view="pods"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "filter filter"
+      "view sort";
   }
   .cd-view-filter {
-    grid-column: 1 / -1;
-    grid-row: 1;
+    grid-area: filter;
+  }
+  .cd-viewbar > .cd-view-select {
+    grid-area: view;
+  }
+  .cd-view-sort {
+    grid-area: sort;
+    min-width: 0;
+  }
+  .cd-view-opt {
+    grid-area: opt;
+    justify-self: start;
   }
 }
 
 /* ---------------------------------------------------------------- kinds and marks */
 .cd-kind {
   display: inline-grid;
-  min-width: 40px;
+  min-width: 46px;
   height: 18px;
   flex: none;
   place-items: center;
@@ -766,7 +798,7 @@ button.cd-gnode:hover {
 .cd-trow-line {
   min-width: 0;
   overflow: hidden;
-  padding-left: 48px;
+  padding-left: 54px;
   color: #8c8f98;
   font-family: var(--font-mono);
   font-size: 10.5px;
@@ -965,10 +997,16 @@ button.cd-gnode:hover {
 }
 .cd-details-why {
   margin: 8px 0 0;
-  color: #d8c8b0;
+  color: #a1a4ad;
   font-size: 12.5px;
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+.cd-details-why[data-tone="warn"] {
+  color: #d8c8b0;
+}
+.cd-details-why[data-tone="fail"] {
+  color: #d8b9bb;
 }
 .cd-details-show {
   max-width: 260px;
@@ -988,7 +1026,7 @@ button.cd-gnode:hover {
 }
 .cd-facts {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
   gap: 12px 22px;
   margin: 0;
 }
@@ -1079,12 +1117,18 @@ button.cd-gnode:hover {
 }
 @container (max-width: 640px) {
   .cd-kv li,
-  .cd-containers li,
-  .cd-conditions li {
+  .cd-containers li {
     grid-template-columns: minmax(0, 1fr);
   }
   .cd-c-state {
     grid-column: 1;
+  }
+  /* A condition: its name and status on a line, why and when under them. */
+  .cd-conditions li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .cd-conditions li > :nth-child(n + 3) {
+    grid-column: 1 / -1;
   }
 }
 .cd-manifest-bar {
@@ -1176,8 +1220,10 @@ button.cd-gnode:hover {
   gap: 8px;
   margin-left: auto;
 }
+/* As tall as what it holds, up to a screenful; then it scrolls, the newest line kept in view. */
 .cd-log {
-  height: min(56dvh, 460px);
+  min-height: 96px;
+  max-height: min(56dvh, 460px);
   margin-top: 10px;
   overflow: auto;
   overscroll-behavior: contain;

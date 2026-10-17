@@ -54,35 +54,38 @@ export function kindShort(kind: string): string {
   return (kind.length <= 7 || caps.length < 2 ? kind.slice(0, 7) : caps).toLowerCase();
 }
 
-/** Kinds in the order an app is read: what everything else needs first, what runs last. */
+/**
+ * Kinds in the order an app is read: what runs first (workloads and what they run), then how it is
+ * reached, then what it is configured and stored with, then what it is allowed to do.
+ */
 const ORDER = [
-  "Namespace",
-  "CustomResourceDefinition",
-  "ServiceAccount",
-  "ClusterRole",
-  "ClusterRoleBinding",
-  "Role",
-  "RoleBinding",
-  "PriorityClass",
-  "StorageClass",
-  "PersistentVolume",
-  "PersistentVolumeClaim",
-  "ConfigMap",
-  "Secret",
-  "Service",
-  "Ingress",
   "Deployment",
   "StatefulSet",
   "DaemonSet",
   "CronJob",
   "Job",
   "ReplicaSet",
+  "Pod",
+  "ControllerRevision",
   "HorizontalPodAutoscaler",
   "PodDisruptionBudget",
-  "NetworkPolicy",
+  "Service",
   "EndpointSlice",
-  "ControllerRevision",
-  "Pod",
+  "Ingress",
+  "NetworkPolicy",
+  "ConfigMap",
+  "Secret",
+  "PersistentVolumeClaim",
+  "PersistentVolume",
+  "StorageClass",
+  "ServiceAccount",
+  "Role",
+  "RoleBinding",
+  "ClusterRole",
+  "ClusterRoleBinding",
+  "PriorityClass",
+  "Namespace",
+  "CustomResourceDefinition",
 ];
 const RANK = new Map(ORDER.map((k, i) => [k, i]));
 export const kindRank = (kind: string) => RANK.get(kind) ?? ORDER.length;

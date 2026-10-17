@@ -1,10 +1,11 @@
 import * as React from "react";
+import { Link } from "react-router";
 import { api } from "@/api/client";
-import type { Agent, SyncConflict, SyncCopy, SyncKeep, SyncRepo } from "@/api/types";
+import type { SyncConflict, SyncCopy, SyncKeep, SyncRepo, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { EmptyState, ErrorState, PageIntro, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
+import { EmptyState, ErrorState, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
-import { errorMessage, useDocumentTitle, useResource } from "@/lib/hooks";
+import { errorMessage, type Resource } from "@/lib/hooks";
 import "./sync.css";
 
 /** A copy's state as a status dot shows it. */
@@ -18,38 +19,42 @@ const DOT: Record<SyncCopy["state"], string> = {
   error: "failed",
 };
 
-export default function Sync() {
-  useDocumentTitle("Sync");
-  const view = useResource((s) => api.sync(s), [], { pollMs: 3_000 });
-  const agents = useResource((s) => api.agents(s), [], { pollMs: 30_000 });
-  const [adding, setAdding] = React.useState(false);
-  const machines = React.useMemo(() => (agents.data ?? []).map((a: Agent) => a.name).sort(), [agents.data]);
-  const repos = view.data?.repos ?? [];
+/**
+ * Folders kept the same on several machines, as a section of the Repositories page: a change on one
+ * reaches the others within seconds, and when two machines change one file, both versions are kept.
+ * The page owns the data (it links the repositories it builds to their synced copies), the name
+ * filter and whether the form to start one is open.
+ */
+export function SyncedRepos({
+  view,
+  machines,
+  adding,
+  onAdding,
+  q,
+  builtBy,
+}: {
+  view: Resource<SyncView>;
+  machines: string[];
+  adding: boolean;
+  onAdding: (on: boolean) => void;
+  q: string;
+  /** The repository kiln builds that a synced folder is the other half of, if any. */
+  builtBy?: (name: string) => { name: string; href: string } | undefined;
+}) {
+  const needle = q.trim().toLowerCase();
+  const repos = (view.data?.repos ?? []).filter((r) => !needle || r.name.toLowerCase().includes(needle));
 
   return (
-    <div className="container-console page sync-page">
-      <PageIntro
-        index={5}
-        label="Sync"
-        title="Synced repos"
-        lead="A folder kept the same on several machines. A change on one reaches the others within seconds; when two machines change one file, both versions are kept."
-        actions={
-          !adding && (
-            <Button size="sm" variant="secondary" onClick={() => setAdding(true)}>
-              Sync a folder
-            </Button>
-          )
-        }
-      />
+    <div className="sync-page">
       {view.data?.error && <p className="sync-off">{view.data.error}</p>}
       {adding && (
         <NewRepo
           machines={machines}
           onDone={() => {
-            setAdding(false);
+            onAdding(false);
             view.reload();
           }}
-          onCancel={() => setAdding(false)}
+          onCancel={() => onAdding(false)}
         />
       )}
       {view.error && !view.data ? (
@@ -57,20 +62,34 @@ export default function Sync() {
       ) : !view.data ? (
         <SkeletonRows rows={3} cols={3} />
       ) : repos.length === 0 && !adding ? (
-        <EmptyState
-          title="Nothing is synced yet"
-          action={
-            <Button size="sm" variant="secondary" onClick={() => setAdding(true)}>
-              Sync a folder
-            </Button>
-          }
-        >
-          Pick a folder on two or more machines, a repository or anything else, and kiln keeps them the same.
-        </EmptyState>
+        needle ? (
+          <p className="sync-none">No synced folder matches.</p>
+        ) : (
+          <EmptyState
+            title="Nothing is synced yet"
+            action={
+              <Button size="sm" variant="secondary" onClick={() => onAdding(true)}>
+                Sync a folder
+              </Button>
+            }
+          >
+            Pick a folder on two or more machines, a repository or anything else, and kiln keeps them the same.
+          </EmptyState>
+        )
       ) : (
         <div className="sync-list">
           {repos.map((r) => (
-            <RepoBlock key={r.id} repo={r} machines={machines} onChange={view.reload} />
+            <div key={r.id} id={`sync-${r.id}`} className="sync-item">
+              {(() => {
+                const built = builtBy?.(r.name);
+                return built ? (
+                  <Link to={built.href} className="sync-built">
+                    Built by kiln as {built.name}: its runs
+                  </Link>
+                ) : null;
+              })()}
+              <RepoBlock repo={r} machines={machines} onChange={view.reload} />
+            </div>
           ))}
         </div>
       )}

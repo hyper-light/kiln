@@ -1,5 +1,5 @@
 import * as React from "react";
-import { BrowserRouter, Route, Routes } from "react-router";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { api, onAuthChange } from "@/api/client";
 import { events } from "@/api/events";
 import type { Me } from "@/api/types";
@@ -17,7 +17,6 @@ const RunDetail = React.lazy(() => import("@/views/run-detail/index"));
 const Deployments = React.lazy(() => import("@/views/deployments/index"));
 const DeploymentApp = React.lazy(() => import("@/views/deployments/app"));
 const Repos = React.lazy(() => import("@/views/repos"));
-const Sync = React.lazy(() => import("@/views/sync"));
 const Runners = React.lazy(() => import("@/views/runners"));
 const AddMachines = React.lazy(() => import("@/views/add-machines"));
 // Found sessions live in Mission control now; their old page sends you there.
@@ -82,7 +81,7 @@ export function App() {
                   <Route path="deployments" element={<Deployments />} />
                   <Route path="deployments/apps/:project/:name" element={<DeploymentApp />} />
                   <Route path="repos" element={<Repos />} />
-                  <Route path="sync" element={<Sync />} />
+                  <Route path="sync" element={<Navigate to="/repos?show=synced" replace />} />
                   <Route path="runners" element={<Runners />} />
                   <Route path="runners/add" element={<AddMachines />} />
                   <Route path="agents" element={<Mission />} />

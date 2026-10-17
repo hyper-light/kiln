@@ -515,9 +515,12 @@ fn describe(n: &mut Node, o: &Value) {
             let keys = obj::map_at(o, &["data"]).map_or(0, |m| m.len()) + obj::map_at(o, &["binaryData"]).map_or(0, |m| m.len());
             info(n, "Keys", keys.to_string());
         }
+        // Secrets are read as metadata alone: their type and keys are said only when known.
         ("", "Secret") => {
-            info(n, "Type", str_at(o, &["type"]).unwrap_or("Opaque"));
-            info(n, "Keys", obj::map_at(o, &["data"]).map_or(0, |m| m.len()).to_string());
+            info(n, "Type", str_at(o, &["type"]).unwrap_or(""));
+            if let Some(d) = obj::map_at(o, &["data"]) {
+                info(n, "Keys", d.len().to_string());
+            }
         }
         ("autoscaling", "HorizontalPodAutoscaler") => {
             let (cur, want) = (int(o, &["status", "currentReplicas"]), int(o, &["status", "desiredReplicas"]));
@@ -948,6 +951,17 @@ mod tests {
         assert_eq!(d.map(|n| n.containers.iter().map(|c| (c.name.as_str(), c.init)).collect::<Vec<_>>()), Some(vec![("migrate", true), ("app", false)]));
         let ports = tree.nodes.get(1).and_then(|n| n.info.iter().find(|i| i.name == "Ports")).map(|i| i.value.as_str());
         assert_eq!(ports, Some("80→8080/TCP"));
+    }
+
+    #[test]
+    fn a_secret_read_as_metadata_claims_no_type() {
+        let meta = json!({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "tls", "namespace": "web", "uid": "s"}});
+        let full = json!({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "cfg", "namespace": "web", "uid": "t"},
+            "type": "kubernetes.io/tls", "data": {"tls.crt": "eA==", "tls.key": "eQ=="}});
+        let tree = build(vec![managed("", "Secret", "web", "tls", Some(meta)), managed("", "Secret", "web", "cfg", Some(full))], vec![]);
+        assert_eq!(node(&tree, "tls").map(|n| n.info.len()), Some(0));
+        let said: Vec<(String, String)> = node(&tree, "cfg").map(|n| n.info.iter().map(|i| (i.name.clone(), i.value.clone())).collect()).unwrap_or_default();
+        assert_eq!(said, [("Type".to_owned(), "kubernetes.io/tls".to_owned()), ("Keys".to_owned(), "2".to_owned())]);
     }
 
     #[test]
