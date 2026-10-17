@@ -77,6 +77,41 @@ back, with the `base` it had, and go through the conflict rule.
 - Symbolic links travel as links; permissions as the exec bit only.
 - A copy's path must exist and be writable by the runner's user.
 
+## The group (phase 2)
+
+- **Roles.** Each synced repo is one hyper-raft group. The server's member is its voter (and so its
+  leader); each copy's machine runs a member as a **learner**. Members are hyper-durable `Replica`s:
+  the server's log on hyper-log (`GroupStore`), a runner's in its state folder.
+- **The state machine** is the repo's index as the log makes it: path → version (the `log` of a
+  copy's state). Applying an entry updates it, a pure function of the entry, the same on every
+  member; images (snapshots) are that index. Writing files is not the state machine's job: a copy
+  applies committed steps to its folder after the machine has taken them, once their blobs are
+  there, so a missing blob delays a copy's files, never the group.
+- **Proposals.** A runner sends its step to the server, which proposes it (a learner doesn't
+  propose). A step is proposed only once its blobs are on the server.
+- **Messages.** One kiln message each way, appended last to the wire enums (`ServerMsg::Sync`,
+  `AgentMsg::Sync`), sent only to runners announcing `CAP_SYNC` (64). Its payload is
+  `{repo, kind, ...}`:
+  - `raft`: a hyper-raft message, between the server's member and a runner's;
+  - `copies` (server → runner): the copies this machine holds: repo, path, mode, limits;
+  - `step` (runner → server): a step to propose;
+  - `blob`, `want` (both ways): contents, in chunks on the bulk lane, and asking for them;
+  - `status` (runner → server): applied index, pending steps, conflicts, skipped files.
+- **Blobs.** The server keeps every blob a step names until each copy has applied it, then drops
+  it. A copy asks the server for what it lacks before applying a step.
+
+## API
+
+| Method | Path | |
+| --- | --- | --- |
+| GET | `/api/sync` | synced repos: name, mode, copies (machine, path, state, applied, conflicts) |
+| POST | `/api/sync` | `{name, mode?, copies: [{machine, path}]}`: start syncing |
+| POST | `/api/sync/:id/copies` | `{machine, path}`: add a copy (it catches up from the log) |
+| DELETE | `/api/sync/:id/copies/:machine` | stop syncing there (its files stay) |
+| GET | `/api/sync/:id/conflicts` | conflict copies, with both versions |
+| POST | `/api/sync/:id/conflicts/resolve` | `{path, keep: "name" | "copy" | "both"}` |
+| DELETE | `/api/sync/:id` | stop syncing (every copy's files stay) |
+
 ## Phases
 
 1. **Engine:** scanning a folder into an index with exclusions, detecting changes (polling size,
