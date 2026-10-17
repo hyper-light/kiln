@@ -801,3 +801,59 @@ export interface DirListing {
   /** Why it can't be listed: "no such folder", "not a folder", "permission denied", ... */
   error?: string;
 }
+
+/* ------------------------------------------------------------ repo sync (docs/sync.md) */
+
+export interface SyncSkipped {
+  path: string;
+  why: string;
+}
+
+/** How a copy is doing, as its machine last said. */
+export interface SyncCopyStatus {
+  applied: number;
+  behind: number;
+  unsent: number;
+  waiting: number;
+  conflicts: number;
+  skipped: SyncSkipped[];
+  error: string | null;
+  at: number;
+}
+
+export type SyncCopyState = "in step" | "catching up" | "fetching" | "sending" | "starting" | "offline" | "error";
+
+export interface SyncCopy {
+  member: number;
+  machine: string;
+  path: string;
+  added: number;
+  state: SyncCopyState;
+  status: SyncCopyStatus | null;
+}
+
+export interface SyncConflict {
+  /** The conflict copy. */
+  path: string;
+  /** The path it stands beside. */
+  beside: string;
+}
+
+export interface SyncRepo {
+  id: string;
+  name: string;
+  created: number;
+  exclude: string[];
+  files: number;
+  index: number;
+  conflicts: SyncConflict[];
+  copies: SyncCopy[];
+  error: string | null;
+}
+
+export interface SyncView {
+  repos: SyncRepo[];
+  error: string | null;
+}
+
+export type SyncKeep = "name" | "copy" | "both";

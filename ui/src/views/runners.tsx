@@ -102,7 +102,7 @@ export default function Runners() {
   return (
     <div className="container-console page">
       <PageIntro
-        index={5}
+        index={6}
         label="Runners"
         title="Fleet"
         lead={

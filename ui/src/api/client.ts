@@ -8,6 +8,7 @@ import type {
   Job,
   JoinInfo,
   JoinRequest,
+  KilnBinary,
   Me,
   MetricsHistory,
   NewRepo,
@@ -15,11 +16,12 @@ import type {
   Repo,
   Run,
   RunDetail,
+  SyncKeep,
+  SyncView,
   SystemInfo,
   TerminalSessionInfo,
   UpdateJob,
   UpdatesOverview,
-  KilnBinary,
 } from "./types";
 
 export class ApiError extends Error {
@@ -139,6 +141,13 @@ export const api = {
   overview: (signal?: AbortSignal) => get<Overview>("/api/overview", signal),
 
   repos: (signal?: AbortSignal) => get<Repo[]>("/api/repos", signal),
+  sync: (signal?: AbortSignal) => get<SyncView>("/api/sync", signal),
+  syncCreate: (body: { name: string; copies: { machine: string; path: string }[]; exclude: string[] }) =>
+    post<{ id: string }>("/api/sync", body),
+  syncAddCopy: (id: string, copy: { machine: string; path: string }) => post<{ member: number }>(`/api/sync/${enc(id)}/copies`, copy),
+  syncRemoveCopy: (id: string, member: number) => del<void>(`/api/sync/${enc(id)}/copies/${member}`),
+  syncDelete: (id: string) => del<void>(`/api/sync/${enc(id)}`),
+  syncResolve: (id: string, path: string, keep: SyncKeep) => post<void>(`/api/sync/${enc(id)}/conflicts/resolve`, { path, keep }),
   addRepo: (repo: NewRepo) => post<Repo>("/api/repos", repo),
   deleteRepo: (id: string) => del<void>(`/api/repos/${enc(id)}`),
   pollRepo: (id: string) => post<void>(`/api/repos/${enc(id)}/poll`),

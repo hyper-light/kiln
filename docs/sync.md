@@ -1,6 +1,20 @@
 # Repo sync
 
-> **Design, being built.** Phase 1 (the engine) is in progress; nothing here ships yet.
+> **Phases 1 and 2 are built:** the engine, each repo's Raft group, the server and runner sides,
+> the API and the Sync page. Git refs (phase 3) and voters on machines (phase 4) are not yet.
+
+## Using it
+
+**Sync** in the console's menu: *Sync a folder*, name it, and pick a machine and a folder for each
+copy. A folder that doesn't exist yet is made; one that holds files already keeps them, and they
+meet the others' by the rule below (a file the same on both is no conflict). Each copy shows how it
+is doing (*in step*, *catching up*, *fetching*, *sending*, *offline*, *error*) and what it left out;
+conflicts are listed with what to keep. Removing a copy, or the whole repo, leaves the files where
+they are.
+
+A machine syncs through its runner (`kiln agent`), version with sync (`CAP_SYNC`); an older runner
+shows its copies *offline* until it is upgraded. One runner process of a machine syncs at a time
+(it holds `<state>/sync/lock`); during an in-place upgrade the new process takes over.
 
 A repository, or any folder, kept on several machines stays one. A change on any machine reaches
 the others within seconds. Two machines changing the same file never lose either change. No ports
@@ -112,12 +126,32 @@ back, with the `base` it had, and go through the conflict rule.
 | POST | `/api/sync/:id/conflicts/resolve` | `{path, keep: "name" | "copy" | "both"}` |
 | DELETE | `/api/sync/:id` | stop syncing (every copy's files stay) |
 
+## As built
+
+- **Server:** one thread (`sync::server`) leads every repo's group on one hyper-log file
+  (`<data>/sync/sync.log`), keeps each repo's tree beside it (`<id>.tree.json`) and its contents in
+  `<data>/sync/blobs`, and the list of repos and copies in `repos.json`. It takes a copy's steps in
+  that copy's order, once their contents are on the server, and adds or removes one learner at a
+  time to match the copies. It compacts each log well within the room hyper-log keeps for a group,
+  leaving about 2 MiB of entries for copies a little behind; one further behind takes an image.
+- **Runner:** one thread (`sync::runner`) holds `<state>/sync`: the machine's own hyper-log file, a
+  learner and a saved state per copy, and a content store. Every two seconds it looks at each folder
+  that has taken everything committed, sends new contents over HTTP, then the steps; it fetches the
+  contents committed steps name, writes them, and states durable only what the folder took.
+- **Links:** Raft messages ride `ServerMsg::Sync`/`AgentMsg::Sync` on a lane of their own, an image
+  in parts of 512 KiB. Contents go over `GET`/`PUT /api/sync/blobs/:hash?machine=`, with a token the
+  server signs for each machine and gives it with its copies.
+- **Tested** on a scratch server and two runners: a first sync (a 5 MB file, the exec bit, a link,
+  `node_modules` left out), edits and deletes both ways, a conflict and its resolution, a runner and
+  the server restarted mid-way, 30,000 files in 3 s, three rounds of deleting and making them again,
+  a copy added after compaction (an image), and a copy removed.
+
 ## Phases
 
-1. **Engine:** scanning a folder into an index with exclusions, detecting changes (polling size,
-   mtime and hash; inotify and FSEvents later), the blob store, and applying steps with the conflict
-   rule. Tested on its own.
-2. **Group:** a hyper-durable replica per synced repo; the server as voter, copies as learners;
-   relay over kiln's links; API and UI.
+1. **Engine** (built): scanning a folder into an index with exclusions, detecting changes (polling
+   size, mtime and hash; inotify and FSEvents later), the blob store, and applying steps with the
+   conflict rule.
+2. **Group** (built): a hyper-durable replica per synced repo; the server as voter, copies as
+   learners; relay over kiln's links; API and UI.
 3. **Git refs.**
 4. **Voters on machines**, with fleet membership: no server needed.

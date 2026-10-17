@@ -274,7 +274,7 @@ export default function Mission() {
   return (
     <div className="container-console page ms-page">
       <PageIntro
-        index={6}
+        index={7}
         label="Agents"
         title="Mission control."
         lead={lead}
