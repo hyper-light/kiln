@@ -280,6 +280,16 @@ function stateOf(d: Demo): State {
     todos: [],
     usage: { cost_usd: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, turns: 1 },
     dropped: 0,
+    // A Max plan's windows, as Claude's /usage reports them.
+    ...(d.info.kind === "claude" && {
+      plan: "Max 20x",
+      limits: [
+        { id: "five_hour", label: "Session", used_percent: 42, resets_at: Date.now() + (2 * 60 + 5) * 60_000, window: "5h" },
+        { id: "seven_day", label: "Weekly", used_percent: 18, resets_at: Date.now() + (3 * 24 + 4) * 3_600_000, window: "7d" },
+        { id: "model:opus", label: "Weekly · Opus", used_percent: 81, resets_at: Date.now() + (3 * 24 + 4) * 3_600_000, window: "7d", status: "warning" },
+        { id: "extra_usage", label: "Extra usage", used_percent: 25, used: 12.4, limit: 50, unit: "USD", window: "month" },
+      ],
+    }),
   };
 }
 

@@ -1939,6 +1939,26 @@ textarea.hx-input {
   font-size: 10.5px;
   color: var(--color-subtle);
 }
+.hx-limit-reset {
+  display: flex;
+  flex-wrap: wrap;
+}
+.hx-limit-reset > span {
+  white-space: nowrap;
+}
+.hx-limit-reset > span + span::before {
+  margin: 0 6px;
+  content: "·";
+}
+.hx-limit-window {
+  color: var(--color-subtle);
+}
+.hx-limit-said {
+  color: #ead8bd;
+}
+.hx-limit[data-tone="fail"] .hx-limit-said {
+  color: #ecc9cb;
+}
 .hx-limit-compact .hx-limit-top {
   font-size: 11.5px;
 }

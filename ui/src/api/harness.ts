@@ -220,6 +220,8 @@ export interface Limit {
   window?: string;
   /** A stable, non-secret id of the account ("claude:max:3f2a…"), the same across its agents. */
   account?: string;
+  /** "allowed", "warning" (close to the limit) or "rejected" (reached), when the harness says. */
+  status?: string;
 }
 
 /** One line of the harness's status: version, account, model, sandbox, MCP servers … */
