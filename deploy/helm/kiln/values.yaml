@@ -136,7 +136,7 @@ rbac:
   # what runs (shadow mode for apps adopted from Argo CD; Secrets included, masked in diffs);
   # "write" also lets it sync, as Argo CD's application controller may; "none" keeps kiln to its
   # own namespaces.
-  deployments: read
+  deployments: write
 
 replicaCount: 1   # kiln uses a local sqlite database: run exactly one replica.
 
