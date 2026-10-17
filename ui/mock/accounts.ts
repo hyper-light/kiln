@@ -386,11 +386,7 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
   if (p === "/api/harness/sessions" && m === "GET") {
-    json(
-      res,
-      200,
-      [...[...demos.values()].map((d) => d.info), longInfo()],
-    );
+    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo()]);
     return true;
   }
 

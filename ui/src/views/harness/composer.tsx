@@ -509,16 +509,7 @@ export function Composer({
       >
         {chips}
         {canOverride && (withOpen || override.model || override.effort) && (
-          <SendWith
-            className="cp-with"
-            models={meta?.models ?? []}
-            model={model}
-            modelLabel={modelLabel}
-            efforts={meta?.efforts ?? []}
-            effort={effort}
-            value={override}
-            onChange={setOverride}
-          />
+          <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />
         )}
         <textarea
           onPaste={(e) => {

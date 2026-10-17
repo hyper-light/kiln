@@ -68,8 +68,33 @@ for (let i = 1; i <= TURNS; i++) {
   const at = T0 + i * 90_000;
   add({ id: `L-u${i}`, at, kind: "user", text: ASKS[i % ASKS.length]! + (i % 4 === 0 ? "\n\nKeep the change small; the release is tomorrow." : "") });
   add({ id: `L-t${i}`, at: at + 2_000, kind: "thinking", text: `Looking at how the deadline is computed in turn ${i}, and whether the clock is read once.` });
-  add({ id: `L-r${i}a`, at: at + 4_000, kind: "tool", tool_id: `tr${i}a`, name: "Read", tool: "read", title: `/home/ada/src/kiln/${FILES[i % FILES.length]}`, input: {}, status: "done", started: at + 4_000, ended: at + 4_200 });
-  add({ id: `L-r${i}b`, at: at + 4_500, kind: "tool", tool_id: `tr${i}b`, name: "Grep", tool: "search", title: "deadline", detail: "crates/kiln/src", input: {}, status: "done", started: at + 4_500, ended: at + 4_900 });
+  add({
+    id: `L-r${i}a`,
+    at: at + 4_000,
+    kind: "tool",
+    tool_id: `tr${i}a`,
+    name: "Read",
+    tool: "read",
+    title: `/home/ada/src/kiln/${FILES[i % FILES.length]}`,
+    input: {},
+    status: "done",
+    started: at + 4_000,
+    ended: at + 4_200,
+  });
+  add({
+    id: `L-r${i}b`,
+    at: at + 4_500,
+    kind: "tool",
+    tool_id: `tr${i}b`,
+    name: "Grep",
+    tool: "search",
+    title: "deadline",
+    detail: "crates/kiln/src",
+    input: {},
+    status: "done",
+    started: at + 4_500,
+    ended: at + 4_900,
+  });
   if (i % 2 === 0)
     add({
       id: `L-e${i}`,
@@ -86,7 +111,15 @@ for (let i = 1; i <= TURNS; i++) {
       diffs: [
         {
           path: `/home/ada/src/kiln/${FILES[(i + 1) % FILES.length]}`,
-          hunks: [{ old_start: 40 + i, old_lines: 3, new_start: 40 + i, new_lines: 4, lines: [" let now = clock.now();", "-let deadline = clock.now() + budget;", "+let deadline = now + budget;", "+let first = now;", " loop {"] }],
+          hunks: [
+            {
+              old_start: 40 + i,
+              old_lines: 3,
+              new_start: 40 + i,
+              new_lines: 4,
+              lines: [" let now = clock.now();", "-let deadline = clock.now() + budget;", "+let deadline = now + budget;", "+let first = now;", " loop {"],
+            },
+          ],
         },
       ],
     });
@@ -111,7 +144,18 @@ for (let i = 1; i <= TURNS; i++) {
 // The turn still going.
 const LIVE_AT = T0 + (TURNS + 1) * 90_000;
 add({ id: "L-u-live", at: LIVE_AT, kind: "user", text: "Now do the same for the websocket reconnects, and keep going until the suite is green." });
-add({ id: "L-s-live", at: LIVE_AT + 3_000, kind: "tool", tool_id: "ts-live", name: "Bash", tool: "shell", title: "cargo test -p kiln ws::reconnect", input: {}, status: "running", started: LIVE_AT + 3_000 });
+add({
+  id: "L-s-live",
+  at: LIVE_AT + 3_000,
+  kind: "tool",
+  tool_id: "ts-live",
+  name: "Bash",
+  tool: "shell",
+  title: "cargo test -p kiln ws::reconnect",
+  input: {},
+  status: "running",
+  started: LIVE_AT + 3_000,
+});
 let live = add({ id: "L-a-live", at: LIVE_AT + 5_000, kind: "assistant", text: "Working through the reconnect path:", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
 
 const info: AgentInfo = {
@@ -176,7 +220,10 @@ const send = (ws: WebSocket, u: unknown) => {
 };
 const broadcast = (u: unknown) => viewers.forEach((ws) => send(ws, u));
 
-const WORDS = "the reconnect path reads its backoff from the same clock as the deadline so a slow tick can no longer put the deadline before the first attempt and the socket comes back within one interval".split(" ");
+const WORDS =
+  "the reconnect path reads its backoff from the same clock as the deadline so a slow tick can no longer put the deadline before the first attempt and the socket comes back within one interval".split(
+    " ",
+  );
 let w = 0;
 let step = 0;
 let timer: NodeJS.Timeout | null = null;
@@ -196,7 +243,19 @@ function tick() {
     const at = Date.now();
     // The words so far are done; a step; then the reply goes on, in a note of its own.
     live.streaming = false;
-    const e = add({ id: `L-step-${step}`, at, kind: "tool", tool_id: `tstep${step}`, name: "Read", tool: "read", title: `/home/ada/src/kiln/${FILES[step % FILES.length]}`, input: {}, status: "done", started: at, ended: at + 120 });
+    const e = add({
+      id: `L-step-${step}`,
+      at,
+      kind: "tool",
+      tool_id: `tstep${step}`,
+      name: "Read",
+      tool: "read",
+      title: `/home/ada/src/kiln/${FILES[step % FILES.length]}`,
+      input: {},
+      status: "done",
+      started: at,
+      ended: at + 120,
+    });
     const done = { ...live };
     live = add({ id: `L-a-live-${step}`, at: at + 200, kind: "assistant", text: "", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
     broadcast({ t: "events", events: [done, e, { ...live }] });
@@ -225,7 +284,11 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
     return true;
   }
   const slow = Number(process.env.MOCK_SLOW_SNAPSHOT ?? 0);
-  const frames: unknown[] = [{ t: "open", info }, { t: "meta", meta }, { t: "state", state: state() }];
+  const frames: unknown[] = [
+    { t: "open", info },
+    { t: "meta", meta },
+    { t: "state", state: state() },
+  ];
   // Events in batches, as the server cuts them (by size); the last frame says it's complete.
   for (let i = 0; i < events.length; i += 120) frames.push({ t: "events", events: events.slice(i, i + 120) });
   if (process.env.MOCK_NO_SYNCED !== "1") frames.push({ t: "synced" });
