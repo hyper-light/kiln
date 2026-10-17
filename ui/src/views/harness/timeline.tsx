@@ -247,7 +247,8 @@ const StepRow = React.memo(function StepRow({
         <span className="hx-step-title">{stepSummary(step.group, step.calls)}</span>
         {subtitle && <span className="hx-step-sub">{subtitle}</span>}
         <span className="hx-step-end">
-          {stats && <DiffStat add={stats.add} del={stats.del} />}
+          {stats && (stats.add > 0 || stats.del > 0) && <DiffStat add={stats.add} del={stats.del} />}
+          {status === "pending" && <span className="hx-warn text-[11px]">waiting for you</span>}
           {failures > 0 && <span className="hx-bad">{failures} failed</span>}
           {status === "running" && first ? <Elapsed from={first.started} /> : first && last?.ended ? <span className="hx-meta-num">{duration(last.ended - first.started)}</span> : null}
           <i className="dot" data-status={dotFor(failures > 0 ? "error" : status)} aria-hidden="true" />

@@ -10,11 +10,31 @@ import { errorMessage, useLocalStorage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 import { HarnessMark } from "./parts";
 
-const MODES = [
-  { id: "default", label: "Ask first", hint: "Asks before commands and edits" },
-  { id: "acceptEdits", label: "Edits OK", hint: "Edits files freely, asks before commands" },
-  { id: "plan", label: "Plan first", hint: "Researches and proposes a plan; changes nothing until you approve" },
-];
+interface ModeChoice {
+  id: string;
+  label: string;
+  hint: string;
+}
+
+/** Each harness's own permission modes (a machine that reports them wins). Never the skip-all modes. */
+const MODES: Record<string, ModeChoice[]> = {
+  claude: [
+    { id: "default", label: "Ask first", hint: "Asks before commands and edits" },
+    { id: "acceptEdits", label: "Edits OK", hint: "Edits files freely, asks before commands" },
+    { id: "plan", label: "Plan first", hint: "Researches and proposes a plan; changes nothing until you approve" },
+  ],
+  codex: [
+    { id: "untrusted", label: "Ask first", hint: "Asks before anything beyond reading" },
+    { id: "auto", label: "Auto", hint: "Works in its folder; asks to go outside it or online" },
+    { id: "read-only", label: "Read only", hint: "Reads and answers; changes nothing" },
+  ],
+};
+const modesFor = (k: KindInfo | undefined): ModeChoice[] =>
+  (k as (KindInfo & { modes?: { id: string; label: string; description: string; dangerous?: boolean }[] }) | undefined)?.modes
+    ?.filter((m) => !m.dangerous)
+    .map((m) => ({ id: m.id, label: m.label, hint: m.description })) ??
+  MODES[k?.id ?? ""] ??
+  [];
 
 export function SpawnDialog({
   open,
@@ -32,7 +52,7 @@ export function SpawnDialog({
   const [shells, setShells] = React.useState<TerminalSessionInfo[]>([]);
   const [target, setTarget] = useLocalStorage("kiln.agents.target", "local");
   const [kind, setKind] = useLocalStorage("kiln.agents.kind", "claude");
-  const [mode, setMode] = useLocalStorage("kiln.agents.mode", "default");
+  const [modeByKind, setModeByKind] = useLocalStorage<Record<string, string>>("kiln.agents.modes", {});
   const [cwd, setCwd] = useLocalStorage("kiln.agents.cwd", "~");
   const [kinds, setKinds] = React.useState<KindInfo[] | null>(null);
   const [count, setCount] = React.useState(1);
@@ -49,7 +69,10 @@ export function SpawnDialog({
     if (defaults?.target) setTarget(defaults.target);
     if (defaults?.cwd) setCwd(defaults.cwd);
     setShell(defaults?.shell ?? "");
-    api.agents().then((a) => setMachines(a.filter((m) => m.connected && !m.ephemeral)), () => undefined);
+    api.agents().then(
+      (a) => setMachines(a.filter((m) => m.connected && !m.ephemeral)),
+      () => undefined,
+    );
     api.terminalSessions().then(setShells, () => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -74,6 +97,10 @@ export function SpawnDialog({
   }, [kinds]);
 
   const targetShells = shells.filter((s) => s.target === target && !s.exited);
+  const kindInfo = (kinds ?? []).find((k) => k.id === kind);
+  const modes = modesFor(kindInfo);
+  const mode = modes.some((m) => m.id === modeByKind[kind]) ? (modeByKind[kind] ?? "") : (modes[0]?.id ?? "");
+  const setMode = (m: string) => setModeByKind({ ...modeByKind, [kind]: m });
 
   const start = async () => {
     setBusy(true);
@@ -81,7 +108,7 @@ export function SpawnDialog({
     const spec: Spec = {
       kind,
       cwd: cwd.trim() || undefined,
-      mode,
+      mode: mode || undefined,
       model: model.trim() || undefined,
       name: name.trim() || undefined,
       prompt: prompt.trim() || undefined,
@@ -123,7 +150,15 @@ export function SpawnDialog({
               {kinds === null && <span className="hx-dim text-[12px]">Looking…</span>}
               {kinds?.length === 0 && <span className="hx-dim text-[12px]">No harness found on this machine.</span>}
               {(kinds ?? []).map((k) => (
-                <button key={k.id} type="button" className="hx-kind" aria-pressed={kind === k.id} disabled={!k.available} onClick={() => setKind(k.id)} title={k.available ? undefined : "Not installed on this machine"}>
+                <button
+                  key={k.id}
+                  type="button"
+                  className="hx-kind"
+                  aria-pressed={kind === k.id}
+                  disabled={!k.available}
+                  onClick={() => setKind(k.id)}
+                  title={k.available ? undefined : "Not installed on this machine"}
+                >
                   <HarnessMark kind={k.id} name={k.name} size={20} />
                   <span>{k.name}</span>
                   {!k.verified && <span className="hx-tag">untested</span>}
@@ -166,17 +201,19 @@ export function SpawnDialog({
             {!shell && <input className="hx-input hx-mono" value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="~/Projects/repo" spellCheck={false} autoCapitalize="off" />}
           </div>
 
-          <div className="hx-field">
-            <span className="hx-eyebrow">Permissions</span>
-            <div className="hx-modes-pick">
-              {MODES.map((m) => (
-                <button key={m.id} type="button" className="hx-mode-card" aria-pressed={mode === m.id} onClick={() => setMode(m.id)}>
-                  <span className="hx-mode-card-label">{m.label}</span>
-                  <span className="hx-dim">{m.hint}</span>
-                </button>
-              ))}
+          {modes.length > 0 && (
+            <div className="hx-field">
+              <span className="hx-eyebrow">Permissions</span>
+              <div className="hx-modes-pick">
+                {modes.map((m) => (
+                  <button key={m.id} type="button" className="hx-mode-card" aria-pressed={mode === m.id} onClick={() => setMode(m.id)}>
+                    <span className="hx-mode-card-label">{m.label}</span>
+                    <span className="hx-dim">{m.hint}</span>
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="hx-field">
             <span className="hx-eyebrow">Model</span>
@@ -185,7 +222,13 @@ export function SpawnDialog({
 
           <div className="hx-field">
             <span className="hx-eyebrow">First message</span>
-            <textarea className="hx-input" rows={4} value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder={count > 1 ? "Every agent gets this message" : "What should it do? (optional)"} />
+            <textarea
+              className="hx-input"
+              rows={4}
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder={count > 1 ? "Every agent gets this message" : "What should it do? (optional)"}
+            />
           </div>
 
           {error && <div className="hx-bad text-[12px]">{error}</div>}

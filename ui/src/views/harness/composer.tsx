@@ -80,7 +80,7 @@ export function Composer({ store, state, meta, disabled }: { store: SessionStore
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
   const ta = React.useRef<HTMLTextAreaElement>(null);
-  const features = meta?.features ?? [];
+  const features = React.useMemo(() => meta?.features ?? [], [meta]);
   const running = state?.status === "running" || state?.status === "waiting";
   const modes = MODES.filter((m) => !m.feature || features.includes(m.feature));
   const queue = state?.queue ?? [];

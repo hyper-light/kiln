@@ -1,9 +1,9 @@
 /**
-import "./harness.css";
  * One agent, in full: its work as a timeline, what it's waiting on you for, the composer, and
  * beside it the changeset, plan, commands and subagents. On a phone the side panels become tabs.
  */
 import * as React from "react";
+import "./harness.css";
 import { Link, useNavigate, useParams } from "react-router";
 import { ArrowLeft, ChevronRight, Power, RotateCcw, SquareTerminal, X } from "lucide-react";
 import { harnessApi, useAgentSession, type Command } from "@/api/harness";
@@ -144,7 +144,7 @@ export default function AgentPage() {
           <div className="hx-agent-where">
             <span>{info?.target === "local" ? "server" : (info?.target ?? "").replace(/^agent:/, "")}</span>
             <span className="hx-trunc">{tildify(cwd)}</span>
-            {state?.usage && <span>{money(state.usage.cost_usd)}</span>}
+            {state?.usage && state.usage.cost_usd > 0 && <span>{money(state.usage.cost_usd)}</span>}
             {conn === "reconnecting" && <span className="hx-warn">reconnecting…</span>}
           </div>
         </div>
@@ -186,9 +186,9 @@ export default function AgentPage() {
       ) : (
         <div className="hx-agent-phone">
           <div className="hx-tabs hx-phone-tabs" role="tablist">
-            {(["work", "changes", "plan", "runs", "agents"] as PhoneTab[]).map((t) => (
+            {(["work", "changes", "plan", "runs", "agents", "usage"] as PhoneTab[]).map((t) => (
               <button key={t} type="button" role="tab" aria-selected={phoneTab === t} className="hx-tab" onClick={() => setPhoneTab(t)}>
-                {t === "work" ? "Work" : t === "changes" ? "Changes" : t === "plan" ? "Plan" : t === "runs" ? "Runs" : "Subagents"}
+                {t === "work" ? "Work" : t === "changes" ? "Changes" : t === "plan" ? "Plan" : t === "runs" ? "Runs" : t === "agents" ? "Subagents" : "Usage"}
                 {t === "work" && approvals.length > 0 && <span className="hx-tab-count hx-tab-alert">{approvals.length}</span>}
               </button>
             ))}
@@ -206,6 +206,7 @@ export default function AgentPage() {
               store={store}
               cwd={cwd}
               onOpenTask={openTask}
+              hideTabs
               className={cn("hx-side hx-side-phone")}
             />
           )}

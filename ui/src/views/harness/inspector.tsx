@@ -206,7 +206,10 @@ export function Inspector({
   cwd,
   onOpenTask,
   className,
+  hideTabs,
 }: {
+  /** The page shows its own tabs (phones). */
+  hideTabs?: boolean;
   tab: InspectorTab;
   onTab: (t: InspectorTab) => void;
   events: HEvent[];
@@ -232,7 +235,7 @@ export function Inspector({
   ];
   return (
     <div className={cn("hx-inspector", className)}>
-      <div className="hx-tabs" role="tablist">
+      <div className="hx-tabs" role="tablist" hidden={hideTabs}>
         {tabs.map((t) => (
           <button key={t.id} type="button" role="tab" aria-selected={tab === t.id} className="hx-tab" onClick={() => onTab(t.id)}>
             {t.label}

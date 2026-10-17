@@ -212,3 +212,16 @@ export function tokens(n: number | undefined): string {
   if (!n) return "0";
   return n < 1000 ? String(n) : n < 1_000_000 ? `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k` : `${(n / 1_000_000).toFixed(1)}M`;
 }
+
+/** Markdown as one line of plain text (card previews). */
+export function plain(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/(^|\s)[*_]([^*_\s][^*_]*)[*_]/g, "$1$2")
+    .replace(/^\s*(#{1,6}|[-*]|\d+[.)])\s+/gm, "")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}

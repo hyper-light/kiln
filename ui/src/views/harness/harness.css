@@ -308,9 +308,13 @@ textarea.hx-input {
 }
 .hx-card-name {
   display: flex;
+  flex: 1;
   flex-direction: column;
   min-width: 0;
   text-align: left;
+}
+.hx-card-top .hx-pill {
+  flex: none;
 }
 .hx-card-name > span:first-child {
   font-size: 14px;

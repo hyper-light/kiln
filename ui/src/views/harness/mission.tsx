@@ -1,10 +1,10 @@
 /**
-import "./harness.css";
  * Mission control: every agent kiln runs, on every machine, at a glance — what each is doing, how
  * far along it is, what it changed, what it costs — with one inbox for everything waiting on you
  * and messages to one agent or many at once.
  */
 import * as React from "react";
+import "./harness.css";
 import { Link, useNavigate } from "react-router";
 import { Check, CheckSquare, Plus, Send, Square, X } from "lucide-react";
 import { api } from "@/api/client";
@@ -17,7 +17,7 @@ import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useDocumentTitle, useLocalStorage, useNow } from "@/lib/hooks";
 import { relativeTime } from "@/lib/format";
-import { money, tildify } from "./derive";
+import { money, plain, tildify } from "./derive";
 import { DiffStat } from "./diff";
 import { HarnessMark, StatusPill, ToolIcon } from "./parts";
 import { SpawnDialog } from "./spawn";
@@ -135,7 +135,7 @@ const AgentCard = React.memo(function AgentCard({ a, selected, onSelect, now }: 
             <span className="hx-trunc">{a.doing || a.activity}</span>
           </div>
         ) : a.summary ? (
-          <div className="hx-card-summary">{a.summary}</div>
+          <div className="hx-card-summary">{plain(a.summary)}</div>
         ) : null}
         {waiting > 0 && (
           <div className="hx-card-wait">
@@ -165,8 +165,8 @@ const AgentCard = React.memo(function AgentCard({ a, selected, onSelect, now }: 
         )}
         {a.tasks_running > 0 && <span>{a.tasks_running} subagent{a.tasks_running === 1 ? "" : "s"}</span>}
         {a.queued > 0 && <span>{a.queued} queued</span>}
-        {a.context_pct !== undefined && <span>ctx {Math.round(a.context_pct)}%</span>}
-        <span>{money(a.cost_usd)}</span>
+        {(a.context_pct ?? 0) >= 1 && <span>context {Math.round(a.context_pct ?? 0)}%</span>}
+        {a.cost_usd > 0 && <span>{money(a.cost_usd)}</span>}
         <span className="ml-auto">{relativeTime(Math.floor(a.last_activity / 1000), now)}</span>
       </div>
 
