@@ -49,7 +49,8 @@ function Questions({ a, onDecide, agentName, kind }: { a: Approval; onDecide: De
       onDecline={() => onDecide({ type: "approve", id: a.id, decision: "deny", message: "The user chose not to answer." })}
       onSubmit={(answers) => {
         setBusy(true);
-        onDecide({ type: "approve", id: a.id, decision: "allow", answers: answersToClaude(answers) });
+        // Structured for current machines (commas and notes intact), the joined form for older ones.
+        onDecide({ type: "approve", id: a.id, decision: "allow", choices: answers, answers: answersToClaude(answers) });
       }}
     />
   );

@@ -465,7 +465,17 @@ export type Command =
   | { type: "queue_remove"; id: string }
   | { type: "queue_move"; id: string; index: number }
   | { type: "queue_send_now"; id: string }
-  | { type: "approve"; id: string; decision: Decision; message?: string; always?: number; answers?: Record<string, string> }
+  | {
+      type: "approve";
+      id: string;
+      decision: Decision;
+      message?: string;
+      always?: number;
+      /** The older form: one string per question (runners from before `choices`). */
+      answers?: Record<string, string>;
+      /** Each question's answer as picked: labels, your own words, a note. Wins over `answers`. */
+      choices?: { question: string; id?: string; selected: string[]; other?: string; note?: string }[];
+    }
   | { type: "interrupt" }
   | { type: "set_mode"; mode: string }
   | { type: "set_model"; model: string }
