@@ -118,6 +118,8 @@ pub struct Runtime {
     pub api_url: String,
     pub graphql_url: String,
     pub github_token: String,
+    /// `ACTIONS_CACHE_MODE`: `read`, `write`, `write-only` or `none` (W08-R14).
+    pub cache_mode: Option<String>,
 }
 
 /// A remote action, resolved (W07-R02).

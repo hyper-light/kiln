@@ -2,6 +2,7 @@
  * Views over an agent's timeline: turns made of steps (not one row per tool call), the cumulative
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
+import { useState } from "react";
 import type { FileDiff, HEvent, ToolCall, ToolKind } from "@/api/harness";
 
 export type ToolEvent = Extract<HEvent, { kind: "tool" }>;
@@ -105,6 +106,38 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
   return turns;
 }
 
+const sameList = <T>(a: readonly T[] | undefined, b: readonly T[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b?.[i]);
+
+/** Whether two items show the same events (the session keeps an event's object while it doesn't change). */
+function sameItem(a: Item, b: Item): boolean {
+  if (a.type !== b.type || a.key !== b.key) return false;
+  if (a.type === "step") return b.type === "step" && a.group === b.group && sameList(a.calls, b.calls);
+  if (a.type === "thought") return b.type === "thought" && a.event === b.event && sameList(a.more, b.more);
+  return "event" in b && a.event === b.event;
+}
+
+/**
+ * `next` with every turn and item that shows what it showed before kept as the object it was
+ * (`kept`: the last turns, by key; updated here), so a conversation that grows renders only what
+ * changed.
+ */
+export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
+  const out = next.map((t) => {
+    const was = kept.get(t.key);
+    if (!was) return t;
+    const before = new Map(was.items.map((it) => [it.key, it]));
+    const items = t.items.map((it) => {
+      const b = before.get(it.key);
+      return b && sameItem(b, it) ? b : it;
+    });
+    const same = was.prompt === t.prompt && was.outcome === t.outcome && was.started === t.started && was.ended === t.ended && sameList(was.items, items);
+    return same ? was : { ...t, items };
+  });
+  kept.clear();
+  for (const t of out) kept.set(t.key, t);
+  return out;
+}
+
 export function diffStats(diffs: FileDiff[] | undefined): { add: number; del: number } {
   let add = 0;
   let del = 0;
@@ -150,6 +183,21 @@ export function changesetOf(events: HEvent[]): FileChange[] {
 
 export function runsOf(events: HEvent[]): ToolEvent[] {
   return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "shell");
+}
+
+/** The edits it made (or proposed). */
+export function editsOf(events: HEvent[]): ToolEvent[] {
+  return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "edit");
+}
+
+/**
+ * `list`, or the list last returned here while it holds the same items: what's worked out from it
+ * (and what shows it) stays as it was while the rest of the conversation streams.
+ */
+export function useSameList<T>(list: T[]): T[] {
+  const [kept] = useState(() => ({ list }));
+  if (kept.list !== list && (kept.list.length !== list.length || kept.list.some((x, i) => x !== list[i]))) kept.list = list;
+  return kept.list;
 }
 
 /** What a group of calls did, in a few words. */

@@ -2,6 +2,7 @@
 import * as React from "react";
 import { useServerEvents } from "@/api/events";
 import { harnessApi, type AgentInfo } from "@/api/harness";
+import { useSuspenseResource } from "@/lib/resource";
 
 /**
  * How often the list takes in what changed. Many agents working at once send a stream of events;
@@ -10,46 +11,43 @@ import { harnessApi, type AgentInfo } from "@/api/harness";
  */
 const BATCH_MS = 250;
 
-export function useAgents() {
-  const [list, setList] = React.useState<AgentInfo[] | null>(null);
-  const [error, setError] = React.useState<Error | null>(null);
-  const load = React.useCallback(() => {
-    harnessApi.list().then(
-      (l) => {
-        setList(l);
-        setError(null);
-      },
-      (e: unknown) => setError(e instanceof Error ? e : new Error(String(e))),
-    );
-  }, []);
-  React.useEffect(load, [load]);
+const KEY = "harness/agents";
+const list = () => harnessApi.list();
 
+/** The agents as last read (suspends until the first list is in). */
+export function useAgentList(): AgentInfo[] {
+  return useSuspenseResource(KEY, list).data;
+}
+
+/**
+ * The agents, live: the list (suspends until it's in; read again when the server's back after a
+ * restart), with each agent's news from the server's events applied as it comes, in batches.
+ */
+export function useAgents() {
+  const res = useSuspenseResource(KEY, list);
   // The latest word from each agent since the last batch (null: it closed).
-  const pending = React.useRef(new Map<string, AgentInfo | null>());
-  const timer = React.useRef(0);
-  const apply = React.useCallback(() => {
-    timer.current = 0;
-    const batch = pending.current;
-    if (batch.size === 0) return;
-    pending.current = new Map();
-    setList((l) => {
-      const next = (l ?? []).slice();
-      for (const [id, info] of batch) {
-        const i = next.findIndex((a) => a.id === id);
-        if (info === null) {
-          if (i !== -1) next.splice(i, 1);
-        } else if (i === -1) next.push(info);
-        else next[i] = info;
-      }
-      return next;
-    });
-  }, []);
-  React.useEffect(() => () => window.clearTimeout(timer.current), []);
+  const [batch] = React.useState(() => ({ pending: new Map<string, AgentInfo | null>(), timer: 0 }));
   useServerEvents((ev) => {
-    if (ev.type === "harness") pending.current.set(ev.info.id, ev.info);
-    else if (ev.type === "harness_closed") pending.current.set(ev.id, null);
+    if (ev.type === "harness") batch.pending.set(ev.info.id, ev.info);
+    else if (ev.type === "harness_closed") batch.pending.set(ev.id, null);
     else return;
-    if (!timer.current) timer.current = window.setTimeout(apply, BATCH_MS);
+    if (batch.timer) return;
+    batch.timer = window.setTimeout(() => {
+      batch.timer = 0;
+      const news = batch.pending;
+      batch.pending = new Map();
+      res.setData((l) => {
+        const next = l.slice();
+        for (const [id, info] of news) {
+          const i = next.findIndex((a) => a.id === id);
+          if (info === null) {
+            if (i !== -1) next.splice(i, 1);
+          } else if (i === -1) next.push(info);
+          else next[i] = info;
+        }
+        return next;
+      });
+    }, BATCH_MS);
   });
-  return { list, error, reload: load };
+  return { list: res.data, reload: res.reload };
 }

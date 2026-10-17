@@ -5,9 +5,10 @@
  */
 import * as React from "react";
 import { Link, useNavigate } from "react-router";
-import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
+import { ArrowLeft, MoreHorizontal, Pause, PencilLine, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
 import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
+import { useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
 import { LimitBadge, UsagePanel } from "./limits";
 import { machineName, StateWord } from "./parts";
@@ -62,14 +63,14 @@ export function AgentHeader({
   const limits = state?.limits ?? info?.limits ?? [];
   const [usage, setUsage] = React.useState(false);
   const usageId = React.useId();
-  React.useEffect(() => {
-    if (!usage) return;
-    const onKey = (e: KeyboardEvent) => {
+  useListener<KeyboardEvent>(
+    document,
+    "keydown",
+    (e) => {
       if (e.key === "Escape") setUsage(false);
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [usage]);
+    },
+    { on: usage },
+  );
   // The kind is said beside a label that isn't the kind's own name.
   const label = info ? agentLabel(info) : "Agent";
   const named = Boolean(info && label.toLowerCase() !== info.kind_name.trim().toLowerCase());
@@ -95,8 +96,19 @@ export function AgentHeader({
             <NameField value={hasOwnName(info) ? info.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ag-title-field" label="Agent name" />
           ) : (
             <h1 className="ag-title">
-              <button type="button" className="ag-title-btn" onClick={actions.startRenaming} disabled={!info} title="Rename">
-                {label}
+              {/* Says it can be renamed: a pencil after the name, and "Name it" while it has none of its own. */}
+              <button
+                type="button"
+                className="ag-title-btn"
+                onClick={actions.startRenaming}
+                disabled={!info}
+                aria-label={info && hasOwnName(info) ? `Rename ${label}` : `Name this agent (shown as ${label})`}
+              >
+                <span className={info && !hasOwnName(info) ? "ag-title-unnamed" : undefined}>{label}</span>
+                <span className="ag-rename" aria-hidden="true">
+                  <PencilLine size={13} />
+                  {info && !hasOwnName(info) && <span>Name it</span>}
+                </span>
               </button>
             </h1>
           )}
