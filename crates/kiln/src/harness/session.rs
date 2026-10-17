@@ -323,8 +323,29 @@ enum Ev {
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>) {
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
     let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
-    // Announce it before anything else, so whoever mirrors it knows what it is.
-    let _ = sink.send((s.id.clone(), Update::Open { info: Box::new(s.info()) })).await;
+    // A resumed Claude Code session starts from its transcript (its history), not empty.
+    if kind.protocol == super::kinds::Protocol::ClaudeStreamJson {
+        let (resume, env) = {
+            let sp = s.spec.lock();
+            (sp.resume.clone(), sp.env.clone())
+        };
+        let empty = s.core.lock().events().next().is_none();
+        if let Some(r) = resume.filter(|_| empty) {
+            let session = r.clone();
+            match crate::rt::blocking(move || super::transcript::history(&env, &r)).await {
+                Ok(Some(lines)) => {
+                    let mut core = s.core.lock();
+                    super::transcript::load(&mut core, &lines);
+                    tracing::info!(id = %s.id, %session, events = core.events().count(), "agent session history loaded from its transcript");
+                }
+                _ => tracing::info!(id = %s.id, %session, "no transcript found for the resumed agent session"),
+            }
+        }
+    }
+    // Announce it, whole, before anything else: whoever mirrors it starts from all of it.
+    for u in s.snapshot() {
+        let _ = sink.send((s.id.clone(), u)).await;
+    }
     let mut first = true;
     let mut crashes: Vec<Instant> = Vec::new();
     // A message that arrived while the process was down, sent once it is back.

@@ -134,8 +134,29 @@ pub struct KindInfo {
     pub name: String,
     pub verified: bool,
     pub available: bool,
+    /// Its permission modes (the ones that skip every check are left out).
+    #[serde(default)]
+    pub modes: Vec<super::model::ModeOption>,
+    #[serde(default)]
+    pub default_mode: String,
+}
+
+impl Kind {
+    /// Its permission modes, and the one a new session starts in.
+    pub fn modes(&self) -> (Vec<super::model::ModeOption>, &'static str) {
+        match self.protocol {
+            Protocol::ClaudeStreamJson => (super::claude::modes(false), "default"),
+            Protocol::CodexAppServer => (super::codex::modes(false), "auto"),
+        }
+    }
 }
 
 pub fn offered() -> Vec<KindInfo> {
-    KINDS.iter().map(|k| KindInfo { id: k.id.to_owned(), name: k.name.to_owned(), verified: k.verified, available: k.available() }).collect()
+    KINDS
+        .iter()
+        .map(|k| {
+            let (modes, default_mode) = k.modes();
+            KindInfo { id: k.id.to_owned(), name: k.name.to_owned(), verified: k.verified, available: k.available(), modes, default_mode: default_mode.to_owned() }
+        })
+        .collect()
 }

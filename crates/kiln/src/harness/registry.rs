@@ -139,13 +139,48 @@ pub struct Registry {
     /// The server's own sessions.
     pub local: Arc<Host>,
     local_rx: async_channel::Receiver<(String, Update)>,
+    /// Where `kiln spawn` in the server's own terminals reaches `local`.
+    local_sock: Mutex<Option<String>>,
+    /// The shell pid of each of the server's own terminals (their directory and environment are
+    /// where agents started "in this shell" begin).
+    local_shells: Mutex<HashMap<String, u32>>,
+    dir: std::path::PathBuf,
 }
 
 impl Registry {
     pub fn new(dir: std::path::PathBuf) -> Self {
         let (tx, rx) = async_channel::bounded(8192);
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
-        Self { mirrors: Mutex::new(HashMap::new()), kinds: Mutex::new(HashMap::new()), local, local_rx: rx }
+        Self {
+            mirrors: Mutex::new(HashMap::new()),
+            kinds: Mutex::new(HashMap::new()),
+            local,
+            local_rx: rx,
+            local_sock: Mutex::new(None),
+            local_shells: Mutex::new(HashMap::new()),
+            dir,
+        }
+    }
+
+    /// Environment for one of the server's own terminals, so `kiln spawn` there works.
+    pub fn terminal_env(&self, terminal: &str) -> Vec<(&'static str, String)> {
+        let mut env = vec![("KILN_TERM_SESSION", terminal.to_owned())];
+        if let Some(sock) = self.local_sock.lock().clone() {
+            env.push(("KILN_HARNESS_SOCK", sock));
+        }
+        env
+    }
+
+    /// One of the server's own terminals started (its shell runs as `pid`).
+    pub fn note_shell(&self, terminal: &str, pid: Option<u32>) {
+        let mut g = self.local_shells.lock();
+        if let Some(pid) = pid {
+            g.insert(terminal.to_owned(), pid);
+        }
+        // Forget shells that are gone.
+        if g.len() > 256 {
+            g.retain(|_, p| crate::os::pid_alive(*p));
+        }
     }
 
     /// The server's own sessions' updates, into the mirrors (supervised; restartable).
@@ -154,7 +189,13 @@ impl Registry {
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
-        RESTORED.call_once(|| hub.harness.local.restore());
+        RESTORED.call_once(|| {
+            hub.harness.local.restore();
+            match super::socket::serve(&hub.harness.local, super::socket::path("server", &hub.harness.dir)) {
+                Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
+                Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
+            }
+        });
         loop {
             let Ok((id, u)) = rx.recv().await else { return Ok(()) };
             hub.harness.ingest(&hub, &Location::Local, &id, u);
@@ -323,6 +364,16 @@ impl Registry {
             }
             match &loc {
                 Location::Local => {
+                    // Started on one of the server's own shells: in that shell's directory.
+                    if let Some(pid) = spec.shell.as_ref().and_then(|t| self.local_shells.lock().get(t).copied()) {
+                        let (cwd, env) = crate::rt::blocking(move || super::host::shell_context(pid)).await.unwrap_or((None, Vec::new()));
+                        if spec.cwd.is_none() {
+                            spec.cwd = cwd;
+                        }
+                        if spec.env.is_empty() {
+                            spec.env = env;
+                        }
+                    }
                     let s = self.local.open(None, spec)?;
                     let mut info = s.info();
                     info.target = loc.target();

@@ -216,7 +216,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         h
     });
     // What `kiln spawn` in this machine's terminals talks to.
-    let harness_sock = harness.as_ref().and_then(|h| match crate::harness::socket::serve(h, crate::harness::socket::path(&name)) {
+    let harness_sock = harness.as_ref().and_then(|h| match crate::harness::socket::serve(h, crate::harness::socket::path(&name, &o.state_dir)) {
         Ok(p) => Some(p.to_string_lossy().into_owned()),
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
@@ -224,6 +224,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     });
     let mut harness_wait: Option<Instant> = None;
+    // The harnesses this machine offers, as last reported (rechecked every minute or so).
+    let mut harness_kinds_sent: Option<String> = None;
+    let mut harness_kinds_tick: u32 = 0;
     let mut sampler = crate::host::Sampler::new(Some(&o.work_dir));
     let mut sample_tick = Interval::new(Duration::from_secs(5));
     let mut heartbeat = Interval::new(Duration::from_secs(10));
@@ -380,6 +383,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(h) = &harness {
                             while harness_rx.try_recv().is_ok() {}
                             if let Ok(json) = serde_json::to_string(&h.inventory()) {
+                                harness_kinds_sent = serde_json::to_string(&crate::harness::kinds::offered()).ok();
                                 uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
                             }
                             for info in h.list() {
@@ -628,6 +632,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if let Some(ai) = &ai {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());
+                    }
+                    // A harness installed (or removed) since: say so.
+                    harness_kinds_tick = harness_kinds_tick.wrapping_add(1);
+                    if let Some(h) = &harness
+                        && harness_kinds_tick.is_multiple_of(12)
+                    {
+                        let now = serde_json::to_string(&crate::harness::kinds::offered()).ok();
+                        if now != harness_kinds_sent
+                            && let Ok(json) = serde_json::to_string(&h.inventory())
+                        {
+                            harness_kinds_sent = now;
+                            uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
+                        }
                     }
                 }
             }

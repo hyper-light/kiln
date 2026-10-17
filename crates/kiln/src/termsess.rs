@@ -326,8 +326,12 @@ impl Sessions {
 
 /// Open a shell on this server.
 pub fn open_local(hub: &Arc<Hub>, command: Option<String>, cols: u16, rows: u16) -> anyhow::Result<Arc<Session>> {
-    let (pty, pty_out) = crate::terminal::spawn(hub.cfg.terminal.shell.as_deref(), command.as_deref(), cols, rows)?;
-    let (session, input) = Session::new("local".to_owned(), command, cols, rows);
+    let id = crate::util::new_id();
+    // `kiln spawn` in this terminal starts agents on this server, under this terminal.
+    let env = hub.harness.terminal_env(&id);
+    let (pty, pty_out) = crate::terminal::spawn_with(hub.cfg.terminal.shell.as_deref(), command.as_deref(), cols, rows, &env)?;
+    hub.harness.note_shell(&id, pty.pid());
+    let (session, input) = Session::with_id(id, "local".to_owned(), command, cols, rows);
     hub.terminals.insert(&session);
     let s = Arc::clone(&session);
     let h = Arc::clone(hub);

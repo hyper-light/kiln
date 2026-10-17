@@ -856,8 +856,13 @@ impl Codex {
                 }
             }
             "commandExecution" => {
-                let command = item.get("command").and_then(Value::as_str).unwrap_or("").to_owned();
                 let actions = item.get("commandActions").and_then(Value::as_array).cloned().unwrap_or_default();
+                let full = item.get("command").and_then(Value::as_str).unwrap_or("");
+                // The command as written: the single action's, else unwrapped from `bash -lc '…'`.
+                let command = match actions.as_slice() {
+                    [one] => one.get("command").and_then(Value::as_str).map_or_else(|| unwrap_shell(full), str::to_owned),
+                    _ => unwrap_shell(full),
+                };
                 let (tool, title) = match actions.first().and_then(|a| a.get("type")).and_then(Value::as_str) {
                     Some("read") if actions.len() == 1 => (ToolKind::Read, actions.first().and_then(|a| a.get("path")).and_then(Value::as_str).map_or_else(|| command.clone(), |p| super::claude::rel(p, &cwd))),
                     Some("search") | Some("listFiles") if actions.len() == 1 => (ToolKind::Search, command.clone()),
@@ -1078,6 +1083,25 @@ fn set_status(core: &mut Core, id: &str, status: ToolStatus) {
     }
 }
 
+/// `/usr/bin/bash -lc 'cmd'` (or sh/zsh/dash, -c/-lc) → `cmd`; anything else as it is.
+fn unwrap_shell(full: &str) -> String {
+    let mut parts = full.splitn(3, ' ');
+    let (Some(sh), Some(flag), Some(rest)) = (parts.next(), parts.next(), parts.next()) else { return full.to_owned() };
+    let shell = sh.rsplit('/').next().unwrap_or(sh);
+    if !matches!(shell, "bash" | "sh" | "zsh" | "dash") || !matches!(flag, "-c" | "-lc") {
+        return full.to_owned();
+    }
+    let rest = rest.trim();
+    if let Some(inner) = rest.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        // Inside shell single quotes a ' is written '\''.
+        return inner.replace("'\\''", "'");
+    }
+    if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        return inner.replace("\\\"", "\"");
+    }
+    rest.to_owned()
+}
+
 /// A command given as an array of words.
 fn joined(v: Option<&Value>) -> String {
     v.and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).unwrap_or_default()
@@ -1187,6 +1211,15 @@ mod tests {
         assert_eq!(core.state.usage.context_window, Some(1000));
         assert_eq!(core.state.summary, "Removed build/.");
         Ok(())
+    }
+
+    #[test]
+    fn shell_wrappers_unwrap() {
+        assert_eq!(unwrap_shell("/usr/bin/bash -lc 'mkdir -p x && echo ok'"), "mkdir -p x && echo ok");
+        assert_eq!(unwrap_shell(r"bash -c 'echo '\''hi'\'''"), "echo 'hi'");
+        assert_eq!(unwrap_shell(r#"/bin/zsh -lc "ls -la""#), "ls -la");
+        assert_eq!(unwrap_shell("cargo test"), "cargo test");
+        assert_eq!(unwrap_shell("python -c 'x'"), "python -c 'x'");
     }
 
     #[test]

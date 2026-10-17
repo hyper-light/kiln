@@ -10,6 +10,7 @@
 //! * [`session`] — one agent session: the harness process, its adapter and its state.
 //! * [`host`] — a machine's sessions: limits, commands, continuing them after a restart.
 //! * [`registry`] — the server's mirror of every session, for any number of viewers.
+//! * [`transcript`] — Claude Code transcripts as the timeline (history on resume, sessions elsewhere).
 
 pub mod claude;
 pub mod cli;
@@ -22,3 +23,4 @@ pub mod model;
 pub mod registry;
 pub mod session;
 pub mod socket;
+pub mod transcript;
