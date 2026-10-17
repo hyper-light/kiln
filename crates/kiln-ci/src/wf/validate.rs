@@ -291,8 +291,10 @@ pub fn validate(wf: &Workflow, dialect: Dialect, diags: &mut Vec<Diag>) {
         for t in j.kiln.requires.iter().chain(&j.kiln.image) {
             v.tpl(t, Site::KilnJob, &p);
         }
-        for (i, s) in j.steps.iter().enumerate() {
-            let sp = format!("{p}.steps[{i}]");
+        background_refs(v.diags, &j.steps, &p);
+        let mut flat: Vec<(String, &super::ir::Step)> = Vec::new();
+        flatten(&j.steps, &format!("{p}.steps"), &mut flat);
+        for (sp, s) in flat {
             if let Some(t) = &s.cond {
                 v.cond(t, Site::StepIf, &format!("{sp}.if"));
             }
@@ -322,6 +324,33 @@ pub fn validate(wf: &Workflow, dialect: Dialect, diags: &mut Vec<Diag>) {
             if let Some(u) = &s.uses {
                 lint_uses(v.diags, u, s, prt, &format!("{sp}.uses"));
             }
+        }
+    }
+}
+
+/// Steps, with `parallel` groups' steps in place, each with its path.
+fn flatten<'a>(steps: &'a [super::ir::Step], path: &str, out: &mut Vec<(String, &'a super::ir::Step)>) {
+    for (i, s) in steps.iter().enumerate() {
+        let sp = format!("{path}[{i}]");
+        out.push((sp.clone(), s));
+        flatten(&s.parallel, &format!("{sp}.parallel"), out);
+    }
+}
+
+/// `wait` and `cancel` name earlier background steps (`KCI4007`).
+fn background_refs(diags: &mut Vec<Diag>, steps: &[super::ir::Step], path: &str) {
+    let mut background: Vec<&str> = Vec::new();
+    for (i, s) in steps.iter().enumerate() {
+        for id in s.wait.iter().chain(&s.cancel) {
+            if !background.contains(&id.as_str()) {
+                let what = if s.wait.contains(id) { "waits for" } else { "cancels" };
+                diags.push(Diag::error("KCI4007", format!("this step {what} `{id}`, which is not an earlier background step"), s.range).at(format!("{path}.steps[{i}]")));
+            }
+        }
+        if s.background.is_some()
+            && let Some(id) = &s.id
+        {
+            background.push(id);
         }
     }
 }
@@ -434,7 +463,7 @@ fn lint_run(diags: &mut Vec<Diag>, t: &Tpl, exprs: &[Expr], path: &str) {
 }
 
 fn lint_uses(diags: &mut Vec<Diag>, u: &str, step: &super::ir::Step, prt: bool, path: &str) {
-    if u.starts_with("./") || u.starts_with("docker://") || u.starts_with("kiln/") || u.starts_with("kiln://") {
+    if u.starts_with("./") || u.starts_with("$/") || u.starts_with("docker://") || u.starts_with("kiln/") || u.starts_with("kiln://") {
         return;
     }
     if let Some((repo, r)) = u.split_once('@') {

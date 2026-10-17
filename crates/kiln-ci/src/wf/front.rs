@@ -196,6 +196,7 @@ impl Fe<'_> {
                 "env" => wf.env = self.str_map(v, "env"),
                 "defaults" => wf.defaults = self.defaults(v, "defaults"),
                 "concurrency" => wf.concurrency = self.concurrency(v, "concurrency"),
+                "cache-mode" => wf.cache_mode = self.cache_mode(v, "cache-mode"),
                 "jobs" => {
                     saw_jobs = true;
                     wf.jobs = self.jobs(v);
@@ -284,8 +285,8 @@ impl Fe<'_> {
                 "limit" => c.limit = v.text().and_then(|t| t.parse().ok()),
                 "queue" => {
                     let q = self.str(v, &at);
-                    if q.as_deref().is_some_and(|q| !matches!(q, "latest" | "fifo" | "cancel-in-progress")) {
-                        self.err("KCI1015", "`queue` is `latest`, `fifo` or `cancel-in-progress`", v.range, &at);
+                    if q.as_deref().is_some_and(|q| !matches!(q, "single" | "max")) {
+                        self.err("KCI1015", "`queue` is `single` or `max`", v.range, &at);
                     }
                     c.queue = q;
                 }
@@ -295,7 +296,18 @@ impl Fe<'_> {
         if !has_group {
             self.err("KCI1014", "`concurrency` needs a `group`", n.range, path);
         }
+        if c.queue.as_deref() == Some("max") && c.cancel_in_progress == Some(YVal::Bool(true)) {
+            self.err("KCI1015", "`queue: max` can't be combined with `cancel-in-progress: true`", n.range, path);
+        }
         Some(c)
+    }
+
+    fn cache_mode(&mut self, n: &Node, path: &str) -> Option<String> {
+        let m = self.str(n, path)?;
+        if !matches!(m.as_str(), "read" | "write" | "write-only" | "none") {
+            self.err("KCI1015", "`cache-mode` is `read`, `write`, `write-only` or `none`", n.range, path);
+        }
+        Some(m)
     }
 
     fn permissions(&mut self, n: &Node, path: &str) -> Option<Permissions> {
@@ -629,13 +641,14 @@ impl Fe<'_> {
                 "runs-on" => j.runs_on = self.runs_on(v, &at),
                 "environment" => {
                     j.environment = if v.as_scalar().is_some() {
-                        self.tpl(v, &at).map(|name| Environment { name, url: None })
+                        self.tpl(v, &at).map(|name| Environment { name, url: None, deployment: None })
                     } else {
                         let mut e = Environment::default();
                         for (ek, ev, _) in self.entries(v, keys::ENVIRONMENT, &at) {
                             match ek.as_str() {
                                 "name" => e.name = self.tpl(ev, &format!("{at}.name")).unwrap_or_default(),
                                 "url" => e.url = self.tpl(ev, &format!("{at}.url")),
+                                "deployment" => e.deployment = self.bool_or_expr(ev, &format!("{at}.deployment")),
                                 _ => {}
                             }
                         }
@@ -679,6 +692,7 @@ impl Fe<'_> {
                     }
                 }
                 "snapshot" => j.snapshot = Some(self.yval(v)),
+                "cache-mode" => j.cache_mode = self.cache_mode(v, &at),
                 // kiln
                 "matrix" => v1_matrix = Some(v),
                 "toolchain" => kiln.toolchain = self.str(v, &at),
@@ -896,8 +910,12 @@ impl Fe<'_> {
             match (name.as_str(), reserved) {
                 ("include", _) => m.include = Some(self.yval(v)),
                 ("exclude", _) => m.exclude = Some(self.yval(v)),
+                // In GitHub workflows kiln's reserved names are ordinary axes (`platforms` is a
+                // common one).
                 (_, Some(r)) if r.kiln && !(self.kiln() || self.overlay) => {
-                    self.err("KCI5002", format!("`{name}` in a matrix is a kiln key: set it in an overlay"), k.range, &at);
+                    if let Some(a) = self.axis(v, &at) {
+                        m.axes.push((name, a));
+                    }
                 }
                 ("where", _) => m.filter = self.tpl(v, &at),
                 ("platforms", _) => m.platforms = self.axis(v, &at),
@@ -978,6 +996,11 @@ impl Fe<'_> {
                 "continue-on-error" => s.continue_on_error = self.bool_or_expr(v, &at),
                 "timeout-minutes" => s.timeout_minutes = self.num_or_expr(v, &at),
                 "working-directory" => s.working_directory = self.tpl(v, &at),
+                "background" => s.background = self.bool_or_expr(v, &at),
+                "wait" => s.wait = self.str_list(v, &at),
+                "wait-all" => s.wait_all = !matches!(v.as_scalar(), Some(Scalar::Bool(false))),
+                "cancel" => s.cancel = self.str_list(v, &at),
+                "parallel" => s.parallel = self.steps(v, &at),
                 "retry" => kiln.retry = Some(self.yval(v)),
                 "with-secrets" => kiln.with_secrets = self.str_map(v, &at).into_iter().map(|(a, b)| (a, b.src)).collect(),
                 "test-results" => kiln.test_results = Some(self.yval(v)),
@@ -988,9 +1011,12 @@ impl Fe<'_> {
         }
         s.kiln = kiln;
         if !self.overlay {
-            match (&s.run, &s.uses) {
-                (Some(_), Some(_)) => self.err("KCI1012", "a step has `run` or `uses`, not both", n.range, path),
-                (None, None) => self.err("KCI1012", "a step needs `run` or `uses`", n.range, path),
+            match (&s.run, &s.uses, s.is_control()) {
+                (Some(_), Some(_), _) => self.err("KCI1012", "a step has `run` or `uses`, not both", n.range, path),
+                (None, None, false) => self.err("KCI1012", "a step needs `run` or `uses` (or `wait`, `wait-all`, `cancel` or `parallel`)", n.range, path),
+                (Some(_) | None, Some(_) | None, true) if s.run.is_some() || s.uses.is_some() => {
+                    self.err("KCI1012", "a `wait`, `wait-all`, `cancel` or `parallel` step runs nothing itself: it can't have `run` or `uses`", n.range, path)
+                }
                 _ => {}
             }
         }
@@ -998,7 +1024,9 @@ impl Fe<'_> {
     }
 
     fn check_uses(&mut self, u: &str, range: Range, path: &str) {
-        if u.starts_with("./") || u.starts_with("docker://") {
+        // `./path` (the workspace), `$/path` (this repository at the running commit, no checkout
+        // needed), `docker://image`.
+        if u.starts_with("./") || u.starts_with("$/") || u.starts_with("docker://") {
             return;
         }
         if self.kiln() && (u.starts_with("kiln://") || (u.starts_with("kiln/") && u.contains('@'))) {
@@ -1021,6 +1049,9 @@ impl Fe<'_> {
 
 fn reusable_ref_ok(u: &str) -> bool {
     let wf = |p: &str| p.contains("/.github/workflows/") || p.starts_with(".github/workflows/");
+    if let Some(own) = u.strip_prefix("$/") {
+        return own.starts_with(".github/workflows/") && !u.contains('@');
+    }
     if let Some(local) = u.strip_prefix("./") {
         return local.starts_with(".github/workflows/") && !u.contains('@') || local.starts_with("templates/") || local.starts_with(".kiln/");
     }

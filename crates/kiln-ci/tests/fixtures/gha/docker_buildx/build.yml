@@ -1,0 +1,469 @@
+name: build
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'master'
+      - 'v[0-9]*'
+    tags:
+      - 'v*'
+  pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+
+env:
+  SETUP_BUILDX_VERSION: "edge"
+  SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
+  SCOUT_VERSION: "1.26.0"
+  REPO_SLUG: "docker/buildx-bin"
+  DESTDIR: "./bin"
+  TEST_CACHE_SCOPE: "test"
+  TESTFLAGS: "-v --parallel=6 --timeout=30m"
+  GOTESTSUM_FORMAT: "standard-verbose"
+  GO_VERSION: "1.26"
+  GOTESTSUM_VERSION: "v1.13.0"  # same as one in Dockerfile
+
+jobs:
+  test-integration:
+    runs-on: ubuntu-26.04
+    env:
+      TESTFLAGS_DOCKER: "-v --parallel=1 --timeout=30m"
+      TEST_IMAGE_BUILD: "0"
+      TEST_IMAGE_ID: "buildx-tests"
+      TEST_COVERAGE: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        buildkit:
+          - master
+          - latest
+          - buildx-stable-1
+          - v0.34.0
+          - v0.33.1
+          - v0.32.2
+        worker:
+          - docker-container
+          - remote
+        pkg:
+          - ./tests
+        mode:
+          - ""
+          - experimental
+        include:
+          - worker: remote+multinode
+            pkg: ./tests
+          - worker: remote+multinode
+            pkg: ./tests
+            mode: experimental
+          - worker: docker
+            pkg: ./tests
+          - worker: docker
+            pkg: ./tests
+            mode: experimental
+          - worker: docker+containerd  # same as docker, but with containerd snapshotter
+            pkg: ./tests
+          - worker: docker+containerd  # same as docker, but with containerd snapshotter
+            pkg: ./tests
+            mode: experimental
+          - worker: "docker@28.5"
+            pkg: ./tests
+          - worker: "docker+containerd@28.5"  # same as docker, but with containerd snapshotter
+            pkg: ./tests
+          - worker: "docker@28.5"
+            pkg: ./tests
+            mode: experimental
+          - worker: "docker+containerd@28.5"  # same as docker, but with containerd snapshotter
+            pkg: ./tests
+            mode: experimental
+          - worker: "docker@27.5"
+            pkg: ./tests
+          - worker: "docker+containerd@27.5"  # same as docker, but with containerd snapshotter
+            pkg: ./tests
+          - worker: "docker@27.5"
+            pkg: ./tests
+            mode: experimental
+          - worker: "docker+containerd@27.5"  # same as docker, but with containerd snapshotter
+            pkg: ./tests
+            mode: experimental
+    steps:
+      -
+        name: Prepare
+        run: |
+          echo "TESTREPORTS_NAME=${{ github.job }}-$(echo "${{ matrix.pkg }}-${{ matrix.buildkit }}-${{ matrix.worker }}-${{ matrix.mode }}" | tr -dc '[:alnum:]-\n\r' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          if [ -n "${{ matrix.buildkit }}" ]; then
+            echo "TEST_BUILDKIT_TAG=${{ matrix.buildkit }}" >> $GITHUB_ENV
+          fi
+          testFlags="--run=//worker=$(echo "${{ matrix.worker }}" | sed 's/\+/\\+/g')$"
+          case "${{ matrix.worker }}" in
+            docker | docker+containerd | docker@* | docker+containerd@* | remote+multinode)
+              echo "TESTFLAGS=${{ env.TESTFLAGS_DOCKER }} $testFlags" >> $GITHUB_ENV
+              ;;
+            *)
+              echo "TESTFLAGS=${{ env.TESTFLAGS }} $testFlags" >> $GITHUB_ENV
+              ;;
+          esac
+          if [[ "${{ matrix.worker }}" == "docker"* || "${{ matrix.worker }}" == "remote+multinode" ]]; then
+            echo "TEST_DOCKERD=1" >> $GITHUB_ENV
+          fi
+          if [ "${{ matrix.mode }}" = "experimental" ]; then
+            echo "TEST_BUILDX_EXPERIMENTAL=1" >> $GITHUB_ENV
+          fi
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
+      -
+        name: Build test image
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        with:
+          source: .
+          targets: integration-test
+          set: |
+            *.output=type=docker,name=${{ env.TEST_IMAGE_ID }}
+      -
+        name: Test
+        run: |
+          ./hack/test
+        env:
+          TEST_REPORT_SUFFIX: "-${{ env.TESTREPORTS_NAME }}"
+          TESTPKGS: "${{ matrix.pkg }}"
+      -
+        name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          directory: ./bin/testreports
+          flags: integration
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_file_fixes: true # needed for Go language https://docs.codecov.com/docs/fixing-reports
+      -
+        name: Upload test results to Codecov
+        if: always()
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          report_type: test_results
+          directory: ./bin/testreports
+          flags: integration
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_file_fixes: true # needed for Go language https://docs.codecov.com/docs/fixing-reports
+      -
+        name: Generate annotations
+        if: always()
+        uses: crazy-max/.github/.github/actions/gotest-annotations@f91220cba053bd54299ba645a599ee8ed436f222 # v1.11.0
+        with:
+          directory: ./bin/testreports
+      -
+        name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports-${{ env.TESTREPORTS_NAME }}
+          path: ./bin/testreports
+
+  test-unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - macos-26
+          - macos-26-intel
+          - windows-2025
+    env:
+      SKIP_INTEGRATION_TESTS: 1
+    steps:
+      -
+        name: Setup Git config
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      -
+        name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "${{ env.GO_VERSION }}"
+          check-latest: true
+      -
+        name: Prepare
+        run: |
+          testreportsName=${{ github.job }}--${{ matrix.os }}
+          testreportsBaseDir=./bin/testreports
+          testreportsDir=$testreportsBaseDir/$testreportsName
+          echo "TESTREPORTS_NAME=$testreportsName" >> $GITHUB_ENV
+          echo "TESTREPORTS_BASEDIR=$testreportsBaseDir" >> $GITHUB_ENV
+          echo "TESTREPORTS_DIR=$testreportsDir" >> $GITHUB_ENV
+          mkdir -p $testreportsDir
+        shell: bash
+      -
+        name: Install gotestsum
+        run: |
+          go install gotest.tools/gotestsum@${{ env.GOTESTSUM_VERSION }}
+      -
+        name: Test
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          gotestsum \
+            --jsonfile="${{ env.TESTREPORTS_DIR }}/go-test-report.json" \
+            --junitfile="${{ env.TESTREPORTS_DIR }}/junit-report.xml" \
+            --packages="./..." \
+            -- \
+              "-mod=vendor" \
+              "-coverprofile" "${{ env.TESTREPORTS_DIR }}/coverage.txt" \
+              "-covermode" "atomic" ${{ env.TESTFLAGS }}
+        shell: bash
+      -
+        name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          directory: ${{ env.TESTREPORTS_DIR }}
+          env_vars: RUNNER_OS
+          flags: unit
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_file_fixes: true # needed for Go language https://docs.codecov.com/docs/fixing-reports
+      -
+        name: Upload test results to Codecov
+        if: always()
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          report_type: test_results
+          directory: ${{ env.TESTREPORTS_DIR }}
+          env_vars: RUNNER_OS
+          flags: unit
+          token: ${{ secrets.CODECOV_TOKEN }}
+          disable_file_fixes: true # needed for Go language https://docs.codecov.com/docs/fixing-reports
+      -
+        name: Generate annotations
+        if: always()
+        uses: crazy-max/.github/.github/actions/gotest-annotations@f91220cba053bd54299ba645a599ee8ed436f222 # v1.11.0
+        with:
+          directory: ${{ env.TESTREPORTS_DIR }}
+      -
+        name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports-${{ env.TESTREPORTS_NAME }}
+          path: ${{ env.TESTREPORTS_BASEDIR }}
+
+  govulncheck:
+    runs-on: ubuntu-26.04
+    permissions:
+      # same as global permission
+      contents: read
+      # required to write sarif report
+      security-events: write
+    steps:
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
+      -
+        name: Run
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        with:
+          targets: govulncheck
+        env:
+          GOVULNCHECK_FORMAT: sarif
+      -
+        name: Upload SARIF report
+        if: ${{ github.ref == 'refs/heads/master' && github.repository == 'docker/buildx' }}
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: ${{ env.DESTDIR }}/govulncheck.out
+
+  binaries:
+    uses: docker/github-builder/.github/workflows/bake.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    permissions:
+      contents: read # same as global permission
+      id-token: write # for signing attestation(s) with GitHub OIDC Token
+    with:
+      runner: amd64
+      artifact-name: buildx
+      artifact-upload: true
+      cache: true
+      cache-scope: bin-image
+      target: release
+      output: local
+      sbom: true
+      sign: ${{ github.event_name != 'pull_request' }}
+
+  binaries-finalize:
+    runs-on: ubuntu-26.04
+    needs:
+      - binaries
+    steps:
+      -
+        name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: /tmp/buildx-output
+          name: ${{ needs.binaries.outputs.artifact-name }}
+      -
+        name: Rename provenance and sbom
+        run: |
+          for pdir in /tmp/buildx-output/*/; do
+            (
+              cd "$pdir"
+              binname=$(find . -name 'buildx-*')
+              filename=$(basename "${binname%.exe}")
+              mv "provenance.json" "${filename}.provenance.json"
+              mv "sbom-binaries.spdx.json" "${filename}.sbom.json"
+              find . -name 'sbom*.json' -exec rm {} \;
+              if [[ "$binname" == *darwin* ]] || [[ "$binname" == *windows* ]]; then
+                rm -f "provenance.sigstore.json"
+              elif [ -f "provenance.sigstore.json" ]; then
+                mv "provenance.sigstore.json" "${filename}.sigstore.json"
+              fi
+            )
+          done
+          mkdir -p "${{ env.DESTDIR }}"
+          mv /tmp/buildx-output/**/* "${{ env.DESTDIR }}/"
+      -
+        name: Create checksums
+        working-directory: ${{ env.DESTDIR }}
+        run: |
+          sha256sum -b buildx-* > ./checksums.txt
+          sed -i -e '/darwin/d' -e '/windows/d' ./checksums.txt
+          sha256sum -c --strict checksums.txt
+      -
+        name: List artifacts
+        working-directory: ${{ env.DESTDIR }}
+        run: |
+          tree -nh .
+      -
+        name: Check artifacts
+        working-directory: ${{ env.DESTDIR }}
+        run: |
+          find . -type f -exec file -e ascii -- {} +
+      -
+        name: Upload release binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: ${{ env.DESTDIR }}/*
+          if-no-files-found: error
+
+  bin-image-prepare:
+    runs-on: ubuntu-26.04
+    outputs:
+      repo-slug: ${{ env.REPO_SLUG }}
+    steps:
+      # FIXME: can't use env object in reusable workflow inputs: https://github.com/orgs/community/discussions/26671
+      - run: echo "Exposing env vars for reusable workflow"
+
+  bin-image:
+    if: ${{ github.repository == 'docker/buildx' }}
+    uses: docker/github-builder/.github/workflows/bake.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    needs:
+      - bin-image-prepare
+      - test-integration
+      - test-unit
+    permissions:
+      contents: read # same as global permission
+      id-token: write # for signing attestations, cache entries and logging in to Docker Hub with GitHub OIDC
+    with:
+      runner: amd64
+      target: image-cross
+      cache: true
+      cache-scope: bin-image
+      output: image
+      push: ${{ github.event_name != 'pull_request' }}
+      sbom: true
+      set-meta-labels: true
+      meta-images: |
+        ${{ needs.bin-image-prepare.outputs.repo-slug }}
+      meta-tags: |
+        type=ref,event=branch
+        type=ref,event=pr
+        type=semver,pattern={{version}}
+      meta-bake-target: meta-helper
+      registry-identities: |
+        - type: dockerhub
+          registry: docker.io
+          username: docker
+          connection_id: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+
+  scout:
+    runs-on: ubuntu-26.04
+    if: ${{ github.ref == 'refs/heads/master' && github.repository == 'docker/buildx' }}
+    permissions:
+      contents: read # same as global permission
+      security-events: write # required to write sarif report
+    needs:
+      - bin-image
+    steps:
+      -
+        # FIXME: switch to OIDC once Scout supports it
+        name: Login to DockerHub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERPUBLICBOT_USERNAME }}
+          password: ${{ secrets.DOCKERPUBLICBOT_READ_PAT }}
+      -
+        name: Scout
+        id: scout
+        uses: crazy-max/.github/.github/actions/docker-scout@f91220cba053bd54299ba645a599ee8ed436f222 # v1.11.0
+        with:
+          version: ${{ env.SCOUT_VERSION }}
+          format: sarif
+          image: registry://${{ env.REPO_SLUG }}:master
+      -
+        name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: ${{ steps.scout.outputs.result-file }}
+
+  release:
+    runs-on: ubuntu-26.04
+    permissions:
+      # required to create GitHub release
+      contents: write
+    needs:
+      - test-integration
+      - test-unit
+      - binaries-finalize
+    steps:
+      -
+        name: Download release binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ env.DESTDIR }}
+          name: release
+      -
+        name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          draft: true
+          files: ${{ env.DESTDIR }}/*

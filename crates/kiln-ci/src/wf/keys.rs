@@ -61,10 +61,14 @@ pub const CONCURRENCY: &[Key] = &[
     gha("group", Ty::Tpl, "The concurrency group: at most one run (or job) of a group is in progress and one is pending."),
     gha("cancel-in-progress", Ty::BoolOrExpr, "Cancel the run or job in progress when a new one joins the group."),
     kiln("limit", Ty::Num, "kiln: at most this many in progress (docs/ci.md W05-R07)."),
-    kiln("queue", Ty::Str, "kiln: `latest` (GitHub's), `fifo` or `cancel-in-progress` (W05-R07)."),
+    gha("queue", Ty::Str, "`single` (default: one pending, replaced by a newer one) or `max` (up to 100 pending, in order); not with `cancel-in-progress: true`."),
 ];
 
-pub const ENVIRONMENT: &[Key] = &[gha("name", Ty::Tpl, "The environment's name."), gha("url", Ty::Tpl, "The deployment's URL, shown on the run.")];
+pub const ENVIRONMENT: &[Key] = &[
+    gha("name", Ty::Tpl, "The environment's name."),
+    gha("url", Ty::Tpl, "The deployment's URL, shown on the run."),
+    gha("deployment", Ty::BoolOrExpr, "`false`: use the environment's rules and secrets without recording a deployment."),
+];
 
 pub const CREDENTIALS: &[Key] = &[gha("username", Ty::Tpl, "Registry user name."), gha("password", Ty::Tpl, "Registry password (use a secret).")];
 
@@ -231,6 +235,7 @@ pub const PERMISSION_SCOPES: &[&str] = &[
     "attestations",
     "checks",
     "contents",
+    "copilot-requests",
     "deployments",
     "discussions",
     "id-token",
@@ -277,6 +282,11 @@ pub const STEP: &[Key] = &[
     gha("continue-on-error", Ty::BoolOrExpr, "A failure doesn't fail the job."),
     gha("timeout-minutes", Ty::NumOrExpr, "Fail the step after this long."),
     gha("working-directory", Ty::Tpl, "Where `run` runs."),
+    gha("background", Ty::BoolOrExpr, "Run the step in the background: the job goes on, and a later `wait` or `wait-all` collects it (at most 10 at once)."),
+    gha("wait", Ty::StrList, "Wait for these background steps (by id); their outputs and environment apply from here."),
+    gha("wait-all", Ty::Any, "Wait for every earlier background step."),
+    gha("cancel", Ty::StrList, "Stop these background steps (SIGTERM, then SIGKILL after a grace period)."),
+    gha("parallel", Ty::Any, "Steps run as background steps, with an implicit wait at the end."),
     kiln("retry", Ty::Any, "kiln: retry this step (W05-R14)."),
     kiln_only("with-secrets", Ty::StrMap, "kiln: map a kiln action's declared secrets to this job's (W09-R07)."),
     kiln("test-results", Ty::Any, "kiln: test reports this step writes (W16-R01)."),
@@ -305,6 +315,7 @@ pub const JOB: &[Key] = &[
     gha("with", Ty::Any, "Inputs for the reusable workflow."),
     gha("secrets", Ty::Any, "Secrets for the reusable workflow, or `inherit`."),
     gha("snapshot", Ty::Any, "GitHub custom images: the image to make from this job."),
+    gha("cache-mode", Ty::Str, "Cache access for the job: `read`, `write`, `write-only` or `none` (overrides the workflow's)."),
     kiln_only("matrix", Ty::Any, "kiln v1: the job's matrix (`strategy.matrix`)."),
     kiln_only("toolchain", Ty::Str, "kiln: a preset image and caches (`rust`, `go`, `python`, `node`, `bun`, `erlang`)."),
     kiln_only("image", Ty::Tpl, "kiln: the image for container, microVM and Kubernetes legs."),
@@ -341,6 +352,7 @@ pub const WORKFLOW: &[Key] = &[
     gha("defaults", Ty::Map(DEFAULTS), "Defaults for every job."),
     gha("concurrency", Ty::StrOrMap(CONCURRENCY), "A concurrency group for the runs."),
     gha("jobs", Ty::Any, "The jobs."),
+    gha("cache-mode", Ty::Str, "Cache access for every job: `read`, `write`, `write-only` or `none` (low-trust events default to `read`)."),
     kiln_only("secrets", Ty::Any, "kiln: the secrets this workflow uses (W09-R06)."),
     kiln("supersede", Ty::Any, "kiln: cancel or deprioritize older runs (W05-R08)."),
     kiln("routing", Ty::Any, "kiln: `{ infer: true }` (W05-R19)."),

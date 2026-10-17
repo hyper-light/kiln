@@ -297,6 +297,12 @@ pub fn parse(src: &str, diags: &mut Vec<Diag>) -> Option<Node> {
     let mut parser = Parser::new_from_str(src);
     if let Err(e) = parser.load(&mut b, true) {
         let at = pos(*e.marker());
+        // Some YAML GitHub accepts is stricter in this parser (a flow sequence closed at its key's
+        // indentation, for one). Read it with a lenient parser instead, without positions.
+        if let Some(n) = lenient(src) {
+            b.diags.push(Diag::info("KCI1004", format!("read with a lenient YAML parser ({}): positions in this file's diagnostics are approximate", e.info()), Range { start: at, end: at }));
+            return Some(n);
+        }
         b.diags.push(Diag::error("KCI1001", format!("YAML: {}", e.info()), Range { start: at, end: at }));
         return None;
     }
@@ -313,6 +319,28 @@ pub fn parse(src: &str, diags: &mut Vec<Diag>) -> Option<Node> {
         return None;
     }
     Some(docs.swap_remove(0))
+}
+
+fn lenient(src: &str) -> Option<Node> {
+    let v: serde_yaml::Value = serde_yaml::from_str(src).ok()?;
+    Some(from_serde(&v, 0))
+}
+
+fn from_serde(v: &serde_yaml::Value, depth: usize) -> Node {
+    let range = Range::default();
+    if depth > MAX_DEPTH {
+        return Node { kind: Kind::Scalar(Scalar::Null, Style::Plain), range };
+    }
+    let kind = match v {
+        serde_yaml::Value::Null => Kind::Scalar(Scalar::Null, Style::Plain),
+        serde_yaml::Value::Bool(b) => Kind::Scalar(Scalar::Bool(*b), Style::Plain),
+        serde_yaml::Value::Number(n) => Kind::Scalar(n.as_i64().map_or_else(|| Scalar::Float(n.as_f64().unwrap_or(f64::NAN)), Scalar::Int), Style::Plain),
+        serde_yaml::Value::String(s) => Kind::Scalar(Scalar::Str(s.clone()), Style::Quoted),
+        serde_yaml::Value::Sequence(items) => Kind::Seq(items.iter().map(|x| from_serde(x, depth + 1)).collect()),
+        serde_yaml::Value::Mapping(m) => Kind::Map(m.iter().map(|(k, x)| (from_serde(k, depth + 1), from_serde(x, depth + 1))).collect()),
+        serde_yaml::Value::Tagged(t) => return from_serde(&t.value, depth),
+    };
+    Node { kind, range }
 }
 
 #[cfg(test)]

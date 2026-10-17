@@ -190,6 +190,8 @@ pub struct Workflow {
     pub env: Vec<(String, Tpl)>,
     pub defaults: Defaults,
     pub concurrency: Option<Concurrency>,
+    /// `read`, `write`, `write-only` or `none`.
+    pub cache_mode: Option<String>,
     pub jobs: Vec<Job>,
     /// kiln: `secrets:` the workflow declares (W09-R06).
     pub secrets: Vec<SecretDecl>,
@@ -291,9 +293,10 @@ pub struct Concurrency {
     pub group: Tpl,
     /// A boolean or an expression.
     pub cancel_in_progress: Option<YVal>,
-    /// kiln (W05-R07).
-    pub limit: Option<u32>,
+    /// `single` (GitHub's default) or `max`.
     pub queue: Option<String>,
+    /// kiln (W05-R07): at most this many in progress.
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -334,6 +337,7 @@ pub struct Job {
     pub permissions: Option<Permissions>,
     /// GitHub's custom-image `snapshot:` (kept as written).
     pub snapshot: Option<YVal>,
+    pub cache_mode: Option<String>,
     pub kiln: JobKiln,
 }
 
@@ -394,6 +398,8 @@ pub enum RunsOn {
 pub struct Environment {
     pub name: Tpl,
     pub url: Option<Tpl>,
+    /// `false`: no deployment record (a boolean or an expression).
+    pub deployment: Option<YVal>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -419,7 +425,24 @@ pub struct Step {
     pub working_directory: Option<Tpl>,
     pub continue_on_error: Option<YVal>,
     pub timeout_minutes: Option<YVal>,
+    /// Runs in the background (a boolean or an expression).
+    pub background: Option<YVal>,
+    /// Waits for these background steps.
+    pub wait: Vec<String>,
+    /// Waits for every earlier background step.
+    pub wait_all: bool,
+    /// Stops these background steps.
+    pub cancel: Vec<String>,
+    /// Steps run as background steps with an implicit wait after them.
+    pub parallel: Vec<Step>,
     pub kiln: StepKiln,
+}
+
+impl Step {
+    /// A `wait`, `wait-all`, `cancel` or `parallel` step: it runs no command or action itself.
+    pub fn is_control(&self) -> bool {
+        !self.wait.is_empty() || self.wait_all || !self.cancel.is_empty() || !self.parallel.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
