@@ -190,6 +190,9 @@ fn is_zero(n: &u32) -> bool {
 impl Info {
     /// Refresh the live fields from the session's state.
     pub fn apply(&mut self, s: &State) {
+        if !s.name.is_empty() {
+            self.name.clone_from(&s.name);
+        }
         self.status = s.status;
         self.title.clone_from(&s.title);
         self.model.clone_from(&s.model);
@@ -288,6 +291,23 @@ fn store_attachments(files: &Files, msg: &str, list: Vec<super::model::Attachmen
         out.push(a);
     }
     out
+}
+
+/// The longest name a session takes.
+const MAX_NAME: usize = 80;
+
+/// Names a session (the "rename" control: the console, `/rename`, a broadcast): in kiln's lists,
+/// and kept across restarts in its spec. Returns the control to pass on when the harness names
+/// its conversations too (Claude Code, Codex). An empty name gives it back its harness's name.
+fn name_session(s: &Session, value: Option<&serde_json::Value>) -> Option<Command> {
+    let name: String = value.and_then(serde_json::Value::as_str).unwrap_or("").trim().chars().take(MAX_NAME).collect();
+    let kind_name = s.info.lock().kind_name.clone();
+    s.spec.lock().name = (!name.is_empty()).then(|| name.clone());
+    let mut core = s.core.lock();
+    core.state.name = if name.is_empty() { kind_name } else { name.clone() };
+    core.touch_state();
+    let harness_names = core.meta.controls.iter().any(|c| c.id == "rename");
+    (harness_names && !name.is_empty()).then(|| Command::Control { id: "rename".into(), value: Some(serde_json::Value::String(name)) })
 }
 
 /// A command as the adapter should see it (attachments stored first).
@@ -1039,6 +1059,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     let _ = sink.send((s.id.clone(), u)).await;
                                 }
                             }
+                            Command::Control { id, value } if id == "rename" => {
+                                if let Some(c) = name_session(&s, value.as_ref()) {
+                                    adapter.command(&mut s.core.lock(), c);
+                                }
+                                on_change();
+                            }
                             c => {
                                 let c = prepare(&files, c).await;
                                 let mut core = s.core.lock();
@@ -1167,6 +1193,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         carry.push(prepare(&files, c).await);
                         break;
                     }
+                    // Named while it isn't running: kiln's name now, the harness's when it next runs.
+                    Command::Control { id, value } if id == "rename" => {
+                        if let Some(c) = name_session(&s, value.as_ref()) {
+                            carry.push(c);
+                        }
+                        on_change();
+                    }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
                 Ev::Ctl(Some(Ctl::Close) | None) => {
@@ -1248,6 +1281,14 @@ mod tests {
         let mut later = i.clone();
         later.last_activity = 99;
         assert!(!later.differs(&i));
+
+        // A name given to it reaches lists through its state; none given leaves the one it had.
+        let named = i.clone();
+        i.apply(&State { name: "Docs fixer".into(), ..State::default() });
+        assert_eq!(i.name, "Docs fixer");
+        assert!(i.differs(&named));
+        i.apply(&State::default());
+        assert_eq!(i.name, "Docs fixer");
     }
 
     #[test]

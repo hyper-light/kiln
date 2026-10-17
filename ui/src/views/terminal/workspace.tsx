@@ -11,8 +11,10 @@ import { Button } from "@/components/ui/button";
 import { Optic } from "@/components/ui/misc";
 import { Chips } from "@/components/ui/status";
 import { Tip } from "@/components/ui/tooltip";
-import { useLocalStorage, useMediaQuery } from "@/lib/hooks";
+import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+import { NameField } from "@/components/ui/name-field";
+import { toast } from "@/components/ui/toast";
 import { HarnessMark } from "@/views/harness/parts";
 import { SpawnHereButton } from "@/views/harness/spawn-here";
 import { SpawnDialog } from "@/views/harness/spawn";
@@ -27,6 +29,10 @@ interface Tab {
   sessionId: string | null;
   target: string;
   title: string;
+  /** The name a person gave the session (over the window title). */
+  name?: string;
+  /** The window title the program last set. */
+  wtitle?: string;
   /** What the session runs (command + window title), used to pick keyboard shortcuts. */
   hints: string;
   /**
@@ -80,6 +86,15 @@ function sameState(a: SessionState, b: SessionState) {
 
 export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   const [tabs, setTabs] = React.useState<Tab[]>([]);
+  /** The tab whose name is being edited where it shows. */
+  const [renaming, setRenaming] = React.useState<string | null>(null);
+  /** Names a tab's session ("" gives it back its window title), on the server for every viewer. */
+  const renameTab = (tabId: string, name: string) => {
+    const tab = tabs.find((x) => x.id === tabId);
+    if (!tab?.sessionId) return;
+    setTabs((cur) => cur.map((x) => (x.id === tabId ? { ...x, name: name || undefined, title: tabTitle(x.target, name || x.wtitle || "") } : x)));
+    api.renameTerminalSession(tab.sessionId, name).catch((e: unknown) => toast.error("Couldn't rename the terminal", errorMessage(e)));
+  };
   const [activeId, setActiveId] = React.useState<string | null>(null);
   const [kbVisible, setKbVisible] = useLocalStorage("kiln.term.keyboard", isTouchDevice());
   const [kbMode, setKbMode] = useLocalStorage<KeyboardMode>("kiln.term.keyboardMode", isTouchDevice() ? "full" : "keys");
@@ -138,7 +153,9 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
               id: s.id,
               sessionId: s.id,
               target: s.target,
-              title: tabTitle(s.target, s.title),
+              name: s.name ?? undefined,
+              wtitle: s.title,
+              title: tabTitle(s.target, s.name || s.title),
               hints: `${s.command ?? ""} ${s.title}`,
               auto: presetFor(`${s.command ?? ""} ${s.title}`).id,
               state: { kind: "connecting" },
@@ -211,7 +228,9 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
                 sessionId: info.id,
                 hints: `${info.command ?? ""} ${info.title}`,
                 auto: stickyHarness(x.auto, `${info.command ?? ""} ${info.title}`),
-                title: info.title ? tabTitle(info.target, info.title) : x.title,
+                name: info.name ?? x.name,
+                wtitle: info.title || x.wtitle,
+                title: (info.name ?? x.name) ? tabTitle(info.target, info.name ?? x.name ?? "") : info.title ? tabTitle(info.target, info.title) : x.title,
               }
             : x,
         );
@@ -245,7 +264,8 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     setTabs((t) => {
       const tab = t.find((x) => x.id === tabId);
       if (!tab || tab.hints === title) return t;
-      return t.map((x) => (x.id === tabId ? { ...x, title: tabTitle(x.target, title), hints: title, auto: stickyHarness(x.auto, title) } : x));
+      // A named tab keeps its name over whatever title the program sets.
+      return t.map((x) => (x.id === tabId ? { ...x, title: x.name ? x.title : tabTitle(x.target, title), wtitle: title, hints: title, auto: stickyHarness(x.auto, title) } : x));
     });
   }, []);
 
@@ -379,7 +399,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
     else setPasteBox(true);
   }, []);
   const targets = ["local", ...connected.map((a) => `agent:${a.name}`)];
-  const switcherTabs = tabs.map((t) => ({ id: t.id, title: t.title, target: t.target, state: t.state.kind }));
+  const switcherTabs = tabs.map((t) => ({ id: t.id, title: t.title, name: t.name, target: t.target, state: t.state.kind }));
 
   const toggleFull = async () => {
     const el = panelRef.current;
@@ -440,10 +460,14 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
           onNewAgents={() => setSpawn({})}
           kbVisible={kbVisible}
           onToggleKb={() => setKbVisible(!kbVisible)}
+          renaming={renaming !== null && renaming === activeId}
+          onRename={(n) => active && renameTab(active.id, n)}
+          onRenameDone={() => setRenaming(null)}
           more={[
             { label: "Copy", disabled: !active, onSelect: () => void copyFromActive() },
             { label: "Paste", disabled: !active, onSelect: () => void pasteIntoActive() },
             { label: "Select text", disabled: !active, onSelect: () => active && setSelectText(handles.current.get(active.id)?.text() ?? "") },
+            { label: "Rename terminal", disabled: !active?.sessionId, onSelect: () => active && setRenaming(active.id) },
             { label: "Start agents in this shell", onSelect: () => active && setSpawn({ target: active.target, shell: active.sessionId ?? undefined }), disabled: !active?.sessionId },
             { label: "Larger text", onSelect: () => setFontSize(Math.min(24, fontSize + 1)) },
             { label: "Smaller text", onSelect: () => setFontSize(Math.max(9, fontSize - 1)) },
@@ -479,7 +503,23 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
               />
               <span className="font-mono text-[9px] text-[#6d7078]">{String(i + 1).padStart(2, "0")}</span>
               <RunningHere session={t.sessionId ? aiHere[t.sessionId] : undefined} />
-              <span className="max-w-[180px] truncate">{t.title}</span>
+              {renaming === t.id ? (
+                // The tab activates on clicks and keys; the field keeps them to itself.
+                <span className="term-name" onClick={(e) => e.stopPropagation()} onMouseDown={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                  <NameField value={t.name ?? ""} placeholder={t.title} label="Terminal name" onSave={(n) => renameTab(t.id, n)} onDone={() => setRenaming(null)} className="term-name-field" />
+                </span>
+              ) : (
+                <span
+                  className="max-w-[180px] truncate"
+                  title={t.sessionId ? "Double-click to rename" : undefined}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    if (t.sessionId) setRenaming(t.id);
+                  }}
+                >
+                  {t.title}
+                </span>
+              )}
               {t.state.kind === "exited" && <span className="font-mono text-[9px] text-[#8c8f98] uppercase">exited{t.state.code !== null ? ` ${t.state.code}` : ""}</span>}
               <button
                 className="grid size-7 place-items-center rounded-full text-[#7f838d] hover:bg-white/[0.06] hover:text-white"

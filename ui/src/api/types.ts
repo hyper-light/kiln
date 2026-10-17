@@ -663,6 +663,8 @@ export interface TerminalSessionInfo {
   command: string | null;
   /** Window title the program set (OSC 0/2). */
   title: string;
+  /** The name a person gave it (shown over the title). */
+  name?: string | null;
   created_at: number;
   attached: number;
   cols: number;

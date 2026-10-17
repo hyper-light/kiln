@@ -255,6 +255,7 @@ mod tests {
             target: "local".into(),
             command: Some(command.into()),
             title: String::new(),
+            name: None,
             created_at: 0,
             attached: 0,
             cols: 80,
