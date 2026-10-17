@@ -274,6 +274,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => get_artifacts(&hub, id).await,
         (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &hub.agent_list().await)),
+        (&Method::GET, ["api", "reach", "runners"]) => {
+            let want = srv::query(&req).get("want").cloned();
+            reach_runners(&hub, want.as_deref())
+        }
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
         (&Method::POST, ["api", "discovery", "scan"]) => discovery_scan(&hub, req).await,
@@ -1400,6 +1404,18 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         tracing::info!(agent = %name, "agent enrolled");
     }
     Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
+}
+
+/// `GET /api/reach/runners?want=linux/amd64`: reach's directory, ranked for `want` (every runner
+/// without one), with why the others were passed over.
+fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
+    let runners = hub.reach_directory();
+    let want = match want.map(crate::reach::directory::Want::parse).transpose() {
+        Ok(w) => w.unwrap_or_default(),
+        Err(e) => return Err(err(StatusCode::BAD_REQUEST, format!("{e:#}"))),
+    };
+    let (ranked, passed) = crate::reach::directory::rank(&runners, &want, "");
+    Ok(srv::json(StatusCode::OK, &json!({ "want": want.describe(), "runners": runners, "ranked": ranked, "passed": passed })))
 }
 
 /// `POST /api/agents/instance`: a certificate for a second runner process of a machine that is

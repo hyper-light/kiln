@@ -853,7 +853,10 @@ impl Hub {
             AgentMsg::ReachHello { json } => {
                 let pod = self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral);
                 match serde_json::from_str::<crate::reach::relay::Announce>(&json) {
-                    Ok(a) if !pod => self.reach.lock().announce(&agent, a),
+                    Ok(a) if !pod => {
+                        tracing::info!(agent = %agent, fingerprint = %crate::reach::e2e::short(&a.fingerprint), accept = a.accept, "reach identity");
+                        self.reach.lock().announce(&agent, a);
+                    }
                     Ok(_) => {}
                     Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable reach announcement"),
                 }

@@ -150,11 +150,14 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &asy
     let (tx, rx) = async_channel::unbounded::<SyncSay>();
     handle.sync(peer, key, tx).await;
     let leave = || handle.leave(peer, None, Some(key.to_owned()));
-    let entries = crate::rt::blocking({
-        let root = root.to_path_buf();
-        move || sync::scan(&root)
-    })
-    .await??;
+    let tree = std::sync::Arc::new(
+        crate::rt::blocking({
+            let root = root.to_path_buf();
+            move || sync::scan(&root)
+        })
+        .await??,
+    );
+    let entries = &tree.entries;
     let total: u64 = entries.iter().map(|e| e.size).sum();
     let _ = ev.send(Ev::Syncing { files: entries.len() as u64, bytes: total }).await;
     let chunks: Vec<Vec<wire::Entry>> = entries.chunks(2000).map(<[wire::Entry]>::to_vec).collect();
@@ -195,8 +198,8 @@ async fn sync_once(handle: &Handle, peer: &str, root: &Path, key: &str, ev: &asy
         let mut offset = 0u64;
         loop {
             let piece = crate::rt::blocking({
-                let (root, p) = (root.to_path_buf(), p.clone());
-                move || sync::read_piece(&root, &p, offset)
+                let src = tree.source(&p);
+                move || sync::read_piece(&src, offset)
             })
             .await;
             let (data, last) = match piece {

@@ -2,7 +2,9 @@
 //!
 //! The asking side lists its tree ([`scan`]): a git repository's files as git sees them (tracked,
 //! and untracked but not ignored — so `target/` and `node_modules/` stay home) plus `.git` itself,
-//! so git works over there too; any other folder, everything but the usual build output. The other
+//! so git works over there too (a worktree's `.git` becomes a repository of its own: the shared
+//! objects and refs, with the worktree's HEAD and index); any other folder, everything but the
+//! usual build output. The other
 //! side keeps a copy per tree and runner (`~/.kiln/reach/<runner>/<key>`), asks for the files whose
 //! size or modification time differ ([`need`]), writes them ([`Mirror::write`]) with the asker's
 //! times, and on commit makes the copy match the list exactly ([`Mirror::commit`]). A second sync
@@ -115,17 +117,17 @@ fn entry(root: &Path, rel: &Path) -> Option<Entry> {
     Some(Entry { path, kind, size, mtime_ns: mtime_ns(&md), mode: mode(&md), target })
 }
 
-/// Every file and folder under `dir` (relative to `root`), not following symlinks.
+/// Every file and folder under `dir` (relative to `root`), not following symlinks; `skip` is
+/// asked about each folder's path in the tree.
 fn walk(root: &Path, dir: &Path, skip: &dyn Fn(&str) -> bool, out: &mut Vec<Entry>) -> anyhow::Result<()> {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(read) = std::fs::read_dir(root.join(&d)) else { continue };
         for e in read.flatten() {
             let rel = d.join(e.file_name());
-            let name = e.file_name().to_string_lossy().into_owned();
             let Some(en) = entry(root, &rel) else { continue };
             if en.kind == EntryKind::Dir {
-                if skip(&name) {
+                if skip(&en.path) {
                     continue;
                 }
                 stack.push(rel);
@@ -137,9 +139,65 @@ fn walk(root: &Path, dir: &Path, skip: &dyn Fn(&str) -> bool, out: &mut Vec<Entr
     Ok(())
 }
 
+/// A tree as listed: its entries, and where on this machine each file's bytes are (its place in
+/// the tree, except for a worktree's git data).
+pub struct Tree {
+    pub root: PathBuf,
+    pub entries: Vec<Entry>,
+    sources: HashMap<String, PathBuf>,
+}
+
+impl Tree {
+    /// Where the bytes of `path` are read from.
+    pub fn source(&self, path: &str) -> PathBuf {
+        self.sources.get(path).cloned().unwrap_or_else(|| self.root.join(path))
+    }
+}
+
+/// `git rev-parse <what>` in `root`, as an absolute path.
+fn git_path(root: &Path, what: &str) -> Option<PathBuf> {
+    let o = std::process::Command::new("git").arg("-C").arg(root).args(["rev-parse", what]).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success())?;
+    let p = PathBuf::from(String::from_utf8(o.stdout).ok()?.trim_end_matches(['\n', '\r']));
+    let p = if p.is_relative() { root.join(p) } else { p };
+    p.is_dir().then_some(p)
+}
+
+/// A worktree's git data as one repository's `.git`: the shared part (objects, refs, config; not
+/// the other worktrees), then the worktree's own (HEAD, index, logs) over it.
+fn worktree_git(root: &Path, out: &mut Vec<Entry>, sources: &mut HashMap<String, PathBuf>) -> anyhow::Result<bool> {
+    let (Some(own), Some(common)) = (git_path(root, "--absolute-git-dir"), git_path(root, "--git-common-dir")) else { return Ok(false) };
+    if own == common {
+        return Ok(false);
+    }
+    let mut layer = |dir: &Path, skip: &dyn Fn(&str) -> bool| -> anyhow::Result<()> {
+        let mut found = Vec::new();
+        walk(dir, Path::new(""), &|p| p == "worktrees", &mut found)?;
+        for mut e in found {
+            if skip(&e.path) {
+                continue;
+            }
+            let src = dir.join(&e.path);
+            e.path = format!(".git/{}", e.path);
+            sources.insert(e.path.clone(), src);
+            out.retain(|x| x.path != e.path);
+            out.push(e);
+        }
+        Ok(())
+    };
+    layer(&common, &|p| p.ends_with(".lock"))?;
+    layer(&own, &|p| matches!(p, "gitdir" | "commondir" | "locked") || p.ends_with(".lock"))?;
+    if let Some(d) = entry(root, Path::new(".git")) {
+        // `.git` is a folder over there.
+        out.retain(|x| x.path != ".git");
+        out.push(Entry { kind: EntryKind::Dir, size: 0, target: None, ..d });
+    }
+    Ok(true)
+}
+
 /// The tree at `root`, as the other side should have it.
-pub fn scan(root: &Path) -> anyhow::Result<Vec<Entry>> {
+pub fn scan(root: &Path) -> anyhow::Result<Tree> {
     let mut out = Vec::new();
+    let mut sources = HashMap::new();
     let git = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -174,22 +232,22 @@ pub fn scan(root: &Path) -> anyhow::Result<Vec<Entry>> {
                 if d.kind == EntryKind::Dir {
                     out.push(d);
                     walk(root, Path::new(".git"), &|_| false, &mut out)?;
-                } else {
-                    // A worktree's or submodule's `.git` file pointing elsewhere: carried as is.
+                } else if !worktree_git(root, &mut out, &mut sources)? {
+                    // A `.git` file git can't resolve (a submodule's elsewhere): carried as is.
                     out.push(d);
                 }
             }
         }
-        None => walk(root, Path::new(""), &|name| SKIP_DIRS.contains(&name), &mut out)?,
+        None => walk(root, Path::new(""), &|p| SKIP_DIRS.contains(&p.rsplit('/').next().unwrap_or(p)), &mut out)?,
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
-    Ok(out)
+    Ok(Tree { root: root.to_path_buf(), entries: out, sources })
 }
 
-/// A piece of a file of the tree, for the other side.
-pub fn read_piece(root: &Path, path: &str, offset: u64) -> anyhow::Result<(Vec<u8>, bool)> {
-    let full = root.join(path);
+/// A piece of a file of the tree (read from `source`), for the other side.
+pub fn read_piece(source: &Path, offset: u64) -> anyhow::Result<(Vec<u8>, bool)> {
+    let full = source.to_path_buf();
     let mut f = std::fs::File::open(&full).with_context(|| format!("open {}", full.display()))?;
     let len = f.metadata()?.len();
     f.seek(std::io::SeekFrom::Start(offset))?;
@@ -405,14 +463,14 @@ mod tests {
 
     /// Run a whole sync from `src` into a copy at `dst` as the two sides would.
     fn sync(src: &Path, dst: &Path) -> anyhow::Result<(Vec<String>, u32, u32)> {
-        let entries = scan(src)?;
+        let tree = scan(src)?;
         let mut m = Mirror::new(dst.to_path_buf())?;
-        m.plan(entries.clone())?;
+        m.plan(tree.entries.clone())?;
         let needed = need(dst, m.entries());
         for p in &needed {
             let mut off = 0;
             loop {
-                let (data, last) = read_piece(src, p, off)?;
+                let (data, last) = read_piece(&tree.source(p), off)?;
                 m.write(p, off, &data, last)?;
                 off += data.len() as u64;
                 if last {
@@ -475,6 +533,33 @@ mod tests {
         assert!(removed >= 1);
         assert!(!d.join("untracked.txt").exists());
         assert_eq!(std::fs::read_to_string(d.join("src/main.rs"))?, "fn main() { println!(\"x\"); }\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_worktree_becomes_a_repository_of_its_own_over_there() -> anyhow::Result<()> {
+        let (main, wt_parent, dst) = (tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?);
+        let m = main.path();
+        git(m, &["init", "-q", "-b", "main"])?;
+        std::fs::write(m.join("a.txt"), "on main\n")?;
+        git(m, &["add", "."])?;
+        git(m, &["commit", "-qm", "main"])?;
+        let wt = wt_parent.path().join("feature");
+        git(m, &["worktree", "add", "-q", "-b", "feature", &wt.to_string_lossy()])?;
+        std::fs::write(wt.join("a.txt"), "on feature\n")?;
+        git(&wt, &["commit", "-qam", "feature work"])?;
+        std::fs::write(wt.join("a.txt"), "uncommitted\n")?;
+        let d = dst.path().join("copy");
+        sync(&wt, &d)?;
+        assert!(d.join(".git").is_dir(), "a real .git over there");
+        let run = |args: &[&str]| -> anyhow::Result<String> {
+            let o = std::process::Command::new("git").arg("-C").arg(&d).args(args).output()?;
+            Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        assert_eq!(run(&["rev-parse", "--abbrev-ref", "HEAD"])?, "feature");
+        assert_eq!(run(&["log", "--format=%s", "-1"])?, "feature work");
+        assert_eq!(run(&["status", "--porcelain"])?, "M a.txt");
+        assert!(!d.join(".git/worktrees").exists(), "the other worktrees stay home");
         Ok(())
     }
 
