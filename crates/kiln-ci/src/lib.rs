@@ -1,0 +1,20 @@
+//! kiln's CI core (docs/ci.md): everything that *decides*, written as pure code with no clock,
+//! no disk, no network and no randomness except what the caller passes in, the way
+//! `kiln-cd`'s engine is. The kiln crate feeds it events and carries out what it says, so
+//! every decision here is testable at full speed and benchmarkable.
+//!
+//! - [`expr`]: the `${{ }}` expression language, GitHub-exact, with kiln's additions (W01).
+//! - [`wf`]: workflows of both dialects, overlays and action metadata, validated (W02).
+//! - [`trigger`]: events and how workflows match them (W03).
+//! - [`plan`]: a run's graph, matrices, reusable workflows, outputs (W04).
+//! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
+//! - [`results`]: test reports and flaky classification (W16).
+//! - [`stats`]: bootstrap intervals for benchmarks and experiments (W16, W20).
+
+pub mod expr;
+pub mod plan;
+pub mod results;
+pub mod sched;
+pub mod stats;
+pub mod trigger;
+pub mod wf;

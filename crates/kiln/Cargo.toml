@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 kiln-cd = { path = "../kiln-cd" }
+kiln-ci = { path = "../kiln-ci" }
 hyper-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 hyper-rt = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 hyper-rt-transport = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
