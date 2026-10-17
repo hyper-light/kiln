@@ -7,15 +7,18 @@
 import * as React from "react";
 import { X } from "lucide-react";
 
-import { cdApi, type CdLogQuery } from "@/api/cd";
+import { cdApi, resourceKey, type CdLogQuery } from "@/api/cd";
 import { wsUrl } from "@/api/client";
-import type { CdLogLine, CdNode, CdResourceDetail } from "@/api/types";
+import type { CdLogLine, CdLogs, CdNode, CdResourceDetail, CdResourceKey } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { CopyButton, ErrorState, SelectField, SkeletonRows } from "@/components/ui/misc";
-import { errorMessage, useNow, useResource } from "@/lib/hooks";
+import { RowsHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { CopyButton, SelectField } from "@/components/ui/misc";
+import { useNow } from "@/lib/hooks";
+import { useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { age, compareText } from "./model";
-import { HealthPair, KindBadge, StatePair, SyncPair, objectLabel } from "./parts";
+import { HealthPair, KindBadge, StatePair, SyncPair, appKey, objectLabel } from "./parts";
 
 type Show = "summary" | "live" | "desired" | "diff" | "events" | "logs";
 
@@ -28,24 +31,28 @@ const when = (t: string | null | undefined) => {
   return Number.isNaN(d) ? t : new Date(d).toLocaleString();
 };
 
+/** Brought into view as it opens, gently unless motion is reduced. */
+function intoView(el: HTMLElement | null) {
+  if (!el) return;
+  const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches || document.documentElement.dataset.motion === "paused";
+  el.scrollIntoView({ block: "nearest", behavior: still ? "auto" : "smooth" });
+}
+
+const keyOf = (n: CdNode): CdResourceKey => ({ group: n.group, kind: n.kind, namespace: n.namespace, name: n.name });
+
 export function ResourceDetails({
   appId,
   node,
-  tick,
   onClose,
   onSelect,
 }: {
   appId: string;
   node: CdNode;
-  /** Bumped when the app changes, so what is shown is read again. */
-  tick: number;
   onClose: () => void;
   /** Go to another node (an owner). */
   onSelect: (id: string) => void;
 }) {
   const now = useNow();
-  const key = React.useMemo(() => ({ group: node.group, kind: node.kind, namespace: node.namespace, name: node.name }), [node.group, node.kind, node.namespace, node.name]);
-  const detail = useResource((s) => cdApi.resource(appId, key, s), [appId, key, tick]);
   const logs = RUNS_PODS.has(node.kind) && !node.missing;
   const options: { value: Show; label: string }[] = [
     { value: "summary", label: "Summary" },
@@ -56,15 +63,9 @@ export function ResourceDetails({
   ];
   const [show, setShow] = React.useState<Show>(node.kind === "Pod" && (node.health === "Degraded" || (node.restarts ?? 0) > 0) ? "logs" : "summary");
   const current = options.some((o) => o.value === show) ? show : "summary";
-  const head = React.useRef<HTMLElement>(null);
-  // Brought into view when opened, gently unless motion is reduced.
-  React.useEffect(() => {
-    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches || document.documentElement.dataset.motion === "paused";
-    head.current?.scrollIntoView({ block: "nearest", behavior: reduce ? "auto" : "smooth" });
-  }, [node.id]);
 
   return (
-    <section ref={head} className="cd-details" aria-label={`${node.kind} ${node.name}`}>
+    <section ref={intoView} className="cd-details" aria-label={`${node.kind} ${node.name}`}>
       <header className="cd-details-head">
         <div className="cd-details-title">
           <KindBadge kind={node.kind} group={node.group} />
@@ -75,9 +76,7 @@ export function ResourceDetails({
         </button>
       </header>
       <p className="cd-details-meta">
-        {[node.kind, node.namespace || "cluster-scoped", node.created_at ? `${age(node.created_at, now)} old` : "", node.node ? `on ${node.node}` : ""]
-          .filter(Boolean)
-          .join(" · ")}
+        {[node.kind, node.namespace || "cluster-scoped", node.created_at ? `${age(node.created_at, now)} old` : "", node.node ? `on ${node.node}` : ""].filter(Boolean).join(" · ")}
       </p>
       <div className="cd-details-state">
         <HealthPair health={node.health} />
@@ -85,35 +84,34 @@ export function ResourceDetails({
         {node.managed ? <span className="cd-meta">managed</span> : <span className="cd-meta">live, owned by the app's objects</span>}
       </div>
       {(node.message || node.why) && (
-        <p
-          className="cd-details-why"
-          data-tone={node.why ? "warn" : node.health === "Degraded" || node.health === "Missing" ? "fail" : node.health === "Healthy" ? undefined : "warn"}
-        >
+        <p className="cd-details-why" data-tone={node.why ? "warn" : node.health === "Degraded" || node.health === "Missing" ? "fail" : node.health === "Healthy" ? undefined : "warn"}>
           {node.why ?? node.message}
         </p>
       )}
-      <SelectField label="Show" value={current} onChange={(v) => setShow(v as Show)} options={options} className="cd-details-show" />
+      {/* What it shows changes once that is in: until then, what was there stays. */}
+      <SelectField label="Show" value={current} onChange={(v) => React.startTransition(() => setShow(v as Show))} options={options} className="cd-details-show" />
       <div className="cd-details-body">
-        {current === "logs" ? (
-          <Logs appId={appId} node={node} />
-        ) : current === "events" ? (
-          <Events appId={appId} node={node} tick={tick} />
-        ) : detail.error && !detail.data ? (
-          <ErrorState error={detail.error} onRetry={detail.reload} compact />
-        ) : !detail.data ? (
-          <SkeletonRows rows={4} cols={3} />
-        ) : current === "summary" ? (
-          <Summary d={detail.data} node={node} onSelect={onSelect} />
-        ) : current === "live" ? (
-          <Manifest text={detail.data.live} empty="It isn't in the cluster." name={`${node.name}.live.yaml`} />
-        ) : current === "desired" ? (
-          <Manifest text={detail.data.desired} empty="Git doesn't hold it any more." name={`${node.name}.yaml`} />
-        ) : (
-          <Diff d={detail.data} />
-        )}
+        <Loadable label="the object" fallback={<RowsHold rows={4} rowHeight={40} />}>
+          {current === "logs" ? (
+            <Logs appId={appId} node={node} />
+          ) : current === "events" ? (
+            <Events appId={appId} node={node} />
+          ) : (
+            <Detail appId={appId} node={node} show={current} onSelect={onSelect} />
+          )}
+        </Loadable>
       </div>
     </section>
   );
+}
+
+function Detail({ appId, node, show, onSelect }: { appId: string; node: CdNode; show: Show; onSelect: (id: string) => void }) {
+  const k = keyOf(node);
+  const d = useSuspenseResource(`${appKey(appId)}object/${resourceKey(k)}`, (s) => cdApi.resource(appId, k, s)).data;
+  if (show === "summary") return <Summary d={d} node={node} onSelect={onSelect} />;
+  if (show === "live") return <Manifest text={d.live} empty="It isn't in the cluster." name={`${node.name}.live.yaml`} />;
+  if (show === "desired") return <Manifest text={d.desired} empty="Git doesn't hold it any more." name={`${node.name}.yaml`} />;
+  return <Diff d={d} />;
 }
 
 function Fact({ label, children }: { label: string; children: React.ReactNode }) {
@@ -269,13 +267,10 @@ function Diff({ d }: { d: CdResourceDetail }) {
   );
 }
 
-function Events({ appId, node, tick }: { appId: string; node: CdNode; tick: number }) {
+function Events({ appId, node }: { appId: string; node: CdNode }) {
   const now = useNow();
-  const key = { group: node.group, kind: node.kind, namespace: node.namespace, name: node.name };
-  const ev = useResource((s) => cdApi.events(appId, key, s), [appId, node.id, tick], { pollMs: 15_000 });
-  if (ev.error && !ev.data) return <ErrorState error={ev.error} onRetry={ev.reload} compact />;
-  if (!ev.data) return <SkeletonRows rows={3} cols={3} />;
-  const list = ev.data.events;
+  const k = keyOf(node);
+  const list = useSuspenseResource(`${appKey(appId)}events/${resourceKey(k)}`, (s) => cdApi.events(appId, k, s), { pollMs: 15_000 }).data.events;
   if (list.length === 0) return <p className="cd-empty">No events. Kubernetes keeps them for about an hour.</p>;
   return (
     <ul className="cd-events" aria-label="Events">
@@ -313,111 +308,148 @@ const TAIL = [
 /** Lines a followed log keeps. */
 const KEEP = 10_000;
 
+/** How a log is read: its pod and container, how far back, and how it shows. */
+interface LogOpts {
+  container: string;
+  pod: string;
+  since: string;
+  tail: string;
+  follow: boolean;
+  wrap: boolean;
+  previous: boolean;
+  times: boolean;
+}
+
 function Logs({ appId, node }: { appId: string; node: CdNode }) {
-  const key = React.useMemo(() => ({ group: node.group, kind: node.kind, namespace: node.namespace, name: node.name }), [node.group, node.kind, node.namespace, node.name]);
-  const [container, setContainer] = React.useState("");
-  const [pod, setPod] = React.useState("");
-  const [since, setSince] = React.useState("");
-  const [tail, setTail] = React.useState("500");
-  const [follow, setFollow] = React.useState(false);
-  const [wrap, setWrap] = React.useState(true);
-  const [previous, setPrevious] = React.useState(false);
-  const [times, setTimes] = React.useState(false);
-  const [lines, setLines] = React.useState<CdLogLine[]>([]);
-  const [pods, setPods] = React.useState<string[]>([]);
-  const [containers, setContainers] = React.useState<string[]>(() => node.containers.filter((c) => !c.init).map((c) => c.name));
-  const [more, setMore] = React.useState(0);
-  const [errors, setErrors] = React.useState<string[]>([]);
-  const [state, setState] = React.useState<"loading" | "ready" | "live" | "ended" | "failed">("loading");
-  const [nonce, setNonce] = React.useState(0);
-  const box = React.useRef<HTMLPreElement>(null);
-  const stick = React.useRef(true);
+  const [o, setO] = React.useState<LogOpts>({ container: "", pod: "", since: "", tail: "500", follow: false, wrap: true, previous: false, times: false });
+  // A new way of reading it shows once read: until then, the log there was stays.
+  const set = (patch: Partial<LogOpts>) => React.startTransition(() => setO((cur) => ({ ...cur, ...patch })));
+  const q: CdLogQuery = {
+    container: o.container || undefined,
+    pod: o.pod || undefined,
+    since_seconds: o.since ? Number(o.since) : undefined,
+    tail_lines: Number(o.tail),
+    previous: o.previous || undefined,
+  };
+  return o.follow ? <FollowedLog appId={appId} node={node} q={q} o={o} set={set} /> : <ReadLog appId={appId} node={node} q={q} o={o} set={set} />;
+}
 
-  const q: CdLogQuery = React.useMemo(
-    () => ({
-      container: container || undefined,
-      pod: pod || undefined,
-      since_seconds: since ? Number(since) : undefined,
-      tail_lines: Number(tail),
-      previous: previous || undefined,
-    }),
-    [container, pod, since, tail, previous],
+/** The log read once (and again when asked). */
+function useReadLog(appId: string, node: CdNode, q: CdLogQuery) {
+  const k = keyOf(node);
+  return useSuspenseResource(`${appKey(appId)}logs/${resourceKey(k)}?${JSON.stringify(q)}`, (s) => cdApi.logs(appId, k, q, s));
+}
+
+function ReadLog({ appId, node, q, o, set }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void }) {
+  const read = useReadLog(appId, node, q);
+  const r = read.data;
+  return (
+    <LogView
+      node={node}
+      o={o}
+      set={set}
+      known={r}
+      lines={r.lines}
+      errors={r.errors}
+      state={read.refreshing ? "Reading…" : `${r.lines.length.toLocaleString()} lines`}
+      again={read.reload}
+    />
   );
+}
 
-  // Read once (and when asked again).
-  React.useEffect(() => {
-    if (follow) return;
-    const ctl = new AbortController();
-    setState("loading");
-    cdApi
-      .logs(appId, key, q, ctl.signal)
-      .then((r) => {
-        setLines(r.lines);
-        setPods(r.pods);
-        setMore(r.more_pods);
-        if (r.containers.length) setContainers(r.containers);
-        setErrors(r.errors);
-        setState("ready");
-      })
-      .catch((e: unknown) => {
-        if (ctl.signal.aborted) return;
-        setErrors([errorMessage(e)]);
-        setState("failed");
-      });
-    return () => ctl.abort();
-  }, [appId, key, q, follow, nonce]);
+type FollowState = "loading" | "live" | "ended";
 
-  // Followed: a WebSocket says each line as it is written.
-  React.useEffect(() => {
-    if (!follow) return;
-    setLines([]);
-    setErrors([]);
-    setState("loading");
-    stick.current = true;
-    const ws = new WebSocket(wsUrl(cdApi.logsFollowPath(appId, key, q)));
-    let pending: CdLogLine[] = [];
-    let frame = 0;
-    const flush = () => {
-      frame = 0;
-      const add = pending;
-      pending = [];
-      setLines((l) => {
-        const next = l.concat(add);
-        return next.length > KEEP ? next.slice(next.length - KEEP) : next;
-      });
-    };
-    ws.onopen = () => setState("live");
-    ws.onmessage = (m) => {
-      if (typeof m.data !== "string") return;
-      const msg = JSON.parse(m.data) as { type: string; lines?: CdLogLine[]; pod?: string; message?: string };
-      if (msg.type === "lines" && msg.lines) {
-        pending.push(...msg.lines);
-        if (!frame) frame = requestAnimationFrame(flush);
-      } else if (msg.type === "error") {
-        setErrors((e) => [...e, msg.pod ? `${msg.pod}: ${msg.message ?? ""}` : (msg.message ?? "")]);
-      } else if (msg.type === "end") {
-        setState("ended");
-      }
-    };
-    ws.onclose = () => setState((s) => (s === "live" || s === "loading" ? "ended" : s));
-    ws.onerror = () => setErrors((e) => [...e, "The log stream failed."]);
-    return () => {
-      if (frame) cancelAnimationFrame(frame);
-      ws.close();
-    };
-  }, [appId, key, q, follow, nonce]);
+/** The log followed: a WebSocket says each line as it is written (opened with its view, closed with it). */
+function FollowedLog({ appId, node, q, o, set }: { appId: string; node: CdNode; q: CdLogQuery; o: LogOpts; set: (p: Partial<LogOpts>) => void }) {
+  // The pods and containers there are, as the last read found them.
+  const known = useReadLog(appId, node, { ...q, previous: undefined }).data;
+  const [lines, setLines] = React.useState<CdLogLine[]>([]);
+  const [errors, setErrors] = React.useState<string[]>([]);
+  const [state, setState] = React.useState<FollowState>("loading");
+  const k = keyOf(node);
+  const path = cdApi.logsFollowPath(appId, k, q);
+  const stream = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el) return;
+      setLines([]);
+      setErrors([]);
+      setState("loading");
+      const ws = new WebSocket(wsUrl(path));
+      let pending: CdLogLine[] = [];
+      let frame = 0;
+      const flush = () => {
+        frame = 0;
+        const add = pending;
+        pending = [];
+        setLines((l) => {
+          const next = l.concat(add);
+          return next.length > KEEP ? next.slice(next.length - KEEP) : next;
+        });
+      };
+      ws.onopen = () => setState("live");
+      ws.onmessage = (m) => {
+        if (typeof m.data !== "string") return;
+        const msg = JSON.parse(m.data) as { type: string; lines?: CdLogLine[]; pod?: string; message?: string };
+        if (msg.type === "lines" && msg.lines) {
+          pending.push(...msg.lines);
+          if (!frame) frame = requestAnimationFrame(flush);
+        } else if (msg.type === "error") {
+          setErrors((e) => [...e, msg.pod ? `${msg.pod}: ${msg.message ?? ""}` : (msg.message ?? "")]);
+        } else if (msg.type === "end") {
+          setState("ended");
+        }
+      };
+      ws.onclose = () => setState((s) => (s === "live" || s === "loading" ? "ended" : s));
+      ws.onerror = () => setErrors((e) => [...e, "The log stream failed."]);
+      return () => {
+        if (frame) cancelAnimationFrame(frame);
+        ws.close();
+      };
+    },
+    [path],
+  );
+  return (
+    <div ref={stream}>
+      <LogView node={node} o={o} set={set} known={known} lines={lines} errors={errors} state={state === "live" ? "Following" : state === "ended" ? "Ended" : "Reading…"} />
+    </div>
+  );
+}
 
-  // Kept at the bottom while it is followed, unless you scrolled up to read.
-  React.useLayoutEffect(() => {
-    const el = box.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [lines]);
-
-  const many = pods.length > 1 && !pod;
+function LogView({
+  node,
+  o,
+  set,
+  known,
+  lines,
+  errors,
+  state,
+  again,
+}: {
+  node: CdNode;
+  o: LogOpts;
+  set: (p: Partial<LogOpts>) => void;
+  /** What the last read found: its pods and containers. */
+  known: CdLogs;
+  lines: CdLogLine[];
+  errors: string[];
+  state: string;
+  /** Read it again (read once only). */
+  again?: () => void;
+}) {
+  const stick = React.useRef(true);
+  const pods = known.pods;
+  const more = known.more_pods;
+  const containers = known.containers.length ? known.containers : node.containers.filter((c) => !c.init).map((c) => c.name);
+  const many = pods.length > 1 && !o.pod;
   const stamp = (ts: string) => ts.replace("T", " ").replace(/\.\d+Z$/, "Z");
-  const text = React.useMemo(
-    () => lines.map((l) => [times && l.ts ? stamp(l.ts) : "", many ? l.pod : "", l.text].filter(Boolean).join("  ")).join("\n"),
-    [lines, times, many],
+  const text = React.useMemo(() => lines.map((l) => [o.times && l.ts ? stamp(l.ts) : "", many ? l.pod : "", l.text].filter(Boolean).join("  ")).join("\n"), [lines, o.times, many]);
+  // Kept at the bottom as it grows, unless you scrolled up to read.
+  const bottom = React.useCallback(
+    (el: HTMLPreElement | null) => {
+      if (el && stick.current) el.scrollTop = el.scrollHeight;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [text],
   );
   const podOptions = [{ value: "", label: pods.length > 1 || more ? `All ${pods.length + more} pods` : "Its pod" }, ...pods.map((p) => ({ value: p, label: p }))];
   return (
@@ -426,37 +458,37 @@ function Logs({ appId, node }: { appId: string; node: CdNode }) {
         {containers.length > 1 && (
           <SelectField
             label="Container"
-            value={container || containers[0] || ""}
-            onChange={setContainer}
+            value={o.container || containers[0] || ""}
+            onChange={(container) => set({ container })}
             options={containers.map((c) => ({ value: c, label: c }))}
             className="cd-logs-select"
           />
         )}
-        {node.kind !== "Pod" && pods.length > 1 && <SelectField label="Pod" value={pod} onChange={setPod} options={podOptions} className="cd-logs-select" />}
-        <SelectField label="Since" value={since} onChange={setSince} options={SINCE} className="cd-logs-select" />
-        <SelectField label="Lines" value={tail} onChange={setTail} options={TAIL} className="cd-logs-select" />
+        {node.kind !== "Pod" && pods.length > 1 && <SelectField label="Pod" value={o.pod} onChange={(pod) => set({ pod })} options={podOptions} className="cd-logs-select" />}
+        <SelectField label="Since" value={o.since} onChange={(since) => set({ since })} options={SINCE} className="cd-logs-select" />
+        <SelectField label="Lines" value={o.tail} onChange={(tail) => set({ tail })} options={TAIL} className="cd-logs-select" />
       </div>
       <div className="cd-logs-bar">
         <label className="cd-opt">
-          <input type="checkbox" className="check" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> Follow
+          <input type="checkbox" className="check" checked={o.follow} onChange={(e) => set({ follow: e.target.checked })} /> Follow
         </label>
         <label className="cd-opt cd-opt-wrap">
-          <input type="checkbox" className="check" checked={wrap} onChange={(e) => setWrap(e.target.checked)} /> Wrap
+          <input type="checkbox" className="check" checked={o.wrap} onChange={(e) => set({ wrap: e.target.checked })} /> Wrap
         </label>
         <label className="cd-opt">
-          <input type="checkbox" className="check" checked={times} onChange={(e) => setTimes(e.target.checked)} /> Times
+          <input type="checkbox" className="check" checked={o.times} onChange={(e) => set({ times: e.target.checked })} /> Times
         </label>
-        {!follow && (
+        {!o.follow && (
           <label className="cd-opt" title="The run before the container last restarted">
-            <input type="checkbox" className="check" checked={previous} onChange={(e) => setPrevious(e.target.checked)} /> Previous run
+            <input type="checkbox" className="check" checked={o.previous} onChange={(e) => set({ previous: e.target.checked })} /> Previous run
           </label>
         )}
         <span className="cd-logs-end">
           <span className="cd-meta" aria-live="polite">
-            {state === "live" ? "Following" : state === "ended" ? "Ended" : state === "loading" ? "Reading…" : `${lines.length.toLocaleString()} lines`}
+            {state}
           </span>
-          {!follow && (
-            <Button size="xs" variant="ghost" onClick={() => setNonce((n) => n + 1)}>
+          {again && (
+            <Button size="xs" variant="ghost" onClick={again}>
               Read again
             </Button>
           )}
@@ -464,11 +496,15 @@ function Logs({ appId, node }: { appId: string; node: CdNode }) {
         </span>
       </div>
       {errors.length > 0 && <p className="cd-warn">{errors.join("; ")}</p>}
-      {more > 0 && <p className="cd-meta">Showing {pods.length} of {pods.length + more} pods: the newest.</p>}
+      {more > 0 && (
+        <p className="cd-meta">
+          Showing {pods.length} of {pods.length + more} pods: the newest.
+        </p>
+      )}
       <pre
-        ref={box}
+        ref={bottom}
         className="cd-log"
-        data-wrap={wrap || undefined}
+        data-wrap={o.wrap || undefined}
         tabIndex={0}
         aria-label="Log"
         onScroll={(e) => {
@@ -476,7 +512,7 @@ function Logs({ appId, node }: { appId: string; node: CdNode }) {
           stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
         }}
       >
-        {lines.length === 0 ? <span className="cd-dim">{state === "loading" ? "Reading the log…" : "Nothing logged."}</span> : text}
+        {lines.length === 0 ? <span className="cd-dim">{state === "Reading…" ? "Reading the log…" : "Nothing logged."}</span> : text}
       </pre>
     </div>
   );

@@ -76,6 +76,11 @@
   color: #d8b9bb;
 }
 
+/* What the last bulk action did, said in the count's place (nothing moves). */
+.cd-notice-inline {
+  margin: 0;
+}
+
 /* A checkbox in its own column, the whole cell its target. */
 .cd-pick {
   display: grid;
@@ -331,32 +336,9 @@
   cursor: pointer;
 }
 /* A confirmation, in the page, under what it confirms. */
-.cd-confirm {
-  max-width: 72ch;
-  padding: 12px 14px;
-  border: 1px solid #2b2d32;
-  border-left: 2px solid #c6b08e;
-  border-radius: 6px;
-  background: #0b0c0e;
-  color: #c8cad0;
-  font-size: 12.5px;
-  line-height: 1.55;
-}
-.cd-confirm p {
-  margin: 0 0 6px;
-}
-.cd-confirm-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
-}
+/* The sync asked in place (a Confirm, misc.tsx): wider, for its list of objects. */
 .cd-sync {
-  display: flex;
   max-width: 760px;
-  flex-direction: column;
-  align-items: flex-start;
-  border-left-color: #bab0e3;
 }
 .cd-pickset {
   width: 100%;

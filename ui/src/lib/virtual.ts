@@ -15,8 +15,13 @@ export interface Window {
 /**
  * The rows to render, and the ref for the list's element. The ref measures as it attaches (before
  * paint, so a list never shows a frame without its rows) and again whenever the count changes.
+ * `onEnd`: called when the rows shown come within `ahead` rows of the end (load the next page).
  */
-export function useWindowedRows(count: number, rowHeight: number, overscan = 10): [ref: (el: HTMLElement | null) => (() => void) | undefined, win: Window] {
+export function useWindowedRows(
+  count: number,
+  rowHeight: number,
+  { overscan = 10, ahead = 50, onEnd }: { overscan?: number; ahead?: number; onEnd?: () => void } = {},
+): [ref: (el: HTMLElement | null) => (() => void) | undefined, win: Window] {
   const [win, setWin] = React.useState<Window>({ start: 0, end: Math.min(count, 40) });
   const ref = React.useCallback(
     (el: HTMLElement | null) => {
@@ -28,6 +33,7 @@ export function useWindowedRows(count: number, rowHeight: number, overscan = 10)
         const start = Math.max(0, Math.floor(top / rowHeight) - overscan);
         const end = Math.min(count, Math.ceil((top + window.innerHeight) / rowHeight) + overscan);
         setWin((w) => (w.start === start && w.end === end ? w : { start, end }));
+        if (end >= count - ahead) onEnd?.();
       };
       const schedule = () => {
         if (!frame) frame = requestAnimationFrame(measure);
@@ -41,7 +47,7 @@ export function useWindowedRows(count: number, rowHeight: number, overscan = 10)
         if (frame) cancelAnimationFrame(frame);
       };
     },
-    [count, rowHeight, overscan],
+    [count, rowHeight, overscan, ahead, onEnd],
   );
   return [ref, { start: Math.min(win.start, count), end: Math.min(win.end, count) }];
 }
