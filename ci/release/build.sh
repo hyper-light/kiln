@@ -43,8 +43,27 @@ zigbuild="$zig_home/bin/cargo-zigbuild"
 
 # macOS: cargo-zigbuild doesn't let us pick the minimum OS (zig then defaults to its newest), so
 # these wrappers pass zig an explicit `<arch>-macos.11.0` target for both compiling C and linking.
+# They also pass each framework once: rustc repeats `-framework X` for every crate that links X,
+# zig's linker writes a load command per occurrence, and dyld refuses a binary that loads the same
+# library twice ("duplicate linked dylib").
 for arch in aarch64 x86_64; do
-  printf '#!/bin/sh\nexec "%s" zig cc -- -g -fno-sanitize=all -target %s-macos.11.0-none "$@"\n' "$zigbuild" "$arch" > "$zig_home/macos11/cc-$arch"
+  cat > "$zig_home/macos11/cc-$arch" <<WRAPPER
+#!/bin/sh
+seen=" "
+n=\$#
+while [ "\$n" -gt 0 ]; do
+  a=\$1; shift; n=\$((n - 1))
+  if [ "\$a" = -framework ] && [ "\$n" -gt 0 ]; then
+    f=\$1; shift; n=\$((n - 1))
+    case "\$seen" in *" \$f "*) continue ;; esac
+    seen="\$seen\$f "
+    set -- "\$@" -framework "\$f"
+    continue
+  fi
+  set -- "\$@" "\$a"
+done
+exec "$zigbuild" zig cc -- -g -fno-sanitize=all -target $arch-macos.11.0-none "\$@"
+WRAPPER
   chmod +x "$zig_home/macos11/cc-$arch"
 done
 printf '#!/bin/sh\nexec "%s" zig ar -- "$@"\n' "$zigbuild" > "$zig_home/macos11/ar"
