@@ -179,6 +179,9 @@ struct Running {
     cancel: Shutdown,
 }
 
+/// How long a cancelled job has to end before the runner reports it over and lets it go.
+const CANCEL_GRACE: Duration = Duration::from_secs(120);
+
 /// One turn of the agent's event loop (computed inside `select!`, handled after it).
 enum Ev {
     Shutdown,
@@ -594,6 +597,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         if let Some(r) = jobs.get(&job) {
                             tracing::info!(%job, %reason, "cancelling job");
                             r.cancel.cancel();
+                            // A cancelled job that hasn't ended within the grace never will by
+                            // itself (a process that left its group holds its output, a wait
+                            // missed its wake-up): it is reported over, so it can't hold the
+                            // machine (an in-place upgrade waits for no job to finish).
+                            let (tx, j) = (done_tx.clone(), job.clone());
+                            crate::rt::spawn(async move {
+                                crate::rt::sleep(CANCEL_GRACE).await;
+                                let error = format!("cancelled; it hadn't ended {}s later, so the runner let it go", CANCEL_GRACE.as_secs());
+                                let _ = tx.send(JobResult { job: j, status: Status::Cancelled, exit_code: None, error: Some(error), peak_rss: None, cpu_seconds: None }).await;
+                            });
                         }
                     }
                     ServerMsg::Drain => draining = true,
@@ -912,12 +925,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Done(r) => {
-                tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
-                jobs.remove(&r.job);
-                if jobs.is_empty() {
-                    exclusive = false;
+                if jobs.remove(&r.job).is_some() {
+                    tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
+                    if jobs.is_empty() {
+                        exclusive = false;
+                    }
+                    uplink.msg(AgentMsg::JobFinished(r)).await;
+                } else {
+                    // Reported over already: a cancelled job let go of after its grace that ended
+                    // after all (or the grace's report, after the job's own).
+                    tracing::info!(job = %r.job, "a job already reported over has ended");
                 }
-                uplink.msg(AgentMsg::JobFinished(r)).await;
             }
             Ev::Heartbeat => {
                 if connected {

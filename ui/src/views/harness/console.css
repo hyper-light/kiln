@@ -1232,8 +1232,9 @@
   list-style: none;
 }
 
-/* The agent's name: tap it to rename it, in place. */
+/* The agent's name: tap it (or its pencil) to rename it, in place. */
 .ag-title-btn {
+  display: inline;
   padding: 0;
   border: 0;
   background: none;
@@ -1244,9 +1245,33 @@
   overflow-wrap: anywhere;
   cursor: text;
 }
-.ag-title-btn:hover:not(:disabled) {
-  text-decoration: underline dotted #6b6e78;
-  text-underline-offset: 5px;
+/* A name it shows but wasn't given (its first ask, its harness's title): quieter. */
+.ag-title-unnamed {
+  color: #b9bbc2;
+}
+.ag-rename {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  padding: 3px 9px;
+  border: 1px solid #2c2f36;
+  border-radius: 999px;
+  color: #9a9da6;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.09em;
+  line-height: 1;
+  text-transform: uppercase;
+  vertical-align: 0.3em;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+}
+.ag-title-btn:hover:not(:disabled) .ag-rename,
+.ag-title-btn:focus-visible .ag-rename {
+  border-color: rgb(186 176 227 / 45%);
+  color: #ededee;
 }
 .name-field.ag-title-field {
   margin-left: -9px;
