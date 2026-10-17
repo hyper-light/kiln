@@ -1,5 +1,7 @@
-//! The slice of the DNS wire format (RFC 1035) that multicast DNS service discovery needs
-//! (RFC 6762, RFC 6763): messages with questions and A, AAAA, PTR, SRV and TXT records.
+//! The slice of the DNS wire format (RFC 1035) that service discovery needs: multicast DNS
+//! (RFC 6762, RFC 6763) and DNS-SD over plain unicast DNS, with questions and A, AAAA, PTR, SRV
+//! and TXT records, plus what DNS UPDATE (RFC 2136) and TSIG (RFC 8945) build on: the header's
+//! opcode and response code, canonical names and the position of a message's last record.
 //!
 //! Everything read here comes from the network, so decoding is defensive: every read is bounds
 //! checked, names are capped at 255 bytes and labels at 63, compression pointers must point
@@ -14,12 +16,21 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const TYPE_A: u16 = 1;
+pub const TYPE_SOA: u16 = 6;
 pub const TYPE_PTR: u16 = 12;
 pub const TYPE_TXT: u16 = 16;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_SRV: u16 = 33;
+/// EDNS(0) pseudo-record (RFC 6891).
+pub const TYPE_OPT: u16 = 41;
+/// Transaction signature (RFC 8945).
+pub const TYPE_TSIG: u16 = 250;
 pub const TYPE_ANY: u16 = 255;
 pub const CLASS_IN: u16 = 1;
+/// DNS UPDATE: "delete this record" (RFC 2136 §2.5.4).
+pub const CLASS_NONE: u16 = 254;
+/// DNS UPDATE: "delete every record of this name (and type)"; TSIG records' class.
+pub const CLASS_ANY: u16 = 255;
 /// The class field's top bit: "cache flush" on a record, "unicast response wanted" on a question.
 pub const CLASS_TOP: u16 = 0x8000;
 
@@ -27,8 +38,43 @@ pub const CLASS_TOP: u16 = 0x8000;
 pub const FLAG_RESPONSE: u16 = 0x8000;
 /// Header flag: authoritative answer (every mDNS response sets it).
 pub const FLAG_AUTHORITATIVE: u16 = 0x0400;
-/// Header flag: truncated; more known answers follow in another packet.
+/// Header flag: truncated. In multicast DNS: more known answers follow in another packet; in
+/// unicast DNS: the answer did not fit the datagram, ask again over TCP.
 pub const FLAG_TRUNCATED: u16 = 0x0200;
+/// Header flag: recursion desired (unicast queries to a resolver).
+pub const FLAG_RECURSION_DESIRED: u16 = 0x0100;
+/// The header's opcode bits.
+pub const OPCODE_MASK: u16 = 0x7800;
+/// Opcode 5: DNS UPDATE (RFC 2136).
+pub const OPCODE_UPDATE: u16 = 5 << 11;
+/// The header's response code bits.
+pub const RCODE_MASK: u16 = 0x000F;
+pub const RCODE_NOERROR: u16 = 0;
+pub const RCODE_FORMERR: u16 = 1;
+pub const RCODE_NXDOMAIN: u16 = 3;
+pub const RCODE_NOTIMP: u16 = 4;
+
+/// What a response code (or TSIG error, RFC 8945 §5.3) means, for messages.
+pub fn rcode_name(code: u16) -> &'static str {
+    match code {
+        0 => "NOERROR",
+        1 => "FORMERR (the server could not parse the request)",
+        2 => "SERVFAIL",
+        3 => "NXDOMAIN (no such name)",
+        4 => "NOTIMP (not implemented)",
+        5 => "REFUSED",
+        6 => "YXDOMAIN",
+        7 => "YXRRSET",
+        8 => "NXRRSET",
+        9 => "NOTAUTH (not authoritative for the zone, or the signature was refused)",
+        10 => "NOTZONE (a name is outside the zone)",
+        16 => "BADSIG (the TSIG signature did not verify: wrong secret?)",
+        17 => "BADKEY (the server does not know that TSIG key, or not with that algorithm)",
+        18 => "BADTIME (the clocks differ by more than five minutes)",
+        22 => "BADTRUNC",
+        _ => "an unknown error",
+    }
+}
 
 /// The largest message kiln sends or reads (RFC 6762 §17).
 pub const MAX_MESSAGE: usize = 9000;
@@ -119,6 +165,82 @@ impl Name {
     pub fn wire_len(&self) -> usize {
         self.0.iter().map(|l| l.len() + 1).sum::<usize>() + 1
     }
+
+    /// Whether `self` is `other` or below it (`a.b.example.com` is under `example.com`).
+    pub fn is_under(&self, other: &Name) -> bool {
+        let skip = self.0.len().saturating_sub(other.0.len());
+        self.0.len() >= other.0.len() && self.0.iter().skip(skip).zip(&other.0).all(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+
+    /// `self` with `suffix`'s labels appended.
+    pub fn join(&self, suffix: &Name) -> Name {
+        Self(self.0.iter().chain(&suffix.0).cloned().collect())
+    }
+
+    /// The canonical wire form (RFC 4034 §6.2): uncompressed, ASCII letters lowercased. What TSIG
+    /// signs for key and algorithm names.
+    pub fn canonical_wire(&self) -> Result<Vec<u8>, Error> {
+        if self.wire_len() > MAX_NAME {
+            return Err(Error::NameTooLong);
+        }
+        let mut out = Vec::with_capacity(self.wire_len());
+        for l in &self.0 {
+            let b = l.as_bytes();
+            if b.is_empty() || b.len() > MAX_LABEL {
+                return Err(Error::BadLabel);
+            }
+            out.push(u8::try_from(b.len()).map_err(|_| Error::BadLabel)?);
+            out.extend(b.iter().map(u8::to_ascii_lowercase));
+        }
+        out.push(0);
+        Ok(out)
+    }
+
+    /// The name in master-file syntax (RFC 1035 §5.1): special characters escaped, so a DNS-SD
+    /// instance label with spaces, dots or parentheses survives a zone file. Absolute names end
+    /// with a dot; relative ones are relative to the zone's origin.
+    pub fn to_zone(&self, absolute: bool) -> String {
+        let mut s = self.0.iter().map(|l| zone_label(l)).collect::<Vec<_>>().join(".");
+        if absolute || s.is_empty() {
+            s.push('.');
+        }
+        s
+    }
+}
+
+/// One label in master-file syntax: `.`, `\`, `"`, `;`, `(`, `)`, `@`, `$` escaped with a
+/// backslash, spaces and everything outside printable ASCII as `\DDD` (per byte).
+fn zone_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for b in label.bytes() {
+        match b {
+            b'.' | b'\\' | b'"' | b';' | b'(' | b')' | b'@' | b'$' => {
+                out.push('\\');
+                out.push(char::from(b));
+            }
+            0x21..=0x7E => out.push(char::from(b)),
+            _ => out.push_str(&format!("\\{b:03}")),
+        }
+    }
+    out
+}
+
+/// A TXT string in master-file syntax: quoted, `"` and `\` escaped, non-printable bytes as `\DDD`.
+pub fn zone_txt_string(s: &[u8]) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for &b in s {
+        match b {
+            b'"' | b'\\' => {
+                out.push('\\');
+                out.push(char::from(b));
+            }
+            0x20..=0x7E => out.push(char::from(b)),
+            _ => out.push_str(&format!("\\{b:03}")),
+        }
+    }
+    out.push('"');
+    out
 }
 
 impl PartialEq for Name {
@@ -207,8 +329,39 @@ pub struct Message {
 }
 
 impl Message {
+    /// A unicast query for `name`/`qtype` with recursion desired, advertising a 1232-byte UDP
+    /// payload with EDNS(0) when `edns` (the size DNS flag day 2020 settled on: no fragments).
+    pub fn query(id: u16, name: Name, qtype: u16, edns: bool) -> Self {
+        let additionals = if edns {
+            vec![Record { name: Name::default(), class: 1232, cache_flush: false, ttl: 0, data: RData::Other { rtype: TYPE_OPT, data: Vec::new() } }]
+        } else {
+            Vec::new()
+        };
+        Self {
+            id,
+            flags: FLAG_RECURSION_DESIRED,
+            questions: vec![Question { name, qtype, qclass: CLASS_IN, unicast: false }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals,
+        }
+    }
+
     pub fn is_response(&self) -> bool {
         self.flags & FLAG_RESPONSE != 0
+    }
+
+    pub fn opcode(&self) -> u16 {
+        self.flags & OPCODE_MASK
+    }
+
+    /// The (4-bit) response code.
+    pub fn rcode(&self) -> u16 {
+        self.flags & RCODE_MASK
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.flags & FLAG_TRUNCATED != 0
     }
 
     /// Answers and additional records (where mDNS responders put what they announce).
@@ -272,6 +425,35 @@ impl Message {
         let additionals = section(ar)?;
         Ok(Self { id, flags, questions, answers, authorities, additionals })
     }
+}
+
+/// Where the last record of a well-formed message starts: what TSIG verification strips (the
+/// signature is the last additional record, RFC 8945 §5.1). Reads with the same limits as
+/// [`Message::decode`], and refuses trailing bytes.
+pub fn last_record_start(buf: &[u8]) -> Result<usize, Error> {
+    let mut r = Reader { buf, pos: 0 };
+    r.take(4)?;
+    let qd = usize::from(r.u16()?);
+    let records = [r.u16()?, r.u16()?, r.u16()?].iter().map(|n| usize::from(*n)).sum::<usize>();
+    if qd + records > MAX_RECORDS {
+        return Err(Error::TooManyRecords);
+    }
+    if records == 0 {
+        return Err(Error::Truncated);
+    }
+    for _ in 0..qd {
+        r.name()?;
+        r.take(4)?;
+    }
+    let mut start = r.pos;
+    for _ in 0..records {
+        start = r.pos;
+        r.record()?;
+    }
+    if r.pos != buf.len() {
+        return Err(Error::BadRdata);
+    }
+    Ok(start)
 }
 
 // ------------------------------------------------------------------------------------ reading
@@ -596,6 +778,67 @@ mod tests {
         assert_ne!(Name::parse("_kiln._udp.local"), service());
         assert_eq!(service().to_string(), "_kiln._tcp.local.");
         assert_eq!(Name::child("a.b", &service()).parent(), service());
+        let zone = Name::parse("Example.COM");
+        assert!(Name::parse("_kiln._tcp.example.com").is_under(&zone));
+        assert!(zone.is_under(&Name::parse("example.com")));
+        assert!(!Name::parse("example.org").is_under(&zone));
+        assert!(!Name::parse("com").is_under(&zone));
+        assert_eq!(Name::parse("_kiln._tcp").join(&zone), Name::parse("_kiln._tcp.example.com"));
+    }
+
+    #[test]
+    fn canonical_and_zone_file_names() -> Result<(), Error> {
+        assert_eq!(Name::parse("Key.Example.").canonical_wire()?, b"\x03key\x07example\x00".to_vec());
+        assert_eq!(Name::default().canonical_wire()?, vec![0]);
+        assert_eq!(Name::from_labels(["x".repeat(64)]).canonical_wire(), Err(Error::BadLabel));
+        // A DNS-SD instance label keeps its spaces, dots and parentheses through a zone file.
+        let instance = Name::child("kiln server on box.lan (1a2b3c4d)", &Name::parse("_kiln._tcp"));
+        assert_eq!(instance.to_zone(false), r"kiln\032server\032on\032box\.lan\032\(1a2b3c4d\)._kiln._tcp");
+        assert_eq!(Name::parse("example.com").to_zone(true), "example.com.");
+        assert_eq!(Name::default().to_zone(false), ".");
+        assert_eq!(Name::from_labels(["ü;@"]).to_zone(false), r"\195\188\;\@");
+        assert_eq!(zone_txt_string(b"name=a \"b\" \\ \x07"), r#""name=a \"b\" \\ \007""#);
+        Ok(())
+    }
+
+    #[test]
+    fn unicast_queries_and_headers() -> Result<(), Error> {
+        let q = Message::query(0xBEEF, Name::parse("_kiln._tcp.example.com"), TYPE_PTR, true);
+        let bytes = q.encode()?;
+        // Header: id, RD set, one question, one additional (the OPT record).
+        assert_eq!(bytes.get(..12), Some(&[0xBE, 0xEF, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1][..]));
+        let back = Message::decode(&bytes)?;
+        assert_eq!(back, q);
+        assert_eq!(back.additionals.first().map(|r| (r.rtype(), r.class)), Some((TYPE_OPT, 1232)));
+        assert!(!back.is_response() && !back.is_truncated());
+        let plain = Message::query(1, Name::parse("x.example"), TYPE_SRV, false);
+        assert!(plain.additionals.is_empty());
+        let r = Message { flags: FLAG_RESPONSE | FLAG_TRUNCATED | OPCODE_UPDATE | 9, ..Message::default() };
+        assert_eq!((r.opcode(), r.rcode(), r.is_truncated()), (OPCODE_UPDATE, 9, true));
+        assert!(rcode_name(17).starts_with("BADKEY"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_last_record_is_found() -> Result<(), Error> {
+        let m = announcement();
+        let bytes = m.encode()?;
+        let at = last_record_start(&bytes)?;
+        // Cutting there leaves a message whose last record is gone (counts aside).
+        let last = Message::decode(&bytes)?.additionals.last().cloned();
+        let mut shorter = m.clone();
+        shorter.additionals.pop();
+        assert_eq!(bytes.get(..at).map(<[u8]>::len), Some(shorter.encode()?.len()));
+        assert!(last.is_some_and(|r| r.rtype() == TYPE_AAAA));
+        // Trailing garbage, a message without records and truncation are refused.
+        let mut long = bytes.clone();
+        long.push(0);
+        assert_eq!(last_record_start(&long), Err(Error::BadRdata));
+        assert!(last_record_start(&header(0, 0)).is_err());
+        for n in 0..bytes.len() {
+            assert!(last_record_start(bytes.get(..n).unwrap_or_default()).is_err(), "prefix of {n} bytes");
+        }
+        Ok(())
     }
 
     #[test]
