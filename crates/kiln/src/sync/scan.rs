@@ -41,7 +41,7 @@ impl Default for Limits {
 }
 
 /// A path a scan left out, and why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Skipped {
     pub path: String,
     pub why: String,

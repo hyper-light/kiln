@@ -410,6 +410,24 @@ impl Feed {
         }
     }
 
+    /// The contents this copy still needs: what its queue and an install name, and what its unsent
+    /// steps carry to the server.
+    pub fn named(&self) -> std::collections::HashSet<String> {
+        let file = |v: &Option<super::Version>| match v {
+            Some(super::Version::File { hash, .. }) => Some(hash.clone()),
+            _ => None,
+        };
+        let queued = self.queue.iter().filter_map(|f| match f {
+            Fed::Step(_, s) => Some(s),
+            _ => None,
+        });
+        let mut out: std::collections::HashSet<String> = queued.chain(self.copy.state.sent.iter()).flat_map(|s| s.changes.iter()).filter_map(|c| file(&c.to)).collect();
+        if let Some(t) = &self.install {
+            out.extend(t.files.values().filter_map(|v| file(&Some(v.clone()))));
+        }
+        out
+    }
+
     /// Conflict copies in the tree, each with the path it stands beside.
     pub fn conflicts(&self) -> BTreeMap<String, String> {
         conflicts(&self.copy.state.tree)

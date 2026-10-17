@@ -17,6 +17,9 @@ use crate::store::Status;
 pub const LANE_CONTROL: u32 = 0;
 pub const LANE_TERM: u32 = 1;
 pub const LANE_LOGS: u32 = 2;
+/// Repo sync's lane (`crate::sync`): a queue of its own, so a burst of sync never sheds a job's or a
+/// terminal's frames.
+pub const LANE_SYNC: u32 = 3;
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -82,6 +85,10 @@ pub enum AgentMsg {
     /// Answer to [`ServerMsg::HarnessHistory`]: JSON `[`[`crate::aisessions::PastSession`]`]`,
     /// `None` when this machine does not look. Appended last: postcard encodes variants by index.
     HarnessHistory { req: u64, json: Option<String> },
+    /// Repo sync (`crate::sync`, on [`LANE_SYNC`]): `json` a [`crate::sync::wire::Msg`], `raft` the
+    /// bytes of the hyper-raft message it carries (empty when none). Only from runners announcing
+    /// [`CAP_SYNC`]. Appended last: postcard encodes variants by index.
+    Sync { json: String, raft: Vec<u8> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -95,6 +102,8 @@ pub const CAP_DIRS: u32 = 4;
 /// itself (`Spec::takeover_stop`), then resumes the conversation. Without it, such a session has to
 /// be quit by hand first.
 pub const CAP_TAKEOVER_STOP: u32 = 8;
+/// [`AgentMsg::Build`] capability: the runner syncs repos ([`ServerMsg::Sync`], `crate::sync`).
+pub const CAP_SYNC: u32 = 64;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,6 +204,9 @@ pub enum ServerMsg {
     /// answered by [`AgentMsg::HarnessHistory`]. Appended last: postcard encodes variants by
     /// index.
     HarnessHistory { req: u64, kind: Option<String>, limit: u32 },
+    /// Repo sync (`crate::sync`, on [`LANE_SYNC`]): as [`AgentMsg::Sync`]. Only to runners that
+    /// announced [`CAP_SYNC`]. Appended last: postcard encodes variants by index.
+    Sync { json: String, raft: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

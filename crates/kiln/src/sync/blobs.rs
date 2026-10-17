@@ -106,6 +106,47 @@ impl Blobs {
         std::fs::read(p)
     }
 
+    /// A place for a download on its way in: inside the store, so it moves in with a rename.
+    pub fn incoming(&self) -> PathBuf {
+        self.dir.join(format!(".incoming-{}", crate::util::new_id()))
+    }
+
+    /// Takes a file as blob `hash` if that is what it holds (moved in: true); else drops it.
+    pub fn adopt(&self, file: &Path, hash: &str) -> io::Result<bool> {
+        let Some(dest) = self.path(hash) else {
+            let _ = std::fs::remove_file(file);
+            return Ok(false);
+        };
+        if hash_file(file)? != hash {
+            std::fs::remove_file(file)?;
+            return Ok(false);
+        }
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::rename(file, &dest)?;
+        Ok(true)
+    }
+
+    /// Every blob held, and when it was last written.
+    pub fn all(&self) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+        let mut out = Vec::new();
+        for shard in std::fs::read_dir(&self.dir)? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(shard.path())? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if valid_hash(&name) {
+                    out.push((name, entry.metadata()?.modified()?));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Drops a blob nothing needs any more.
     pub fn remove(&self, hash: &str) -> io::Result<()> {
         match self.path(hash) {

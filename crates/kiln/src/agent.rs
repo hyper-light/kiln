@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -236,6 +236,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut paths = crate::tunnel::Paths::new(&o.server_url, &quic_addr);
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
+    // Repo sync: the copies of synced repos this machine holds (none in a job pod).
+    let sync = (!o.ephemeral).then(|| {
+        let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone());
+        let up = up_tx.clone();
+        crate::rt::spawn(async move {
+            while let Ok(m) = said.recv().await {
+                if up.send(Up::Sync(m)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        sync
+    });
     let uplink = Uplink(up_tx);
     let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
@@ -392,6 +405,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // and dial directly; the tunnel stays open until that connection is up.
                 if paths.tick(connected, Instant::now()) {
                     connected = false;
+                    if let Some(s) = &sync {
+                        s.connected(false);
+                    }
                     dialing_since = None;
                     redial = Some(Instant::now());
                 }
@@ -419,6 +435,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
                 connected = true;
+                if let Some(s) = &sync {
+                    s.connected(true);
+                }
                 while let Some((lane, kind, data)) = buffer.pop_front() {
                     buffered = buffered.saturating_sub(data.len());
                     net.send(SERVER_PEER, lane, kind, data).await;
@@ -436,6 +455,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     at_once = paths.dial_failed(now);
                 }
                 connected = false;
+                if let Some(s) = &sync {
+                    s.connected(false);
+                }
                 dialing_since = None;
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
@@ -490,6 +512,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             anyhow::bail!("refused: {reason}");
                         }
                         connected = false;
+                        if let Some(s) = &sync {
+                            s.connected(false);
+                        }
                         net.command(Out::Disconnect { peer: SERVER_PEER }).await;
                         redial = Some(Instant::now() + Duration::from_secs(60));
                     }
@@ -727,6 +752,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = up.send(Up::Term(AgentMsg::HarnessTaskOutput { req, json })).await;
                         });
                     }
+                    ServerMsg::Sync { json, raft } => {
+                        if let Some(s) = &sync {
+                            s.heard(&json, raft);
+                        }
+                    }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
                         let up = uplink.0.clone();
@@ -757,11 +787,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Msg(m) => (LANE_CONTROL, Kind::Control, proto::encode(m)),
                     Up::Log(c) => (LANE_LOGS, Kind::Log, proto::encode(c)),
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
+                    Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term {
+                } else if kind != Kind::Term && lane != LANE_SYNC {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.

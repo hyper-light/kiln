@@ -10,10 +10,14 @@
 //! proposed yet: that change is proposed from the version it was made from, and meets the rule.
 
 pub mod blobs;
+pub mod disk;
 pub mod group;
+pub mod runner;
 pub mod scan;
+pub mod server;
+pub mod wire;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -165,6 +169,11 @@ pub struct Copy {
     pub member: u64,
     pub limits: Limits,
     pub state: State,
+    /// What the last look left out.
+    pub skipped: Vec<scan::Skipped>,
+    /// Contents the server no longer has: versions later steps replaced, for a copy far behind.
+    /// Such a version is never written here; the later one is.
+    pub gone: HashSet<String>,
 }
 
 /// Whether a path from a step may be written here: relative, `/`-separated, without `.`, `..` or
@@ -210,7 +219,7 @@ fn set(map: &mut BTreeMap<String, Version>, path: &str, v: Option<Version>) {
 
 impl Copy {
     pub fn new(root: &Path, me: &str, member: u64, limits: Limits, state: State) -> Self {
-        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state }
+        Self { root: root.to_owned(), me: me.to_owned(), member, limits, state, skipped: Vec::new(), gone: HashSet::new() }
     }
 
     /// What this copy's file at `path` holds now (none: no file).
@@ -251,7 +260,8 @@ impl Copy {
     /// steps for the log, numbered on from the last this member sent, each of at most
     /// [`STEP_CHANGES`] changes, with the new contents put in `blobs`. Empty: nothing changed.
     pub fn propose(&mut self, blobs: &Blobs, at: i64) -> io::Result<Vec<Step>> {
-        let (found, _skipped) = scan::scan(&self.root, &self.state.seen, &self.limits)?;
+        let (found, skipped) = scan::scan(&self.root, &self.state.seen, &self.limits)?;
+        self.skipped = skipped;
         let mut paths: BTreeSet<String> = found.keys().cloned().collect();
         paths.extend(self.state.synced.keys().cloned());
         paths.extend(self.state.pending.keys().cloned());
@@ -315,9 +325,15 @@ impl Copy {
                 out.push(hash.clone());
             }
         }
+        out.retain(|h| !self.gone.contains(h));
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Whether `v` is contents the server no longer has.
+    fn is_gone(&self, v: Option<&Version>) -> bool {
+        matches!(v, Some(Version::File { hash, .. }) if self.gone.contains(hash))
     }
 
     /// Whether this copy proposed `step`.
@@ -352,17 +368,23 @@ impl Copy {
                 Decision::Beside(copy) => {
                     if let (Some(name), Some(v)) = (&copy, &c.to)
                         && self.parents_real(name)
+                        && !self.is_gone(Some(v))
                     {
                         self.write(name, Some(v), blobs)?;
                         set(&mut self.state.synced, name, Some(v.clone()));
                     }
                     if ours {
                         if self.now(&c.path)? == c.to {
-                            // Ours, unchanged since: it is beside the name now, and the name takes the log's.
-                            if self.parents_real(&c.path) {
-                                self.write(&c.path, log_now.as_ref(), blobs)?;
+                            // Ours, unchanged since: it is beside the name now, and the name takes the log's
+                            // (unless that is gone too: a later step brings the name its version).
+                            if self.is_gone(log_now.as_ref()) {
+                                set(&mut self.state.synced, &c.path, c.to.clone());
+                            } else {
+                                if self.parents_real(&c.path) {
+                                    self.write(&c.path, log_now.as_ref(), blobs)?;
+                                }
+                                set(&mut self.state.synced, &c.path, log_now);
                             }
-                            set(&mut self.state.synced, &c.path, log_now);
                         } else {
                             // Changed again since: kept, and proposed as a change of what lost, so it can't
                             // silently undo what won.
@@ -381,6 +403,10 @@ impl Copy {
     fn bring(&mut self, path: &str, to: Option<&Version>, blobs: &Blobs) -> io::Result<Outcome> {
         if !self.parents_real(path) {
             return Ok(Outcome::Refused { path: path.to_owned(), why: "a folder on its way is a link".to_owned() });
+        }
+        if self.is_gone(to) {
+            // Replaced since: the step that replaced it comes next and brings what it holds now.
+            return Ok(Outcome::Kept { path: path.to_owned() });
         }
         let here = self.now(path)?;
         if here.as_ref() == to {
