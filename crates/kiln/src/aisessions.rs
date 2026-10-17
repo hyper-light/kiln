@@ -266,7 +266,11 @@ impl Scanner {
         );
         let tools: Vec<Pid> = self.sys.processes().iter().filter(|(_, p)| tool_of(p).is_some()).map(|(pid, _)| *pid).collect();
         if !tools.is_empty() {
-            self.sys.refresh_processes_specifics(ProcessesToUpdate::Some(&tools), false, ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always).without_tasks());
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&tools),
+                false,
+                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always).with_environ(UpdateKind::OnlyIfNotSet).without_tasks(),
+            );
         }
         let mut out = Vec::new();
         let mut open = HashMap::new();
@@ -593,19 +597,25 @@ fn interactive(tool: Tool, args: &[String]) -> bool {
     }
 }
 
-/// The kiln terminal a process runs in: the nearest ancestor that is a terminal's shell.
+/// The kiln terminal a process runs in: the nearest ancestor that is one of this runner's
+/// terminal shells, else the `KILN_TERM_SESSION` every kiln terminal's shell exports. The
+/// variable finds terminals another runner process of this machine holds (an older one keeps its
+/// shells across an upgrade, and only the newest reports); the server drops ids it no longer has.
 fn terminal_of(sys: &System, pid: Pid, terminals: &HashMap<u32, String>) -> Option<String> {
-    if terminals.is_empty() {
-        return None;
-    }
     let mut cur = pid;
     for _ in 0..MAX_DEPTH {
         if let Some(id) = terminals.get(&cur.as_u32()) {
             return Some(id.clone());
         }
-        cur = sys.process(cur)?.parent()?;
+        let Some(parent) = sys.process(cur).and_then(Process::parent) else { break };
+        cur = parent;
     }
-    None
+    sys.process(pid).and_then(|p| term_session_in(p.environ()))
+}
+
+/// The kiln terminal session an environment names.
+fn term_session_in(env: &[std::ffi::OsString]) -> Option<String> {
+    env.iter().find_map(|kv| kv.to_str()?.strip_prefix("KILN_TERM_SESSION=").filter(|v| !v.is_empty()).map(str::to_owned))
 }
 
 /// Created at or after `since` (unix seconds). Where the filesystem keeps no creation time,
@@ -972,5 +982,43 @@ mod tests {
         let found = s.scan(&HashMap::new());
         assert!(found.len() <= MAX_SESSIONS);
         assert!(s.transcript(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn terminal_from_the_environment() {
+        let env = |vars: &[&str]| vars.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(term_session_in(&env(&["HOME=/home/ada", "KILN_TERM_SESSION=t-41", "TERM=xterm"])), Some("t-41".into()));
+        assert_eq!(term_session_in(&env(&["KILN_TERM_SESSION="])), None);
+        assert_eq!(term_session_in(&env(&["XKILN_TERM_SESSION=t-1", "KILN_TERM_SESSIONS=t-2"])), None);
+        assert_eq!(term_session_in(&[]), None);
+    }
+
+    /// A harness started in a terminal another runner process holds (so it isn't in `terminals`)
+    /// is still linked to that terminal, by the variable its shell exported.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn harness_in_another_runners_terminal() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (Ok(home), Ok(bin)) = (tempfile::tempdir(), tempfile::tempdir()) else { return };
+        // A script is named for itself in the process table; it waits on sleep rather than exec it.
+        let claude = bin.path().join("claude");
+        if std::fs::write(&claude, "#!/bin/sh\nsleep 30\n").is_err() || std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).is_err() {
+            return;
+        }
+        let Ok(mut child) = std::process::Command::new(&claude).env("KILN_TERM_SESSION", "t-elsewhere").spawn() else { return };
+        let pid = child.id();
+        let mut s = Scanner::new(home.path().to_owned());
+        let mut found = None;
+        for _ in 0..50 {
+            found = s.scan(&HashMap::new()).into_iter().find(|x| x.pid == pid);
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = found.map(|f| (f.tool, f.terminal));
+        assert_eq!(found, Some(("claude".to_owned(), Some("t-elsewhere".to_owned()))));
     }
 }
