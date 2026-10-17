@@ -93,6 +93,12 @@ pub async fn ls_remote(hub: &Hub, url: &str) -> anyhow::Result<BTreeMap<String, 
     Ok(refs)
 }
 
+/// Whether `ls_remote` found anything to build: an empty repository has no refs, at most the
+/// symbolic HEAD of its unborn default branch.
+fn has_commits(refs: &BTreeMap<String, String>) -> bool {
+    refs.keys().any(|k| k != "HEAD->")
+}
+
 /// Create or refresh the bare mirror. Concurrent callers for one repo are serialised.
 pub async fn sync_mirror(hub: &Hub, repo: &Repo) -> anyhow::Result<PathBuf> {
     static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> =
@@ -415,10 +421,14 @@ async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Resu
                 if r.get("archived").unwrap_or(&serde_json::Value::Null).as_bool() == Some(true) || (hub.cfg.gitops.skip_forks && r.get("fork").unwrap_or(&serde_json::Value::Null).as_bool() == Some(true)) {
                     continue;
                 }
-                if r.get("size").unwrap_or(&serde_json::Value::Null).as_u64() == Some(0) {
+                let url = r.get("clone_url").unwrap_or(&serde_json::Value::Null).as_str().map(str::to_owned).unwrap_or_else(|| default_url(&name));
+                // GitHub fills in `size` lazily: a repository created and pushed minutes ago can
+                // still say 0. Git knows (and costs no API quota): no branch or tag means empty.
+                if r.get("size").unwrap_or(&serde_json::Value::Null).as_u64() == Some(0)
+                    && !ls_remote(hub, &url).await.is_ok_and(|refs| has_commits(&refs))
+                {
                     continue; // empty repository: nothing to build yet; re-checked next discovery
                 }
-                let url = r.get("clone_url").unwrap_or(&serde_json::Value::Null).as_str().map(str::to_owned).unwrap_or_else(|| default_url(&name));
                 tracing::info!(repo = %name, "discovered repository");
                 hub.store
                     .upsert_repo(Repo {
@@ -618,6 +628,16 @@ pub async fn archive(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<async_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_repository_has_no_commits() {
+        let mut refs = BTreeMap::new();
+        assert!(!has_commits(&refs));
+        refs.insert("HEAD->".to_owned(), "refs/heads/main".to_owned());
+        assert!(!has_commits(&refs));
+        refs.insert("refs/heads/main".to_owned(), "c5781cd98aa37175970723a4de31f3af5077311f".to_owned());
+        assert!(has_commits(&refs));
+    }
 
     #[test]
     fn cron() {
