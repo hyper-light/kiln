@@ -231,6 +231,23 @@ pub async fn terminate_group(running: &mut Running, grace: Duration) {
     }
 }
 
+/// GitHub's cancel (docs/ci.md W05-R18): SIGINT to the group, SIGTERM after `int_grace`, SIGKILL
+/// after `term_grace` more.
+pub async fn interrupt_group(running: &mut Running, int_grace: Duration, term_grace: Duration) {
+    if running.pgid <= 0 {
+        return;
+    }
+    let group = Pid::from_raw(running.pgid);
+    let _ = killpg(group, Signal::SIGINT);
+    if crate::rt::timeout(int_grace, running.wait()).await.is_ok() {
+        return;
+    }
+    let _ = killpg(group, Signal::SIGTERM);
+    if crate::rt::timeout(term_grace, running.wait()).await.is_err() {
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+}
+
 /// Kill a whole process group immediately (best effort).
 pub fn kill_group(pgid: i32) {
     if pgid > 0 {
