@@ -15,6 +15,7 @@ pub mod cli;
 pub mod kube;
 pub mod live;
 pub mod ops;
+pub mod plans;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -117,6 +118,8 @@ pub struct Cd {
     kick: crate::rt::Notify,
     /// What viewers read from clusters (trees, logs), kept a few seconds.
     pub live: live::Live,
+    /// Renders plans made, kept by key.
+    plans: plans::Renders,
 }
 
 impl Cd {
@@ -464,7 +467,10 @@ impl Cd {
     /// Renders every source of an app into one list; Argo CD Applications among the objects are
     /// its children (app of apps), returned apart.
     fn render_app(&self, def: &AppDef, inputs: &Resolved, key: u64, kube_version: Option<&str>, api_versions: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
-        let views = self.dir.join("views").join(format!("{key:016x}"));
+        // A directory of its own: a plan may render a key while the app renders it too.
+        static VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let views = self.dir.join("views").join(format!("{key:016x}-{n}"));
         let _ = std::fs::remove_dir_all(&views);
         // Ref sources' files, by name.
         let mut refs: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -982,6 +988,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         kubeconfig: cfg.kubeconfig.clone(),
         kick: crate::rt::Notify::new(),
         live: live::Live::default(),
+        plans: plans::Renders::default(),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

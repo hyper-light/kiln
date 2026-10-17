@@ -539,3 +539,91 @@ fn a_sync_creates_its_namespace_before_validating_what_goes_in_it() {
     deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({})), deployment("web", "web:1", json!({}))]);
     assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
 }
+
+/// The steps of a plan, as `kind phase name`.
+fn steps(plan: &crate::engine::Plan) -> Vec<String> {
+    plan.steps.iter().map(|s| format!("{} {} {}", s.kind.as_str(), s.phase.as_str(), s.key.name)).collect()
+}
+
+#[test]
+fn a_plan_says_what_a_sync_of_another_render_would_do_and_changes_nothing() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({})), deployment("web", "web:1", json!({})), service("web")]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    let records = h.records.len();
+    // The next commit changes the ConfigMap, adds one, leaves the Deployment, drops the Service,
+    // and runs a migration first.
+    let next = vec![config_map("cfg", "2", json!({})), config_map("extra", "1", json!({})), deployment("web", "web:1", json!({})), job("migrate", "PreSync")];
+    let plan = h.engine.plan("web", Some(next), &FxHashMap::default()).unwrap_or_default();
+    assert_eq!(steps(&plan), ["hook PreSync migrate", "update Sync cfg", "create Sync extra", "prune Sync web"]);
+    assert_eq!((plan.unchanged, plan.held.len(), plan.unread.len(), plan.taken.len()), (1, 0, 0, 0));
+    let cfg = plan.steps.iter().find(|s| &*s.key.name == "cfg").map(|s| &s.change);
+    let data = |v: Option<&Value>| v.and_then(|v| v.pointer("/data/v")).cloned();
+    assert_eq!(cfg.map(|c| (data(c.before.as_ref()), data(c.after.as_ref()))), Some((Some(json!("1")), Some(json!("2")))));
+    assert!(plan.steps.iter().find(|s| s.kind == crate::engine::StepKind::Prune).is_some_and(|s| s.change.after.is_none()));
+    // Every object as the app applies it: in the app's namespace, with its tracking.
+    let names: Vec<(&str, &str, bool)> = plan.objects.iter().map(|p| (&*p.key.name, &*p.key.namespace, p.hook)).collect();
+    assert_eq!(names, [("cfg", "web", false), ("extra", "web", false), ("web", "web", false), ("migrate", "web", true)]);
+    assert!(plan.objects.iter().all(|p| obj::label(&p.object, crate::engine::APP_LABEL) == Some(crate::engine::app_label("web").as_str())));
+    // Planning asked nothing of the cluster and started nothing.
+    h.run_for(5_000);
+    assert_eq!(h.records.len(), records);
+    assert!(settled(&h, "web"));
+}
+
+#[test]
+fn a_plan_keeps_what_prune_false_keeps_and_shows_drift_for_the_render_deployed() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.sync.self_heal = false;
+    h.input(Input::UpsertApp(a));
+    let keep = json!({"argocd.argoproj.io/sync-options": "Prune=false"});
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", keep), deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    let plan = h.engine.plan("web", Some(vec![deployment("web", "web:1", json!({}))]), &FxHashMap::default()).unwrap_or_default();
+    assert!(plan.steps.is_empty(), "{:?}", steps(&plan));
+    let held: Vec<(&str, crate::model::PruneMode)> = plan.held.iter().map(|(k, m)| (&*k.name, *m)).collect();
+    assert_eq!(held, [("cfg", crate::model::PruneMode::Never)]);
+    // The render deployed now, planned: nothing to do until the cluster drifts.
+    assert!(h.engine.plan("web", None, &FxHashMap::default()).is_some_and(|p| p.steps.is_empty() && p.unchanged == 2));
+    let key = ResKey::new("apps", "Deployment", "web", "web");
+    h.edit("dev", &key, |v| {
+        if let Some(c) = v.pointer_mut("/spec/template/spec/containers/0").and_then(Value::as_object_mut) {
+            c.insert("image".into(), json!("evil:1"));
+        }
+    });
+    h.run_for(5_000);
+    let drift = h.engine.plan("web", None, &FxHashMap::default()).unwrap_or_default();
+    assert_eq!(steps(&drift), ["update Sync web"]);
+    assert_eq!(drift.steps.first().and_then(|s| s.why.clone()).as_deref(), Some(".spec.template.spec.containers[name=app].image differs"));
+    assert!(h.engine.plan("nope", None, &FxHashMap::default()).is_none());
+}
+
+#[test]
+fn a_plan_reads_kinds_the_engine_has_not_listed_from_what_the_owner_read() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("web")));
+    deploy(&mut h, &git, "web", "r1", vec![deployment("web", "web:1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")));
+    // The next commit adds a ConfigMap and a Service: kinds this app never had, so never listed.
+    let next = vec![deployment("web", "web:1", json!({})), config_map("cfg", "1", json!({})), service("web")];
+    let plan = h.engine.plan("web", Some(next.clone()), &FxHashMap::default()).unwrap_or_default();
+    assert_eq!(plan.unread.iter().map(|k| k.kind.to_string()).collect::<Vec<_>>(), ["ConfigMap", "Service"]);
+    assert!(plan.steps.is_empty());
+    // Read by the owner: the ConfigMap isn't there; a Service someone made by hand is.
+    let mut by_hand = service("web");
+    if let Some(m) = by_hand.pointer_mut("/metadata").and_then(Value::as_object_mut) {
+        m.insert("namespace".into(), json!("web"));
+    }
+    if let Some(p) = by_hand.pointer_mut("/spec/ports/0").and_then(Value::as_object_mut) {
+        p.insert("port".into(), json!(8080));
+    }
+    let mut read = FxHashMap::default();
+    read.insert(ResKey::new("", "ConfigMap", "web", "cfg"), None);
+    read.insert(ResKey::new("", "Service", "web", "web"), Some(by_hand));
+    let plan = h.engine.plan("web", Some(next), &read).unwrap_or_default();
+    assert!(plan.unread.is_empty());
+    assert_eq!(steps(&plan), ["create Sync cfg", "update Sync web"]);
+    assert_eq!(plan.unchanged, 1);
+}

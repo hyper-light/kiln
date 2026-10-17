@@ -16,6 +16,7 @@ const Runs = React.lazy(() => import("@/views/runs"));
 const RunDetail = React.lazy(() => import("@/views/run-detail/index"));
 const Deployments = React.lazy(() => import("@/views/deployments/index"));
 const DeploymentApp = React.lazy(() => import("@/views/deployments/app"));
+const DeployPlans = React.lazy(() => import("@/views/deployments/plans"));
 const Repos = React.lazy(() => import("@/views/repos"));
 const Plans = React.lazy(() => import("@/views/plans/index"));
 const PlanPage = React.lazy(() => import("@/views/plans/plan"));
@@ -89,6 +90,7 @@ export function App() {
                   <Route path="runs/:id" element={<RunDetail />} />
                   <Route path="runs/:id/jobs/:jobId" element={<RunDetail />} />
                   <Route path="deployments" element={<Deployments />} />
+                  <Route path="deployments/plans" element={<DeployPlans />} />
                   <Route path="deployments/apps/:project/:name" element={<DeploymentApp />} />
                   <Route path="repos" element={<Repos />} />
                   <Route path="sync" element={<Navigate to="/repos?show=synced" replace />} />

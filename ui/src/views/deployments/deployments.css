@@ -1346,3 +1346,176 @@ button.cd-gnode:hover {
     animation: none;
   }
 }
+
+/* ---------------------------------------------------------------- deploy plans */
+/* What to plan, on one line on a wide screen (labels above the fields), stacked on a phone. Each
+   commit of the plan, then its apps under it, a guide line marking what belongs to the commit. */
+.cd-plan-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) 220px minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+  margin-top: 18px;
+}
+.cd-plan-form:not(:has(.cd-plan-repo)) {
+  grid-template-columns: 220px minmax(0, 1fr) auto;
+}
+.cd-plan-go {
+  min-height: 40px;
+}
+.cd-plan-from {
+  margin: 8px 0 0;
+}
+.cd-plan-form ~ .empty-state {
+  margin-top: 22px;
+}
+/* What happens to an object, toned: created green, pruned rose, hooks violet, changes amber. */
+.cd-plan-verb[data-what="create"],
+.cd-plan-verb[data-what="added"] {
+  color: #a8c9bc;
+}
+.cd-plan-verb[data-what="prune"],
+.cd-plan-verb[data-what="removed"] {
+  color: #d8b9bb;
+}
+.cd-plan-verb[data-what="hook"] {
+  color: #c9c1ec;
+}
+.cd-plan {
+  margin-top: 22px;
+}
+.cd-plan-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #25272c;
+}
+.cd-plan-bar-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.cd-plan-show {
+  min-width: 250px;
+}
+.cd-plan-order {
+  margin: 12px 0 0;
+}
+.cd-plan-diffs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.cd-plan-diff {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 0 18px 12px;
+  border-bottom: 1px solid #25272c;
+  box-shadow: inset 1px 0 0 #2b2d32;
+}
+.cd-plan-diff[data-tone="fail"] {
+  box-shadow: inset 2px 0 0 #d1aaad;
+}
+.cd-plan-commit {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+.cd-plan-subject {
+  min-width: 0;
+  color: #ededee;
+  font-size: 14.5px;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.cd-plan-app {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  margin-left: 2px;
+  padding: 10px 0 2px 14px;
+  border-left: 1px solid #2b2d32;
+}
+.cd-plan-app[data-tone="fail"] {
+  border-left-color: rgb(209 170 173 / 60%);
+}
+.cd-plan-app-head {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+.cd-plan-app-name {
+  color: #ededee;
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+.cd-plan-app-name:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.cd-plan-counts {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.cd-plan-note {
+  margin: 0;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.cd-plan-app .cd-notice {
+  margin: 0;
+}
+.cd-plan-nothing {
+  margin: 0;
+}
+.cd-plan-objects {
+  margin-top: 4px;
+}
+.cd-plan-line {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+  margin: 0;
+  color: #c8cad0;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+@container (max-width: 640px) {
+  .cd-plan-form,
+  .cd-plan-form:not(:has(.cd-plan-repo)) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cd-plan-go {
+    justify-self: start;
+  }
+  .cd-plan-bar-end,
+  .cd-plan-show {
+    width: 100%;
+    min-width: 0;
+  }
+  .cd-plan-bar-end > .cd-plan-show {
+    flex: 1 1 0;
+  }
+  .cd-plan-diff {
+    padding-left: 10px;
+  }
+  .cd-plan-app {
+    padding-left: 10px;
+  }
+}
