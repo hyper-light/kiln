@@ -2,8 +2,9 @@
    mono uppercase keys, hairline rules, state as a dot and words; standard controls at 30px, boxed
    the way the console's and the account card's fields are (#303239 edge, 5px radius, the violet
    focus ring). Live lines keep their place and their height whatever they say: one line when a
-   part is off, two when it is on (state, then detail or its fix). Nothing scrolls sideways and
-   nothing pops up: words wrap or end in an ellipsis, fields stack on phones. */
+   part is off, two when it is on (state, then detail or its fix). The certificate in use is four
+   rows that keep their height with or without one. Nothing scrolls sideways and nothing pops up:
+   words wrap or end in an ellipsis, fields stack on phones, the device steps open in place. */
 
 .fd {
   --fd-edge: #303239;
@@ -149,6 +150,10 @@
   background: #d1aaad;
   box-shadow: 0 0 6px rgb(209 170 173 / 22%);
 }
+/* Works, but needs you soon (a certificate near its end, names it misses): the console's amber. */
+.fd-dot[data-state="warn"] {
+  background: #d8bb95;
+}
 .fd-dot[data-state="off"] {
   border: 1px solid #7e818a;
   background: transparent;
@@ -180,6 +185,9 @@
 .fd-line[data-state="waiting"] .fd-text {
   color: #d7d1ef;
 }
+.fd-line[data-state="warn"] .fd-text {
+  color: #e2cfae;
+}
 .fd-detail {
   grid-column: 3;
   min-width: 0;
@@ -204,6 +212,7 @@
 }
 /* A copy button inside an 18px line, without making it taller. */
 .fd-copy {
+  position: relative;
   display: inline-grid;
   flex: none;
   width: 26px;
@@ -213,6 +222,12 @@
   border-radius: 5px;
   color: var(--fd-muted);
   transition: color 0.15s;
+}
+/* The target is 40px, the button stays 26px. */
+.fd-copy::before {
+  position: absolute;
+  inset: -7px;
+  content: "";
 }
 .fd-copy:hover {
   color: var(--fd-text);
@@ -348,10 +363,29 @@
   font-family: var(--font-mono);
   font-size: 12px;
 }
-/* Phones zoom into fields under 16px. */
+/* Phones zoom into fields under 16px. On touch the controls stay 34px and their targets are
+   40px, past their edges. */
 @media (pointer: coarse) {
   .fd {
     --fd-ctl: 34px;
+  }
+  .fd .fd-btn,
+  .fd .fd-download,
+  .fd-file,
+  .fd-disclose {
+    position: relative;
+  }
+  .fd .fd-btn::after,
+  .fd .fd-download::after,
+  .fd-file::after {
+    position: absolute;
+    inset: -3px 0;
+    content: "";
+  }
+  .fd-disclose::after {
+    position: absolute;
+    inset: -4px 0;
+    content: "";
   }
   .fd-input,
   .fd-select {
@@ -372,6 +406,166 @@
   font-size: 13px;
   cursor: pointer;
 }
+/* The .local name: an extra under the names, quieter than them. */
+.fd-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.fd-extra > .fd-toggle {
+  color: #a1a4ad;
+  font-size: 12.5px;
+}
+
+/* ---------------------------------------------------------------- the certificate */
+.fd-cert {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding-top: 12px;
+  border-top: 1px solid #1d1f24;
+}
+/* Which certificate: a select, like the DNS mode; its words say what each kind does. */
+.fd-cert > .fd-field {
+  max-width: 720px;
+}
+.fd-cert > .fd-field > .fd-select {
+  max-width: 440px;
+}
+
+/* The certificate in use: four rows, a key column and its value; the fingerprint is two lines. */
+.fd-facts,
+.fd-facts > dl {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  margin: 0;
+}
+.fd-fact {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  column-gap: 10px;
+  align-items: baseline;
+  min-width: 0;
+}
+.fd-fact > dt {
+  line-height: 18px;
+}
+.fd-fact > dd {
+  min-width: 0;
+  margin: 0;
+  color: #c4c6cd;
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+.fd-none {
+  color: var(--fd-faint);
+}
+.fd-fp {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  color: #c4c6cd;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+}
+.fd-fp > span {
+  min-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Narrow: the fingerprint's 47 characters a line still fit beside its key. */
+@container fd (max-width: 400px) {
+  .fd-fp {
+    font-size: 9.5px;
+  }
+}
+.fd .fd-download[aria-disabled="true"] {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* How devices trust kiln's root: a quiet disclosure, closed until asked for. */
+.fd-trust {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.fd-disclose {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 6px;
+  min-height: 32px;
+  margin-left: -4px;
+  padding: 0 4px;
+  border-radius: 4px;
+  color: #a1a4ad;
+  font-size: 12.5px;
+  white-space: nowrap;
+  transition: color 0.15s;
+}
+.fd-disclose:hover {
+  color: var(--fd-text);
+}
+.fd-disclose:focus-visible {
+  outline: 2px solid #bab0e3;
+  outline-offset: 0;
+}
+.fd-disclose > svg {
+  color: var(--fd-faint);
+}
+.fd-trust-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding-left: 14px;
+  border-left: 1px solid #2a2c33;
+}
+.fd-trust-body a {
+  color: #d1c6e6;
+  text-decoration: underline;
+  text-decoration-color: rgb(209 198 230 / 35%);
+  text-underline-offset: 3px;
+}
+.fd-root {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  column-gap: 10px;
+  align-items: baseline;
+  margin: 0;
+}
+.fd-root > .fd-key {
+  line-height: 18px;
+}
+/* Narrow, indented under the hairline: the root's fingerprint under its key, at full width. */
+@container fd (max-width: 400px) {
+  .fd-root {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.fd-steps {
+  margin: 0;
+  padding-left: 16px;
+  list-style: decimal;
+}
+.fd-steps > li::marker {
+  color: var(--fd-faint);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.fd-steps > li + li {
+  margin-top: 2px;
+}
+
 .fd-custom {
   display: flex;
   flex-direction: column;
@@ -443,8 +637,7 @@
   color: #e2c4c6;
 }
 
-/* ---------------------------------------------------------------- the CA, and setup */
-.fd-ca,
+/* ---------------------------------------------------------------- downloads, devices, setup */
 .fd-setup {
   display: flex;
   flex-direction: column;
@@ -452,15 +645,6 @@
   max-width: 980px;
   padding-top: 12px;
   border-top: 1px solid var(--fd-line);
-}
-.fd-ca a {
-  color: #d1c6e6;
-  text-decoration: underline;
-  text-decoration-color: rgb(209 198 230 / 35%);
-  text-underline-offset: 3px;
-}
-.fd-fp {
-  overflow-wrap: anywhere;
 }
 .fd-downloads {
   display: flex;
@@ -563,7 +747,9 @@
   .fd-name,
   .fd-detail,
   .fd-hint,
-  .fd-when {
+  .fd-when,
+  .fd-none,
+  .fd-disclose {
     color: #c4c5ce;
   }
   .fd-input,
