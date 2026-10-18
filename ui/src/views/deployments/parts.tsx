@@ -1,4 +1,6 @@
-/** Deployments' small pieces: sync and health as a dot and a word, in kiln's eight tones. */
+/** Deployments' small pieces: sync and health as Argo CD's signs and a word, in kiln's eight tones;
+ *  what's under way turns, and a change plays in. */
+import { CircleArrowUp, CircleCheck, CircleHelp, CirclePause, CircleX, Ghost, Heart, HeartCrack, LoaderCircle, RefreshCw, type LucideIcon } from "lucide-react";
 import type { CdApp, CdNode, CdOperation, CdResourceKey } from "@/api/types";
 import { cn } from "@/lib/utils";
 import { kindShort } from "./model";
@@ -30,6 +32,51 @@ export const TRIGGER_WORD: Record<string, string> = {
   promotion: "Promotion",
 };
 
+/** Argo CD's signs: sync (synced, out of sync), health (a heart, broken when degraded, turning while
+ *  it progresses, paused, a ghost when missing). */
+const SYNC_ICON: Record<string, LucideIcon> = { Synced: CircleCheck, OutOfSync: CircleArrowUp, Unknown: CircleHelp, Hook: CircleHelp };
+const HEALTH_ICON: Record<string, LucideIcon> = { Healthy: Heart, Progressing: LoaderCircle, Degraded: HeartCrack, Suspended: CirclePause, Missing: Ghost, Unknown: CircleHelp };
+
+/**
+ * A state as a sign and a word. Keyed by what it says, so a change plays in (it fades and settles)
+ * rather than snapping; `spin` turns the sign while something is under way.
+ */
+export function StateGlyph({
+  icon: Icon,
+  tone,
+  word,
+  spin = false,
+  words = true,
+  size = 14,
+  title,
+  className,
+}: {
+  icon: LucideIcon;
+  tone: string;
+  word: string;
+  spin?: boolean;
+  words?: boolean;
+  size?: number;
+  title?: string;
+  className?: string;
+}) {
+  const said = WORD[word] ?? word;
+  return (
+    <span className={cn("status cd-glyph", className)} title={title}>
+      <span key={said} className="cd-glyph-in">
+        <Icon size={size} className={cn("cd-glyph-i", spin && "cd-spin")} data-status={tone} aria-hidden="true" />
+        {words ? (
+          <span className="status-text" data-status={tone}>
+            {said}
+          </span>
+        ) : (
+          <span className="sr-only">{said}</span>
+        )}
+      </span>
+    </span>
+  );
+}
+
 /** A dot and a word. */
 export function StatePair({ tone, word, className }: { tone: string; word: string; className?: string }) {
   return (
@@ -42,13 +89,21 @@ export function StatePair({ tone, word, className }: { tone: string; word: strin
   );
 }
 
-export function SyncPair({ sync }: { sync: string }) {
-  return <StatePair tone={SYNC_TONE[sync] ?? "skipped"} word={sync} />;
+/** Sync, or while a sync is under way, the sync: its sign turning. */
+export function SyncPair({ sync, op }: { sync: string; op?: CdOperation | null }) {
+  if (running(op)) return <StateGlyph icon={RefreshCw} tone="running" word={op?.phase === "Terminating" ? "Stopping" : "Syncing"} spin title={opWords(op)} />;
+  return <StateGlyph icon={SYNC_ICON[sync] ?? CircleHelp} tone={SYNC_TONE[sync] ?? "skipped"} word={sync} />;
 }
 
 export function HealthPair({ health }: { health: string | null | undefined }) {
   if (!health) return <span className="cd-none">No health</span>;
-  return <StatePair tone={HEALTH_TONE[health] ?? "skipped"} word={health} />;
+  return <StateGlyph icon={HEALTH_ICON[health] ?? CircleHelp} tone={HEALTH_TONE[health] ?? "skipped"} word={health} spin={health === "Progressing"} />;
+}
+
+/** A sync, under way or done: its sign (turning while it runs) and what it is in words. */
+export function OpPair({ op }: { op: CdOperation }) {
+  const icon = running(op) ? RefreshCw : op.phase === "Succeeded" ? CircleCheck : op.phase === "Failed" ? CircleX : CircleHelp;
+  return <StateGlyph icon={icon} tone={opTone(op)} word={opWords(op)} spin={running(op)} />;
 }
 
 /** Whether a sync is under way. */
@@ -158,17 +213,11 @@ export function NodeMarks({ n, words = true }: { n: Pick<CdNode, "health" | "syn
   const stone = s ? (SYNC_TONE[s] ?? "skipped") : null;
   return (
     <span className="cd-marks">
-      {htone ? (
-        <span className="status" title={`Health: ${h}`}>
-          <i className="dot" data-status={htone} aria-hidden="true" />
-          {words && h !== "Healthy" ? <span className="status-text" data-status={htone}>{h}</span> : <span className="sr-only">{h}</span>}
-        </span>
+      {htone && h ? (
+        <StateGlyph icon={HEALTH_ICON[h] ?? CircleHelp} tone={htone} word={h} words={words && h !== "Healthy"} spin={h === "Progressing"} size={12} title={`Health: ${h}`} />
       ) : null}
-      {stone && !n.hook ? (
-        <span className="status" title={`Sync: ${WORD[s ?? ""] ?? s}`}>
-          <i className="dot cd-sync-dot" data-status={stone} aria-hidden="true" />
-          {words && s === "OutOfSync" ? <span className="status-text" data-status={stone}>Out of sync</span> : <span className="sr-only">{WORD[s ?? ""] ?? s}</span>}
-        </span>
+      {stone && s && !n.hook ? (
+        <StateGlyph icon={SYNC_ICON[s] ?? CircleHelp} tone={stone} word={s} words={words && s === "OutOfSync"} size={12} title={`Sync: ${WORD[s] ?? s}`} className="cd-sync-glyph" />
       ) : null}
       {n.hook ? <span className="cd-hook">hook</span> : null}
       {n.tracked_by ? (

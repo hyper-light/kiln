@@ -61,12 +61,13 @@ const ENDED: Record<string, string> = {
 function LastTurn({ state, status }: { state: State | null; status: Status }) {
   const now = useNow();
   const t = state?.last_turn;
-  if (status === "starting") return <span className="ag-turn-meta">Starting…</span>;
+  // An existing conversation resumes; only a new one starts.
+  if (status === "starting") return <span className="ag-turn ag-turn-idle ag-turn-meta">{state?.harness_session ? "Resuming…" : "Starting…"}</span>;
   if (!t) return null;
   const ago = relativeTime(t.at / 1000, now);
   const how = ENDED[t.how];
   return (
-    <span className="ag-turn">
+    <span className="ag-turn ag-turn-idle">
       <span className="ag-turn-meta ag-turn-effort">
         Last turn ended {ago === "now" ? "just now" : ago}
         {how && `, ${how}`}
@@ -233,7 +234,7 @@ export function AgentHeader({
       </div>
       <div className="ag-turn-row">{running ? <TurnLine state={state} activity={activity} stopAt={stopAt} onForce={features.includes("interrupt") ? onForceStop : undefined} /> : <LastTurn state={state} status={status} />}</div>
       <div className="ag-state">
-        <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause }} />
+        <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause, harness_session: state?.harness_session ?? info?.harness_session }} />
         <span className="ag-cwd ag-wide-only" title={cwd}>
           {tildify(cwd)}
         </span>

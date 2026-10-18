@@ -283,9 +283,10 @@ async fn drive(hub: &Arc<Hub>, cli: &'static Cli, id: &str, target: &str, sessio
     let account = if cancelled { None } else { Some(account(hub, target, cli).await) };
     let signed_in = account.as_ref().and_then(|a| a.signed_in);
     let lines = get(id).map(|f| f.lines).unwrap_or_default();
+    let mut ok = false;
     finish(hub, id, |f| {
         if f.state != "cancelled" {
-            let ok = failed.is_none() && code == Some(0) && signed_in == Some(true);
+            ok = failed.is_none() && code == Some(0) && signed_in == Some(true);
             f.state = if ok { "done" } else { "failed" };
             if !ok {
                 f.error = Some(why(failed, code, &lines, signed_in));
@@ -293,6 +294,10 @@ async fn drive(hub: &Arc<Hub>, cli: &'static Cli, id: &str, target: &str, sessio
         }
         f.account = account;
     });
+    // Signed in (perhaps as someone else): the machine's sessions of this harness take it up.
+    if ok {
+        hub.harness.signed_in(hub, target, cli.kind).await;
+    }
 }
 
 /// Read a sign-in's output into its flow until the terminal ends (or nobody finishes it in

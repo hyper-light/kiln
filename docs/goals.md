@@ -89,7 +89,9 @@ ending doesn't clear it, a force stop does). Started again from that record, a s
 was open gets one message first in its queue, shown as kiln's: "kiln restarted on this machine
 part-way through your last turn, which stopped it and anything it was running. Pick up where you
 left off." Agents that were between turns hear nothing, and it isn't said twice if the runner
-restarts again before it goes out. The runner does this whether or not keep-going is on for the
+restarts again before it goes out. What the agent started that still runs (a dev server, a test
+run, a script it left going) is named in that message, so it uses it rather than starting it
+again; see "What an agent left running" in [agents.md](agents.md). The runner does this whether or not keep-going is on for the
 agent, since the turn was kiln's to have stopped.
 
 Every harness kiln runs as an agent reports how its turns end: Claude Code (its result's stop

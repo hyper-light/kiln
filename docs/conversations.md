@@ -28,6 +28,10 @@ For each agent session (kiln's id):
   rewind. The store drops the session's events from number `from` on, then keeps the snapshot that
   follows. Events before `from` stay: the timeline no longer holds them in memory (it holds
   `MAX_EVENTS`, 4,000), but they are its history.
+- **A clear** (`/clear`) is a reset too: the timeline starts over from the line saying so, and
+  `State::cleared` holds that line's number. The events before it stay in the store, where search
+  finds them, but a timeline taken up again from the store (after a restart, a move, or in the
+  server's list of agents whose machine is away) leaves them out.
 - **Transcripts are kept compressed.** They are nearly all of what a store holds: on the first
   server, 5.4 GB of 6.5 GB, in 15 transcripts of long-running agents. A line of 256 bytes or more
   is kept brotli-compressed (quality 5) when that saves a tenth or more, about 3× overall. Lines

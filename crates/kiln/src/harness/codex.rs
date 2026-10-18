@@ -391,6 +391,11 @@ impl Codex {
         let text = || value.as_ref().and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("text").and_then(Value::as_str).map(str::to_owned))).unwrap_or_default();
         let event = || value.as_ref().and_then(|v| v.get("event")).and_then(Value::as_str).map(str::to_owned);
         let client = value.as_ref().and_then(|v| v.get("client")).and_then(Value::as_str).unwrap_or("").to_owned();
+        // Signed in on this machine (kiln's /login): what account it runs on now.
+        if id == "account" {
+            self.request(core, Pending::Account, "account/read", json!({}));
+            return;
+        }
         // Answered from what kiln knows, thread or not.
         if matches!(id, "export" | "rollout" | "pwd") {
             let reply = match id {
@@ -553,7 +558,8 @@ impl Codex {
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
-        for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+        // What kiln took back over runs apart from it (`survivors`).
+        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }
@@ -1635,7 +1641,17 @@ impl Codex {
                     // A model provider of its own (no OpenAI account).
                     None => None,
                 };
+                let was = core.state.account.clone();
                 core.state.account = plan.as_deref().filter(|p| *p != "Signed out").map(|p| account_id("codex", p, email.as_deref()));
+                // Signed in as someone else: the old account's limits go, and a pause for one ends.
+                if was.is_some() && core.state.account != was {
+                    core.state.limits.clear();
+                    if core.state.pause.as_ref().is_some_and(|p| p.reason == super::pause::LIMIT)
+                        && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
+                    {
+                        self.go_on(core, p);
+                    }
+                }
                 core.state.plan = plan;
                 self.account_email = email.as_deref().map(mask_emails);
                 if kind.as_deref() == Some("chatgpt") {

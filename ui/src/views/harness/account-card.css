@@ -748,3 +748,15 @@
   }
 }
 
+
+/* In its dialog: the dialog is its frame. */
+.ac-dialog {
+  padding: 14px 14px 18px;
+}
+.ac-dialog .ac {
+  padding-left: 0;
+  border-left: 0;
+}
+.ac-dialog .ac::before {
+  display: none;
+}
