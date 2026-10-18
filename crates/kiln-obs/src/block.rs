@@ -458,17 +458,8 @@ impl Block {
         }
         self.load(i, buf)?;
         for c in self.chunks_in(i, buf, from, to)? {
-            let (_, _, count, bytes) = c?;
-            let mut d = ChunkRef::new(bytes, count).iter();
-            while let Some((t, v)) = d.next_sample().map_err(|e| BlockError::Decode(self.path.clone(), e))? {
-                if t > to {
-                    break;
-                }
-                if t >= from {
-                    ts.push(t);
-                    values.push(v);
-                }
-            }
+            let (first, last, count, bytes) = c?;
+            ChunkRef::new(bytes, count).decode_range_into((first, last), from, to, ts, values).map_err(|e| BlockError::Decode(self.path.clone(), e))?;
         }
         Ok(())
     }

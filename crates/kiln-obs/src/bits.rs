@@ -150,13 +150,23 @@ impl<'a> BitReader<'a> {
     /// Loads bits until more than 56 are loaded or none are left.
     #[inline]
     fn refill(&mut self) {
-        // Eight bytes at once while the word is empty and the bytes last.
-        if self.avail == 0
-            && let Some((word, rest)) = self.head.split_first_chunk::<8>()
-        {
-            self.acc = u64::from_be_bytes(*word);
-            self.avail = 64;
-            self.head = rest;
+        // While eight bytes last, one load: as many of them as the word has room for, in one shift
+        // (no loop a byte; the byte after them stays unread).
+        if let Some(word) = self.head.first_chunk::<8>() {
+            let word = u64::from_be_bytes(*word);
+            if self.avail == 0 {
+                self.acc = word;
+                self.avail = 64;
+                self.head = self.head.get(8..).unwrap_or(&[]);
+                return;
+            }
+            let bytes = (64 - self.avail) / 8;
+            if bytes > 0 {
+                let bits = bytes * 8;
+                self.acc |= (word >> (64 - bits)) << (64 - self.avail - bits);
+                self.avail += bits;
+                self.head = self.head.get(bytes as usize..).unwrap_or(&[]);
+            }
             return;
         }
         while self.avail <= 56 {

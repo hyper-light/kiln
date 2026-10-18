@@ -740,7 +740,14 @@ exported with `crates/kiln-obs/benches/export-prom.py <prometheus> 24 4 <corpus>
 | --- | --- |
 | bytes a sample | 1.167 (raw 16; Gorilla reports 1.37 on Facebook's data) |
 | encode | 2.80 ns a sample; 1.08 allocations, 1.26 reallocations (none moved) a chunk; 0.084 page faults a chunk |
-| decode into a query's columns | 6.37 ns a sample; no allocation; no page fault |
+| decode into a query's columns | 4.12 ns a sample; no allocation; no page fault |
+
+Decoding was 6.37 ns a sample; perf (2026-10-18, its sampling now open here) put a quarter of a
+query's time in the bit reader's refill, which loaded a byte at a time whenever the word was not
+empty. It now takes as many whole bytes as the word has room for in one load and one shift, a byte
+at a time only in a chunk's last eight: 4.1 ns, the same figures bit for bit (its tests: every width
+and alignment). Reading a unary code (a delta-of-delta's bucket, a value's control bits) in one look
+was tried and measured slower, 5.4 ns: kept a bit at a time.
 
 ### 12.2 Chunk size and timestamp buckets
 
@@ -799,24 +806,31 @@ compacted after each cut by the logarithmic method.
 
 ### 12.5 Queries
 
-2026-10-18, same machine: `KOBS_CORPUS=<corpus> cargo bench -p kiln-obs --bench query`. Each query
-over the corpus's whole day (a grid of at most 1,200 points a series), fifteen runs.
+2026-10-18, same machine, loaded (load average 31–39 from other work): `KOBS_CORPUS=<corpus> cargo
+bench -p kiln-obs --bench query`. Each query over the corpus's whole day (a grid of at most 1,200
+points a series), fifteen runs; allocations the second run's.
 
 | query | series | samples | p50 | p99 | ns a sample | allocations |
 | --- | --- | --- | --- | --- | --- | --- |
-| `avg:node_load1{*} by {instance}` | 3 | 8,640 | 0.13 ms | 0.16 ms | 14.5 | 60 |
-| `p99:node_load1{*}` | 1 | 8,640 | 0.14 ms | 0.17 ms | 16.4 | 50 (a bucket's own list at first: 760) |
-| `sum:node_cpu_seconds_total{mode:idle} by {instance}` (a counter's rate) | 1 | 2,880 | 0.05 ms | 0.05 ms | 15.9 | 58 |
-| `sum:apiserver_request_total{*} by {verb}` | 2 | 11,520 | 0.08 ms | 0.09 ms | 7.2 | 54 |
-| `100 * sum:…{code:5*} / sum:…{*}` | 0 | 11,520 | 0.08 ms | 0.10 ms | 7.1 | 59 |
-| `top(avg:container_memory_working_set_bytes{*} by {pod}, 10, 'mean', 'desc')` | 4 | 23,114 | 0.39 ms | 0.43 ms | 16.9 | 87 |
-| `avg:node_*{*} by {instance}` | 7 | 2.93 M | 27.0 ms | 27.3 ms | 9.2 | 95 (a group key a series at first: 1,116) |
-| `sum:*{job:apiserver}` | 1 | 2.18 M | 20.2 ms | 20.9 ms | 9.3 | 48 |
-| `avg:node_*{*} by {instance}.rollup(avg, daily, 'America/New_York')` | 7 | 2.93 M | 24.3 ms | 25.2 ms | 8.3 | 102 |
-| `avg:node_*{*} by {instance}.weighted()` | 7 | 2.93 M | 26.4 ms | 27.1 ms | 9.0 | 100 (each series' interval from all its gaps at first: 118, 13% slower) |
+| `avg:node_load1{*} by {instance}` | 3 | 8,640 | 0.08 ms | 0.12 ms | 8.8 | 49 |
+| `p99:node_load1{*}` | 1 | 8,640 | 0.09 ms | 0.12 ms | 10.5 | 39 (a bucket's own list at first: 760) |
+| `sum:node_cpu_seconds_total{mode:idle} by {instance}` (a counter's rate) | 1 | 2,880 | 0.03 ms | 0.04 ms | 9.1 | 47 |
+| `sum:apiserver_request_total{*} by {verb}` | 2 | 11,520 | 0.06 ms | 0.07 ms | 5.4 | 43 |
+| `100 * sum:…{code:5*} / sum:…{*}` | 0 | 11,520 | 0.06 ms | 0.07 ms | 5.3 | 48 |
+| `top(avg:container_memory_working_set_bytes{*} by {pod}, 10, 'mean', 'desc')` | 4 | 23,114 | 0.25 ms | 0.29 ms | 10.7 | 76 |
+| `avg:node_*{*} by {instance}` | 7 | 2.93 M | 18.1 ms | 19.5 ms | 6.2 | 84 (a group key a series at first: 1,116) |
+| `sum:*{job:apiserver}` | 1 | 2.18 M | 13.9 ms | 14.9 ms | 6.4 | 37 |
+| `avg:node_*{*} by {instance}.rollup(avg, daily, 'America/New_York')` | 7 | 2.93 M | 16.0 ms | 17.4 ms | 5.5 | 90 |
+| `avg:node_*{*} by {instance}.weighted()` | 7 | 2.93 M | 18.7 ms | 20.6 ms | 6.4 | 88 (each series' interval from all its gaps at first: 13% slower) |
 
-A calendar rollup (rerun beside the plain query, 25.8 ms then): its two buckets, faster than the
-plain query's 1,200; its edges one allocation a metric, its timezone loaded once a process (47
+The decoder's refill (§12.1) and chunks read whole: the same binary before and after, run in turn
+three times under the same load, `avg:node_*` 25.0–27.1 ms before and 18.0–18.3 after (−29%),
+`sum:*{job:apiserver}` 19.4–21.2 and 14.0–14.4 (−28%), the small queries 30–40% faster. A chunk that
+lies wholly inside the range is now decoded without a look at each sample's time, its columns grown
+once to its count: 12 allocations fewer a query (1.5–2.5% of the time alone).
+
+A calendar rollup: its two buckets, faster than the plain query's 1,200; its edges one allocation a
+metric, its timezone loaded once a process (47
 allocations, the first query to name it). Parsing it costs nothing more than a rollup in seconds
 (8 allocations; it compared names lowercased at first: 14): what a query's shape costs on an empty
 store, parse and evaluation, is the bench's first table (`rollup(avg, 60)` 8 and 15,

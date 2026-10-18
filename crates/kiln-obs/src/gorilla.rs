@@ -242,6 +242,25 @@ impl<'a> ChunkRef<'a> {
         Decoder::new(*self)
     }
 
+    /// Appends the samples in `[from, to]` to `ts` and `values`, the chunk's first and last times
+    /// `span`: a chunk wholly inside the range decoded without a look at each sample's time.
+    pub fn decode_range_into(&self, span: (i64, i64), from: i64, to: i64, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), DecodeError> {
+        if span.0 >= from && span.1 <= to {
+            return self.decode_into(ts, values);
+        }
+        let mut d = self.iter();
+        while let Some((t, v)) = d.next_sample()? {
+            if t > to {
+                break;
+            }
+            if t >= from {
+                ts.push(t);
+                values.push(v);
+            }
+        }
+        Ok(())
+    }
+
     /// Appends every sample to `ts` and `values`, the columns a query works on.
     pub fn decode_into(&self, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), DecodeError> {
         let n = self.count as usize;

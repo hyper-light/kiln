@@ -157,13 +157,13 @@ impl HeadSeries {
             if c.first > to {
                 break;
             }
-            decode_range(c.as_ref(), from, to, ts, values)?;
+            c.as_ref().decode_range_into((c.first, c.last), from, to, ts, values)?;
         }
         if let Some((f, l)) = self.open.span()
             && l >= from
             && f <= to
         {
-            decode_range(self.open.view(), from, to, ts, values)?;
+            self.open.view().decode_range_into((f, l), from, to, ts, values)?;
         }
         if let Some(late) = &self.late {
             merge_late(late, start, from, to, ts, values)?;
@@ -240,20 +240,6 @@ fn find(c: ChunkRef<'_>, ts: i64) -> Result<Option<f64>, DecodeError> {
         }
     }
     Ok(None)
-}
-
-fn decode_range(c: ChunkRef<'_>, from: i64, to: i64, ts: &mut Vec<i64>, values: &mut Vec<f64>) -> Result<(), DecodeError> {
-    let mut d = c.iter();
-    while let Some((t, v)) = d.next_sample()? {
-        if t > to {
-            break;
-        }
-        if t >= from {
-            ts.push(t);
-            values.push(v);
-        }
-    }
-    Ok(())
 }
 
 /// Merges a series' late writes in `[from, to]` into the in-order run `ts[start..]`: at a time the
