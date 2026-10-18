@@ -195,6 +195,189 @@ impl LogStore {
     }
 }
 
+/// What records are grouped by: a field of their own, or an attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Facet {
+    Service,
+    Host,
+    Source,
+    /// The severity's level (`error`, `warn`, ...).
+    Status,
+    Attr(String),
+}
+
+impl Facet {
+    /// `service`, `host`, `source`, `status` (or `level`), else an attribute (`@key` or `key`).
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "service" => Self::Service,
+            "host" => Self::Host,
+            "source" => Self::Source,
+            "status" | "level" => Self::Status,
+            other => Self::Attr(other.trim_start_matches('@').to_owned()),
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Self::Service => "service".into(),
+            Self::Host => "host".into(),
+            Self::Source => "source".into(),
+            Self::Status => "status".into(),
+            Self::Attr(k) => format!("@{k}"),
+        }
+    }
+
+    fn of<'a>(&self, r: &RecordRef<'a>) -> Option<&'a str> {
+        match self {
+            Self::Service => Some(r.service),
+            Self::Host => Some(r.host),
+            Self::Source => Some(r.source),
+            Self::Status => Some(super::record::level(r.severity)),
+            Self::Attr(k) => r.attr(k),
+        }
+    }
+}
+
+/// What each group's records come to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Measure {
+    Count,
+    /// Distinct values of a facet.
+    Cardinality(Facet),
+    /// Of an attribute's numeric values (a record without one, or not a number, is left out).
+    Sum(String),
+    Avg(String),
+    Min(String),
+    Max(String),
+}
+
+/// Groups an aggregation keeps at the most: a query's answer's (`crate::query::eval`'s).
+pub const MAX_GROUPS: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Aggregated {
+    /// Each group's facet values, in `by`'s order (`N/A` where a record had none), and its value;
+    /// sorted by the values.
+    pub groups: Vec<(Vec<String>, f64)>,
+    pub rows_scanned: u64,
+    pub blocks_pruned: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AggregateError {
+    #[error(transparent)]
+    Store(#[from] LogStoreError),
+    #[error("more than {MAX_GROUPS} groups: a narrower search, or fewer facets")]
+    TooManyGroups,
+}
+
+/// One group's running value.
+#[derive(Debug, Default)]
+struct Acc {
+    n: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    distinct: Option<std::collections::HashSet<String>>,
+}
+
+impl LogStore {
+    /// Every record in `[from, to]` (ns) that `search` matches, grouped by `by` and measured: log
+    /// analytics' `count() by {service}`, and what a log monitor counts. Every matching record
+    /// counts (blocks a search rules out are never read).
+    pub fn aggregate(&self, search: &Search, from: i64, to: i64, by: &[Facet], measure: &Measure) -> Result<Aggregated, AggregateError> {
+        let mut groups: std::collections::HashMap<Vec<String>, Acc> = std::collections::HashMap::new();
+        let mut out = Aggregated { groups: Vec::new(), rows_scanned: 0, blocks_pruned: 0 };
+        if to < from {
+            return Ok(out);
+        }
+        let mut scratch = RowScratch::default();
+        let mut key: Vec<String> = Vec::with_capacity(by.len());
+        let mut take = |r: &RecordRef<'_>, groups: &mut std::collections::HashMap<Vec<String>, Acc>, out: &mut Aggregated| -> Result<(), AggregateError> {
+            out.rows_scanned += 1;
+            if r.ts < from || r.ts > to || !search.row(r, &mut scratch) {
+                return Ok(());
+            }
+            let value = match measure {
+                Measure::Sum(k) | Measure::Avg(k) | Measure::Min(k) | Measure::Max(k) => match r.attr(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()) {
+                    Some(v) => Some(v),
+                    None => return Ok(()),
+                },
+                _ => None,
+            };
+            key.clear();
+            key.extend(by.iter().map(|f| f.of(r).unwrap_or("N/A").to_owned()));
+            if !groups.contains_key(&key) && groups.len() >= MAX_GROUPS {
+                return Err(AggregateError::TooManyGroups);
+            }
+            let acc = groups.entry(key.clone()).or_insert_with(|| Acc { min: f64::INFINITY, max: f64::NEG_INFINITY, ..Acc::default() });
+            acc.n += 1;
+            if let Some(v) = value {
+                acc.sum += v;
+                acc.min = acc.min.min(v);
+                acc.max = acc.max.max(v);
+            }
+            if let Measure::Cardinality(f) = measure
+                && let Some(v) = f.of(r)
+            {
+                acc.distinct.get_or_insert_with(std::collections::HashSet::new).insert(v.to_owned());
+            }
+            Ok(())
+        };
+        for (seg, n) in &self.head {
+            let mut rows = Rows::new(seg, *n as usize);
+            while let Some(r) = rows.next_row().map_err(LogStoreError::from)? {
+                take(&r, &mut groups, &mut out)?;
+            }
+        }
+        let mut raw = Vec::new();
+        let mut whole = LogBlock::seal(&[]);
+        let consider = |b: &LogBlock| b.max_ts >= from && b.min_ts <= to && search.block(b) != Maybe::No;
+        for b in &self.sealed {
+            if !consider(b) {
+                out.blocks_pruned += 1;
+                continue;
+            }
+            b.decompress(&mut raw).map_err(|_| LogStoreError::Text)?;
+            let mut rows = b.rows(&raw);
+            while let Some(r) = rows.next_row().map_err(LogStoreError::from)? {
+                take(&r, &mut groups, &mut out)?;
+            }
+        }
+        for f in &self.files {
+            for (i, b) in f.log.blocks.iter().enumerate() {
+                if !consider(b) {
+                    out.blocks_pruned += 1;
+                    continue;
+                }
+                f.log.load(i, &mut whole).map_err(LogStoreError::from)?;
+                whole.decompress(&mut raw).map_err(|_| LogStoreError::Text)?;
+                let mut rows = whole.rows(&raw);
+                while let Some(r) = rows.next_row().map_err(LogStoreError::from)? {
+                    take(&r, &mut groups, &mut out)?;
+                }
+            }
+        }
+        out.groups = groups
+            .into_iter()
+            .map(|(k, a)| {
+                let v = match measure {
+                    Measure::Count => a.n as f64,
+                    Measure::Cardinality(_) => a.distinct.map_or(0, |d| d.len()) as f64,
+                    Measure::Sum(_) => a.sum,
+                    Measure::Avg(_) => a.sum / a.n.max(1) as f64,
+                    Measure::Min(_) => a.min,
+                    Measure::Max(_) => a.max,
+                };
+                (k, v)
+            })
+            .collect();
+        out.groups.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+}
+
 /// Two records of one time, by their contents: severity, service, host, source, message,
 /// attributes, trace and span.
 fn cmp_contents(a: &RecordRef<'_>, b: &Record) -> std::cmp::Ordering {
@@ -270,5 +453,18 @@ mod tests {
         let found = s.search(&parse("").unwrap(), 0, i64::MAX, 3).unwrap();
         assert_eq!(found.records.iter().map(|r| r.ts / 1_000_000_000).collect::<Vec<_>>(), vec![29_999, 29_998, 29_997]);
         assert!(found.rows_scanned < 15_000, "{}", found.rows_scanned);
+        // Analytics: every match counted, by service, across head, sealed blocks and files.
+        let agg = s.aggregate(&parse("status:error").unwrap(), 0, i64::MAX, &[Facet::Service], &Measure::Count).unwrap();
+        // Errors are every 10th (3,000); i % 3 picks the service: 0 → api, 1 → web, 2 → db.
+        let want: Vec<(Vec<String>, f64)> = vec![(vec!["api".into()], 1000.0), (vec!["db".into()], 1000.0), (vec!["web".into()], 1000.0)];
+        assert_eq!(agg.groups, want);
+        // A numeric attribute: the sum of n over records 0..100 (4,950); its distinct hosts.
+        let some = s.aggregate(&parse("*").unwrap(), 0, 99 * 1_000_000_000, &[], &Measure::Sum("n".into())).unwrap();
+        assert_eq!(some.groups, vec![(Vec::<String>::new(), 4950.0)]);
+        let hosts = s.aggregate(&parse("*").unwrap(), 0, i64::MAX, &[Facet::Status], &Measure::Cardinality(Facet::Host)).unwrap();
+        assert_eq!(hosts.groups, vec![(vec!["error".into()], 2.0), (vec!["info".into()], 4.0)]);
+        // A word no block holds: every block ruled out, nothing read but the head.
+        let none = s.aggregate(&parse("nosuchwordanywhere").unwrap(), 0, i64::MAX, &[Facet::Host], &Measure::Count).unwrap();
+        assert!(none.groups.is_empty() && none.blocks_pruned > 0);
     }
 }

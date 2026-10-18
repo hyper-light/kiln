@@ -1117,6 +1117,12 @@ impl Store {
         Ok(self.logs.search(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, limit)?)
     }
 
+    /// Log records in `[from, to]` (ns, none older than the logs' cutoff) that `search` matches,
+    /// grouped by `by` and measured (log analytics).
+    pub fn aggregate_logs(&self, search: &Search, from: i64, to: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Aggregated, crate::logs::store::AggregateError> {
+        self.logs.aggregate(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, by, measure)
+    }
+
     /// Bytes of logs on disk.
     pub fn log_bytes(&self) -> u64 {
         self.logs.disk_bytes()

@@ -21,6 +21,7 @@ pub mod logs;
 pub mod lz4;
 pub mod machine;
 pub mod manifest;
+pub mod monitor;
 pub mod otlp;
 pub mod prom;
 pub mod query;
