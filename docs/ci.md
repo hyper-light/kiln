@@ -177,11 +177,11 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
-| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1` and `kiln/test-results@v1`; `kiln://` and the other built-ins left |
+| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
-| W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; next: the job side (`kiln/auth@v1`, secrets `from: integration:…`) on CI's board |
+| W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; next: secrets `from: integration:…` (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
@@ -2138,6 +2138,8 @@ Gives step execution for `uses:`.
     (quarantined ones excepted under `enforce`), with `failed` and `passed` as outputs.
   - `kiln/notify@v1`: a message through the repository's channels (W19-R06), failing only when
     no channel took it.
+  - `kiln/auth@v1`: an integration's variables from its step on (W11-R03), with `kind` and `env`
+    outputs.
   - Inputs are checked as JavaScript actions' are (required ones, GitHub's "Unexpected
     input(s)" warning). Their metadata is at `GET /api/ci/actions/kiln`, and they lead
     `GET /api/ci/actions?q=` (R12).
@@ -2756,10 +2758,46 @@ catalog; this section is the machinery.
 - **W11-AC05 Model providers.** An agent kiln starts calls the Anthropic API with a federated
   token and no stored API key. *E2E, user-assisted.*
 
-**Progress.** Not started. Ownership, agreed 2026-10-18: the Kiln CD lane builds the registry and
+**Progress.** In progress. Ownership, agreed 2026-10-18: the Kiln CD lane builds the registry and
 the exchanges (`crates/kiln/src/ci/integrations/`, each kind's `mint()`), on W10's
 `workload_claims` and `ci::oidc::mint`; this lane wires them into jobs (`integrations:`, `kiln
-auth`, W11-R03, R04).
+auth`, W11-R03, R04). Done on this side: R03, R04.
+
+- *R03* (`crates/kiln/src/runner/auth.rs`; the dispatcher's `leg_integrations`):
+  - **What names them.** A job's `integrations:` (every step), a step's (that step), and
+    `uses: kiln/auth@v1` with `integration:` (its step on).
+  - **Server checks.** The server gives a leg only integrations whose scope holds its
+    repository, and only to trusted runs. Federating kinds need `permissions: id-token: write`.
+    Anything else fails the leg before it starts, with a message that names the integration.
+  - **Federating kinds** get the provider's own files and variables, so SDKs and CLIs work
+    unchanged:
+    - `aws`: `AWS_ROLE_ARN`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_SESSION_NAME`, region;
+    - `gcp`: an `external_account` file (`GOOGLE_APPLICATION_CREDENTIALS`, gcloud's override),
+      written with the paths a job container sees, and the project;
+    - `azure`: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, and
+      Terraform's `ARM_*`.
+
+    Their ID tokens (mode 0600) are rewritten every four minutes while the leg runs, and masked.
+  - **Stored tokens** become the variables their tools read: `CLOUDFLARE_API_TOKEN` and
+    `CLOUDFLARE_ACCOUNT_ID`, `VERCEL_TOKEN`, Slack's, Discord's, PagerDuty's, `FLY_API_TOKEN`,
+    `TF_TOKEN_<host>`, and so on. An OCI registry becomes a Docker config (`DOCKER_CONFIG`). All
+    are masked.
+  - **Precedence.** A job's integrations sit under its own `env`; a step's under the step's.
+- *R04*: `kiln auth <integration> [--print-env | --exec CMD…]`.
+  - It runs in any executor: the runner puts its own binary last on steps' `PATH`
+    (`<work>/_externals/kiln`, `/__e/kiln` in containers, which need its libc).
+  - It reads the leg's integrations from `$KILN_INTEGRATIONS`.
+  - It exchanges the leg's ID token itself, for short-lived credentials: AWS keys
+    (`AssumeRoleWithWebIdentity`), a Google access token (STS, then impersonation), an Azure one.
+  - It prints `::add-mask::` for every secret before printing or running anything.
+- *Verified end to end* on a local server:
+  - a Cloudflare integration on a job: its variables set, its token masked, in `kiln auth
+    --print-env` too, and in `--exec`'s environment;
+  - on one step only: unset before and after it;
+  - through `kiln/auth@v1`: set from its step on, with `kind` and `env` outputs;
+  - an AWS integration: its role, region and session name, and a token file (0600) whose token
+    has `aud: sts.amazonaws.com`;
+  - a federating integration without `id-token: write`, and an unknown one, refused by name.
 
 ### W12 Registries
 

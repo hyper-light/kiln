@@ -1010,6 +1010,17 @@ impl Dispatch {
         let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // Its integrations (W11-R03); one it may not use fails it before it starts.
+        match self.leg_integrations(l, r, a.runtime.id_token_url.is_some()).await {
+            Ok(list) => a.integrations = list,
+            Err(m) => {
+                runs::annotation(&self.hub, leg, None, "error", Some("integrations".into()), &m, None, None, None, None, None).await?;
+                let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
+                let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
+                Box::pin(self.commands(cmds)).await;
+                return Ok(());
+            }
+        }
         // Its deployment (W15-R04), unless `deployment: false`.
         let deploys = l.deployment.is_none() && l.spec.environment.as_ref().is_some_and(|e| e.deployment && !e.name.is_empty());
         let deployment = if deploys {
@@ -1116,6 +1127,49 @@ impl Dispatch {
         (out, ids, vars)
     }
 
+    /// The integrations a leg authenticates to (W11-R03): its job's `integrations:`, its steps',
+    /// and those its `kiln/auth@v1` steps name, each one its repository may use. Federating
+    /// ones need ID tokens (`permissions: id-token: write`); untrusted runs get none.
+    async fn leg_integrations(&self, l: &LegSt, r: &RunSt, id_tokens: bool) -> Result<Vec<wire::Integration>, String> {
+        let Some(job) = l.spec.def() else { return Ok(Vec::new()) };
+        let mut names: Vec<(String, bool)> = job.kiln.integrations.iter().map(|n| (n.clone(), true)).collect();
+        for step in &job.steps {
+            names.extend(step.kiln.integrations.iter().map(|n| (n.clone(), false)));
+            if step.uses.as_deref().and_then(crate::runner::builtins::builtin).is_some_and(|b| b.name == "auth") {
+                let name = step.with.iter().find(|(k, _)| k == "integration").and_then(|(_, v)| v.as_str()).unwrap_or_default();
+                if name.is_empty() || name.contains("${{") {
+                    return Err("kiln/auth@v1 names its integration (`with: integration: <name>`), not an expression".into());
+                }
+                names.push((name.to_owned(), false));
+            }
+        }
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !r.trusted {
+            return Err("untrusted runs (from forks) get no integrations".into());
+        }
+        let mut out: Vec<wire::Integration> = Vec::new();
+        for (name, whole) in names {
+            if let Some(have) = out.iter_mut().find(|i| i.name == name) {
+                have.job |= whole;
+                continue;
+            }
+            let i = super::integrations::get(&self.hub, &name).await.map_err(|e| format!("{e:#}"))?.filter(|i| super::integrations::usable_by(i, &r.repo)).ok_or_else(|| format!("no integration `{name}` that {} may use", r.repo.name))?;
+            let mode = super::integrations::kind(&i.kind).map(|k| k.mode);
+            let oidc = mode == Some(super::integrations::Mode::Oidc);
+            if oidc && !id_tokens {
+                return Err(format!("`{name}` ({}) federates with kiln's ID token: the job needs `permissions: id-token: write`", i.kind));
+            }
+            let token = if oidc { None } else { super::integrations::token(&self.hub, &i).await.map_err(|e| format!("`{name}`'s token: {e:#}"))? };
+            if mode == Some(super::integrations::Mode::Token) && token.is_none() {
+                return Err(format!("`{name}` has no token stored"));
+            }
+            out.push(wire::Integration { name, kind: i.kind.clone(), mode: if oidc { "oidc".into() } else { "token".into() }, config: i.config.clone(), token, job: whole });
+        }
+        Ok(out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>, image: Option<String>, token: String, job_token: String, cache_mode: kiln_ci::store::cache::Mode, secrets: Vec<wire::Secret>, vars: serde_json::Value) -> AssignmentV2 {
         let spec = &l.spec;
@@ -1186,6 +1240,7 @@ impl Dispatch {
             secret_outputs: job.map(|j| j.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect()).unwrap_or_default(),
             run_env: wf.run_env,
             quarantine: job.is_some_and(|j| j.kiln.quarantine_enforce),
+            integrations: Vec::new(),
             limits: wire::Limits::default(),
         }
     }

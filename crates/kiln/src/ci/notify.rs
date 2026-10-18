@@ -210,13 +210,7 @@ async fn channel(hub: &Hub, repo: &Repo, spec: &str) -> Result<(Integration, Opt
 
 /// Whether `repo`'s events may go through integration `i` (its scope holds the repository).
 fn usable_by(i: &Integration, repo: &Repo) -> bool {
-    let owner = repo.name.split('/').next().unwrap_or_default();
-    match i.scope.split_once(':') {
-        None => i.scope == "server" || i.scope.is_empty(),
-        Some(("org", o)) => o.eq_ignore_ascii_case(owner),
-        Some(("repo", r)) => r == repo.id || r.eq_ignore_ascii_case(&repo.name),
-        _ => false,
-    }
+    integrations::usable_by(i, repo)
 }
 
 /// Sends one message through `i`.
