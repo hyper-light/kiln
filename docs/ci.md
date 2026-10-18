@@ -176,7 +176,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug and outputs JSON left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
@@ -191,7 +191,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W18 | Supply chain, untrusted code | W10, W13 | blocked (W10) | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
-| W21 | UI | each backend it shows | in progress | the CI API the pages read (runs, graph, legs, annotations, summaries, artifacts, routing explain); the pages left |
+| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC02: 39 of F-21's 50 green, the rest waiting on W14, W18, accounts |
 
 ---
@@ -945,7 +945,9 @@ references, lints and their fixes), `schema.rs` (JSON Schemas from `keys.rs`), `
   moves the value to `env:`.
 
 **Progress.** Done, except W02-AC09. That criterion needs runs (W03, W05); the loader already
-returns a broken file with its diagnostics for the run to show.
+returns a broken file with its diagnostics for the run to show. `[ci] kiln_workflows` (off by
+default) lets the engine run `.kiln/` workflows too, v1 standing aside for a commit the engine
+took: the kiln dialect's outputs, exports and implicit checkout run on it end to end.
 
 - *Code.*
   - `crates/kiln-ci/src/wf/` (above).
@@ -1422,7 +1424,9 @@ contexts to every later evaluation, and plan previews to W20 and W21.
   - kiln's `where`, `when`, `platforms`/`emulate`, `shard` (LPT over history), `chunk`, per-axis
     `max-parallel`, scoped `fail-fast`, leg-level needs (`same`, `where`).
   - Outputs: last writer, `legs`, typed, `exports`/`env-from`, `run.env`, secret outputs kept out
-    of contexts, limits with warnings, and provenance (`reads`).
+    of contexts, limits with warnings, and provenance (`reads`). On the runner and server too
+    (R20 to R22): `$KILN_OUTPUT_JSON`, exports, `$KILN_RUN_ENV` (`run.env` and `KILN_RUN_<X>`),
+    and secret outputs as `KILN_NEEDS_<JOB>_<NAME>`, checked end to end with a `.kiln/` workflow.
   - `preview` (R29's core).
   - Tests: 42 unit tests (AC03 to AC06, S01 to S05) and the AC02 property test.
   - `ci/runs.rs` persists runs and legs; `ci_plans` and `ci_plan_log` rebuild a plan by replay.
@@ -1939,10 +1943,12 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     masks, outputs and post steps reach the leg in declared order. `cancel` sends SIGTERM, then
     SIGKILL after 10 s. Checked end to end on a local server: S05's background server, read by a
     later step and cancelled.
+  - R13: debug from a debug rerun or the `ACTIONS_*_DEBUG` secrets and variables.
+  - R14: `checkout: auto` fetches the commit through the git facade with the leg's token
+    (shallow, `.git` kept), else the facade's tarball, as a step of its own.
+  - kiln's files: `$KILN_OUTPUT_JSON` and `$KILN_RUN_ENV` (W04-R20, R21).
 - *Left.*
-  - `KILN_OUTPUT_JSON` and `exports`.
-  - Debug (R13).
-  - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.
+  - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC07.
 
 ### W07 Actions
 
@@ -2410,11 +2416,15 @@ and masking), names to the editor's completion (W21; names only).
     - `vars` by scope;
     - AC01, no stored value anywhere in the data directory;
     - AC09, rotation with runs still working.
+  - R10: secret outputs (W04-R22) sealed by the master key the moment the server reads them,
+    bound to their leg and name, deleted with the run; consumers get them only as masked
+    environment; the step outputs that feed them are masked as their step ends.
+  - `ACTIONS_STEP_DEBUG` and `ACTIONS_RUNNER_DEBUG` reach a leg whenever they're set, unmasked
+    (W06-R13).
 - *Left.*
   - Environment secrets after approval, `SecretsFor` (R04, AC07), with W15.
   - R07 (kiln actions' declared secrets).
   - R08 (brokered, W11).
-  - R10 (secret outputs).
   - The UI (W21).
   - AC02 as a route walk, AC06 as an integration test, AC08 (fork pull requests, with W18).
 
@@ -3629,20 +3639,43 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 - **W21-AC04** The runs list with 1,000,000 runs shows its first page in < 100 ms of server time and
   scrolls without blanking. *UI bench.*
 
-**Progress.** In progress: the data comes first.
+**Progress.** In progress.
 
 - *Done.* The API the pages read (§4.1), in `crates/kiln/src/ci/runs_api.rs`:
   - runs, with filters and cursor paging;
-  - a run with its legs;
+  - a run with its legs, per attempt (`?attempt=`), with the actions it pinned;
   - the graph, with needs edges and the critical path;
-  - annotations, summaries and artifacts;
-  - cancel, and rerun (mode `all`);
+  - annotations, summaries and artifacts (a leg a rerun kept shows its original's);
+  - cancel, and reruns (all, failed, one job; debug);
   - a leg with its steps and annotations, its logs, and routing explain;
-  - caches.
-- Legs of the engine already show on today's run page (steps, logs). Their graph edges come from
-  the needed legs' keys.
-- *Left.* Every page and component of this workstream: runs, the run graph, the leg page, the
-  editor and the rest, with the UI acceptance criteria in Chromium and WebKit.
+  - caches;
+  - the names a workflow sees (`/repos/:repo/names`, names only) for completion.
+- *Done.* R04, the run page for the engine's runs (`ui/src/views/run-detail/ci.tsx`):
+  - the attempt select, and Rerun (failed jobs, all, one job; debug logging) and Cancel;
+  - the graph with the critical path heavier, a matrix job's legs as cells by state, a queued
+    leg's wait reason in words, and kept legs marked;
+  - job summaries, annotations, artifacts and the pinned actions;
+  - "Edit workflow".
+- *Done.* R05's start: a leg's annotations inline, "kept from the last attempt", why a queued
+  leg waits with each runner's checks, and its steps in the order they ran.
+- *Done.* R01 and R06's start:
+  - the code editor (`ui/src/components/code/editor.tsx`): CodeMirror 6, YAML, `${{ }}` marked,
+    diagnostics from `/api/ci/validate` 300 ms after typing stops, completion, wrapped lines;
+    135 KB gzipped, loaded on demand;
+  - `/workflows`: a repository's workflow in the editor beside its plan preview for an event
+    (W04-R29), refreshed after each clean check;
+  - completion of `needs.`, `steps.`, `matrix.`, `needs.<job>.outputs.`, `inputs.`, `env.`,
+    `secrets.` and `vars.` (names in scope), `uses:` (the catalog) and `runs-on:`;
+  - Copy and Download until saving to the repository arrives (W14).
+- Checked in Chromium and WebKit (WebKit through Playwright's own image) at 1440×900 and 390×844:
+  no horizontal scrolling, nothing fixed but the shell's, no page errors.
+- *Left.*
+  - R03's facet box and sort on the runs list.
+  - R05's step timing bar, attempts with failure classes, outputs, terminal and Keep (W17),
+    "Compare with last green" (W19).
+  - R06's flow view and matrix editor, saving.
+  - R01's hover, schema completion of keys, and the Dockerfile and Agentfile modes.
+  - R07 to R12, and AC01's Playwright scripts in kiln's own CI, AC02 to AC04.
 
 ### W22 Conformance, end-to-end and performance testing
 
