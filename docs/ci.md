@@ -181,7 +181,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken); principals and roles left |
-| W11 | Integrations and credential broker | W10 | ready (OIDC issuer) | |
+| W11 | Integrations and credential broker | W10 | in progress (CD, branch cd-design) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope, the `oci` kind (any OCI registry, Docker Hub first); cloud `mint()` (AWS, Google Cloud, Azure) next |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches); hosting, review left |

@@ -498,7 +498,7 @@ and the network come on top, and are measured separately as they are built.
 | Durable state on hyper-raft (one voter) | built; replicas across servers: not yet |
 | Clusters: kubeconfig (exec plugins included), in-cluster (the chart's `rbac.deployments`: read, write or none), discovery (again when a CRD appears), watches, server-side apply | built; runner and delegated modes: not yet |
 | Argo CD Applications (import, app of apps, tracking, shadow mode, take-over) | built; ApplicationSets and AppProjects: not yet |
-| `.kiln/deploy.yaml` and environments | parsed and tested; read from kiln repositories: not yet |
+| `.kiln/deploy.yaml` and environments | read from kiln's repositories at trunk each round (apps registered when they change, removed with the file); artifacts, published images, agents' rights: [cd-targets.md](cd-targets.md) |
 | `/api/cd`, `kiln cd` | built |
 | MCP at `/api/mcp` (and `kiln mcp` over stdio): code mode in QuickJS, a tool per operation, skills; Claude Code sessions kiln starts get it | built |
 | Rollback: to any deployment kept, held until git changes the app (API, CLI, MCP, UI) | built |

@@ -718,4 +718,10 @@ Agreed with the Kiln CI work on 2026-10-18:
 | Part | State |
 | --- | --- |
 | This design | agreed 2026-10-18 |
-| Everything else | not built yet |
+| Registries (§7.1): `oci` integrations, any OCI registry, private or public, tag → digest, indexes' platforms, pull secrets | built; checked against a fake token-auth registry and Docker Hub |
+| Artifacts (§1.3): images resolved per revision, in render keys and sources (`${{ artifacts.* }}`, in plain manifests too), recorded with each deployment, a rollback's exactly as recorded; plans ask no registry | built; checked on the test cluster |
+| Published images (§7.1, §10): local Docker (loaded into the cluster's nodes by the image pipeline) or a registry, set in the UI (Settings → Deployments) | built; checked on the test cluster |
+| `.kiln/deploy.yaml` from kiln's repositories at trunk, apps registered and removed with the file | built; checked on the test cluster |
+| Agents deploy only where people let them (D6) | built; checked |
+| kiln deploying itself, with the guard (§10) | built; the guard checked on the test cluster; kiln's own move: next |
+| Providers other than Kubernetes, rollouts, the builder | not built yet |
