@@ -300,7 +300,7 @@ fn store_attachments(files: &Files, msg: &str, list: Vec<super::model::Attachmen
 }
 
 /// The longest name a session takes.
-const MAX_NAME: usize = 80;
+pub(crate) const MAX_NAME: usize = 80;
 
 /// Names a session (the "rename" control: the console, `/rename`, a broadcast): in kiln's lists,
 /// and kept across restarts in its spec. Returns the control to pass on when the harness names

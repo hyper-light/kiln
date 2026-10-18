@@ -266,6 +266,8 @@ export interface State {
   model: string;
   mode: string;
   title: string;
+  /** Its name as a person last gave it (absent: the one it started with). */
+  name?: string;
   approvals: Approval[];
   queue: QueueItem[];
   delivery: Record<string, Delivery>;
@@ -760,9 +762,13 @@ function share<T>(was: T, now: T): T {
   return (equal ? was : out) as T;
 }
 
-/** The agent's info with its state's words, the same object while they're the same. */
-const withState = (info: AgentInfo | null, s: State): AgentInfo | null =>
-  !info || (info.status === s.status && info.title === s.title && info.model === s.model && info.mode === s.mode) ? info : { ...info, status: s.status, title: s.title, model: s.model, mode: s.mode };
+/** The agent's info with its state's words (a new name included), the same object while they're the same. */
+const withState = (info: AgentInfo | null, s: State): AgentInfo | null => {
+  const name = s.name || info?.name;
+  return !info || (info.status === s.status && info.title === s.title && info.model === s.model && info.mode === s.mode && info.name === name)
+    ? info
+    : { ...info, name: name ?? info.name, status: s.status, title: s.title, model: s.model, mode: s.mode };
+};
 
 /** A snapshot on its way: gathered here and swapped in at once, so what's shown never empties. */
 interface Incoming {
