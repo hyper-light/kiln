@@ -9,6 +9,7 @@ import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTermi
 import { FORCE_STOP_AFTER_MS, harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
 import { useSuspenseResource } from "@/lib/resource";
 import { useNow } from "@/lib/hooks";
+import { relativeTime } from "@/lib/format";
 import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
 import { useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
@@ -21,10 +22,8 @@ import "./console.css";
 
 /** A turn under way, said plainly: for how long, at what effort, and what it's doing, so a long
  *  think doesn't look like nothing happening. Once a stop is asked it says so, and if the turn goes
- *  on regardless it offers to force it. Only its last words change as the turn goes (the clock has
- *  a width of its own, and the effort stays said while it runs a tool), and it fills a slot that
- *  ends the row whether or not a turn is under way, so nothing on the row moves as it ticks,
- *  thinks, starts or ends. */
+ *  on regardless it offers to force it. It has a row of its own, there between turns too (saying
+ *  when the last one ended), so nothing moves as a turn starts, ticks, thinks or ends. */
 function TurnLine({ state, activity, stopAt, onForce }: { state: State | null; activity?: string; stopAt: number | null; onForce?: () => void }) {
   const now = useNow();
   const doing = state?.doing || activity || "Working";
@@ -45,6 +44,34 @@ function TurnLine({ state, activity, stopAt, onForce }: { state: State | null; a
           Force stop
         </button>
       )}
+    </span>
+  );
+}
+
+/** How a turn ended, in words, when it didn't simply finish. */
+const ENDED: Record<string, string> = {
+  cut: "stopped part-way",
+  stopped: "stopped by you",
+  limit: "stopped at a limit",
+  refused: "the model wouldn't go on",
+  blocked: "not allowed to go on",
+};
+
+/** Between turns: when the last one ended, and how if it didn't simply finish. */
+function LastTurn({ state, status }: { state: State | null; status: Status }) {
+  const now = useNow();
+  const t = state?.last_turn;
+  if (status === "starting") return <span className="ag-turn-meta">Starting…</span>;
+  if (!t) return null;
+  const ago = relativeTime(t.at / 1000, now);
+  const how = ENDED[t.how];
+  return (
+    <span className="ag-turn">
+      <span className="ag-turn-meta ag-turn-effort">
+        Last turn ended {ago === "now" ? "just now" : ago}
+        {how && `, ${how}`}
+      </span>
+      {(t.kept ?? 0) > 0 && <span className="ag-turn-meta ag-turn-kept">· kept going ×{t.kept}</span>}
     </span>
   );
 }
@@ -204,6 +231,7 @@ export function AgentHeader({
           )}
         </div>
       </div>
+      <div className="ag-turn-row">{running ? <TurnLine state={state} activity={activity} stopAt={stopAt} onForce={features.includes("interrupt") ? onForceStop : undefined} /> : <LastTurn state={state} status={status} />}</div>
       <div className="ag-state">
         <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause }} />
         <span className="ag-cwd ag-wide-only" title={cwd}>
@@ -221,7 +249,6 @@ export function AgentHeader({
         )}
         <LimitBadge limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} />
         {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
-        <span className="ag-turn-slot">{running && <TurnLine state={state} activity={activity} stopAt={stopAt} onForce={features.includes("interrupt") ? onForceStop : undefined} />}</span>
       </div>
       {usage && limits.length > 0 && (
         <UsagePanel

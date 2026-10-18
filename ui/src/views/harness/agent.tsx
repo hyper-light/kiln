@@ -434,7 +434,7 @@ function Dock({
   const empty = useSession(store, (s) => s.events.length === 0);
   const resume = useSession(store, (s) => (s.meta?.features ?? []).includes("resume"));
   return (
-    <div className="hx-dock">
+    <div className="hx-dock" onPointerDown={keepTyping} onMouseDown={keepTyping}>
       <ActivityLine store={store} agent={id} onOpenTask={onOpenTask} />
       {status === "exited" && exit?.error && empty ? (
         <div className="hx-startfail" role="alert">
@@ -462,6 +462,15 @@ function Dock({
       <Composer store={store} agent={id} attachments={attachments} toMain={toMain} onView={onView} onTerminal={onTerminal} />
     </div>
   );
+}
+
+/** While you type, pressing one of the dock's buttons leaves the message box focused. On a phone
+ *  the keyboard stays up and nothing moves under your finger: had the box lost focus (iOS doesn't
+ *  focus a button it taps), the agent's head would come back at once, moving the buttons before the
+ *  tap landed on them. */
+function keepTyping(e: React.PointerEvent | React.MouseEvent) {
+  const t = e.target as Element;
+  if (document.activeElement?.classList.contains("hx-compose-input") && t.closest("button") && !t.closest("input, textarea, select")) e.preventDefault();
 }
 
 /** A phone's tabs, with what each holds. */

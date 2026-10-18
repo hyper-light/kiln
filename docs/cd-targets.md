@@ -422,6 +422,13 @@ Vercel, Cloud Run, Container Apps and Kubernetes (D9). That goes past Argo CD, w
 rollouts, and past Argo Rollouts, which is Kubernetes only. §5.2 compares the two, from Argo
 Rollouts' code; §5.3 says what each platform's API allows.
 
+**Built so far.** The state machine is the same for every platform. The server drives it on
+**Lambda aliases** for now: canary, linear and blue/green, with `http`, `metric` (Prometheus) and
+`approve` checks. A rollout that names a check of another kind is refused before any traffic
+moves. Not built yet: the other platforms of §5.3 (Workers, Vercel and ECS come next), `script` and
+`workflow` checks, metric backends other than Prometheus, `http` checks from runners (`from:`),
+secrets in checks, and notifications.
+
 ### 5.1 How a rollout runs
 
 **Strategies.**
@@ -469,7 +476,7 @@ canary steps, blue/green phases and `watch:`. Each is one of:
 
 | Kind | What it does |
 | --- | --- |
-| `http` | requests a URL with a method, headers and a body; measures the status, headers, body, JSON and latency. It runs from the server, or from runners matching `from:` (near a private target) |
+| `http` | requests a URL with a method, headers and a body; measures the status, headers, body, JSON and latency. It runs from the server (from runners matching `from:`, near a private target, isn't built yet) |
 | `metric` | a query: Prometheus (kiln ships one), CloudWatch, Cloud Monitoring, Azure Monitor, Cloudflare's Workers analytics, Datadog (W11-R09) |
 | `script` | your script, inline or a file of the repository, run on a runner (`runs-on`, and `image:` for a container) at the revision, with the rollout in its environment. Exit 0 passes, 1 fails, 2 is inconclusive; lines `name=value` written to `$KILN_OUTPUT` are its result. Its log is a CI run's |
 | `workflow` | a workflow of the repository (smoke or end-to-end tests), dispatched at the revision with `inputs`; it passes when the run succeeds (W15-R06) |
@@ -494,11 +501,14 @@ the end; a failure at any point aborts. Without a `count`, a background check me
 rollout ends, and passes if nothing counted against it.
 
 Criteria are yours: `pass:` and `fail:` are `${{ }}` expressions, the language workflows use,
-over `result` (what was measured) and `rollout` (`weight`, `phase`, `step`, `preview_url`,
-`stable_url`, `revision`, `previous_revision`, `app`, `environment`). A measurement neither
-criterion decides is inconclusive. Without criteria an `http` check passes on a 2xx status, a
-`script` on exit 0, a `workflow` on success. Secrets a check uses are taken out of what it
-measured and of its messages before they are recorded.
+over `result` (what was measured) and `rollout`: `weight`, `phase` (`before`, `during`, `after`),
+`step` and `steps`, `against` (`preview` or `production`), `preview_url`, `stable_url`,
+`revision`, `previous_revision`, `blue` and `green` (the versions), `app`, `environment` and
+`target`. A check's strings read them too (`url: "${{ rollout.preview_url }}/healthz"`). A
+measurement neither criterion decides is inconclusive. Without criteria an `http` check passes on
+a 2xx status, a `script` on exit 0, a `workflow` on success. Secrets in checks aren't built yet;
+when they are, they will be taken out of what a check measured and of its messages before either
+is recorded.
 
 ```yaml
 apps:
@@ -520,13 +530,15 @@ checks:
     every: 10s
     pass: "${{ result.status == 200 && result.json.db == 'ok' && result.latency_ms < 300 }}"
   e2e:
-    script:
+    script: # not built yet: script checks
       run: ./ci/e2e.sh "$KILN_PREVIEW_URL"
       runs-on: [linux]
     timeout: 10m
   errors:
     metric:
-      cloudwatch: { namespace: AWS/Lambda, metric: Errors, dimensions: { FunctionName: api }, stat: Sum }
+      prometheus:
+        address: http://prometheus.monitoring:9090
+        query: sum(rate(lambda_errors_total{function="api"}[1m]))
     every: 1m
     count: 10
     failures: 1
@@ -544,17 +556,22 @@ checks:
   (green is deployed again first if it was already let go).
 
 A newer revision supersedes a running rollout. Traffic goes back to blue, the green in between
-goes at once, and the newer revision starts from the first step. An app's first deploy has no
+goes at once, and the newer revision starts from the first step. Changing a running rollout's
+steps or checks in git starts it again from the first step too, traffic back on blue first: kiln
+compiles a rollout's plan when it starts. An app's first deploy has no
 blue, so it goes straight to all the traffic with no steps or checks, and so does going back to
 one of the last `rollback-window` revisions.
 
 **Failing or aborting** sends traffic straight back to the stable version, the platform's way:
 the alias to its old version, the Worker's deployment back to 100% of the old version, the
 revision traffic back, the Service's selector back. Switching back never gives up: when the
-platform refuses, kiln tries again 10 seconds later, and the panel says why. kiln records the
-sync as failed with the check that failed and what it measured. With `auto-rollback: true` (the
-default for canary and blue/green), the app holds at its previous deployment, as a rollback does
-in cd.md, until git changes it again.
+platform refuses, kiln tries again 10 seconds later, and the panel says why. The sync that started
+the rollout stays recorded as it ran: it applied what git says. The app reads `Degraded`, and the
+rollout's record says which check failed and what it measured. With `auto-rollback: true` (the
+default), the app then goes back to the deployment that ran before and holds there, as a rollback
+does in cd.md, until git changes it again; retrying that rollout means letting the app follow git
+again. Without it, traffic stays on blue until a person retries or git moves on, and syncing the
+app again puts traffic moved by hand back on blue.
 
 **State.** The engine's sync deploys green; the rollout then moves traffic and runs the checks.
 The app reads `Progressing` while it runs, `Suspended` while it waits for a person, `Degraded`
@@ -565,10 +582,15 @@ run again. A check keeps its last 10 measurements and a tally of all of them; th
 record keeps its first entries and its latest.
 
 **The rollout panel** shows on the app's page while a rollout runs, and after it as a record:
-- the weights, as a bar per version, and the preview's address;
-- the phases and steps, each check's measurements against its criteria, with the logs of
-  scripts and workflows;
-- **Promote**, **Promote fully**, **Pause**, **Resume**, **Abort** and **Retry**, in place.
+- the traffic, as a bar between blue and green with their versions, and green's preview address;
+- the steps, with the one it's at (or failed at), and each check's verdict, tally and last
+  measurement;
+- approvals waiting, with **Approve** and **Deny**;
+- **Promote**, **Promote fully**, **Pause**, **Resume**, **Abort** (with a reason, for the record)
+  and **Retry**, in place;
+- what happened, newest first.
+
+A rollout that finished well folds to a line.
 
 ### 5.2 Compared with Argo Rollouts
 
@@ -595,6 +617,7 @@ Read from Argo Rollouts' controller: `analysis/analysis.go` (how a metric is ass
 | AnalysisRuns are objects: a controller restart loses no measurement, and a stale result can't land on a newer run | every request carries an id: late answers are ignored, and a restart asks again with the same ids |
 | `progressDeadlineSeconds` (600) | `progress-deadline` (10m) |
 | a new revision mid-rollout starts again from step 0; stable stays stable | the same |
+| a canary whose steps change (`currentStepHash`) starts again from step 0; blue/green settings apply as they change | any change to a rollout's steps or checks starts it again from the first step, for every strategy |
 | no steps or analysis on a first deploy, or going back within `rollbackWindow` | the same, `rollback-window` |
 | `scaleDownDelaySeconds` and `abortScaleDownDelaySeconds` (30s) | 30s after a canary; `keep` (30m) after a blue/green; `keep-failed` (30s) |
 
@@ -804,13 +827,17 @@ Everything works at phone width:
 | GET | `/api/cd/discover?integration=&provider=&place=` | what an account holds (for the builder and import) |
 | POST | `/api/cd/validate` | a definition → errors at positions, and its plan per environment |
 | POST | `/api/cd/import` | from an account, a repository or Argo CD → apps in shadow mode |
-| GET | `/api/cd/apps/:app/rollout` | the rollout: weights, step, each check's measurements and tally, its record |
-| POST | `/api/cd/apps/:app/rollout/{promote,pause,resume,abort,retry}` | `promote` takes `{ full: true }` to go past every step and check |
+| GET | `/api/cd/apps/:app/rollout` | the app's rollouts, the one under way first: where each stands, its steps, each check's measurements and tally, the approvals it waits for, its record (`cd.apps.rollout`) |
+| POST | `/api/cd/apps/:app/rollout/{promote,pause,resume,abort,retry,approve,deny}` | `promote` takes `{ full: true }` to go past every step and check, `abort` a `reason`, `approve` and `deny` the `check`; each takes `rollout` (its id) when the app has more than one under way (`cd.apps.rollout_act`) |
 
 CLI: `kiln cd discover`, `kiln cd import --from aws-ecs --integration aws-prod`, `kiln cd
-validate`, `kiln cd rollout promote [--full]|pause|resume|abort|retry <app>`. MCP gets the same
-operations (code mode) and skills for deploying to a new platform, adopting from an account, and
-running a canary.
+validate`, `kiln cd rollout status|promote [--full]|pause|resume|abort [--reason]|retry <app>`,
+`kiln cd rollout approve|deny <app> --check <name>`. MCP gets the same operations (code mode) and
+skills for deploying to a new platform, adopting from an account, and running a canary.
+
+People act on rollouts; agents as D6 says. An agent promotes, resumes, aborts or retries where
+its environment lets it deploy, and answers approvals where it lets it approve. Anyone may pause
+a rollout: that changes nothing that runs.
 
 ## 10. Moving kiln's own deploys
 

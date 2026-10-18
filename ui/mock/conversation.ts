@@ -245,10 +245,12 @@ let effort = "high";
 let running = !PAUSED;
 let doing = "Thinking";
 let turnStarted = Date.now() - Number(process.env.MOCK_TURN_AGE_MS ?? 134_000);
+let lastTurn: State["last_turn"];
 const state = (): State => ({
   status: running ? "running" : "idle",
   doing: running ? doing : undefined,
   turn_started: running ? turnStarted : undefined,
+  last_turn: running ? undefined : lastTurn,
   cwd: info.cwd,
   model: info.model,
   mode: info.mode,
@@ -397,7 +399,10 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
     if (c.type === "set_mode" && c.mode) info.mode = c.mode;
     else if (c.type === "set_model" && c.model) info.model = c.model;
     else if (c.type === "set_effort" && c.effort) effort = c.effort;
-    else if (c.type === "force_stop") running = false;
+    else if (c.type === "force_stop") {
+      running = false;
+      lastTurn = { at: Date.now(), how: "stopped", kept: 0 };
+    }
     else if (c.type === "send" && c.text) {
       const e = add({ id: `L-sent-${seq}`, at: Date.now(), kind: "user", text: c.text, client_id: c.id });
       if (!running) {

@@ -29,6 +29,7 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
 import { ResourceDetails } from "./details";
+import { RolloutPanel } from "./rollout";
 import { FIXES, age, compareNodes, compareText, facetsOf, fixOf, forest, isFiltered, keep, kindRank, troubled, whatDiffers, type Fix, type GroupItem } from "./model";
 import {
   HealthPair,
@@ -155,12 +156,13 @@ const appRes = (id: string) => ({
   detail: { key: `${appKey(id)}detail`, fetch: (s: AbortSignal) => readApp(id, s), opts: { pollMs: 10_000 } },
   objects: { key: `${appKey(id)}tree`, fetch: (s: AbortSignal) => readObjects(id, s), opts: { pollMs: 5_000 } },
   history: { key: `${appKey(id)}history`, fetch: (s: AbortSignal) => cdApi.history(id, s) },
+  rollouts: { key: `${appKey(id)}rollout`, fetch: (s: AbortSignal) => cdApi.rollouts(id, s), opts: { pollMs: 10_000 } },
 });
 
 function DeploymentApp({ project, name }: { project: string; name: string }) {
   const id = `${project}/${name}`;
   const r = appRes(id);
-  warm(r.detail, r.objects, r.history);
+  warm(r.detail, r.objects, r.history, r.rollouts);
   const app = useRes(r.detail).data;
   if ("notFound" in app) {
     return (
@@ -177,6 +179,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
   const r = appRes(id);
   const objects = useRes(r.objects).data;
   const history = useRes(r.history).data.history;
+  const rollouts = useRes(r.rollouts).data.rollouts;
   const [ask, setAsk] = React.useState<Ask>(null);
   const [orphan, setOrphan] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
@@ -184,10 +187,11 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
   const [preset, setPreset] = React.useState<SyncPreset>(null);
   const [diffOnly, setDiffOnly] = React.useState<Fix | null>(null);
 
-  // Live: this app's status changed, so read it again (at most twice a second).
+  // Live: this app's status or its rollout changed, so read it again (at most twice a second).
   const soon = React.useRef<number | null>(null);
   useServerEvents((ev) => {
-    if (ev.type === "cd_apps" && soon.current === null && ev.apps.some((x) => x.app === id)) {
+    const mine = (ev.type === "cd_apps" && ev.apps.some((x) => x.app === id)) || (ev.type === "cd_rollout" && ev.app === id);
+    if (mine && soon.current === null) {
       soon.current = window.setTimeout(() => {
         soon.current = null;
         invalidate(appKey(id));
@@ -415,6 +419,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
 
       {a.source_error && <p className="cd-warn">kiln can't read its sources: {a.source_error}</p>}
       {a.message && <p className="cd-warn">{a.message}</p>}
+      <RolloutPanel appId={id} appName={name} rollouts={rollouts} busy={busy} onAct={(done, f) => act(done, f, true)} />
       {!live && (a.out_of_sync ?? 0) > 0 && (
         <Differences
           a={a}

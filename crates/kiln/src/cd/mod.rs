@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod artifacts;
+pub mod checks;
 pub mod cli;
 pub mod guard;
 pub mod images;
@@ -19,6 +20,7 @@ pub mod kube;
 pub mod live;
 pub mod ops;
 pub mod plans;
+pub mod rollouts;
 pub mod targets;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -187,6 +189,8 @@ pub struct Cd {
     pub target_errors: Mutex<BTreeMap<String, String>>,
     /// Repositories' `owner/name`, by clone URL: whose workload a target's calls are.
     pub repo_names: RwLock<HashMap<String, String>>,
+    /// Rollouts on targets being driven (docs/cd-targets.md §5).
+    pub rollouts: rollouts::Drivers,
 }
 
 impl Cd {
@@ -1380,6 +1384,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         targets: RwLock::new(BTreeMap::new()),
         target_errors: Mutex::new(BTreeMap::new()),
         repo_names: RwLock::new(HashMap::new()),
+        rollouts: rollouts::Drivers::default(),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.
@@ -1391,6 +1396,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
     crate::rt::spawn(cd.clone().dispatch(arx));
     crate::rt::spawn(cd.clone().poll_loop());
     crate::rt::spawn(cd.clone().flush_loop());
+    cd.resume_rollouts();
     // The store's changes (from this server or, later, other members) reach the registry.
     if let Some(changes) = changes {
         let (ctx, crx) = async_channel::unbounded();

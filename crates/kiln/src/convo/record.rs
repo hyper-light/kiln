@@ -54,7 +54,7 @@ fn files_of(src: &Source) -> Vec<(String, PathBuf)> {
                 .filter_map(|p| p.file_name().map(|n| (n.to_string_lossy().into_owned(), p.clone())))
                 .collect()
         }
-        Protocol::Acp(_) | Protocol::Terminal => Vec::new(),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => Vec::new(),
     }
 }
 

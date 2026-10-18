@@ -17,6 +17,9 @@
 //!   status carries the chain it serves, certificates only, for downloads.
 //! * **Standby.** While another runner process of the machine is the newest (an upgrade beside
 //!   this one), the server tells this one to stand by: its listeners stop so the other can bind.
+//!   The one told to take over may try its ports before the other has let go of them: ports in
+//!   use are tried again every [`RETRY_IN_USE`] for [`RETRY_IN_USE_FOR`] after it starts or is
+//!   told to run the front door, not only every [`TICK`].
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -38,6 +41,11 @@ use super::{CertMode, CertStatus, DnsMode, Fix, Listener, Push, Settings, State,
 
 /// How often the front door looks again (interfaces, failed binds, the certificate's age).
 pub const TICK: Duration = Duration::from_secs(15);
+
+/// How often ports another process holds are tried again, and for how long, after the front door
+/// starts or is told to run: the runner an upgrade replaces lets go of them moments later.
+pub const RETRY_IN_USE: Duration = Duration::from_millis(250);
+pub const RETRY_IN_USE_FOR: Duration = Duration::from_secs(30);
 /// A CSR the server has not answered is asked again after this long.
 pub const ASK_AGAIN: Duration = Duration::from_secs(300);
 /// Renew a kiln certificate with less than this left.
@@ -117,6 +125,14 @@ pub fn start(ctx: Ctx, shutdown: &Shutdown) -> Handle {
     handle
 }
 
+/// After `wait`, or never.
+async fn soon(wait: Option<Duration>) {
+    match wait {
+        Some(d) => crate::rt::sleep(d).await,
+        None => futures::future::pending().await,
+    }
+}
+
 async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>, shutdown: Shutdown) {
     let mut fd = FrontDoor::new(ctx);
     let mut tick = Interval::new(TICK);
@@ -139,6 +155,7 @@ async fn run(ctx: Ctx, rx: async_channel::Receiver<Command>, latest: Arc<Latest>
             },
             () = tick.tick().fuse() => None,
             () = tailnet_changes.changed().fuse() => None,
+            () = soon(fd.retry_in()).fuse() => None,
         };
         match cmd {
             Some(Command::Push(json)) => fd.on_push(&json),
@@ -217,6 +234,10 @@ struct FrontDoor {
     https: Option<proxy::Listening>,
     https_failure: Option<Failure>,
     https_wait: Option<String>,
+    /// A listener's port is held by another process (the runner an upgrade replaces), and until
+    /// when it is tried again soon ([`RETRY_IN_USE`]).
+    in_use: bool,
+    retry_until: Option<Instant>,
     redirect: Arc<proxy::Redirect>,
     http: Option<proxy::Listening>,
     http_failure: Option<Failure>,
@@ -252,6 +273,8 @@ impl FrontDoor {
             https: None,
             https_failure: None,
             https_wait: None,
+            in_use: false,
+            retry_until: Some(Instant::now() + RETRY_IN_USE_FOR),
             redirect: Arc::default(),
             http: None,
             http_failure: None,
@@ -299,6 +322,11 @@ impl FrontDoor {
                 }
                 Err(e) => self.upload_error = Some(format!("The uploaded certificate was not taken: {e:#}")),
             }
+        }
+        // Told to run it (as the newest process of an upgrade, or again): the one it takes over from
+        // may hold the ports a moment longer.
+        if !push.standby && (self.standby || self.in_use) {
+            self.retry_until = Some(Instant::now() + RETRY_IN_USE_FOR);
         }
         self.standby = push.standby;
         if !push.standby {
@@ -349,9 +377,17 @@ impl FrontDoor {
         self.mdns = None;
     }
 
+    /// When to try again sooner than [`TICK`]: while a listener's port is held by another process,
+    /// for a while after starting or being told to run.
+    fn retry_in(&self) -> Option<Duration> {
+        (self.in_use && !self.standby && self.retry_until.is_some_and(|t| Instant::now() < t)).then_some(RETRY_IN_USE)
+    }
+
     /// Match the listeners to the settings (and retry what failed).
     fn reconcile(&mut self) {
         let s = self.settings.clone();
+        let was_in_use = self.in_use;
+        self.in_use = false;
         self.ifaces = netinfo::lan();
         // On the tailnet too: its addresses are the front door's like the LAN's.
         let seen = self.tailnet.seen();
@@ -377,6 +413,12 @@ impl FrontDoor {
             resolve: (s.dns.enabled && !s.domain.is_empty()).then(|| s.domain.clone()),
             listening,
         });
+        if was_in_use && !self.in_use {
+            tracing::info!("front door: the ports another process held are its own now");
+        } else if self.in_use && self.retry_until.is_some_and(|t| Instant::now() >= t) {
+            self.retry_until = None;
+            tracing::warn!("front door: another program still holds its ports; trying again every {}s", TICK.as_secs());
+        }
     }
 
     fn reconcile_dns(&mut self, s: &Settings, active: bool) {
@@ -403,6 +445,7 @@ impl FrontDoor {
                 if e.kind() == std::io::ErrorKind::AddrNotAvailable {
                     continue;
                 }
+                self.in_use |= e.kind() == std::io::ErrorKind::AddrInUse;
                 let (message, fix) = netinfo::bind_problem("DNS", addr, e);
                 self.dns_failures.push(Failure { message, fix });
             }
@@ -568,6 +611,7 @@ impl FrontDoor {
                     self.https = Some(l);
                 }
                 Err(e) => {
+                    self.in_use |= e.kind() == std::io::ErrorKind::AddrInUse;
                     let (message, fix) = netinfo::bind_problem("HTTPS", &SocketAddr::from(([0, 0, 0, 0], s.https.port)), &e);
                     self.https_failure = Some(Failure { message, fix });
                 }
@@ -589,6 +633,7 @@ impl FrontDoor {
             match proxy::listen_redirect(s.https.http_port, &self.redirect) {
                 Ok(l) => self.http = Some(l),
                 Err(e) => {
+                    self.in_use |= e.kind() == std::io::ErrorKind::AddrInUse;
                     let (message, fix) = netinfo::bind_problem("The HTTP redirect", &SocketAddr::from(([0, 0, 0, 0], s.https.http_port)), &e);
                     self.http_failure = Some(Failure { message, fix });
                 }
@@ -804,6 +849,66 @@ mod tests {
             fd.on_push(&push(&Settings::default(), None, false)?);
             let st = fd.status();
             assert_eq!((st.dns.state, st.https.state), (State::Off, State::Off));
+            Ok(())
+        })
+    }
+
+    /// Holds `port` as another process would (waiting for a listener just stopped to let it go).
+    async fn hold(port: u16) -> anyhow::Result<std::net::TcpListener> {
+        for _ in 0..100 {
+            match std::net::TcpListener::bind(("::", port)).or_else(|e| if e.kind() == std::io::ErrorKind::AddrInUse { Err(e) } else { std::net::TcpListener::bind(("0.0.0.0", port)) }) {
+                Ok(l) => return Ok(l),
+                Err(_) => crate::rt::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        anyhow::bail!("port {port} stayed in use")
+    }
+
+    /// Taking over from the runner an upgrade replaces, which still holds the port: tried again
+    /// soon (not a TICK later), up once it's let go, and back to TICKs after a while.
+    #[test]
+    fn ports_still_held_are_tried_again_soon() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(&dir.path().join("pki"))?;
+            let ctx = Ctx { dir: dir.path().join("front-door"), server_url: "http://127.0.0.1:9".into(), ca_der: pki.ca_der.clone() };
+            let https_port = free_port()?;
+            let settings = Settings {
+                domain: "kiln.test".into(),
+                https: Https { enabled: true, port: https_port, http_port: 0, ..Https::default() },
+                cert: Cert { mode: CertMode::Kiln },
+                ..Settings::default()
+            };
+            let push = |issued: Option<String>, standby: bool| serde_json::to_string(&Push { settings: settings.clone(), standby, issued, custom: None, renew: false });
+            let mut fd = FrontDoor::new(ctx);
+            fd.on_push(&push(None, false)?);
+            let st = fd.status();
+            let csr = st.csr.clone().ok_or_else(|| anyhow::anyhow!("a CSR"))?;
+            let issued = pki.sign_front_door(&csr, &st.want, crate::pki::FRONT_DOOR_DAYS)?;
+            fd.on_push(&push(Some(issued), true)?);
+            assert_eq!(fd.retry_in(), None, "standing by, nothing to try");
+
+            // The other process holds the port when this one is told to run.
+            let held = hold(https_port).await?;
+            fd.on_push(&push(None, false)?);
+            assert_eq!(fd.status().https.state, State::Error, "{:?}", fd.status().https);
+            assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
+
+            // It lets go: the next try binds, and nothing more is tried soon.
+            drop(held);
+            fd.reconcile();
+            assert_eq!(fd.status().https.state, State::On, "{:?}", fd.status().https);
+            assert_eq!(fd.retry_in(), None);
+
+            // Held for longer than the while: back to every TICK.
+            fd.on_push(&push(None, true)?);
+            let held = hold(https_port).await?;
+            fd.on_push(&push(None, false)?);
+            assert_eq!(fd.retry_in(), Some(RETRY_IN_USE));
+            fd.retry_until = Some(Instant::now());
+            fd.reconcile();
+            assert_eq!(fd.retry_in(), None);
+            drop(held);
             Ok(())
         })
     }

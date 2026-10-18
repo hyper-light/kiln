@@ -112,8 +112,9 @@ const children: Child[] = [
   { name: "raft", state: "finished", restarts: 0, last_error: null, since_unix: now() - 86_000 },
 ];
 
+let auditSeq = 0;
 function addAudit(actor: string, action: string, detail: string) {
-  audit.unshift({ ts: now(), actor, action, detail });
+  audit.unshift({ id: ++auditSeq, ts: now(), principal: actor, on_behalf_of: null, token: null, scope: null, action, target: null, result: "ok", ip: null, detail, actor });
   if (audit.length > 500) audit.length = 500;
 }
 
