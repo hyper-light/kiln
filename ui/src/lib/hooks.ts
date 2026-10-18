@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { ApiError } from "@/api/client";
 import { getPref, usePref } from "./prefs";
 
@@ -37,63 +37,6 @@ export function useNow(): number {
 /* Legacy, used by no page now (they read useSuspenseResource,         */
 /* lib/resource.ts); kept until it is deleted on main.                 */
 /* ------------------------------------------------------------------ */
-
-export interface Resource<T> {
-  data: T | undefined;
-  error: Error | null;
-  loading: boolean;
-  reload: () => void;
-  setData: (fn: (prev: T | undefined) => T | undefined) => void;
-}
-
-export function useResource<T>(
-  fetcher: (signal: AbortSignal) => Promise<T>,
-  deps: React.DependencyList,
-  opts: { pollMs?: number } = {},
-): Resource<T> {
-  const [data, setDataState] = useState<T | undefined>(undefined);
-  const [error, setError] = useState<Error | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [nonce, setNonce] = useState(0);
-  const fetcherRef = useRef(fetcher);
-  useEffect(() => {
-    fetcherRef.current = fetcher;
-  });
-
-  useEffect(() => {
-    const ctl = new AbortController();
-    setLoading(true);
-    fetcherRef
-      .current(ctl.signal)
-      .then((d) => {
-        if (ctl.signal.aborted) return;
-        setDataState(d);
-        setError(null);
-      })
-      .catch((e: unknown) => {
-        if (ctl.signal.aborted) return;
-        if (e instanceof DOMException && e.name === "AbortError") return;
-        setError(e instanceof Error ? e : new Error(String(e)));
-      })
-      .finally(() => {
-        if (!ctl.signal.aborted) setLoading(false);
-      });
-    return () => ctl.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, nonce]);
-
-  useEffect(() => {
-    if (!opts.pollMs) return;
-    const t = window.setInterval(() => {
-      if (!document.hidden) setNonce((n) => n + 1);
-    }, opts.pollMs);
-    return () => window.clearInterval(t);
-  }, [opts.pollMs]);
-
-  const reload = useCallback(() => setNonce((n) => n + 1), []);
-  const setData = useCallback((fn: (prev: T | undefined) => T | undefined) => setDataState(fn), []);
-  return { data, error, loading, reload, setData };
-}
 
 export function errorMessage(e: unknown): string {
   if (e instanceof ApiError) return e.message;
