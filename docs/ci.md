@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | ready (OIDC issuer) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | job containers, services, Docker actions on the host executor; probes, pools, microVMs, k8s left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (artifacts, 501s); hosting, review left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | blocked (W04) | |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
 | W17 | Debugging | W06, W13 | blocked (W06) | |
@@ -192,7 +192,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
 | W21 | UI | each backend it shows | ready (runs and DAG, editor) | |
-| W22 | Conformance, e2e, performance | grows with the rest | ready (harness) | |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC02 first batch (16 actions: 11 green, 4 DNS, 1 needs Ubuntu) |
 
 ---
 
@@ -2972,11 +2972,24 @@ adapts [review.md](review.md), which it replaces.
   - served at the root of the server's origin (§2.6);
   - open to a leg's token only, and each token reads only its own run's repository.
   - `actions/checkout@v4` with default settings runs unmodified.
-- *REST so far.* `crates/kiln/src/ci/rest.rs`, at `/api/v3`:
+- *REST so far.* `crates/kiln/src/ci/rest/`, at `/api/v3`, each route checking the job token's
+  permissions with GitHub's mapping:
   - the artifact endpoints (`download-artifact` across runs);
-  - 501 "not implemented by kiln" with a warning on the leg for everything else;
+  - the dispatches;
+  - the repository's reads from the mirror: repository, commits (with files), branches, refs,
+    contents, tarballs and zipballs, compare;
+  - commit statuses with the combined status, and check runs;
+  - releases, with assets uploaded to `upload_url` (`/api/uploads/…`) and served by
+    `browser_download_url`;
+  - `/user`, `/rate_limit`;
+  - 501 "not implemented by kiln", with a warning on the leg, for everything else;
   - GraphQL answering the same;
   - GitHub-shaped run links redirected to kiln's pages.
+  - Checked end to end:
+    - `github-script` (statuses, checks, repository, commit, contents);
+    - `docker/metadata-action`;
+    - `softprops/action-gh-release` with an asset;
+    - `actions/checkout` unpacking the tarball where git is missing.
 - *Left.* Everything else: the rest of R11's REST subset and GraphQL, hosting (R01, R02), review,
   landing, the App, the schema, and AC01 to AC07.
 
@@ -3591,7 +3604,23 @@ live cluster, fault injection, security, performance, and mixed-version fleets.
   the CI work (no `CAP_CI2`) and runners at the new version: v1 jobs keep running on old runners, v2
   legs wait on old runners with `capability` and run on new ones, nothing fails because of the mix.
 
-**Progress.** Not started.
+**Progress.** In progress: the local harness only.
+
+- *Done.* A throwaway server with the built-in agent (see the W03 to W14 progress notes) runs
+  fixture workflows end to end.
+- *AC02, first batch* (16 actions, 2026-10-18):
+  - Green: `setup-node`, `setup-go`, `setup-java`, `setup-uv`, `pnpm/action-setup`,
+    `setup-bun`, `dtolnay/rust-toolchain`, `setup-terraform`, `docker/metadata-action`,
+    `github-script`, `softprops/action-gh-release`, `actions/cache`, `upload-artifact`,
+    `download-artifact` and `checkout`.
+  - Failed, and why:
+    - `setup-buildx`, `cosign-installer`, `setup-deno` and `setup-zig`: the host's DNS failed
+      during the run (to rerun).
+    - `setup-python`: GitHub's `python-versions` manifest has builds for Ubuntu only, and the
+      host is not Ubuntu. It needs an Ubuntu environment: the `docker` executor with an Ubuntu
+      runner image (W13-R04, W05-R21).
+- *Left.* Everything else: AC01 and AC03 to AC09, `docs/ci-conformance.md`, and the rest of
+  F-21.
 
 ---
 
