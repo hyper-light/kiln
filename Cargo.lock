@@ -1583,6 +1583,7 @@ dependencies = [
  "hyper-log",
  "hyper-measure",
  "hyper-raft",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.21",

@@ -6,6 +6,7 @@
 //! own: it is fed the group's entries and asked queries, and kiln drives it and carries its
 //! messages (`crates/kiln/src/observe`).
 
+pub mod anomaly;
 pub mod batch;
 pub mod bits;
 pub mod block;

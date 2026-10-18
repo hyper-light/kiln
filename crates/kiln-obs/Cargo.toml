@@ -25,6 +25,8 @@ tempfile = "3.27.0"
 # Only to measure LZ4 against deflate (benches/lz4.rs); kiln has it already.
 flate2 = "1.1.10"
 hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+# Only to read NAB's labels and results (benches/nab.rs); kiln has it already.
+serde_json = "1.0.154"
 
 [[bench]]
 name = "codec"
@@ -52,6 +54,10 @@ harness = false
 
 [[bench]]
 name = "otlp"
+harness = false
+
+[[bench]]
+name = "nab"
 harness = false
 
 [lints]

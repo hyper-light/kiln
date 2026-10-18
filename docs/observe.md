@@ -19,7 +19,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); next: live tail, patterns | in progress |
-| O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; next: anomaly, forecast, composite | in progress |
+| O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12); next: `anomalies()` in queries and monitors, forecast, composite | in progress |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
@@ -393,15 +393,44 @@ To come: anomaly, forecast, outlier and composite monitors (§9.1).
 
 ### 9.1 Anomalies and forecasts
 
-Learned, not configured: the season is found from the series' autocorrelation (the lag of its
-strongest peak among the candidate periods hour, day, week); the baseline is the seasonal median
-and the scale the median absolute deviation (Iglewicz and Hoaglin 1993) of the deseasonalised
-residuals; a point is anomalous past `k` scales, `k` chosen per series from the target false-positive
-rate measured on its own history; extreme points are found with Seasonal Hybrid ESD (Hochenbaum,
-Vallis and Kejariwal 2017) for the batch views. Forecasts use additive Holt-Winters (Winters 1960)
-with its three smoothing parameters fitted by minimising one-step squared error on the history. The
-detectors are scored on the Numenta Anomaly Benchmark's labelled data (Lavin and Ahmad 2015); the
-scores are in §12.
+`kiln_obs::anomaly`: Datadog's three algorithms, each giving, before it sees a point, its expected
+value and its scale (the robust spread of its own one-step errors: 1.4826 × their median absolute
+value, the MAD's consistency constant; 1.2533 × their mean absolute value when that is 0, Iglewicz
+and Hoaglin):
+
+- `basic`: the median of the recent past; no season; follows a new level in half its window.
+- `robust`: the learned season's median of the same phase in the last five seasons (two outlying
+  seasons outvoted), moved by the level's median offset over the last season: steady through a long
+  anomaly, slow to take a new level.
+- `agile`: additive Holt-Winters (Winters 1960), its smoothing fitted to the history by least
+  absolute one-step error over the usual grid (Hyndman et al. 2008), its updates Huberised at two
+  scales (Gelper, Fried and Croux 2010) so that an outlier does not move it.
+
+**The season is learned**: among a day, a week and the strongest peak of the differenced series'
+autocorrelation (above the white-noise band, 3/√n), the period with which the robust algorithm's own
+one-step errors on the history are smallest, if smaller than without one by more than twice the MAD's
+standard error (1.166 σ/√n): a cycle is kept only if it predicts.
+
+**A deviation is calibrated per series** (`anomaly::Scorer`): a point's error in scales (`z`) means
+different things in a calm series and a wild one (NAB's anomalies peak at |z| = 3 in one series and
+200,000 in another, and a smooth series without any reaches 140, §12.12), so a deviation is defined
+so that the series' own 1-in-500 |z| (its 99.8% quantile, so far) counts as 3.09 deviations, as a
+normal law's would. A band of `k` deviations is expected ± k of them; Datadog's `bounds` read the same
+in every series. An episode, from a point past 3.09 deviations to the next back under them, has an
+onset: an anomaly begins.
+
+The history the scorer reads is all of what is asked (up to 20,000 points): more steadies the
+baseline and the scale (§12.12). The calibration is the |z| of a detector that learned the history's
+first quarter, over the rest.
+
+Measured on the Numenta Anomaly Benchmark (§12.12): `robust` 52.6 (standard), 41.0 (rewarding few
+false positives), 58.3 (rewarding few false negatives); `basic` 50.3, 41.0, 54.8; `agile` 31.3, 13.1,
+41.1. Among NAB's published detectors, `robust` is above Random Cut Forest (51.7), Twitter's ADVec
+(47.1) and the windowed Gaussian (39.6), below Relative Entropy (54.6).
+
+To come: `anomalies()` in queries and anomaly monitors (the fraction of the alert window's points
+past `bounds`); forecasts (Holt-Winters with the fitted smoothing, its intervals from the calibrated
+deviation); outlier and composite monitors.
 
 ## 10. Integrations
 
@@ -752,6 +781,74 @@ removed the cause: a thousand blocks a request allocated on one thread and freed
 merges that stopped, an index that grew with samples, and merges that held whole blocks (§4.5).
 With a reader alongside (a dashboard's two queries every 250 ms: one series, and all 8,000 summed by
 host over 15 minutes), one series answered in 0.19 ms at the median, all of them by host in 335 ms.
+
+### 12.12 Anomalies on the Numenta Anomaly Benchmark
+
+`NAB=<a checkout of github.com/numenta/NAB> cargo bench -p kiln-obs --bench nab` (NAB v1.1,
+commit ea702d7: 58 labelled series, 365,558 points, 116 anomaly windows; Lavin and Ahmad 2015).
+
+**The scorer** (`kiln_obs::anomaly::nab`) is NAB's, ported from `sweeper.py`, `optimizer.py`,
+`scorer.py` and the normalisation of `runner.py`: scored at the thresholds NAB keeps
+(`config/thresholds.json`), the results NAB publishes for numenta, Twitter's ADVec, the windowed
+Gaussian, random and null come out as `final_results.json` says, all 15 within 4.5e-11. Swept here
+over every threshold, a detector's threshold is the corpus' best: never below NAB's (numenta's
+standard 70.10 either way; its low-FP 63.21 against the kept threshold's 63.12).
+
+**Each algorithm runs as it would live**: started on the series' probation (its first 15%, 750
+points at most: NAB's learning period, unscored), each later point's score from what it expected
+before it saw it; NAB's threshold sweep is the only thing fitted to the labels.
+
+**How a point's error became its score** (standard, low FP, low FN; and, not NAB's, each file at
+its own best threshold: an upper bound set by the ranking within files), the window the whole
+probation, the calibration a quarter's detector over the rest:
+
+| | basic | agile | robust | robust, each file's threshold |
+| --- | --- | --- | --- | --- |
+| \|z\| itself, one threshold for the corpus | 1.3 | 0.0 | 1.3 | 66.7 |
+| a generalised Pareto tail of the series' \|z\| (SPOT; probability-weighted moments) | 35.4 | 0.0 | 31.6 | 65.2 |
+| \|z\| over the series' largest so far | 43.9 | 23.2 | 42.1 | 62.1 |
+| \|z\| over its 99.9% quantile | 46.0 | 17.5 | 44.4 | 65.7 |
+| … over its 99.7% quantile, an episode scored by its onset | 48.1 | 32.5 | 49.4 | 68.8 |
+| **… over its 99.8% quantile, onsets** | **50.3** | 31.3 | **52.6** | 68.8 |
+| … over its 99.9% quantile, onsets | 46.3 | 31.1 | 46.3 | 67.5 |
+| … the 99.8% quantile from an exponential tail over the 98% (peaks over threshold) | 45.3 | 30.6 | 49.1 | 67.7 |
+
+Within a file the errors rank anomalies well from the start (66.7 with each file at its own
+threshold), but |z| is not comparable across files: the anomalies' largest |z| is 3 in one series
+and 200,000 in another, and a smooth series without any anomaly reaches 140. Calibrating each
+series against its own past does it; a fitted tail (SPOT, Siffer et al. 2017) is less steady than
+the empirical quantile on so few peaks (the PWM fit's shape kept at 0 or above, or a bounded tail
+calls anything past it impossible). Scoring an episode by its onset spares NAB's per-point false
+positives the long run of points past the band that a level shift leaves (as a monitor counts an
+episode once). The level is the best of a smooth, single-peaked curve (49.4, 52.6, 49.0, 46.3 from
+99.7% to 99.9%; on another calibration split 47.6, 51.5, 48.7, 46.3).
+
+**How much history**: the window (the median's, the offsets', the errors' scale's) read from a day
+to the whole probation: `robust` 45.2 at a day, 47.1 at two, 52.6 at the whole (with its best level
+at each); the calibration's detector learning an eighth or a quarter of the probation: 51.5 and 52.6.
+
+**Against NAB's published detectors** (standard, low FP, low FN; `results/final_results.json`):
+
+| detector | standard | low FP | low FN |
+| --- | --- | --- | --- |
+| ARTime | 74.85 | 65.15 | 80.36 |
+| Numenta HTM | 70.10 | 63.12 | 74.32 |
+| CAD OSE | 69.90 | 66.98 | 73.18 |
+| earthgecko Skyline | 58.20 | 46.20 | 63.80 |
+| KNN CAD | 57.99 | 43.41 | 64.81 |
+| Relative Entropy | 54.64 | 47.60 | 58.84 |
+| **kiln `robust`** | **52.59** | **41.02** | **58.34** |
+| Random Cut Forest | 51.72 | 38.36 | 59.75 |
+| **kiln `basic`** | **50.31** | **40.99** | **54.81** |
+| Twitter ADVec | 47.06 | 33.61 | 53.50 |
+| Windowed Gaussian | 39.65 | 20.87 | 47.41 |
+| Etsy Skyline | 35.69 | 27.08 | 44.48 |
+| **kiln `agile`** | **31.34** | **13.05** | **41.12** |
+| random | 16.83 | 5.76 | 25.88 |
+
+A point costs 0.36–0.46 µs (robust; the calibration's sorted window the larger part). `agile`'s
+ranking within files is as good (62.3 each file at its own threshold) but its errors' spread moves as
+its smoothing follows level shifts: next to be studied.
 
 ## 13. Scenarios
 
