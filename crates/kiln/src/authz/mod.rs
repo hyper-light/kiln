@@ -355,7 +355,7 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/cd/**", "runs.read", At::Server),
     any("/api/cd/**", "environments.deploy", At::Server),
     // Observe (docs/observe.md §7): every GET and every query, search and check asked by POST
-    // reads; integrations, clouds and the store's operations manage; the rest writes (dashboards,
+    // reads; integrations, clouds, scrape targets and the store's operations manage; the rest writes (dashboards,
     // monitors, series, logs and events posted). Snapshot files and OTLP are answered before this,
     // on tokens of their own.
     r("GET", "/api/observe/v1/**", "observe.read", At::Server),
@@ -368,6 +368,7 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/observe/v1/monitors/validate", "observe.read", At::Server),
     any("/api/observe/v1/integrations/**", "observe.manage", At::Server),
     any("/api/observe/v1/clouds/**", "observe.manage", At::Server),
+    any("/api/observe/v1/scrapes/**", "observe.manage", At::Server),
     r("POST", "/api/observe/v1/compact", "observe.manage", At::Server),
     r("POST", "/api/observe/v1/verify", "observe.manage", At::Server),
     any("/api/observe/v1/**", "observe.write", At::Server),

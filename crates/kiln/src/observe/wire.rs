@@ -64,6 +64,9 @@ pub enum Msg {
     Verify,
     /// Runner → server: how this machine's replica is doing.
     Status(Status),
+    /// Server → runner: the scrape targets this machine reads (`super::scrape`), all of them each
+    /// time, sent when it connects and when they change.
+    Scrapes { targets: Vec<(String, super::scrape::Target)> },
 }
 
 /// What a write came to, as its sender needs it.
@@ -124,6 +127,8 @@ pub struct Status {
     pub error: Option<String>,
     /// Unix seconds.
     pub at: i64,
+    /// How each scrape target it reads goes.
+    pub scrapes: Vec<(String, super::scrape::State)>,
 }
 
 pub fn encode(msg: &Msg) -> String {

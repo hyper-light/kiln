@@ -182,6 +182,8 @@ enum Input {
     /// Take the full digest, and on the server ask every replica for theirs.
     Verify,
     Verified { at: u64, digest: u64 },
+    /// The server's scrape targets, all of them: each runner is told those it reads.
+    Scrapes(Vec<(String, super::scrape::Target)>),
 }
 
 /// What a node has taken to write and not yet cut into a write, against the batcher's bound: taken
@@ -399,6 +401,12 @@ impl Observe {
         self.admission.spares.give_decoded(d);
     }
 
+    /// The server's scrape targets now: each runner is told those it reads, now and when it
+    /// connects.
+    pub fn set_scrapes(&self, all: Vec<(String, super::scrape::Target)>) {
+        let _ = self.tx.send(Input::Scrapes(all));
+    }
+
     /// Log records of kiln's own (its events): taken up to the bound itself, else refused and
     /// counted as dropped.
     pub fn log(&self, records: Vec<Record>) {
@@ -554,6 +562,8 @@ struct Owner {
     feed: Arc<Feed>,
     start: Instant,
     batcher: Batcher,
+    /// The server's scrape targets (`super::scrape`): each runner is told those it reads.
+    scrapes: Vec<(String, super::scrape::Target)>,
     joiner: Joiner,
     part: u64,
     error: Option<String>,
@@ -619,6 +629,7 @@ impl Owner {
             feed,
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
+            scrapes: Vec::new(),
             joiner: Joiner::default(),
             part: 0,
             error: None,
@@ -804,6 +815,13 @@ impl Owner {
                 self.batcher.samples(&mut d.keys, &d.samples, Instant::now());
                 self.admission.spares.give_decoded(d);
             }
+            Input::Scrapes(all) => {
+                self.scrapes = all;
+                let up: Vec<String> = self.up.iter().cloned().collect();
+                for machine in up {
+                    self.send_scrapes(&machine);
+                }
+            }
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::Staged { generation, msg, ok } => {
                 if self.fetching.as_ref().is_some_and(|f| f.generation == generation) {
@@ -862,6 +880,13 @@ impl Owner {
             Role::Runner { .. } => String::new(),
         };
         self.send(machine, Msg::Member { member, token, group: self.members.group.clone() }, Vec::new());
+        self.send_scrapes(machine);
+    }
+
+    /// Tells `machine` the scrape targets it reads.
+    fn send_scrapes(&mut self, machine: &str) {
+        let targets: Vec<(String, super::scrape::Target)> = self.scrapes.iter().filter(|(_, t)| t.read_by(machine)).cloned().collect();
+        self.send(machine, Msg::Scrapes { targets }, Vec::new());
     }
 
     fn member_of(&self, machine: &str) -> Option<u64> {
@@ -909,7 +934,7 @@ impl Owner {
             Msg::Status(s) => {
                 self.statuses.insert(machine.to_owned(), s);
             }
-            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify => {}
+            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify | Msg::Scrapes { .. } => {}
         }
     }
 
@@ -1017,6 +1042,11 @@ impl Owner {
             }
             Msg::Release => self.close(),
             Msg::Verify => self.digest_full(),
+            Msg::Scrapes { targets } => {
+                if let Some(s) = super::scrape::get() {
+                    s.set(&targets);
+                }
+            }
             Msg::Write { .. } | Msg::Status(_) => {}
         }
     }
@@ -1260,6 +1290,7 @@ impl Owner {
             s.blocks = store.block_count() as u64;
         }
         s.disk_bytes = self.dir_bytes;
+        s.scrapes = super::scrape::get().map(|s| s.states()).unwrap_or_default();
         s
     }
 

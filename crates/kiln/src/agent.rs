@@ -325,6 +325,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             max_series: 0,
         });
         crate::observe::api::set_global(obs.clone());
+        // Prometheus's scrapes of the targets the server says this machine reads.
+        crate::observe::scrape::start(&name, &name, http.clone(), shutdown.clone());
         // This machine's own figures, as the server's are.
         let every = std::env::var("KILN_OBSERVE_HOST_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(crate::observe::host::EVERY, Duration::from_secs);
         crate::observe::host::start(obs.clone(), name.clone(), "runner", every);

@@ -54,6 +54,28 @@ fn dashboards() -> Result<&'static std::sync::Arc<super::dashboards::Dashboards>
 /// The server's cloud integrations, once it started.
 static CLOUDS: OnceLock<std::sync::Arc<super::cloud::Clouds>> = OnceLock::new();
 
+/// The server's scrape targets, once it started.
+static SCRAPES: OnceLock<std::sync::Arc<super::scrape::Targets>> = OnceLock::new();
+
+pub fn set_scrape_targets(t: std::sync::Arc<super::scrape::Targets>) {
+    let _ = SCRAPES.set(t);
+}
+
+fn scrapes() -> Result<&'static std::sync::Arc<super::scrape::Targets>, Fail> {
+    SCRAPES.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "scrape targets are kept by the server"))
+}
+
+/// The targets now, applied: the server's own read from now, each runner told its own.
+fn apply_scrapes(t: &super::scrape::Targets) {
+    let all = t.list();
+    if let Some(s) = super::scrape::get() {
+        s.set(&all);
+    }
+    if let Some(o) = get() {
+        o.set_scrapes(all);
+    }
+}
+
 pub fn set_clouds(c: std::sync::Arc<super::cloud::Clouds>) {
     let _ = CLOUDS.set(c);
 }
@@ -329,6 +351,77 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["integrations", name, "test"]) => {
             monitors()?.test(name).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "sent": true })))
+        }
+        (&Method::GET, ["scrapes"]) => {
+            // Each target, and how each machine that reads it goes: the server's own here, a
+            // runner's from its last status.
+            let mut by_target: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+            for (name, st) in super::scrape::get().map(|s| s.states()).unwrap_or_default() {
+                by_target.entry(name).or_default().push(json!({ "machine": super::scrape::SERVER, "state": st }));
+            }
+            if let Some(o) = get() {
+                for m in o.view().machines {
+                    for (name, st) in m.status.map(|s| s.scrapes).unwrap_or_default() {
+                        by_target.entry(name).or_default().push(json!({ "machine": m.machine, "state": st }));
+                    }
+                }
+            }
+            let list: Vec<Value> = scrapes()?
+                .list()
+                .into_iter()
+                .map(|(name, t)| {
+                    let mut v = t.redacted();
+                    if let Value::Object(o) = &mut v {
+                        o.insert("name".into(), Value::from(name.clone()));
+                        o.insert("machines".into(), Value::from(by_target.remove(&name).unwrap_or_default()));
+                    }
+                    v
+                })
+                .collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "scrapes": list })))
+        }
+        (&Method::PUT, ["scrapes", name]) => {
+            let name = (*name).to_owned();
+            let t: super::scrape::Target = read_json(req.into_body(), QUERY_BODY).await?;
+            let store = scrapes()?;
+            store.put(&name, t).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            apply_scrapes(store);
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::DELETE, ["scrapes", name]) => {
+            let store = scrapes()?;
+            match store.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
+                true => {
+                    apply_scrapes(store);
+                    Ok(srv::status(StatusCode::NO_CONTENT))
+                }
+                false => Err(fail(StatusCode::NOT_FOUND, "no such scrape target")),
+            }
+        }
+        (&Method::POST, ["scrapes", name, "test"]) => {
+            // The target given (its token, if left out, the kept one's), or the kept one, read once
+            // from the server: what it would get, nothing written.
+            let name = (*name).to_owned();
+            let given: Option<super::scrape::Target> = read_json::<Value>(req.into_body(), QUERY_BODY).await.ok().filter(|v| v.as_object().is_some_and(|o| !o.is_empty())).and_then(|v| serde_json::from_value(v).ok());
+            let kept = scrapes()?.get(&name);
+            let mut t = given.or_else(|| kept.clone()).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such scrape target"))?;
+            if t.bearer.is_none() {
+                t.bearer = kept.and_then(|k| k.bearer);
+            }
+            t.check().map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let http = crate::http::client::Client::public().map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let t0 = std::time::Instant::now();
+            let answer = match super::scrape::scrape_once(&http, &t).await {
+                Ok((text, format)) => {
+                    let s = kiln_obs::prom::parse_target(&text, super::clock_ms(), &[("job", name.as_str())], format);
+                    let mut metrics: Vec<String> = s.series.iter().filter_map(|(k, _)| kiln_obs::batch::parse_key(&k.key).ok().map(|k| k.metric.to_owned())).collect();
+                    metrics.sort_unstable();
+                    metrics.dedup();
+                    json!({ "ok": true, "format": if format == kiln_obs::prom::Format::OpenMetrics { "openmetrics" } else { "text" }, "samples": s.samples, "skipped": s.skipped, "series": s.series.len(), "metrics": metrics.len(), "sample": metrics.iter().take(50).collect::<Vec<_>>(), "took_ms": t0.elapsed().as_millis() as u64 })
+                }
+                Err(e) => json!({ "ok": false, "error": format!("{e:#}"), "took_ms": t0.elapsed().as_millis() as u64 }),
+            };
+            Ok(srv::json(StatusCode::OK, &answer))
         }
         (&Method::GET, ["clouds"]) => Ok(srv::json(StatusCode::OK, &json!({ "clouds": clouds()?.list() }))),
         (&Method::PUT, ["clouds", name]) => {

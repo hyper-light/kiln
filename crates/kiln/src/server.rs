@@ -176,6 +176,20 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "cloud integrations did not start: no HTTPS client"),
         }
+        // Prometheus's scrapes: the targets kept here, the server's own read here, each runner told
+        // its own.
+        match crate::http::client::Client::public() {
+            Ok(http) => {
+                let targets = std::sync::Arc::new(crate::observe::scrape::Targets::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key")));
+                let all = targets.list();
+                crate::observe::scrape::start(crate::observe::scrape::SERVER, &crate::os::hostname(), std::sync::Arc::new(http), shutdown.clone()).set(&all);
+                if let Some(o) = crate::observe::api::get() {
+                    o.set_scrapes(all);
+                }
+                crate::observe::api::set_scrape_targets(targets);
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "scrapes did not start: no HTTPS client"),
+        }
         match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {
             Ok(t) => crate::observe::api::set_ingest_token(t),
             Err(e) => tracing::warn!(error = %e, "observe's ingest token could not be made: OTLP takes the admin token alone"),

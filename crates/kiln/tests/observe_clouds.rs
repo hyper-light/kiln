@@ -3,7 +3,8 @@
 //! service), Google (OAuth, Cloud Monitoring, the metadata server) and Azure (Entra, Resource
 //! Manager, the VM's metadata service). Each checks what the real one checks (a signature over the
 //! request, a signed assertion, a secret, a token) and answers with figures that are a function of
-//! their time, so what kiln stores can be checked point by point.
+//! their time, so what kiln stores can be checked point by point. And Prometheus's scrapes: an
+//! exporter served here, read by the server and a runner as its targets say.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 mod common;
@@ -976,5 +977,119 @@ fn the_server_s_own_credentials_are_found_where_it_runs() -> anyhow::Result<()> 
     expect(&f, "avg:azure.compute_virtualmachines.percentage_cpu{name:vm-1}", from, to, |t| vm_cpu("vm-1", t))?;
     anyhow::ensure!(azure_mock.count(|r| r.path == "/metadata/identity/oauth2/token") >= 1);
     anyhow::ensure!(azure_mock.count(|r| r.path.contains("networkSecurityGroups")) == 0, "only the types asked are listed, by the list's filter");
+    Ok(())
+}
+
+/// Prometheus's scrapes (docs/observe.md §8, §13): an exporter served here, a counter climbing a
+/// hundred a second and a gauge; a target the server reads, one the runner reads, one every
+/// machine reads and one that asks for a token. The samples arrive tagged `job` and `instance` (and
+/// the machine's `host` where every machine reads its own), a sample's own `job` kept as
+/// `exported_job`, each target's `up` 1, read where its target says; the counter as a rate is the
+/// hundred it climbs by; the exporter failing makes `up` 0 and is said once, and its recovery too;
+/// a target deleted is read no more; the token is sent, and never shown.
+#[test]
+#[ignore = "starts a kiln server and a runner as processes, and an exporter for them"]
+fn a_prometheus_exporter_is_read_where_its_target_says_and_tagged_as_prometheus_tags_it() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let failing = Arc::new(AtomicBool::new(false));
+    let born = Instant::now();
+    let exporter = {
+        let failing = failing.clone();
+        Service::start(move |r: &Req| {
+            if failing.load(Ordering::Relaxed) {
+                return text(500, "down");
+            }
+            if r.path == "/secure" && r.header("authorization") != Some("Bearer t0ken") {
+                return text(401, "no token");
+            }
+            let climbed = (born.elapsed().as_secs_f64() * 100.0).floor();
+            let body = format!("# HELP e2e_requests_total Requests.\n# TYPE e2e_requests_total counter\ne2e_requests_total{{code=\"200\",job=\"theirs\"}} {climbed}\n# TYPE e2e_temperature gauge\ne2e_temperature 21.5\n");
+            Resp { status: 200, headers: vec![("content-type".into(), "text/plain; version=0.0.4; charset=utf-8".into())], body: body.into_bytes() }
+        })?
+    };
+    let mut f = Fleet::new()?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| common::caught_up(s, &["r1"]))?;
+    let url = |path: &str| format!("{}{path}", exporter.url());
+    // Tested first: what it would read.
+    let tested = f.call("POST", "/api/observe/v1/scrapes/srv/test", Some(&json!({ "url": url("/metrics"), "every_s": 1, "timeout_s": 1 })))?;
+    anyhow::ensure!(tested["ok"] == true && tested["samples"] == 2 && tested["sample"].as_array().is_some_and(|m| m.iter().any(|n| n == "e2e_requests_total")), "{tested:#}");
+    for (name, target) in [
+        ("srv", json!({ "url": url("/metrics"), "every_s": 1, "timeout_s": 1, "tags": ["env:e2e"] })),
+        ("run", json!({ "url": url("/metrics?r=1"), "every_s": 1, "timeout_s": 1, "on": "r1" })),
+        ("all", json!({ "url": url("/metrics?a=1"), "every_s": 1, "timeout_s": 1, "on": "*" })),
+        ("sec", json!({ "url": url("/secure"), "every_s": 1, "timeout_s": 1, "bearer": "t0ken" })),
+    ] {
+        let (code, body) = f.request("PUT", &format!("/api/observe/v1/scrapes/{name}"), Some(&target))?;
+        anyhow::ensure!(code == 204, "{name}: {code} {}", String::from_utf8_lossy(&body));
+    }
+    let t0 = now_ms();
+    // Each target up, read where it says: by job; every machine's by host; the runner's own by r1.
+    let start = Instant::now();
+    loop {
+        let up = read(&f, "max:up{*} by {job,host}", t0 - 60_000, now_ms() + 60_000)?;
+        let ones: Vec<(String, String)> = up.iter().filter(|(_, v)| v.values().last().copied() == Some(1.0)).map(|(t, _)| (t.get("job").cloned().unwrap_or_default(), t.get("host").cloned().unwrap_or_default())).collect();
+        let jobs = |j: &str| ones.iter().filter(|(job, _)| job == j).count();
+        if jobs("srv") == 1 && jobs("run") == 1 && jobs("sec") == 1 && jobs("all") == 2 && ones.iter().any(|(j, h)| j == "all" && h == "r1") {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "up by job and host: {up:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Who reads what, as each machine reports it (a runner's every 10 s, with its status).
+    let start = Instant::now();
+    loop {
+        let listed = f.call("GET", "/api/observe/v1/scrapes", None)?;
+        anyhow::ensure!(!listed.to_string().contains("t0ken"), "a token shown: {listed}");
+        let entry = |name: &str| listed["scrapes"].as_array().and_then(|l| l.iter().find(|t| t["name"] == name).cloned()).unwrap_or(Value::Null);
+        anyhow::ensure!(entry("sec")["bearer"] == true, "{listed:#}");
+        let machines = |name: &str| -> Vec<String> {
+            let mut m: Vec<String> = entry(name)["machines"].as_array().into_iter().flatten().filter(|m| m["state"]["up"] == true).filter_map(|m| m["machine"].as_str().map(str::to_owned)).collect();
+            m.sort();
+            m
+        };
+        if machines("run") == ["r1"] && machines("srv") == ["server"] && machines("all") == ["r1", "server"] {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(40), "who reads what: {listed:#}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Tagged as Prometheus tags them: the target's `job` over the sample's, kept as `exported_job`.
+    let t1 = now_ms();
+    std::thread::sleep(Duration::from_secs(25));
+    let rows = read(&f, "sum:e2e_requests_total{job:srv,env:e2e} by {exported_job,instance}", t1 - 60_000, now_ms() + 60_000)?;
+    let [(tags, _)] = rows.as_slice() else { anyhow::bail!("one series: {rows:?}") };
+    anyhow::ensure!(tags.get("exported_job").map(String::as_str) == Some("theirs") && tags.get("instance").is_some_and(|i| i.starts_with("127.0.0.1:")), "{tags:?}");
+    // A counter read as a rate: the hundred a second it climbs.
+    let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:e2e_requests_total{job:srv}", "from": t1, "to": now_ms() - 2_000, "step": 5_000 })))?;
+    let rates: Vec<f64> = a["series"][0]["values"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+    // The whole buckets: not the first nor the last, which the range cuts.
+    let whole = rates.get(1..rates.len().saturating_sub(1)).unwrap_or(&[]);
+    anyhow::ensure!(whole.len() >= 2 && whole.iter().all(|r| (90.0..=110.0).contains(r)), "the counter's rate: {rates:?}");
+    // The exporter down: `up` 0, said once; up again, said too.
+    failing.store(true, Ordering::Relaxed);
+    let start = Instant::now();
+    loop {
+        // A second's grid: the newest scrape's `up`.
+        let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "max:up{job:srv}", "from": now_ms() - 10_000, "to": now_ms(), "step": 1_000 })))?;
+        let newest = a["series"][0]["values"].as_array().into_iter().flatten().rev().find_map(Value::as_f64);
+        if newest == Some(0.0) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "up never 0: {a}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let down = events(&f, "source:kiln.event @event.type:scrape @target:srv @result:failing", t0, 1)?;
+    anyhow::ensure!(down.len() == 1 && down[0].contains("scrape target srv is down"), "{down:?}");
+    failing.store(false, Ordering::Relaxed);
+    let back = events(&f, "source:kiln.event @event.type:scrape @target:srv @result:recovered", t0, 1)?;
+    anyhow::ensure!(back.len() == 1 && back[0].contains("is up again"), "{back:?}");
+    // Deleted: read no more, by the runner either.
+    anyhow::ensure!(f.request("DELETE", "/api/observe/v1/scrapes/run", None)?.0 == 204);
+    std::thread::sleep(Duration::from_secs(3));
+    let before = exporter.count(|r| r.query.contains_key("r"));
+    std::thread::sleep(Duration::from_secs(4));
+    anyhow::ensure!(exporter.count(|r| r.query.contains_key("r")) == before, "the runner reads a target gone");
+    anyhow::ensure!(f.request("DELETE", "/api/observe/v1/scrapes/run", None)?.0 == 404);
     Ok(())
 }
