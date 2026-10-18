@@ -20,6 +20,7 @@ import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProbl
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
+import { handlePlaces } from "./places.ts";
 import { handleLongSession, setLongEmit } from "./conversation.ts";
 import {
   AUTOJOIN,
@@ -1560,6 +1561,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
     if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
 
     return err(res, 404, `no route for ${m} ${p}`);

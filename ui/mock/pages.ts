@@ -654,7 +654,7 @@ const TAILSCALE: TailscaleView = {
   replaced: {},
 };
 
-function syncView(ctx: PagesCtx): SyncView {
+export function syncView(ctx: Pick<PagesCtx, "agents">): SyncView {
   const names = ctx
     .agents()
     .filter((a) => !a.ephemeral)

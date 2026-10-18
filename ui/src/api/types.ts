@@ -361,7 +361,9 @@ export type ServerEvent =
   /** Apps' statuses changed (batched, at most every 300 ms). */
   | { type: "cd_apps"; apps: CdStatus[] }
   /** An app was deleted. */
-  | { type: "cd_app_deleted"; app: string };
+  | { type: "cd_app_deleted"; app: string }
+  /** What machines hold, or a task moving a repository between them, changed: refetch GET /api/places. */
+  | { type: "places" };
 
 /* ---------------------------- front doors (Runners → Domain & HTTPS) ---------------------------- */
 
@@ -1146,6 +1148,10 @@ export interface SyncCopyStatus {
   skipped: SyncSkipped[];
   error: string | null;
   at: number;
+  /** It has looked at its folder since it opened. */
+  looked?: boolean;
+  /** It waits to take the group's files (a folder kiln just cloned). */
+  adopting?: boolean;
 }
 
 export type SyncCopyState = "in step" | "catching up" | "fetching" | "sending" | "starting" | "offline" | "error";
@@ -1176,6 +1182,8 @@ export interface SyncRepo {
   conflicts: SyncConflict[];
   copies: SyncCopy[];
   error: string | null;
+  /** Synced only while a move is under way (that task's batch). */
+  transient?: string | null;
 }
 
 export interface SyncView {
@@ -1184,6 +1192,114 @@ export interface SyncView {
 }
 
 export type SyncKeep = "name" | "copy" | "both";
+
+/* ---------------------------- repositories on machines (GET /api/places, docs/sync.md) ---------------------------- */
+
+/** What git says of a folder, as its machine last looked. */
+export interface GitState {
+  path: string;
+  /** Its remote, without credentials. */
+  origin: string | null;
+  /** null: a detached HEAD. */
+  branch: string | null;
+  /** null: no commit yet. */
+  head: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  /** Tracked files changed and not committed. */
+  changed: number;
+  /** When git last did something there (unix seconds). */
+  active: number;
+  /** kiln cloned it there. */
+  kiln: boolean;
+}
+
+/** `copy`: kept in step by sync; `clone`: kiln cloned it there; `found`: it was there. */
+export type PlaceKind = "copy" | "clone" | "found";
+
+/** One place a repository is: a folder on a machine. */
+export interface Place {
+  machine: string;
+  path: string;
+  kind: PlaceKind;
+  git: GitState | null;
+  copy: { repo: string; member: number; state: SyncCopyState; moving: boolean } | null;
+  online: boolean;
+}
+
+/** A repository and the places it is. */
+export interface RepoRow {
+  /** Its remote without scheme, user or `.git` (`github.com/owner/name`); `here:<machine>:<path>` for one with no remote. */
+  key: string;
+  name: string;
+  /** A remote to clone it from, when one is known. */
+  origin: string | null;
+  /** The id of the repository kiln builds, and of the synced repo, that it is. */
+  built: string | null;
+  synced: string | null;
+  places: Place[];
+}
+
+export interface PlaceMachine {
+  name: string;
+  os: string;
+  arch: string;
+  labels: string[];
+  connected: boolean;
+  /** Where `~` is on it, once it has said. */
+  home: string | null;
+  /** When it last said what it holds (unix seconds). */
+  looked: number | null;
+  error: string | null;
+  /** Its runner clones, bundles and moves repositories, and syncs. */
+  can_clone: boolean;
+  can_sync: boolean;
+}
+
+export type TaskKind = "clone" | "sync" | "move" | "remove";
+
+/** Where a repository's commits come from. */
+export type TaskSource = { kind: "kiln"; repo: string } | { kind: "machine"; machine: string; path: string } | { kind: "url"; url: string };
+
+/** One machine's part of a clone, sync, move or removal. */
+export interface PlaceTask {
+  id: string;
+  batch: string;
+  kind: TaskKind;
+  key: string;
+  name: string;
+  from: TaskSource;
+  branch?: string;
+  machine: string;
+  path: string;
+  delete: boolean;
+  /** `queued`, `bundling`, `fetching`, `cloning`, `joining`, `catching up`, `leaving`, `deleting`, `done`, `failed`. */
+  state: string;
+  detail: string;
+  error?: string;
+  notes: { at: number; text: string }[];
+  created: number;
+  updated: number;
+  synced?: string;
+  head?: string;
+}
+
+export interface PlacesView {
+  repos: RepoRow[];
+  machines: PlaceMachine[];
+  /** Newest first. */
+  tasks: PlaceTask[];
+}
+
+/** What `POST /api/places/:kind` takes. */
+export interface PlaceAsk {
+  key: string;
+  from?: TaskSource;
+  branch?: string;
+  to?: { machine: string; path: string }[];
+  delete?: boolean;
+}
 
 /** What to plan (`/api/cd/plans`): one commit, a stack (`head`, from where it leaves trunk or
  * from `base`), or a pull request. */
