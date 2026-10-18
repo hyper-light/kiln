@@ -380,6 +380,9 @@ pub struct AppConfig {
     /// Create the destination namespace (`CreateNamespace=true`), with these labels and
     /// annotations.
     pub create_namespace: Option<(Vec<(String, String)>, Vec<(String, String)>)>,
+    /// They are its managed metadata (`managedNamespaceMetadata`), applied at every sync; without
+    /// it the namespace is only made when missing, as Argo CD does.
+    pub manage_namespace: bool,
 }
 
 impl AppConfig {
@@ -397,6 +400,7 @@ impl AppConfig {
             tracking_name: None,
             read_only: false,
             create_namespace: None,
+            manage_namespace: false,
         }
     }
 

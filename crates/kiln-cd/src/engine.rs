@@ -494,6 +494,10 @@ struct Res {
     why: Option<Box<str>>,
     /// It differs only by tracking marks (kiln's or Argo CD's): a sync changes nothing else.
     marks: bool,
+    /// The namespace its app makes (`CreateNamespace=true`), not one of its objects: made by a
+    /// sync when it is missing, its managed metadata applied when the app has some, and never
+    /// compared, counted, tracked, nor anyone's to share or prune, as Argo CD makes it.
+    made: bool,
 }
 
 /// What a resource adds to its app's counts.
@@ -1076,7 +1080,7 @@ impl Engine {
                 self.remove_app(&id, None);
             } else {
                 let changed = self.app(a).is_some_and(|app| {
-                    app.cfg.ignore != cfg.ignore || app.cfg.namespace != cfg.namespace || app.cfg.create_namespace != cfg.create_namespace
+                    app.cfg.ignore != cfg.ignore || app.cfg.namespace != cfg.namespace || app.cfg.create_namespace != cfg.create_namespace || app.cfg.manage_namespace != cfg.manage_namespace
                 });
                 let old_name: Option<Str> = self.app(a).map(|app| app.cfg.tracked_as().into());
                 if let Some(old) = old_name {
@@ -1369,8 +1373,9 @@ impl Engine {
             let (changed, gained) = {
                 let Some(res) = self.res_mut(c, ix) else { continue };
                 let before = res.desired.as_ref().map(|(r, i)| r.objects.get(*i as usize).map(|o| o.hash));
-                let gained = res.desired.is_none();
+                let gained = res.desired.is_none() || res.made;
                 res.desired = Some((render.clone(), i as u32));
+                res.made = false;
                 (made || before != Some(Some(r.hash)), gained)
             };
             if made {
@@ -1391,6 +1396,7 @@ impl Engine {
             keep.insert(ix);
             if let Some(res) = self.res_mut(c, ix) {
                 res.desired = Some((nr, 0));
+                res.made = true;
             }
             if made {
                 self.share_live(c, &key, ix);
@@ -1403,7 +1409,10 @@ impl Engine {
         }
         for ix in old {
             if !keep.contains(&ix) {
-                let dropped = self.res_mut(c, ix).and_then(|res| res.desired.take().map(|_| res.key.clone()));
+                let dropped = self.res_mut(c, ix).and_then(|res| {
+                    res.made = false;
+                    res.desired.take().map(|_| res.key.clone())
+                });
                 self.recompare(c, ix);
                 self.gc_res(c, ix);
                 // Whether another app may prune it now depends on nobody deploying it.
@@ -1472,7 +1481,7 @@ impl Engine {
 
     /// Another app that deploys an object (has it in its render), if one does.
     fn other_deployer(&self, c: ClusterIx, key: &ResKey, a: AppIx) -> Option<Str> {
-        let res = self.slots(c, key).iter().filter_map(|ix| self.res(c, ix)).find(|r| r.app != Some(a) && r.desired.is_some())?;
+        let res = self.slots(c, key).iter().filter_map(|ix| self.res(c, ix)).find(|r| r.app != Some(a) && r.desired.is_some() && !r.made)?;
         res.app.and_then(|o| self.app(o)).map(|o| o.cfg.id.clone())
     }
 
@@ -1520,7 +1529,7 @@ impl Engine {
         }
         let Some(cl) = self.clusters.get_mut(c as usize) else { return (0, false) };
         let head = cl.index.get(&key).copied();
-        let res = Res { key: key.clone(), app: Some(a), sibling: head, desired: None, live: None, state: ResState::None, counted: None, why: None, marks: false };
+        let res = Res { key: key.clone(), app: Some(a), sibling: head, desired: None, live: None, state: ResState::None, counted: None, why: None, marks: false, made: false };
         let ix = match cl.free.pop() {
             Some(ix) => {
                 if let Some(slot) = cl.res.get_mut(ix as usize) {
@@ -1819,6 +1828,10 @@ impl Engine {
 
     fn classify(&mut self, c: ClusterIx, ix: ResIx) -> (ResState, Option<Box<str>>) {
         let Some(res) = self.res(c, ix) else { return (ResState::None, None) };
+        // The namespace its app makes is no object of the app's (Argo CD's): nothing to compare.
+        if res.made {
+            return (ResState::None, None);
+        }
         let Some(a) = res.app else { return (ResState::None, None) };
         let Some(app) = self.app(a) else { return (ResState::None, None) };
         match (&res.desired, &res.live) {
@@ -2014,7 +2027,7 @@ impl Engine {
                     .slots(app.cluster, &r.key)
                     .iter()
                     .filter_map(|s| self.res(app.cluster, s))
-                    .filter(|s| s.app != r.app && s.desired.is_some())
+                    .filter(|s| s.app != r.app && s.desired.is_some() && !s.made)
                     .filter_map(|s| s.app.and_then(|x| self.app(x)).map(|x| x.cfg.id.clone()))
                     .collect(),
                 marks_only: r.marks,
@@ -2202,10 +2215,15 @@ impl Engine {
             if automatic && shared_with_other(res, a) {
                 continue;
             }
+            // The namespace it makes: made when missing, its managed metadata applied each sync,
+            // and otherwise left as it is (Argo CD's).
+            if res.made && res.live.is_some() && !app.cfg.manage_namespace {
+                continue;
+            }
             keys.push(res.key.clone());
             desired.push(self.desired_object(app, res));
             live.push(res.live.as_ref().and_then(|l| l.blob.decode().ok()));
-            differs.push(matches!(res.state, ResState::OutOfSync | ResState::Missing | ResState::Prune));
+            differs.push(res.made || matches!(res.state, ResState::OutOfSync | ResState::Missing | ResState::Prune));
             ixs.push(Some(*ix));
         }
         for &h in &app.hooks {
@@ -2319,7 +2337,7 @@ impl Engine {
             .resources
             .iter()
             .filter_map(|ix| self.res(app.cluster, *ix))
-            .filter(|r| r.desired.is_some())
+            .filter(|r| r.desired.is_some() && !r.made)
             .filter_map(|r| Some((&r.key, r.live.as_ref()?.tracked.filter(|t| *t != a)?)))
             .collect();
         shared.sort_by(|x, y| x.0.cmp(y.0));
@@ -2398,6 +2416,9 @@ impl Engine {
         let t = if fail_phase { op.on_fail.get(i)? } else { op.tasks.get(i)? };
         if let Some(ix) = op.res.get(i).copied().flatten().filter(|_| !fail_phase) {
             let res = self.res(app.cluster, ix)?;
+            if res.made {
+                return made_namespace(res);
+            }
             return self.desired_object(app, res);
         }
         // A hook: find it in the render by key.
@@ -3121,7 +3142,24 @@ fn strip_marks(v: &mut Value) {
 
 /// Whether a resource an app deploys carries another app's tracking.
 fn shared_with_other(res: &Res, a: AppIx) -> bool {
-    res.desired.is_some() && res.live.as_ref().is_some_and(|l| l.tracked.is_some_and(|t| t != a))
+    !res.made && res.desired.is_some() && res.live.as_ref().is_some_and(|l| l.tracked.is_some_and(|t| t != a))
+}
+
+/// The namespace an app makes, as the cluster gets it: its managed metadata, without the wave
+/// and options that order the sync, and without tracking (Argo CD tracks none on it either).
+fn made_namespace(res: &Res) -> Option<Value> {
+    let (render, i) = res.desired.as_ref()?;
+    let mut v = render.objects.get(*i as usize)?.blob.decode().ok()?;
+    if let Some(ann) = v.pointer_mut("/metadata/annotations").and_then(Value::as_object_mut) {
+        ann.remove(sync::SYNC_OPTIONS);
+        ann.remove(sync::SYNC_WAVE);
+        if ann.is_empty()
+            && let Some(meta) = v.get_mut("metadata").and_then(Value::as_object_mut)
+        {
+            meta.remove("annotations");
+        }
+    }
+    Some(v)
 }
 
 fn res_counted_set(res: &mut Res, v: Option<Counted>) {

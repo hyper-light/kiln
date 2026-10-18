@@ -133,6 +133,7 @@ impl Kept {
                 hash: obj::hash_value(&v),
                 object: v,
                 hook: false,
+                made: false,
             })
             .collect()
     }
