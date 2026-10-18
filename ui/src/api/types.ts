@@ -640,7 +640,7 @@ export interface RunnerUpdate {
   standing?: "current" | "behind" | "unknown" | "branch" | "local" | null;
   /** What it does next to reach the newest kiln, as the end of a sentence about it. */
   next?: string | null;
-  how?: "download" | "build" | "wait" | "upgrading" | "left" | null;
+  how?: "download" | "build" | "wait" | "upgrading" | "left" | "off" | null;
   /** Its kiln checkout, as it reports it. */
   checkout?: string | null;
 }

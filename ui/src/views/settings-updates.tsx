@@ -180,7 +180,8 @@ export function UpdatesPanel() {
 
   const setPolicy = async (names: string[] | "all", policy: UpdatePolicy) => {
     try {
-      if (names !== "all" && names.length === 1) await api.setRunnerPolicy(names[0], policy);
+      const [one] = names === "all" ? [] : names;
+      if (names !== "all" && names.length === 1 && one) await api.setRunnerPolicy(one, policy);
       else await api.setPolicies(policy, names);
     } catch (e) {
       toast.error("Couldn't change the update policy", errorMessage(e));
