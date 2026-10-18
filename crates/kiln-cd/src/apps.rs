@@ -257,6 +257,7 @@ impl AppDef {
         if self.sync.options.create_namespace == Some(true) {
             let m = self.managed_namespace.clone().unwrap_or_default();
             c.create_namespace = Some((m.labels.into_iter().collect(), m.annotations.into_iter().collect()));
+            c.manage_namespace = self.managed_namespace.is_some();
         }
         c
     }

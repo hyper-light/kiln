@@ -160,6 +160,9 @@ pub struct Registry {
     /// What runners' feeds send into it (`crate::convo::feed`), and what to answer them.
     pub feed: Option<crate::convo::feed::Intake>,
     feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
+    /// The runners that keep a copy of it (`crate::convo::mirror`), and what to send them.
+    pub copies: Option<Arc<crate::convo::mirror::Mirrors>>,
+    copies_out: Option<async_channel::Receiver<(hyper_transport::PeerId, String, Vec<u8>)>>,
     local_rx: async_channel::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
@@ -209,16 +212,28 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
 
 impl Registry {
     pub fn new(dir: std::path::PathBuf) -> Self {
+        Self::with(dir, &crate::config::Conversations::default())
+    }
+
+    /// The registry, its store in `dir`, its mirrors as `conversations` says.
+    pub fn with(dir: std::path::PathBuf, conversations: &crate::config::Conversations) -> Self {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = crate::convo::open(&dir);
         // Runners that keep a store send it here; the server keeps their sessions from that.
-        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone())) {
+        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine)) {
             Some(Ok((i, o))) => (Some(i), Some(o)),
             Some(Err(e)) => {
                 tracing::warn!(error = %format!("{e:#}"), "runners' conversation stores won't reach the server's");
                 (None, None)
+            }
+            None => (None, None),
+        };
+        let (copies, copies_out) = match convo.clone().filter(|_| conversations.mirrors > 0) {
+            Some(st) => {
+                let (m, out) = crate::convo::mirror::Mirrors::start(st, conversations.mirrors, conversations.mirror_on.clone(), dir.join("mirrors.json"));
+                (Some(m), Some(out))
             }
             None => (None, None),
         };
@@ -231,6 +246,8 @@ impl Registry {
             convo,
             feed,
             feed_out,
+            copies,
+            copies_out,
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
@@ -404,6 +421,17 @@ impl Registry {
                 if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || local.record_sources()) {
                     tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
                 }
+            }
+            // What the server sends its mirrors, on the feed's lane.
+            if let Some(out) = hub.harness.copies_out.clone() {
+                let h = hub.clone();
+                crate::rt::spawn(async move {
+                    while let Ok((peer, json, data)) = out.recv().await {
+                        if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json, data }) {
+                            h.net.send(peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
+                        }
+                    }
+                });
             }
             // What the server answers runners' feeds, on the feed's lane.
             if let Some(out) = hub.harness.feed_out.clone() {
