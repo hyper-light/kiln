@@ -1711,9 +1711,24 @@ impl Leg {
     /// doesn't.
     async fn job_outputs(&self, st: &State) {
         let a = &self.a;
-        if a.outputs.is_empty() && a.exports_env.is_empty() && !(a.run_env && !st.run_env.is_empty()) {
+        if a.outputs.is_empty() && a.exports_env.is_empty() && !(a.run_env && !st.run_env.is_empty()) && a.environment_url.is_none() {
             return;
         }
+        // `environment.url` (W15-R04): its deployment's URL, as the steps left things.
+        let environment_url = match &a.environment_url {
+            Some(t) => match st.render(t, Site::JobOutputs, "environment.url") {
+                Ok(v) if st.masker.mask(&v) != v => {
+                    self.annotate(0, "warning", "Skip the environment's url since it may contain secret.").await;
+                    None
+                }
+                Ok(v) => Some(v).filter(|v| !v.is_empty()),
+                Err(e) => {
+                    self.annotate(0, "warning", &e).await;
+                    None
+                }
+            },
+            None => None,
+        };
         let (mut outputs, mut json_outputs, mut secret_values) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         for (k, t) in &a.outputs {
             let what = format!("outputs.{k}");
@@ -1758,7 +1773,7 @@ impl Leg {
         }
         let run_env = if a.run_env { st.run_env.iter().filter(|(_, v)| st.masker.mask(v) == **v).cloned().collect() } else { Vec::new() };
         let secret_outputs = secret_values.keys().cloned().collect();
-        self.event(&JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values }).await;
+        self.event(&JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values, environment_url }).await;
     }
 }
 
@@ -2475,7 +2490,7 @@ jobs:
         assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
         assert!(logs.get(&1).is_some_and(|l| l.contains("typed 1.2.3 3")), "the kiln dialect sees typed outputs: {logs:?}");
         let outs = events.iter().find_map(|e| match e {
-            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values } => Some((outputs.clone(), json_outputs.clone(), env.clone(), run_env.clone(), secret_outputs.clone(), secret_values.clone())),
+            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values, .. } => Some((outputs.clone(), json_outputs.clone(), env.clone(), run_env.clone(), secret_outputs.clone(), secret_values.clone())),
             _ => None,
         });
         let Some((outputs, json_outputs, env, run_env, secret_outputs, secret_values)) = outs else { anyhow::bail!("no job outputs") };

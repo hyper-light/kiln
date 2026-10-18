@@ -239,6 +239,9 @@ export const ci = {
   summaries: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<{ summaries: CiSummary[] }>("GET", `/api/ci/runs/${enc(id)}/summary${at(attempt)}`, undefined, { signal }),
   artifacts: (id: string, signal?: AbortSignal) => request<{ artifacts: CiArtifact[] }>("GET", `/api/ci/runs/${enc(id)}/artifacts`, undefined, { signal }),
   rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean) => request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug }),
+  /** A review of the run's deployments waiting on their environments (W15-R04). */
+  approve: (id: string, environments: string[], state: "approved" | "rejected", comment: string) =>
+    request<{ run: string; environments: string[]; state: string }>("POST", `/api/ci/runs/${enc(id)}/approve`, { environments, state, comment }),
   cancel: (id: string) => request<void>("POST", `/api/ci/runs/${enc(id)}/cancel`, {}),
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
   validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
@@ -277,6 +280,9 @@ export function waitSentence(w: unknown): string | null {
     holders?: string[];
     limit?: number;
     at?: number;
+    environment?: string;
+    reviewers?: string[];
+    until?: number | null;
   };
   const list = (xs?: string[]) => (xs && xs.length ? `: ${xs.join(", ")}` : "");
   switch (o.reason) {
@@ -296,7 +302,18 @@ export function waitSentence(w: unknown): string | null {
       return "Waiting to run alone on a runner.";
     case "retry":
       return `Retrying at ${o.at ? new Date(o.at * 1000).toLocaleTimeString() : "a moment"}.`;
+    case "approval":
+      return `Waiting for a review to deploy to ${o.environment ?? "its environment"}${o.reviewers?.length ? ` (${o.reviewers.join(", ")})` : ""}${o.until ? `, and until ${new Date(o.until * 1000).toLocaleTimeString()}` : ""}.`;
+    case "wait-timer":
+      return `Waiting until ${o.until ? new Date(o.until * 1000).toLocaleTimeString() : "its wait timer ends"} to deploy to ${o.environment ?? "its environment"}.`;
     default:
       return o.reason ? o.reason.replace(/-/g, " ") : null;
   }
+}
+
+/** The environment a leg waits for a review to deploy to, if it does. */
+export function reviewOf(w: unknown): string | null {
+  if (!w || typeof w !== "object") return null;
+  const o = w as { reason?: string; environment?: string; reviewers?: string[] };
+  return o.reason === "approval" && o.environment && (o.reviewers?.length ?? 0) > 0 ? o.environment : null;
 }

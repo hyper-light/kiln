@@ -8,7 +8,7 @@
 //!   - the repository's reads from the server's mirror ([`repos`]): repository, commits,
 //!     branches, refs, contents, tarballs and zipballs, compare;
 //!   - what jobs record ([`records`]): commit statuses, check runs, releases and their assets,
-//!     dependency snapshots;
+//!     dependency snapshots, deployments and their statuses (and the environments they go to);
 //!   - `/user` and `/rate_limit`.
 //! - Anything else answers 501 with `{"message": "not implemented by kiln: …"}`, and the leg gets
 //!   a warning naming the route, so gaps are visible and get filled.
@@ -74,6 +74,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::DELETE, ["repos", _, _, "actions", ..]) | (&Method::POST, ["repos", _, _, "actions", "workflows", ..]) => Some(("actions", Level::Write)),
         (&Method::POST, ["repos", _, _, "dispatches"]) => Some(("contents", Level::Write)),
         (&Method::POST, ["repos", _, _, "dependency-graph", "snapshots"]) => Some(("contents", Level::Write)),
+        (&Method::GET, ["repos", _, _, "deployments" | "environments", ..]) => Some(("deployments", Level::Read)),
+        (&Method::POST, ["repos", _, _, "deployments", ..]) => Some(("deployments", Level::Write)),
         _ => None,
     };
     if let Some((scope, level)) = need
@@ -113,6 +115,13 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::DELETE, ["releases", "assets", id]) => records::delete(&s, true, id).await,
             (&Method::DELETE, ["releases", id]) => records::delete(&s, false, id).await,
             (&Method::POST, ["dependency-graph", "snapshots"]) => records::dependency_snapshot(&s, &body(req).await?).await,
+            (&Method::GET, ["deployments"]) => records::deployments(&s, None, &q).await,
+            (&Method::GET, ["deployments", id]) => records::deployments(&s, Some(id), &q).await,
+            (&Method::POST, ["deployments"]) => records::create_deployment(&s, &body(req).await?).await,
+            (&Method::GET, ["deployments", id, "statuses"]) => records::deployment_statuses(&s, id, None).await,
+            (&Method::POST, ["deployments", id, "statuses"]) => records::deployment_statuses(&s, id, Some(&body(req).await?)).await,
+            (&Method::GET, ["environments"]) => records::environments(&s, None).await,
+            (&Method::GET, ["environments", name]) => records::environments(&s, Some(name)).await,
             _ => not_implemented(hub, &claims, &method, &format!("/api/v3/{}", rest.join("/"))).await,
         };
     }

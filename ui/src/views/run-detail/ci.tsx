@@ -2,9 +2,9 @@
  * leaves behind (summaries, annotations, artifacts, the actions it pinned). */
 import * as React from "react";
 import { RotateCcw, Square } from "lucide-react";
-import { ci, waitSentence, type CiAnnotation, type CiRunDetail, type RerunMode } from "@/api/ci";
+import { ci, reviewOf, waitSentence, type CiAnnotation, type CiRunDetail, type RerunMode } from "@/api/ci";
 import { Button } from "@/components/ui/button";
-import { Confirm, Panel, SelectField } from "@/components/ui/misc";
+import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { formatBytes } from "@/lib/format";
@@ -74,6 +74,7 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
   if (active) {
     return (
       <div className="flex flex-col items-start gap-3 md:items-end">
+        <DeployReview detail={detail} />
         <Button variant="danger" disabled={busy} aria-expanded={confirm} onClick={() => setConfirm(!confirm)}>
           <Square /> Cancel
         </Button>
@@ -113,6 +114,48 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
         <RotateCcw /> Rerun
       </Button>
     </div>
+  );
+}
+
+/** The deployments a run waits on a review for, decided in place in one step (W15-R04). */
+function DeployReview({ detail }: { detail: CiRunDetail }) {
+  const { run } = detail;
+  const envs = [...new Set(detail.legs.map((l) => reviewOf(l.wait_reason)).filter((e): e is string => !!e))];
+  const [comment, setComment] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  if (envs.length === 0) return null;
+  const decide = async (state: "approved" | "rejected") => {
+    setBusy(true);
+    try {
+      await ci.approve(run.id, envs, state, comment);
+      toast({ title: state === "approved" ? `Approved: deploying to ${envs.join(", ")}` : "Deployment rejected", tone: "info" });
+      invalidate(`run/${run.id}`);
+      invalidate(`ci-run/${run.id}`);
+    } catch (e) {
+      toast.error("Review failed", errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const label = `Review the deployment to ${envs.join(", ")}`;
+  return (
+    <Confirm
+      label={label}
+      className="w-full md:w-96"
+      actions={
+        <>
+          <Button size="xs" variant="primary" disabled={busy} onClick={() => decide("approved")}>
+            Approve and deploy
+          </Button>
+          <Button size="xs" variant="ghost" disabled={busy} onClick={() => decide("rejected")}>
+            Reject
+          </Button>
+        </>
+      }
+    >
+      <p className="font-medium text-[#e4e5e7]">{`Waiting for a review to deploy to ${envs.join(", ")}`}</p>
+      <TextField label="Comment" placeholder="Optional" value={comment} onChange={(e) => setComment(e.target.value)} />
+    </Confirm>
   );
 }
 

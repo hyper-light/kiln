@@ -93,6 +93,17 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let body: serde_json::Value = if method == Method::PUT || method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
             super::actions::route(hub, &method, tail, q, body).await
         }
+        // W15: environments, their deployments, and reviews of runs waiting on them.
+        (_, ["environments", tail @ ..]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = if matches!(method, Method::POST | Method::PUT | Method::PATCH) { crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+            super::environments::route(hub, &method, tail, q, body, caller.as_ref()).await
+        }
+        (&Method::POST, ["runs", id, "approve"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::environments::approve(hub, id, body, caller.as_ref()).await
+        }
         // W05-R21: routing rules, and where a leg would go.
         (&Method::GET, ["routing", "rules"]) => super::routing::get(hub).await,
         (&Method::PUT, ["routing", "rules"]) => {

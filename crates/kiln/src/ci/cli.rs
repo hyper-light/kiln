@@ -677,3 +677,128 @@ mod tests {
         assert_eq!(enc("repo:acme/app"), "repo%3Aacme%2Fapp");
     }
 }
+
+#[derive(clap::Args)]
+pub struct EnvArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: EnvCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum EnvCmd {
+    /// A repository's environments, their protection and latest deployment.
+    List {
+        #[arg(long)]
+        repo: String,
+    },
+    /// Make an environment in kiln (or change one made here), with its protection rules.
+    Create {
+        name: String,
+        #[arg(long)]
+        repo: String,
+        /// A required reviewer: a person, or `team:<name>` (repeatable).
+        #[arg(long = "reviewer")]
+        reviewers: Vec<String>,
+        #[arg(long)]
+        prevent_self_review: bool,
+        /// Minutes a job waits before it deploys.
+        #[arg(long, default_value_t = 0)]
+        wait_timer: u32,
+        /// Branches that may deploy (patterns, repeatable); with none and no `--tag`, any ref.
+        #[arg(long = "branch")]
+        branches: Vec<String>,
+        /// Tags that may deploy (patterns, repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Remove an environment made in kiln.
+    Delete {
+        name: String,
+        #[arg(long)]
+        repo: String,
+    },
+    /// An environment's deployments, newest first.
+    Deployments {
+        name: String,
+        #[arg(long)]
+        repo: String,
+    },
+}
+
+/// `kiln env`.
+pub async fn env(args: EnvArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    match args.cmd {
+        EnvCmd::List { repo } => {
+            let v = api.call(Method::Get, &format!("/environments?repo={}", enc(&repo)), None).await?;
+            for e in v.get("environments").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let p = e.get("protection").cloned().unwrap_or_default();
+                let mut rules = Vec::new();
+                if let Some(r) = p.get("reviewers").and_then(Value::as_array).filter(|r| !r.is_empty()) {
+                    rules.push(format!("reviewers {}", r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")));
+                }
+                if let Some(w) = p.get("wait-timer").and_then(Value::as_u64).filter(|w| *w > 0) {
+                    rules.push(format!("waits {w}m"));
+                }
+                for k in ["branches", "tags"] {
+                    if let Some(b) = p.get(k).and_then(Value::as_array) {
+                        rules.push(format!("{k} {}", b.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")));
+                    }
+                }
+                let last = e.get("latest_deployment").filter(|d| !d.is_null()).map(|d| format!("; last: {} {} {}", s(d, "state"), s(d, "ref"), s(d, "sha").get(..8).unwrap_or_default())).unwrap_or_default();
+                println!("{:<16} ({}) {}{last}", s(&e, "name"), s(&e, "source"), if rules.is_empty() { "no protection".to_owned() } else { rules.join("; ") });
+            }
+        }
+        EnvCmd::Create { name, repo, reviewers, prevent_self_review, wait_timer, branches, tags, url } => {
+            let protection = json!({
+                "reviewers": reviewers, "prevent-self-review": prevent_self_review, "wait-timer": wait_timer,
+                "branches": (!branches.is_empty()).then_some(branches), "tags": (!tags.is_empty()).then_some(tags),
+            });
+            api.call(Method::Put, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), Some(json!({ "protection": protection, "url": url }))).await?;
+            println!("{name} saved in {repo}");
+        }
+        EnvCmd::Delete { name, repo } => {
+            api.call(Method::Delete, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), None).await?;
+            println!("removed {name} from {repo}");
+        }
+        EnvCmd::Deployments { name, repo } => {
+            let v = api.call(Method::Get, &format!("/environments/{}/deployments?repo={}", enc(&name), enc(&repo)), None).await?;
+            for d in v.get("deployments").and_then(Value::as_array).cloned().unwrap_or_default() {
+                println!("{:>6} {:<12} {:<20} {} {}  {}", d.get("id").and_then(Value::as_i64).unwrap_or_default(), s(&d, "state"), s(&d, "ref"), s(&d, "sha").get(..8).unwrap_or_default(), when(d.get("created_at").and_then(Value::as_i64)), s(&d, "url"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct ApproveArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// The run waiting for a deployment review.
+    run: String,
+    /// The environments decided (default: every one the run waits for; repeatable).
+    #[arg(long = "env")]
+    environments: Vec<String>,
+    /// Reject instead: the waiting jobs fail.
+    #[arg(long)]
+    reject: bool,
+    #[arg(long, default_value = "")]
+    comment: String,
+}
+
+/// `kiln approve`.
+pub async fn approve(args: ApproveArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let body = json!({ "environments": args.environments, "state": if args.reject { "rejected" } else { "approved" }, "comment": args.comment });
+    let v = api.call(Method::Post, &format!("/runs/{}/approve", enc(&args.run)), Some(body)).await?;
+    let envs: Vec<String> = v.get("environments").and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|e| e.as_str().map(str::to_owned)).collect();
+    println!("{} the deployments to {}", if args.reject { "rejected" } else { "approved" }, envs.join(", "));
+    Ok(())
+}
+

@@ -48,6 +48,9 @@ pub struct AssignmentV2 {
     pub job_defaults: Defaults,
     /// The job's `outputs`, evaluated after its steps.
     pub outputs: Vec<(String, Tpl)>,
+    /// `environment.url`, evaluated after its steps too (W15-R04).
+    #[serde(default)]
+    pub environment_url: Option<Tpl>,
     pub contexts: Contexts,
     /// Secrets the leg may read (W09 narrows them to what it references).
     pub secrets: Vec<Secret>,
@@ -254,6 +257,9 @@ pub enum JobEventV2 {
         secret_outputs: Vec<String>,
         #[serde(default)]
         secret_values: BTreeMap<String, String>,
+        /// `environment.url`, evaluated (W15-R04).
+        #[serde(default)]
+        environment_url: Option<String>,
     },
     TestReport { idx: u32, format: String, object: String },
     Metrics { idx: u32, points: Vec<serde_json::Value> },

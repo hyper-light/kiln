@@ -6,6 +6,7 @@ pub mod actions;
 pub mod api;
 pub mod cli;
 pub mod dispatch;
+pub mod environments;
 pub mod events;
 pub mod facade;
 pub mod hooks;

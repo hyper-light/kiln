@@ -18,6 +18,7 @@
 //! - [`facts`]: what runners report about themselves (W13).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
 
+pub mod env;
 pub mod expr;
 pub mod facts;
 pub mod oidc;

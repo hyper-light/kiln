@@ -132,6 +132,10 @@ enum Cmd {
     Cancel(kiln::ci::cli::CancelArgs),
     /// Where CI legs go, and why they wait.
     Routing(kiln::ci::cli::RoutingArgs),
+    /// CI environments: list, create (with protection), delete, deployments.
+    Env(kiln::ci::cli::EnvArgs),
+    /// Approve (or reject) a run's deployments waiting for review.
+    Approve(kiln::ci::cli::ApproveArgs),
     /// People who sign in: add (with a sign-in link), list, link, sign out, remove.
     Users(kiln::authz::cli::UsersArgs),
     /// What users may do: roles and capabilities in scopes (`developer@org:acme`).
@@ -618,6 +622,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Rerun(a) => kiln::ci::cli::rerun(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Cancel(a) => kiln::ci::cli::cancel(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Env(a) => kiln::ci::cli::env(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Approve(a) => kiln::ci::cli::approve(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Grants(a) => kiln::authz::cli::grants(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Roles(a) => kiln::authz::cli::roles(a, &config::Config::load(&config_path).unwrap_or_default()).await,

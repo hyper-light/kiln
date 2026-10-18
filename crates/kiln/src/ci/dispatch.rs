@@ -59,6 +59,9 @@ pub enum Msg {
     Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
     /// The stored routing rules changed (W05-R21): read them again.
     RoutingChanged,
+    /// A run's deployments were reviewed (W15-R03): its legs held for approval are let go, or
+    /// fail.
+    Reviewed { run: String },
     /// Where a leg routed so would go now, and why each runner can or can't take it.
     ExplainRoute { route: Box<LegRoute>, reply: async_channel::Sender<serde_json::Value> },
     /// A new attempt of a finished run (W05-R17): its number, or why not.
@@ -163,6 +166,17 @@ struct LegSt {
     agent: Option<String>,
     report: LegReport,
     class: Option<FailureClass>,
+    /// Its deployment (W15-R04), once it started, and the `environment.url` it evaluated.
+    deployment: Option<i64>,
+    env_url: Option<String>,
+}
+
+/// A leg its environment's protection holds back (W15-R03, R04): not yet the scheduler's.
+struct Held {
+    leg: LegIn,
+    env: String,
+    /// When it could first have started: the wait timer counts from here.
+    ready_at: i64,
 }
 
 /// Reusable workflows: read at the run's commit from the repository's mirror (W04-R24; remote
@@ -183,6 +197,8 @@ struct Dispatch {
     sched: Scheduler,
     /// The routing rules by source (W05-R21); the scheduler holds them in order.
     routing: super::routing::Sources,
+    /// Legs waiting on their environment's protection.
+    held: HashMap<String, Held>,
     runs: HashMap<String, RunSt>,
     legs: HashMap<String, LegSt>,
     timers: BTreeSet<i64>,
@@ -226,7 +242,7 @@ pub fn spawn(hub: Arc<Hub>) {
     crate::rt::spawn(async move {
         let sources = super::routing::sources(&hub).await;
         let rules = sources.effective();
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), routing: sources, runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), routing: sources, held: HashMap::new(), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -284,6 +300,15 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
+            Msg::Reviewed { run } => {
+                let ids: Vec<String> = self.held.keys().filter(|id| self.legs.get(*id).is_some_and(|l| l.run == run)).cloned().collect();
+                for id in ids {
+                    if let Err(e) = self.gate(&id).await {
+                        tracing::warn!(leg = %id, error = %format!("{e:#}"), "an environment's protection could not be checked");
+                    }
+                }
+                Ok(())
+            }
             Msg::RoutingChanged => {
                 let fresh = super::routing::sources(&self.hub).await;
                 if fresh != self.routing {
@@ -320,8 +345,19 @@ impl Dispatch {
 
     async fn tick(&mut self) {
         let now = now_ms();
+        let mut woke = false;
         while self.timers.first().is_some_and(|t| *t <= now) {
             self.timers.pop_first();
+            woke = true;
+        }
+        // Wait timers that ran out (W15-R03).
+        if woke && !self.held.is_empty() {
+            let ids: Vec<String> = self.held.keys().cloned().collect();
+            for id in ids {
+                if let Err(e) = self.gate(&id).await {
+                    tracing::warn!(leg = %id, error = %format!("{e:#}"), "an environment's protection could not be checked");
+                }
+            }
         }
         let cmds = self.sched.handle(Input::Tick, now);
         self.commands(cmds).await;
@@ -590,6 +626,11 @@ impl Dispatch {
                 PlanAction::Cancel { leg, reason, .. } => {
                     let id = self.runs.get(run).and_then(|r| r.keys.get(&leg).cloned());
                     if let Some(id) = id {
+                        // Held for its environment: it never reached the scheduler, and ends here.
+                        if self.held.remove(&id).is_some() {
+                            Box::pin(self.settled(&id, Outcome::Cancelled, Some(reason))).await?;
+                            continue;
+                        }
                         let cmds = self.sched.handle(Input::LegCancelled { leg: id, reason }, now_ms());
                         Box::pin(self.commands(cmds)).await;
                     }
@@ -699,6 +740,49 @@ impl Dispatch {
         Ok(attempt)
     }
 
+    /// A held leg against its environment's protection (W15-R03, R04): let go to the scheduler,
+    /// failed (a ref that may not deploy there, a rejection), or kept waiting, its wait reason
+    /// saying for what.
+    async fn gate(&mut self, id: &str) -> anyhow::Result<()> {
+        let Some((env, ready_at)) = self.held.get(id).map(|h| (h.env.clone(), h.ready_at)) else { return Ok(()) };
+        let Some((run, git_ref, repo)) = self.legs.get(id).and_then(|l| self.runs.get(&l.run).map(|r| (l.run.clone(), r.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), r.repo.clone()))) else {
+            self.held.remove(id);
+            return Ok(());
+        };
+        let def = super::environments::ensure(&self.hub, &repo, &env).await?;
+        let reviews = super::environments::reviews(&self.hub, &run, &def.name).await?;
+        let now = crate::util::now_unix();
+        match kiln_ci::env::gate(&def.name, &def.protection, &git_ref, ready_at, now, &reviews) {
+            kiln_ci::env::Gate::Open => {
+                let Some(h) = self.held.remove(id) else { return Ok(()) };
+                runs::wait_reason(&self.hub, id, &serde_json::Value::Null).await?;
+                self.hub.emit_job(id).await;
+                let cmds = self.sched.handle(Input::LegQueued(Box::new(h.leg)), now_ms());
+                Box::pin(self.commands(cmds)).await;
+            }
+            kiln_ci::env::Gate::Refused(m) => {
+                self.held.remove(id);
+                runs::annotation(&self.hub, id, None, "error", None, &m, None, None, None, None, None).await?;
+                Box::pin(self.settled(id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await?;
+            }
+            kiln_ci::env::Gate::Rejected { by, comment } => {
+                self.held.remove(id);
+                let m = format!("The deployment to {} was rejected by {by}{}", def.name, if comment.is_empty() { String::new() } else { format!(": {comment}") });
+                runs::annotation(&self.hub, id, None, "error", None, &m, None, None, None, None, None).await?;
+                Box::pin(self.settled(id, Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() }), Some(m))).await?;
+            }
+            kiln_ci::env::Gate::Waiting { reviewers, until } => {
+                let reason = if reviewers.is_empty() { "wait-timer" } else { "approval" };
+                runs::wait_reason(&self.hub, id, &serde_json::json!({ "reason": reason, "environment": def.name, "reviewers": reviewers, "until": until })).await?;
+                self.hub.emit_job(id).await;
+                if let Some(t) = until {
+                    self.timers.insert(t * 1000);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A leg the plan queued: its row, then the scheduler.
     async fn queue(&mut self, run: &str, spec: LegSpec) -> anyhow::Result<()> {
         let id = crate::util::new_id();
@@ -721,8 +805,13 @@ impl Dispatch {
             retry,
             ..LegIn::default()
         };
-        self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None });
+        self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None });
         self.hub.emit_job(&id).await;
+        // A leg bound to an environment starts when its protection lets it (W15-R04).
+        if let Some(env) = self.legs.get(&id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
+            self.held.insert(id.clone(), Held { leg, env, ready_at: crate::util::now_unix() });
+            return self.gate(&id).await;
+        }
         let cmds = self.sched.handle(Input::LegQueued(Box::new(leg)), now_ms());
         Box::pin(self.commands(cmds)).await;
         Ok(())
@@ -786,6 +875,17 @@ impl Dispatch {
         let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // Its deployment (W15-R04), unless `deployment: false`.
+        let deploys = l.deployment.is_none() && l.spec.environment.as_ref().is_some_and(|e| e.deployment && !e.name.is_empty());
+        let deployment = if deploys {
+            let env = l.spec.environment.as_ref().map(|e| e.name.clone()).unwrap_or_default();
+            // As GitHub records a job's deployment: the ref's short name.
+            let git_ref = r.github.get("ref_name").or_else(|| r.github.get("ref")).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+            let actor = r.github.get("actor").and_then(serde_json::Value::as_str).unwrap_or("github-actions").to_owned();
+            super::environments::started(&self.hub, &r.repo, &env, &l.run, leg, &r.event.sha, &git_ref, &actor).await
+        } else {
+            None
+        };
         // Docker inside the `docker` executor's container: the host's socket, for trusted runs
         // only (W13-R04).
         if let Some(d) = docker.filter(|_| r.trusted && a.executor.kind == "docker") {
@@ -817,6 +917,9 @@ impl Dispatch {
         }
         if let Some(l) = self.legs.get_mut(leg) {
             l.agent = Some(runner.to_owned());
+            if deployment.is_some() {
+                l.deployment = deployment;
+            }
         }
         let _rx = self.hub.logs.subscribe(leg);
         tracing::info!(leg, runner, attempt, "leg assigned");
@@ -898,6 +1001,7 @@ impl Dispatch {
             workflow_defaults: wf.defaults.clone(),
             job_defaults: job.map(|j| j.defaults.clone()).unwrap_or_default(),
             outputs: job.map(|j| j.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect()).unwrap_or_default(),
+            environment_url: job.and_then(|j| j.environment.as_ref()).and_then(|e| e.url.clone()),
             contexts: wire::Contexts {
                 github: r.github.clone(),
                 vars,
@@ -973,7 +1077,7 @@ impl Dispatch {
                 runs::annotation(&self.hub, leg, Some(idx), &level, title, &message, file, line, end_line, col, end_col).await?;
             }
             JobEventV2::Summary { idx, markdown } => runs::summary(&self.hub, leg, idx, &markdown).await?,
-            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values } => {
+            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values, environment_url } => {
                 // Secret outputs are sealed the moment they arrive (W04-R22, W09-R10).
                 if !secret_values.is_empty()
                     && let Some(run) = self.legs.get(leg).map(|l| l.run.clone())
@@ -981,6 +1085,7 @@ impl Dispatch {
                     seal_secret_outputs(&self.hub, &run, leg, &secret_values).await?;
                 }
                 if let Some(l) = self.legs.get_mut(leg) {
+                    l.env_url = environment_url.filter(|u| !u.is_empty());
                     l.report.outputs = outputs.into_iter().collect();
                     l.report.json_outputs = json_outputs.into_iter().collect();
                     l.report.env = env.into_iter().collect();
@@ -1036,6 +1141,18 @@ impl Dispatch {
             Outcome::Failed(_) => PlanC::Failure,
         };
         let outputs = serde_json::to_string(&l.report.outputs.iter().cloned().collect::<std::collections::BTreeMap<_, _>>()).ok();
+        // Its deployment's last status (W15-R04).
+        if let Some(d) = l.deployment {
+            let state = match c {
+                PlanC::Success => "success",
+                PlanC::Cancelled => "inactive",
+                PlanC::Failure | PlanC::TimedOut => "failure",
+                _ => "error",
+            };
+            if let Err(e) = super::environments::status(&self.hub, d, state, l.env_url.clone(), None, "github-actions[bot]").await {
+                tracing::warn!(leg = %leg, error = %format!("{e:#}"), "a deployment's status could not be recorded");
+            }
+        }
         runs::finish_leg(&self.hub, leg, status_of(c), c.result(), outputs, reason).await?;
         self.hub.emit_job(leg).await;
         let report = LegReport { conclusion: Some(c), ..l.report };
@@ -1169,7 +1286,7 @@ impl Dispatch {
             let Some(spec) = leg.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok()) else { continue };
             let spec = rebuild_spec(&wf, &spec);
             self.hub.ci.legs.lock().insert(id.clone());
-            self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None });
+            self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None });
             let li = LegIn { id: id.clone(), run: run.to_owned(), repo: repo.name.clone(), route: LegRoute { job: spec.job.clone(), labels: spec.runs_on.labels.clone(), requires: spec.requires.clone(), caps: u64::from(CAP_CI2), ..LegRoute::default() }, priority: priority(&row.event), ..LegIn::default() };
             match (s, agent) {
                 (Status::Running, Some(a)) => {
@@ -1187,6 +1304,16 @@ impl Dispatch {
         self.runs.insert(run.to_owned(), st);
         let _ = self.sched.handle(Input::RunQueued { run: run.to_owned(), group: None, supersede: None }, now_ms());
         for li in queued {
+            // Held for its environment before the restart: held again, its wait counted from then.
+            if let Some(env) = self.legs.get(&li.id).and_then(|l| l.spec.environment.as_ref()).map(|e| e.name.clone()).filter(|n| !n.is_empty()) {
+                let id = li.id.clone();
+                let ready_at = runs::queued_at(&self.hub, &id).await.unwrap_or_else(|_| crate::util::now_unix());
+                self.held.insert(id.clone(), Held { leg: li, env, ready_at });
+                if let Err(e) = self.gate(&id).await {
+                    tracing::warn!(leg = %id, error = %format!("{e:#}"), "an environment's protection could not be checked");
+                }
+                continue;
+            }
             let cmds = self.sched.handle(Input::LegQueued(Box::new(li)), now_ms());
             self.commands(cmds).await;
         }

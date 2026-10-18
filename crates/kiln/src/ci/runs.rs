@@ -174,6 +174,12 @@ pub async fn requeue(hub: &Hub, leg: &str, attempt: u32, note: Option<String>) -
         .await
 }
 
+/// When a leg was queued (Unix seconds).
+pub async fn queued_at(hub: &Hub, leg: &str) -> anyhow::Result<i64> {
+    let leg = leg.to_owned();
+    hub.store.call(move |c| Ok(c.query_row("SELECT COALESCE(queued_at, 0) FROM jobs WHERE id = ?1", [&leg], |r| r.get::<_, i64>(0))?)).await
+}
+
 pub async fn wait_reason(hub: &Hub, leg: &str, reason: &serde_json::Value) -> anyhow::Result<()> {
     let (leg, r) = (leg.to_owned(), reason.to_string());
     hub.store.call(move |c| Ok(c.execute("UPDATE jobs SET wait_reason = ?2 WHERE id = ?1", params![leg, r]).map(|_| ())?)).await
