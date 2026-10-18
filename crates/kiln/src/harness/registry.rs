@@ -370,7 +370,9 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                for e in events {
+                // A conversation cleared since: what came before it is history, not its timeline.
+                let cleared = m.state.get("cleared").and_then(Value::as_u64).unwrap_or(0);
+                for e in events.into_iter().filter(|e| e.seq >= cleared) {
                     if let Ok(v) = serde_json::from_str::<Value>(&e.body) {
                         m.upsert(v);
                     }
