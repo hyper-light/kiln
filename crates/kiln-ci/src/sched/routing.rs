@@ -708,10 +708,17 @@ pub fn checks(req: &Requirement, r: &RunnerView) -> Vec<Check> {
         out.push(Check { requirement: format!("capabilities {:#x}", req.caps), value: format!("has {:#x}", r.caps), pass: lacking == 0 });
     }
     if !req.executors.is_empty() {
-        let has: Vec<&String> = req.executors.iter().filter(|e| r.facts.executors.contains_key(e.as_str())).collect();
-        out.push(Check { requirement: format!("executor in [{}]", req.executors.join(", ")), value: format!("[{}]", r.facts.executors.keys().cloned().collect::<Vec<_>>().join(", ")), pass: !has.is_empty() });
+        let has: Vec<&String> = req.executors.iter().filter(|e| has_executor(&r.facts, e)).collect();
+        let shown = if r.facts.executors.is_empty() { "host".to_owned() } else { r.facts.executors.keys().cloned().collect::<Vec<_>>().join(", ") };
+        out.push(Check { requirement: format!("executor in [{}]", req.executors.join(", ")), value: format!("[{shown}]"), pass: !has.is_empty() });
     }
     out
+}
+
+/// Whether a runner has an executor. One that reports none runs legs on its host, as every
+/// runner can.
+pub fn has_executor(facts: &crate::facts::RunnerFacts, e: &str) -> bool {
+    facts.executors.contains_key(e) || (e == "host" && facts.executors.is_empty())
 }
 
 pub fn eligible(req: &Requirement, r: &RunnerView) -> bool {

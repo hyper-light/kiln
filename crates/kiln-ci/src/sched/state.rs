@@ -548,7 +548,7 @@ impl Scheduler {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
             r.exclusive = exclusive;
-            executor = executors.iter().find(|e| r.input.view.facts.executors.contains_key(e.as_str())).cloned();
+            executor = executors.iter().find(|e| super::routing::has_executor(&r.input.view.facts, e)).cloned();
         }
         out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image });
     }
