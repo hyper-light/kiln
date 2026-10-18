@@ -20,8 +20,16 @@ function stringifySearch(o: Record<string, unknown>): string {
   return s ? `?${s}` : "";
 }
 
+/**
+ * An agent's conversation keeps your place itself (views/harness/timeline.tsx), so the router
+ * doesn't scroll there: not back to where you were in pixels, nor where the page before was. A
+ * conversation that grew since, or is another agent's, puts those pixels somewhere else (often far
+ * back), and after the page has put you where you were.
+ */
+const keepsItsPlace = (path: string) => /^\/agents\/(?!plans(?:\/|$)|sessions(?:\/|$))[^/]+\/?$/.test(path);
+
 export function getRouter() {
-  return createRouter({ routeTree, scrollRestoration: true, parseSearch, stringifySearch });
+  return createRouter({ routeTree, scrollRestoration: ({ location }) => !keepsItsPlace(location.pathname), parseSearch, stringifySearch });
 }
 
 declare module "@tanstack/react-router" {

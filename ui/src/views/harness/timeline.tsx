@@ -746,7 +746,15 @@ export const Timeline = React.memo(function Timeline({
   const signIn = React.useMemo(() => (signedOut && target && kind ? { notice: signedOut, target, kind } : null), [signedOut, target, kind]);
   return (
     <Contexts asking={asking} signIn={signIn} findNow={findNow} tasks={tasks}>
-      <div ref={keeper.ref} className="hx-timeline" onScroll={keeper.onScroll} onPointerDownCapture={keeper.onTouch} onKeyDownCapture={keeper.onTouch}>
+      {/* Named for the router's scroll memory, so another page's never lands here or this one's there. */}
+      <div
+        ref={keeper.ref}
+        className="hx-timeline"
+        data-scroll-restoration-id={`timeline:${placeKey(agent, parent)}`}
+        onScroll={keeper.onScroll}
+        onPointerDownCapture={keeper.onTouch}
+        onKeyDownCapture={keeper.onTouch}
+      >
         <div ref={marks} className="hx-flow">
           {state && state.dropped > 0 && <div className="hx-dim px-1 pb-3 text-[11px]">{state.dropped} earlier events not shown</div>}
           {turns.length === 0 &&
