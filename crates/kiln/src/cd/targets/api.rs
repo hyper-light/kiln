@@ -87,7 +87,7 @@ fn target_of(v: &Value) -> Result<Conn, (StatusCode, String)> {
 pub async fn discover(cx: Cx, v: Value) -> Out {
     let conn = target_of(&v)?;
     let creds = cx.cd.creds(&conn, None, "discover").await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-    let tcx = TargetCx { conn: &conn, creds, records: cx.cd.as_ref() };
+    let tcx = TargetCx { conn: &conn, creds, records: cx.cd.as_ref(), files: cx.hub.as_ref() };
     let scope = s(&v, "scope").map(str::to_owned);
     let r = match (conn.def.name, s(&v, "name")) {
         ("aws-lambda", None) => super::aws_lambda::discover(&tcx).await,

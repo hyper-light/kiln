@@ -32,7 +32,12 @@ use kiln_ci::secrets::ScopeKind;
 /// Where a service's requests go (`aws:ecs`, `gcp:sts`): its real endpoint, or a fake a test put
 /// in its place with [`override_endpoint`].
 pub fn endpoint(service: &str, real: impl FnOnce() -> String) -> String {
-    overrides().lock().get(service).cloned().unwrap_or_else(real)
+    let found = overrides().lock().get(service).cloned();
+    // Tests never reach a real cloud: one that forgot to fake a service gets nowhere.
+    if cfg!(test) {
+        return found.unwrap_or_else(|| "http://127.0.0.1:9".into());
+    }
+    found.unwrap_or_else(real)
 }
 
 fn overrides() -> &'static parking_lot::Mutex<HashMap<String, String>> {

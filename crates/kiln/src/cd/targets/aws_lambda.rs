@@ -189,16 +189,15 @@ pub async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     }
 }
 
-/// Where the function's code is, as Lambda takes it.
-fn code_location(desired: &Value) -> Result<Value> {
+/// Where the function's code is, as Lambda takes it: an artifact goes to kiln's bucket in the
+/// account first (once; its key is its hash).
+async fn code_location(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let code = desired.pointer("/spec/Code").ok_or_else(|| anyhow::anyhow!("no spec.Code"))?;
-    if let Some(a) = code.get("Artifact").and_then(Value::as_str) {
-        let source = p::code_source(a).map_err(|e| anyhow::anyhow!("{e}"))?;
-        if matches!(source, CodeSource::Artifact(_)) {
-            bail!("a zip CI built goes through kiln's bucket in the account, which isn't built yet: give code as s3://bucket/key or an image for now");
-        }
+    match code.get("Artifact").and_then(Value::as_str).map(p::code_source) {
+        Some(Ok(CodeSource::Artifact(hex))) => super::aws_s3::code(cx, cx.files, &hex).await,
+        Some(Ok(_)) | None => Ok(code.clone()),
+        Some(Err(e)) => bail!("{e}"),
     }
-    Ok(code.clone())
 }
 
 /// Waits until the function settles (it isn't pending, nor updating), failing if Lambda says
@@ -221,7 +220,7 @@ async fn settle(cx: &Cx<'_>, name: &str) -> Result<Value> {
 async fn apply_function(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let name = obj::name(desired);
     let aws = cx.aws()?;
-    let code = code_location(desired)?;
+    let code = code_location(cx, desired).await?;
     let live = function(cx, name).await?;
     let record = cx.applied(GROUP, "Function", "", name);
     let mut changed = false;
@@ -380,13 +379,16 @@ mod tests {
         crate::rt::block_on(async {
             let fake = Arc::new(Fake::default());
             let base = fake::start(fake.clone()).await?;
-            aws::override_endpoint("lambda", &base);
+            for service in ["lambda", "sts", "s3"] {
+                aws::override_endpoint(service, &base);
+            }
             let target = Target::parse("aws-lambda/aws-test/us-east-1").ok_or_else(|| anyhow::anyhow!("target"))?;
             let def = target.def().ok_or_else(|| anyhow::anyhow!("provider"))?;
             let conn = Conn { settle_every: std::time::Duration::from_millis(5), gap: std::time::Duration::ZERO, ..Conn::new(target, def) };
             let records = MemRecords::default();
             let creds = Credentials { access_key_id: "AKIDFAKE".into(), secret_access_key: "s".into(), session_token: Some("t".into()), expires_at: None };
-            let cx = Cx { conn: &conn, creds: Creds::Aws(Aws { creds, region: "us-east-1".into() }), records: &records };
+            let files = fake::MemFiles::default();
+            let cx = Cx { conn: &conn, creds: Creds::Aws(Aws { creds, region: "us-east-1".into() }), records: &records, files: &files };
 
             let objs = desired("s3://bucket/thumbs/v1.zip", 512)?;
             let (f, a, u) = (objs.first().cloned().unwrap_or_default(), objs.get(1).cloned().unwrap_or_default(), objs.get(2).cloned().unwrap_or_default());
@@ -432,6 +434,24 @@ mod tests {
             let adopted = adopt(&cx, "thumbs").await?;
             assert_eq!((adopted.pointer("/definition/alias"), adopted.pointer("/definition/config/MemorySize")), (Some(&json!("live")), Some(&json!(1024))));
             assert!(adopted.get("note").is_some_and(|n| n.as_str().is_some_and(|n| n.contains("zip"))));
+
+            // A zip CI built: into kiln's bucket in the account once (its key its hash), then
+            // the function's code; the same zip again uploads nothing.
+            let zip = crate::cd::artifacts::tests::zip(&[("app.py", b"def handler(e, c): return 1")]);
+            let hex = files.add(&zip);
+            let objs = desired(&format!("sha256:{hex}"), 1024)?;
+            let f3 = objs.first().cloned().unwrap_or_default();
+            let live = cx.with_applied(apply(&cx, &f3).await?);
+            assert_eq!(live.pointer("/spec/Code"), Some(&json!({ "Artifact": format!("sha256:{hex}") })), "code reads as the artifact kiln deployed");
+            assert!(p::code_matches(&f3, &live));
+            let key = format!("kiln/lambda/{hex}.zip");
+            {
+                let st = fake.state.lock();
+                assert_eq!(st.buckets.get("kiln-123456789012-us-east-1").and_then(|b| b.get(&key)), Some(&zip));
+                assert_eq!(st.functions.get("thumbs").map(|f| f.code.clone()), Some(json!({ "S3Bucket": "kiln-123456789012-us-east-1", "S3Key": key })));
+            }
+            apply(&cx, &f3).await?;
+            assert_eq!(fake.state.lock().calls.iter().filter(|c| c.starts_with("PutObject")).count(), 1);
 
             // Gone: the alias, then the function; their records with them.
             delete(&cx, &key_of(&a2)).await?;

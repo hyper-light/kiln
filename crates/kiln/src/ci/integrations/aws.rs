@@ -199,7 +199,20 @@ pub struct Call<'a> {
     pub path: &'a str,
     pub query: &'a [(String, String)],
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Body,
+}
+
+/// What a request carries.
+pub enum Body {
+    Bytes(Vec<u8>),
+    /// Streamed, its length and SHA-256 (hex) known ahead: S3 signs the hash and wants the length.
+    Stream { rx: async_channel::Receiver<bytes::Bytes>, len: u64, sha256: String },
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(b: Vec<u8>) -> Self {
+        Body::Bytes(b)
+    }
 }
 
 impl Aws {
@@ -207,8 +220,14 @@ impl Aws {
     pub async fn send(&self, call: Call<'_>) -> Result<Response> {
         let host = call.base.split_once("://").map_or(call.base, |(_, h)| h).trim_end_matches('/').to_owned();
         let amz_date = amz_date_now();
-        let payload = crate::util::sha256_hex(&call.body);
+        let payload = match &call.body {
+            Body::Bytes(b) => crate::util::sha256_hex(b),
+            Body::Stream { sha256, .. } => sha256.clone(),
+        };
         let mut headers = call.headers;
+        if let Body::Stream { len, .. } = &call.body {
+            headers.push(("content-length".into(), len.to_string()));
+        }
         headers.push(("host".into(), host));
         headers.push(("x-amz-date".into(), amz_date.clone()));
         if let Some(t) = &self.creds.session_token {
@@ -221,11 +240,17 @@ impl Aws {
         let auth = authorization(&self.creds, &self.region, call.service, &amz_date, &Signable { method, path: call.path, query: call.query, headers: &headers, payload_sha256: &payload }, call.service != "s3");
         let query: Vec<String> = call.query.iter().map(|(k, v)| format!("{}={}", encode(k, false), encode(v, false))).collect();
         let url = if query.is_empty() { format!("{}{}", call.base.trim_end_matches('/'), call.path) } else { format!("{}{}?{}", call.base.trim_end_matches('/'), call.path, query.join("&")) };
-        let mut req = client()?.request(call.method, &url).timeout(std::time::Duration::from_secs(60)).header("authorization", &auth);
+        // An upload's answer comes once it's all sent.
+        let wait = if matches!(call.body, Body::Stream { .. }) { 1800 } else { 60 };
+        let mut req = client()?.request(call.method, &url).timeout(std::time::Duration::from_secs(wait)).header("authorization", &auth);
         for (k, v) in headers.iter().filter(|(k, _)| k != "host") {
             req = req.header(k, v);
         }
-        req.body(call.body).send().await.with_context(|| format!("AWS {} {}", call.service, call.path))
+        let req = match call.body {
+            Body::Bytes(b) => req.body(b),
+            Body::Stream { rx, .. } => req.body_stream(rx),
+        };
+        req.send().await.with_context(|| format!("AWS {} {}", call.service, call.path))
     }
 
     /// An operation of a JSON-protocol service (ECS): `target` is
@@ -233,7 +258,7 @@ impl Aws {
     pub async fn json(&self, service: &str, target: &str, body: &Value) -> Result<Value> {
         let base = endpoint(service, &self.region);
         let headers = vec![("content-type".into(), "application/x-amz-json-1.1".into()), ("x-amz-target".into(), target.to_owned())];
-        let resp = self.send(Call { service, base: &base, method: Method::Post, path: "/", query: &[], headers, body: serde_json::to_vec(body)? }).await?;
+        let resp = self.send(Call { service, base: &base, method: Method::Post, path: "/", query: &[], headers, body: serde_json::to_vec(body)?.into() }).await?;
         json_answer(resp).await
     }
 
@@ -244,7 +269,7 @@ impl Aws {
             Some(b) => (vec![("content-type".to_owned(), "application/json".to_owned())], serde_json::to_vec(b)?),
             None => (Vec::new(), Vec::new()),
         };
-        let resp = self.send(Call { service, base: &base, method, path, query, headers, body }).await?;
+        let resp = self.send(Call { service, base: &base, method, path, query, headers, body: body.into() }).await?;
         json_answer(resp).await
     }
 
@@ -255,8 +280,16 @@ impl Aws {
         form.extend(params.iter().cloned());
         let body = form_body(&form);
         let headers = vec![("content-type".to_owned(), "application/x-www-form-urlencoded; charset=utf-8".to_owned())];
-        let resp = self.send(Call { service, base: &base, method: Method::Post, path: "/", query: &[], headers, body: body.into_bytes() }).await?;
+        let resp = self.send(Call { service, base: &base, method: Method::Post, path: "/", query: &[], headers, body: body.into_bytes().into() }).await?;
         xml_answer(resp).await
+    }
+}
+
+impl Aws {
+    /// The account these credentials act in (STS GetCallerIdentity).
+    pub async fn account(&self) -> Result<String> {
+        let xml = self.query("sts", "GetCallerIdentity", "2011-06-15", &[]).await?;
+        xml_text(&xml, "Account").ok_or_else(|| anyhow::anyhow!("STS didn't say which account this is"))
     }
 }
 

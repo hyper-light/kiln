@@ -22,6 +22,7 @@
 pub mod api;
 pub mod aws_ecs;
 pub mod aws_lambda;
+pub mod aws_s3;
 #[cfg(test)]
 pub mod fake;
 
@@ -141,11 +142,13 @@ impl Records for Cd {
     }
 }
 
-/// What a provider's calls know: the target, credentials, and what kiln applied there.
+/// What a provider's calls know: the target, credentials, what kiln applied there, and where
+/// artifacts' content is.
 pub struct Cx<'a> {
     pub conn: &'a Conn,
     pub creds: Creds,
     pub records: &'a dyn Records,
+    pub files: &'a dyn crate::cd::artifacts::Files,
 }
 
 impl Cx<'_> {
@@ -334,7 +337,7 @@ impl Cd {
             };
             let names = self.names(&cluster, &kind).await;
             let read = async {
-                let cx = Cx { conn: &conn, creds: self.creds(&conn, None, "watch").await?, records: self.as_ref() };
+                let cx = Cx { conn: &conn, creds: self.creds(&conn, None, "watch").await?, records: self.as_ref(), files: self.hub.as_ref() };
                 list(&cx, &kind.kind, &names).await
             };
             match read.await {
@@ -405,7 +408,7 @@ impl Cd {
         }
         let app = app_of(object);
         let result = async {
-            let cx = Cx { conn: &conn, creds: self.creds(&conn, app.as_deref(), "sync").await?, records: self };
+            let cx = Cx { conn: &conn, creds: self.creds(&conn, app.as_deref(), "sync").await?, records: self, files: self.hub.as_ref() };
             apply(&cx, object).await
         };
         let r = result.await.map(Some).map_err(|e| format!("{e:#}"));
@@ -417,7 +420,7 @@ impl Cd {
     pub(super) async fn target_delete(&self, cluster: &str, key: &ResKey) -> Result<(), String> {
         let conn = self.target(cluster).ok_or_else(|| format!("target {cluster} is not connected"))?;
         let result = async {
-            let cx = Cx { conn: &conn, creds: self.creds(&conn, None, "delete").await?, records: self };
+            let cx = Cx { conn: &conn, creds: self.creds(&conn, None, "delete").await?, records: self, files: self.hub.as_ref() };
             delete(&cx, key).await?;
             cx.record(&key.group, &key.kind, &key.namespace, &key.name, None).await
         };

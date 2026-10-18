@@ -73,6 +73,14 @@ pub struct ArtifactSpec {
     /// The pipeline that builds a published image (default `image`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
+    /// Instead of an image: a file a workflow's run at the commit uploaded (`artifact`, its
+    /// name), from `workflow` (the workflow's name, or its file). It resolves to its content's
+    /// SHA-256 (`sha256:<hex>`): a zip, a bundle, a built site (docs/cd-targets.md §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// The artifact's name, with `workflow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
     /// Its tag, when `image` carries none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
@@ -1180,6 +1188,15 @@ fn app_from_spec(
         }
         None => SyncPolicy::default(),
     };
+    for (n, a) in &spec.artifacts {
+        let kinds = [!a.image.is_empty(), a.published.is_some(), a.artifact.is_some()].iter().filter(|x| **x).count();
+        if kinds != 1 {
+            return Err(DefError(format!("app {name}: artifact {n} is one of: an image, a published image, or a workflow's artifact (workflow and artifact)")));
+        }
+        if a.artifact.is_some() != a.workflow.is_some() {
+            return Err(DefError(format!("app {name}: artifact {n} needs both the workflow and its artifact")));
+        }
+    }
     Ok(AppDef {
         name: name.to_owned(),
         project: spec.project.clone().unwrap_or_else(|| "default".into()),
@@ -1226,6 +1243,8 @@ fn app_from_spec(
                         image: k(&a.image),
                         published: a.published.as_deref().map(k),
                         pipeline: a.pipeline.clone(),
+                        workflow: a.workflow.as_deref().map(k),
+                        artifact: a.artifact.as_deref().map(k),
                         tag: a.tag.as_deref().map(k),
                         registry: a.registry.as_deref().map(k),
                         pull_secret: a.pull_secret.as_deref().map(k),
@@ -1371,6 +1390,29 @@ apps:
         assert!(from_deploy_file("apps: { x: { aws-lambda: { function: f, code: s3://b/k }, to: production } }", "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("no aws-lambda target")));
         assert!(from_deploy_file("apps: { x: { aws-ecs: {}, aws-lambda: {}, to: production } }", "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("one provider")));
         assert!(from_deploy_file("apps: { x: { aws-ecs: {}, to: { cluster: in-cluster } } }", "r", "main", &envs, &Scope::default()).is_err());
+        Ok(())
+    }
+
+    /// docs/cd-targets.md §7: a file a workflow uploaded is an artifact too; an artifact is one
+    /// kind of thing.
+    #[test]
+    fn workflow_artifacts_read_and_artifacts_are_one_thing() -> Result<(), DefError> {
+        let envs: BTreeMap<String, EnvironmentSpec> = serde_yaml::from_str("production: { targets: { aws-lambda: { account: aws, region: us-east-1 } } }").map_err(|e| DefError(e.to_string()))?;
+        let text = r#"
+apps:
+  thumbs:
+    aws-lambda: { function: thumbs, code: "${{ artifacts.zip }}", set: { Runtime: python3.13, Handler: app.handler, Role: r } }
+    artifacts:
+      zip: { workflow: ci, artifact: thumbs.zip }
+    to: production
+"#;
+        let apps = from_deploy_file(text, "acme/thumbs", "main", &envs, &Scope::default())?;
+        let a = apps.first().and_then(|a| a.artifacts.get("zip")).ok_or_else(|| DefError("no artifact".into()))?;
+        assert_eq!((a.workflow.as_deref(), a.artifact.as_deref()), (Some("ci"), Some("thumbs.zip")));
+        let both = "apps: { x: { aws-lambda: { function: f, code: c }, artifacts: { zip: { image: a/b, workflow: ci, artifact: z } }, to: production } }";
+        assert!(from_deploy_file(both, "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("one of")));
+        let half = "apps: { x: { aws-lambda: { function: f, code: c }, artifacts: { zip: { artifact: z } }, to: production } }";
+        assert!(from_deploy_file(half, "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("both")));
         Ok(())
     }
 

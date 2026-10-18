@@ -33,6 +33,8 @@ pub struct State {
     pub task_defs: BTreeMap<String, Vec<Value>>,
     pub tags: BTreeMap<String, Vec<Value>>,
     pub services: BTreeMap<(String, String), Value>,
+    /// S3: buckets, and their objects' bytes by key.
+    pub buckets: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
     /// Every operation, in order: `CreateFunction thumbs`.
     pub calls: Vec<String>,
 }
@@ -58,12 +60,20 @@ impl srv::Handler for Fake {
             return err(403, "UnrecognizedClientException", "unsigned");
         }
         let target = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-target")).map(str::to_owned);
+        let signed_sha = srv::header_str(&req, &http::header::HeaderName::from_static("x-amz-content-sha256")).map(str::to_owned);
         let method = req.method().clone();
         let path = srv::decode(req.uri().path());
         let query = srv::query(&req);
-        let body = srv::body_bytes(req.into_body(), 4 << 20).await.unwrap_or_default();
-        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let raw = srv::body_bytes(req.into_body(), 4 << 20).await.unwrap_or_default();
         let mut st = self.state.lock();
+        // STS's Query form, S3's buckets (kiln's are kiln-…), ECS's JSON, Lambda's REST.
+        if raw.starts_with(b"Action=GetCallerIdentity") {
+            return srv::text(http::StatusCode::OK, "<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account><Arn>arn:aws:sts::123456789012:assumed-role/kiln/x</Arn></GetCallerIdentityResult></GetCallerIdentityResponse>");
+        }
+        if path.starts_with("/kiln-") {
+            return s3(&mut st, &method, &path, &raw, signed_sha.as_deref());
+        }
+        let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         match target {
             Some(t) => ecs(&mut st, t.rsplit('.').next().unwrap_or_default(), &body),
             None => lambda(&mut st, &method, &path, &query, &body),
@@ -284,6 +294,31 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
     }
 }
 
+fn s3(st: &mut State, method: &http::Method, path: &str, body: &[u8], signed: Option<&str>) -> Response {
+    let mut parts = path.trim_start_matches('/').splitn(2, '/');
+    let (bucket, key) = (parts.next().unwrap_or_default().to_owned(), parts.next().map(str::to_owned));
+    match (method.as_str(), key) {
+        ("HEAD", None) => srv::status(if st.buckets.contains_key(&bucket) { http::StatusCode::OK } else { http::StatusCode::NOT_FOUND }),
+        ("PUT", None) => {
+            st.buckets.entry(bucket.clone()).or_default();
+            st.calls.push(format!("CreateBucket {bucket}"));
+            srv::status(http::StatusCode::OK)
+        }
+        ("HEAD", Some(k)) => srv::status(if st.buckets.get(&bucket).is_some_and(|b| b.contains_key(&k)) { http::StatusCode::OK } else { http::StatusCode::NOT_FOUND }),
+        ("PUT", Some(k)) => {
+            // S3 checks the payload against the hash the request signed.
+            if signed != Some(crate::util::sha256_hex(body).as_str()) {
+                return srv::text(http::StatusCode::BAD_REQUEST, "<Error><Code>XAmzContentSHA256Mismatch</Code><Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message></Error>");
+            }
+            let Some(b) = st.buckets.get_mut(&bucket) else { return srv::text(http::StatusCode::NOT_FOUND, "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>") };
+            b.insert(k.clone(), body.to_vec());
+            st.calls.push(format!("PutObject {bucket}/{k}"));
+            srv::status(http::StatusCode::OK)
+        }
+        _ => srv::text(http::StatusCode::BAD_REQUEST, "<Error><Code>NotImplemented</Code><Message>the fake has no such S3 call</Message></Error>"),
+    }
+}
+
 fn td_arn(family: &str, revision: usize) -> String {
     format!("arn:aws:ecs:us-east-1:1:task-definition/{family}:{revision}")
 }
@@ -479,6 +514,37 @@ impl super::Records for MemRecords {
                 None => self.0.lock().remove(&(target.to_owned(), key)),
             };
             Ok(())
+        })
+    }
+}
+
+/// Artifacts' content kept in memory, by SHA-256.
+#[derive(Default)]
+pub struct MemFiles(pub Mutex<BTreeMap<String, Vec<u8>>>);
+
+impl MemFiles {
+    /// Keeps `data`: its SHA-256 (hex).
+    pub fn add(&self, data: &[u8]) -> String {
+        let hex = crate::util::sha256_hex(data);
+        self.0.lock().insert(hex.clone(), data.to_vec());
+        hex
+    }
+}
+
+impl crate::cd::artifacts::Files for MemFiles {
+    fn open<'a>(&'a self, hex: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(async_channel::Receiver<bytes::Bytes>, u64)>> + Send + 'a>> {
+        Box::pin(async move {
+            let data = self.0.lock().get(hex).cloned().ok_or_else(|| anyhow::anyhow!("no artifact {hex}"))?;
+            let (tx, rx) = async_channel::bounded(4);
+            let len = data.len() as u64;
+            crate::rt::spawn(async move {
+                for piece in data.chunks(1000) {
+                    if tx.send(bytes::Bytes::copy_from_slice(piece)).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok((rx, len))
         })
     }
 }

@@ -11,6 +11,7 @@
 //! carry one line each for it.
 
 pub mod api;
+pub mod artifacts;
 pub mod cli;
 pub mod guard;
 pub mod images;
@@ -623,6 +624,13 @@ impl Cd {
     pub(crate) async fn resolve_artifacts(&self, def: &AppDef, revision: &str) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
         let mut refs = Vec::new();
         for (name, given) in &def.artifacts {
+            // A workflow's artifact: its content, by hash, as the commit's run uploaded it.
+            if let (Some(workflow), Some(artifact)) = (&given.workflow, &given.artifact) {
+                let hex = self.workflow_artifact(def, workflow, artifact, revision).await.with_context(|| format!("artifact {name}"))?;
+                let digest = format!("sha256:{hex}");
+                refs.push(ArtifactRef { name: name.clone(), reference: digest.clone(), repository: format!("{workflow}/{artifact}"), tag: None, digest });
+                continue;
+            }
             // A published image: in a registry, an image like any other; local, ready when its
             // pipeline's run at this commit succeeded, and run by its tag.
             let spec = match (&given.published, self.published_spec(given)) {

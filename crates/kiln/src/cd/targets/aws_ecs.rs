@@ -301,7 +301,8 @@ mod tests {
             let conn = Conn { settle_every: std::time::Duration::from_millis(5), gap: std::time::Duration::ZERO, ..Conn::new(target, def) };
             let records = MemRecords::default();
             let creds = Credentials { access_key_id: "AKIDFAKE".into(), secret_access_key: "s".into(), session_token: None, expires_at: None };
-            let cx = Cx { conn: &conn, creds: Creds::Aws(Aws { creds, region: "us-east-1".into() }), records: &records };
+            let files = fake::MemFiles::default();
+            let cx = Cx { conn: &conn, creds: Creds::Aws(Aws { creds, region: "us-east-1".into() }), records: &records, files: &files };
 
             let objs = desired("acme/api@sha256:aaa", 2)?;
             let (td, svc) = (objs.first().cloned().unwrap_or_default(), objs.get(1).cloned().unwrap_or_default());
