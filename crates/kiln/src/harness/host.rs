@@ -128,6 +128,13 @@ impl Host {
         v
     }
 
+    /// What each session's harness keeps as its record, for the conversation store to follow.
+    /// The sessions' locks are taken after this host's is let go.
+    pub fn record_sources(&self) -> Vec<crate::convo::record::Source> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        sessions.iter().filter_map(|s| s.record_source()).collect()
+    }
+
     pub fn inventory(&self) -> Inventory {
         Inventory { sessions: self.sessions.lock().keys().cloned().collect(), kinds: super::kinds::offered() }
     }
@@ -512,7 +519,7 @@ mod tests {
                 host.open(Some("a".into()), spec)?;
                 host.save_now();
             }
-            let store = crate::convo::store::Store::start(Box::<crate::convo::store::Memory>::default())?;
+            let (_dir, store) = crate::convo::store::scratch()?;
             let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
             store.send("a", &Update::State { state: Box::new(State { title: "the parser".into(), ..State::default() }) });
             store.send("a", &said("m1", 1, "first"));

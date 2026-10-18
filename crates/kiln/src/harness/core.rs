@@ -42,8 +42,14 @@ pub enum Update {
     Stream { id: String, text: String },
     /// The answer to one client's request (file suggestions ...).
     Reply { client: String, value: serde_json::Value },
-    /// The timeline starts over (a snapshot follows).
-    Reset,
+    /// The timeline starts over (a snapshot follows). `from`: the number of the snapshot's first
+    /// event. What came before it isn't in memory any more but is still the timeline's: a store
+    /// keeps it, and drops only its events from there on that the snapshot doesn't bring again (a
+    /// rewind's). None: from the start.
+    Reset {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+    },
 }
 
 /// How a file was before the agent first changed it.
@@ -518,7 +524,7 @@ impl Core {
 
     /// Everything a newly attached viewer needs, as updates (events in bounded batches).
     pub fn snapshot(&self, batch_bytes: usize) -> Vec<Update> {
-        let mut out = vec![Update::Reset, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(self.state.clone()) }];
+        let mut out = vec![Update::Reset { from: self.events.front().map(|e| e.seq) }, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(self.state.clone()) }];
         if !self.changes.is_empty() {
             out.push(Update::Changes { files: self.changes() });
         }
@@ -667,7 +673,7 @@ mod tests {
         assert_eq!(c.state.dropped, 10);
         assert!(c.get("e0").is_none() && c.get("e10").is_some());
         let snap = c.snapshot(64 * 1024);
-        assert!(matches!(snap.first(), Some(Update::Reset)));
+        assert!(matches!(snap.first(), Some(Update::Reset { .. })));
         let total: usize = snap.iter().map(|u| if let Update::Events { events } = u { events.len() } else { 0 }).sum();
         assert_eq!(total, MAX_EVENTS);
         assert!(snap.len() > 4);
@@ -682,7 +688,7 @@ mod tests {
         c.take_out();
         c.truncate_from("two");
         let out = c.take_out();
-        assert!(matches!(out.first(), Some(Update::Reset)));
+        assert!(matches!(out.first(), Some(Update::Reset { .. })));
         c.upsert("three", None, Body::Assistant { text: "three".into(), streaming: true });
         c.append("three", "!");
         let out = c.take_out();

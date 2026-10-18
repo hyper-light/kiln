@@ -23,6 +23,9 @@ pub const LANE_SYNC: u32 = 3;
 /// Reach's lane (`crate::reach`): links between runners, relayed by the server. Interactive class:
 /// a remote command's output must not queue behind job logs.
 pub const LANE_REACH: u32 = 4;
+/// The conversation feed's lane (`crate::convo::feed`): a runner's store sent to the server's, in
+/// bulk frames, never in the way of a job's or a terminal's (lane 5 is observe's).
+pub const LANE_CONVO: u32 = 6;
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -119,6 +122,10 @@ pub enum AgentMsg {
     /// Reach: a question for the server (JSON `{"op": "directory"}`), answered by
     /// [`ServerMsg::ReachAnswer`]. Appended last: postcard encodes variants by index.
     ReachAsk { req: u64, json: String },
+    /// The conversation feed (`crate::convo::feed`, on [`LANE_CONVO`]): `json` a
+    /// [`crate::convo::feed::Msg`], `data` a batch's bytes (empty for the rest). Only from runners
+    /// announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
+    Convo { json: String, data: Vec<u8> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -168,6 +175,11 @@ pub const CAP_FACTS: u32 = 1 << 15;
 pub const CAP_JOB_TTY: u32 = 1 << 16;
 /// The runner takes reach links ([`ServerMsg::Reach`], `crate::reach`).
 pub const CAP_REACH: u32 = 1 << 17;
+/// [`AgentMsg::Build`] capability: the runner keeps its agent sessions' conversations in a store
+/// and sends it to the server's ([`AgentMsg::Convo`], `crate::convo::feed`), so the server keeps
+/// them from that, not from the sessions' updates. Clear of CI's bits, `CAP_REPOS` and the bits
+/// observe and updates take (128, 256, 512).
+pub const CAP_CONVO: u32 = 1 << 19;
 
 /// See [`AgentMsg::Instance`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -311,6 +323,10 @@ pub enum ServerMsg {
     /// its container), its output on terminal session `session` (docs/ci.md W17-R05). Only to
     /// runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
     JobExec { job: String, session: String, command: String },
+    /// The conversation feed (`crate::convo::feed`, on [`LANE_CONVO`]): as [`AgentMsg::Convo`].
+    /// Only to runners announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by
+    /// index.
+    Convo { json: String, data: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -473,6 +489,26 @@ mod tests {
             assert!(c.is_power_of_two() && c & others == 0 && c & seen == 0, "{c} is a bit of its own");
             seen |= c;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_conversation_feed_is_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let last_server = encode(&ServerMsg::JobExec { job: "j".into(), session: "s".into(), command: "c".into() })?;
+        let convo = ServerMsg::Convo { json: "{}".into(), data: vec![1, 2] };
+        let b = encode(&convo)?;
+        assert_eq!(b.first().copied(), last_server.first().map(|i| i + 1), "ServerMsg::Convo comes right after JobExec");
+        assert_eq!(decode::<ServerMsg>(&b)?, convo);
+        let last_agent = encode(&AgentMsg::ReachAsk { req: 1, json: "{}".into() })?;
+        let convo = AgentMsg::Convo { json: "{}".into(), data: Vec::new() };
+        let b = encode(&convo)?;
+        assert_eq!(b.first().copied(), last_agent.first().map(|i| i + 1), "AgentMsg::Convo comes right after ReachAsk");
+        assert_eq!(decode::<AgentMsg>(&b)?, convo);
+        let all = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_REPOS, CAP_OUTPOST, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH];
+        assert!(CAP_CONVO.is_power_of_two() && all.iter().all(|c| c & CAP_CONVO == 0), "CAP_CONVO is a bit of its own");
+        // Observe's and updates' bits, taken elsewhere; a lane of its own, within the eight a peer has.
+        const { assert!(CAP_CONVO & (128 | 256 | 512) == 0) };
+        const { assert!(LANE_CONVO > LANE_REACH && LANE_CONVO != 5 && LANE_CONVO < 8) };
         Ok(())
     }
 }

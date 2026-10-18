@@ -5,7 +5,11 @@
 //! - [`rows`]: what a session's updates become in the store (no engine in sight).
 //! - [`store`]: a machine's store, its writer thread, and the tee that feeds it from the sessions.
 //! - [`turso`]: the engine: Turso, embedded.
+//! - [`record`]: the harness's own record (transcripts, rollouts), followed into the store.
+//! - [`feed`]: a runner's store sent to the server's, over the runner's link.
 
+pub mod feed;
+pub mod record;
 pub mod rows;
 pub mod sql;
 pub mod store;

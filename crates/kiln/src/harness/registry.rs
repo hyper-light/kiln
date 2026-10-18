@@ -157,6 +157,9 @@ pub struct Registry {
     pub local: Arc<Host>,
     /// The server's conversation store (docs/conversations.md), when it's on.
     pub convo: Option<crate::convo::store::Store>,
+    /// What runners' feeds send into it (`crate::convo::feed`), and what to answer them.
+    pub feed: Option<crate::convo::feed::Intake>,
+    feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
     local_rx: async_channel::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
@@ -207,6 +210,15 @@ impl Registry {
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = crate::convo::open(&dir);
+        // Runners that keep a store send it here; the server keeps their sessions from that.
+        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone())) {
+            Some(Ok((i, o))) => (Some(i), Some(o)),
+            Some(Err(e)) => {
+                tracing::warn!(error = %format!("{e:#}"), "runners' conversation stores won't reach the server's");
+                (None, None)
+            }
+            None => (None, None),
+        };
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         Self {
             mirrors: Mutex::new(HashMap::new()),
@@ -214,6 +226,8 @@ impl Registry {
             kinds: Mutex::new(HashMap::new()),
             local,
             convo,
+            feed,
+            feed_out,
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
@@ -320,6 +334,24 @@ impl Registry {
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
         RESTORED.call_once(|| {
             hub.harness.local.restore_from(hub.harness.convo.as_ref());
+            // The server's own sessions' harness records, followed into its store.
+            if let Some(st) = &hub.harness.convo {
+                let local = hub.harness.local.clone();
+                if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || local.record_sources()) {
+                    tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
+                }
+            }
+            // What the server answers runners' feeds, on the feed's lane.
+            if let Some(out) = hub.harness.feed_out.clone() {
+                let h = hub.clone();
+                crate::rt::spawn(async move {
+                    while let Ok(o) = out.recv().await {
+                        if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json: o.json, data: Vec::new() }) {
+                            h.net.send(o.peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
+                        }
+                    }
+                });
+            }
             match super::socket::serve(&hub.harness.local, super::socket::path("server", &hub.harness.dir)) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
@@ -391,6 +423,12 @@ impl Registry {
 
     /// Apply one update from a machine and pass it on to the session's viewers.
     pub fn ingest(&self, hub: &Hub, from: &Location, id: &str, u: Update) {
+        self.ingest_from(hub, from, id, u, false);
+    }
+
+    /// An update of session `id` from `from`. `shipped`: its machine keeps it in a store it sends
+    /// the server's (`crate::convo::feed`), which keeps it from that, not from here.
+    pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let mut changed: Option<Info> = None;
         let mut gone = false;
         let mut save_names = false;
@@ -413,7 +451,7 @@ impl Registry {
             }
             other => other,
         };
-        if let Some(store) = &self.convo {
+        if let Some(store) = self.convo.as_ref().filter(|_| !shipped) {
             store.send(id, &u);
         }
         {
@@ -442,7 +480,7 @@ impl Registry {
             match &u {
                 Update::Open { .. } | Update::Reply { .. } => {}
                 Update::Closed => gone = true,
-                Update::Reset => {
+                Update::Reset { .. } => {
                     m.events.clear();
                     m.index.clear();
                 }

@@ -903,6 +903,11 @@ impl Hub {
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
+            AgentMsg::Convo { json, data } => {
+                if let Some(f) = &self.harness.feed {
+                    f.heard(peer, &agent, json, data);
+                }
+            }
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             AgentMsg::JobEvent { job, json } => {
@@ -965,6 +970,9 @@ impl Hub {
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
                 Ok(u) => {
                     let closed = matches!(u, crate::harness::core::Update::Closed);
+                    // A runner process that sends its conversation store: the server keeps its
+                    // sessions from that.
+                    let shipped = self.instances.lock().get(peer).is_some_and(|i| i.caps & proto::CAP_CONVO != 0);
                     {
                         let mut inst = self.instances.lock();
                         let what = crate::instances::Owned::Agent(session.clone());
@@ -974,7 +982,7 @@ impl Hub {
                             inst.own(what, peer);
                         }
                     }
-                    self.harness.ingest(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u);
+                    self.harness.ingest_from(self, &crate::harness::registry::Location::Machine(agent.clone()), &session, u, shipped);
                     if closed {
                         self.check_retire().await;
                     }

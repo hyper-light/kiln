@@ -1213,7 +1213,7 @@ pub fn codex_home(env: &[(String, String)]) -> PathBuf {
 }
 
 /// The rollout segments of Codex thread `thread` under `home` (its sessions, archived ones too).
-fn codex_files(home: &Path, thread: &str) -> Vec<PathBuf> {
+pub(crate) fn codex_files(home: &Path, thread: &str) -> Vec<PathBuf> {
     if thread.is_empty() || thread.contains(['/', '\\']) || thread.contains("..") {
         return Vec::new();
     }
