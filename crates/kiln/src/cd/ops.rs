@@ -469,6 +469,9 @@ async fn get(cx: Cx, v: Value) -> Out {
         m.insert("commits".into(), json!(entry.commits));
         m.insert("children".into(), json!(entry.children));
         m.insert("revision_info".into(), revision.unwrap_or(Value::Null));
+        // What its inputs deploy now: each artifact pinned (docs/cd-targets.md §1.3).
+        let artifacts = entry.key.and_then(|k| entry.resolved.iter().find(|r| r.key == k)).map(|r| r.artifacts.clone()).unwrap_or_default();
+        m.insert("artifacts".into(), json!(artifacts));
     }
     Ok(out)
 }

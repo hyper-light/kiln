@@ -160,6 +160,8 @@ pub struct Cd {
     plans: plans::Renders,
     /// Images resolved lately, by registry and reference, so apps sharing one ask once a minute.
     artifacts: Mutex<HashMap<String, (crate::ci::integrations::oci::Resolved, Instant)>>,
+    /// Why a repository's deploy file doesn't read, by repository.
+    pub deploy_errors: Mutex<BTreeMap<String, String>>,
 }
 
 impl Cd {
@@ -266,7 +268,108 @@ impl Cd {
         }
     }
 
+    /// Apps from `.kiln/deploy.yaml` in kiln's repositories (cd.md, Defining applications): each
+    /// round reads the file, and `.kiln/environments.yaml`, at the commit trunk is at. An app is
+    /// registered when its definition changed, and removed (with its objects, as deleting an app
+    /// does) when the file no longer defines it. A file that doesn't read, or a repository that
+    /// can't be fetched, changes nothing: its apps stay as they were.
+    async fn refresh_deploy_files(self: &Arc<Self>) {
+        let repos = match self.hub.store.repos().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "deployments: can't list repositories");
+                return;
+            }
+        };
+        for repo in repos.into_iter().filter(|r| r.enabled) {
+            let trunk = repo.branches.first().cloned().unwrap_or_else(|| "main".into());
+            let (dir, auth, url, t) = (self.mirror_dir(&repo.clone_url), self.git_auth(&repo.clone_url), repo.clone_url.clone(), trunk.clone());
+            let read = crate::rt::blocking(move || -> Result<(String, Option<String>, Option<String>)> {
+                let m = Mirror::open(&dir, &url, auth)?;
+                m.fetch()?;
+                let commit = m.resolve(&t)?;
+                let text = |p: &str| -> Result<Option<String>> { Ok(m.read(&commit, p)?.map(|b| String::from_utf8_lossy(&b).into_owned())) };
+                let deploy = text(".kiln/deploy.yaml")?;
+                let envs = if deploy.is_some() { text(".kiln/environments.yaml")? } else { None };
+                Ok((commit, deploy, envs))
+            })
+            .await
+            .and_then(|r| r);
+            let (commit, deploy, envs) = match read {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::debug!(repo = %repo.name, error = %format!("{e:#}"), "deployments: can't read the repository's deploy file");
+                    continue;
+                }
+            };
+            let defs = match deploy {
+                // No file: none of its apps are left.
+                None => Vec::new(),
+                Some(text) => {
+                    let environments: BTreeMap<String, apps::EnvironmentSpec> = match envs.as_deref().map(serde_yaml::from_str).transpose() {
+                        Ok(e) => e.unwrap_or_default(),
+                        Err(e) => {
+                            self.deploy_file_error(&repo.name, Some(format!(".kiln/environments.yaml at {}: {e}", short(&commit))));
+                            continue;
+                        }
+                    };
+                    let mut scope = apps::Scope::default();
+                    scope.set("git.sha", json!(commit));
+                    scope.set("git.short_sha", json!(short(&commit)));
+                    scope.set("git.ref", json!(format!("refs/heads/{trunk}")));
+                    scope.set("repo.name", json!(repo.name));
+                    match apps::from_deploy_file(&text, &repo.clone_url, &trunk, &environments, &scope) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.deploy_file_error(&repo.name, Some(format!(".kiln/deploy.yaml at {}: {}", short(&commit), e.0)));
+                            continue;
+                        }
+                    }
+                }
+            };
+            self.deploy_file_error(&repo.name, None);
+            let ids: BTreeSet<String> = defs.iter().map(AppDef::id).collect();
+            for def in defs {
+                let changed = self.apps.read().get(&def.id()).is_none_or(|e| e.def != def);
+                if changed {
+                    tracing::info!(app = %def.id(), repo = %repo.name, commit = %short(&commit), "deployments: an app from a deploy file");
+                    self.register(def);
+                }
+            }
+            let gone: Vec<String> = self
+                .apps
+                .read()
+                .iter()
+                .filter(|(id, e)| matches!(&e.def.origin, Origin::Deploy { repo: r } if *r == repo.clone_url) && !ids.contains(*id))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in gone {
+                tracing::info!(app = %id, repo = %repo.name, "deployments: the deploy file no longer defines an app; removing it");
+                let cascade = self.apps.read().get(&id).is_some_and(|e| e.def.cascade);
+                self.unregister(&id, cascade);
+            }
+        }
+    }
+
+    /// Records (or clears) why a repository's deploy file doesn't read, once per change.
+    fn deploy_file_error(&self, repo: &str, error: Option<String>) {
+        let mut errors = self.deploy_errors.lock();
+        if errors.get(repo) == error.as_ref() {
+            return;
+        }
+        match error {
+            Some(e) => {
+                tracing::warn!(repo = %repo, error = %e, "deployments: a deploy file doesn't read; its apps stay as they were");
+                errors.insert(repo.to_owned(), e);
+            }
+            None => {
+                errors.remove(repo);
+            }
+        }
+    }
+
     async fn refresh_sources(self: &Arc<Self>) {
+        self.refresh_deploy_files().await;
         let apps: Vec<AppEntry> = self.apps.read().values().cloned().collect();
         // Each repository is fetched once a round.
         let mut urls: BTreeSet<String> = BTreeSet::new();
@@ -663,6 +766,12 @@ impl Cd {
             };
             objects.extend(render::render(&req, &self.tools)?);
         }
+        // Plain manifests read them too: `image: ${{ artifacts.web }}` in a Deployment.
+        if !inputs.artifacts.is_empty() {
+            for o in &mut objects {
+                apps::substitute_value(o, &inputs.artifacts).map_err(|e| anyhow::anyhow!("{} {}: {}", obj::kind(o), obj::name(o), e.0))?;
+            }
+        }
         for p in &inputs.pull_secrets {
             objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
@@ -1056,6 +1165,11 @@ pub fn summary_json(s: &Summary) -> Value {
     })
 }
 
+/// A commit's first seven characters.
+fn short(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
 fn blake(parts: &[&[u8]]) -> u64 {
     let mut joined = Vec::new();
     for p in parts {
@@ -1149,6 +1263,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         live: live::Live::default(),
         plans: plans::Renders::default(),
         artifacts: Mutex::new(HashMap::new()),
+        deploy_errors: Mutex::new(BTreeMap::new()),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

@@ -148,7 +148,8 @@ pub fn substitute_artifacts(text: &str, artifacts: &[ArtifactRef]) -> Result<Str
     Ok(out)
 }
 
-fn substitute_value(v: &mut Value, artifacts: &[ArtifactRef]) -> Result<(), DefError> {
+/// Fills `${{ artifacts.* }}` in every string of `v` (a rendered object, say).
+pub fn substitute_value(v: &mut Value, artifacts: &[ArtifactRef]) -> Result<(), DefError> {
     match v {
         Value::String(s) if s.contains("${{") => *s = substitute_artifacts(s, artifacts)?,
         Value::Array(a) => {
