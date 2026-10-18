@@ -21,7 +21,6 @@ use rusqlite::params;
 use serde_json::{Value, json};
 
 use super::Fail;
-use crate::gitops::{self, LS_REMOTE_TIMEOUT};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 use crate::store::Repo;
@@ -160,16 +159,12 @@ pub async fn repo_rules(hub: &Hub, repo: &Repo) -> Vec<Rule> {
     {
         return r.clone();
     }
-    let mirror = gitops::mirror_path(hub, &repo.name).to_string_lossy().to_string();
-    let branch = gitops::run_git(hub, &["-C", &mirror, "symbolic-ref", "--short", "HEAD"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_else(|_| "main".into());
     let mut rules = Vec::new();
-    for name in [".kiln/routing.yaml", ".kiln/routing.yml"] {
-        let Ok(text) = gitops::run_git(hub, &["-C", &mirror, "show", &format!("{branch}:{name}")], LS_REMOTE_TIMEOUT).await else { continue };
+    if let Some((name, text)) = super::repo_config::trunk_file(hub, repo, &[".kiln/routing.yaml", ".kiln/routing.yml"]).await {
         match parse_file(&text) {
             Ok(r) => rules = for_repo(&repo.name, r),
             Err(e) => tracing::warn!(repo = %repo.name, file = name, error = %e, "the repository's routing rules can't be read; it has none"),
         }
-        break;
     }
     CACHE.lock().get_or_insert_with(HashMap::new).insert(repo.id.clone(), (Instant::now(), rules.clone()));
     rules

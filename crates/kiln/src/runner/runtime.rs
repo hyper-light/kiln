@@ -1220,13 +1220,16 @@ impl Leg {
         self.hosted_image().is_some() && self.a.executor.options.get("docker").and_then(serde_json::Value::as_str) == Some("socket")
     }
 
-    /// Where the leg's directories are inside its containers. With the host's Docker inside,
-    /// the workspace and temporary directories keep their host paths, so what a step bind-mounts
-    /// (`docker run -v $GITHUB_WORKSPACE:/src`) is what the host's daemon finds.
+    /// Where the leg's directories are inside its containers. A job's `container:` gets
+    /// GitHub's `/__w`. The `docker` executor's container (the leg's machine) keeps the host's
+    /// paths for the workspace, temporary and action directories: what a step bind-mounts
+    /// through the host's Docker (`docker run -v $GITHUB_WORKSPACE:/src`) is what the daemon
+    /// finds, and every such leg on a runner has its workspace at the same depth, so the paths a
+    /// cache saved relative to it (`actions/cache`) restore in any other.
     fn container_map(&self, l: &Layout) -> super::docker::PathMap {
         let repo = self.a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
         let work = &self.work_dir;
-        let same = self.docker_inside();
+        let same = self.hosted_image().is_some();
         let at = |host: &Path, inside: String| if same { host.to_string_lossy().into_owned() } else { inside };
         super::docker::PathMap::new(vec![
             (l.workspace.clone(), at(&l.workspace, format!("/__w/{repo}/{repo}"))),
