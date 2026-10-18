@@ -259,7 +259,11 @@
 .cp .hx-compose-live {
   border-color: #3a3550;
 }
+/* The field grows to ten lines (four on a phone, where the keyboard takes most of the screen),
+   then scrolls inside. A line is 1.55em; 16px is its padding. */
 .cp .hx-compose-input {
+  max-height: calc(10 * 1.55em + 16px);
+  overflow-y: auto;
   font-size: 15px;
 }
 @media (pointer: coarse) {
@@ -267,12 +271,10 @@
     font-size: 16px;
   }
 }
-.cp-warn {
-  padding: 4px 14px 0;
-  color: #d8bb95;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.5;
+@media (max-width: 640px), (max-height: 520px) {
+  .cp .hx-compose-input {
+    max-height: calc(4 * 1.55em + 16px);
+  }
 }
 .cp-bar {
   display: flex;
@@ -379,7 +381,9 @@
   color: #ededee;
   cursor: pointer;
 }
+/* As wide for Now as for Queue and Steer, so the pill keeps its size as the mode changes. */
 .cp-mode-value {
+  min-width: calc(5ch + 0.4em);
   font-family: var(--font-mono);
   font-size: 10.5px;
   letter-spacing: 0.08em;
