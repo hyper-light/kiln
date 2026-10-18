@@ -1300,19 +1300,28 @@ impl Leg {
         if uses.starts_with("docker://") {
             anyhow::bail!("`{uses}`: Docker actions run with Docker executors (docs/ci.md W13); this runner can't run them yet");
         }
-        if uses.starts_with("$/") {
-            anyhow::bail!("`{uses}`: actions of the running commit (`$/`) arrive with docs/ci.md W07-R01's mirror reads");
-        }
+        // Remote actions, and `$/` ones (this repository at the running commit, W07-R01): as the
+        // run's start resolved them.
         let r = self.a.actions.get(uses).ok_or_else(|| anyhow::anyhow!("`{uses}` was not resolved when the run started"))?;
         let root = self.fetch_action(r).await?;
         let dir = if r.path.is_empty() { root } else { root.join(&r.path) };
+        if uses.starts_with("$/") {
+            return Ok(Located { dir, repo: String::new(), git_ref: String::new() });
+        }
         let git_ref = uses.rsplit_once('@').map(|(_, r)| r.to_owned()).unwrap_or_default();
         Ok(Located { dir, repo: r.repo.clone(), git_ref })
     }
 
     /// An action's code at its commit, kept under `<work>/_actions/<owner>/<repo>/<sha>`.
     async fn fetch_action(&self, r: &kiln_ci::wire::ActionRef) -> anyhow::Result<PathBuf> {
-        let dir = self.work_dir.join("_actions").join(r.repo.replace("..", "_")).join(&r.sha);
+        // A `$/` action's tarball holds its directory only: kept apart by path.
+        let key = if r.url.contains("?path=") {
+            let d = crate::util::sha256_hex(r.path.as_bytes());
+            format!("{}-{}", r.sha, d.get(..12).unwrap_or(&d))
+        } else {
+            r.sha.clone()
+        };
+        let dir = self.work_dir.join("_actions").join(r.repo.replace("..", "_")).join(key);
         let done = dir.join(".kiln-complete");
         if done.exists() {
             return Ok(dir);

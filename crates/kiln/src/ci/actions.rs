@@ -141,6 +141,25 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
             continue;
         }
         allowed(&uses)?;
+        // `$/path`: this repository at the running commit (W07-R01), read from the server's
+        // mirror, so no checkout is needed.
+        if let Some(p) = uses.strip_prefix("$/") {
+            let path = p.trim_matches('/').to_owned();
+            if path.split('/').any(|s| s == ".." || s == ".git") {
+                return Err(format!("`{uses}`: the path must stay inside the repository"));
+            }
+            if let Some(meta) = own_metadata(hub, repo, sha, &path).await
+                && let (Some(action), _) = kiln_ci::wf::parse_action(&meta)
+                && action.runs.using == "composite"
+            {
+                let mut inner = Vec::new();
+                steps_uses(&action.runs.steps, &mut inner);
+                todo.extend(inner.into_iter().map(|x| (x, depth + 1)));
+            }
+            let url = format!("/_kiln/actions/{}/{sha}.tar.gz?path={}", repo.name, encode_path(&path));
+            out.insert(uses.clone(), ActionRef { repo: repo.name.clone(), sha: sha.to_owned(), path, url });
+            continue;
+        }
         let Some(r) = Remote::parse(&uses) else { continue };
         if depth > 9 {
             return Err(format!("`{uses}`: composite actions nest at most 10 deep"));
@@ -201,6 +220,23 @@ pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     anyhow::bail!("no tag, branch or commit `{}` in {} (or the action source is unreachable and it was never mirrored)", r.git_ref, r.full())
 }
 
+/// `path`, percent-encoded for a query (its `/` kept).
+fn encode_path(path: &str) -> String {
+    path.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// A `$/` action's `action.yml` (or `.yaml`), from the repository's own mirror.
+async fn own_metadata(hub: &Hub, repo: &Repo, sha: &str, path: &str) -> Option<String> {
+    let d = gitops::mirror_path(hub, &repo.name).to_string_lossy().to_string();
+    let base = if path.is_empty() { String::new() } else { format!("{path}/") };
+    for name in ["action.yml", "action.yaml"] {
+        if let Ok(o) = gitops::run_git(hub, &["-C", &d, "show", &format!("{sha}:{base}{name}")], GIT_TIMEOUT).await {
+            return Some(String::from_utf8_lossy(&o).into_owned());
+        }
+    }
+    None
+}
+
 /// `action.yml` (or `.yaml`) of an action at a commit.
 async fn metadata(hub: &Hub, r: &Remote, sha: &str) -> Option<String> {
     let d = mirror(hub, &r.owner, &r.repo).to_string_lossy().to_string();
@@ -213,7 +249,9 @@ async fn metadata(hub: &Hub, r: &Remote, sha: &str) -> Option<String> {
     None
 }
 
-/// `GET /_kiln/actions/<owner>/<repo>/<sha>.tar.gz`, for a leg's token (W07-R03).
+/// `GET /_kiln/actions/<owner>/<repo>/<sha>.tar.gz`, for a leg's token (W07-R03). With
+/// `?path=`, a `$/` action: that directory of the leg's own repository at the commit, from the
+/// repository's mirror (W07-R01).
 pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Response, Fail> {
     let [owner, repo, file] = rest else { return Err((StatusCode::NOT_FOUND, "no such action".into())) };
     let sha = file.trim_end_matches(".tar.gz");
@@ -221,14 +259,32 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
     if !ok_name(owner) || !ok_name(repo) || sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err((StatusCode::NOT_FOUND, "no such action".into()));
     }
-    let leg = token::from_headers(req.headers()).and_then(|t| token::verify(hub, &t));
-    if leg.is_none() {
+    let Some(leg) = token::from_headers(req.headers()).and_then(|t| token::verify(hub, &t)) else {
         return Err((StatusCode::UNAUTHORIZED, "a leg's token is needed".into()));
-    }
-    let path = tarball_path(hub, owner, repo, sha);
+    };
+    let own = srv::query(req).get("path").cloned();
+    let (path, mirror_dir, args) = match &own {
+        Some(p) => {
+            if p.split('/').any(|s| s == ".." || s == ".git") {
+                return Err((StatusCode::NOT_FOUND, "no such action".into()));
+            }
+            // Only the leg's own repository.
+            let mine = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.id == leg.repo);
+            let name = format!("{owner}/{repo}");
+            let Some(mine) = mine.filter(|r| r.name == name) else { return Err((StatusCode::FORBIDDEN, "a `$/` action is the leg's own repository's".into())) };
+            let digest = crate::util::sha256_hex(p.as_bytes());
+            let file = tarball_path(hub, owner, repo, &format!("{sha}-{}", digest.get(..16).unwrap_or(&digest)));
+            let p = p.trim_matches('/').to_owned();
+            let args = if p.is_empty() { vec![sha.to_owned()] } else { vec![sha.to_owned(), "--".to_owned(), p] };
+            (file, gitops::mirror_path(hub, &mine.name), args)
+        }
+        None => (tarball_path(hub, owner, repo, sha), mirror(hub, owner, repo), vec![sha.to_owned()]),
+    };
     if !path.exists() {
-        let d = mirror(hub, owner, repo).to_string_lossy().to_string();
-        let out = gitops::run_git(hub, &["-C", &d, "archive", "--format=tar.gz", sha], GIT_TIMEOUT).await.map_err(|e| (StatusCode::NOT_FOUND, format!("action not mirrored: {e:#}")))?;
+        let d = mirror_dir.to_string_lossy().to_string();
+        let mut git = vec!["-C", &d, "archive", "--format=tar.gz"];
+        git.extend(args.iter().map(String::as_str));
+        let out = gitops::run_git(hub, &git, GIT_TIMEOUT).await.map_err(|e| (StatusCode::NOT_FOUND, format!("action not mirrored: {e:#}")))?;
         let p = path.clone();
         crate::rt::blocking(move || -> std::io::Result<()> {
             if let Some(parent) = p.parent() {
