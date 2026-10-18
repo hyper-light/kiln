@@ -344,6 +344,48 @@ export interface CiInsightsRunner extends CiInsightsHead, CiRunnerInsight {
   repos: { id: string; name: string | null; legs: number; runner_minutes: number; failure: number }[];
 }
 
+/** Something that differs between two runs or legs (W19-R03): `a` is the base's, `b` the head's (null: not there). */
+export interface CiDifference {
+  kind: "action" | "var" | "leg" | "conclusion" | "runner" | "executor" | "machine" | "version" | "image" | "env" | "cache" | string;
+  leg?: string;
+  what: string;
+  a: string | null;
+  b: string | null;
+}
+
+export interface CiCompareRun {
+  id: string;
+  number: number;
+  workflow: string;
+  branch: string;
+  sha: string;
+  conclusion: string | null;
+  created_at: number;
+  duration: number | null;
+}
+
+export interface CiCompareLeg {
+  id: string | null;
+  conclusion: string;
+  duration: number | null;
+  runner: string;
+  executor: string;
+  machine: string | null;
+}
+
+export interface CiCompare {
+  base: CiCompareRun;
+  head: CiCompareRun;
+  differences: CiDifference[];
+  files: { count: number | null; files: string[]; error?: string };
+  legs: {
+    key: string;
+    base: CiCompareLeg | null;
+    head: CiCompareLeg | null;
+    steps: { name: string; a: number | null; b: number | null; a_conclusion: string | null; b_conclusion: string | null }[];
+  }[];
+}
+
 export async function ciRun(id: string, attempt: number | undefined, signal?: AbortSignal): Promise<CiRunDetail | null> {
   try {
     return await request<CiRunDetail>("GET", `/api/ci/runs/${enc(id)}${at(attempt)}`, undefined, { signal });
@@ -383,6 +425,9 @@ export const ci = {
     request<CiWorkflowSource>("GET", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
   names: (repo: string, path: string, signal?: AbortSignal) => request<{ secrets: string[]; variables: string[] }>("GET", `/api/ci/repos/${enc(repo)}/names?path=${enc(path)}`, undefined, { signal }),
   catalog: (q: string, signal?: AbortSignal) => request<{ actions: CiCatalogEntry[] }>("GET", `/api/ci/actions?q=${enc(q)}`, undefined, { signal }),
+  /** `other`: a run's (or leg's) id, or `last-green`. */
+  compare: (run: string, other: string, signal?: AbortSignal) => request<CiCompare>("GET", `/api/ci/runs/${enc(run)}/compare/${enc(other)}`, undefined, { signal }),
+  compareLegs: (leg: string, other: string, signal?: AbortSignal) => request<CiCompare>("GET", `/api/ci/legs/${enc(leg)}/compare/${enc(other)}`, undefined, { signal }),
   insightsRepos: (days: number, signal?: AbortSignal) => request<CiInsightsHead & { repos: CiRepoShare[] }>("GET", `/api/ci/insights/repos?days=${days}`, undefined, { signal }),
   insightsRepo: (repo: string, days: number, signal?: AbortSignal) => request<CiInsightsRepo>("GET", `/api/ci/insights/repos/${enc(repo)}?days=${days}`, undefined, { signal }),
   insightsWorkflow: (repo: string, workflow: string, days: number, signal?: AbortSignal) =>

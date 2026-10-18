@@ -25,6 +25,9 @@ const WINDOWS: { value: Window; label: string }[] = [
   { value: "90", label: "90 days" },
 ];
 
+/** A link inside a sentence, as the metrics page's. */
+const INLINE = "text-[#d1c6e6] underline decoration-[#635b73] underline-offset-4 hover:text-[#f1e7ff]";
+
 /** One measure's hue, and its darker step for the tail (p90). */
 const MEASURE = "#b8a6d5";
 const TAIL = "#7f6ca6";
@@ -337,7 +340,7 @@ function WorkflowInsights({ repo, workflow, days }: { repo: string; workflow: st
       {d.critical_path && d.critical_path.jobs.length > 0 && (
         <p className="text-[13px] leading-[1.7] text-[#b0b4be]">
           The longest chain of the latest run,{" "}
-          <Link to={`/runs/${encodeURIComponent(d.critical_path.run)}`} className="text-link">
+          <Link to={`/runs/${encodeURIComponent(d.critical_path.run)}`} className={INLINE}>
             #{d.critical_path.number}
           </Link>
           : <span className="font-mono text-[12px] text-[#e4e5e7]">{d.critical_path.jobs.join(" → ")}</span>, {formatDuration(d.critical_path.seconds)}.
