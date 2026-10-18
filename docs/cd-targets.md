@@ -57,6 +57,7 @@ Agreed with the user on 2026-10-18:
 | D6 | Who deploys and approves | people, by default. Agents deploy and approve only where the user allows it, per environment (§6) |
 | D7 | Registries | Docker Hub to start; any number of registries; any OCI registry, private ones included, from the start (§7.1). kiln's own registry comes later |
 | D8 | Test accounts | real sandbox accounts per platform, created once with the user, for each provider's end-to-end tests |
+| D9 | Beyond Argo (asked 2026-10-18) | blue/green done properly on every platform with traffic control, Kubernetes natively: green beside blue with its own preview, checks before and after promotion that you write (HTTP probes, metrics, scripts, workflows, approvals) with criteria in `${{ }}` expressions, instant switch back while blue is kept (§5) |
 
 ## 1. The model
 
@@ -413,59 +414,127 @@ production:
 
 ## 5. Rollouts and verification
 
+kiln drives every rollout itself, the same way on every target. A rollout is a state machine in
+the engine's crate, recorded at each step and resumed after a restart. It moves traffic with the
+platform's own mechanism (D4), but the steps, the checks and the decisions are kiln's. So a
+blue/green with checks you write works alike on Lambda, Workers, Vercel, Cloud Run, Container
+Apps and Kubernetes (D9). That goes past Argo CD, which has no rollouts, and Argo Rollouts, which
+is Kubernetes only and judges with metric queries alone.
+
 **Strategies.**
 
 | Strategy | What happens |
 | --- | --- |
 | `all-at-once` | the default |
 | `rolling` | batches with a maximum unavailable, for instance-based targets |
-| `blue-green` | the new version starts beside the old; traffic switches after its checks pass; the old version stays for a while (`keep`) |
-| `canary` | steps |
+| `blue-green` | green starts beside blue with an address of its own; checks run against it, then traffic switches, then checks run against production; blue stays warm to switch back to |
+| `canary` | steps: weights, pauses, checks, approvals |
 | `linear` | equal steps, shorthand |
 
-**Steps.**
+**Blue/green** (D9):
 
-| Step | What it does |
+1. **Beside.** The sync deploys green beside blue. Blue keeps all the traffic.
+2. **Preview.** Green gets an address of its own (the table below), as `${{ rollout.preview_url }}`.
+3. **Before promotion.** The `before:` checks run against green, in order, or together with
+   `parallel: true`. A failure aborts: green never takes traffic. An inconclusive result pauses
+   for a person.
+4. **Promotion.** `promote: auto` switches once the checks pass. `promote: manual` waits for a
+   person (or an agent where its environment allows it, D6) to press **Promote**. `ramp: [10, 50]`
+   moves traffic in steps first, with the `after:` checks at each.
+5. **After promotion.** The `after:` checks run against production for `window` (10 minutes by
+   default). A failure switches traffic straight back to blue, which is still running.
+6. **Keep.** Blue stays warm for `keep` (30 minutes by default), then goes the platform's way:
+   Lambda and Workers versions stay (they cost nothing), Cloud Run and Container Apps revisions
+   keep no traffic, Kubernetes scales the old pods to zero, ECS removes the old task set.
+
+**Checks.** Named in a deploy file's `checks:` (an app's own `checks:` adds to them), and used by
+canary steps and blue/green phases. Each is one of:
+
+| Kind | What it does |
 | --- | --- |
-| `weight` | the share of traffic for the new version |
-| `pause` | a duration, or until someone promotes |
-| `analysis` | a named template passes |
-| `check` | an HTTP check, a CI workflow (smoke tests, W15-R06), or an attached agent's verdict (W15-R03 custom gates) |
-| `approve` | a person approves before the next step |
+| `http` | requests a URL with a method, headers and a body; measures the status, headers, body, JSON and latency. It runs from the server, or from runners matching `from:` (near a private target) |
+| `metric` | a query: Prometheus (kiln ships one), CloudWatch, Cloud Monitoring, Azure Monitor, Cloudflare's Workers analytics, Datadog (W11-R09) |
+| `script` | your script, inline or a file of the repository, run on a runner (`runs-on`, and `image:` for a container) at the revision, with the rollout in its environment. Exit 0 passes, 1 fails, 2 is inconclusive; lines `name=value` written to `$KILN_OUTPUT` are its result. Its log is a CI run's |
+| `workflow` | a workflow of the repository (smoke or end-to-end tests), dispatched at the revision with `inputs`; it passes when the run succeeds (W15-R06) |
+| `approve` | a person, or an allowed agent, says yes |
+| `agent` | an attached agent's verdict (W15-R03), later |
 
-**Analysis** reads Prometheus (kiln ships one), CloudWatch, Cloud Monitoring, Azure Monitor,
-Cloudflare's Workers analytics and Datadog (W11-R09). HTTP checks run from the server, or from a
-runner near the target. A template runs `count` times, `every` interval, and fails after
-`failures` misses, as Argo Rollouts' analysis does.
+Every check takes `count` measurements, `every` apart, after `delay`, within `timeout`, and
+tolerates `failures` misses and `inconclusive` unclear ones (then it pauses for a person).
+Criteria are yours: `pass:` and `fail:` are `${{ }}` expressions, the language workflows use,
+over `result` (what was measured) and `rollout` (`weight`, `phase`, `step`, `preview_url`,
+`stable_url`, `revision`, `previous_revision`, `app`, `environment`). A measurement neither
+criterion decides is inconclusive. Without criteria an `http` check passes on a 2xx status, a
+`script` on exit 0, a `workflow` on success.
+
+```yaml
+apps:
+  api:
+    aws-lambda: { function: api, code: "${{ artifacts.zip }}", url: { AuthType: NONE } }
+    rollout:
+      blue-green:
+        before: [smoke, e2e]
+        promote: auto
+        after: [errors]
+        window: 15m
+        keep: 1h
+checks:
+  smoke:
+    http:
+      url: "${{ rollout.preview_url }}/healthz"
+      headers: { x-check: kiln }
+    count: 5
+    every: 10s
+    pass: "${{ result.status == 200 && result.json.db == 'ok' && result.latency_ms < 300 }}"
+  e2e:
+    script:
+      run: ./ci/e2e.sh "$KILN_PREVIEW_URL"
+      runs-on: [linux]
+      timeout: 10m
+  errors:
+    metric:
+      cloudwatch: { namespace: AWS/Lambda, metric: Errors, dimensions: { FunctionName: api }, stat: Sum }
+    every: 1m
+    count: 10
+    failures: 1
+    fail: "${{ result > 5 }}"
+```
 
 **Failing or aborting** sends traffic straight back to the stable version, the platform's way:
-alias weight to 0, the deployment back to 100% of the old version, revision traffic back. kiln
-then records the sync as failed. With `auto-rollback: true` (the default for canary and
+the alias to its old version, the Worker's deployment back to 100% of the old version, the
+revision traffic back, the Service's selector back. kiln records the sync as failed with the
+check that failed and what it measured. With `auto-rollback: true` (the default for canary and
 blue/green), the app holds at its previous deployment, as a rollback does in cd.md, until git
 changes it again.
 
-**The rollout panel** shows during a rollout, on the app's page:
-- the weights, as a bar per version;
-- the steps, with each analysis result;
-- **Promote**, **Pause** and **Abort**, in place.
+**State.** The engine's sync deploys green; the rollout then moves traffic and runs the checks.
+The app reads `Progressing` while it runs, `Suspended` while it waits for a person, `Degraded`
+once it aborted. After a restart, a rollout resumes at the step it was in; checks in flight run
+again.
+
+**The rollout panel** shows on the app's page while a rollout runs, and after it as a record:
+- the weights, as a bar per version, and the preview's address;
+- the phases and steps, each check's measurements against its criteria, with the logs of
+  scripts and workflows;
+- **Promote**, **Pause**, **Resume**, **Abort** and **Retry**, in place.
 
 **Native or orchestrated** (D4):
 
-| Platform | Its own mechanism, which kiln drives and shows | kiln orchestrates |
-| --- | --- | --- |
-| ECS | rolling with the circuit breaker; blue/green, linear, canary (where available) | weights over two services' ALB target groups |
-| Lambda | alias weights, moved per step | — |
-| Beanstalk | its deployment policies, traffic splitting | — |
-| EC2 | Auto Scaling instance refresh with checkpoints | — |
-| Cloud Run, App Engine | traffic percentages, traffic splits | — |
-| Compute Engine | managed instance group canaries | — |
-| Container Apps | revision weights | — |
-| App Service, Functions | slot traffic %, swap | — |
-| Workers | gradual deployments | — |
-| Vercel | rolling releases | promotion and rollback |
-| Fly | — | rolling, blue/green, canary over machines |
-| Kubernetes | Argo Rollouts, when an app uses it | Gateway API weights (later) |
-| hosts, Compose, microVMs | — | batches across hosts |
+| Platform | Its own mechanism, which kiln drives | Green's preview | kiln orchestrates |
+| --- | --- | --- | --- |
+| Lambda | alias weights | a preview alias and its URL | the steps and checks |
+| Workers | gradual deployments | the version's preview URL | the steps and checks |
+| Vercel | staged production deployments, promotion | the deployment's URL | the steps and checks |
+| Cloud Run, App Engine | traffic percentages, traffic splits | a revision tag's URL | the steps and checks |
+| Container Apps | revision weights | a revision label's URL | the steps and checks |
+| App Service, Functions | slot traffic %, swap | the slot's URL | the steps and checks |
+| ECS | blue/green with lifecycle hooks, linear, canary; rolling with the circuit breaker | the load balancer's test listener | weights over two services' target groups where the native kind is missing |
+| Beanstalk | its deployment policies, traffic splitting | — | — |
+| EC2 | Auto Scaling instance refresh with checkpoints | — | — |
+| Compute Engine | managed instance group canaries | — | — |
+| Fly | — | the new machines' addresses | rolling, blue/green, canary over machines |
+| Kubernetes | Argo Rollouts, when an app uses it | a preview Service | blue/green natively: a green Deployment beside blue, a preview Service, the Service's selector switched; Gateway API weights for canaries |
+| hosts, Compose, microVMs | — | the new instance on each host | batches across hosts |
 
 ## 6. Identity and credentials
 
@@ -707,7 +776,7 @@ Every provider in §3 is in scope (D2). This is the order they are built in, not
 | --- | --- | --- |
 | **M0** | kiln deploys itself: §11 items 1 to 4; the registry; the self-deploy guard; take-over from Argo CD | §10's criteria |
 | **M1** | The provider framework: both halves, polling, budgets, tracking, health, tree, logs, events, discovery. W11's exchanges (AWS, Google Cloud, Azure `mint()`; token kinds). Providers `aws-ecs`, `aws-lambda`, `cloudflare-workers` (with Durable Objects), `vercel`. The builder (§8.2), import and shadow mode (§8.3) | per provider, against a real sandbox account: create, change, roll back, detect drift, shadow then take over |
-| **M2** | Rollouts and analysis (§5), with the rollout panel. Providers `gcp-run`, `gcp-functions`, `azure-containerapps`, `azure-functions`, `azure-appservice`, `host`, `compose` | a canary that fails its analysis rolls back, on each platform with traffic weights |
+| **M2** | Rollouts and checks (§5, D9): canary, linear and blue/green with previews and checks you write, the rollout panel, Kubernetes blue/green natively. Providers `gcp-run`, `gcp-functions`, `azure-containerapps`, `azure-functions`, `azure-appservice`, `host`, `compose` | on each platform with traffic control: a canary that fails a check rolls back; a blue/green whose before-check fails never takes traffic, and one whose after-check fails switches back to blue |
 | **M3** | `aws-ec2`, `aws-beanstalk`, `aws-static`, `gcp-appengine`, `gcp-compute`, `azure-vmss`, `azure-static`, `cloudflare-pages`, `netlify`, `fly`, `railway`, `render`, `heroku`, `digitalocean`, `nomad`, `microvm` | per provider, as M1 |
 | **M4** | `cloudformation`, `terraform` and OpenTofu, `pulumi` (D3), `job`; Argo Rollouts; Gateway API weights; previews on every provider that has them | plans show each tool's changes; a failed apply is recorded with its output |
 
