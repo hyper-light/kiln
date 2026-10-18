@@ -733,3 +733,38 @@ fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
         Err(_) => String::new(),
     }
 }
+
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn github_s_webhooks_and_posted_events_are_events_and_counts() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let now_s = crate_now() / 1000;
+    let iso = |s: i64| time::OffsetDateTime::from_unix_timestamp(s).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_default();
+    let push = json!({ "ref": "refs/heads/main", "compare": "https://github.com/acme/web/compare/a...b", "commits": [{}, {}, {}], "repository": { "full_name": "acme/web" }, "sender": { "login": "ada" } });
+    let run = json!({ "action": "completed", "workflow_run": { "name": "ci", "conclusion": "failure", "head_branch": "main", "run_started_at": iso(now_s - 120), "updated_at": iso(now_s), "html_url": "https://github.com/acme/web/actions/runs/1" }, "repository": { "full_name": "acme/web" }, "sender": { "login": "ada" } });
+    for (event, body) in [("push", &push), ("workflow_run", &run)] {
+        let (code, b) = raw(f.http, "POST", "/api/hooks/github", &format!("X-GitHub-Event: {event}\r\nX-GitHub-Delivery: d-{event}\r\nContent-Type: application/json\r\n"), &serde_json::to_vec(body)?)?;
+        anyhow::ensure!(code == 202, "the {event} webhook: {code} {}", String::from_utf8_lossy(&b));
+    }
+    f.call("POST", "/api/observe/v1/events", Some(&json!({ "title": "deploy of web 1.2.3", "text": "rolled out by ada", "tags": ["service:web", "env:prod"], "alert_type": "success", "source_type_name": "deployer" })))?;
+    let start = Instant::now();
+    loop {
+        let found = f.call("POST", "/api/observe/v1/events/search", Some(&json!({ "query": "*", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 20 })))?;
+        let msgs: Vec<String> = at(&found, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str().map(str::to_owned)).collect();
+        let has = |s: &str| msgs.iter().any(|m| m.contains(s));
+        if has("ada pushed 3 commit(s) to acme/web main") && has("acme/web ci failure") && has("deploy of web 1.2.3") {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(20), "events: {msgs:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let failed = f.call("POST", "/api/observe/v1/events/search", Some(&json!({ "query": "service:github status:error @conclusion:failure", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 5 })))?;
+    anyhow::ensure!(at(&failed, &["records"]).as_array().is_some_and(|a| a.len() == 1), "the failed run is an error event: {failed}");
+    let d = f.query("max:github.actions.run.duration{repo:acme/web} by {conclusion}", crate_now() - 600_000, crate_now() + 60_000)?;
+    anyhow::ensure!(d.values().any(|v| v.contains(&Some(120.0))), "the run's duration: {d:?}");
+    let agg = f.call("POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "query": "source:kiln.event", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "by": ["service"] })))?;
+    let by: BTreeMap<String, f64> = at(&agg, &["groups"]).as_array().into_iter().flatten().map(|g| (at(g, &["group", "service"]).as_str().unwrap_or("").to_owned(), at(g, &["value"]).as_f64().unwrap_or(0.0))).collect();
+    anyhow::ensure!(by.get("github") == Some(&2.0) && by.get("web") == Some(&1.0), "events counted by service: {by:?}");
+    Ok(())
+}

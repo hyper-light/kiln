@@ -139,6 +139,13 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             .await
         }
         (&Method::POST, ["logs", "search"]) => search(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::POST, ["logs", "aggregate"]) => aggregate(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::POST, ["events"]) => post_event(read_json(req.into_body(), QUERY_BODY).await?),
+        (&Method::POST, ["events", "search"]) => {
+            let mut b: SearchBody = read_json(req.into_body(), QUERY_BODY).await?;
+            b.query = if b.query.trim().is_empty() || b.query.trim() == "*" { "source:kiln.event".into() } else { format!("source:kiln.event ({})", b.query) };
+            search(b).await
+        }
         (&Method::GET, ["status"]) => Ok(srv::json(StatusCode::OK, &observe()?.view())),
         (&Method::POST, ["compact"]) => {
             observe()?.compact();
@@ -330,6 +337,100 @@ async fn search(body: SearchBody) -> Result<Response, Fail> {
         ))
     })
     .await
+}
+
+#[derive(Debug, Deserialize)]
+struct AggregateBody {
+    #[serde(default)]
+    query: String,
+    from: i64,
+    to: i64,
+    /// Facets: `service`, `host`, `source`, `status`, `@attribute`.
+    #[serde(default)]
+    by: Vec<String>,
+    /// `count` (default), `cardinality`, `sum`, `avg`, `min`, `max`.
+    #[serde(default)]
+    measure: Option<String>,
+    /// The facet or attribute measured (`@duration`).
+    #[serde(default)]
+    of: Option<String>,
+}
+
+/// Log analytics: `count() by {service}` and the like over a search and a range.
+async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
+    use kiln_obs::logs::store::{Facet, Measure};
+    let of = body.of.clone().unwrap_or_default().trim_start_matches('@').to_owned();
+    let need = |m: Measure| if of.is_empty() { Err(fail(StatusCode::BAD_REQUEST, "this measure needs `of`, the attribute it measures")) } else { Ok(m) };
+    let measure = match body.measure.as_deref().unwrap_or("count") {
+        "count" => Measure::Count,
+        "cardinality" => need(Measure::Cardinality(Facet::parse(&of)))?,
+        "sum" => need(Measure::Sum(of.clone()))?,
+        "avg" => need(Measure::Avg(of.clone()))?,
+        "min" => need(Measure::Min(of.clone()))?,
+        "max" => need(Measure::Max(of.clone()))?,
+        other => return Err(fail(StatusCode::BAD_REQUEST, format!("a measure: {other} (count, cardinality, sum, avg, min, max)"))),
+    };
+    let by: Vec<Facet> = body.by.iter().map(|f| Facet::parse(f)).collect();
+    reading(move |s| {
+        let started = std::time::Instant::now();
+        let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let ns = |ms: i64| ms.saturating_mul(1_000_000);
+        let agg = s.aggregate_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let names: Vec<String> = by.iter().map(Facet::name).collect();
+        let groups: Vec<Value> = agg.groups.iter().map(|(vals, v)| json!({ "group": names.iter().zip(vals).map(|(k, x)| (k.clone(), Value::from(x.clone()))).collect::<serde_json::Map<_, _>>(), "value": v })).collect();
+        Ok(srv::json(StatusCode::OK, &json!({ "groups": groups, "rows_scanned": agg.rows_scanned, "blocks_pruned": agg.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 })))
+    })
+    .await
+}
+
+/// An event as Datadog's events API takes one (v1): a title and a text, tags `key:value`, an
+/// alert type, its source and host, when it happened (seconds).
+#[derive(Debug, Deserialize)]
+struct EventIn {
+    title: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    /// `error`, `warning`, `info` (default), `success`.
+    #[serde(default)]
+    alert_type: Option<String>,
+    #[serde(default)]
+    source_type_name: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    date_happened: Option<i64>,
+    #[serde(default)]
+    aggregation_key: Option<String>,
+}
+
+fn post_event(e: EventIn) -> Result<Response, Fail> {
+    let o = observe()?;
+    if e.title.trim().is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "an event's title"));
+    }
+    let ts = e.date_happened.map_or_else(crate::util::now_ms, |s| s.saturating_mul(1000));
+    let severity = match e.alert_type.as_deref() {
+        Some("error") => 17,
+        Some("warning") => 13,
+        _ => 9,
+    };
+    let mut attrs: Vec<(String, String)> = vec![("event.type".into(), "custom".into()), ("title".into(), e.title.clone()), ("alert_type".into(), e.alert_type.clone().unwrap_or_else(|| "info".into()))];
+    if let Some(k) = &e.aggregation_key {
+        attrs.push(("aggregation_key".into(), k.clone()));
+    }
+    let mut service = String::new();
+    for t in &e.tags {
+        let (k, v) = t.split_once(':').unwrap_or((t.as_str(), ""));
+        if k == "service" {
+            service = v.to_owned();
+        }
+        attrs.push((k.to_owned(), v.to_owned()));
+    }
+    let message = if e.text.is_empty() { e.title.clone() } else { format!("{}\n\n{}", e.title, e.text) };
+    o.log(vec![Record { ts: ts.saturating_mul(1_000_000), severity, service, host: e.host.unwrap_or_default(), source: "kiln.event".into(), message, attrs: { attrs.push(("event.source".into(), e.source_type_name.unwrap_or_else(|| "api".into()))); attrs }, trace_id: None, span_id: None }]);
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "status": "ok" })))
 }
 
 fn hex<const N: usize>(b: [u8; N]) -> String {

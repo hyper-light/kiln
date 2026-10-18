@@ -2196,6 +2196,8 @@ async fn github_hook(hub: &Arc<Hub>, req: Request) -> R {
             return Err(err(StatusCode::UNAUTHORIZED, "bad signature"));
         }
     }
+    // What GitHub said, as events and metrics (`crate::observe::github`).
+    crate::observe::github::webhook(&event, &body);
     // Without the CI engine a webhook only hints; the poll decides what changed (GitOps: state
     // comes from git). With it, GitHub's payload reaches the workflows (docs/ci.md W03-R07).
     let hub = Arc::clone(hub);
