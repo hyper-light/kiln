@@ -1246,6 +1246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-measure"
+version = "0.1.0"
+source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "hyper-quic"
 version = "0.1.0"
 source = "git+https://github.com/hyper-light/hyper-raft?rev=767627fb9b15e9912aa4accb2d92db2d9518d6b1#767627fb9b15e9912aa4accb2d92db2d9518d6b1"
@@ -1560,6 +1569,14 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "yaml-rust2",
+]
+
+[[package]]
+name = "kiln-obs"
+version = "0.1.0"
+dependencies = [
+ "hyper-measure",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

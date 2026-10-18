@@ -1,0 +1,20 @@
+[package]
+name = "kiln-obs"
+description = "kiln's observability engine: columnar time series, logs and events, the query language, monitors' rules (docs/observe.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = "2.0.21"
+
+[dev-dependencies]
+hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+
+[[bench]]
+name = "codec"
+harness = false
+
+[lints]
+workspace = true
