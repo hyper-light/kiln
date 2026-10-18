@@ -1070,39 +1070,59 @@ fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, ma
     // In the order of the series' fingerprints, the same on every replica: each group's buckets
     // summed in one order everywhere.
     ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
-    // Groups by the query's tags, each its buckets' series: (id, scale, bucket).
-    let mut groups: std::collections::BTreeMap<Vec<(String, String)>, Vec<(u32, i32, crate::dist::Bucket)>> = std::collections::BTreeMap::new();
+    // Groups by the query's tags' values, each its buckets' series: (id, scale, bucket). The key
+    // built in one buffer, copied only for a new group.
+    let mut groups: std::collections::BTreeMap<Vec<&str>, Vec<(u32, i32, crate::dist::Bucket)>> = std::collections::BTreeMap::new();
+    let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
     for &id in &ids {
         let Some(s) = store.series(id) else { continue };
         let Some((scale, b)) = s.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value) else { continue };
-        let tags: Vec<(String, String)> = q.by.iter().map(|k| (k.clone(), s.tag(k).unwrap_or("N/A").to_owned())).collect();
-        let n = groups.len();
-        let entry = groups.entry(tags);
-        if matches!(entry, std::collections::btree_map::Entry::Vacant(_)) && n >= max_series {
-            return Err(QueryError::TooManySeries(n + 1, max_series));
+        key.clear();
+        key.extend(q.by.iter().map(|k| s.tag(k).unwrap_or("N/A")));
+        if let Some(members) = groups.get_mut(key.as_slice()) {
+            members.push((id, scale, b));
+            continue;
         }
-        entry.or_default().push((id, scale, b));
+        if groups.len() >= max_series {
+            return Err(QueryError::TooManySeries(groups.len() + 1, max_series));
+        }
+        groups.insert(key.clone(), vec![(id, scale, b)]);
     }
     let mut out = Vec::with_capacity(groups.len());
-    for (tags, members) in groups {
-        let (scale, by_bucket) = dist_counts(store, q, grid, spans, &members, scratch, scanned)?;
+    let mut table = DistTable::default();
+    let mut totals = vec![0.0; grid.n];
+    let q01 = (p / 100.0).clamp(0.0, 1.0);
+    for (values, members) in groups {
+        let scale = dist_counts(store, q, grid, spans, &members, scratch, scanned, &mut table)?;
+        let tags = q.by.iter().zip(values).map(|(k, v)| (k.clone(), v.to_owned())).collect();
         // Each bucket of time: the rank's bucket, DDSketch's way (`crate::dist::Merged::quantile`).
-        let q01 = (p / 100.0).clamp(0.0, 1.0);
-        let values: Vec<f64> = (0..grid.n)
-            .map(|i| {
-                let total: f64 = by_bucket.values().map(|(_, c)| c.get(i).copied().unwrap_or(0.0)).sum();
+        totals.fill(0.0);
+        for &row in &table.sorted {
+            for (t, c) in totals.iter_mut().zip(table.counts(row)) {
+                *t += c;
+            }
+        }
+        let values: Vec<f64> = totals
+            .iter()
+            .enumerate()
+            .map(|(i, &total)| {
                 if total <= 0.0 {
                     return f64::NAN;
                 }
                 let rank = q01 * (total - 1.0).max(0.0);
-                let mut seen = 0.0;
-                for (b, c) in by_bucket.values() {
-                    seen += c.get(i).copied().unwrap_or(0.0);
+                let (mut seen, mut last) = (0.0, f64::NAN);
+                for &row in &table.sorted {
+                    let c = table.counts(row).get(i).copied().unwrap_or(0.0);
+                    if c <= 0.0 {
+                        continue;
+                    }
+                    last = table.buckets.get(row).map_or(f64::NAN, |b| b.value(scale));
+                    seen += c;
                     if rank < seen {
-                        return b.value(scale);
+                        return last;
                     }
                 }
-                by_bucket.values().next_back().map_or(f64::NAN, |(b, _)| b.value(scale))
+                last
             })
             .collect();
         out.push(Series { tags, values, bounds: None, outlier: None });
@@ -1110,16 +1130,90 @@ fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, ma
     Ok(out)
 }
 
-/// A distribution's buckets in a bucket of time each: `members`' (series id, scale, bucket),
-/// each made the coarsest scale's among them, their counts summed; the scale and the buckets by
-/// their order.
-fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, members: &[(u32, i32, crate::dist::Bucket)], scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<(i32, DistCounts), QueryError> {
+/// A distribution's buckets, each its counts in each bucket of time: one table, its room kept from
+/// group to group (a query by host allocates for its largest group, not for each bucket of each).
+#[derive(Debug, Default)]
+struct DistTable {
+    n: usize,
+    buckets: Vec<crate::dist::Bucket>,
+    /// `counts[row * n + t]`.
+    counts: Vec<f64>,
+    rows: HashMap<(u8, i64), usize>,
+    /// The rows, ascending by value.
+    sorted: Vec<usize>,
+    ts: Vec<i64>,
+    vs: Vec<f64>,
+    each: Vec<f64>,
+}
+
+impl DistTable {
+    fn clear(&mut self, n: usize) {
+        self.n = n;
+        self.buckets.clear();
+        self.counts.clear();
+        self.rows.clear();
+        self.sorted.clear();
+    }
+
+    /// `b`'s row, made if new.
+    fn row(&mut self, b: crate::dist::Bucket) -> usize {
+        let Self { n, buckets, counts, rows, .. } = self;
+        *rows.entry(b.order()).or_insert_with(|| {
+            buckets.push(b);
+            counts.resize(counts.len() + *n, 0.0);
+            buckets.len() - 1
+        })
+    }
+
+    fn counts(&self, row: usize) -> &[f64] {
+        self.counts.get(row * self.n..(row + 1) * self.n).unwrap_or(&[])
+    }
+
+    /// Adds `from` to `row`'s counts, each positive finite one.
+    fn add(&mut self, row: usize, from: &[f64]) {
+        if let Some(counts) = self.counts.get_mut(row * self.n..(row + 1) * self.n) {
+            for (c, v) in counts.iter_mut().zip(from) {
+                if v.is_finite() && *v > 0.0 {
+                    *c += v;
+                }
+            }
+        }
+    }
+
+    /// Adds a count series' samples to `row`, each in its bucket of time (what `rollup` sums for
+    /// it, without a pass over every bucket of time for each series).
+    fn add_samples(&mut self, row: usize, spans: Spans<'_>, ts: &[i64], vs: &[f64]) {
+        let Some(counts) = self.counts.get_mut(row * self.n..(row + 1) * self.n) else { return };
+        for (&t, &v) in ts.iter().zip(vs) {
+            if v.is_finite()
+                && v > 0.0
+                && let Some(c) = spans.index(t).and_then(|i| counts.get_mut(i))
+            {
+                *c += v;
+            }
+        }
+    }
+
+    /// The rows in order, once filled.
+    fn sort(&mut self) {
+        let Self { buckets, sorted, .. } = self;
+        sorted.clear();
+        sorted.extend(0..buckets.len());
+        sorted.sort_unstable_by_key(|&r| buckets.get(r).map(|b| b.order()));
+    }
+}
+
+/// A distribution's buckets in a bucket of time each, into `table`: `members`' (series id, scale,
+/// bucket), each made the coarsest scale's among them, their counts summed; the scale.
+#[allow(clippy::too_many_arguments)]
+fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, members: &[(u32, i32, crate::dist::Bucket)], scratch: &mut Scratch, scanned: &mut (u64, u64), table: &mut DistTable) -> Result<i32, QueryError> {
     let counted = MetricQuery { mode: Some(CountMode::Count), rollup: Some((Rollup::Sum, None)), calendar: None, weighted: false, fill: None, ..q.clone() };
     let (from, end) = (spans.start(0), spans.start(grid.n));
-    let (mut ts, mut vs) = (Vec::new(), Vec::new());
-    let mut buckets = vec![f64::NAN; grid.n];
     let scale = members.iter().map(|m| m.1).min().unwrap_or(crate::dist::SCALE);
-    let mut by_bucket = DistCounts::new();
+    table.clear(grid.n);
+    let (mut ts, mut vs, mut each) = (std::mem::take(&mut table.ts), std::mem::take(&mut table.vs), std::mem::take(&mut table.each));
+    each.clear();
+    each.resize(grid.n, f64::NAN);
     for &(id, at, b) in members {
         let Some(s) = store.series(id) else { continue };
         ts.clear();
@@ -1128,20 +1222,18 @@ fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, mem
         store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
         scanned.0 += 1;
         scanned.1 += ts.len() as u64;
-        rollup(s.kind(), &counted, spans, &ts, &vs, &mut buckets, None);
-        let coarse = b.coarser(u32::try_from(at - scale).unwrap_or(0));
-        let counts = &mut by_bucket.entry(coarse.order()).or_insert_with(|| (coarse, vec![0.0; grid.n])).1;
-        for (c, v) in counts.iter_mut().zip(&buckets) {
-            if v.is_finite() && *v > 0.0 {
-                *c += v;
-            }
+        let row = table.row(b.coarser(u32::try_from(at - scale).unwrap_or(0)));
+        if s.kind() == Kind::Count {
+            table.add_samples(row, spans, &ts, &vs);
+        } else {
+            rollup(s.kind(), &counted, spans, &ts, &vs, &mut each, None);
+            table.add(row, &each);
         }
     }
-    Ok((scale, by_bucket))
+    (table.ts, table.vs, table.each) = (ts, vs, each);
+    table.sort();
+    Ok(scale)
 }
-
-/// Buckets by their order, each its count a bucket of time.
-type DistCounts = std::collections::BTreeMap<(u8, i64), (crate::dist::Bucket, Vec<f64>)>;
 
 /// A heatmap of a query (`docs/observe.md` §6): each bucket of time, how many values fell in each
 /// row. A distribution's rows are its buckets, merged across its series and made coarser a scale
@@ -1178,22 +1270,21 @@ pub fn heatmap(store: &Store, req: &Request<'_>, rows: usize) -> Result<Heatmap,
         store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
         ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
         let members: Vec<(u32, i32, crate::dist::Bucket)> = ids.iter().filter_map(|&id| store.series(id)?.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value).map(|(s, b)| (id, s, b))).collect();
-        let (mut scale, mut by_bucket) = dist_counts(store, q, grid, spans, &members, &mut Scratch::default(), &mut (0, 0))?;
+        let (mut table, mut coarser) = (DistTable::default(), DistTable::default());
+        let mut scale = dist_counts(store, q, grid, spans, &members, &mut Scratch::default(), &mut (0, 0), &mut table)?;
         // Coarser until the rows fit: each step halves the buckets of each sign, exactly.
-        while by_bucket.len() > rows && scale > crate::dist::MIN_SCALE {
+        while table.buckets.len() > rows && scale > crate::dist::MIN_SCALE {
             scale -= 1;
-            let mut coarser = DistCounts::new();
-            for (b, c) in std::mem::take(&mut by_bucket).into_values() {
-                let b = b.coarser(1);
-                let into = &mut coarser.entry(b.order()).or_insert_with(|| (b, vec![0.0; grid.n])).1;
-                for (x, y) in into.iter_mut().zip(c) {
-                    *x += y;
-                }
+            coarser.clear(grid.n);
+            for (row, &b) in table.buckets.iter().enumerate() {
+                let into = coarser.row(b.coarser(1));
+                coarser.add(into, table.counts(row));
             }
-            by_bucket = coarser;
+            coarser.sort();
+            std::mem::swap(&mut table, &mut coarser);
         }
-        let rows: Vec<(f64, f64)> = by_bucket.values().map(|(b, _)| b.bounds(scale)).collect();
-        let counts = (0..grid.n).map(|t| by_bucket.values().map(|(_, c)| c.get(t).copied().unwrap_or(0.0)).collect()).collect();
+        let rows: Vec<(f64, f64)> = table.sorted.iter().filter_map(|&r| table.buckets.get(r).map(|b| b.bounds(scale))).collect();
+        let counts = (0..grid.n).map(|t| table.sorted.iter().map(|&r| table.counts(r).get(t).copied().unwrap_or(0.0)).collect()).collect();
         return Ok(Heatmap { grid, rows, counts, distribution: true });
     }
     let a = eval(store, req)?;

@@ -778,8 +778,8 @@ time range and the search in the address (a page is a link).
 - **Live**: the hosts' samples of the last hour at 5 s, streamed (what the Metrics page was); before
   that, the Hosts dashboard.
 
-Every chart is uPlot, already kiln's. To come: distribution and heatmap widgets; series reduced to
-the chart's width with largest-triangle-three-buckets (Steinarsson 2013) when a range holds more
+Every chart is uPlot, already kiln's, but the heatmap and the distribution, drawn on a canvas. To
+come: series reduced to the chart's width with largest-triangle-three-buckets (Steinarsson 2013) when a range holds more
 buckets than pixels (today the query's `points` bounds them: 240 a chart).
 
 ## 12. Measurements
@@ -898,6 +898,31 @@ store, parse and evaluation, is the bench's first table (`rollup(avg, 60)` 8 and
 sized to their quote, one allocation, not one and a growth). `weighted()` reads at most 64 of a
 series' gaps, spread over it, for its interval: a median of 64 has a standard error of 0.16 of the
 gaps' spread, and a series that reports at an interval has gaps all but equal.
+
+Distributions (§4.4), the bench's second table, a store of its own: 50 hosts' latencies, each
+host's log-normal (σ 0.5, its median 18 ms to 135 ms by host), 100 values every 10 s for an hour,
+posted as `kiln_obs::dist::series_of` writes them: 8,600 bucket series (172 a host), 1.07 M of their
+samples, and beside them a gauge read as often (100 samples every 10 s a host, 1.8 M). Each query
+over the hour at 120 points, fifteen runs; the same binary before and after run in turn three times
+(load average 33–34):
+
+| query | series | samples | p50 | allocations |
+| --- | --- | --- | --- | --- |
+| `p99:lat{*}` | 1 | 1.07 M | 14.0–15.9 ms (18.4–21.9 before) | 67 (355 at first) |
+| `p99:lat{*} by {host}` | 50 | 1.07 M | 17.9–19.2 ms (22.9–25.8) | 862 (36,500 at first) |
+| `avg:lat{*}` (its sums over its counts) | 1 | 36,000 | 0.22 ms | 55 |
+| `p99:lat{*}`, a heatmap of 40 rows | 38 rows | 1.07 M | 13.6–15.7 ms (18.3–23.9) | 209 (767 at first) |
+| `avg:plain{*}`, the gauge | 1 | 1.8 M | 10.0–10.5 ms (the same) | 41 |
+
+A distribution's buckets are one table (`DistTable`): each bucket a row of counts, their room kept
+from group to group, the rows ordered once a group; a group's key is the tags' values borrowed from
+the store, copied only for a new group (each bucket series built its own tags at first, three
+allocations each). A bucket series is a count, so each of its samples goes straight into its row's
+bucket of time, not through `rollup`'s 120 buckets a series and a second pass over them (−20 to
+−27%). What remains is decoding (over half the profile): a bucket series holds a count only in the
+steps a value fell in its bucket, so its times are irregular and each costs more bits and branches
+than a gauge's (14 ns a sample here against the gauge's 5.6). A rollup tier (§0, O-10) is what
+would read fewer of them over long ranges.
 
 ### 12.6 Log text: LZ4 against deflate
 
