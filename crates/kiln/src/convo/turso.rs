@@ -257,6 +257,7 @@ fn like(word: &str) -> String {
 /// The statements a transaction writes with, prepared once for it.
 struct Writes {
     session: Statement,
+    machine: Statement,
     open: Statement,
     close: Statement,
     event: Statement,
@@ -274,6 +275,7 @@ impl Turso {
     fn writes(&self) -> anyhow::Result<Writes> {
         Ok(Writes {
             session: self.prepare(sql::SESSION_UPSERT)?,
+            machine: self.prepare(sql::SESSION_MACHINE)?,
             open: self.prepare(sql::SESSION_OPEN)?,
             close: self.prepare(sql::SESSION_CLOSE)?,
             event: self.prepare(sql::EVENT_UPSERT)?,
@@ -328,6 +330,8 @@ impl Turso {
                 self.run(&mut w.records_reset, &[txt(session), txt(source)], none)?;
                 self.run(&mut w.dropped, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
             }
+            // Where it runs isn't a write of its own: it goes with the session's row.
+            Row::Machine { session, machine } => self.run(&mut w.machine, &[txt(session), txt(machine)], none)?,
         }
         Ok(())
     }
@@ -386,6 +390,9 @@ impl Engine for Turso {
                 let mut rows = vec![Row::Session { session: id.clone(), info: s(r, 1), meta: s(r, 2), state: s(r, 3), changes: s(r, 4), epoch: Some(epoch), open: closed.is_none(), at: r.get::<i64>(5).unwrap_or(0) }];
                 if let Some(at) = closed {
                     rows.push(Row::Closed { session: id.clone(), at });
+                }
+                if let Some(machine) = s(r, 9) {
+                    rows.push(Row::Machine { session: id.clone(), machine });
                 }
                 Ok((u(r, 8), id, rows, Some(epoch)))
             })?,
@@ -446,13 +453,13 @@ impl Engine for Turso {
         Ok(out)
     }
 
-    fn take(&mut self, peer: &str, machine: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+    fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {
         let have = self.peer(peer)?;
         if from != have || batch.upto < from {
             return Ok(Took { rev: have, gap: true, ..Took::default() });
         }
         let now = crate::util::now_ms();
-        let (peer, machine) = (peer.to_owned(), machine.to_owned());
+        let (peer, machine) = (peer.to_owned(), machine.map(str::to_owned));
         self.transaction(|t| {
             let mut w = t.writes()?;
             let mut epochs: HashMap<String, u64> = HashMap::new();
@@ -485,12 +492,14 @@ impl Engine for Turso {
                 took.applied += 1;
             }
             // Where each session it brought runs: the machine of this feed (a former writer's
-            // rows, left out, don't say so).
-            let mut at = t.prepare(sql::SESSION_MACHINE)?;
-            for (session, epoch) in &epochs {
-                let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
-                if theirs {
-                    t.run(&mut at, &[txt(session), txt(&machine)], |_| Ok(()))?;
+            // rows, left out, don't say so). A mirror's feed says it in its rows instead.
+            if let Some(machine) = &machine {
+                let mut at = t.prepare(sql::SESSION_MACHINE)?;
+                for (session, epoch) in &epochs {
+                    let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
+                    if theirs {
+                        t.run(&mut at, &[txt(session), txt(machine)], |_| Ok(()))?;
+                    }
                 }
             }
             let mut set = t.prepare(sql::PEER_SET)?;

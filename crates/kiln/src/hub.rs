@@ -211,6 +211,7 @@ impl Hub {
             std::env::var("KILN_GENERATION").ok().and_then(|g| g.parse().ok()).unwrap_or(1);
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
+        let harness = crate::harness::registry::Registry::with(harness_dir, &cfg.conversations);
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
         let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
         let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
@@ -228,7 +229,7 @@ impl Hub {
             events: Broadcast::new(4096),
             terms: Mutex::new(HashMap::new()),
             terminals: crate::termsess::Sessions::new(),
-            harness: crate::harness::registry::Registry::new(harness_dir),
+            harness,
             ai_sessions: Mutex::new(HashMap::new()),
             ai_requests: Mutex::new(HashMap::new()),
             ai_seq: AtomicU64::new(1),
@@ -299,6 +300,27 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    /// The runners that could keep a copy of the conversation store, as they are now: the
+    /// mirrors are picked again from them, and fed (`crate::convo::mirror`).
+    fn mirrors_seen(&self) {
+        let Some(m) = &self.harness.copies else { return };
+        let candidates: Vec<crate::convo::mirror::Candidate> = {
+            let agents = self.agents.lock();
+            let inst = self.instances.lock();
+            agents
+                .values()
+                .filter(|a| a.connected && !a.ephemeral && !a.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
+                .filter_map(|a| {
+                    let peer = inst.newest_with(&a.name, proto::CAP_CONVO)?;
+                    let connected_at = inst.get(peer).map_or(0, |i| i.connected_at);
+                    let disk_free = a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used));
+                    Some(crate::convo::mirror::Candidate { machine: a.name.clone(), peer, connected_at, disk_free })
+                })
+                .collect()
+        };
+        m.connected(candidates);
     }
 
     /// What a machine's runner said on the sync lane: of its copies (to the groups), of the git
@@ -670,6 +692,9 @@ impl Hub {
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
                 let lost = self.instances.lock().lost(peer);
+                if let (Some(name), Some(m)) = (&name, &self.harness.copies) {
+                    m.disconnected(name, peer);
+                }
                 if let Some(name) = name {
                     // Sync moves to another runner process of the machine that syncs, if any.
                     let syncing = self.instances.lock().newest_with(&name, proto::CAP_SYNC).is_some();
@@ -905,13 +930,23 @@ impl Hub {
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
                 }
+                if caps & proto::CAP_CONVO != 0 {
+                    self.mirrors_seen();
+                }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::Convo { json, data } => {
-                if let Some(f) = &self.harness.feed {
-                    f.heard(peer, &agent, json, data);
+                // About the server's own store: a mirror's answer. Else the runner's own store's feed.
+                let msg = crate::convo::feed::decode(&json);
+                match (&self.harness.copies, msg) {
+                    (Some(m), Some(msg)) if msg.store() == m.store_id() => m.heard(&agent, msg),
+                    _ => {
+                        if let Some(f) = &self.harness.feed {
+                            f.heard(peer, &agent, json, data);
+                        }
+                    }
                 }
             }
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
