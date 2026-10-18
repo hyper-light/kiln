@@ -57,6 +57,27 @@ pub const BUILTINS: &[Builtin] = &[
         outputs: &[("kind", "The integration's kind."), ("env", "The variables set, comma-separated.")],
     },
     Builtin {
+        name: "attest",
+        description: "Attest what the job built (W18): SLSA v1.0 provenance the server makes from its own records of the run, which the job's steps can't write, and an SBOM of the working directory's lockfiles when asked, signed by the server as Sigstore bundles (beside each file as `<file>.sigstore.json`). kiln's way to attest: `actions/attest-build-provenance` works only with a Fulcio that trusts kiln's OIDC issuer.",
+        inputs: &[
+            input("subject-path", "Files: patterns, one a line, from the working directory.", None),
+            input("subject-name", "A subject named by hand, with `subject-digest`.", None),
+            input("subject-digest", "That subject's digest: `sha256:<hex>`.", None),
+            input("subject-checksums", "A `sha256sum` list (a file): each line a subject.", None),
+            input("subject-image", "Images, one a line: their digests from the runner's container engine, or a reference's own `@sha256:`.", None),
+            input("subjects", "kiln's: files or images, one a line (as a job's `attest.subjects`).", None),
+            input("provenance", "Attest SLSA v1.0 provenance.", Some("true")),
+            input("sbom", "Also attest an SBOM: `spdx` (or `true`), `cyclonedx`, or `false`.", Some("false")),
+        ],
+        outputs: &[
+            ("bundle-path", "The provenance's Sigstore bundle (the SBOM's, when it is the only one)."),
+            ("sbom-path", "The SBOM."),
+            ("sbom-bundle-path", "The SBOM attestation's bundle."),
+            ("attestation-id", "The provenance's id."),
+            ("attestation-url", "Where the run lists its attestations."),
+        ],
+    },
+    Builtin {
         name: "notify",
         description: "Send a message through the repository's channels: Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie or a webhook (W19).",
         inputs: &[

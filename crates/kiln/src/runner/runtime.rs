@@ -429,6 +429,12 @@ fn refuses_ghes(dir: &Path, scripts: &[&str]) -> bool {
 }
 
 impl State {
+    /// A runner path as the leg's steps see it (in the job container, its mount).
+    fn seen(&self, p: &Path) -> String {
+        let s = p.to_string_lossy();
+        self.containers.as_ref().and_then(|c| c.job.as_ref()).map_or_else(|| s.to_string(), |j| j.map.translate(&s))
+    }
+
     /// `s` with [`NOT_GHES`] put back to the real server.
     fn unfake(&self, s: &str) -> String {
         s.replace(NOT_GHES, &self.server_url)
@@ -1441,14 +1447,7 @@ impl Leg {
         };
         // Patterns are the working directory's; the workspace is what they may reach.
         let root = st.layout.workspace.clone();
-        let rel = wd.strip_prefix(&root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
-        let patterns: Vec<String> = patterns
-            .iter()
-            .map(|p| {
-                let (neg, body) = p.strip_prefix('!').map_or(("", p.as_str()), |b| ("!", b));
-                if Path::new(body).is_absolute() || rel.is_empty() { p.clone() } else { format!("{neg}{rel}/{body}") }
-            })
-            .collect();
+        let patterns = from_wd(&root, wd, &patterns);
         let files = match super::hashfiles::Workspace::new(&root).and_then(|w| w.matching(&patterns)) {
             Ok(f) => f,
             Err(e) => {
@@ -2187,6 +2186,18 @@ impl Leg {
     }
 }
 
+/// Patterns of the working directory `wd` as the workspace's (`!` negations kept).
+fn from_wd(root: &Path, wd: &Path, patterns: &[String]) -> Vec<String> {
+    let rel = wd.strip_prefix(root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+    patterns
+        .iter()
+        .map(|p| {
+            let (neg, body) = p.strip_prefix('!').map_or(("", p.as_str()), |b| ("!", b));
+            if Path::new(body).is_absolute() || rel.is_empty() { p.clone() } else { format!("{neg}{rel}/{body}") }
+        })
+        .collect()
+}
+
 /// GitHub's input variable: `INPUT_<NAME>`, upper-cased, spaces as `_` (hyphens kept).
 fn input_var(name: &str) -> String {
     format!("INPUT_{}", name.replace(' ', "_").to_uppercase())
@@ -2468,9 +2479,170 @@ impl Leg {
                 // It fails only when no channel took it.
                 sent > 0
             }
+            "attest" => {
+                outputs = self.attest(st, idx, &with, wd).await?;
+                true
+            }
             other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
         };
         Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })
+    }
+
+    /// `kiln/attest@v1` (W18-R01, R02): the subjects' digests are reported over the runner's own
+    /// channel (and the SBOM uploaded under the report's random name); the server makes and signs
+    /// the statements from its own records, and their bundles come back to `$RUNNER_TEMP` and
+    /// beside each file (`<file>.sigstore.json`).
+    async fn attest(&self, st: &mut State, idx: u32, with: &BTreeMap<String, String>, wd: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+        use super::attest as at;
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let lines = |k: &str| get(k).map(|v| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+        let root = st.layout.workspace.clone();
+        let mut subjects: Vec<kiln_ci::attest::Subject> = Vec::new();
+        let mut beside: Vec<PathBuf> = Vec::new();
+        // Files, by patterns from the working directory; kiln's `subjects` are files when one
+        // matches, else images.
+        let mut images = lines("subject-image");
+        let mut patterns: Vec<(String, bool)> = lines("subject-path").into_iter().map(|p| (p, true)).collect();
+        for s in lines("subjects") {
+            if at::is_image(&s) {
+                images.push(s);
+            } else {
+                patterns.push((s, false));
+            }
+        }
+        let ws = super::hashfiles::Workspace::new(&root).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+        for (pattern, must) in patterns {
+            let files = ws.matching(&from_wd(&root, wd, std::slice::from_ref(&pattern))).map_err(|e| anyhow::anyhow!("`{pattern}`: {}", e.message))?;
+            if files.is_empty() {
+                anyhow::ensure!(!must, "no file matched `{pattern}`");
+                images.push(pattern);
+                continue;
+            }
+            for f in files {
+                let full = root.join(&f);
+                let p = full.clone();
+                let hex = crate::rt::blocking(move || at::sha256_file(&p)).await??;
+                let name = full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(f);
+                subjects.push(at::subject(&name, &format!("sha256:{hex}")).map_err(anyhow::Error::msg)?);
+                beside.push(full);
+            }
+        }
+        match (get("subject-name"), get("subject-digest")) {
+            (Some(n), Some(d)) => subjects.push(at::subject(&n, &d).map_err(anyhow::Error::msg)?),
+            (None, None) => {}
+            _ => anyhow::bail!("`subject-name` and `subject-digest` go together"),
+        }
+        if let Some(list) = get("subject-checksums") {
+            let path = if Path::new(&list).is_absolute() { PathBuf::from(&list) } else { wd.join(&list) };
+            let text = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("`{list}`: {e}"))?;
+            subjects.extend(at::checksums(&text).map_err(anyhow::Error::msg)?);
+        }
+        for r in images {
+            subjects.push(self.image_subject(st, idx, &r).await?);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        subjects.retain(|s| seen.insert((s.name.clone(), s.digest.clone())));
+        let provenance = get("provenance").is_none_or(|v| v != "false");
+        let sbom = match get("sbom").as_deref() {
+            None | Some("false") => None,
+            Some("true" | "spdx") => Some("spdx"),
+            Some("cyclonedx") => Some("cyclonedx"),
+            Some(other) => anyhow::bail!("`sbom: {other}`: say `spdx`, `cyclonedx` or `false`"),
+        };
+        anyhow::ensure!(provenance || sbom.is_some(), "nothing to attest: `provenance: false` and no `sbom`");
+        anyhow::ensure!(!subjects.is_empty() || !provenance, "nothing to attest: name `subject-path`, `subject-name` and `subject-digest`, `subject-checksums`, `subject-image` or `subjects`");
+        anyhow::ensure!(subjects.len() <= crate::ci::attest::MAX_SUBJECTS, "{} subjects: a statement names at most {}", subjects.len(), crate::ci::attest::MAX_SUBJECTS);
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let dir = st.layout.temp.join("_kiln_attest").join(&nonce);
+        let d = dir.clone();
+        crate::rt::blocking(move || std::fs::create_dir_all(d)).await??;
+        let base = self.a.runtime.results_url.trim_end_matches('/').to_owned();
+        let token = self.a.runtime.runtime_token.clone();
+        let mut outputs = BTreeMap::new();
+        if let Some(format) = sbom {
+            let gh = &self.a.contexts.github;
+            let name = gh.get("repository").and_then(serde_json::Value::as_str).unwrap_or("workspace").to_owned();
+            let doc = crate::ci::sbom::document(wd, &name, gh.get("sha").and_then(serde_json::Value::as_str), format).await?;
+            // SPDX's packages start with the one it describes.
+            let count = match doc.get("packages").and_then(serde_json::Value::as_array) {
+                Some(p) => p.len().saturating_sub(1),
+                None => doc.get("components").and_then(serde_json::Value::as_array).map_or(0, Vec::len),
+            };
+            let body = serde_json::to_vec(&doc)?;
+            let file = dir.join(if format == "spdx" { "sbom.spdx.json" } else { "sbom.cdx.json" });
+            std::fs::write(&file, &body)?;
+            let resp = self.http.post(&format!("{base}/_kiln/attestations/sbom?nonce={nonce}")).bearer(&token).header("content-type", "application/json").body(body).timeout(Duration::from_secs(300)).send().await?;
+            anyhow::ensure!(resp.is_success(), "the server refused the SBOM: HTTP {}", resp.status());
+            self.note(idx, &format!("SBOM ({format}): {count} packages, from the lockfiles under {}", wd.display())).await;
+            outputs.insert("sbom-path".to_owned(), st.seen(&file));
+        }
+        for s in &subjects {
+            let digest = s.digest.iter().next().map(|(a, h)| format!("{a}:{}", h.get(..16).unwrap_or(h))).unwrap_or_default();
+            self.note(idx, &format!("{} ({digest}…)", s.name)).await;
+        }
+        self.event(&JobEventV2::Attest { idx, nonce: nonce.clone(), subjects, provenance, sbom: sbom.is_some() }).await;
+        // The server signs as the report arrives: its bundles, when they're there.
+        let want = usize::from(provenance) + usize::from(sbom.is_some());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let list = loop {
+            let resp = self.http.get(&format!("{base}/_kiln/attestations?nonce={nonce}")).bearer(&token).timeout(Duration::from_secs(30)).send().await?;
+            if resp.is_success() {
+                let v: serde_json::Value = serde_json::from_slice(&resp.bytes(64 << 20).await?).unwrap_or_default();
+                let list = v.get("attestations").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+                if list.len() >= want {
+                    break list;
+                }
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the server made no attestation in a minute (its log says why)");
+            crate::rt::sleep(Duration::from_millis(250)).await;
+        };
+        let pretty = |b: &serde_json::Value| serde_json::to_vec_pretty(b).unwrap_or_default();
+        for a in &list {
+            let (kind, bundle) = (a.get("predicate_type").and_then(serde_json::Value::as_str).unwrap_or_default(), a.get("bundle").cloned().unwrap_or_default());
+            if kind == kiln_ci::attest::PROVENANCE {
+                let file = dir.join("provenance.sigstore.json");
+                std::fs::write(&file, pretty(&bundle))?;
+                for f in &beside {
+                    let mut b = f.clone().into_os_string();
+                    b.push(".sigstore.json");
+                    std::fs::write(PathBuf::from(b), pretty(&bundle))?;
+                }
+                outputs.insert("bundle-path".to_owned(), st.seen(&file));
+                outputs.insert("attestation-id".to_owned(), a.get("id").map(ToString::to_string).unwrap_or_default());
+                self.note(idx, &format!("provenance signed by the server{}", if beside.is_empty() { String::new() } else { format!(", beside each file as <file>.sigstore.json ({})", beside.len()) })).await;
+            } else {
+                let file = dir.join("sbom.sigstore.json");
+                std::fs::write(&file, pretty(&bundle))?;
+                outputs.entry("bundle-path".to_owned()).or_insert_with(|| st.seen(&file));
+                outputs.insert("sbom-bundle-path".to_owned(), st.seen(&file));
+                self.note(idx, "SBOM signed by the server").await;
+            }
+        }
+        let gh = &self.a.contexts.github;
+        let at = |k: &str| gh.get(k).and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        outputs.insert("attestation-url".to_owned(), format!("{}/api/ci/runs/{}/attestations", at("server_url").trim_end_matches('/'), self.a.run_id));
+        if !beside.is_empty() {
+            self.note(idx, &format!("verify with the server's key: cosign verify-blob-attestation --key {}/_kiln/attestation-key.pem --bundle <file>.sigstore.json --new-bundle-format --insecure-ignore-tlog --type slsaprovenance1 <file>", at("server_url").trim_end_matches('/'))).await;
+        }
+        Ok(outputs)
+    }
+
+    /// An image subject: a reference's own digest, else the engine's record of the image.
+    async fn image_subject(&self, st: &State, idx: u32, r: &str) -> anyhow::Result<kiln_ci::attest::Subject> {
+        use super::attest as at;
+        let (name, digest) = at::image_name(r);
+        if let Some(d) = digest {
+            return at::subject(&name, &d).map_err(anyhow::Error::msg);
+        }
+        let plain = r.strip_prefix("docker://").or_else(|| r.strip_prefix("oci://")).unwrap_or(r).to_owned();
+        let cli = self.cli(st).await.map_err(|e| anyhow::anyhow!("no container engine here to read `{plain}`'s digest ({e:#}): name it with one, `{name}@sha256:…`"))?;
+        let out = cli.run(&["image".into(), "inspect".into(), "--format".into(), "{{json .RepoDigests}}\t{{.Id}}".into(), plain.clone()], &BTreeMap::new(), Duration::from_secs(60)).await.map_err(|e| anyhow::anyhow!("`{plain}` matched no file and is no image the engine has ({e:#})"))?;
+        let (digests, id) = out.split_once('\t').unwrap_or((&out, ""));
+        let (digest, pushed) = at::pick_digest(&name, digests, id).map_err(anyhow::Error::msg)?;
+        if !pushed {
+            self.annotate(idx, "warning", &format!("{plain} was never pushed: its subject is the image's ID, not a registry's manifest digest")).await;
+        }
+        at::subject(&name, &digest).map_err(anyhow::Error::msg)
     }
 
     /// A `uses:` step (W07): built in, JavaScript, composite, Docker.

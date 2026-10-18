@@ -4,6 +4,7 @@
 
 pub mod actions;
 pub mod api;
+pub mod attest;
 pub mod broker;
 pub mod cli;
 pub mod compare;
@@ -28,6 +29,7 @@ pub mod reusable;
 pub mod routing;
 pub mod runs;
 pub mod runs_api;
+pub mod sbom;
 pub mod schedule;
 pub mod secrets;
 pub mod services;

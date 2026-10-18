@@ -130,10 +130,11 @@ pub trait Engine: Send + 'static {
     fn search(&mut self, q: &Query) -> anyhow::Result<Vec<EventRow>>;
     /// The rows written after number `from`, as they are now, oldest first, about `max_bytes`.
     fn changes(&mut self, from: u64, max_bytes: usize) -> anyhow::Result<Changes>;
-    /// Take a batch of `peer`'s feed (a store of machine `machine`), which follows number `from`
-    /// of it, in one transaction: numbered here as this store's own writes, a session's rows from
-    /// its latest writer alone.
-    fn take(&mut self, peer: &str, machine: &str, from: u64, batch: &Changes) -> anyhow::Result<Took>;
+    /// Take a batch of `peer`'s feed, which follows number `from` of it, in one transaction:
+    /// numbered here as this store's own writes, a session's rows from its latest writer alone.
+    /// `machine`: the machine of the feed, where the sessions it brings run (None: its rows say,
+    /// a mirror's feed of the server's store).
+    fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took>;
     /// Through where this store has taken `peer`'s feed (0: none of it).
     fn peer(&mut self, peer: &str) -> anyhow::Result<u64>;
     /// Each file of `session`'s record kept, with its last line.
@@ -243,12 +244,13 @@ impl Store {
         self.run(move |e| e.changes(from, max_bytes))
     }
 
-    /// Take a batch of `peer`'s feed (a store of machine `machine`; it follows `from`). Blocking.
-    pub fn take(&self, peer: &str, machine: &str, from: u64, batch: Changes) -> anyhow::Result<Took> {
-        let (p, m) = (peer.to_owned(), machine.to_owned());
+    /// Take a batch of `peer`'s feed (it follows `from`; `machine` as for [`Engine::take`]).
+    /// Blocking.
+    pub fn take(&self, peer: &str, machine: Option<&str>, from: u64, batch: Changes) -> anyhow::Result<Took> {
+        let (p, m) = (peer.to_owned(), machine.map(str::to_owned));
         let w = self.watchers.clone();
         self.run(move |e| {
-            let took = e.take(&p, &m, from, &batch)?;
+            let took = e.take(&p, m.as_deref(), from, &batch)?;
             if took.applied > 0 {
                 notify(&w);
             }

@@ -76,6 +76,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::POST, ["repos", _, _, "dependency-graph", "snapshots"]) => Some(("contents", Level::Write)),
         (&Method::GET, ["repos", _, _, "deployments" | "environments", ..]) => Some(("deployments", Level::Read)),
         (&Method::POST, ["repos", _, _, "deployments", ..]) => Some(("deployments", Level::Write)),
+        (&Method::GET, ["repos", _, _, "attestations", ..]) => Some(("attestations", Level::Read)),
+        (&Method::POST, ["repos", _, _, "attestations"]) => Some(("attestations", Level::Write)),
         _ => None,
     };
     if let Some((scope, level)) = need
@@ -122,6 +124,9 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::POST, ["deployments", id, "statuses"]) => records::deployment_statuses(&s, id, Some(&body(req).await?)).await,
             (&Method::GET, ["environments"]) => records::environments(&s, None).await,
             (&Method::GET, ["environments", name]) => records::environments(&s, Some(name)).await,
+            // W18-R02: GitHub's attestations API.
+            (&Method::GET, ["attestations", digest]) => crate::ci::attest::facade_list(hub, &s.repo.id, digest, q.get("predicate_type").map(String::as_str)).await,
+            (&Method::POST, ["attestations"]) => crate::ci::attest::facade_create(hub, &claims, &body(req).await?).await,
             _ => not_implemented(hub, &claims, &method, &format!("/api/v3/{}", rest.join("/"))).await,
         };
     }
