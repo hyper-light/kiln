@@ -3009,7 +3009,6 @@ textarea.hx-input {
   margin-top: 18px;
 }
 
-
 /* Move to… */
 .mv-list {
   display: flex;
@@ -3051,4 +3050,9 @@ textarea.hx-input {
 .mv-none {
   font-size: 13px;
   color: var(--color-secondary);
+}
+.mv-why {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: var(--color-subtle);
 }

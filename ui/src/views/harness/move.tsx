@@ -29,25 +29,43 @@ const askPlaces = (signal: AbortSignal): Promise<Places> =>
 
 type Agent = Pick<AgentInfo, "id" | "name" | "kind" | "kind_name" | "target" | "status">;
 
+/** Names in words: "a", "a and b", "a, b and c". */
+const inWords = (ns: string[]) => (ns.length < 2 ? ns.join("") : `${ns.slice(0, -1).join(", ")} and ${ns[ns.length - 1]}`);
+
 function Choices({ agent, picked, onPick }: { agent: Agent; picked: string; onPick: (t: string) => void }) {
   const { byTarget, runners } = useSuspenseResource("harness/move", askPlaces).data;
-  const fit = runners.filter((r) => r.connected && r.reach && `agent:${r.name}` !== agent.target && (byTarget[`agent:${r.name}`] ?? []).some((k) => k.id === agent.kind && k.available));
-  if (fit.length === 0) return <p className="mv-none">No other connected machine has {agent.kind_name} installed and takes agents from other runners.</p>;
+  // A runner without a reach identity runs a kiln from before agents could move.
+  const here = runners.find((r) => `agent:${r.name}` === agent.target);
+  if (here && !here.fingerprint) return <p className="mv-none">{here.name} runs an older kiln that can't hand agents over: upgrade it in Settings → Updates.</p>;
+  const others = runners.filter((r) => r.connected && `agent:${r.name}` !== agent.target && (byTarget[`agent:${r.name}`] ?? []).some((k) => k.id === agent.kind && k.available));
+  const fit = others.filter((r) => r.reach);
+  const older = others.filter((r) => !r.fingerprint).map((r) => r.name);
+  const closed = others.filter((r) => r.fingerprint && !r.reach).map((r) => r.name);
+  const why = [
+    older.length > 0 && `${inWords(older)} ${older.length === 1 ? "runs an older kiln: upgrade it" : "run an older kiln: upgrade them"} in Settings → Updates to move agents there.`,
+    closed.length > 0 && `${inWords(closed)} ${closed.length === 1 ? "is" : "are"} set not to take work from other runners.`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  if (fit.length === 0) return <p className="mv-none">{why || `No other connected machine has ${agent.kind_name} installed.`}</p>;
   return (
-    <div className="mv-list" role="radiogroup" aria-label="Machines">
-      {fit.map((r) => {
-        const t = `agent:${r.name}`;
-        return (
-          <button key={t} type="button" role="radio" aria-checked={picked === t} className={cn("mv-choice", picked === t && "mv-choice-on")} onClick={() => onPick(t)}>
-            <span className="mv-name">{r.name}</span>
-            <span className="mv-meta">
-              {r.os}/{r.arch}
-              {r.hostname && r.hostname !== r.name ? ` · ${r.hostname}` : ""}
-            </span>
-          </button>
-        );
-      })}
-    </div>
+    <>
+      <div className="mv-list" role="radiogroup" aria-label="Machines">
+        {fit.map((r) => {
+          const t = `agent:${r.name}`;
+          return (
+            <button key={t} type="button" role="radio" aria-checked={picked === t} className={cn("mv-choice", picked === t && "mv-choice-on")} onClick={() => onPick(t)}>
+              <span className="mv-name">{r.name}</span>
+              <span className="mv-meta">
+                {r.os}/{r.arch}
+                {r.hostname && r.hostname !== r.name ? ` · ${r.hostname}` : ""}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      {why && <p className="mv-why">{why}</p>}
+    </>
   );
 }
 
