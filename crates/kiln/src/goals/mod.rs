@@ -498,8 +498,9 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
         } else if item.busy_at > 0 && said_met(&info.summary) {
             return Next::End { id, status: "met", reason: None };
         }
-        let since = item.reminded_at.max(item.started_at.unwrap_or(0));
-        if now.saturating_sub(since) < gap(item.reminders) {
+        // Since it was last sent (never, by these rules: a goal just resumed, or under way from
+        // before them: at once).
+        if now.saturating_sub(item.reminded_at) < gap(item.reminders) {
             return Next::Wait;
         }
         let worked = item.busy_at > 0 && info.last_activity.saturating_sub(item.busy_at) >= WORKED_MS;
@@ -592,7 +593,7 @@ mod tests {
     }
 
     fn item(status: &str, how: Option<&str>) -> Item {
-        Item { id: "g1".into(), text: "tests pass".into(), status: status.into(), how: how.map(str::to_owned), started_at: Some(1_000), prior_at: 5, ..Item::default() }
+        Item { id: "g1".into(), text: "tests pass".into(), status: status.into(), how: how.map(str::to_owned), started_at: Some(1_000), reminded_at: 1_000, prior_at: 5, ..Item::default() }
     }
 
     fn stack(items: Vec<Item>) -> Stack {
@@ -656,6 +657,14 @@ mod tests {
         assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 9)))), LATER), Next::Remind { .. }));
         // Cleared in the agent long after: by you, so the goal ends.
         assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 7 + OWN_CLEAR_MS + 1)))), LATER), Next::End { status: "skipped", .. }));
+    }
+
+    #[test]
+    fn a_goal_resumed_or_from_before_reminders_goes_to_a_free_agent_at_once() {
+        let mut resumed = item("active", Some("goal"));
+        resumed.reminded_at = 0;
+        // Any time now (unix ms): it has never been sent by these rules.
+        assert!(matches!(decide(&stack(vec![resumed]), Some(&info(Status::Idle, None)), 1_792_000_000_000), Next::Remind { .. }));
     }
 
     #[test]
