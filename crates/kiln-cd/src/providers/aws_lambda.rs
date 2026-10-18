@@ -361,13 +361,26 @@ pub fn covers(want: &Value, have: &Value) -> bool {
 pub fn health(obj: &Value) -> Option<Status> {
     match crate::obj::kind(obj) {
         "Function" => {
+            // Every State and LastUpdateStatus botocore's model lists; one it doesn't know isn't
+            // taken for healthy.
             let st = |k: &str| crate::obj::str_at(obj, &["status", k]).unwrap_or_default();
+            let why = |k: &str, code: &str| match (st(code), st(k)) {
+                ("", m) => m.to_owned(),
+                (c, "") => c.to_owned(),
+                (c, m) => format!("{c}: {m}"),
+            };
             match (st("State"), st("LastUpdateStatus")) {
-                ("Failed", _) => status(Health::Degraded, st("StateReason")),
-                (_, "Failed") => status(Health::Degraded, st("LastUpdateStatusReason")),
-                ("Pending", _) | (_, "InProgress") => status(Health::Progressing, "updating"),
+                ("Failed", _) => status(Health::Degraded, why("StateReason", "StateReasonCode")),
+                (_, "Failed") => status(Health::Degraded, why("LastUpdateStatusReason", "LastUpdateStatusReasonCode")),
+                ("Pending", _) => status(Health::Progressing, "creating"),
+                (_, "InProgress") => status(Health::Progressing, "updating"),
+                ("Deleting", _) => status(Health::Progressing, "deleting"),
+                ("Deactivating", _) => status(Health::Progressing, "deactivating"),
+                ("Deactivated", _) => status(Health::Suspended, format!("deactivated: {}", why("StateReason", "StateReasonCode"))),
+                ("ActiveNonInvocable", _) => status(Health::Suspended, format!("not taking invocations: {}", why("StateReason", "StateReasonCode"))),
                 ("Inactive", _) => status(Health::Healthy, "inactive until its next invocation"),
-                _ => status(Health::Healthy, ""),
+                ("Active" | "", "Successful" | "") => status(Health::Healthy, ""),
+                (s, u) => status(Health::Unknown, format!("state {s}, last update {u}")),
             }
         }
         "Alias" => match obj.pointer("/spec/RoutingConfig/AdditionalVersionWeights").and_then(Value::as_object).filter(|w| !w.is_empty()) {
@@ -485,5 +498,11 @@ mod tests {
         assert_eq!(health(&f("Active", "InProgress")).map(|s| s.health), Some(Health::Progressing));
         assert_eq!(health(&f("Active", "Failed")).map(|s| (s.health, s.message)), Some((Health::Degraded, "bad zip".to_owned())));
         assert_eq!(health(&f("Failed", "Successful")).map(|s| s.health), Some(Health::Degraded));
+        assert_eq!(health(&f("Pending", "InProgress")).map(|s| s.health), Some(Health::Progressing));
+        assert_eq!(health(&f("Deleting", "Successful")).map(|s| s.health), Some(Health::Progressing));
+        assert_eq!(health(&f("Deactivated", "Successful")).map(|s| (s.health, s.message)), Some((Health::Suspended, "deactivated: boom".to_owned())));
+        assert_eq!(health(&f("ActiveNonInvocable", "Successful")).map(|s| s.health), Some(Health::Suspended));
+        assert_eq!(health(&f("Inactive", "Successful")).map(|s| s.health), Some(Health::Healthy));
+        assert_eq!(health(&f("Hibernating", "Successful")).map(|s| s.health), Some(Health::Unknown), "a state it doesn't know isn't healthy");
     }
 }
