@@ -265,8 +265,6 @@ export interface State {
   model: string;
   mode: string;
   title: string;
-  /** Its name as a person last gave it (absent: the one it started with). */
-  name?: string;
   approvals: Approval[];
   queue: QueueItem[];
   delivery: Record<string, Delivery>;
@@ -816,12 +814,7 @@ export class SessionStore {
         this.snap = { ...this.snap, conn: "gone" };
         break;
       case "state":
-        // A rename reaches the page through its state, as it does the lists.
-        this.snap = {
-          ...this.snap,
-          state: u.state,
-          info: this.snap.info ? { ...this.snap.info, name: u.state.name || this.snap.info.name, status: u.state.status, title: u.state.title, model: u.state.model, mode: u.state.mode } : null,
-        };
+        this.snap = { ...this.snap, state: u.state, info: this.snap.info ? { ...this.snap.info, status: u.state.status, title: u.state.title, model: u.state.model, mode: u.state.mode } : null };
         break;
       case "meta":
         this.snap = { ...this.snap, meta: u.meta };
