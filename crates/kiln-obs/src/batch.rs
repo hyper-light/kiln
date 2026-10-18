@@ -9,6 +9,7 @@
 //! batch := VERSION u8 | items varint | item*
 //! item  := DEF u8 | fp u64-le | kind u8 | key varint-length bytes
 //!        | RUN u8 | fp u64-le | samples varint | chunk varint-length bytes
+//!        | LOGS u8 | rows varint | raw length varint | LZ4 of the rows varint-length bytes
 //! key   := metric | tags varint | (tag-key, tag-value)*          (each varint-length bytes)
 //! ```
 //!
@@ -26,6 +27,12 @@ pub const VERSION: u8 = 1;
 
 const DEF: u8 = 0;
 const RUN: u8 = 1;
+const LOGS: u8 = 2;
+
+/// The most bytes a batch's log rows decompress to: three times the largest request the
+/// OpenTelemetry Collector's HTTP receiver takes by default (`confighttp` `max_request_body_size`,
+/// 20 MiB), the rows' encoding being about the size of OTLP's.
+pub const MAX_LOG_ROWS_BYTES: usize = 64 << 20;
 
 /// The longest metric name, tag key or value: Datadog's limit on a tag and a metric name, 200
 /// characters (docs.datadoghq.com, "Getting Started with Tags" and "Metrics: naming"), in bytes of
@@ -220,6 +227,26 @@ impl Builder {
         self.samples += u64::from(self.enc.count());
     }
 
+    /// Log records, as one item: their rows, LZ4-compressed.
+    pub fn logs(&mut self, records: &[crate::logs::record::Record]) {
+        if records.is_empty() {
+            return;
+        }
+        let mut raw = Vec::new();
+        let mut prev = 0i64;
+        for r in records {
+            crate::logs::record::put_row(&mut raw, r, prev);
+            prev = r.ts;
+        }
+        let mut packed = Vec::with_capacity(raw.len() / 4);
+        crate::lz4::compress(&raw, &mut packed);
+        self.body.push(LOGS);
+        varint::put(&mut self.body, records.len() as u64);
+        varint::put(&mut self.body, raw.len() as u64);
+        put_bytes(&mut self.body, &packed);
+        self.items += 1;
+    }
+
     pub fn items(&self) -> u64 {
         self.items
     }
@@ -254,6 +281,8 @@ impl Builder {
 pub enum Item<'a> {
     Def { fp: u64, kind: Kind, key: &'a [u8] },
     Run { fp: u64, samples: ChunkRef<'a> },
+    /// Log rows: how many, their size decompressed, and their LZ4 bytes.
+    Logs { rows: u32, raw_len: usize, packed: &'a [u8] },
 }
 
 /// A batch's items, read in place.
@@ -281,6 +310,13 @@ impl<'a> Reader<'a> {
         }
         let (&tag, rest) = self.at.split_first().ok_or(BatchError::Malformed("item tag"))?;
         self.at = rest;
+        if tag == LOGS {
+            let rows = varint::get(&mut self.at).and_then(|r| u32::try_from(r).ok()).ok_or(BatchError::Malformed("log rows"))?;
+            let raw_len = varint::get(&mut self.at).and_then(|r| usize::try_from(r).ok()).filter(|&r| r <= MAX_LOG_ROWS_BYTES).ok_or(BatchError::Malformed("log rows' size"))?;
+            let packed = get_bytes(&mut self.at).ok_or(BatchError::Malformed("log rows"))?;
+            self.left -= 1;
+            return Ok(Some(Item::Logs { rows, raw_len, packed }));
+        }
         let fp = get_u64(&mut self.at).ok_or(BatchError::Malformed("fingerprint"))?;
         let item = match tag {
             DEF => {
@@ -367,14 +403,14 @@ mod tests {
         let mut r = Reader::new(&batch).unwrap();
         match r.next_item().unwrap().unwrap() {
             Item::Def { fp, kind, key } => assert_eq!((fp, kind, key), (a.fp, Kind::Gauge, a.key.as_slice())),
-            Item::Run { .. } => panic!("a definition first"),
+            Item::Run { .. } | Item::Logs { .. } => panic!("a definition first"),
         }
         match r.next_item().unwrap().unwrap() {
             Item::Run { fp, samples } => {
                 assert_eq!(fp, a.fp);
                 assert_eq!(samples.iter().map(Result::unwrap).collect::<Vec<_>>(), vec![(10, 1.0), (20, 2.5), (30, 3.0)]);
             }
-            Item::Def { .. } => panic!("a run"),
+            Item::Def { .. } | Item::Logs { .. } => panic!("a run"),
         }
         assert!(matches!(r.next_item().unwrap().unwrap(), Item::Run { fp: 77, .. }));
         assert!(r.next_item().unwrap().is_none());
@@ -414,6 +450,10 @@ mod tests {
                                     break;
                                 }
                             }
+                        }
+                        Item::Logs { raw_len, packed, .. } => {
+                            let mut out = Vec::new();
+                            let _ = crate::lz4::decompress(packed, &mut out, raw_len);
                         }
                     }
                 }

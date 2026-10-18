@@ -2,5 +2,7 @@
 
 pub mod block;
 pub mod bloom;
+pub mod file;
 pub mod record;
 pub mod search;
+pub mod store;

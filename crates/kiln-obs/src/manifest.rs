@@ -11,6 +11,7 @@
 //! durable <index> <term>
 //! next <seq>
 //! block <seq> <file name>
+//! logs <seq> <file name>
 //! crc <crc32c of the lines above, hex>
 //! ```
 
@@ -42,6 +43,8 @@ pub struct Manifest {
     pub durable: Point,
     pub next_seq: u64,
     pub blocks: Vec<BlockEntry>,
+    /// Logs files.
+    pub logs: Vec<BlockEntry>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +60,11 @@ pub fn block_file(seq: u64) -> String {
     format!("{seq:016}.block")
 }
 
+/// A logs file's name for its sequence number.
+pub fn logs_file(seq: u64) -> String {
+    format!("{seq:016}.logs")
+}
+
 impl Manifest {
     fn encode(&self) -> String {
         let mut body = String::new();
@@ -65,6 +73,9 @@ impl Manifest {
         body.push_str(&format!("durable {} {}\nnext {}\n", self.durable.index, self.durable.term, self.next_seq));
         for b in &self.blocks {
             body.push_str(&format!("block {} {}\n", b.seq, b.file));
+        }
+        for b in &self.logs {
+            body.push_str(&format!("logs {} {}\n", b.seq, b.file));
         }
         let crc = crc32c::checksum(body.as_bytes());
         body.push_str(&format!("crc {crc:08x}\n"));
@@ -91,12 +102,17 @@ impl Manifest {
                     m.durable = Point { index: i.parse().map_err(|_| damaged("durable"))?, term: t.parse().map_err(|_| damaged("durable"))? };
                 }
                 (Some("next"), Some(n), None, None) => m.next_seq = n.parse().map_err(|_| damaged("next"))?,
-                (Some("block"), Some(seq), Some(file), None) => {
-                    // A block's file is a name in the store's directory, never a path.
+                (Some(kind @ ("block" | "logs")), Some(seq), Some(file), None) => {
+                    // A file is a name in the store's directory, never a path.
                     if file.contains(['/', '\\']) || file.starts_with('.') {
                         return Err(damaged("block file"));
                     }
-                    m.blocks.push(BlockEntry { seq: seq.parse().map_err(|_| damaged("block"))?, file: file.to_owned() });
+                    let e = BlockEntry { seq: seq.parse().map_err(|_| damaged("block"))?, file: file.to_owned() };
+                    if kind == "block" {
+                        m.blocks.push(e);
+                    } else {
+                        m.logs.push(e);
+                    }
                 }
                 _ => return Err(damaged("a line")),
             }
@@ -153,7 +169,7 @@ mod tests {
     fn a_manifest_round_trips_and_damage_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), None);
-        let m = Manifest { durable: Point { index: 42, term: 3 }, next_seq: 7, blocks: vec![BlockEntry { seq: 5, file: block_file(5) }, BlockEntry { seq: 6, file: block_file(6) }] };
+        let m = Manifest { durable: Point { index: 42, term: 3 }, next_seq: 7, blocks: vec![BlockEntry { seq: 5, file: block_file(5) }, BlockEntry { seq: 6, file: block_file(6) }], logs: vec![BlockEntry { seq: 6, file: logs_file(6) }] };
         m.save(dir.path()).unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), Some(m.clone()));
         let path = dir.path().join(NAME);

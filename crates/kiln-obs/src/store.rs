@@ -20,6 +20,9 @@ use crate::gorilla::{Chunk, DecodeError, Encoder};
 use crate::hash::Keyed;
 use crate::head::{Appended, CHUNK_SAMPLES, HeadSeries};
 use crate::index::{Defined, Index, IndexError, Selector, SeriesInfo};
+use crate::logs::file::LogFile;
+use crate::logs::search::Search;
+use crate::logs::store::{Found, HeldFile, LogStore, LogStoreError};
 use crate::manifest::{self, BlockEntry, Manifest, ManifestError, Point};
 use crate::symbols::Symbols;
 
@@ -31,6 +34,10 @@ pub enum ApplyError {
     Index(#[from] IndexError),
     #[error("a series' samples: {0}")]
     Samples(#[from] DecodeError),
+    #[error("a batch's log rows do not decompress")]
+    LogRows,
+    #[error("log rows: {0}")]
+    Logs(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +54,10 @@ pub enum StoreError {
     Io { path: PathBuf, source: std::io::Error },
     #[error("the store has no directory (it was made in memory)")]
     NoDir,
+    #[error(transparent)]
+    Logs(#[from] LogStoreError),
+    #[error(transparent)]
+    LogFile(#[from] crate::logs::file::LogFileError),
 }
 
 /// What applying batches did, counted.
@@ -60,6 +71,8 @@ pub struct Counts {
     pub late: u64,
     /// Late samples identical to one held: a replayed write, dropped.
     pub duplicates: u64,
+    /// Log records.
+    pub logs: u64,
 }
 
 impl std::ops::AddAssign for Counts {
@@ -69,6 +82,7 @@ impl std::ops::AddAssign for Counts {
         self.samples += o.samples;
         self.late += o.late;
         self.duplicates += o.duplicates;
+        self.logs += o.logs;
     }
 }
 
@@ -97,6 +111,7 @@ pub struct Store {
     index: Index,
     head: Vec<HeadSeries>,
     blocks: Vec<OpenBlock>,
+    logs: LogStore,
     dir: Option<PathBuf>,
     manifest: Manifest,
     totals: Counts,
@@ -153,7 +168,7 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
 impl Store {
     /// A store in memory: it applies and answers, and cannot cut.
     pub fn new(hash: Keyed) -> Self {
-        Self { hash, symbols: Symbols::new(hash), index: Index::new(hash), head: Vec::new(), blocks: Vec::new(), dir: None, manifest: Manifest::default(), totals: Counts::default() }
+        Self { hash, symbols: Symbols::new(hash), index: Index::new(hash), head: Vec::new(), blocks: Vec::new(), logs: LogStore::default(), dir: None, manifest: Manifest::default(), totals: Counts::default() }
     }
 
     /// Opens the store in `dir` (made if missing): its blocks, as its manifest lists them; block
@@ -168,6 +183,10 @@ impl Store {
             store.blocks.push(OpenBlock { seq: e.seq, file: e.file.clone(), block });
         }
         store.blocks.sort_by_key(|b| b.seq);
+        for e in &manifest.logs {
+            let log = LogFile::open(&dir.join(&e.file))?;
+            store.logs.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log });
+        }
         store.manifest = manifest;
         store.remove_orphans()?;
         store.reindex(Vec::new())?;
@@ -179,8 +198,8 @@ impl Store {
         for entry in std::fs::read_dir(dir).map_err(io_err(dir))? {
             let entry = entry.map_err(io_err(dir))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            let listed = self.manifest.blocks.iter().any(|b| b.file == name);
-            if (name.ends_with(".block") && !listed) || name == "MANIFEST.tmp" {
+            let listed = self.manifest.blocks.iter().chain(&self.manifest.logs).any(|b| b.file == name);
+            if ((name.ends_with(".block") || name.ends_with(".logs")) && !listed) || name == "MANIFEST.tmp" {
                 std::fs::remove_file(entry.path()).map_err(io_err(&entry.path()))?;
             }
         }
@@ -245,6 +264,15 @@ impl Store {
                     Err(IndexError::Collision(fp) | IndexError::WrongFingerprint(fp)) => done.refused.push(fp),
                     Err(e) => return Err(e.into()),
                 },
+                Item::Logs { rows, raw_len, packed } => {
+                    let mut raw = Vec::with_capacity(raw_len);
+                    crate::lz4::decompress(packed, &mut raw, raw_len).map_err(|_| ApplyError::LogRows)?;
+                    if raw.len() != raw_len {
+                        return Err(ApplyError::LogRows);
+                    }
+                    self.logs.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
+                    done.counts.logs += u64::from(rows);
+                }
                 Item::Run { fp, samples } => {
                     let Some(series) = self.index.by_fp(fp).and_then(|id| self.head.get_mut(id as usize)) else {
                         done.unknown.push(fp);
@@ -287,6 +315,25 @@ impl Store {
         let mut done = Maintained::default();
         let mut manifest = self.manifest.clone();
         manifest.durable = at;
+        // Logs first: a file of their own, listed with the blocks in the same manifest.
+        let mut new_logs = None;
+        if self.logs.unwritten_rows() > 0 {
+            let seq = manifest.next_seq;
+            let file = manifest::logs_file(seq);
+            match self.logs.cut(&dir.join(&file)) {
+                Ok(Some(log)) => {
+                    done.bytes_written += log.bytes;
+                    manifest.next_seq = seq + 1;
+                    manifest.logs.push(BlockEntry { seq, file: file.clone() });
+                    new_logs = Some(HeldFile { seq, file, log });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    restore(&mut self.head, taken);
+                    return Err(e.into());
+                }
+            }
+        }
         let mut new_block = None;
         if !taken.is_empty() {
             let seq = manifest.next_seq;
@@ -321,6 +368,9 @@ impl Store {
         self.manifest = manifest;
         if let Some(b) = new_block {
             self.blocks.push(b);
+        }
+        if let Some(l) = new_logs {
+            self.logs.files.push(l);
         }
         Ok(done)
     }
@@ -409,6 +459,18 @@ impl Store {
         let dir = self.dir.clone().ok_or(StoreError::NoDir)?;
         let mut done = Maintained::default();
         let before = self.index.len();
+        let logs_gone = self.logs.retain(cutoff.saturating_mul(1_000_000));
+        if !logs_gone.is_empty() {
+            let mut manifest = self.manifest.clone();
+            manifest.logs.retain(|e| !logs_gone.contains(&e.file));
+            manifest.save(&dir)?;
+            self.manifest = manifest;
+            for f in &logs_gone {
+                let p = dir.join(f);
+                std::fs::remove_file(&p).map_err(io_err(&p))?;
+            }
+            done.blocks_removed += logs_gone.len() as u64;
+        }
         let gone: Vec<String> = self.blocks.iter().filter(|b| b.block.max_ts < cutoff).map(|b| b.file.clone()).collect();
         if !gone.is_empty() {
             let mut manifest = self.manifest.clone();
@@ -420,7 +482,7 @@ impl Store {
                 let p = dir.join(f);
                 std::fs::remove_file(&p).map_err(io_err(&p))?;
             }
-            done.blocks_removed = gone.len() as u64;
+            done.blocks_removed += gone.len() as u64;
         }
         // A block more than half expired: rewritten alone (merged with nothing).
         let mut i = 0;
@@ -561,6 +623,16 @@ impl Store {
         Ok(())
     }
 
+    /// The newest `limit` log records in `[from, to]` (ns) that `search` matches.
+    pub fn search_logs(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
+        Ok(self.logs.search(search, from, to, limit)?)
+    }
+
+    /// Bytes of logs on disk.
+    pub fn log_bytes(&self) -> u64 {
+        self.logs.disk_bytes()
+    }
+
     /// Every metric's name.
     pub fn metric_names(&self) -> impl Iterator<Item = &str> {
         self.index.metrics().iter().map(|&m| self.symbols.get(m))
@@ -592,7 +664,7 @@ impl Store {
     pub fn heap(&self) -> Heap {
         Heap {
             symbols: self.symbols.heap_bytes(),
-            index: self.index.heap_bytes() + self.blocks.iter().map(|b| b.block.heap_bytes()).sum::<usize>(),
+            index: self.index.heap_bytes() + self.blocks.iter().map(|b| b.block.heap_bytes()).sum::<usize>() + self.logs.heap_bytes(),
             samples: self.head.iter().map(HeadSeries::heap_bytes).sum::<usize>() + self.head.capacity() * std::mem::size_of::<HeadSeries>(),
         }
     }
@@ -710,7 +782,7 @@ mod tests {
         b.run(b_key.fp, (0..10).map(|i| (i * 1000, 100.0 + i as f64)));
         b.run(m.fp, [(0, 1e9)]);
         let applied = s.apply(&b.finish()).unwrap();
-        assert_eq!(applied.counts, Counts { runs: 3, new_series: 3, samples: 21, late: 0, duplicates: 0 });
+        assert_eq!(applied.counts, Counts { runs: 3, new_series: 3, samples: 21, late: 0, duplicates: 0, logs: 0 });
         let mut ids = Vec::new();
         s.select(&Selector::metric("system.cpu.user").tag("env", "prod"), &mut ids);
         assert_eq!(ids.len(), 2);
@@ -913,6 +985,47 @@ mod tests {
         drop(s);
         let s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
         assert_eq!(s.series_count(), 1);
+    }
+
+    #[test]
+    fn logs_ride_batches_through_cuts_a_reopen_and_retention() {
+        use crate::logs::record::Record;
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+        let rec = |i: i64| Record { ts: i * 1_000_000_000, severity: if i % 7 == 0 { 17 } else { 9 }, service: "api".into(), host: "h".into(), source: "kiln".into(), message: format!("event {i} {}", if i % 7 == 0 { "boom" } else { "fine" }), ..Record::default() };
+        let mut b = Builder::new();
+        for batch in 0..20 {
+            let recs: Vec<Record> = (batch * 1000..(batch + 1) * 1000).map(rec).collect();
+            b.logs(&recs);
+            let applied = s.apply(&b.finish()).unwrap();
+            assert_eq!(applied.counts.logs, 1000);
+            if batch % 6 == 5 {
+                s.cut(Point { index: batch as u64 + 1, term: 1 }).unwrap();
+            }
+        }
+        let q = crate::logs::search::parse("status:error boom").unwrap();
+        let newest = |s: &Store| s.search_logs(&q, 0, i64::MAX, 3).unwrap().records.iter().map(|r| r.ts / 1_000_000_000).collect::<Vec<_>>();
+        assert_eq!(newest(&s), vec![19_999, 19_992, 19_985]);
+        // After a restart: the files reopen; the batches past the durable point come again.
+        let durable = s.durable();
+        drop(s);
+        let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+        for batch in (durable.index as i64)..20 {
+            let recs: Vec<Record> = (batch * 1000..(batch + 1) * 1000).map(rec).collect();
+            b.logs(&recs);
+            s.apply(&b.finish()).unwrap();
+        }
+        assert_eq!(newest(&s), vec![19_999, 19_992, 19_985]);
+        assert!(s.log_bytes() > 0);
+        // Retention drops whole files: those wholly before 13,000 s go (0–5,999 and 6,000–11,999);
+        // the one holding 12,000–17,999 stays whole.
+        s.cut(Point { index: 20, term: 1 }).unwrap();
+        let before = s.log_bytes();
+        s.retain(13_000_000).unwrap();
+        assert!(s.log_bytes() < before);
+        let all = crate::logs::search::parse("*").unwrap();
+        assert!(s.search_logs(&all, 0, 11_999_999_999_999, 1).unwrap().records.is_empty());
+        assert_eq!(s.search_logs(&all, 0, 12_000_000_000_000, 1).unwrap().records.len(), 1);
     }
 
     #[test]
