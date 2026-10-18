@@ -33,16 +33,22 @@ pub enum Rollup {
     Last,
 }
 
-/// What `.fill()` puts in buckets without data.
+/// What `.fill()` puts in buckets without data, in gaps of at most `limit` seconds
+/// ([`FILL_LIMIT_S`] unless said).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fill {
     Null,
-    Zero,
-    /// Linear between neighbours, across at most `limit` seconds of gap (none: any).
+    Zero(Option<i64>),
+    /// Linear between neighbours.
     Linear(Option<i64>),
-    /// The last value, for at most `limit` seconds.
+    /// The last value.
     Last(Option<i64>),
 }
+
+/// The widest gap a fill fills unless it says (s): Datadog's default, "the maximum size of a gap you
+/// want to interpolate" (its `fill()`: default 300, at most 600; kiln takes wider when asked).
+/// `default_zero()` fills every gap.
+pub const FILL_LIMIT_S: i64 = 300;
 
 /// For counts and counters: a total a bucket, or a rate a second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,7 +659,7 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
                 };
                 q.fill = Some(match how.as_str() {
                     "null" => Fill::Null,
-                    "zero" => Fill::Zero,
+                    "zero" => Fill::Zero(limit),
                     "linear" => Fill::Linear(limit),
                     "last" => Fill::Last(limit),
                     _ => return Err(syntax(m_at, "fill(null|zero|linear|last[, seconds])")),
@@ -673,12 +679,15 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
 /// A calendar rollup's periods from its unit and what follows it: an alignment, a timezone, or
 /// both in that order (Datadog's `.rollup(sum, weekly, monday, 'America/New_York')`).
 fn calendar(unit: &Tok<'_>, rest: &[&Tok<'_>]) -> Result<Calendar, String> {
-    let word = |t: &Tok<'_>| match t {
-        Tok::Name(n) => Some((*n).to_owned()),
-        Tok::Str(s) => Some(s.clone()),
-        Tok::Number(n) if n.fract() == 0.0 && (1.0..=31.0).contains(n) => Some(format!("{n}")),
-        _ => None,
-    };
+    fn word<'t>(t: &'t Tok<'_>) -> Option<std::borrow::Cow<'t, str>> {
+        match t {
+            Tok::Name(n) => Some((*n).into()),
+            Tok::Str(s) => Some(s.as_str().into()),
+            // A day of the month written bare (`15`).
+            Tok::Number(n) if n.fract() == 0.0 && (1.0..=31.0).contains(n) => Some(format!("{n}").into()),
+            _ => None,
+        }
+    }
     let unit = word(unit).and_then(|u| calendar::Unit::parse(&u)).ok_or("a rollup's interval: seconds, or daily, weekly or monthly")?;
     let how = match unit {
         calendar::Unit::Daily => "a daily rollup's start: a time of day (12am, 9:30am, 21:30)",

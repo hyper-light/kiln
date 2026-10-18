@@ -306,7 +306,9 @@ it is: smoothed, it would read flatter than it is).
 
 **Rollups.** `.rollup(fn, seconds)` sets a bucket's width (never finer than asked); a query's grid is
 otherwise the smallest nice step that fits the range in the points asked. `.fill(how, seconds)`
-fills gaps of at most `seconds` (300 unless said, Datadog's default; larger is allowed).
+fills a gap (from the point before it to the point after) of at most `seconds`, 300 unless said
+(Datadog's default; wider is allowed), and leaves a wider one a gap whatever the way: `zero`,
+`linear` between its ends, or `last`, the value before it; `default_zero()` fills every gap.
 **Calendar rollups**, `.rollup(sum, daily|weekly|monthly[, alignment][, 'timezone'])`, are
 Datadog's: a day begins at a time of day (`12am` unless said; `9:30am`, `21:30`), a week on a day
 (`sunday` unless said; `monday`), a month on a day of it (the `1st` unless said; a month without the
@@ -810,6 +812,18 @@ over the corpus's whole day (a grid of at most 1,200 points a series), fifteen r
 | `top(avg:container_memory_working_set_bytes{*} by {pod}, 10, 'mean', 'desc')` | 4 | 23,114 | 0.39 ms | 0.43 ms | 16.9 | 87 |
 | `avg:node_*{*} by {instance}` | 7 | 2.93 M | 27.0 ms | 27.3 ms | 9.2 | 95 (a group key a series at first: 1,116) |
 | `sum:*{job:apiserver}` | 1 | 2.18 M | 20.2 ms | 20.9 ms | 9.3 | 48 |
+| `avg:node_*{*} by {instance}.rollup(avg, daily, 'America/New_York')` | 7 | 2.93 M | 24.3 ms | 25.2 ms | 8.3 | 102 |
+| `avg:node_*{*} by {instance}.weighted()` | 7 | 2.93 M | 26.4 ms | 27.1 ms | 9.0 | 100 (each series' interval from all its gaps at first: 118, 13% slower) |
+
+A calendar rollup (rerun beside the plain query, 25.8 ms then): its two buckets, faster than the
+plain query's 1,200; its edges one allocation a metric, its timezone loaded once a process (47
+allocations, the first query to name it). Parsing it costs nothing more than a rollup in seconds
+(8 allocations; it compared names lowercased at first: 14): what a query's shape costs on an empty
+store, parse and evaluation, is the bench's first table (`rollup(avg, 60)` 8 and 15,
+`rollup(avg, daily, 'America/New_York')` 9 and 17, a quoted string's one; quoted strings are now
+sized to their quote, one allocation, not one and a growth). `weighted()` reads at most 64 of a
+series' gaps, spread over it, for its interval: a median of 64 has a standard error of 0.16 of the
+gaps' spread, and a series that reports at an interval has gaps all but equal.
 
 ### 12.6 Log text: LZ4 against deflate
 

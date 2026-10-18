@@ -1049,7 +1049,7 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
     // alike over a bucket they both covered). One with too few samples to tell takes the query's,
     // the median of the others', once they are known.
     let mut counts = if q.weighted { vec![0.0; grid.n] } else { Vec::new() };
-    let (mut gaps, mut intervals) = (Vec::new(), Vec::new());
+    let (mut gaps, mut intervals) = if q.weighted { (Vec::with_capacity(INTERVAL_GAPS), Vec::with_capacity(ids.len())) } else { (Vec::new(), Vec::new()) };
     let mut pending: Vec<(usize, usize, f64, f64)> = Vec::new();
     for &id in &ids {
         let Some(s) = store.series(id) else { continue };
@@ -1119,20 +1119,25 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
     Ok(out)
 }
 
-/// A series' submission interval (ms): the median gap between its finite samples; none under two.
+/// Gaps [`interval_ms`] reads at the most, spread over the series: a median of 64 has a standard
+/// error of 0.16 of the gaps' own spread (√(π/2) / √64 of their σ, a normal law's), and a series
+/// reporting at an interval has gaps all but equal, so reading every gap of a long one buys nothing.
+const INTERVAL_GAPS: usize = 64;
+
+/// A series' submission interval (ms): the median gap between consecutive finite samples, of at
+/// most [`INTERVAL_GAPS`] of them spread over it; none under two samples.
 fn interval_ms(ts: &[i64], vs: &[f64], gaps: &mut Vec<i64>) -> Option<i64> {
     gaps.clear();
-    let mut prev: Option<i64> = None;
-    for (&t, v) in ts.iter().zip(vs) {
-        if !v.is_finite() {
-            continue;
-        }
-        if let Some(p) = prev
-            && t > p
+    let pairs = ts.len().saturating_sub(1);
+    let stride = pairs.div_ceil(INTERVAL_GAPS).max(1);
+    for i in (0..pairs).step_by(stride) {
+        if let (Some(&a), Some(&b), Some(va), Some(vb)) = (ts.get(i), ts.get(i + 1), vs.get(i), vs.get(i + 1))
+            && va.is_finite()
+            && vb.is_finite()
+            && b > a
         {
-            gaps.push(t - p);
+            gaps.push(b - a);
         }
-        prev = Some(t);
     }
     if gaps.is_empty() {
         return None;
@@ -1344,28 +1349,49 @@ fn percentile_sorted(mut sorted: impl Iterator<Item = f64>, n: usize, p: f64) ->
 }
 
 fn apply_fill(fill: Fill, grid: Grid, v: &mut [f64]) {
-    let limit_buckets = |limit: Option<i64>| limit.map_or(usize::MAX, |s| usize::try_from(s.saturating_mul(1000) / grid.step.max(1)).unwrap_or(usize::MAX));
+    // A gap's size is from the point before it to the point after, in buckets (an end's, from its
+    // edge): `limit` seconds' worth at the most.
+    let limit_buckets = |limit: Option<i64>| usize::try_from(limit.unwrap_or(super::parse::FILL_LIMIT_S).saturating_mul(1000) / grid.step.max(1)).unwrap_or(usize::MAX);
     match fill {
         Fill::Null => {}
-        Fill::Zero => {
-            for x in v.iter_mut() {
-                if x.is_nan() {
-                    *x = 0.0;
+        Fill::Zero(limit) => {
+            let max = limit_buckets(limit);
+            let mut i = 0;
+            while i < v.len() {
+                if !v.get(i).is_some_and(|x| x.is_nan()) {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                while v.get(i).is_some_and(|x| x.is_nan()) {
+                    i += 1;
+                }
+                if i - start < max {
+                    v.get_mut(start..i).into_iter().flatten().for_each(|x| *x = 0.0);
                 }
             }
         }
         Fill::Last(limit) => {
             let max = limit_buckets(limit);
-            let mut last: Option<(usize, f64)> = None;
-            for (i, x) in v.iter_mut().enumerate() {
-                if x.is_nan() {
-                    if let Some((at, l)) = last
-                        && i - at <= max
-                    {
-                        *x = l;
+            let mut prev: Option<(usize, f64)> = None;
+            let mut i = 0;
+            while i < v.len() {
+                match v.get(i) {
+                    Some(x) if !x.is_nan() => {
+                        prev = Some((i, *x));
+                        i += 1;
                     }
-                } else {
-                    last = Some((i, *x));
+                    _ => {
+                        let start = i;
+                        while v.get(i).is_some_and(|x| x.is_nan()) {
+                            i += 1;
+                        }
+                        if let Some((a, last)) = prev
+                            && i - a <= max
+                        {
+                            v.get_mut(start..i).into_iter().flatten().for_each(|x| *x = last);
+                        }
+                    }
                 }
             }
         }
@@ -1968,9 +1994,21 @@ mod tests {
         assert_eq!(a.series[0].values[1], 0.0);
         let a = q(&s, "avg:gap{*}.fill(linear)");
         assert_eq!(a.series[0].values[1], 10.0);
-        let a = q(&s, "avg:gap{*}.fill(last, 120)");
-        assert_eq!(a.series[0].values[2], 0.0);
-        assert!(a.series[0].values[3].is_nan());
+        // A 300 s gap: past a limit of 120, none of it; within one of 300, all of it.
+        assert!(q(&s, "avg:gap{*}.fill(last, 120)").series[0].values[1..5].iter().all(|v| v.is_nan()));
+        assert!(q(&s, "avg:gap{*}.fill(last, 300)").series[0].values[1..5].iter().all(|&v| v == 0.0));
+        // A gap wider than a fill's limit (300 s unless said) stays a gap, whatever the fill.
+        let mut b = Builder::new();
+        let k = SeriesKey::new("wide", [], Kind::Gauge).unwrap();
+        b.define(&k);
+        b.run(k.fp, [(0, 0.0), (420_000, 70.0)]);
+        s.apply(&b.finish()).unwrap();
+        for how in ["linear", "last", "zero"] {
+            assert!(q(&s, &format!("avg:wide{{*}}.fill({how})")).series[0].values[1].is_nan(), "{how}");
+        }
+        assert_eq!(q(&s, "avg:wide{*}.fill(linear, 420)").series[0].values[1], 10.0);
+        assert_eq!(q(&s, "avg:wide{*}.fill(zero, 420)").series[0].values[1], 0.0);
+        assert_eq!(q(&s, "default_zero(avg:wide{*})").series[0].values[1], 0.0);
         let a = q(&s, "avg:gap{*}.rollup(count, 600)");
         assert_eq!(a.grid.step, 600_000);
         assert_eq!(a.series[0].values[0], 2.0);

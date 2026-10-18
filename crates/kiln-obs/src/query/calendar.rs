@@ -24,12 +24,7 @@ const WEEKDAYS: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "frid
 
 impl Unit {
     pub fn parse(s: &str) -> Option<Self> {
-        Some(match s.to_ascii_lowercase().as_str() {
-            "daily" => Self::Daily,
-            "weekly" => Self::Weekly,
-            "monthly" => Self::Monthly,
-            _ => return None,
-        })
+        [Self::Daily, Self::Weekly, Self::Monthly].into_iter().find(|u| u.as_str().eq_ignore_ascii_case(s))
     }
 
     pub fn as_str(self) -> &'static str {
@@ -63,10 +58,10 @@ impl Unit {
     /// `9:30pm`, `21:30`); for weeks a day (`monday`, `mon`); for months a day of the month (`15`,
     /// `15th`, `1st`; 1 to 31).
     pub fn alignment(self, s: &str) -> Option<u32> {
-        let s = s.trim().to_ascii_lowercase();
+        let s = s.trim();
         match self {
-            Self::Daily => time_of_day(&s),
-            Self::Weekly => WEEKDAYS.iter().position(|d| *d == s || (s.len() == 3 && d.starts_with(s.as_str()))).and_then(|i| u32::try_from(i).ok()),
+            Self::Daily => time_of_day(s),
+            Self::Weekly => WEEKDAYS.iter().position(|d| d.eq_ignore_ascii_case(s) || (s.len() == 3 && d.get(..3).is_some_and(|p| p.eq_ignore_ascii_case(s)))).and_then(|i| u32::try_from(i).ok()),
             Self::Monthly => {
                 let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
                 let (n, suffix) = s.split_at(digits);
@@ -78,7 +73,7 @@ impl Unit {
                     (3, _) => "rd",
                     _ => "th",
                 };
-                (suffix.is_empty() || suffix == ordinal).then_some(n)
+                (suffix.is_empty() || suffix.eq_ignore_ascii_case(ordinal)).then_some(n)
             }
         }
     }
@@ -87,7 +82,8 @@ impl Unit {
 /// Seconds into the day of `12am`, `9am`, `9:30pm` (12am is midnight, 12pm noon), or of a 24-hour
 /// `21:30`.
 fn time_of_day(s: &str) -> Option<u32> {
-    let (body, pm) = match (s.strip_suffix("am"), s.strip_suffix("pm")) {
+    let half = |suffix: &str| s.len().checked_sub(2).and_then(|at| s.get(at..).filter(|t| t.eq_ignore_ascii_case(suffix)).and_then(|_| s.get(..at)));
+    let (body, pm) = match (half("am"), half("pm")) {
         (Some(b), _) => (b, Some(false)),
         (_, Some(b)) => (b, Some(true)),
         _ => (s, None),

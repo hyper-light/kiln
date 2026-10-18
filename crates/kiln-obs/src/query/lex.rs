@@ -101,7 +101,9 @@ pub fn lex(q: &str) -> Result<Vec<Spanned<'_>>, LexError> {
             '\'' | '"' => {
                 let quote = c;
                 it.next();
-                let mut s = String::new();
+                // Sized to the next quote: the string's length unless it escapes one.
+                let rest = q.get(i + 1..).unwrap_or("");
+                let mut s = String::with_capacity(rest.find(quote).unwrap_or(rest.len()));
                 let mut closed = false;
                 while let Some((_, c)) = it.next() {
                     match c {

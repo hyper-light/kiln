@@ -1,5 +1,7 @@
 //! Queries on recorded data (`docs/observe.md` §12.5): dashboard queries over the corpus's day,
-//! each run repeatedly; latency tails, samples scanned, nanoseconds a sample and allocations.
+//! each run repeatedly; latency tails, samples scanned, nanoseconds a sample and allocations (a
+//! query's second run's: a timezone's first use in a process loads it, once). Before them, what a
+//! query's shape costs in allocations to parse and to evaluate, on an empty store.
 //!
 //! `KOBS_CORPUS=<corpus> cargo bench -p kiln-obs --bench query`
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::cast_precision_loss)]
@@ -18,6 +20,20 @@ use kiln_obs::query::eval::{Request, eval};
 static COUNTING: alloc::Counting = alloc::Counting;
 
 fn main() {
+    println!("{:<60} {:>7} {:>7}", "a query's shape, on an empty store", "parse", "eval");
+    let empty = kiln_obs::store::Store::new(kiln_obs::hash::Keyed::with_keys(1, 2));
+    for q in ["avg:x{*}.rollup(avg, 60)", "avg:x{*}.rollup(avg, daily)", "avg:x{*}.rollup(avg, daily, 'America/New_York')", "avg:x{*}.weighted()"] {
+        let r = Request::new(q, 0, 86_400_000);
+        let _ = eval(&empty, &r);
+        alloc::begin();
+        let _ = kiln_obs::query::parse::parse(q);
+        let p = alloc::end();
+        alloc::begin();
+        let _ = eval(&empty, &r);
+        let e = alloc::end();
+        println!("{q:<60} {:>7} {:>7}", p.calls(), e.calls());
+    }
+    println!();
     let series = match corpus::load() {
         Ok(s) => s,
         Err(e) => {
@@ -38,6 +54,12 @@ fn main() {
         "top(avg:container_memory_working_set_bytes{*} by {pod}, 10, 'mean', 'desc')",
         "avg:node_*{*} by {instance}",
         "sum:*{job:apiserver}",
+        // The calendar's grid (a local day's periods, their edges from the tz database) and the
+        // weights (each series' interval learned, its samples counted a bucket), on the widest read.
+        "avg:node_load1{*} by {instance}.rollup(avg, daily)",
+        "avg:node_load1{*} by {instance}.rollup(avg, daily, 'America/New_York')",
+        "avg:node_*{*} by {instance}.rollup(avg, daily, 'America/New_York')",
+        "avg:node_*{*} by {instance}.weighted()",
     ];
     println!("{:<80} {:>7} {:>10} {:>11} {:>11} {:>8} {:>9}", "query", "series", "samples", "p50", "p99", "ns/smp", "allocs");
     for q in queries {
@@ -51,7 +73,7 @@ fn main() {
             let a = eval(&store, &req).unwrap();
             let c = alloc::end();
             ns.push(t.elapsed().as_nanos() as u64);
-            if i == 0 {
+            if i == 1 {
                 allocs = c.calls();
             }
             answer = Some(a);
