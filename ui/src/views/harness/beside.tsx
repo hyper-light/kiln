@@ -9,21 +9,52 @@
  * what's on its screen added to the message, and on touch screens the keys a phone lacks.
  */
 import * as React from "react";
+import { create } from "zustand";
 import { CornerDownLeft, X } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type BesideTerminal } from "@/api/harness";
 import { charKey, namedKey, type NamedKey } from "@/components/terminal/keys";
 import { SelectField } from "@/components/ui/misc";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
-import { TerminalSession, type SessionHandle, type SessionState } from "@/views/terminal/session";
+import { useSuspenseResource } from "@/lib/resource";
+import { Loading } from "@/components/ui/loading";
+import type { SessionHandle, SessionState } from "@/views/terminal/session";
 import { machineName } from "./parts";
 import "./beside.css";
 
-/** A terminal asked for (a new `seq` each time). */
-export interface BesideRequest {
-  what: "shell" | "screen";
-  command?: string;
-  seq: number;
+// The terminal itself (xterm, about 500 KB) loads when a terminal beside the agent is first shown,
+// not with the agent's page.
+const TerminalSession = React.lazy(() => import("@/views/terminal/session").then((m) => ({ default: m.TerminalSession })));
+
+/** What was done here to an agent's terminals: opened, closed, the one shown, what went wrong or what it said. */
+interface Here {
+  opened: BesideTerminal[];
+  closed: string[];
+  current: string | null;
+  error: string | null;
+  said: string | null;
+}
+
+const NOTHING: Here = { opened: [], closed: [], current: null, error: null, said: null };
+
+const useHere = create<{ by: Record<string, Here> }>()(() => ({ by: {} }));
+const change = (agent: string, f: (h: Here) => Here) => useHere.setState((s) => ({ by: { ...s.by, [agent]: f(s.by[agent] ?? NOTHING) } }));
+
+/**
+ * Opens a terminal beside an agent (from the composer: `!command`, /terminal, a command only its
+ * own screen does): its shell, with `command` run in it, or its harness's own screen on `command`.
+ * It shows under the conversation, brought into view.
+ */
+export function openBeside(agent: string, what: "shell" | "screen", command?: string) {
+  change(agent, (h) => ({ ...h, error: null, said: null }));
+  const width = document.querySelector<HTMLElement>(".hx-timeline .hx-flow")?.clientWidth || 760;
+  harnessApi.openTerminal(agent, { what, command, cols: Math.max(40, Math.floor((width - 28) / 7.8)), rows: 26 }).then(
+    (b) => {
+      change(agent, (h) => ({ ...h, opened: [b, ...h.opened.filter((x) => x.terminal.id !== b.terminal.id)], closed: h.closed.filter((id) => id !== b.terminal.id), current: b.terminal.id }));
+      requestAnimationFrame(() => document.querySelector(".bt")?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
+    },
+    (e: unknown) => change(agent, (h) => ({ ...h, error: errorMessage(e) })),
+  );
 }
 
 /** Keys a phone's keyboard lacks, for shells and full-screen programs. */
@@ -42,72 +73,37 @@ const KEYS: { label: string; aria: string; key?: NamedKey; ctrl?: string; shift?
 /** How many lines of what's on screen go into the message. */
 const HAND_LINES = 60;
 
-export function BesideTerminals({
-  agent,
-  info,
-  request,
-  onTaken,
-  onInsert,
-}: {
+type BesideProps = {
   agent: string;
   info: AgentInfo | null;
-  /** What was asked for; `onTaken` once it's on its way (so it's asked for once). */
-  request: BesideRequest | null;
-  onTaken: () => void;
   onInsert: (text: string) => void;
-}) {
-  const [list, setList] = React.useState<BesideTerminal[]>([]);
-  const [current, setCurrent] = React.useState<string | null>(null);
+};
+
+/** The terminals beside an agent; nothing until it's known whether there are any. */
+export function BesideTerminals(props: BesideProps) {
+  return (
+    <React.Suspense fallback={null}>
+      <Terminals {...props} />
+    </React.Suspense>
+  );
+}
+
+function Terminals({ agent, info, onInsert }: BesideProps) {
+  // The ones already open beside it (here earlier, or on another device), and what was done here since.
+  const there = useSuspenseResource(`harness/terminals/${agent}`, () => harnessApi.terminals(agent).catch((): BesideTerminal[] => []));
+  const here = useHere((s) => s.by[agent] ?? NOTHING);
+  const list = React.useMemo(() => {
+    const opened = new Set(here.opened.map((b) => b.terminal.id));
+    return [...here.opened, ...there.data.filter((b) => !b.terminal.exited && !opened.has(b.terminal.id))].filter((b) => !here.closed.includes(b.terminal.id));
+  }, [here.opened, here.closed, there.data]);
+  const { current, error, said } = here;
+  const setCurrent = (id: string) => change(agent, (h) => ({ ...h, current: id }));
   const [states, setStates] = React.useState<Record<string, SessionState>>({});
-  const [error, setError] = React.useState<string | null>(null);
-  const [said, setSaid] = React.useState<string | null>(null);
   const handle = React.useRef<SessionHandle | null>(null);
-  const root = React.useRef<HTMLDivElement>(null);
   const [fontSize] = useLocalStorage("kiln.term.fontSize", 13);
   const [copyOnSelect] = useLocalStorage("kiln.term.copyOnSelect", false);
   const touch = useMediaQuery("(pointer: coarse)");
   const harness = info?.kind_name ?? "The harness";
-
-  // The ones already open beside it (here earlier, or on another device).
-  React.useEffect(() => {
-    let live = true;
-    harnessApi.terminals(agent).then(
-      (l) => {
-        if (!live) return;
-        const open = l.filter((b) => !b.terminal.exited);
-        setList(open);
-        setCurrent((c) => c ?? open[0]?.terminal.id ?? null);
-      },
-      () => undefined,
-    );
-    return () => {
-      live = false;
-    };
-  }, [agent]);
-
-  // What was asked for: its shell (again, with a command run in it), or its own screen.
-  const seq = request?.seq;
-  React.useEffect(() => {
-    if (!request) return;
-    let live = true;
-    setError(null);
-    setSaid(null);
-    const width = root.current?.clientWidth || 760;
-    onTaken();
-    harnessApi.openTerminal(agent, { what: request.what, command: request.command, cols: Math.max(40, Math.floor((width - 28) / 7.8)), rows: 26 }).then(
-      (b) => {
-        if (!live) return;
-        setList((l) => [b, ...l.filter((x) => x.terminal.id !== b.terminal.id)]);
-        setCurrent(b.terminal.id);
-        requestAnimationFrame(() => root.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
-      },
-      (e: unknown) => live && setError(errorMessage(e)),
-    );
-    return () => {
-      live = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- each request once, by its seq
-  }, [seq]);
 
   const shown = list.find((b) => b.terminal.id === current) ?? list[0] ?? null;
   const st = shown ? states[shown.terminal.id] : undefined;
@@ -117,14 +113,15 @@ export function BesideTerminals({
   /** It ended (here, on another device, or by itself): it goes; a screen says what happens next. */
   const onClosed = React.useCallback(
     (id: string) => {
-      setList((l) => {
-        const gone = l.find((b) => b.terminal.id === id);
-        if (gone?.what === "screen") setSaid(`${harness}'s own screen closed. The agent starts again once it's idle, to load what you changed; the conversation continues.`);
-        return l.filter((b) => b.terminal.id !== id);
-      });
-      setCurrent((c) => (c === id ? null : c));
+      const gone = list.find((b) => b.terminal.id === id);
+      change(agent, (h) => ({
+        ...h,
+        closed: h.closed.includes(id) ? h.closed : [...h.closed, id],
+        current: h.current === id ? null : h.current,
+        said: gone?.what === "screen" ? `${harness}'s own screen closed. The agent starts again once it's idle, to load what you changed; the conversation continues.` : h.said,
+      }));
     },
-    [harness],
+    [agent, list, harness],
   );
 
   const close = async (b: BesideTerminal) => {
@@ -157,7 +154,7 @@ export function BesideTerminals({
   const labelOf = (b: BesideTerminal) => (b.what === "shell" ? "Shell" : `${harness}${b.command ? ` · ${b.command}` : ""}`);
 
   return (
-    <section ref={root} className="bt" aria-label="Terminal beside the agent">
+    <section className="bt" aria-label="Terminal beside the agent">
       {error && <p className="bt-error">{error}</p>}
       {said && !shown && <p className="bt-said">{said}</p>}
       {shown && (
@@ -190,21 +187,23 @@ export function BesideTerminals({
             </p>
           )}
           <div className="bt-screen">
-            <TerminalSession
-              key={shown.terminal.id}
-              ref={handle}
-              tabId={shown.terminal.id}
-              sessionId={shown.terminal.id}
-              target={shown.terminal.target}
-              active
-              fontSize={fontSize}
-              copyOnSelect={copyOnSelect}
-              deviceKeyboard
-              onState={onState}
-              onTitle={noop}
-              onSession={noop}
-              onClosed={onClosed}
-            />
+            <React.Suspense fallback={<Loading label="Opening the terminal" block />}>
+              <TerminalSession
+                key={shown.terminal.id}
+                ref={handle}
+                tabId={shown.terminal.id}
+                sessionId={shown.terminal.id}
+                target={shown.terminal.target}
+                active
+                fontSize={fontSize}
+                copyOnSelect={copyOnSelect}
+                deviceKeyboard
+                onState={onState}
+                onTitle={noop}
+                onSession={noop}
+                onClosed={onClosed}
+              />
+            </React.Suspense>
           </div>
           {st?.kind === "reconnecting" && <p className="bt-note">Reconnecting…</p>}
           {st?.kind === "error" && <p className="bt-error">{st.message}</p>}

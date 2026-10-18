@@ -1,57 +1,18 @@
 /** Data for Runners → Add machines (and the notice on Runners): join requests, what discovery hears, and what each machine is to this server. */
-import * as React from "react";
 import { api } from "@/api/client";
-import { useServerEvents } from "@/api/events";
-import type { Agent, DiscoveredInstance, DiscoveryVia, InstallOs, JoinInfo } from "@/api/types";
-import { useResource } from "@/lib/hooks";
-
-/** Calls `fn` at most once per `ms`, and once more after the last call of a burst. */
-export function useThrottled(fn: () => void, ms: number): () => void {
-  const fnRef = React.useRef(fn);
-  React.useEffect(() => {
-    fnRef.current = fn;
-  });
-  const last = React.useRef(0);
-  const timer = React.useRef<number | null>(null);
-  React.useEffect(
-    () => () => {
-      if (timer.current !== null) window.clearTimeout(timer.current);
-    },
-    [],
-  );
-  return React.useCallback(() => {
-    const wait = last.current + ms - Date.now();
-    if (wait <= 0) {
-      last.current = Date.now();
-      fnRef.current();
-    } else if (timer.current === null) {
-      timer.current = window.setTimeout(() => {
-        timer.current = null;
-        last.current = Date.now();
-        fnRef.current();
-      }, wait);
-    }
-  }, [ms]);
-}
+import type { Agent, DiscoveredInstance, DiscoveryInfo, DiscoveryVia, InstallOs, JoinInfo, JoinRequest } from "@/api/types";
+import type { Res } from "@/lib/data";
 
 /**
- * Machines asking to join (`kiln join`) and the kiln instances discovery knows. Refetched on the
- * `join_requests` and `discovery` events (scan progress arrives as the latter, up to twice a second)
- * and when a runner connects or leaves; slow polling covers a dropped event stream.
+ * Machines asking to join (`kiln join`) and the kiln instances discovery knows. Read again on the
+ * `join_requests` and `discovery` events (scan progress arrives as the latter, up to twice a
+ * second; one read at a time, lib/resource.ts) and when a runner connects or leaves (discovery then
+ * counts it as one of ours); slow polling covers a dropped event stream.
  */
-export function useJoinData() {
-  const requests = useResource((s) => api.joinRequests(s), [], { pollMs: 15_000 });
-  const discovery = useResource((s) => api.discovery(s), [], { pollMs: 30_000 });
-  const reloadRequests = useThrottled(requests.reload, 300);
-  const reloadDiscovery = useThrottled(discovery.reload, 300);
-  useServerEvents((ev) => {
-    if (ev.type === "join_requests") reloadRequests();
-    else if (ev.type === "discovery") reloadDiscovery();
-    // A machine that just joined connects as a runner: discovery now counts it as one of ours.
-    else if (ev.type === "agent" && !ev.agent.ephemeral) reloadDiscovery();
-  });
-  return { requests, discovery };
-}
+export const joinRequestsRes: Res<JoinRequest[]> = { key: "join-requests", fetch: (s) => api.joinRequests(s), opts: { pollMs: 15_000, on: ["join_requests"] } };
+export const discoveryRes: Res<DiscoveryInfo> = { key: "discovery", fetch: (s) => api.discovery(s), opts: { pollMs: 30_000, on: ["discovery", "agent"] } };
+/** The install commands, with the join token they carry. */
+export const joinRes: Res<JoinInfo> = { key: "join", fetch: (s) => api.join(s) };
 
 /** A runner that connected while Add machines was open. */
 export interface Arrival {

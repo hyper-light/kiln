@@ -12,7 +12,7 @@ use super::core::{MAX_EVENTS, Update};
 use super::host::{Host, Inventory, Limits};
 use super::kinds::KindInfo;
 use super::model::{Command, State, Status};
-use super::session::{Info, Spec};
+use super::session::{Info, MAX_NAME, Spec};
 use crate::hub::Hub;
 use crate::proto::{LANE_TERM, ServerMsg};
 use crate::rt::Broadcast;
@@ -44,6 +44,8 @@ impl Location {
 
 struct Mirror {
     info: Info,
+    /// The last name of its own its machine reported for it (empty: none yet).
+    reported: String,
     location: Location,
     meta: Value,
     state: Value,
@@ -55,7 +57,7 @@ struct Mirror {
 
 impl Mirror {
     fn new(info: Info, location: Location) -> Self {
-        Self { info, location, meta: Value::Null, state: Value::Null, changes: Value::Null, events: Vec::new(), index: HashMap::new(), out: Broadcast::new(FANOUT) }
+        Self { info, reported: String::new(), location, meta: Value::Null, state: Value::Null, changes: Value::Null, events: Vec::new(), index: HashMap::new(), out: Broadcast::new(FANOUT) }
     }
 
     fn reindex(&mut self) {
@@ -162,6 +164,36 @@ pub struct Registry {
     dir: std::path::PathBuf,
     /// The server machine's transcripts, for its past sessions (made on first use).
     scanner: Arc<Mutex<Option<crate::aisessions::Scanner>>>,
+    /// Names people gave sessions, by id (the "rename" control), kept in `names.json`: a session
+    /// takes its name here at once, whatever its machine's runner knows of names (one from before
+    /// kiln named sessions never reports it), and keeps it across restarts.
+    names: Mutex<HashMap<String, String>>,
+}
+
+/// The name a session's machine reports as its own: none when it's empty or its harness's name.
+fn own_name<'a>(name: &'a str, kind_name: &str) -> Option<&'a str> {
+    let n = name.trim();
+    (!n.is_empty() && !n.eq_ignore_ascii_case(kind_name.trim())).then_some(n)
+}
+
+/// Whose name a session shows once its machine reports `reported` in a state.
+#[derive(Debug, PartialEq, Eq)]
+enum Naming<'a> {
+    /// A name of its own the machine gives anew (not the `last` it gave): it's kept here too.
+    Adopt(&'a str),
+    /// The name kept here: the machine has none of its own (a runner from before names, or one
+    /// upgraded since), or hasn't taken the one given here yet.
+    Keep,
+    /// The machine's: nothing is kept here.
+    Theirs,
+}
+
+fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Naming<'a> {
+    match own_name(reported, kind_name) {
+        Some(own) if own != last => Naming::Adopt(own),
+        _ if kept => Naming::Keep,
+        _ => Naming::Theirs,
+    }
 }
 
 impl Registry {
@@ -176,9 +208,51 @@ impl Registry {
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
+            names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn save_names(&self) {
+        let names = self.names.lock().clone();
+        let path = self.dir.join("names.json");
+        let write = || -> anyhow::Result<()> {
+            std::fs::create_dir_all(&self.dir)?;
+            let tmp = path.with_extension("json.part");
+            std::fs::write(&tmp, serde_json::to_vec(&names)?)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't keep the agents' names");
+        }
+    }
+
+    /// A session is given a name here (the "rename" control from any device; empty gives it its
+    /// harness's name back): its page and every list show it at once.
+    fn rename(&self, hub: &Hub, id: &str, value: Option<&Value>) {
+        let name: String = value.and_then(Value::as_str).unwrap_or("").trim().chars().take(MAX_NAME).collect();
+        {
+            let mut g = self.names.lock();
+            if name.is_empty() {
+                g.remove(id);
+            } else {
+                g.insert(id.to_owned(), name.clone());
+            }
+        }
+        self.save_names();
+        let info = {
+            let mut g = self.mirrors.lock();
+            let Some(m) = g.get_mut(id) else { return };
+            m.info.name = if name.is_empty() { m.info.kind_name.clone() } else { name };
+            if let Some(o) = m.state.as_object_mut() {
+                o.insert("name".into(), json!(m.info.name));
+                m.out.send(Arc::from(json!({"t": "state", "state": m.state}).to_string()));
+            }
+            m.info.clone()
+        };
+        hub.emit(&json!({"type": "harness", "info": info}));
     }
 
     /// Environment for one of the server's own terminals, so `kiln spawn` there works.
@@ -228,7 +302,15 @@ impl Registry {
     }
 
     pub fn kinds(&self) -> HashMap<String, Vec<KindInfo>> {
-        self.kinds.lock().clone()
+        let mut all = self.kinds.lock().clone();
+        // The server's own harnesses: the models its sessions listed since it started.
+        for k in all.get_mut("local").into_iter().flatten() {
+            let m = super::kinds::models_of(&k.id);
+            if !m.is_empty() {
+                k.models = m;
+            }
+        }
+        all
     }
 
     /// A session's meta as last reported (its harness's catalog: slash commands, models, modes).
@@ -275,13 +357,29 @@ impl Registry {
     pub fn ingest(&self, hub: &Hub, from: &Location, id: &str, u: Update) {
         let mut changed: Option<Info> = None;
         let mut gone = false;
+        let mut save_names = false;
+        // Where it runs, and the name given here, are the server's to say: to the mirror and to
+        // viewers alike (a session announced again — a switch of harness, a reconnect — keeps its
+        // machine and its name). The machine's own name is kept aside: it counts once it changes it.
+        let mut reported = String::new();
+        let u = match u {
+            Update::Open { mut info } => {
+                info.target = from.target();
+                own_name(&info.name, &info.kind_name).unwrap_or_default().clone_into(&mut reported);
+                if let Some(n) = self.names.lock().get(id) {
+                    info.name.clone_from(n);
+                }
+                Update::Open { info }
+            }
+            other => other,
+        };
         {
             let mut g = self.mirrors.lock();
             if let Update::Open { info } = &u {
-                let mut info = (**info).clone();
-                info.target = from.target();
+                let info = (**info).clone();
                 let m = g.entry(id.to_owned()).or_insert_with(|| Mirror::new(info.clone(), from.clone()));
                 m.info = info.clone();
+                m.reported = reported;
                 m.location = from.clone();
                 m.events.clear();
                 m.index.clear();
@@ -310,6 +408,25 @@ impl Registry {
                     let before = m.info.clone();
                     m.info.apply(state);
                     m.info.last_activity = crate::util::now_ms();
+                    // Its name: one of its own the machine gives anew; else the one given here.
+                    let mut names = self.names.lock();
+                    match naming(&state.name, &m.reported, &m.info.kind_name, names.contains_key(id)) {
+                        Naming::Adopt(own) => {
+                            m.reported = own.to_owned();
+                            names.insert(id.to_owned(), own.to_owned());
+                            save_names = true;
+                        }
+                        Naming::Keep => {
+                            if let Some(n) = names.get(id) {
+                                m.info.name.clone_from(n);
+                                if let Some(o) = m.state.as_object_mut() {
+                                    o.insert("name".into(), json!(n));
+                                }
+                            }
+                        }
+                        Naming::Theirs => {}
+                    }
+                    drop(names);
                     if m.info.differs(&before) {
                         changed = Some(m.info.clone());
                     }
@@ -325,12 +442,21 @@ impl Registry {
                 }
                 Update::Stream { id, text } => m.append(id, text),
             }
-            if let Ok(frame) = serde_json::to_string(&u) {
+            // A state goes out with the name given here in it (the machine's may lack it).
+            let frame = match &u {
+                Update::State { .. } => Some(json!({"t": "state", "state": m.state}).to_string()),
+                _ => serde_json::to_string(&u).ok(),
+            };
+            if let Some(frame) = frame {
                 m.out.send(Arc::from(frame));
             }
             if gone {
                 g.remove(id);
+                save_names = self.names.lock().remove(id).is_some() || save_names;
             }
+        }
+        if save_names {
+            self.save_names();
         }
         if gone {
             hub.emit(&json!({"type": "harness_closed", "id": id}));
@@ -591,6 +717,14 @@ impl Registry {
     /// A command for a session, from any device.
     pub async fn command(&self, hub: &Hub, id: &str, c: Command) -> Sent {
         let Some(loc) = self.location(id) else { return Sent::NoSession };
+        // A name is kept here: the session takes it at once, whatever its machine can do (and
+        // its harness names its conversation too, where it does).
+        let renamed = matches!(&c, Command::Control { id: control, .. } if control == "rename");
+        if let Command::Control { id: control, value } = &c
+            && control == "rename"
+        {
+            self.rename(hub, id, value.as_ref());
+        }
         let c = match self.route_attachments(hub, id, &loc, c).await {
             Ok(c) => c,
             Err(e) => return e,
@@ -606,7 +740,8 @@ impl Registry {
             }
             Some(Location::Machine(machine)) => {
                 let Ok(json) = serde_json::to_string(&c) else { return Sent::NoSession };
-                if hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await {
+                // A name is given even while the machine is away: it's kept here.
+                if hub.send_to_agent(&machine, LANE_TERM, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await || renamed {
                     Sent::Ok
                 } else {
                     Sent::Unreachable
@@ -641,4 +776,36 @@ impl Registry {
 
 fn default_name(kind: &str) -> String {
     super::kinds::Kind::get(kind).map_or_else(|| kind.to_owned(), |k| k.name.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_name_given_here_holds_whatever_the_machine_knows_of_names() {
+        // A runner from before names reports none: the name given here shows.
+        assert_eq!(naming("", "", "Claude Code", true), Naming::Keep);
+        assert_eq!(naming("", "", "Claude Code", false), Naming::Theirs);
+        // Upgraded since, it reports its harness's name (in any case): still the one given here.
+        assert_eq!(naming("Claude Code", "", "Claude Code", true), Naming::Keep);
+        assert_eq!(naming("claude code ", "", "Claude Code", true), Naming::Keep);
+        // A machine that names it itself: taken, and kept here too.
+        assert_eq!(naming("slates-6d", "", "Claude Code", false), Naming::Adopt("slates-6d"));
+        assert_eq!(naming("Mantle", "slates-6d", "Codex", true), Naming::Adopt("Mantle"));
+        // Renamed here while the machine still reports its old one: the new one shows until the
+        // machine takes it.
+        assert_eq!(naming("slates-6d", "slates-6d", "Claude Code", true), Naming::Keep);
+    }
+
+    #[test]
+    fn names_are_kept_across_restarts() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let r = Registry::new(dir.path().to_owned());
+        r.names.lock().insert("s1".into(), "Mantle".into());
+        r.save_names();
+        let again = Registry::new(dir.path().to_owned());
+        assert_eq!(again.names.lock().get("s1").map(String::as_str), Some("Mantle"));
+        Ok(())
+    }
 }

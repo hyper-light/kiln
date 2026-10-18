@@ -1,4 +1,4 @@
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { ArrowRight } from "lucide-react";
 import type { DiscoveryInfo, JoinRequest } from "@/api/types";
 import { cn } from "@/lib/utils";

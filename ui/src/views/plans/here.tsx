@@ -5,12 +5,16 @@
  * Kept plans are the same ones Agents › Plans lists; everything stays in the page's flow.
  */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { planHref, plansApi, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
+import { Loadable } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
+import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { errorMessage, useResource } from "@/lib/hooks";
+import { errorMessage } from "@/lib/hooks";
+import { invalidate } from "@/lib/resource";
+import { plansRes } from "./data";
 import { PlanItemsEditor } from "./items";
 import "./plans.css";
 
@@ -29,7 +33,15 @@ const MODES: { value: PlanMode; label: string }[] = [
 ];
 
 export function PlansHere({ session }: { session: string }) {
-  const res = useResource((s) => plansApi.list(s), []);
+  return (
+    <Loadable label="your plans">
+      <Here session={session} />
+    </Loadable>
+  );
+}
+
+function Here({ session }: { session: string }) {
+  const res = useRes(plansRes);
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [picked, setPicked] = React.useState("");
   const [mode, setMode] = React.useState<PlanMode>("message");
@@ -37,7 +49,7 @@ export function PlansHere({ session }: { session: string }) {
   const [note, setNote] = React.useState<string | null>(null);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [error, setError] = React.useState<string | null>(null);
-  const plans = res.data ?? [];
+  const plans = res.data;
   const plan = plans.find((p) => p.id === picked) ?? plans[0];
 
   const edit = (p?: Plan) => {
@@ -51,9 +63,11 @@ export function PlansHere({ session }: { session: string }) {
     setBusy(true);
     setError(null);
     try {
-      const body = { title: draft.title.trim() || undefined, body: draft.body, items: draft.items };
+      // Emptied, the title is taken from the plan (its overview, else its first step).
+      const body = { title: draft.title.trim(), body: draft.body, items: draft.items };
       const p = draft.id ? await plansApi.update(draft.id, body) : await plansApi.create({ ...body, source: { session } });
-      res.setData((l) => [p, ...(l ?? []).filter((x) => x.id !== p.id)]);
+      res.setData((l) => [p, ...l.filter((x) => x.id !== p.id)]);
+      invalidate("plans/");
       setPicked(p.id);
       setDraft(null);
       setNote(draft.id ? `Saved as version ${p.version}.` : "Saved.");
@@ -77,8 +91,6 @@ export function PlansHere({ session }: { session: string }) {
     }
   };
 
-  if (!res.data) return res.error ? <p className="in-none">{errorMessage(res.error)}</p> : null;
-
   if (draft) {
     return (
       <div className="ph">
@@ -87,7 +99,7 @@ export function PlansHere({ session }: { session: string }) {
             Title
           </label>
           <div className="field">
-            <input id={`ph-title-${session}`} value={draft.title} placeholder="From the first step when left empty" onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
+            <input id={`ph-title-${session}`} value={draft.title} placeholder="From the overview, or the first step, when left empty" onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
           </div>
         </div>
         <div>

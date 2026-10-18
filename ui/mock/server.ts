@@ -5,7 +5,8 @@
  *   npm run mock            # http://127.0.0.1:7070, token printed on start
  *   MOCK_NO_AUTH=1 npm run mock
  *
- * If ../dist exists it is served at / with SPA fallback (like rust-embed in the server).
+ * If ../dist/client exists (the built UI) it is served at /, with the app's shell for every page,
+ * as kiln serves it when its UI server isn't running.
  */
 import http from "node:http";
 import { randomBytes } from "node:crypto";
@@ -18,6 +19,9 @@ import type { Agent, AuditEntry, Child, HostSample, Job, PlannedJob, Repo, Run, 
 import type { DiscoveredInstance, DiscoveryInfo, DiscoveryMethod, DiscoveryProblem, DiscoveryVia, JoinInfo, JoinRequest, ScanState } from "../src/api/types.ts";
 import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, pipelineFor, sha, stepLog, type JobTpl, type LogPlan, type Toolchain } from "./data.ts";
 import { handleAccounts, handleDemoSession } from "./accounts.ts";
+import { handlePages } from "./pages.ts";
+import { handlePlaces } from "./places.ts";
+import { handleLongSession, setLongEmit } from "./conversation.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -45,7 +49,8 @@ const VERSION = "0.1.0";
 const STARTED = Date.now();
 const HOSTNAME = "kiln-01";
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DIST = join(__dirname, "..", "dist");
+// MOCK_DIST: serve another build's client files (a scratch one, so builds in progress elsewhere don't clash).
+const DIST = process.env.MOCK_DIST ?? join(__dirname, "..", "dist", "client");
 
 const now = () => Math.floor(Date.now() / 1000);
 const rid = (p: string) => `${p}${randomBytes(6).toString("hex")}`;
@@ -454,6 +459,7 @@ function emit(ev: ServerEvent) {
   const msg = JSON.stringify(ev);
   for (const ws of eventClients) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
+setLongEmit((ev) => emit(ev as ServerEvent));
 
 function queueCounts() {
   let queued = 0;
@@ -1174,7 +1180,7 @@ function serveStatic(pathname: string, res: http.ServerResponse) {
   }
   const safe = normalize(pathname).replace(/^(\.\.[/\\])+/, "");
   let file = join(DIST, safe);
-  if (!file.startsWith(DIST) || !existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "index.html");
+  if (!file.startsWith(DIST) || !existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "_shell.html");
   const ext = extname(file);
   res.writeHead(200, {
     "content-type": MIME[ext] ?? "application/octet-stream",
@@ -1555,6 +1561,8 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, audit.slice(0, limit));
     }
     if (p.startsWith("/api/hooks/github")) return noContent(res);
+    if (await handlePlaces(req, res, url, { agents: () => [...agents.values()], repos: () => repos, emit, json, err, body })) return;
+    if (await handlePages(req, res, url, { agents: () => [...agents.values()], runs: () => runs, version: VERSION, hostname: HOSTNAME, json, err, body })) return;
 
     return err(res, 404, `no route for ${m} ${p}`);
   } catch (e) {
@@ -1592,7 +1600,7 @@ server.on("upgrade", (req, socket, head) => {
     if (lm) return handleLogs(ws, decodeURIComponent(lm[1]!), Number(url.searchParams.get("step") ?? 0));
     if (p === "/api/terminal/ws") return handleTerminal(ws, url.searchParams);
     const hm = p.match(/^\/api\/harness\/sessions\/([^/]+)\/ws$/);
-    if (hm && handleDemoSession(ws, decodeURIComponent(hm[1]!))) return;
+    if (hm && (handleDemoSession(ws, decodeURIComponent(hm[1]!)) || handleLongSession(ws, decodeURIComponent(hm[1]!)))) return;
     ws.close(1008, "no such socket");
   });
 });
@@ -1637,6 +1645,27 @@ function handleTerminal(ws: WebSocket, params: URLSearchParams) {
   }
   addAudit("admin", "terminal.open", target);
   const banner = target === "local" ? "" : `\x1b[2m[mock] ${target} → local shell on ${os.hostname()}\x1b[0m\r\n`;
+  // Which session this socket is on (the server's first frame on every attach).
+  ws.send(
+    JSON.stringify({
+      type: "session",
+      session: {
+        id: params.get("session") ?? rid("ts_"),
+        target,
+        command: null,
+        title: "",
+        name: null,
+        created_at: now(),
+        attached: 1,
+        cols,
+        rows,
+        idle_seconds: 0,
+        exited: false,
+        exit_code: null,
+        error: null,
+      },
+    }),
+  );
 
   if (!ptyMod) {
     // Echo terminal fallback

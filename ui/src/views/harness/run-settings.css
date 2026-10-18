@@ -349,6 +349,23 @@ button.rs-v:focus-visible {
   transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* Another harness's models, under the agent's own: its name, quiet, then its models and what choosing one does. */
+.rs-elsewhere {
+  margin-top: 10px;
+}
+.rs-elsewhere-name {
+  margin: 0 0 -8px;
+  color: #6d7078;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  line-height: 16px;
+  text-transform: uppercase;
+}
+.rs-elsewhere > .rs-desc {
+  margin-top: 0;
+}
+
 /* The composer's row for one message: its name in a 96px column, the words beside it (or under it). */
 .rs-set {
   display: flex;

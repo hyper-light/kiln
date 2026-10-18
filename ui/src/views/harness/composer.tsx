@@ -3,10 +3,13 @@
  * reaches the agent the way you choose while it works — queued for when it finishes, steered into
  * the running turn, or sent now (stopping the turn). Queued messages stay editable and reorderable
  * on every device until they go out.
+ *
+ * What you type lives in the drafts store (state.ts) and only this reads it, so typing renders the
+ * composer and nothing else; how a message goes is kept until you change it.
  */
 import * as React from "react";
 import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
-import { clientId, type Meta, type SendMode, type SessionStore, type State } from "@/api/harness";
+import { clientId, useSession, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { Attachments } from "./controls";
@@ -14,6 +17,7 @@ import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCom
 import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
+import { useDrafts, useSendMode } from "./state";
 
 const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -28,7 +32,12 @@ function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: str
   const [editing, setEditing] = React.useState(false);
   const [whole, setWhole] = React.useState(false);
   const [draft, setDraft] = React.useState(text);
-  React.useEffect(() => setDraft(text), [text]);
+  // Changed elsewhere (another device): what's edited starts from that.
+  const [was, setWas] = React.useState(text);
+  if (was !== text) {
+    setWas(text);
+    setDraft(text);
+  }
   return (
     <li className="qd-row">
       <span className="qd-n">{index + 1}</span>
@@ -111,10 +120,17 @@ function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text:
       else setOpen(false);
     }, 4000);
   }, []);
-  React.useEffect(() => () => window.clearTimeout(timer.current), []);
-  React.useEffect(() => {
-    if (open) fold();
-  }, [open, queue.length, fold]);
+  // While it's open (and again whenever the queue changes), it's counting down to folding.
+  const count = queue.length;
+  const folding = React.useCallback(
+    (list: HTMLOListElement | null) => {
+      if (!list) return;
+      void count;
+      fold();
+      return () => window.clearTimeout(timer.current);
+    },
+    [fold, count],
+  );
   const first = queue[0]?.text ?? "";
   return (
     <div
@@ -137,7 +153,7 @@ function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text:
         <ChevronDown size={12} className="qd-chev" aria-hidden="true" />
       </button>
       {open && (
-        <ol className="qd-list">
+        <ol ref={folding} className="qd-list">
           {queue.map((q, i) => (
             <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={canNow} canSteer={canSteer} />
           ))}
@@ -147,21 +163,60 @@ function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text:
   );
 }
 
+/** How a message goes while it works: kept until changed (the composer's typing doesn't render it). */
+const SendModes = React.memo(function SendModes({ modes, mode, onMode }: { modes: typeof MODES; mode: SendMode; onMode: (m: SendMode) => void }) {
+  return (
+    <>
+      <div className="cp-modes" role="radiogroup" aria-label="How to send while it works">
+        {modes.map((m) => (
+          <Tip key={m.id} content={m.hint}>
+            <button type="button" role="radio" aria-checked={mode === m.id} data-mode={m.id} onClick={() => onMode(m.id)}>
+              {m.label}
+            </button>
+          </Tip>
+        ))}
+      </div>
+      <label className="cp-mode-pick" data-mode={mode}>
+        <span className="cp-mode-value">{modes.find((m) => m.id === mode)?.label ?? "Queue"}</span>
+        <ChevronDown size={11} aria-hidden="true" />
+        <select aria-label="How to send while it works" value={mode} onChange={(e) => onMode(e.target.value as SendMode)}>
+          {modes.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+      </label>
+    </>
+  );
+});
+
+const StopTurn = React.memo(function StopTurn({ store }: { store: SessionStore }) {
+  return (
+    <Tip content="Stop the current turn (Esc)">
+      <button type="button" className="cp-stop" onClick={() => store.send({ type: "interrupt" })} aria-label="Stop the current turn">
+        <Square size={10} fill="currentColor" />
+        <span className="cp-label">Stop</span>
+      </button>
+    </Tip>
+  );
+});
+
+const NO_QUEUE: QueueItem[] = [];
+const NO_FEATURES: string[] = [];
+const NO_COMMANDS: SlashCommand[] = [];
+
 export function Composer({
   store,
-  state,
-  meta,
-  disabled,
+  agent,
   attachments,
   toMain,
   onView,
   onTerminal,
-  insert,
 }: {
   store: SessionStore;
-  state: State | null;
-  meta: Meta | null;
-  disabled?: boolean;
+  /** The agent's id: what's written to it is kept under it until it's sent. */
+  agent: string;
   attachments: Attachments;
   /** Shown over a subagent's thread: what's typed here goes to the main agent. */
   toMain?: boolean;
@@ -169,17 +224,26 @@ export function Composer({
   onView?: (view: string) => void;
   /** Open a terminal beside the agent: its shell (`!command`), or its harness's own screen (a command only that screen does). */
   onTerminal?: (open: { what: "shell" | "screen"; command?: string }) => void;
-  /** Words to add to what's being written (from the terminal beside it), once per `seq`. */
-  insert?: { text: string; seq: number } | null;
 }) {
-  const [text, setText] = React.useState("");
-  const [mode, setMode] = React.useState<SendMode>("queue");
+  const text = useDrafts((s) => s.drafts[agent] ?? "");
+  const setDraft = useDrafts((s) => s.setDraft);
+  const setText = React.useCallback((t: string | ((was: string) => string)) => setDraft(agent, typeof t === "function" ? t(useDrafts.getState().drafts[agent] ?? "") : t), [agent, setDraft]);
+  const chosen = useSendMode((s) => s.mode);
+  const setMode = useSendMode((s) => s.setMode);
+  const disabled = useSession(store, (s) => s.conn !== "open");
+  const status = useSession(store, (s) => s.state?.status);
+  const queue = useSession(store, (s) => s.state?.queue ?? NO_QUEUE);
+  const approvals = useSession(store, (s) => s.state?.approvals.length ?? 0);
+  const model = useSession(store, (s) => s.state?.model ?? "");
+  const effort = useSession(store, (s) => s.state?.effort ?? "");
+  const meta = useSession(store, (s) => s.meta);
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
-  const ta = React.useRef<HTMLTextAreaElement>(null);
-  const features = React.useMemo(() => meta?.features ?? [], [meta]);
-  const running = state?.status === "running" || state?.status === "waiting";
-  const modes = MODES.filter((m) => !m.feature || features.includes(m.feature));
-  const queue = state?.queue ?? [];
+  const ta = React.useRef<HTMLTextAreaElement | null>(null);
+  const features = meta?.features ?? NO_FEATURES;
+  const running = status === "running" || status === "waiting";
+  const modes = React.useMemo(() => MODES.filter((m) => !m.feature || features.includes(m.feature)), [features]);
+  // How you chose to send stays chosen; an agent that can't send that way queues.
+  const mode: SendMode = modes.some((m) => m.id === chosen) ? chosen : "queue";
   const canAttach = attachments.enabled;
   const canOverride = features.includes("overrides");
   const { files, add, clear, chips, pending } = attachments;
@@ -189,68 +253,79 @@ export function Composer({
   const [withOpen, setWithOpen] = React.useState(false);
   const pressTimer = React.useRef(0);
   const longPressed = React.useRef(false);
-  const approvals = state?.approvals.length ?? 0;
   const shellLine = Boolean(onTerminal) && text.trimStart().startsWith("!");
   const sendLabel = shellLine ? "Run" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
 
-  // Grow with the text, up to a third of the screen.
-  React.useLayoutEffect(() => {
-    const el = ta.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight / 3))}px`;
-  }, [text]);
+  // Grow with the text (measured as each change is shown) up to the stylesheet's most lines, ten,
+  // or four on a phone; past that it scrolls inside, so a long message never pushes the
+  // conversation off the screen.
+  const grow = React.useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      ta.current = el;
+      if (!el) return;
+      void text;
+      el.style.height = "auto";
+      el.style.height = `${el.scrollHeight}px`;
+    },
+    [text],
+  );
 
   // Commands, while a name is typed after "/": every one the agent's harness offers, by name,
   // alias or what it does.
-  const commands = React.useMemo(() => meta?.commands ?? [], [meta]);
+  const commands = meta?.commands ?? NO_COMMANDS;
   const slash = parseSlash(text);
   const [palIndex, setPalIndex] = React.useState(0);
   const [palClosed, setPalClosed] = React.useState(false);
   const [reply, setReply] = React.useState<Reply | "loading" | null>(null);
   const [note, setNote] = React.useState<string | null>(null);
-  // What the terminal beside it hands over goes after what's written.
-  const insertSeq = insert?.seq;
-  React.useEffect(() => {
-    if (!insert) return;
-    setText((t) => (t.trim() ? `${t.replace(/\s+$/, "")}\n\n${insert.text}` : insert.text));
-    ta.current?.focus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per insert
-  }, [insertSeq]);
-  const palItems = React.useMemo(() => (slash?.typingName && !palClosed ? matchCommands(commands, slash.name) : []), [slash?.typingName, slash?.name, palClosed, commands]);
-  React.useEffect(() => {
+  // Another command name: the list starts at its top again, open, and a new name replaces an old
+  // note (clearing the field after one keeps it in view).
+  const [named, setNamed] = React.useState(slash?.name);
+  if (named !== slash?.name) {
+    setNamed(slash?.name);
     setPalIndex(0);
     setPalClosed(false);
-    // A new command name replaces an old note; clearing the field after one keeps it in view.
     if (slash?.name) setNote(null);
-  }, [slash?.name]);
+  }
+  const palItems = React.useMemo(() => (slash?.typingName && !palClosed ? matchCommands(commands, slash.name) : []), [slash?.typingName, slash?.name, palClosed, commands]);
   const typed = slash && !slash.typingName ? findCommand(commands, slash.name) : undefined;
 
-  // @-file suggestions for the word being typed at the end.
-  React.useEffect(() => {
-    const at = text.match(/(?:^|\s)@(\S*)$/);
-    if (at && features.includes("file_suggestions")) {
-      let live = true;
-      const t = window.setTimeout(() => {
+  // @-file suggestions for the word being typed at the end, asked for a moment after typing stops.
+  const asking = React.useRef({ n: 0, timer: 0 });
+  const suggestFor = React.useCallback(
+    (t: string) => {
+      const a = asking.current;
+      a.n += 1;
+      window.clearTimeout(a.timer);
+      const at = t.match(/(?:^|\s)@(\S*)$/);
+      if (!at || !features.includes("file_suggestions")) {
+        setSuggest(null);
+        return;
+      }
+      const n = a.n;
+      a.timer = window.setTimeout(() => {
         void store
           .request((client) => ({ type: "suggest", client, query: at[1] ?? "" }))
           .then((v) => {
-            if (!live) return;
+            if (asking.current.n !== n) return;
             const list = Array.isArray(v) ? (v as unknown[]).filter((x): x is string => typeof x === "string").slice(0, 8) : [];
             setSuggest(list.length ? { kind: "@", items: list.map((p) => ({ label: `@${p}` })), index: 0 } : null);
           });
       }, 120);
-      return () => {
-        live = false;
-        window.clearTimeout(t);
-      };
-    }
-    setSuggest(null);
-  }, [text, meta, features, store]);
+    },
+    [features, store],
+  );
+  /** The text changed here (typed, completed, cleared): its suggestions follow it. */
+  const write = React.useCallback(
+    (t: string) => {
+      setText(t);
+      suggestFor(t);
+    },
+    [setText, suggestFor],
+  );
 
   const complete = (label: string) => {
-    setText((t) => t.replace(/@\S*$/, `${label} `));
-    setSuggest(null);
+    write(text.replace(/@\S*$/, `${label} `));
     ta.current?.focus();
   };
 
@@ -258,10 +333,10 @@ export function Composer({
   const runEntry = (entry: NonNullable<ReturnType<typeof findCommand>>, args: string): string | true => {
     const out = runCommand(entry, args, store);
     if (out.kind === "send") return out.text;
-    setText("");
+    write("");
     if (out.kind === "view") {
       if (out.view === "files") {
-        setText("@");
+        write("@");
         ta.current?.focus();
       } else onView?.(out.view);
     } else if (out.kind === "unsupported") setNote(`/${entry.name}: ${out.reason}`);
@@ -287,7 +362,7 @@ export function Composer({
       if (r !== true) sendText(r);
       return;
     }
-    setText(`/${entry.name} `);
+    write(`/${entry.name} `);
     setPalClosed(true);
     ta.current?.focus();
   };
@@ -297,7 +372,7 @@ export function Composer({
     // `!command` runs in the shell beside the agent, in its folder (not sent to it).
     if (raw.startsWith("!") && onTerminal) {
       onTerminal({ what: "shell", command: raw.slice(1).trim() || undefined });
-      setText("");
+      write("");
       return;
     }
     const s = parseSlash(raw);
@@ -321,13 +396,10 @@ export function Composer({
       overrides: override.model || override.effort ? override : undefined,
     });
     if (ok) {
-      setText("");
-      setSuggest(null);
+      write("");
       clear();
       setOverride({});
       setWithOpen(false);
-      // "Now" and "Steer" are for one message: the next one queues again unless chosen.
-      setMode("queue");
     }
   };
 
@@ -439,16 +511,7 @@ export function Composer({
       >
         {chips}
         {canOverride && (withOpen || override.model || override.effort) && (
-          <SendWith
-            className="cp-with"
-            models={meta?.models ?? []}
-            model={state?.model ?? ""}
-            modelLabel={modelLabel}
-            efforts={meta?.efforts ?? []}
-            effort={state?.effort ?? ""}
-            value={override}
-            onChange={setOverride}
-          />
+          <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />
         )}
         <textarea
           onPaste={(e) => {
@@ -457,7 +520,7 @@ export function Composer({
               void add(e.clipboardData.files);
             }
           }}
-          ref={ta}
+          ref={grow}
           className="hx-compose-input"
           rows={1}
           value={text}
@@ -471,22 +534,18 @@ export function Composer({
                   ? mode === "steer"
                     ? "Steer it — it reads this at its next step"
                     : mode === "now"
-                      ? "Stop and say…"
+                      ? approvals > 0
+                        ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                        : "Stop and say…"
                       : "Queue a message for when it finishes"
                   : "Tell the agent what to do"
           }
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => write(e.target.value)}
           onKeyDown={onKeyDown}
           aria-label="Message to the agent"
           enterKeyHint="send"
           autoCapitalize="sentences"
         />
-        {running && mode === "now" && (
-          <div className="cp-warn" role="note">
-            Now stops the current turn
-            {approvals > 0 ? ` and cancels ${approvals === 1 ? "the request waiting on you" : `the ${approvals} requests waiting on you`}` : ""}, then sends this.
-          </div>
-        )}
         <div className="cp-bar">
           {canAttach && (
             <>
@@ -509,40 +568,10 @@ export function Composer({
               </Tip>
             </>
           )}
-          <MicButton field={ta} setText={setText} onNote={setNote} disabled={disabled} />
-          {running && modes.length > 1 && (
-            <>
-              <div className="cp-modes" role="radiogroup" aria-label="How to send while it works">
-                {modes.map((m) => (
-                  <Tip key={m.id} content={m.hint}>
-                    <button type="button" role="radio" aria-checked={mode === m.id} data-mode={m.id} onClick={() => setMode(m.id)}>
-                      {m.label}
-                    </button>
-                  </Tip>
-                ))}
-              </div>
-              <label className="cp-mode-pick" data-mode={mode}>
-                <span className="cp-mode-value">{modes.find((m) => m.id === mode)?.label ?? "Queue"}</span>
-                <ChevronDown size={11} aria-hidden="true" />
-                <select aria-label="How to send while it works" value={mode} onChange={(e) => setMode(e.target.value as SendMode)}>
-                  {modes.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </>
-          )}
+          <MicButton field={ta} setText={write} onNote={setNote} disabled={disabled} />
+          {running && modes.length > 1 && <SendModes modes={modes} mode={mode} onMode={setMode} />}
           <span className="cp-gap" />
-          {running && features.includes("interrupt") && (
-            <Tip content="Stop the current turn (Esc)">
-              <button type="button" className="cp-stop" onClick={() => store.send({ type: "interrupt" })} aria-label="Stop the current turn">
-                <Square size={10} fill="currentColor" />
-                <span className="cp-label">Stop</span>
-              </button>
-            </Tip>
-          )}
+          {running && features.includes("interrupt") && <StopTurn store={store} />}
           <button
             type="button"
             className="cp-send"

@@ -6,16 +6,17 @@
 import * as React from "react";
 import "./harness.css";
 import "./mission.css";
-import { Link, useNavigate, useSearchParams } from "react-router";
+import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ArrowUpRight, ChevronRight, Plus, RotateCcw } from "lucide-react";
 import { api } from "@/api/client";
-import { useServerEvents } from "@/api/events";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { ErrorState, PageIntro, SkeletonRows } from "@/components/ui/misc";
+import { Loadable, Loading } from "@/components/ui/loading";
+import { PageIntro } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { errorMessage, useDocumentTitle, useLocalStorage } from "@/lib/hooks";
+import { errorMessage, useLocalStorage } from "@/lib/hooks";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
@@ -24,7 +25,7 @@ import { byStart, FoundSessions, sessionKey } from "./found";
 import { Ago, machineName } from "./parts";
 import { useSeen } from "./seen";
 import { SpawnDialog } from "./spawn";
-import { useAgents } from "./use-agents";
+import { useAgentList, useAgents } from "./use-agents";
 
 /** Where an agent stands. */
 type Stand = "needs" | "crashed" | "working" | "finished" | "ready" | "offline" | "ended";
@@ -178,77 +179,21 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
   );
 });
 
-export default function Mission() {
-  useDocumentTitle("Agents");
-  const { list, error, reload } = useAgents();
+/** Where each agent stands, and how many stand where (the page's lead says so). */
+function standsOf(list: AgentInfo[], seen: Record<string, number>) {
+  return list.map((a) => ({ a, stand: standOf(a, seen[a.id]) }));
+}
+
+/** What the page's lead says before the agents are known. */
+const LEAD = "Every coding agent kiln runs, on every machine.";
+
+/** The lead: how your agents stand, and where. */
+function Lead() {
+  const list = useAgentList();
   const seen = useSeen();
-  const [found, setFound] = React.useState<AiSession[]>([]);
-  const [quiet, setQuiet] = React.useState<string[]>([]);
-  const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
-  const [spawn, setSpawn] = React.useState(false);
-  const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
-  const navigate = useNavigate();
-  const [params, setParams] = useSearchParams();
-  // ?new=1 (links from elsewhere): open New agents.
-  React.useEffect(() => {
-    if (params.get("new") !== "1") return;
-    setSpawn(true);
-    const n = new URLSearchParams(params);
-    n.delete("new");
-    setParams(n, { replace: true });
-  }, [params, setParams]);
-
-  // Sessions found on your machines: told when they change, and re-read now and then for their
-  // state and last activity. A scan can miss a session for a moment, so a row goes only once two
-  // reads in a row miss it, rather than blinking out and back.
-  const kept = React.useRef(new Map<string, { s: AiSession; missed: number }>());
-  const readFound = React.useCallback(() => {
-    api.aiSessions().then(
-      (list) => {
-        const m = kept.current;
-        const here = new Set(list.map(sessionKey));
-        // An unchanged session keeps its object, so its row doesn't re-render.
-        for (const s of list) {
-          const k = sessionKey(s);
-          const was = m.get(k)?.s;
-          m.set(k, {
-            s: was && JSON.stringify(was) === JSON.stringify(s) ? was : s,
-            missed: 0,
-          });
-        }
-        for (const [k, v] of m) if (!here.has(k) && ++v.missed >= 2) m.delete(k);
-        setFound([...m.values()].map((v) => v.s).sort(byStart));
-      },
-      () => undefined,
-    );
-    api.aiSilent().then(
-      (r) => setQuiet(r.machines),
-      () => undefined,
-    );
-  }, []);
-  React.useEffect(() => {
-    readFound();
-    const t = window.setInterval(readFound, 20_000);
-    return () => window.clearInterval(t);
-  }, [readFound]);
-  useServerEvents((ev) => {
-    if (ev.type === "ai_sessions") readFound();
-  });
-
-  const all = React.useMemo(() => (list ?? []).map((a) => ({ a, stand: standOf(a, seen[a.id]) })), [list, seen]);
-  // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
-  // to find a name are not. The list holds still while agents work: see useShownList.
-  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.list", DEFAULT_VIEW);
-  const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored }), [stored]);
-  const [q, setQ] = React.useState("");
-  const shown = useShownList(all, q, view, list !== null);
-  const { live, ended } = shown;
-  const filtered = isFiltered(q, view.facets);
+  const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
   const n = (s: Stand) => all.filter((r) => r.stand === s).length;
   const machines = [...new Set(all.filter((r) => r.stand !== "ended").map((r) => machineName(r.a.target)))];
-  // Sessions found on your machines that kiln doesn't run itself (its own agents are rows above).
-  const elsewhere = found.filter((s) => !s.managed_by && !all.some((r) => r.a.harness_session && r.a.harness_session === s.id));
-
   const status = [
     n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`,
     n("crashed") && `${n("crashed")} stopped`,
@@ -257,43 +202,35 @@ export default function Mission() {
   ]
     .filter(Boolean)
     .join(", ");
-  const lead = !list
-    ? "Every coding agent kiln runs, on every machine."
-    : all.length === 0
-      ? "Start coding agents on any of your machines and run them all from here."
-      : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}.`;
+  return <>{all.length === 0 ? "Start coding agents on any of your machines and run them all from here." : `${status || "All quiet"}${machines.length ? ` — on ${machines.join(" and ")}` : ""}.`}</>;
+}
 
-  const select = React.useCallback((id: string, on: boolean) => {
-    setSelected((s) => {
-      const next = new Set(s);
-      if (on) next.add(id);
-      else next.delete(id);
-      return next;
-    });
-  }, []);
-  // Only what the list shows can be checked: a row the filter takes away is unchecked with it.
-  const shownIds = [...live, ...ended].map((r) => r.a.id).join(",");
-  React.useEffect(() => {
-    const here = new Set(shownIds.split(","));
-    setSelected((s) => ([...s].every((id) => here.has(id)) ? s : new Set([...s].filter((id) => here.has(id)))));
-  }, [shownIds]);
-  const checked = [...live, ...ended].filter((r) => selected.has(r.a.id));
-  const liveChecked = live.filter((r) => selected.has(r.a.id)).length;
-  const allBox = React.useRef<HTMLInputElement>(null);
-  React.useEffect(() => {
-    if (allBox.current) allBox.current.indeterminate = liveChecked > 0 && liveChecked < live.length;
-  }, [liveChecked, live.length]);
-  // The message goes to what's checked; with nothing checked, to every agent the list shows.
-  const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
-  const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
-
+export default function Mission() {
+  const [spawn, setSpawn] = React.useState(false);
+  const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
+  // ?new=1 (links from elsewhere) opens New agents: open, it stays so by itself, and the link's
+  // mark comes off the address.
+  const fromLink = params.get("new") === "1";
+  const opened = () => {
+    if (!fromLink) return;
+    setSpawn(true);
+    const n = new URLSearchParams(params);
+    n.delete("new");
+    setParams(n, { replace: true });
+  };
   return (
     <div className="container-console page ms-page">
+      <title>Agents · kiln</title>
       <PageIntro
         index={6}
         label="Agents"
         title="Mission control."
-        lead={lead}
+        lead={
+          <React.Suspense fallback={LEAD}>
+            <Lead />
+          </React.Suspense>
+        }
         actions={
           <>
             <Button asChild variant="secondary">
@@ -305,7 +242,110 @@ export default function Mission() {
           </>
         }
       />
+      <Loadable label="Loading agents" fallback={<Loading label="Loading agents" block />}>
+        <Agents onSpawn={() => setSpawn(true)} />
+      </Loadable>
+      <SpawnDialog
+        open={spawn || fromLink}
+        onOpenChange={setSpawn}
+        onOpened={opened}
+        onStarted={(started) => {
+          setSpawn(false);
+          if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
+          else invalidate("harness/agents");
+        }}
+      />
+    </div>
+  );
+}
 
+/** Sessions found on your machines, as last read (each kept a read longer than it was missing, so rows don't blink). */
+const kept = new Map<string, { s: AiSession; missed: number }>();
+async function readFound(signal: AbortSignal): Promise<AiSession[]> {
+  const list = await api.aiSessions(signal);
+  const here = new Set(list.map(sessionKey));
+  // An unchanged session keeps its object, so its row doesn't re-render.
+  for (const s of list) {
+    const k = sessionKey(s);
+    const was = kept.get(k)?.s;
+    kept.set(k, { s: was && JSON.stringify(was) === JSON.stringify(s) ? was : s, missed: 0 });
+  }
+  for (const [k, v] of kept) if (!here.has(k) && ++v.missed >= 2) kept.delete(k);
+  return [...kept.values()].map((v) => v.s).sort(byStart);
+}
+/**
+ * The found sessions and the machines that can't say what runs on them, read together. A read that
+ * fails leaves what was found (a server without these says nothing here).
+ */
+const readAll = (signal: AbortSignal) =>
+  Promise.all([
+    readFound(signal).catch(() => [...kept.values()].map((v) => v.s).sort(byStart)),
+    api.aiSilent(signal).then(
+      (r) => r.machines,
+      (): string[] => [],
+    ),
+  ]);
+const FOUND = { on: ["ai_sessions"], pollMs: 20_000 } as const;
+
+/**
+ * Sessions found on your machines that kiln doesn't run itself (its own agents are rows above):
+ * told when they change, and read again now and then for their state and last activity.
+ */
+function Found({ all }: { all: { a: AgentInfo }[] }) {
+  // Its own key: "ai-sessions" is the list alone (`aiSessionsRes`), and whichever read it first
+  // would hand the other the wrong shape.
+  const [found, quiet] = useSuspenseResource("ai-sessions-found", readAll, FOUND).data;
+  const elsewhere = found.filter((s) => !s.managed_by && !all.some((r) => r.a.harness_session && r.a.harness_session === s.id));
+  return <FoundSessions sessions={elsewhere} quiet={quiet} />;
+}
+
+function Agents({ onSpawn }: { onSpawn: () => void }) {
+  const { list, reload } = useAgents();
+  const seen = useSeen();
+  const [showEnded, setShowEnded] = useLocalStorage<boolean>("kiln.agents.showEnded", false);
+  const [selected, setSelected] = React.useState<ReadonlySet<string>>(new Set());
+
+  const all = React.useMemo(() => standsOf(list, seen), [list, seen]);
+  // How the list is shown (the sort and the facets chosen) is kept across visits; the words typed
+  // to find a name are not. The list holds still while agents work: see useShownList.
+  const [stored, setView] = useLocalStorage<Partial<ListView>>("kiln.agents.list", DEFAULT_VIEW);
+  const view = React.useMemo(() => ({ ...DEFAULT_VIEW, ...stored }), [stored]);
+  const [q, setQ] = React.useState("");
+  const shown = useShownList(all, q, view, true);
+  const { live, ended } = shown;
+  const filtered = isFiltered(q, view.facets);
+
+  const select = React.useCallback((id: string, on: boolean) => {
+    setSelected((s) => {
+      const next = new Set(s);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }, []);
+  // Only what the list shows can be checked: a row the filter takes away is unchecked with it.
+  const shownIds = [...live, ...ended].map((r) => r.a.id).join(",");
+  const [wasShown, setWasShown] = React.useState(shownIds);
+  if (wasShown !== shownIds) {
+    setWasShown(shownIds);
+    const here = new Set(shownIds.split(","));
+    if (![...selected].every((id) => here.has(id))) setSelected(new Set([...selected].filter((id) => here.has(id))));
+  }
+  const checked = [...live, ...ended].filter((r) => selected.has(r.a.id));
+  const liveChecked = live.filter((r) => selected.has(r.a.id)).length;
+  const some = liveChecked > 0 && liveChecked < live.length;
+  const allBox = React.useCallback(
+    (el: HTMLInputElement | null) => {
+      if (el) el.indeterminate = some;
+    },
+    [some],
+  );
+  // The message goes to what's checked; with nothing checked, to every agent the list shows.
+  const targets = checked.length > 0 ? checked.map((r) => r.a) : live.map((r) => r.a);
+  const reach = checked.length > 0 ? "selected" : filtered ? "shown" : "all";
+
+  return (
+    <>
       {all.length > 0 && (
         <>
           <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
@@ -313,15 +353,11 @@ export default function Mission() {
         </>
       )}
 
-      {error && !list ? (
-        <ErrorState error={error} onRetry={reload} />
-      ) : !list ? (
-        <SkeletonRows rows={4} cols={3} />
-      ) : all.length === 0 ? (
+      {all.length === 0 ? (
         <div className="ms-empty">
           <p className="ms-empty-title">No agents yet.</p>
           <p>Claude Code, Codex, or any harness your machines have — one or a dozen. kiln runs them: steer them, answer them, review what they change.</p>
-          <Button onClick={() => setSpawn(true)}>
+          <Button onClick={onSpawn}>
             New agents <Plus />
           </Button>
         </div>
@@ -384,7 +420,9 @@ export default function Mission() {
       )}
 
       {/* Once kiln's own agents are known, so its own sessions never show here for a moment. */}
-      {list && <FoundSessions sessions={elsewhere} quiet={quiet} />}
+      <React.Suspense fallback={null}>
+        <Found all={all} />
+      </React.Suspense>
 
       {ended.length > 0 && (
         <section className="ms-ended">
@@ -406,16 +444,6 @@ export default function Mission() {
           )}
         </section>
       )}
-
-      <SpawnDialog
-        open={spawn}
-        onOpenChange={setSpawn}
-        onStarted={(started) => {
-          setSpawn(false);
-          if (started.length === 1 && started[0]) navigate(`/agents/${started[0].id}`);
-          else reload();
-        }}
-      />
-    </div>
+    </>
   );
 }

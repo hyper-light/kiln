@@ -90,10 +90,11 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
   const kRef = React.useRef<KilnTerminal | null>(null);
   const wsRef = React.useRef<WebSocket | null>(null);
   const sessionRef = React.useRef<string | null>(sessionId);
-  const [gen, setGen] = React.useState(0);
+  /** The connection to the session: started once the terminal exists, again on reconnect(). */
+  const connRef = React.useRef<{ stop: () => void } | null>(null);
   // Everything handlers read lives in refs: handlers never go stale and nothing re-renders for them.
-  const live = React.useRef({ tabId, active, fontSize, copyOnSelect, onState, onTitle, onSession, onClosed, onGesture, onRenderer });
-  live.current = { tabId, active, fontSize, copyOnSelect, onState, onTitle, onSession, onClosed, onGesture, onRenderer };
+  const live = React.useRef({ tabId, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer });
+  live.current = { tabId, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer };
   /** The session's size as the server last announced it. */
   const sessionSize = React.useRef<Size | null>(null);
   /** The size that fills this view at the user's font size (measured on layout changes only). */
@@ -216,10 +217,156 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
     [claim],
   );
 
-  /* ---- terminal instance: created once per view ---- */
-  React.useEffect(() => {
-    const host = hostRef.current;
+  /* ---- device keyboard: suppressed while the kiln keyboard is in use ---- */
+  const applyInputMode = React.useCallback(() => {
+    const ta = kRef.current?.term.textarea;
+    if (!ta) return;
+    if (live.current.deviceKeyboard) ta.removeAttribute("inputmode");
+    else ta.setAttribute("inputmode", "none");
+    ta.setAttribute("autocapitalize", "off");
+    ta.setAttribute("autocorrect", "off");
+    ta.setAttribute("spellcheck", "false");
+  }, []);
+
+  /* ---- websocket: attach, and reattach whenever it drops ---- */
+  const startConnection = React.useCallback(() => {
+    const k = kRef.current;
+    if (!k) return;
+    connRef.current?.stop();
+    const term = k.term;
+    let stopped = false;
+    let ended = false;
+    let attempt = 0;
+    let timer = 0;
+    let ws: WebSocket | null = null;
+
+    const schedule = (fast = false) => {
+      if (stopped || ended) return;
+      window.clearTimeout(timer);
+      const delay = fast ? 150 : (BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)] ?? 4000);
+      attempt += 1;
+      live.current.onState(live.current.tabId, { kind: "reconnecting", attempt });
+      timer = window.setTimeout(connect, delay);
+    };
+
+    function connect() {
+      if (stopped || ended) return;
+      const params = new URLSearchParams();
+      const reattach = sessionRef.current !== null;
+      if (sessionRef.current) params.set("session", sessionRef.current);
+      else {
+        const d = measure();
+        params.set("target", target);
+        params.set("cols", String(d?.cols ?? term.cols));
+        params.set("rows", String(d?.rows ?? term.rows));
+      }
+      const sock = new WebSocket(wsUrl(`/api/terminal/ws?${params}`));
+      sock.binaryType = "arraybuffer";
+      ws = sock;
+      wsRef.current = sock;
+      if (!reattach) live.current.onState(live.current.tabId, { kind: "connecting" });
+
+      sock.onmessage = (ev) => {
+        if (typeof ev.data !== "string") {
+          term.write(new Uint8Array(ev.data as ArrayBuffer));
+          return;
+        }
+        let msg: TerminalControlFrame;
+        try {
+          msg = JSON.parse(ev.data) as TerminalControlFrame;
+        } catch {
+          term.write(ev.data);
+          return;
+        }
+        switch (msg.type) {
+          case "session": {
+            sessionRef.current = msg.session.id;
+            live.current.onSession(live.current.tabId, msg.session);
+            // The replay that follows repaints the session from scratch, at the session's size.
+            if (reattach) term.reset();
+            sessionSize.current = { cols: msg.session.cols, rows: msg.session.rows };
+            follow();
+            attempt = 0;
+            live.current.onState(live.current.tabId, { kind: "open" });
+            if (live.current.active) {
+              // After the replay is drawn: the program then redraws for this view's size.
+              requestAnimationFrame(() => claim(true, true));
+              term.focus();
+            }
+            return;
+          }
+          case "size":
+            // The device in use (maybe this one) set the session's size.
+            sessionSize.current = { cols: msg.cols, rows: msg.rows };
+            follow();
+            return;
+          case "missing":
+            // Its machine is reconnecting (or the server just restarted): keep trying.
+            schedule();
+            sock.close();
+            return;
+          case "reconnect":
+            schedule(true);
+            sock.close();
+            return;
+          case "exit":
+            ended = true;
+            live.current.onState(live.current.tabId, { kind: "exited", code: msg.code ?? null });
+            term.write(`\r\n\x1b[2m\x1b[38;2;151;153;159m[process exited${msg.code !== null && msg.code !== undefined ? ` with code ${msg.code}` : ""}]\x1b[0m\r\n`);
+            return;
+          case "error":
+            ended = true;
+            if (msg.message === "session closed") {
+              // Ended on purpose (here or on another device): the tab goes everywhere.
+              live.current.onClosed(live.current.tabId);
+              return;
+            }
+            live.current.onState(live.current.tabId, { kind: "error", message: msg.message });
+            term.write(`\r\n\x1b[38;2;209;170;173m[error] ${msg.message}\x1b[0m\r\n`);
+            return;
+        }
+      };
+      sock.onclose = () => {
+        if (wsRef.current === sock) wsRef.current = null;
+        if (stopped || ended) return;
+        schedule();
+      };
+    }
+
+    // Back to the page or the network: retry at once instead of waiting out the backoff, and
+    // picking the device up again makes it the one in use.
+    const kick = () => {
+      if (!stopped && !ended && (!ws || ws.readyState === WebSocket.CLOSED)) {
+        window.clearTimeout(timer);
+        attempt = 0;
+        connect();
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      kick();
+      if (live.current.active) claim(true, true);
+    };
+    window.addEventListener("online", kick);
+    document.addEventListener("visibilitychange", onVisible);
+
+    connect();
+    connRef.current = {
+      stop: () => {
+        stopped = true;
+        window.clearTimeout(timer);
+        window.removeEventListener("online", kick);
+        document.removeEventListener("visibilitychange", onVisible);
+        if (wsRef.current === ws) wsRef.current = null;
+        ws?.close();
+      },
+    };
+  }, [measure, follow, claim, target]);
+
+  /* ---- terminal instance: created with its element, gone with it ---- */
+  const hostEl = React.useCallback((host: HTMLDivElement | null) => {
     if (!host) return;
+    hostRef.current = host;
     let disposed = false;
     let k: KilnTerminal | null = null;
     const subs: { dispose(): void }[] = [];
@@ -292,7 +439,14 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
         subs.push({ dispose: () => document.fonts.removeEventListener("loadingdone", remeasure) });
       }
 
-      setGen((g) => g + 1); // start the connection now that the terminal exists
+      // The terminal exists: set up its keyboard, connect, and take the size if this view is in use.
+      applyInputMode();
+      startConnection();
+      if (live.current.active)
+        requestAnimationFrame(() => {
+          claim(true, true);
+          kRef.current?.term.focus();
+        });
     });
 
     // Space changes (rotation, keyboard shown/resized, window resize): lay out once per frame.
@@ -456,175 +610,49 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
       host.removeEventListener("touchend", onTouchEnd, { capture: true });
       host.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       subs.forEach((s) => s.dispose());
+      connRef.current?.stop();
+      connRef.current = null;
       wsRef.current?.close();
       wsRef.current = null;
       k?.dispose();
       kRef.current = null;
+      hostRef.current = null;
     };
     // Created once; everything it reads changes through refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ---- device keyboard: suppressed while the kiln keyboard is in use ---- */
-  React.useEffect(() => {
-    const ta = kRef.current?.term.textarea;
-    if (!ta) return;
-    if (deviceKeyboard) ta.removeAttribute("inputmode");
-    else ta.setAttribute("inputmode", "none");
-    ta.setAttribute("autocapitalize", "off");
-    ta.setAttribute("autocorrect", "off");
-    ta.setAttribute("spellcheck", "false");
-  }, [deviceKeyboard, gen]);
-
-  /* ---- websocket: attach, and reattach whenever it drops ---- */
-  React.useEffect(() => {
-    const k = kRef.current;
-    if (!k || gen === 0) return;
-    const term = k.term;
-    let stopped = false;
-    let ended = false;
-    let attempt = 0;
-    let timer = 0;
-    let ws: WebSocket | null = null;
-
-    const schedule = (fast = false) => {
-      if (stopped || ended) return;
-      window.clearTimeout(timer);
-      const delay = fast ? 150 : (BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)] ?? 4000);
-      attempt += 1;
-      live.current.onState(live.current.tabId, { kind: "reconnecting", attempt });
-      timer = window.setTimeout(connect, delay);
-    };
-
-    function connect() {
-      if (stopped || ended) return;
-      const params = new URLSearchParams();
-      const reattach = sessionRef.current !== null;
-      if (sessionRef.current) params.set("session", sessionRef.current);
-      else {
-        const d = measure();
-        params.set("target", target);
-        params.set("cols", String(d?.cols ?? term.cols));
-        params.set("rows", String(d?.rows ?? term.rows));
-      }
-      const sock = new WebSocket(wsUrl(`/api/terminal/ws?${params}`));
-      sock.binaryType = "arraybuffer";
-      ws = sock;
-      wsRef.current = sock;
-      if (!reattach) live.current.onState(live.current.tabId, { kind: "connecting" });
-
-      sock.onmessage = (ev) => {
-        if (typeof ev.data !== "string") {
-          term.write(new Uint8Array(ev.data as ArrayBuffer));
-          return;
-        }
-        let msg: TerminalControlFrame;
-        try {
-          msg = JSON.parse(ev.data) as TerminalControlFrame;
-        } catch {
-          term.write(ev.data);
-          return;
-        }
-        switch (msg.type) {
-          case "session": {
-            sessionRef.current = msg.session.id;
-            live.current.onSession(live.current.tabId, msg.session);
-            // The replay that follows repaints the session from scratch, at the session's size.
-            if (reattach) term.reset();
-            sessionSize.current = { cols: msg.session.cols, rows: msg.session.rows };
-            follow();
-            attempt = 0;
-            live.current.onState(live.current.tabId, { kind: "open" });
-            if (live.current.active) {
-              // After the replay is drawn: the program then redraws for this view's size.
-              requestAnimationFrame(() => claim(true, true));
-              term.focus();
-            }
-            return;
-          }
-          case "size":
-            // The device in use (maybe this one) set the session's size.
-            sessionSize.current = { cols: msg.cols, rows: msg.rows };
-            follow();
-            return;
-          case "missing":
-            // Its machine is reconnecting (or the server just restarted): keep trying.
-            schedule();
-            sock.close();
-            return;
-          case "reconnect":
-            schedule(true);
-            sock.close();
-            return;
-          case "exit":
-            ended = true;
-            live.current.onState(live.current.tabId, { kind: "exited", code: msg.code ?? null });
-            term.write(`\r\n\x1b[2m\x1b[38;2;151;153;159m[process exited${msg.code !== null && msg.code !== undefined ? ` with code ${msg.code}` : ""}]\x1b[0m\r\n`);
-            return;
-          case "error":
-            ended = true;
-            if (msg.message === "session closed") {
-              // Ended on purpose (here or on another device): the tab goes everywhere.
-              live.current.onClosed(live.current.tabId);
-              return;
-            }
-            live.current.onState(live.current.tabId, { kind: "error", message: msg.message });
-            term.write(`\r\n\x1b[38;2;209;170;173m[error] ${msg.message}\x1b[0m\r\n`);
-            return;
-        }
-      };
-      sock.onclose = () => {
-        if (wsRef.current === sock) wsRef.current = null;
-        if (stopped || ended) return;
-        schedule();
-      };
-    }
-
-    // Back to the page or the network: retry at once instead of waiting out the backoff, and
-    // picking the device up again makes it the one in use.
-    const kick = () => {
-      if (!stopped && !ended && (!ws || ws.readyState === WebSocket.CLOSED)) {
-        window.clearTimeout(timer);
-        attempt = 0;
-        connect();
-      }
-    };
-    const onVisible = () => {
-      if (document.visibilityState !== "visible") return;
-      kick();
-      if (live.current.active) claim(true, true);
-    };
-    window.addEventListener("online", kick);
-    document.addEventListener("visibilitychange", onVisible);
-
-    connect();
-    return () => {
-      stopped = true;
-      window.clearTimeout(timer);
-      window.removeEventListener("online", kick);
-      document.removeEventListener("visibilitychange", onVisible);
-      if (wsRef.current === ws) wsRef.current = null;
-      ws?.close();
-    };
-    // Reconnects only for a new terminal (gen) or target; the rest is read through refs.
+  /* ---- what the props say, applied to the terminal there is (each as it changes) ---- */
+  // The device keyboard: suppressed while the kiln keyboard is in use.
+  const keyboardSync = React.useCallback(
+    (el: HTMLSpanElement | null) => {
+      if (el) applyInputMode();
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gen, target]);
-
-  /* ---- becoming the view in use: claim the size, take focus ---- */
-  React.useEffect(() => {
-    if (!active || gen === 0) return;
-    const id = requestAnimationFrame(() => {
-      claim(true, true);
-      kRef.current?.term.focus();
-    });
-    return () => cancelAnimationFrame(id);
-  }, [active, gen, claim]);
-
-  React.useEffect(() => {
-    if (gen === 0) return;
-    const id = requestAnimationFrame(layout);
-    return () => cancelAnimationFrame(id);
-  }, [fontSize, gen, layout]);
+    [deviceKeyboard, applyInputMode],
+  );
+  // Becoming the view in use: claim the size, take focus.
+  const activeSync = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el || !active || !kRef.current) return;
+      const id = requestAnimationFrame(() => {
+        claim(true, true);
+        kRef.current?.term.focus();
+      });
+      return () => cancelAnimationFrame(id);
+    },
+    [active, claim],
+  );
+  // Another text size: lay the view out again.
+  const fontSync = React.useCallback(
+    (el: HTMLSpanElement | null) => {
+      if (!el || !kRef.current) return;
+      const id = requestAnimationFrame(layout);
+      return () => cancelAnimationFrame(id);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [fontSize, layout],
+  );
 
   React.useImperativeHandle(
     ref,
@@ -638,9 +666,10 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
         }
         sessionRef.current = null;
         sessionSize.current = null;
+        connRef.current?.stop();
         wsRef.current?.close();
         wsRef.current = null;
-        setGen((g) => g + 1);
+        startConnection();
       },
       focus: () => kRef.current?.term.focus(),
       clear: () => kRef.current?.term.clear(),
@@ -681,13 +710,15 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
       },
       appCursor: () => kRef.current?.term.modes.applicationCursorKeysMode ?? false,
     }),
-    [sendBytes],
+    [sendBytes, startConnection],
   );
 
   // Hidden views are display:none, which also pauses xterm's rendering for them.
   return (
-    <div className="term-host" data-terminal style={active ? undefined : { display: "none" }} aria-hidden={!active}>
-      <div ref={hostRef} className="h-full w-full" />
+    <div ref={activeSync} className="term-host" data-terminal style={active ? undefined : { display: "none" }} aria-hidden={!active}>
+      <div ref={hostEl} className="h-full w-full" />
+      <span ref={keyboardSync} hidden />
+      <span ref={fontSync} hidden />
     </div>
   );
 });

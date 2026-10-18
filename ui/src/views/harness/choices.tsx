@@ -12,6 +12,7 @@
  * waiting (your picks survive a remount); declining answers the agent.
  */
 import * as React from "react";
+import { flushSync } from "react-dom";
 import { Dialog as D } from "radix-ui";
 import { ArrowLeft, ArrowRight, Check, ChevronDown, FlaskConical, Minus, Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -458,6 +459,29 @@ function remember(sig: string, s: Saved) {
 /** Who asked what: the same questions from two agents are two drafts. */
 const signature = (qs: ChoiceQuestion[], agent?: string) => JSON.stringify([agent ?? "", qs.map((q) => [q.id ?? "", q.question, q.multi ? 1 : 0, q.options.map((o) => o.label)])]);
 
+/** Where you are in a question set, as a store it reads: each change is remembered (under `sig`) as it's made. */
+function useSaved(sig: string, init: () => Saved): [Saved, (fn: (s: Saved) => Saved) => void] {
+  const [box] = React.useState(() => {
+    let s = init();
+    const fns = new Set<() => void>();
+    return {
+      get: () => s,
+      subscribe: (fn: () => void) => {
+        fns.add(fn);
+        return () => void fns.delete(fn);
+      },
+      set: (f: (s: Saved) => Saved) => {
+        const next = f(s);
+        if (next === s) return;
+        s = next;
+        remember(sig, s);
+        fns.forEach((fn) => fn());
+      },
+    };
+  });
+  return [React.useSyncExternalStore(box.subscribe, box.get, box.get), box.set];
+}
+
 /* ------------------------------------------------------------------ the dialog */
 
 export function Choices(props: ChoicesProps) {
@@ -490,14 +514,30 @@ function Ask({
   const frame = layout ?? (phone ? "sheet" : "dialog");
   const n = questions.length;
 
-  const [restored] = React.useState(() => saved.get(sig));
-  const [drafts, setDrafts] = React.useState<Draft[]>(() => restored?.drafts ?? questions.map(() => BLANK));
-  const [step, setStep] = React.useState(() => Math.min(restored?.step ?? 0, n === 1 ? 0 : n));
+  // Your picks so far, kept as you make them: reopened, it finds them.
+  const [{ drafts, step, toReview, setup, trying }, save] = useSaved(sig, () => {
+    const restored = saved.get(sig);
+    return {
+      drafts: restored?.drafts ?? questions.map(() => BLANK),
+      step: Math.min(restored?.step ?? 0, n === 1 ? 0 : n),
+      toReview: restored?.toReview ?? false,
+      setup: restored?.setup ?? null,
+      trying: Boolean(restored?.trying && restored.setup),
+    };
+  });
+  /** Sets one part of it, as a state setter would (left as it was, nothing happens). */
+  const put = <K extends keyof Saved>(k: K, f: (was: Saved[K]) => Saved[K]) =>
+    save((s) => {
+      const next = f(s[k]);
+      return next === s[k] ? s : { ...s, [k]: next };
+    });
+  const setDrafts = (v: Draft[] | ((ds: Draft[]) => Draft[])) => put("drafts", typeof v === "function" ? v : () => v);
+  const setStep = (to: number) => put("step", () => to);
   /** Editing from the review: Next goes straight back to it. */
-  const [toReview, setToReview] = React.useState(() => restored?.toReview ?? false);
-  const [setup, setSetup] = React.useState<Setup | null>(() => restored?.setup ?? null);
+  const setToReview = (on: boolean) => put("toReview", () => on);
+  const setSetup = (fn: (setup: Setup | null) => Setup | null) => put("setup", fn);
   /** The experiment setup is open. */
-  const [trying, setTrying] = React.useState(() => Boolean(restored?.trying && restored.setup));
+  const setTrying = (on: boolean) => put("trying", () => on);
   const [focused, setFocused] = React.useState<number | null>(null);
   const [hint, setHint] = React.useState("");
 
@@ -506,12 +546,16 @@ function Ask({
     rootRef.current = el;
   }, []);
   const bodyRef = React.useRef<HTMLDivElement>(null);
-  const otherRef = React.useRef<HTMLInputElement>(null);
+  const otherRef = React.useRef<HTMLInputElement | null>(null);
   const wantOther = React.useRef(false);
-
-  React.useEffect(() => {
-    remember(sig, { drafts, step, toReview, setup, trying });
-  }, [sig, drafts, step, toReview, setup, trying]);
+  // "Other…" was just chosen: type (in its field as it shows).
+  const setOther = React.useCallback((el: HTMLInputElement | null) => {
+    otherRef.current = el;
+    if (el && wantOther.current) {
+      wantOther.current = false;
+      el.focus();
+    }
+  }, []);
 
   // Each view starts at its top, focus on what it asks of you (what it marks data-autofocus).
   const focusView = React.useCallback(() => {
@@ -520,17 +564,15 @@ function Ask({
   }, []);
   const view = trying ? "x" : String(step);
   const lastView = React.useRef(view);
-  React.useEffect(() => {
-    if (lastView.current === view) return;
-    lastView.current = view;
-    focusView();
-  }, [view, focusView]);
-  // "Other…" was just chosen: type.
-  React.useEffect(() => {
-    if (!wantOther.current) return;
-    wantOther.current = false;
-    otherRef.current?.focus();
-  });
+  // Each view is its own element (keyed by it), so this runs as a new one shows; the first one's focus is the frame's.
+  const showView = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el || lastView.current === view) return;
+      lastView.current = view;
+      focusView();
+    },
+    [view, focusView],
+  );
 
   const q = step < n ? questions[step] : undefined;
   const d = drafts[step] ?? BLANK;
@@ -600,7 +642,11 @@ function Ask({
     const next = withPick(drafts, step, q, o, on);
     setDrafts(next);
     setHint("");
-    if (o >= q.options.length && next[step]?.other) wantOther.current = true;
+    // "Other…" chosen: its field is there already (chosen before), or it takes focus as it shows.
+    if (o >= q.options.length && next[step]?.other) {
+      if (otherRef.current) otherRef.current.focus();
+      else wantOther.current = true;
+    }
   };
 
   const patch = (p: Partial<Draft>) => setDrafts((ds) => ds.map((x, j) => (j === step ? { ...x, ...p } : x)));
@@ -758,7 +804,7 @@ function Ask({
       )}
 
       <div className="ch-body" ref={bodyRef}>
-        <div className="ch-view" key={view}>
+        <div className="ch-view" key={view} ref={showView}>
           {trying && setup && tried ? (
             <ExperimentSetup
               uid={uid}
@@ -782,7 +828,7 @@ function Ask({
               single={n === 1}
               focused={focused}
               coarse={coarse}
-              otherRef={otherRef}
+              otherRef={setOther}
               onPick={choose}
               onFocusRow={setFocused}
               onChange={patch}
@@ -910,13 +956,12 @@ function QuestionStep({
   single: boolean;
   focused: number | null;
   coarse: boolean;
-  otherRef: React.RefObject<HTMLInputElement | null>;
+  otherRef: React.Ref<HTMLInputElement>;
   onPick: (o: number) => void;
   onFocusRow: (o: number | null) => void;
   onChange: (p: Partial<Draft>) => void;
 }) {
   const noteRef = React.useRef<HTMLTextAreaElement>(null);
-  const noteWasOpen = React.useRef(d.noteOpen);
   const free = q.options.length === 0;
   const other = offersOther(q);
   const rows = q.options.length + (other ? 1 : 0);
@@ -929,12 +974,6 @@ function QuestionStep({
   const stop = focused ?? first;
   const role = q.multi ? "checkbox" : "radio";
   const kind = free ? "In your words" : q.multi ? "Pick any" : "Pick one";
-
-  // Opening the note puts you in it (coming back to an open one doesn't).
-  React.useEffect(() => {
-    if (d.noteOpen && !noteWasOpen.current) noteRef.current?.focus();
-    noteWasOpen.current = d.noteOpen;
-  }, [d.noteOpen]);
 
   const field = q.secret ? (
     <input
@@ -1074,7 +1113,18 @@ function QuestionStep({
         )}
 
         <div className="ch-note">
-          <button type="button" className="ch-link" aria-expanded={d.noteOpen} aria-controls={`${uid}-note`} onClick={() => onChange({ noteOpen: !d.noteOpen })}>
+          <button
+            type="button"
+            className="ch-link"
+            aria-expanded={d.noteOpen}
+            aria-controls={`${uid}-note`}
+            onClick={() => {
+              if (d.noteOpen) return onChange({ noteOpen: false });
+              // Opening the note puts you in it (coming back to an open one doesn't).
+              flushSync(() => onChange({ noteOpen: true }));
+              noteRef.current?.focus();
+            }}
+          >
             {d.noteOpen ? <Minus size={13} /> : <Plus size={13} />}
             {d.note.trim() ? "Note" : "Add a note"}
             {!d.noteOpen && d.note.trim() && <span className="ch-note-peek">{d.note.trim()}</span>}

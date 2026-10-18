@@ -23,6 +23,10 @@ pub struct Event {
     /// The subagent run (its spawning tool call's id) this event belongs to; None for the main thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// The harness that was running when it appeared ("Claude Code", "Codex"): a conversation
+    /// switched between harnesses keeps who said what.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
     #[serde(flatten)]
     pub body: Body,
 }
@@ -675,6 +679,9 @@ pub struct ModelOption {
     pub label: String,
     #[serde(default)]
     pub description: String,
+    /// The effort levels it takes, lowest first, when the harness says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
 }
 
 /// One entry of a harness's command catalog (`Meta::commands`): every slash command it has, and
@@ -1002,6 +1009,17 @@ pub struct State {
     /// work): `Task::left_running` ones, counted when no turn is under way.
     #[serde(default)]
     pub left_behind: u32,
+    /// A switch to another harness's model, waiting for the turn under way to end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switching: Option<Switching>,
+}
+
+/// A switch the session will make (`State::switching`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Switching {
+    /// The harness ("codex").
+    pub kind: String,
+    pub model: String,
 }
 
 impl State {
@@ -1036,7 +1054,8 @@ pub struct Meta {
     pub agents: Vec<String>,
     /// Features this adapter drives for this harness: "steer", "send_now", "queue_cancel",
     /// "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions",
-    /// "resume", "attachments", "images", "overrides".
+    /// "resume", "attachments", "images", "overrides", "switch_harness" (a model of another
+    /// harness: `Command::SetModel::kind`).
     #[serde(default)]
     pub features: Vec<String>,
     /// Effort / reasoning levels the harness offers (empty: none).
@@ -1120,6 +1139,11 @@ pub enum Command {
     },
     SetModel {
         model: String,
+        /// The harness the model belongs to, when it is another one than the session's (feature
+        /// "switch_harness"): the session goes on in that one once the turn under way ends, with
+        /// the conversation so far.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     SetEffort {
         effort: String,
@@ -1401,6 +1425,7 @@ mod tests {
             seq: 1,
             at: 5,
             parent: None,
+            by: None,
             body: Body::Assistant { text: "hi".into(), streaming: false },
         };
         let v = serde_json::to_value(&e)?;

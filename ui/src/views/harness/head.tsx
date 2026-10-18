@@ -4,14 +4,16 @@
  * as one line of words that opens in place to change them (no popups). Settings live in ⋯.
  */
 import * as React from "react";
-import { Link, useNavigate } from "react-router";
-import { ArrowLeft, MoreHorizontal, Pause, PencilLine, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
-import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
+import { Link, useNavigate } from "@/lib/router";
+import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
+import { harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
+import { useSuspenseResource } from "@/lib/resource";
 import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
+import { useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
 import { LimitBadge, UsagePanel } from "./limits";
 import { machineName, StateWord } from "./parts";
-import { RunSettings } from "./run-settings";
+import { RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
 import "./console.css";
 
@@ -58,44 +60,62 @@ export function AgentHeader({
   const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), ...(sessionControls > 0 ? [{ label: "Settings…", onSelect: onSettings }] : [])];
   // Codex takes a new permission mode, model or effort from its next turn.
   const nextTurn = info?.kind === "codex" ? { mode: true, model: true, effort: true } : undefined;
+  // How it runs, as one line; with the other harnesses' models on its machine where it can go on in them.
+  const line: RunSettingsProps = {
+    className: "ag-run",
+    modes: meta?.modes ?? [],
+    mode: state?.mode ?? info?.mode ?? "",
+    onMode: features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined,
+    models: meta?.models ?? [],
+    model: state?.switching?.model ?? state?.model ?? info?.model ?? "",
+    onModel: features.includes("set_model") ? (m, kind) => send(kind && kind !== info?.kind ? { type: "set_model", model: m, kind } : { type: "set_model", model: m }) : undefined,
+    harness: info?.kind,
+    modelLabel,
+    efforts: meta?.efforts ?? [],
+    effort: state?.effort ?? "",
+    onEffort: features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0 ? (e) => send({ type: "set_effort", effort: e }) : undefined,
+    appliesNextTurn: nextTurn,
+    running,
+  };
+  const switchTarget = features.includes("switch_harness") ? info?.target : undefined;
   // The plan's limits open in place under the line, from the usage badge.
   const limits = state?.limits ?? info?.limits ?? [];
   const [usage, setUsage] = React.useState(false);
   const usageId = React.useId();
-  React.useEffect(() => {
-    if (!usage) return;
-    const onKey = (e: KeyboardEvent) => {
+  useListener<KeyboardEvent>(
+    document,
+    "keydown",
+    (e) => {
       if (e.key === "Escape") setUsage(false);
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [usage]);
+    },
+    { on: usage },
+  );
   // The kind is said beside a label that isn't the kind's own name.
   const label = info ? agentLabel(info) : "Agent";
   const named = Boolean(info && label.toLowerCase() !== info.kind_name.trim().toLowerCase());
 
   return (
     <header className="ag-head">
+      <p className="ag-eyebrow">
+        <Link to="/agents" className="ag-back">
+          <ArrowLeft size={12} aria-hidden="true" /> Agents
+        </Link>
+        <span aria-hidden="true">/</span>
+        {named && info?.kind_name && (
+          <>
+            <span>{info.kind_name}</span>
+            <span aria-hidden="true">·</span>
+          </>
+        )}
+        {info && <span>{machineName(info.target)}</span>}
+      </p>
+      {/* The name and the buttons on one row, centred on each other. */}
       <div className="ag-top">
         <div className="ag-id">
-          <p className="ag-eyebrow">
-            <Link to="/agents" className="ag-back">
-              <ArrowLeft size={12} aria-hidden="true" /> Agents
-            </Link>
-            <span aria-hidden="true">/</span>
-            {named && (
-              <>
-                <span>{info?.kind_name}</span>
-                <span aria-hidden="true">·</span>
-              </>
-            )}
-            {info && <span>{machineName(info.target)}</span>}
-          </p>
           {actions.renaming && info ? (
             <NameField value={hasOwnName(info) ? info.name : ""} placeholder={label} onSave={actions.rename} onDone={actions.stopRenaming} className="ag-title-field" label="Agent name" />
           ) : (
             <h1 className="ag-title">
-              {/* Says it can be renamed: a pencil after the name, and "Name it" while it has none of its own. */}
               <button
                 type="button"
                 className="ag-title-btn"
@@ -104,32 +124,9 @@ export function AgentHeader({
                 aria-label={info && hasOwnName(info) ? `Rename ${label}` : `Name this agent (shown as ${label})`}
               >
                 <span className={info && !hasOwnName(info) ? "ag-title-unnamed" : undefined}>{label}</span>
-                <span className="ag-rename" aria-hidden="true">
-                  <PencilLine size={13} />
-                  {info && !hasOwnName(info) && <span>Name it</span>}
-                </span>
               </button>
             </h1>
           )}
-          <div className="ag-state">
-            <StateWord a={{ status, approvals }} />
-            {status === "running" && activity && <span className="ag-activity">{activity}</span>}
-            <span className="ag-cwd ag-wide-only" title={cwd}>
-              {tildify(cwd)}
-            </span>
-            {cost > 0 && (
-              <span className="ag-cost ag-wide-only" title={costText(cost, plan).title}>
-                {costText(cost, plan).text}
-              </span>
-            )}
-            {left > 0 && (
-              <button type="button" className="ag-left" onClick={onBackground}>
-                {left} left running
-              </button>
-            )}
-            <LimitBadge limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} />
-            {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
-          </div>
         </div>
         <div className="ag-actions">
           {running && features.includes("interrupt") && (
@@ -163,6 +160,25 @@ export function AgentHeader({
           )}
         </div>
       </div>
+      <div className="ag-state">
+        <StateWord a={{ status, approvals }} />
+        {status === "running" && activity && <span className="ag-activity">{activity}</span>}
+        <span className="ag-cwd ag-wide-only" title={cwd}>
+          {tildify(cwd)}
+        </span>
+        {cost > 0 && (
+          <span className="ag-cost ag-wide-only" title={costText(cost, plan).title}>
+            {costText(cost, plan).text}
+          </span>
+        )}
+        {left > 0 && (
+          <button type="button" className="ag-left" onClick={onBackground}>
+            {left} left running
+          </button>
+        )}
+        <LimitBadge limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} />
+        {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
+      </div>
       {usage && limits.length > 0 && (
         <UsagePanel
           id={usageId}
@@ -174,21 +190,20 @@ export function AgentHeader({
           }}
         />
       )}
-      <RunSettings
-        className="ag-run"
-        modes={meta?.modes ?? []}
-        mode={state?.mode ?? info?.mode ?? ""}
-        onMode={features.includes("set_mode") ? (m) => send({ type: "set_mode", mode: m }) : undefined}
-        models={meta?.models ?? []}
-        model={state?.model ?? info?.model ?? ""}
-        onModel={features.includes("set_model") ? (m) => send({ type: "set_model", model: m }) : undefined}
-        modelLabel={modelLabel}
-        efforts={meta?.efforts ?? []}
-        effort={state?.effort ?? ""}
-        onEffort={features.includes("set_effort") || (meta?.efforts?.length ?? 0) > 0 ? (e) => send({ type: "set_effort", effort: e }) : undefined}
-        appliesNextTurn={nextTurn}
-        running={running}
-      />
+      {switchTarget ? (
+        <React.Suspense fallback={<RunSettings {...line} />}>
+          <RunSettingsElsewhere {...line} target={switchTarget} />
+        </React.Suspense>
+      ) : (
+        <RunSettings {...line} />
+      )}
     </header>
   );
+}
+
+/** The line with the models of the other harnesses on the agent's machine it can go on in (its conversation carried over). */
+function RunSettingsElsewhere({ target, ...line }: RunSettingsProps & { target: string }) {
+  const kinds = useSuspenseResource(`harness-kinds/${target}`, () => harnessApi.kinds(target).catch((): KindInfo[] => []), { pollMs: 120_000 });
+  const elsewhere = kinds.data.filter((k) => k.switch && k.available && k.id !== line.harness).map((k) => ({ kind: k.id, name: k.name, models: k.models ?? [] }));
+  return <RunSettings {...line} elsewhere={elsewhere} />;
 }

@@ -568,6 +568,16 @@ mod tests {
             self.settle()
         }
 
+        /// A folder kiln just cloned joins, to take the group's files through the log index `at`.
+        fn add_adopting(&mut self, member: u64, at: u64) -> anyhow::Result<()> {
+            let mut feed = self.feed(member)?;
+            feed.copy.adopt(at)?;
+            let r = Replica::open(&settings(member, 1)?, RamStore::new(), feed, Unbounded).map_err(e)?;
+            self.copies.insert(member, r);
+            self.leader.change(Vec::new(), &learner(member, true)).map_err(e)?;
+            self.settle()
+        }
+
         /// The copy's process starts again: its member reopens on what its log and its saved
         /// state hold.
         fn restart(&mut self, member: u64) -> anyhow::Result<()> {
@@ -721,6 +731,39 @@ mod tests {
         // And a restart with nothing new changes nothing.
         g.restart(2)?;
         assert_eq!(g.tree(2), g.tree(3));
+        Ok(())
+    }
+
+    #[test]
+    fn a_clone_that_joins_takes_the_source_s_working_tree_through_the_log() -> anyhow::Result<()> {
+        let mut g = Group::new()?;
+        g.add(2)?;
+        // The source: the commit both have, then an edit, a new file and a deletion not committed.
+        g.write(2, "a.txt", "an edit")?;
+        g.write(2, "src/new.rs", "fn new() {}")?;
+        g.write(2, "same.md", "same")?;
+        g.propose(2, 1_000)?;
+        // The clone of that commit, on another machine.
+        g.write(3, "a.txt", "committed")?;
+        g.write(3, "gone.txt", "deleted on the source")?;
+        g.write(3, "same.md", "same")?;
+        let at = g.leader.applied().index;
+        g.add_adopting(3, at)?;
+        let blobs = g.blobs.clone();
+        let feed = g.copies.get_mut(&3).map(Replica::machine_mut).ok_or_else(|| anyhow::anyhow!("no copy 3"))?;
+        assert!(feed.idle() && feed.progress().0 >= at, "the log brought it through the index it adopts at");
+        assert!(feed.copy.adopting());
+        feed.copy.adopted(&blobs)?;
+        assert_eq!(g.read(3, "a.txt").as_deref(), Some("an edit"));
+        assert_eq!(g.read(3, "src/new.rs").as_deref(), Some("fn new() {}"));
+        assert_eq!(g.read(3, "gone.txt"), None);
+        assert!(g.propose(3, 2_000)?.is_empty(), "in step: nothing to say");
+        assert_eq!(g.tree(3), Some(&g.leader.machine().tree));
+        assert!(conflicts(&g.leader.machine().tree).is_empty(), "no conflict copy anywhere");
+        // From now on it is a copy like any other.
+        g.write(3, "a.txt", "from the new machine")?;
+        g.propose(3, 3_000)?;
+        assert_eq!(g.read(2, "a.txt").as_deref(), Some("from the new machine"));
         Ok(())
     }
 

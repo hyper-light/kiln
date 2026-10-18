@@ -515,9 +515,14 @@ fn fill_source(hub: &Hub, s: Source) -> Source {
 /// Changes a plan; a new title or body is a new version.
 pub async fn update(hub: &Hub, id: &str, patch: Patch, by: &str) -> R<Plan> {
     let old = get(hub, id).await?;
-    let title = patch.title.map(|t| t.trim().to_owned()).unwrap_or_else(|| old.title.clone());
     let body = patch.body.unwrap_or_else(|| old.body.clone());
     let items = patch.items.unwrap_or_else(|| old.items.clone());
+    // A title emptied is taken from the plan, as for a new one.
+    let title = match patch.title.map(|t| t.trim().to_owned()) {
+        Some(t) if t.is_empty() => title_for(&body, &items),
+        Some(t) => t,
+        None => old.title.clone(),
+    };
     check(&title, &body, &items)?;
     let tags = match patch.tags {
         Some(t) => clean_tags(t)?,

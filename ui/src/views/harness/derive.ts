@@ -2,6 +2,7 @@
  * Views over an agent's timeline: turns made of steps (not one row per tool call), the cumulative
  * changeset, the commands it ran. Pure functions of the event list, memoized by the caller.
  */
+import { useState } from "react";
 import type { FileDiff, HEvent, ToolCall, ToolKind } from "@/api/harness";
 
 export type ToolEvent = Extract<HEvent, { kind: "tool" }>;
@@ -31,7 +32,14 @@ export interface Turn {
   outcome: Extract<HEvent, { kind: "assistant" }> | null;
   started: number;
   ended: number | null;
+  /** The harness that answered (a conversation switched between harnesses keeps who said what). */
+  by?: string;
+  /** Not a turn: the line where the conversation went on in another harness. */
+  divider?: Extract<HEvent, { kind: "notice" }>;
 }
+
+/** The notice kiln puts where a conversation went on in another harness (`harness-switch:` ids). */
+const switchOf = (e: HEvent): Extract<HEvent, { kind: "notice" }> | null => (e.kind === "notice" && e.id.startsWith("harness-switch:") ? e : null);
 
 const GROUP: Record<ToolKind, StepGroup> = {
   read: "explore",
@@ -71,8 +79,16 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
       open(e, e.at, e.id);
       continue;
     }
+    // A switch to another harness is a line between turns, not part of the one before it.
+    const divider = switchOf(e);
+    if (divider) {
+      turns.push({ key: e.id, prompt: null, items: [], outcome: null, started: e.at, ended: null, divider });
+      cur = null;
+      continue;
+    }
     const t: Turn = cur ?? open(null, e.at, `start-${e.id}`);
     t.ended = e.at;
+    if (e.by && !t.by && e.kind !== "notice") t.by = e.by;
     if (e.kind === "tool") {
       const g = GROUP[e.tool] ?? "tool";
       const last = t.items.at(-1);
@@ -92,6 +108,7 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
   // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
   for (const [ti, t] of turns.entries()) {
     if (openLast && ti === turns.length - 1) break;
+    if (t.divider) continue;
     for (let i = t.items.length - 1; i >= 0; i--) {
       const it = t.items[i];
       if (!it || it.type === "thought" || it.type === "notice") continue;
@@ -103,6 +120,38 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
     }
   }
   return turns;
+}
+
+const sameList = <T>(a: readonly T[] | undefined, b: readonly T[] | undefined) => (a ?? []).length === (b ?? []).length && (a ?? []).every((x, i) => x === b?.[i]);
+
+/** Whether two items show the same events (the session keeps an event's object while it doesn't change). */
+function sameItem(a: Item, b: Item): boolean {
+  if (a.type !== b.type || a.key !== b.key) return false;
+  if (a.type === "step") return b.type === "step" && a.group === b.group && sameList(a.calls, b.calls);
+  if (a.type === "thought") return b.type === "thought" && a.event === b.event && sameList(a.more, b.more);
+  return "event" in b && a.event === b.event;
+}
+
+/**
+ * `next` with every turn and item that shows what it showed before kept as the object it was
+ * (`kept`: the last turns, by key; updated here), so a conversation that grows renders only what
+ * changed.
+ */
+export function shareTurns(kept: Map<string, Turn>, next: Turn[]): Turn[] {
+  const out = next.map((t) => {
+    const was = kept.get(t.key);
+    if (!was) return t;
+    const before = new Map(was.items.map((it) => [it.key, it]));
+    const items = t.items.map((it) => {
+      const b = before.get(it.key);
+      return b && sameItem(b, it) ? b : it;
+    });
+    const same = was.prompt === t.prompt && was.outcome === t.outcome && was.started === t.started && was.ended === t.ended && sameList(was.items, items);
+    return same ? was : { ...t, items };
+  });
+  kept.clear();
+  for (const t of out) kept.set(t.key, t);
+  return out;
 }
 
 export function diffStats(diffs: FileDiff[] | undefined): { add: number; del: number } {
@@ -150,6 +199,21 @@ export function changesetOf(events: HEvent[]): FileChange[] {
 
 export function runsOf(events: HEvent[]): ToolEvent[] {
   return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "shell");
+}
+
+/** The edits it made (or proposed). */
+export function editsOf(events: HEvent[]): ToolEvent[] {
+  return events.filter((e): e is ToolEvent => e.kind === "tool" && e.tool === "edit");
+}
+
+/**
+ * `list`, or the list last returned here while it holds the same items: what's worked out from it
+ * (and what shows it) stays as it was while the rest of the conversation streams.
+ */
+export function useSameList<T>(list: T[]): T[] {
+  const [kept] = useState(() => ({ list }));
+  if (kept.list !== list && (kept.list.length !== list.length || kept.list.some((x, i) => x !== list[i]))) kept.list = list;
+  return kept.list;
 }
 
 /** What a group of calls did, in a few words. */

@@ -18,7 +18,7 @@ runs the same way on bare metal and on Kubernetes.
 | Full machine control from the UI | PTY-backed terminal sessions (xterm.js + WebGL), full TTY semantics: resize, raw mode, alt-screen TUIs (k9s, htop, vim). |
 | Starts on boot, self-healing without systemd/K8s | `kiln supervise` is a tiny parent process that restarts the server with exponential backoff and reaps zombies (works as PID 1). Boot hook: systemd unit if present, else `@reboot` crontab, else XDG autostart. Inside the server, every subsystem is a supervised task that is restarted on error (Erlang-style). |
 | Never panic | Workspace lints deny `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`, unchecked indexing. Task boundaries additionally use `catch_unwind` as a last line of defence. |
-| Containerizable, single distribution | Static musl binary; UI built by Vite and embedded with `rust-embed`; `Dockerfile` is `FROM scratch`-style (distroless). |
+| Containerizable, single distribution | Static musl binary; the UI's static files (TanStack Start's client build) embedded with `rust-embed`; pages and React Server Components rendered by the UI server, which the kiln server runs under Bun (in the image; see [The web UI](#the-web-ui)). |
 | Install with or without passwords | `kiln install` is interactive by default; `--unattended` never prompts (uses `sudo -n` or user-level install only, generates secrets itself and writes them `0600`). |
 | No paid services | Everything here is open source and self-hosted. |
 
@@ -34,6 +34,30 @@ runs the same way on bare metal and on Kubernetes.
                     browser UI     kiln agent (bare     kiln agent pod
                     (embedded)     metal, bench box)    (per job, k8s)
 ```
+
+### The web UI
+
+The UI (`ui/`) is a TanStack Start app with React Server Components.
+- **Static files:** the kiln server serves the client build (`ui/dist/client`, embedded) itself, and
+  keeps earlier builds' assets so pages loaded before a deploy keep working (`crate::ui`).
+- **Pages, server functions and server components:** these come from the UI server, TanStack
+  Start's server build (`ui/dist/server`) run by Bun (`ui/server/main.ts`). The kiln server starts it
+  on a loopback port, forwards the UI's requests to it with streaming both ways, and starts it
+  again if it exits (`crate::uiserver`). The UI server stops when kiln does.
+- **Without Bun or the UI server's files:** every page is the app's shell (`_shell.html`, rendered
+  at build time), and the app runs in the browser.
+- **The API stays with the kiln server.** Server functions reach it on its own listener, carrying
+  the visitor's cookie.
+- **Where it looks:** `KILN_UI_DIR` (default `/usr/local/lib/kiln/ui`) and `KILN_BUN` (default:
+  `bun` on the PATH).
+- **HTTP/1.1 and HTTP/2:** the kiln server's listener speaks both (`crate::http::server`). Over TLS
+  (`server.https`) the browser picks by ALPN. In the clear, HTTP/2 opens with its preface, which is
+  how the front door passes a browser's HTTP/2 on. Handlers see every request shaped as HTTP/1.1's:
+  `Host` from `:authority`, one `Cookie`, the target as a path. WebSockets stay on HTTP/1.1.
+
+Every page is a route of its own (`ui/src/routes/_app.*.tsx`), rendered in the browser for now.
+Pages become server components where that keeps JavaScript out of the browser; the shared plan page
+(`routes/shared.plans.$token.tsx`) is the first.
 
 ### Pipeline definition (`.kiln/*.yaml`)
 

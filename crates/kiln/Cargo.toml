@@ -46,7 +46,7 @@ tar = "0.4.46"
 hmac = "0.13.0"
 # Secrets at rest: AES-256-GCM (docs/ci.md W09-R03); already in the tree through hyper-raft.
 aws-lc-rs = "1.18.2"
-hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
+hyper = { version = "1.12.0", features = ["http1", "http2", "server", "client"] }
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
@@ -55,6 +55,7 @@ async-broadcast = "0.7.2"
 event-listener = "5.4.2"
 webpki-roots = "1.0.9"
 flate2 = "1.1.10"
+brotli = "8.0.4"
 async-tungstenite = { version = "0.35.0", default-features = false, features = ["handshake"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 async-lock = "3.4.2"

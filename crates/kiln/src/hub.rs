@@ -148,6 +148,12 @@ pub struct Hub {
     pub tailnet: crate::frontdoor::tailnet::TailnetDns,
     /// Repo sync: every synced repo's group, led from here (`crate::sync`).
     pub sync: crate::sync::server::Sync,
+    /// Reach: the links between runners this server relays, and their identities (`crate::reach`).
+    pub reach: Mutex<crate::reach::relay::Relay>,
+    /// The git repositories each machine holds, as it last said (`crate::sync::places`).
+    pub places: crate::sync::places::Places,
+    /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
+    pub tasks: crate::sync::tasks::Tasks,
 }
 
 impl Hub {
@@ -167,6 +173,8 @@ impl Hub {
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
+        let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
+        let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
         Arc::new(Self {
             cfg,
             store,
@@ -206,13 +214,18 @@ impl Hub {
             front_doors: crate::frontdoor::control::FrontDoors::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
+            reach: Mutex::new(crate::reach::relay::Relay::default()),
+            places,
+            tasks,
         })
     }
 
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
     /// each other platform's runners upgrade to now.
     async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
-        if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) {
+        // The server's commit, or the newest one a runner runs (`crate::fleet`).
+        let newest = self.updates.fleet.target().map(|t| t.commit).unwrap_or_default();
+        if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) && (newest.is_empty() || !crate::updates::adopts(&self.cfg.updates, run, &newest)) {
             return;
         }
         let path = crate::api::artifact_path(self, job);
@@ -227,6 +240,7 @@ impl Hub {
                 tracing::info!(run = run.number, targets = ?targets, "runners' binaries built by the release pipeline");
                 self.store.audit("kiln".into(), "upgrade.binary".into(), format!("built by {} run #{} ({}): {}", run.pipeline, run.number, run.sha.get(..12).unwrap_or(&run.sha), targets.join(", "))).await;
                 self.emit(&serde_json::json!({ "type": "updates" }));
+                self.updates.fleet.wake();
             }
             Ok(Ok(_)) => {}
             Ok(Err(e)) | Err(e) => tracing::warn!(run = run.number, error = %format!("{e:#}"), "the release pipeline's binaries were not kept"),
@@ -245,6 +259,21 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    /// What a machine's runner said on the sync lane: of its copies (to the groups), of the git
+    /// repositories it holds, or of its part of a task.
+    fn sync_heard(&self, machine: &str, json: &str, raft: Vec<u8>) {
+        match crate::sync::wire::decode(json) {
+            Some(crate::sync::wire::Msg::Repos(r)) => {
+                if self.places.heard(machine, r) {
+                    self.emit(&serde_json::json!({ "type": "places" }));
+                }
+            }
+            Some(crate::sync::wire::Msg::Task(news)) => self.tasks.heard(machine, news),
+            Some(msg) => self.sync.from_runner(machine, msg, raft),
+            None => {}
+        }
     }
 
     /// A runner process of `machine` that syncs said so: the newest such process syncs, and every
@@ -513,12 +542,54 @@ impl Hub {
             self.net.command(crate::net::Out::Disconnect { peer: p }).await;
         }
         self.net.command(crate::net::Out::Revoke { name: agent.to_owned() }).await;
+        self.reach.lock().forget(agent);
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
+        self.places.forget(agent);
         self.tailnet.wake.notify();
         self.update_slot_gauges();
         Ok(())
+    }
+
+    // ------------------------------------------------------------ reach
+
+    /// Reach's directory (`crate::reach::directory`): every runner that is not a job pod — what it
+    /// is, how busy it is, its harnesses, its reach identity and whether it takes links.
+    pub fn reach_directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
+        let kinds = self.harness.kinds();
+        let relay = self.reach.lock();
+        let agents = self.agents.lock();
+        let mut out: Vec<crate::reach::directory::RunnerInfo> = agents
+            .values()
+            .filter(|a| !a.ephemeral)
+            .map(|a| {
+                let ann = relay.announced(&a.name);
+                let s = a.sample.as_ref();
+                crate::reach::directory::RunnerInfo {
+                    name: a.name.clone(),
+                    hostname: a.hostname.clone(),
+                    os: a.os.clone(),
+                    arch: a.arch.clone(),
+                    labels: a.labels.clone(),
+                    connected: a.connected,
+                    reach: a.connected && ann.is_some_and(|x| x.accept),
+                    fingerprint: ann.map(|x| x.fingerprint.clone()),
+                    cpus: s.map_or(0, |s| s.cpus),
+                    cpu_pct: s.map_or(0.0, |s| s.cpu_pct),
+                    load1: s.map_or(0.0, |s| s.load1),
+                    mem_total: s.map_or(0, |s| s.mem_total),
+                    mem_used: s.map_or(0, |s| s.mem_used),
+                    slots: a.slots,
+                    busy: a.busy,
+                    draining: a.draining,
+                    harnesses: kinds.get(&format!("agent:{}", a.name)).map(|ks| ks.iter().filter(|k| k.available).map(|k| k.id.clone()).collect()).unwrap_or_default(),
+                    via: a.transport.map(|t| t.to_string()).unwrap_or_default(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     // ------------------------------------------------------------ network
@@ -543,6 +614,13 @@ impl Hub {
             }
             NetEvent::Closed { peer, reason } | NetEvent::Unreachable { peer, reason } => {
                 self.tunnels.closed(peer);
+                // Its reach links end; the runners at their other ends hear so (and resume later).
+                let closes = self.reach.lock().lost(peer, "disconnected from the kiln server");
+                for (p, m) in closes {
+                    if let Ok(b) = proto::encode(&m) {
+                        self.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
+                    }
+                }
                 self.pending_peers.lock().remove(&peer);
                 let name = self.peers.lock().remove(&peer);
                 let lost = self.instances.lock().lost(peer);
@@ -768,6 +846,7 @@ impl Hub {
             AgentMsg::Build { build, caps } => {
                 self.instances.lock().set_build(peer, build.clone(), caps);
                 self.updates.on_build(self, &agent, &build);
+                self.updates.fleet.wake();
                 self.emit(&serde_json::json!({ "type": "updates" }));
                 crate::frontdoor::control::on_build(self, &agent, caps).await;
                 if caps & proto::CAP_SYNC != 0 {
@@ -776,7 +855,7 @@ impl Hub {
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
             }
-            AgentMsg::Sync { json, raft } => self.sync.from_runner(&agent, &json, raft),
+            AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             AgentMsg::JobEvent { job, json } => {
@@ -784,7 +863,56 @@ impl Hub {
                     self.ci.send(crate::ci::dispatch::Msg::Event { agent: agent.clone(), leg: job, json });
                 }
             }
-            AgentMsg::Facts { .. } => tracing::debug!(agent = %agent, "runner facts before CI facts are stored"),
+            // The kiln it runs (`crate::fleet`); the rest is W13's.
+            AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
+                Ok(f) => {
+                    if let Some(k) = f.kiln {
+                        crate::fleet::remember(self, &k.build, &k.target, &k.commit);
+                        self.instances.lock().set_kiln(peer, k);
+                        self.updates.fleet.wake();
+                    }
+                }
+                Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable runner facts"),
+            },
+            AgentMsg::ReachHello { json } => {
+                let pod = self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral);
+                match serde_json::from_str::<crate::reach::relay::Announce>(&json) {
+                    Ok(a) if !pod => {
+                        tracing::info!(agent = %agent, fingerprint = %crate::reach::e2e::short(&a.fingerprint), accept = a.accept, "reach identity");
+                        self.reach.lock().announce(&agent, a);
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable reach announcement"),
+                }
+            }
+            AgentMsg::Reach { to, link, open, data, close } => {
+                // Job pods neither send nor receive reach links.
+                if self.agents.lock().get(&agent).is_none_or(|a| a.ephemeral) {
+                    return Ok(());
+                }
+                let out = {
+                    let (agents, instances) = (&self.agents, &self.instances);
+                    self.reach.lock().forward(&agent, peer, crate::reach::relay::Frame { to, link, open, data, close }, |n| {
+                        if agents.lock().get(n).is_none_or(|a| a.ephemeral || !a.connected) {
+                            return None;
+                        }
+                        instances.lock().newest_with(n, proto::CAP_REACH)
+                    })
+                };
+                for (p, m) in out {
+                    if let Ok(b) = proto::encode(&m) {
+                        self.net.send(p, proto::LANE_REACH, Kind::Term, b).await;
+                    }
+                }
+            }
+            AgentMsg::ReachAsk { req, json } => {
+                let op = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v.get("op").and_then(serde_json::Value::as_str).map(str::to_owned));
+                let answer = match op.as_deref() {
+                    Some("directory") => serde_json::json!({ "runners": self.reach_directory() }),
+                    _ => serde_json::json!({ "error": "unknown reach question" }),
+                };
+                self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+            }
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -1072,6 +1200,12 @@ impl Hub {
     pub fn runner_caps(&self, name: &str) -> u32 {
         let inst = self.instances.lock();
         inst.newest(name).and_then(|p| inst.get(p)).map_or(0, |i| i.caps)
+    }
+
+    /// The kiln a machine's newest runner process says it runs (`crate::fleet`).
+    pub fn runner_kiln(&self, name: &str) -> Option<kiln_ci::facts::KilnFacts> {
+        let inst = self.instances.lock();
+        inst.newest(name).and_then(|p| inst.get(p)).and_then(|i| i.kiln.clone())
     }
 
     pub fn runner_processes(&self, name: &str) -> Vec<crate::instances::InstanceView> {

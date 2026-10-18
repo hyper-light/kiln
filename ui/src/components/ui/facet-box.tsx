@@ -88,19 +88,20 @@ export function FacetBox({
   );
   const any = chips.length > 0 || query.length > 0;
 
-  // Closes when you click or tab anywhere else.
-  React.useEffect(() => {
-    if (!open) return;
-    const away = (e: PointerEvent) => {
+  // Closes when you click or tab anywhere else (listened for only while its list is open).
+  const away = React.useCallback((pop: HTMLDivElement | null) => {
+    if (!pop) return;
+    const onDown = (e: PointerEvent) => {
       if (!root.current?.contains(e.target as Node)) setOpen(false);
     };
-    document.addEventListener("pointerdown", away);
-    return () => document.removeEventListener("pointerdown", away);
-  }, [open]);
-  // The active option stays in view as the arrows move it.
-  React.useEffect(() => {
-    if (open && active >= 0) document.getElementById(`${uid}-o${active}`)?.scrollIntoView({ block: "nearest" });
-  }, [open, active, uid]);
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, []);
+  /** Move the highlight, keeping it in view. */
+  const highlight = (i: number) => {
+    setActive(i);
+    if (i >= 0) document.getElementById(optionId(i))?.scrollIntoView({ block: "nearest" });
+  };
 
   const pick = (i: number) => {
     const it = flat[i];
@@ -122,7 +123,7 @@ export function FacetBox({
         return;
       }
       if (flat.length === 0) return;
-      setActive((a) => (e.key === "ArrowDown" ? (a + 1) % flat.length : a <= 0 ? flat.length - 1 : a - 1));
+      highlight(e.key === "ArrowDown" ? (active + 1) % flat.length : active <= 0 ? flat.length - 1 : active - 1);
     } else if (e.key === "Enter") {
       if (open && active >= 0) {
         e.preventDefault();
@@ -207,7 +208,7 @@ export function FacetBox({
         )}
       </div>
       {open && (
-        <div className="facet-pop popover">
+        <div ref={away} className="facet-pop popover">
           <div id={listId} role="listbox" aria-multiselectable="true" aria-label={label}>
             {groups.length === 0 && <p className="facet-none">{onQueryProp ? `Filtering names by “${query.trim()}”.` : `Nothing matches “${query.trim()}”.`}</p>}
             {groups.map((f) => (

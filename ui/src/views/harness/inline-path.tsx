@@ -7,11 +7,13 @@
  * puts back what it was when it opened. Tapping anywhere else folds it, keeping what's applied.
  */
 import * as React from "react";
+import { flushSync } from "react-dom";
 import "./inline-path.css";
 import { ApiError, machineDirs } from "@/api/client";
 import type { DirEntry, DirListing } from "@/api/types";
 import { relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { useClock, useListener } from "./dom";
 import { Optic } from "./signals";
 
 export interface InlinePathProps {
@@ -135,47 +137,67 @@ function failure(e: unknown): Got {
   return { status: 0, message: e instanceof Error ? e.message : String(e) };
 }
 
+type Answer = { key: string; got: Got };
+
+/**
+ * One picker's asking, as a store it reads: a folder is asked for while the picker shows it (once
+ * typing settles; not at all when a fresh answer is remembered), and the last answer it got stays.
+ */
+function asker() {
+  let answer: Answer | null = null;
+  let tell: (() => void) | null = null;
+  const give = (a: Answer) => {
+    answer = a;
+    tell?.();
+  };
+  return {
+    answer: () => answer,
+    /** Asks for `path` on `target` for as long as `fn` listens. */
+    ask(target: string, path: string, fn: () => void) {
+      const key = `${target}\n${path}`;
+      tell = fn;
+      const known = remembered(key);
+      if (known) {
+        give({ key, got: known });
+        return () => {
+          tell = null;
+        };
+      }
+      const ctl = new AbortController();
+      const timer = window.setTimeout(() => {
+        void machineDirs(target, path, ctl.signal)
+          .then((listing): Got => ({ listing }), failure)
+          .then((got) => {
+            if (ctl.signal.aborted) return;
+            // Not reaching the server says nothing about the folder: ask again next time.
+            if (!("status" in got && got.status === 0)) answers.set(key, { at: Date.now(), got });
+            give({ key, got });
+          });
+      }, SETTLE_MS);
+      return () => {
+        window.clearTimeout(timer);
+        ctl.abort();
+        tell = null;
+      };
+    },
+  };
+}
+
 /** The listing of `path` on `target`; while the next one comes, the last answer stays around (`last`). */
 function useListing(target: string, path: string) {
   const key = `${target}\n${path}`;
-  const [answer, setAnswer] = React.useState<{ key: string; got: Got } | null>(null);
+  const [asking] = React.useState(asker);
+  const subscribe = React.useCallback((fn: () => void) => asking.ask(target, path, fn), [asking, target, path]);
+  const answer = React.useSyncExternalStore(subscribe, asking.answer, asking.answer);
   const hit = remembered(key);
-  React.useEffect(() => {
-    const known = remembered(key);
-    if (known) {
-      setAnswer({ key, got: known });
-      return;
-    }
-    const ctl = new AbortController();
-    const timer = window.setTimeout(() => {
-      void machineDirs(target, path, ctl.signal)
-        .then((listing): Got => ({ listing }), failure)
-        .then((got) => {
-          if (ctl.signal.aborted) return;
-          // Not reaching the server says nothing about the folder: ask again next time.
-          if (!("status" in got && got.status === 0)) answers.set(key, { at: Date.now(), got });
-          setAnswer({ key, got });
-        });
-    }, SETTLE_MS);
-    return () => {
-      window.clearTimeout(timer);
-      ctl.abort();
-    };
-  }, [key, target, path]);
   const fresh = answer?.key === key ? answer.got : hit;
   return { fresh, last: fresh ?? answer?.got ?? null };
 }
 
-/** True once `on` has held for `ms`. */
-function useAfter(on: boolean, ms: number): boolean {
-  const [late, setLate] = React.useState(false);
-  React.useEffect(() => {
-    setLate(false);
-    if (!on) return;
-    const t = window.setTimeout(() => setLate(true), ms);
-    return () => window.clearTimeout(t);
-  }, [on, ms]);
-  return on && late;
+/** Its words once it has shown for `ms`: what's said while waiting, so a quick answer never flashes it. */
+function Quiet({ ms, children }: { ms: number; children: React.ReactNode }) {
+  const [since] = React.useState(Date.now);
+  return useClock(ms) - since >= ms ? <>{children}</> : null;
 }
 
 /** Arrow keys move through a row of words; Up from the first goes back to the field; typing goes on in the field. */
@@ -227,15 +249,20 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
   const [focused, setFocused] = React.useState<string | null>(null);
   const [width, setWidth] = React.useState(0);
   const [fonts, setFonts] = React.useState(false);
-  const root = React.useRef<HTMLDivElement>(null);
+  // Another machine: start over there.
+  const [targetWas, setTargetWas] = React.useState(target);
+  if (targetWas !== target) {
+    setTargetWas(target);
+    setOpen(false);
+  }
+  const root = React.useRef<HTMLDivElement | null>(null);
   const line = React.useRef<HTMLButtonElement>(null);
-  const pathBox = React.useRef<HTMLSpanElement>(null);
-  const field = React.useRef<HTMLTextAreaElement>(null);
+  const field = React.useRef<HTMLTextAreaElement | null>(null);
   const list = React.useRef<HTMLDivElement>(null);
   /** How the line was last pressed: a tap doesn't bring up the keyboard. */
   const pointer = React.useRef("");
-  /** Where focus goes after the next render. */
-  const refocus = React.useRef<"field" | "line" | "list" | null>(null);
+  /** A folder picked from the keyboard: focus goes on to its folders once they're listed. */
+  const refocus = React.useRef<"list" | null>(null);
   const panelId = React.useId();
   const recentId = React.useId();
   const machine = machineOf(target);
@@ -244,7 +271,6 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
   // Folded, it checks the folder applied (and has it ready for opening); open, the folder browsed.
   const { fresh, last } = useListing(target, open ? askFor(dir, prefix) : clean(value));
   const stale = fresh === null;
-  const reading = useAfter(open && stale, QUIET_MS);
   const got = open ? last : fresh;
   const listing = got && "listing" in got ? got.listing : null;
   const problem = got && "status" in got ? got : null;
@@ -266,15 +292,18 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
   const [fit, setFit] = React.useState({ key: "", skip: 0 });
   const skip = fit.key === fitKey ? fit.skip : 0;
   const maxSkip = Math.max(0, segs.length - 2);
-  React.useLayoutEffect(() => {
-    const box = pathBox.current;
-    if (!box || skip >= maxSkip) return;
-    const end = box.lastElementChild;
-    const over = box.scrollWidth > box.clientWidth + 1 || (end instanceof HTMLElement && end.scrollWidth > end.clientWidth + 1);
-    if (over) setFit({ key: fitKey, skip: skip + 1 });
-  }, [fitKey, skip, maxSkip]);
-  React.useLayoutEffect(() => {
-    const el = root.current;
+  const fitPath = React.useCallback(
+    (box: HTMLSpanElement | null) => {
+      if (!box || skip >= maxSkip) return;
+      const end = box.lastElementChild;
+      const over = box.scrollWidth > box.clientWidth + 1 || (end instanceof HTMLElement && end.scrollWidth > end.clientWidth + 1);
+      if (over) setFit({ key: fitKey, skip: skip + 1 });
+    },
+    [fitKey, skip, maxSkip],
+  );
+  // Its width (how many folders show, what fits on the line), and its fonts once they're in.
+  const watchRoot = React.useCallback((el: HTMLDivElement | null) => {
+    root.current = el;
     if (!el) return;
     const watch = new ResizeObserver((es) => setWidth(Math.round(es[0]?.contentRect.width ?? 0)));
     watch.observe(el);
@@ -282,38 +311,35 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
     return () => watch.disconnect();
   }, []);
 
-  // The field grows to fit what's typed instead of scrolling sideways.
-  React.useLayoutEffect(() => {
-    const f = field.current;
-    if (!f) return;
-    f.style.height = "0px";
-    f.style.height = `${f.scrollHeight}px`;
-  }, [draft, open, width, fonts]);
+  // The field grows to fit what's typed instead of scrolling sideways (again as that, the width or
+  // the fonts change).
+  const fitField = React.useCallback(
+    (f: HTMLTextAreaElement | null) => {
+      field.current = f;
+      void [draft, width, fonts];
+      if (!f) return;
+      f.style.height = "0px";
+      f.style.height = `${f.scrollHeight}px`;
+    },
+    [draft, width, fonts],
+  );
 
-  // Another machine: start over there.
-  React.useEffect(() => {
-    setOpen(false);
-  }, [target]);
-
-  React.useLayoutEffect(() => {
-    const to = refocus.current;
-    if (!to || (to === "list" && stale)) return;
-    refocus.current = null;
-    if (to === "line") {
-      line.current?.focus({ preventScroll: true });
-    } else if (to === "field") {
-      const f = field.current;
-      f?.focus();
-      f?.setSelectionRange(f.value.length, f.value.length);
-    } else {
+  // A folder picked from the keyboard: once its folders are listed (looked at whenever the listing
+  // shown changes), focus goes to the first of them, else to the field.
+  const listed = React.useCallback(
+    (panel: HTMLDivElement | null) => {
+      void got;
+      if (!panel || refocus.current !== "list" || stale) return;
+      refocus.current = null;
       const opts = list.current?.querySelectorAll<HTMLElement>('[role="option"]');
       const first = opts && (Array.from(opts).find((o) => !o.hasAttribute("data-up")) ?? opts[0]);
       if (first) first.focus();
       else field.current?.focus();
-    }
-  });
+    },
+    [got, stale],
+  );
 
-  const browse = (path: string, focus: "field" | "list" | null = null) => {
+  const browse = (path: string, focus: "list" | null = null) => {
     setDraft(browseText(path));
     setFocused(null);
     if (focus) refocus.current = focus;
@@ -323,7 +349,11 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
     browse(path, focus);
   };
   const fold = (back: boolean) => {
-    if (back && root.current?.contains(document.activeElement)) refocus.current = "line";
+    // What has focus folds away: it goes back to the line.
+    if (back && root.current?.contains(document.activeElement)) {
+      refocus.current = null;
+      line.current?.focus({ preventScroll: true });
+    }
     setOpen(false);
     setAllIn(null);
   };
@@ -349,41 +379,45 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
 
   // Esc puts back what it was. Taken before the sheet around it (a Radix dialog, which listens on
   // the document) would close on it.
-  const latest = React.useRef({ revert, fold });
-  React.useLayoutEffect(() => {
-    latest.current = { revert, fold };
-  });
-  React.useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
+  useListener<KeyboardEvent>(
+    window,
+    "keydown",
+    (e) => {
       if (e.key !== "Escape" || e.isComposing || e.defaultPrevented) return;
       if (!root.current?.contains(document.activeElement)) return;
       e.preventDefault();
-      latest.current.revert();
-    };
-    const away = (e: PointerEvent) => {
+      revert();
+    },
+    { on: open, capture: true },
+  );
+  // Tapping anywhere else folds it, keeping what's applied.
+  useListener<PointerEvent>(
+    document,
+    "pointerdown",
+    (e) => {
       if (e.target instanceof Node && root.current?.contains(e.target)) return;
-      latest.current.fold(false);
-    };
-    window.addEventListener("keydown", onKey, true);
-    document.addEventListener("pointerdown", away, true);
-    return () => {
-      window.removeEventListener("keydown", onKey, true);
-      document.removeEventListener("pointerdown", away, true);
-    };
-  }, [open]);
+      fold(false);
+    },
+    { on: open, capture: true },
+  );
 
   const onLine = (e: React.MouseEvent<HTMLButtonElement>) => {
     const seg = e.target instanceof Element ? e.target.closest<HTMLElement>("[data-seg]") : null;
     const at = seg ? Number(seg.dataset.seg) : null;
     const to = at === null ? undefined : segs[at];
     if (!open) {
-      // Keys and mice go on typing; a tap leaves the keyboard down.
+      // Keys and mice go on typing in the field as it opens; a tap leaves the keyboard down.
       const type = e.detail === 0 || pointer.current === "mouse" || pointer.current === "pen";
-      setOpened(value);
-      setAllIn(null);
-      setOpen(true);
-      browse(to?.path ?? value, type ? "field" : null);
+      flushSync(() => {
+        setOpened(value);
+        setAllIn(null);
+        setOpen(true);
+        browse(to?.path ?? value);
+      });
+      if (type) {
+        refocus.current = null;
+        toField();
+      }
     } else if (!to || at === current) {
       fold(true);
     } else {
@@ -399,14 +433,15 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
   // One line under the field (folded: under the line) for what's going on.
   let tone: "warn" | undefined;
   let say: React.ReactNode = null;
-  if (open && reading) {
+  if (open && stale) {
+    // Said once it has taken a moment, so a quick answer never flashes it.
     say = (
-      <>
+      <Quiet ms={QUIET_MS}>
         <span className="ip-optic" aria-hidden="true">
           <Optic state="idle" />
         </span>
         Reading {clean(dir)} on {machine}
-      </>
+      </Quiet>
     );
   } else if (open && !stale && problem) {
     tone = "warn";
@@ -441,7 +476,7 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
   const recentStop = recent.find((r) => clean(r) === clean(value)) ?? recent[0];
 
   return (
-    <div ref={root} className={cn("ip", className)} data-open={open ? "" : undefined}>
+    <div ref={watchRoot} className={cn("ip", className)} data-open={open ? "" : undefined}>
       <button
         ref={line}
         type="button"
@@ -455,14 +490,14 @@ export function InlinePath({ target, value, onChange, recent = [], label = "IN",
         onClick={onLine}
       >
         <span className="ip-eyebrow">{label}</span>
-        <span ref={pathBox} className="ip-path">
+        <span ref={fitPath} className="ip-path">
           {lineWords}
         </span>
       </button>
-      <div id={panelId} className="ip-panel">
+      <div ref={listed} id={panelId} className="ip-panel">
         {open && (
           <textarea
-            ref={field}
+            ref={fitField}
             className="ip-field"
             rows={1}
             value={draft}

@@ -54,6 +54,11 @@ streamed logs work as they do on the server's own port. It forwards to the runne
 `--server` URL unless **Forward to** says otherwise. An `https://` upstream is checked against
 kiln's root and the public roots.
 
+Browsers get HTTP/2 while the upstream speaks it: one connection carries all of a page's
+requests at once, where HTTP/1.1 takes six at a time. The front door asks the upstream every 30
+seconds, and at once when the upstream changes. A kiln server from before HTTP/2 answers no, and
+browsers get HTTP/1.1 as before. WebSockets always use HTTP/1.1 connections of their own.
+
 Plain HTTP on port 80 answers every request with a redirect (307) to the same path over HTTPS,
 keeping the name or address that was asked when it is one of the front door's (else the domain).
 Three things it serves itself, because a device needs them before it trusts the HTTPS: kiln's root

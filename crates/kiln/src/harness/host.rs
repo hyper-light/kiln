@@ -64,6 +64,10 @@ pub const ATTACHMENT_MAX: u64 = 25 << 20;
 
 impl Host {
     pub fn new(sink: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
+        // The models its harnesses' sessions list are kept beside its record of them.
+        if let Some(dir) = file.as_ref().and_then(|f| f.parent()) {
+            super::kinds::keep_models_in(dir.join("harness-models.json"));
+        }
         let files_dir = file.as_ref().and_then(|f| f.parent()).map_or_else(
             || std::env::temp_dir().join(format!("kiln-attachments-{}", crate::os::uid())),
             |d| d.join("attachments"),

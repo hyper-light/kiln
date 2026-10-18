@@ -23,6 +23,9 @@ pub enum Up {
     Term(AgentMsg),
     /// Repo sync, on its own lane: never buffered across a disconnect (it says it all again).
     Sync(AgentMsg),
+    /// Reach links (`crate::reach`), on their own lane: never buffered across a disconnect (a link
+    /// does not outlive the connection; its runs resume on the next one).
+    Reach(AgentMsg),
 }
 
 #[derive(Clone)]

@@ -41,6 +41,10 @@ const SWEEP: Duration = Duration::from_secs(600);
 const SWEEP_AGE: Duration = Duration::from_secs(3600);
 /// Skipped files a status lists, at the most.
 const SKIPPED: usize = 20;
+/// Which of a copy's errors: its group's, its folder taking the log, looking at its folder.
+const E_GROUP: usize = 0;
+const E_FOLDER: usize = 1;
+const E_LOOK: usize = 2;
 
 /// The agent's handle on this machine's sync.
 pub struct Runner {
@@ -49,7 +53,7 @@ pub struct Runner {
 
 enum Input {
     Wake,
-    Heard(Msg, Vec<u8>),
+    Heard(Box<Msg>, Vec<u8>),
     Connected(bool),
     Fetched(String, Got),
     Uploaded(String, bool),
@@ -77,8 +81,10 @@ impl Runner {
         let (tx, rx) = std::sync::mpsc::channel();
         let (say_tx, say_rx) = async_channel::unbounded();
         let (job_tx, job_rx) = async_channel::unbounded::<(Transfer, String)>();
+        // The machine's git repositories, and its part of tasks that move them (`super::repos`).
+        let repos = super::repos::start(dir.clone(), me.to_owned(), http.clone(), server.clone(), say_tx.clone());
         let (owner_dir, owner_me, wake_tx) = (dir.clone(), me.to_owned(), tx.clone());
-        let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || match Owner::new(owner_dir, owner_me, say_tx, job_tx, wake_tx) {
+        let spawned = std::thread::Builder::new().name("kiln-sync".into()).spawn(move || match Owner::new(owner_dir, owner_me, say_tx, job_tx, wake_tx, repos) {
             Ok(owner) => owner.run(&rx),
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "repo sync is off on this machine"),
         });
@@ -110,7 +116,7 @@ impl Runner {
     /// What the server said (`ServerMsg::Sync`).
     pub fn heard(&self, json: &str, raft: Vec<u8>) {
         if let Some(msg) = wire::decode(json) {
-            let _ = self.tx.send(Input::Heard(msg, raft));
+            let _ = self.tx.send(Input::Heard(Box::new(msg), raft));
         }
     }
 
@@ -216,13 +222,17 @@ struct Held {
     r: Replica<Store, Feed>,
     out: Output<()>,
     compacted: u64,
-    error: Option<String>,
+    /// What went wrong last in its group, its folder taking the log, and looking at the folder:
+    /// each until that goes right again.
+    errors: [Option<String>; 3],
     /// The newest step sent so far.
     sent: u64,
     waiting: usize,
     /// What it last said of itself (its time left out), and when.
     said: Option<CopyStatus>,
     said_at: Option<Instant>,
+    /// It has looked at its folder since it opened.
+    looked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +248,8 @@ struct Owner {
     blobs: Blobs,
     say: async_channel::Sender<AgentMsg>,
     jobs: async_channel::Sender<(Transfer, String)>,
+    /// The machine's git repositories and its part of tasks (`super::repos`).
+    repos: async_channel::Sender<super::repos::Job>,
     wakeup: Arc<Wakeup>,
     waker: Waker,
     start: Instant,
@@ -276,7 +288,14 @@ fn hashes(step: &Step) -> impl Iterator<Item = &String> {
 }
 
 impl Owner {
-    fn new(dir: PathBuf, me: String, say: async_channel::Sender<AgentMsg>, jobs: async_channel::Sender<(Transfer, String)>, tx: Sender<Input>) -> anyhow::Result<Self> {
+    fn new(
+        dir: PathBuf,
+        me: String,
+        say: async_channel::Sender<AgentMsg>,
+        jobs: async_channel::Sender<(Transfer, String)>,
+        tx: Sender<Input>,
+        repos: async_channel::Sender<super::repos::Job>,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir.join("copies"))?;
         let blobs = Blobs::new(&dir.join("blobs"))?;
         let registry = match std::fs::read(dir.join("copies.json")) {
@@ -293,6 +312,7 @@ impl Owner {
             blobs,
             say,
             jobs,
+            repos,
             wakeup,
             waker,
             start: Instant::now(),
@@ -342,9 +362,10 @@ impl Owner {
     fn input(&mut self, input: Input) {
         match input {
             Input::Wake => {}
-            Input::Heard(msg, raft) => self.heard(msg, raft),
+            Input::Heard(msg, raft) => self.heard(*msg, raft),
             Input::Connected(up) => {
                 self.connected = up;
+                let _ = self.repos.try_send(super::repos::Job::Connected(up));
                 if up {
                     // Steps and states again, at once.
                     self.resent = Instant::now().checked_sub(RESEND).unwrap_or_else(Instant::now);
@@ -375,6 +396,8 @@ impl Owner {
     fn heard(&mut self, msg: Msg, raft: Vec<u8>) {
         match msg {
             Msg::Copies { copies, token } => {
+                let _ = self.repos.try_send(super::repos::Job::Token(token.clone()));
+                let _ = self.repos.try_send(super::repos::Job::Paths(copies.iter().map(|c| c.path.clone()).collect()));
                 self.wanted = copies;
                 self.token = token;
                 self.told = true;
@@ -398,8 +421,12 @@ impl Owner {
                 }
                 self.resent = Instant::now().checked_sub(RESEND).unwrap_or_else(Instant::now);
             }
+            // The machine's repositories' (`super::repos`), in the order the server sent them.
+            Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } => {
+                let _ = self.repos.try_send(super::repos::Job::Order(msg));
+            }
             // Only a runner says these.
-            Msg::Steps { .. } | Msg::Status(_) => {}
+            Msg::Steps { .. } | Msg::Status(_) | Msg::Repos(_) | Msg::Task(_) => {}
         }
     }
 
@@ -471,11 +498,18 @@ impl Owner {
         let store = disk::claim(log, u128::from(group))?;
         let depth = store.depth();
         let limits = Limits { exclude: spec.exclude.clone(), ..spec.max_size.map_or_else(Limits::default, |max_size| Limits { max_size, ..Limits::default() }) };
-        let mut feed = Feed::open(&root, &self.me, spec.member, limits, self.state_file(spec))?;
+        let file = self.state_file(spec);
+        let fresh = !file.exists();
+        let mut feed = Feed::open(&root, &self.me, spec.member, limits, file)?;
         feed.copy.gone.clone_from(&self.gone);
+        // A folder kiln just cloned to join: it takes the group's files, once, before it says anything.
+        if fresh && let Some(at) = spec.adopt.filter(|at| *at > 0) {
+            feed.copy.adopt(at).map_err(|e| anyhow::anyhow!("{}: {e}", root.display()))?;
+            feed.save()?;
+        }
         let r = Replica::open(&group::settings(spec.member, depth)?, store, feed, Unbounded).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let compacted = r.applied().index;
-        Ok(Held { spec: spec.clone(), group, r, out: Output::default(), compacted, error: None, sent: 0, waiting: 0, said: None, said_at: None })
+        Ok(Held { spec: spec.clone(), group, r, out: Output::default(), compacted, errors: [None, None, None], sent: 0, waiting: 0, said: None, said_at: None, looked: false })
     }
 
     fn state_file(&self, spec: &CopySpec) -> PathBuf {
@@ -532,9 +566,10 @@ impl Owner {
         for h in self.held.values_mut() {
             let mut messages = Vec::new();
             if let Err(e) = group::pump(&mut h.r, now, &self.waker, &mut h.out, &mut messages) {
-                h.error = Some(format!("{e:?}"));
+                h.errors[E_GROUP] = Some(format!("{e:?}"));
                 continue;
             }
+            h.errors[E_GROUP] = None;
             for m in messages {
                 if m.to == SERVER {
                     self.part = self.part.wrapping_add(1);
@@ -545,8 +580,20 @@ impl Owner {
                 Ok(missing) => {
                     h.waiting = missing.len();
                     wanted.extend(missing);
+                    h.errors[E_FOLDER] = None;
                 }
-                Err(e) => h.error = Some(format!("the folder: {e}")),
+                Err(e) => h.errors[E_FOLDER] = Some(format!("the folder: {e}")),
+            }
+            // An adopting folder the log has brought through its index: it is the group's now.
+            let feed = h.r.machine_mut();
+            if let Some(at) = feed.copy.state.adopt
+                && feed.idle()
+                && feed.progress().0 >= at
+            {
+                match feed.copy.adopted(&self.blobs).and_then(|_| feed.save()) {
+                    Ok(()) => tracing::info!(repo = %h.spec.name, path = %h.spec.path, "a new copy took the group's files"),
+                    Err(e) => h.errors[E_FOLDER] = Some(format!("the folder: {e}")),
+                }
             }
             // A copy serves no one: it keeps nothing it took.
             if disk::due(&h.r, h.compacted) && h.r.compact(0, now, &self.waker).unwrap_or(false) {
@@ -616,14 +663,19 @@ impl Owner {
                 continue;
             }
             let feed = h.r.machine_mut();
+            if feed.copy.adopting() {
+                continue;
+            }
             match feed.copy.propose(&self.blobs, now_ms()) {
                 Ok(steps) if !steps.is_empty() => {
-                    if let Err(e) = feed.save() {
-                        h.error = Some(format!("the copy's state: {e}"));
-                    }
+                    h.errors[E_LOOK] = feed.save().err().map(|e| format!("the copy's state: {e}"));
+                    h.looked = true;
                 }
-                Ok(_) => {}
-                Err(e) => h.error = Some(format!("looking at the folder: {e}")),
+                Ok(_) => {
+                    h.errors[E_LOOK] = None;
+                    h.looked = true;
+                }
+                Err(e) => h.errors[E_LOOK] = Some(format!("looking at the folder: {e}")),
             }
         }
     }
@@ -697,8 +749,10 @@ impl Owner {
                 waiting: h.waiting,
                 conflicts: feed.conflicts().len(),
                 skipped: feed.copy.skipped.iter().take(SKIPPED).cloned().collect(),
-                error: h.error.clone().or_else(|| self.error.clone()),
+                error: h.errors.iter().flatten().next().cloned().or_else(|| self.error.clone()),
                 at: 0,
+                looked: h.looked,
+                adopting: feed.copy.adopting(),
             };
             let changed = h.said.as_ref() != Some(&status);
             let soon = h.said_at.is_none_or(|t| t.elapsed() >= STATUS_SOON);

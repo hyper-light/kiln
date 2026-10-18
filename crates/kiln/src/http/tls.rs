@@ -74,6 +74,11 @@ impl ClientTls {
 
     /// A fresh configuration for one connection (TLS 1.3 and 1.2, ALPN http/1.1).
     pub fn config(&self) -> anyhow::Result<ClientConfig> {
+        self.config_alpn(&[HTTP11])
+    }
+
+    /// [`Self::config`] asking for these protocols (ALPN), in order of preference.
+    pub fn config_alpn(&self, alpn: &[&[u8]]) -> anyhow::Result<ClientConfig> {
         let builder = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
             .context("protocol versions")?
@@ -84,7 +89,7 @@ impl ClientTls {
                 .context("client certificate and key")?,
             None => builder.with_no_client_auth(),
         };
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(config)
     }
 }
@@ -95,6 +100,11 @@ pub fn server_name(host: &str) -> anyhow::Result<ServerName<'static>> {
     let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     ServerName::try_from(bare.to_owned()).map_err(|_| anyhow::anyhow!("invalid TLS server name {host:?}"))
 }
+
+/// ALPN's name for HTTP/2.
+pub const H2: &[u8] = b"h2";
+/// ALPN's name for HTTP/1.1.
+pub const HTTP11: &[u8] = b"http/1.1";
 
 // ------------------------------------------------------------------------------- server side
 
@@ -149,12 +159,18 @@ impl ServerTls {
     /// A fresh configuration for one connection (TLS 1.3 and 1.2, ALPN http/1.1, no client
     /// certificates).
     pub fn config(&self) -> anyhow::Result<ServerConfig> {
+        self.config_alpn(&[HTTP11])
+    }
+
+    /// [`Self::config`] offering these protocols (ALPN), in order of preference: a client asking
+    /// for none of them is refused; one asking for none at all gets HTTP/1.1.
+    pub fn config_alpn(&self, alpn: &[&[u8]]) -> anyhow::Result<ServerConfig> {
         let mut config = ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
             .context("protocol versions")?
             .with_no_client_auth()
             .with_cert_resolver(Box::new(OneCertificate(Arc::clone(&self.key))));
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         Ok(config)
     }
 }
@@ -173,6 +189,7 @@ pub trait Side {
     fn wants_write(&self) -> bool;
     fn is_handshaking(&self) -> bool;
     fn send_close_notify(&mut self);
+    fn alpn_protocol(&self) -> Option<&[u8]>;
 }
 
 macro_rules! side {
@@ -202,6 +219,9 @@ macro_rules! side {
             }
             fn send_close_notify(&mut self) {
                 (**self).send_close_notify()
+            }
+            fn alpn_protocol(&self) -> Option<&[u8]> {
+                (**self).alpn_protocol()
             }
         }
     };
@@ -291,6 +311,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S, ServerConnection> {
     /// The name the client asked for (SNI), if it sent one.
     pub fn server_name(&self) -> Option<&str> {
         self.conn.server_name()
+    }
+}
+
+impl<S, C: Side> Stream<S, C> {
+    /// The protocol agreed in the handshake (ALPN), if any: [`H2`], [`HTTP11`].
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.conn.alpn_protocol()
     }
 }
 

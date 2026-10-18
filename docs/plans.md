@@ -73,7 +73,7 @@ A plan's written steps are `items` in the API: `[{title, description, examples, 
 | --- | --- | --- |
 | GET | `/api/plans` | every plan, newest change first |
 | POST | `/api/plans` | `{title?, body, tags?, source?}` |
-| GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, tags?}` |
+| GET / PATCH / DELETE | `/api/plans/:id` | one plan; `{title?, body?, items?, tags?}` (a title given empty is taken from the text, else the first step, as for a new plan) |
 | GET | `/api/plans/:id/versions` | every version, newest first |
 | POST | `/api/plans/:id/restore` | `{version}`: made current again, as a new version |
 | POST | `/api/plans/:id/run` | `{session}` or `{new: {target, kind, cwd?}}`, `mode`: `message` or `steps` |

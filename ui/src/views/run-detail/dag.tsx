@@ -1,7 +1,7 @@
 import * as React from "react";
 import type { Job } from "@/api/types";
 import { formatDuration, spanSeconds } from "@/lib/format";
-import { useNow } from "@/lib/hooks";
+import { useElementWidth, useNow } from "@/lib/hooks";
 import { StatusDot } from "@/components/ui/status";
 
 const NODE_W = 212;
@@ -127,12 +127,78 @@ export function groupMatrix(jobs: Job[]): { nodes: Job[]; groups: Map<string, Da
   return { nodes, groups };
 }
 
+/**
+ * The jobs and what each needs, read left to right. Where the graph doesn't fit the width it has (a
+ * phone, a long pipeline), its columns stack instead, one under the other: nothing scrolls sideways.
+ */
 export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: string | null; onSelect: (id: string) => void }) {
   const now = useNow();
+  const [ref, avail] = useElementWidth<HTMLDivElement>();
   const { nodes, groups } = React.useMemo(() => groupMatrix(jobs), [jobs]);
   const { placed, width, height } = React.useMemo(() => layoutDag(nodes), [nodes]);
   const pos = new Map(placed.map((p) => [p.job.key, p]));
   const gradId = React.useId().replace(/:/g, "");
+  const fits = avail === 0 || width <= avail;
+
+  const node = (job: Job, style?: React.CSSProperties) => {
+    const dur = spanSeconds(job.started_at, job.finished_at, now);
+    const group = groups.get(job.key);
+    const isSelected = group ? group.members.some((m) => m.id === selected) : selected === job.id;
+    // A group selects its most interesting leg: failing or running first.
+    const target = group ? ([...group.members].sort((a, b) => (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9))[0]?.id ?? job.id) : job.id;
+    const summary = group
+      ? Object.entries(group.counts)
+          .sort((a, b) => (STATUS_RANK[a[0]] ?? 9) - (STATUS_RANK[b[0]] ?? 9))
+          .map(([st, n]) => `${n} ${st.replace("_", " ")}`)
+          .join(" · ")
+      : null;
+    return (
+      <button
+        key={job.id}
+        type="button"
+        className="dag-node"
+        data-flow={style ? undefined : ""}
+        data-status={job.status}
+        data-selected={isSelected}
+        data-group={group ? "true" : undefined}
+        style={style}
+        onClick={() => onSelect(target)}
+        aria-pressed={isSelected}
+        aria-label={`${job.display}: ${job.status}`}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <StatusDot status={job.status} />
+          <span className="min-w-0 flex-1 truncate text-[12.5px] text-[#e4e5e7]">{job.display}</span>
+          {job.attempt > 1 && <span className="font-mono text-[9px] text-[#cbb69a]">×{job.attempt}</span>}
+        </span>
+        <span className="flex min-w-0 items-center gap-2 font-mono text-[10px] text-[#8c8f98]">
+          <span className={job.status === "running" ? "text-[#d8d0f2] tabular-nums" : "tabular-nums"}>{dur === null ? job.status.replace("_", " ") : formatDuration(dur)}</span>
+          {summary ? <span className="min-w-0 truncate">· {summary}</span> : job.agent && <span className="min-w-0 truncate">· {job.agent}</span>}
+          {job.executor && (
+            <span className="ml-auto shrink-0 rounded-full border border-white/10 px-1.5 text-[8.5px] tracking-[0.06em] text-[#a9acb5] uppercase">
+              {job.executor === "baremetal" ? "metal" : job.executor}
+            </span>
+          )}
+        </span>
+      </button>
+    );
+  };
+
+  if (!fits) {
+    const stages: Job[][] = [];
+    for (const p of placed) (stages[p.depth] ??= []).push(p.job);
+    return (
+      <div ref={ref} role="group" aria-label="Job dependency graph">
+        <ol className="dag-stages">
+          {stages.map((stage, i) => (
+            <li key={i} className="dag-stage">
+              {stage.map((j) => node(j))}
+            </li>
+          ))}
+        </ol>
+      </div>
+    );
+  }
 
   const edges: { d: string; active: boolean; key: string }[] = [];
   for (const p of placed) {
@@ -153,7 +219,7 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
   }
 
   return (
-    <div className="overflow-x-auto" role="group" aria-label="Job dependency graph">
+    <div ref={ref} role="group" aria-label="Job dependency graph">
       <div className="relative" style={{ width, height, minWidth: "100%" }}>
         <svg className="pointer-events-none absolute inset-0" width={width} height={height} aria-hidden="true">
           <defs>
@@ -173,50 +239,7 @@ export function JobDag({ jobs, selected, onSelect }: { jobs: Job[]; selected: st
             return m ? <circle key={`${e.key}-end`} cx={Number(m[1]) - 0.5} cy={Number(m[2])} r={2} fill={e.active ? "#bab0e3" : "#3b424e"} /> : null;
           })}
         </svg>
-        {placed.map(({ job, x, y }) => {
-          const dur = spanSeconds(job.started_at, job.finished_at, now);
-          const group = groups.get(job.key);
-          const isSelected = group ? group.members.some((m) => m.id === selected) : selected === job.id;
-          // A group selects its most interesting leg: failing or running first.
-          const target = group
-            ? ([...group.members].sort((a, b) => (STATUS_RANK[a.status] ?? 9) - (STATUS_RANK[b.status] ?? 9))[0]?.id ?? job.id)
-            : job.id;
-          const summary = group
-            ? Object.entries(group.counts)
-                .sort((a, b) => (STATUS_RANK[a[0]] ?? 9) - (STATUS_RANK[b[0]] ?? 9))
-                .map(([st, n]) => `${n} ${st.replace("_", " ")}`)
-                .join(" · ")
-            : null;
-          return (
-            <button
-              key={job.id}
-              type="button"
-              className="dag-node"
-              data-status={job.status}
-              data-selected={isSelected}
-              data-group={group ? "true" : undefined}
-              style={{ left: x, top: y, width: NODE_W, height: NODE_H }}
-              onClick={() => onSelect(target)}
-              aria-pressed={isSelected}
-              aria-label={`${job.display}: ${job.status}`}
-            >
-              <span className="flex min-w-0 items-center gap-2">
-                <StatusDot status={job.status} />
-                <span className="min-w-0 flex-1 truncate text-[12.5px] text-[#e4e5e7]">{job.display}</span>
-                {job.attempt > 1 && <span className="font-mono text-[9px] text-[#cbb69a]">×{job.attempt}</span>}
-              </span>
-              <span className="flex min-w-0 items-center gap-2 font-mono text-[10px] text-[#8c8f98]">
-                <span className={job.status === "running" ? "text-[#d8d0f2] tabular-nums" : "tabular-nums"}>{dur === null ? job.status.replace("_", " ") : formatDuration(dur)}</span>
-                {summary ? <span className="min-w-0 truncate">· {summary}</span> : job.agent && <span className="min-w-0 truncate">· {job.agent}</span>}
-                {job.executor && (
-                  <span className="ml-auto shrink-0 rounded-full border border-white/10 px-1.5 text-[8.5px] tracking-[0.06em] text-[#a9acb5] uppercase">
-                    {job.executor === "baremetal" ? "metal" : job.executor}
-                  </span>
-                )}
-              </span>
-            </button>
-          );
-        })}
+        {placed.map(({ job, x, y }) => node(job, { left: x, top: y, width: NODE_W, height: NODE_H }))}
       </div>
     </div>
   );

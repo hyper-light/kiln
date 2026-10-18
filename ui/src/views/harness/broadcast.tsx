@@ -11,8 +11,10 @@ import "./console.css";
 import { ArrowUp, ChevronRight, CornerDownLeft } from "lucide-react";
 import { harnessApi, type AgentInfo, type BroadcastBody, type BroadcastPreview, type BroadcastReport, type Command, type SendMode, type SlashCommand } from "@/api/harness";
 import { Button } from "@/components/ui/button";
+import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
+import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { CommandList, matchCommands, parseSlash } from "./palette";
 
@@ -31,7 +33,30 @@ interface Ask {
 /** Who the message goes to, in words: "2 selected", "5 shown", "all 7". */
 export type Reach = "selected" | "shown" | "all";
 
-export function MessageBar({ agents, reach, onEnded }: { agents: AgentInfo[]; reach: Reach; onEnded?: () => void }) {
+type BarProps = { agents: AgentInfo[]; reach: Reach; onEnded?: () => void };
+
+/** What the agents of a roster ("id:status,…") understand; nothing for no agents, or when it can't be said. */
+const previewOf = (roster: string): Promise<BroadcastPreview | null> =>
+  roster ? harnessApi.broadcastPreview({ ids: roster.split(",").map((r) => r.slice(0, r.lastIndexOf(":"))) }).catch(() => null) : Promise.resolve(null);
+
+export function MessageBar({ agents, reach, onEnded }: BarProps) {
+  // What they understand (commands, modes, models, efforts, and how many have each): again as
+  // the agents picked change, come or go. Meanwhile the bar keeps what it knew; before the first
+  // answer it shows as it does without one.
+  const roster = React.useDeferredValue(agents.map((a) => `${a.id}:${a.status}`).join(","));
+  return (
+    <Loadable label="Loading what the agents understand" fallback={<Bar agents={agents} reach={reach} onEnded={onEnded} preview={null} />}>
+      <Previewed roster={roster} agents={agents} reach={reach} onEnded={onEnded} />
+    </Loadable>
+  );
+}
+
+function Previewed({ roster, ...bar }: BarProps & { roster: string }) {
+  const { data } = useSuspenseResource(`harness/broadcast/${roster}`, () => previewOf(roster));
+  return <Bar {...bar} preview={data} />;
+}
+
+function Bar({ agents, reach, onEnded, preview }: BarProps & { preview: BroadcastPreview | null }) {
   const [text, setText] = React.useState("");
   const [mode, setMode] = React.useState<SendMode>("queue");
   const [picked, setPicked] = React.useState("");
@@ -39,40 +64,19 @@ export function MessageBar({ agents, reach, onEnded }: { agents: AgentInfo[]; re
   const [busy, setBusy] = React.useState(false);
   const [report, setReport] = React.useState<BroadcastReport | null>(null);
   const [reportOpen, setReportOpen] = React.useState(false);
-  const [preview, setPreview] = React.useState<BroadcastPreview | null>(null);
   const [index, setIndex] = React.useState(0);
   const [focused, setFocused] = React.useState(false);
   const roomy = useMediaQuery("(min-width: 640px)");
 
   const ids = agents.map((a) => a.id);
   const key = ids.join(",");
-  // What they understand (commands, modes, models, efforts, and how many have each): again as
-  // the agents picked change, come or go.
-  const roster = agents.map((a) => `${a.id}:${a.status}`).join(",");
-  React.useEffect(() => {
-    if (!key) {
-      setPreview(null);
-      return;
-    }
-    let stop = false;
-    const t = window.setTimeout(() => {
-      harnessApi.broadcastPreview({ ids: key.split(",") }).then(
-        (p) => {
-          if (!stop) setPreview(p);
-        },
-        () => undefined,
-      );
-    }, 150);
-    return () => {
-      stop = true;
-      window.clearTimeout(t);
-    };
-  }, [key, roster]);
   // A different set of agents: whatever was being asked is for the old one.
-  React.useEffect(() => {
+  const [askedOf, setAskedOf] = React.useState(key);
+  if (askedOf !== key) {
+    setAskedOf(key);
     setAsk(null);
     setPicked("");
-  }, [key]);
+  }
 
   const n = agents.length;
   const who = reach === "selected" ? `${n} selected` : reach === "shown" ? `${n} shown` : n === 1 ? "the one agent" : `all ${n}`;

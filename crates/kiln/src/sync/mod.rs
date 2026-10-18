@@ -11,10 +11,14 @@
 
 pub mod blobs;
 pub mod disk;
+pub mod git;
 pub mod group;
+pub mod places;
+pub mod repos;
 pub mod runner;
 pub mod scan;
 pub mod server;
+pub mod tasks;
 pub mod wire;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -145,6 +149,10 @@ pub struct State {
     /// Steps proposed here that the log hasn't brought back, oldest first: sent again until it does.
     #[serde(default)]
     pub sent: Vec<Step>,
+    /// A folder kiln just cloned for this copy takes the group's files once the log has brought it
+    /// through this index ([`Copy::adopt`]); none once it has, or for a copy that joined as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt: Option<u64>,
 }
 
 /// What applying a change did here.
@@ -260,6 +268,9 @@ impl Copy {
     /// steps for the log, numbered on from the last this member sent, each of at most
     /// [`STEP_CHANGES`] changes, with the new contents put in `blobs`. Empty: nothing changed.
     pub fn propose(&mut self, blobs: &Blobs, at: i64) -> io::Result<Vec<Step>> {
+        if self.adopting() {
+            return Ok(Vec::new());
+        }
         let (found, skipped) = scan::scan(&self.root, &self.state.seen, &self.limits)?;
         self.skipped = skipped;
         let mut paths: BTreeSet<String> = found.keys().cloned().collect();
@@ -300,6 +311,46 @@ impl Copy {
             steps.push(step);
         }
         Ok(steps)
+    }
+
+    /// Starts this copy as a folder kiln just cloned to join the group, rather than one whose files
+    /// meet the others': what it holds now counts as in step, so the log's version of each file
+    /// replaces it as the log brings it, and it proposes nothing until [`Copy::adopted`] (`at`: the
+    /// log index it takes the group's files through). A clone of the source's commit then becomes
+    /// the source's working tree, uncommitted work and all, with no conflict copies.
+    pub fn adopt(&mut self, at: u64) -> io::Result<()> {
+        let (found, skipped) = scan::scan(&self.root, &BTreeMap::new(), &self.limits)?;
+        self.skipped = skipped;
+        self.state.synced = found.iter().map(|(p, e)| (p.clone(), e.version.clone())).collect();
+        self.state.seen = found;
+        self.state.adopt = Some(at);
+        Ok(())
+    }
+
+    /// Whether this copy waits to take the group's files and proposes nothing meanwhile.
+    pub fn adopting(&self) -> bool {
+        self.state.adopt.is_some()
+    }
+
+    /// The log has brought this adopting copy through its index: each file it had that the log
+    /// doesn't goes, unless it changed here since (then it is proposed like any change), and from
+    /// now on it syncs as any copy does. A log holding no file at all deletes nothing: that is no
+    /// source a clone was made from.
+    pub fn adopted(&mut self, blobs: &Blobs) -> io::Result<Vec<Outcome>> {
+        let mut out = Vec::new();
+        if !self.state.tree.files.is_empty() {
+            let extra: Vec<(String, Version)> = self.state.synced.iter().filter(|(p, _)| !self.state.tree.files.contains_key(*p)).map(|(p, v)| (p.clone(), v.clone())).collect();
+            for (path, v) in extra {
+                if self.parents_real(&path) && self.now(&path)? == Some(v) {
+                    self.write(&path, None, blobs)?;
+                    out.push(Outcome::Applied { path: path.clone() });
+                }
+                self.state.synced.remove(&path);
+                self.state.seen.remove(&path);
+            }
+        }
+        self.state.adopt = None;
+        Ok(out)
     }
 
     /// The number of this member's next step: one past what it sent, or past what the log took
@@ -675,6 +726,65 @@ mod tests {
         let mode = std::fs::metadata(t.b.root.join("run.sh"))?.permissions().mode();
         assert!(mode & 0o111 != 0, "{mode:o}");
         assert_eq!(std::fs::read_link(t.b.root.join("go"))?, PathBuf::from("run.sh"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_fresh_clone_takes_the_source_s_working_tree_without_conflict_copies() -> anyhow::Result<()> {
+        let mut t = Two::new()?;
+        // The commit both have; the source has since edited one file, added one and deleted one,
+        // none of it committed.
+        for c in [&t.a, &t.b] {
+            for (p, body) in [("a.txt", "committed"), ("gone.txt", "committed"), ("same.txt", "same")] {
+                Two::write(c, p, body)?;
+            }
+        }
+        Two::write(&t.a, "a.txt", "an edit not committed")?;
+        Two::write(&t.a, "src/new.txt", "untracked")?;
+        std::fs::remove_file(t.a.root.join("gone.txt"))?;
+        t.propose('a', 1_000)?;
+        // The clone joins, to take the group's files through the log as it is now.
+        t.b.adopt(u64::try_from(t.log.len())?)?;
+        assert!(t.b.adopting());
+        t.propose('b', 1_500)?;
+        assert_eq!(t.log.len(), 1, "an adopting copy proposes nothing");
+        let outcomes = t.sync()?;
+        assert!(!outcomes.iter().any(|o| matches!(o, Outcome::Conflict { .. } | Outcome::Kept { .. })), "{outcomes:?}");
+        t.b.adopted(&t.blobs)?;
+        assert!(!t.b.adopting());
+        assert_eq!(Two::files(&t.a)?, Two::files(&t.b)?, "the clone is the source's working tree");
+        assert_eq!(Two::read(&t.b, "a.txt").as_deref(), Some("an edit not committed"));
+        assert_eq!(Two::read(&t.b, "gone.txt"), None, "what the source deleted goes from the clone");
+        assert!(group::conflicts(&t.b.state.tree).is_empty());
+        // In step: neither has anything to say, and a change on the clone reaches the source.
+        t.propose('a', 2_000)?;
+        t.propose('b', 2_000)?;
+        assert_eq!(t.log.len(), 1);
+        Two::write(&t.b, "a.txt", "edited on the clone")?;
+        t.propose('b', 3_000)?;
+        t.sync()?;
+        assert_eq!(Two::read(&t.a, "a.txt").as_deref(), Some("edited on the clone"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_adopting_copy_keeps_what_changed_on_it_meanwhile() -> anyhow::Result<()> {
+        let mut t = Two::new()?;
+        for c in [&t.a, &t.b] {
+            Two::write(c, "old.txt", "committed")?;
+        }
+        std::fs::remove_file(t.a.root.join("old.txt"))?;
+        Two::write(&t.a, "kept.txt", "source")?;
+        t.propose('a', 1_000)?;
+        t.b.adopt(1)?;
+        // Someone edits the clone's old.txt before it has caught up: not the clone's file any more.
+        Two::write(&t.b, "old.txt", "edited while adopting")?;
+        t.sync()?;
+        t.b.adopted(&t.blobs)?;
+        assert_eq!(Two::read(&t.b, "old.txt").as_deref(), Some("edited while adopting"), "an edit is never deleted");
+        t.propose('b', 2_000)?;
+        t.sync()?;
+        assert_eq!(Two::read(&t.a, "old.txt").as_deref(), Some("edited while adopting"), "it is proposed like any change");
         Ok(())
     }
 

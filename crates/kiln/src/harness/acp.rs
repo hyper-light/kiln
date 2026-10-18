@@ -264,7 +264,7 @@ impl Acp {
                     self.request(core, Pending::SetMode(mode.clone()), "session/set_mode", json!({"sessionId": s, "modeId": mode}));
                 }
             }
-            Command::SetModel { model } => {
+            Command::SetModel { model, .. } => {
                 if let Some(s) = self.session.clone() {
                     self.request(core, Pending::SetModel(model.clone()), "session/set_model", json!({"sessionId": s, "modelId": model}));
                 }
@@ -547,7 +547,7 @@ impl Acp {
                             ms.iter()
                                 .filter_map(|m| {
                                     let id = m.get("modelId")?.as_str()?.to_owned();
-                                    Some(ModelOption { label: m.get("name").and_then(Value::as_str).unwrap_or(&id).to_owned(), description: m.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), id })
+                                    Some(ModelOption { label: m.get("name").and_then(Value::as_str).unwrap_or(&id).to_owned(), description: m.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), id, efforts: Vec::new() })
                                 })
                                 .collect()
                         })

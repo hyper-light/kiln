@@ -6,14 +6,16 @@
  * transcript, to read in place.
  */
 import * as React from "react";
-import { Link, Navigate, useLocation, useNavigate, useSearchParams } from "react-router";
+import { Link, Navigate, useLocation, useNavigate, useSearchParams } from "@/lib/router";
 import { ChevronRight, SquareTerminal } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi } from "@/api/harness";
 import type { AiSession, AiTranscriptEntry } from "@/api/types";
 import { Button } from "@/components/ui/button";
+import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
+import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 import { tildify } from "./derive";
 import { Ago, HarnessMark } from "./parts";
@@ -83,58 +85,65 @@ function Confirm({ s, onCancel }: { s: AiSession; onCancel: () => void }) {
   );
 }
 
-/** Its transcript, read in the row (refetched whenever the machine reports activity). */
+/** Its transcript, read in the row (read again whenever the machine reports activity). */
 function Transcript({ s }: { s: AiSession }) {
-  const [entries, setEntries] = React.useState<AiTranscriptEntry[] | null>(null);
-  const [err, setErr] = React.useState<string | null>(null);
-  const log = React.useRef<HTMLDivElement>(null);
-  const atBottom = React.useRef(true);
-  const { machine, pid, last_activity: activity, transcript } = s;
-  React.useEffect(() => {
-    if (!transcript) return;
-    const ctl = new AbortController();
-    api
-      .aiTranscript(machine, pid, ctl.signal)
-      .then((e) => {
-        setEntries(e);
-        setErr(null);
-      })
-      .catch((e: unknown) => !ctl.signal.aborted && setErr(errorMessage(e)));
-    return () => ctl.abort();
-  }, [machine, pid, activity, transcript]);
-  // Follow new messages unless the reader scrolled up.
-  React.useLayoutEffect(() => {
-    const el = log.current;
-    if (el && atBottom.current) el.scrollTop = el.scrollHeight;
-  }, [entries]);
   const facts = [toolLabel(s.tool), s.model, s.branch && `on ${s.branch}`, tildify(s.cwd), `pid ${s.pid}`].filter(Boolean).join(" · ");
   return (
     <div className="ms-watch">
       <p className="ms-watch-facts">{facts}</p>
-      {!transcript ? (
+      {!s.transcript ? (
         <p className="ms-watch-note">Its transcript can't be read from here.</p>
-      ) : err ? (
-        <p className="ms-watch-note">{err}</p>
-      ) : !entries ? (
-        <p className="ms-watch-note">Reading its transcript…</p>
-      ) : entries.length === 0 ? (
-        <p className="ms-watch-note">Nothing said yet.</p>
       ) : (
-        <div
-          ref={log}
-          className="ms-watch-log"
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-          }}
-        >
-          {entries.map((e, i) => (
-            <p key={i} className="ms-entry" data-role={e.role}>
-              {e.text}
-            </p>
-          ))}
-        </div>
+        <Loadable label="Loading its transcript" fallback={<p className="ms-watch-note">Reading its transcript…</p>}>
+          <Log machine={s.machine} pid={s.pid} />
+        </Loadable>
       )}
+    </div>
+  );
+}
+
+/** The transcript's messages, or why they can't be read. */
+function Log({ machine, pid }: { machine: string; pid: number }) {
+  const atBottom = React.useRef(true);
+  const { entries, err } = useSuspenseResource(
+    `ai/transcript/${machine}/${pid}`,
+    (signal) =>
+      api.aiTranscript(machine, pid, signal).then(
+        (entries): { entries: AiTranscriptEntry[]; err: string | null } => ({ entries, err: null }),
+        (e: unknown) => ({ entries: [], err: errorMessage(e) }),
+      ),
+    // A machine reports its sessions when one of them changes (its last activity among them).
+    { on: ["ai_sessions"] },
+  ).data;
+  // Follow new messages unless the reader scrolled up: at once, and whenever the log changes.
+  const follow = React.useCallback((log: HTMLDivElement | null) => {
+    if (!log) return;
+    const end = () => {
+      if (atBottom.current) log.scrollTop = log.scrollHeight;
+    };
+    end();
+    const changes = new MutationObserver(end);
+    changes.observe(log, { subtree: true, childList: true, characterData: true });
+    return () => changes.disconnect();
+  }, []);
+  return err ? (
+    <p className="ms-watch-note">{err}</p>
+  ) : entries.length === 0 ? (
+    <p className="ms-watch-note">Nothing said yet.</p>
+  ) : (
+    <div
+      ref={follow}
+      className="ms-watch-log"
+      onScroll={(e) => {
+        const el = e.currentTarget;
+        atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+      }}
+    >
+      {entries.map((e, i) => (
+        <p key={i} className="ms-entry" data-role={e.role}>
+          {e.text}
+        </p>
+      ))}
     </div>
   );
 }
@@ -145,10 +154,13 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
   const [reading, setReading] = React.useState(focused);
   const [confirming, setConfirming] = React.useState(false);
   const [forking, setForking] = React.useState(false);
-  const ref = React.useRef<HTMLLIElement>(null);
-  React.useEffect(() => {
-    if (focused) ref.current?.scrollIntoView({ block: "center" });
-  }, [focused]);
+  // The session a link points at comes into view (again if the link changes to it).
+  const reveal = React.useCallback(
+    (li: HTMLLIElement | null) => {
+      if (li && focused) li.scrollIntoView({ block: "center" });
+    },
+    [focused],
+  );
   const stand = standOf(s);
   const title = s.title || s.name || toolLabel(s.tool);
   const can = abilities(s);
@@ -164,7 +176,7 @@ const Row = React.memo(function Row({ s, focused }: { s: AiSession; focused: boo
     }
   };
   return (
-    <li ref={ref} className="ms-row ms-found-row" data-stand={stand}>
+    <li ref={reveal} className="ms-row ms-found-row" data-stand={stand}>
       <span className="ms-mark" title={toolLabel(s.tool)}>
         <HarnessMark kind={s.tool} size={16} />
       </span>
@@ -227,14 +239,23 @@ export function FoundSessions({ sessions, quiet }: { sessions: AiSession[]; quie
   const { hash } = useLocation();
   const focus = params.get("session");
   const [open, setOpen] = useLocalStorage<boolean>("kiln.agents.showFound", true);
-  const ref = React.useRef<HTMLElement>(null);
   const shown = open || Boolean(focus);
-  React.useEffect(() => {
-    if (hash === "#found" && !focus) ref.current?.scrollIntoView({ block: "start" });
-  }, [hash, focus]);
-  if (sessions.length === 0 && quiet.length === 0) return null;
+  const there = sessions.length > 0 || quiet.length > 0;
+  // At #found (where the old page's links go) the section scrolls into view, once, if it's here as
+  // the page opens or the address changes; not when it turns up later.
+  const [at, setAt] = React.useState({ hash, focus, there });
+  if (at.hash !== hash || at.focus !== focus) setAt({ hash, focus, there });
+  const reveal = React.useMemo(() => {
+    let due = at.there && at.hash === "#found" && !at.focus;
+    return (section: HTMLElement | null) => {
+      if (!section || !due) return;
+      due = false;
+      section.scrollIntoView({ block: "start" });
+    };
+  }, [at]);
+  if (!there) return null;
   return (
-    <section ref={ref} id="found" className="ms-found">
+    <section ref={reveal} id="found" className="ms-found">
       <div className="ms-fold">
         <button type="button" className="ms-fold-btn" aria-expanded={shown} onClick={() => setOpen(!shown)}>
           <ChevronRight size={13} className="ms-chev" aria-hidden="true" />

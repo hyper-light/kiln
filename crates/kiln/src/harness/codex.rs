@@ -82,6 +82,8 @@ enum Pending {
     McpAdded { name: String, client: Option<String> },
     /// thread/goal/get or set: the goal, shown to `client`.
     Goal(String),
+    /// thread/inject_items: a conversation carried over from another harness, into the new thread.
+    Inject,
 }
 
 /// A run of the CLI (or a fetch) kiln is waiting on.
@@ -217,6 +219,11 @@ pub struct Codex {
     reopen: bool,
     /// Settings changed outside it (its own screen): it starts again to load them once idle.
     reload: Option<String>,
+    /// A conversation carried over from another harness (Responses items), put into the new
+    /// thread before its first turn; whether it is in, and while it goes in.
+    seed: Option<Vec<Value>>,
+    seeded: bool,
+    injecting: bool,
 }
 
 impl Codex {
@@ -274,7 +281,21 @@ impl Codex {
             open_tries: 0,
             reopen: false,
             reload: None,
+            seed: None,
+            seeded: false,
+            injecting: false,
         }
+    }
+
+    /// Start the new thread with this conversation (one carried over from another harness).
+    pub fn seed(&mut self, items: Vec<Value>) {
+        self.seeded = items.is_empty();
+        self.seed = (!items.is_empty()).then_some(items);
+    }
+
+    /// The conversation it was given is in its thread (or it was given none).
+    pub fn seeded(&self) -> bool {
+        self.seeded || (self.seed.is_none() && !self.injecting)
     }
 
     /// The approval policy, sandbox (thread) and sandbox policy (turn) in force.
@@ -467,7 +488,7 @@ impl Codex {
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.turn.is_some() || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
+        self.injecting || self.turn.is_some() || !core.state.approvals.is_empty() || self.pending.values().any(|p| matches!(p, Pending::Turn(_)))
     }
 
     /// Start again with the changed settings (resuming the thread), unless a turn is under way or
@@ -505,7 +526,7 @@ impl Codex {
         }
         // Full access is always a choice; choosing it allows it.
         core.meta.modes = modes(true);
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides"]
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "file_suggestions", "resume", "attachments", "images", "overrides", "switch_harness"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -600,7 +621,7 @@ impl Codex {
                     self.notice(core, Level::Warn, format!("{mode}: not a mode this session offers"));
                 }
             }
-            Command::SetModel { model } => {
+            Command::SetModel { model, .. } => {
                 self.model = Some(model.clone()).filter(|m| !m.is_empty());
                 core.state.model = model;
                 core.touch_state();
@@ -1124,7 +1145,7 @@ impl Codex {
 
     /// Between turns: the next waiting message, then kiln's queue.
     fn next(&mut self, core: &mut Core) {
-        if self.busy(core) || core.state.status == Status::Exited {
+        if core.hold || self.busy(core) || core.state.status == Status::Exited {
             return;
         }
         // No turn to steer into: what was to be steered goes out in order.
@@ -1305,6 +1326,11 @@ impl Codex {
                     self.ask_mcp(core);
                 }
                 Pending::Revert(_) => self.notice(core, Level::Warn, format!("Could not rewind: {msg}")),
+                Pending::Inject => {
+                    self.injecting = false;
+                    self.notice(core, Level::Error, format!("Codex did not take the conversation carried over: {msg}"));
+                    self.ready(core);
+                }
                 Pending::Plain(what) => self.notice(core, Level::Warn, format!("{what}: {msg}")),
                 Pending::Initialize => self.notice(core, Level::Error, format!("Codex did not start: {msg}")),
             }
@@ -1380,6 +1406,15 @@ impl Codex {
                 }
                 if let Some(n) = thread.get("name").and_then(Value::as_str) {
                     core.state.title = n.to_owned();
+                }
+                // A new thread that goes on with a conversation from another harness: it goes in
+                // first (the session is ready once it is).
+                if let (Some(items), Some(id)) = (self.seed.take(), thread.get("id").and_then(Value::as_str)) {
+                    self.injecting = true;
+                    let id = id.to_owned();
+                    self.request(core, Pending::Inject, "thread/inject_items", json!({"threadId": id, "items": items}));
+                    self.settle(core);
+                    return;
                 }
                 // A resumed thread's history: inline from a Codex that still sends it so, else
                 // its latest turns, listed (the session is ready once they are in).
@@ -1457,6 +1492,11 @@ impl Codex {
                                     id: m.get("model").or_else(|| m.get("id")).and_then(Value::as_str)?.to_owned(),
                                     label: m.get("displayName").and_then(Value::as_str).unwrap_or("").to_owned(),
                                     description: m.get("description").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                    efforts: m
+                                        .get("supportedReasoningEfforts")
+                                        .and_then(Value::as_array)
+                                        .map(|l| l.iter().filter_map(|e| e.get("reasoningEffort").and_then(Value::as_str).or_else(|| e.as_str()).map(str::to_owned)).collect())
+                                        .unwrap_or_default(),
                                 })
                             })
                             .collect()
@@ -1640,6 +1680,11 @@ impl Codex {
                     }
                 }
                 self.compose_mcp(core);
+            }
+            Pending::Inject => {
+                self.injecting = false;
+                self.seeded = true;
+                self.ready(core);
             }
             Pending::Revert(ev) => {
                 // Those turns are gone: so is their part of the timeline.
@@ -2288,12 +2333,19 @@ impl Codex {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .or_else(|| item.get("result").map(|r| clip_middle(&r.to_string(), OUTPUT_MAX).0));
+                let reach = crate::reach::describe(server, tool_name, item.get("arguments").unwrap_or(&Value::Null));
+                // A command run on another runner (kiln reach): its output and exit code.
+                let shown = item.get("result").and_then(|r| crate::reach::shown(&format!("mcp__{server}__{tool_name}"), r));
+                let output = match &shown {
+                    Some(s) => Some(clip_middle(&s.output, OUTPUT_MAX).0),
+                    None => output,
+                };
                 let call = ToolCall {
                     tool_id: id.clone(),
                     name: format!("mcp__{server}__{tool_name}"),
-                    tool: if ty == "mcpToolCall" { ToolKind::Mcp } else { ToolKind::Other },
-                    title: if server.is_empty() { tool_name.to_owned() } else { format!("{server} · {tool_name}") },
-                    detail: None,
+                    tool: reach.as_ref().map(|r| r.0).unwrap_or(if ty == "mcpToolCall" { ToolKind::Mcp } else { ToolKind::Other }),
+                    title: reach.as_ref().map(|r| r.1.clone()).unwrap_or_else(|| if server.is_empty() { tool_name.to_owned() } else { format!("{server} · {tool_name}") }),
+                    detail: shown.as_ref().and_then(|s| s.runner.as_ref()).map(|r| format!("on {r}")).or_else(|| reach.and_then(|r| r.2)),
                     input: clip_json(item.get("arguments").unwrap_or(&Value::Null), 16 * 1024),
                     status,
                     output,
@@ -2301,7 +2353,7 @@ impl Codex {
                     diffs: Vec::new(),
                     todos: Vec::new(),
                     task: None,
-                    exit_code: None,
+                    exit_code: shown.as_ref().and_then(|s| s.exit_code),
                     started: started_of(core, &id),
                     ended: done.then(Core::now),
                     server: None,
@@ -3346,7 +3398,7 @@ mod tests {
         assert_eq!(ids(&core), ["minimal", "low", "medium", "high"]);
         assert_eq!(core.state.effort, "medium");
         // A model model/list does not name: the default model's levels.
-        c.command(&mut core, Command::SetModel { model: "custom-model".into() });
+        c.command(&mut core, Command::SetModel { model: "custom-model".into(), kind: None });
         c.command(&mut core, Command::Control { id: "reasoning_summary".into(), value: Some(json!("auto")) });
         assert_eq!(ids(&core).len(), 4);
         // Effort and model for the session, and for one message.
