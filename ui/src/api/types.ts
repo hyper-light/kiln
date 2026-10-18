@@ -605,6 +605,9 @@ export type UpdatePolicy = "auto" | "notify" | "off";
 export interface RunnerUpdate {
   name: string;
   policy: UpdatePolicy;
+  /** Its machine refuses upgrades (its own kiln config: `[updates] accept = false`): never upgraded,
+   * whatever its policy here. */
+  locked: boolean;
   /** Where the build it would get comes from ("built by release run #141", "built by a Mac", ...). */
   from: string | null;
   hostname: string;

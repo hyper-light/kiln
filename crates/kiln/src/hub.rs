@@ -556,7 +556,7 @@ impl Hub {
         sent
     }
 
-    async fn send_peer(&self, peer: PeerId, msg: &ServerMsg) {
+    pub(crate) async fn send_peer(&self, peer: PeerId, msg: &ServerMsg) {
         if let Ok(b) = proto::encode(msg) {
             self.net.send(peer, LANE_CONTROL, Kind::Control, b).await;
         }
@@ -901,6 +901,11 @@ impl Hub {
                 }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
+            }
+            AgentMsg::UpdatePrefs { accept } => {
+                self.updates.fleet.set_accept(&agent, accept);
+                self.updates.fleet.wake();
+                self.emit(&serde_json::json!({ "type": "updates" }));
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,

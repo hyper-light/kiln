@@ -946,6 +946,9 @@ pub struct RunnerInfo {
     pub terminal: bool,
     /// What it does with a newer kiln, as chosen for it.
     pub policy: Policy,
+    /// Its machine refuses upgrades (its own kiln config: `[updates] accept = false`): it is never
+    /// upgraded, whatever its policy here.
+    pub locked: bool,
     /// Where the build it would get comes from ("this server's own build", "built by release run
     /// #141", "built by adas-macbook", ...), when there is one.
     pub from: Option<String>,
@@ -1043,6 +1046,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 method: if newest.is_some_and(|i| i.can_upgrade) { "native" } else { "terminal" },
                 terminal: a.terminal,
                 policy: Policy::default(),
+                locked: false,
                 from: None,
                 target,
                 target_build,
@@ -1067,6 +1071,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
     let newest = hub.updates.fleet.target();
     for r in &mut out {
         r.policy = policy(hub, &r.name).await;
+        r.locked = hub.updates.fleet.refuses(&r.name);
         r.commit = crate::fleet::runner_commit(hub, &r.name, r.build.as_deref());
         r.checkout = crate::fleet::reported(hub, &r.name).and_then(|k| k.checkout);
         let Some(t) = &newest else { continue };
@@ -1096,6 +1101,7 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job
     }
     let r = runners(hub).await.into_iter().find(|r| r.name == machine).ok_or_else(|| anyhow::anyhow!("there is no runner called {machine}"))?;
     anyhow::ensure!(r.policy != Policy::Off, "updates are off for {machine}: turn them on to upgrade it");
+    anyhow::ensure!(!r.locked, "{machine} refuses upgrades: its own kiln config says [updates] accept = false");
     anyhow::ensure!(r.connected, "{machine} is not connected");
     if let Some(t) = hub.updates.fleet.target() {
         anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
@@ -1437,7 +1443,7 @@ pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     let mut out = Vec::new();
     for r in runners(hub).await {
         // Runners whose updates are off are left alone, with the others too.
-        if r.policy != Policy::Off && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
+        if r.policy != Policy::Off && !r.locked && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
             out.push(upgrade_runner(hub, &r.name).await.map_err(|e| format!("{}: {e:#}", r.name)));
         }
     }
@@ -1839,6 +1845,7 @@ pub fn kiln_checkout() -> Option<PathBuf> {
 
 /// Everything this build's runner can do ([`AgentMsg::Build`]).
 pub const RUNNER_CAPS: u32 = CAP_UPGRADE
+    | crate::proto::CAP_UPDATES
     | crate::proto::CAP_FACTS
     | crate::proto::CAP_TAKEOVER
     | crate::proto::CAP_DIRS

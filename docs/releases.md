@@ -36,6 +36,26 @@ runner, any selection of them, or all:
 - **Off**: left alone. It isn't upgraded, on its own or with *Upgrade all*, until its policy
   changes.
 
+A machine can also refuse upgrades itself, whatever the server says: `[updates] accept = false` in
+its own kiln config (`kiln config set updates.accept false`). Its runner refuses every upgrade
+from then on, and tells its server within a minute, which shows it as *off on the machine*; no
+restart is needed. Every runner is also told when a newer kiln is available for it, and where
+its build comes from: it logs it, and keeps it in `update-available.json` in its state directory.
+
+From the command line:
+
+```sh
+kiln updates                                  # every runner: what it runs, its updates, what's next
+kiln updates policy off --all                 # or: automatic | notify, for runners named
+kiln updates policy automatic build-box-1 build-box-2
+kiln updates upgrade build-box-1              # now (or --all; runners with updates off are left alone)
+kiln updates build                            # build every platform of the server's commit
+kiln config set updates.accept false          # this machine refuses upgrades (kiln config get/unset/show/path)
+```
+
+`kiln config` changes this machine's kiln config file in place, keeping its comments, and refuses
+a change kiln couldn't read (an unknown key, a wrong type) before writing anything.
+
 `PUT /api/updates/runners/{name}` with `{"policy": "auto" | "notify" | "off"}` sets one;
 `PUT /api/updates/policy` with `{"policy": …, "runners": [...]}` (or `"all": true`) sets many.
 `[updates] follow = false` still turns automatic upgrades off for every runner. The server exports

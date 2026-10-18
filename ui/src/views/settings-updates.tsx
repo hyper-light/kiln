@@ -235,7 +235,7 @@ export function UpdatesPanel() {
   };
 
   // Runners on a branch or a local build run it on purpose: "Upgrade all" leaves them be.
-  const outdated = data.runners.filter((r) => r.connected && !r.up_to_date && r.how !== "left" && r.how !== "wait" && r.policy !== "off");
+  const outdated = data.runners.filter((r) => r.connected && !r.up_to_date && r.how !== "left" && r.how !== "wait" && r.policy !== "off" && !r.locked);
   const byPolicy = (p: UpdatePolicy) => data.runners.filter((r) => r.policy === p).length;
   const newest = data.newest ?? null;
   const current = data.runners.filter((r) => r.up_to_date).length;
@@ -595,13 +595,17 @@ function RunnerRow({
           </span>
         )}
         <div className="upd-actions">
-          <SelectField label={`Updates for ${r.name}`} hideLabel value={r.policy} onChange={(v) => onPolicy(v as UpdatePolicy)} options={POLICIES} className="upd-select upd-policy" />
+          {r.locked ? (
+            <span className="upd-sub">Updates off on the machine</span>
+          ) : (
+            <SelectField label={`Updates for ${r.name}`} hideLabel value={r.policy} onChange={(v) => onPolicy(v as UpdatePolicy)} options={POLICIES} className="upd-select upd-policy" />
+          )}
           {missing && (
             <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
               <Upload /> {uploading === r.target ? "Uploading…" : `Upload ${r.target}`}
             </Button>
           )}
-          {r.connected && !r.up_to_date && !plan && r.how !== "wait" && r.how !== "upgrading" && r.policy !== "off" && (
+          {r.connected && !r.up_to_date && !plan && r.how !== "wait" && r.how !== "upgrading" && r.policy !== "off" && !r.locked && (
             <Button size="xs" variant="secondary" disabled={job?.state === "running" || ((r.method === "terminal" || r.how === "build") && !r.terminal)} onClick={onUpgrade}>
               {r.how === "build" ? "Build and upgrade" : "Upgrade"}
             </Button>

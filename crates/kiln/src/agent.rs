@@ -51,6 +51,9 @@ pub struct Opts {
     /// A runner process beside the machine's usual one (`kiln install --agent --upgrade`): its
     /// own certificate and files under `<state>/instances/<id>` (see `crate::upgrade`).
     pub instance: Option<String>,
+    /// The config file it was started with: `[updates] accept` is read from it as it changes
+    /// (`None`: it takes upgrades).
+    pub config: Option<PathBuf>,
     /// Reach (`crate::reach`): None leaves it off (the server's own in-process agent); otherwise
     /// whether this runner takes commands from other runners (it can always send them).
     pub reach: Option<bool>,
@@ -379,6 +382,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
     }
     let mut harness_wait: Option<Instant> = None;
+    // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
+    let mut accept_said: Option<bool> = None;
+    let mut noticed: Option<String> = None;
     // The harnesses this machine offers, as last reported (rechecked every minute or so).
     let mut harness_kinds_sent: Option<String> = None;
     let mut harness_kinds_tick: u32 = 0;
@@ -546,6 +552,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     && let Ok(b) = proto::encode(&crate::updates::runner_facts())
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
+                // Whether this machine takes upgrades (an older server skips it).
+                if !o.ephemeral && !o.outpost {
+                    let accept = takes_updates(&o);
+                    if let Ok(b) = proto::encode(&AgentMsg::UpdatePrefs { accept }) {
+                        net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    }
+                    accept_said = Some(accept);
                 }
                 // Its reach identity, after Hello (an older server skips it).
                 if let Some(r) = &reach
@@ -868,6 +882,23 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let error = Some("an outpost isn't installed, so the server doesn't upgrade it".to_owned());
                         uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error }).await;
                     }
+                    ServerMsg::Upgrade { job, path, sha256, size } if !takes_updates(&o) => {
+                        let _ = (path, sha256, size);
+                        tracing::info!(%job, "an upgrade refused: this machine's kiln config says [updates] accept = false");
+                        let error = Some("this machine refuses upgrades: its kiln config says [updates] accept = false".to_owned());
+                        uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error }).await;
+                    }
+                    ServerMsg::UpdateAvailable { commit, build, from } => {
+                        if noticed.as_deref() != Some(commit.as_str()) {
+                            let how = if takes_updates(&o) { "the server upgrades it as its policy there says" } else { "this machine refuses upgrades ([updates] accept = false)" };
+                            tracing::info!(commit = %commit, build = %build, from = %from, "a newer kiln is available for this runner: {how}");
+                            let note = serde_json::json!({ "commit": commit, "build": build, "from": from, "at": crate::util::now_unix() });
+                            if let Err(e) = crate::util::write_secret(&own_dir.join("update-available.json"), note.to_string().as_bytes(), 0o644) {
+                                tracing::debug!(error = %e, "couldn't note the newer kiln");
+                            }
+                            noticed = Some(commit);
+                        }
+                    }
                     ServerMsg::Upgrade { job, path, sha256, size } => {
                         // Fetch the new binary from the server and install it beside or over this
                         // runner (`install --agent --upgrade`); nothing running here is stopped.
@@ -1158,6 +1189,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     let free = if upgrade_pending { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
+                    // Its machine's say on upgrades, read again: a change goes to the server at once.
+                    if !o.ephemeral && !o.outpost {
+                        let accept = takes_updates(&o);
+                        if accept_said != Some(accept) {
+                            uplink.msg(AgentMsg::UpdatePrefs { accept }).await;
+                            accept_said = Some(accept);
+                        }
+                    }
                 }
             }
             Ev::Sample => {
@@ -1315,6 +1354,12 @@ struct HandedTerm {
     handover: crate::terminal::Handover,
     /// Bytes that rebuild the session's screen and scrollback in the new image's emulator.
     replay: String,
+}
+
+/// Whether this machine takes upgrades from its server: its config's `[updates] accept`, read
+/// now (a config that can't be read takes them, as before).
+fn takes_updates(o: &Opts) -> bool {
+    o.config.as_deref().and_then(|p| crate::config::Config::load(p).ok()).is_none_or(|c| c.updates.accept)
 }
 
 fn handover_path(o: &Opts) -> PathBuf {

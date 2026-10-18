@@ -116,6 +116,10 @@ pub struct Fleet {
     no_checkout: Mutex<HashMap<String, Instant>>,
     /// Commits looked up on the release branch.
     on_branch: Mutex<HashMap<String, Branch>>,
+    /// Machines whose own kiln config refuses upgrades (`[updates] accept = false`).
+    refusing: Mutex<std::collections::HashSet<String>>,
+    /// (machine, commit): told a newer kiln is available.
+    told: Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 /// A commit against the release branch, as last looked up.
@@ -133,6 +137,21 @@ impl Fleet {
     /// Look at the fleet again now: a runner reported in, a binary arrived, an upgrade ended.
     pub fn wake(&self) {
         self.wake.notify();
+    }
+
+    /// What `machine`'s own kiln config says of upgrades ([`crate::proto::AgentMsg::UpdatePrefs`]).
+    pub fn set_accept(&self, machine: &str, accept: bool) {
+        let mut g = self.refusing.lock();
+        if accept {
+            g.remove(machine);
+        } else {
+            g.insert(machine.to_owned());
+        }
+    }
+
+    /// `machine`'s own kiln config refuses upgrades.
+    pub fn refuses(&self, machine: &str) -> bool {
+        self.refusing.lock().contains(machine)
     }
 
     /// The newest kiln, as last decided.
@@ -535,6 +554,9 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
         return Some(("upgrading", if j.method == "build" { format!("is building {s} itself") } else { format!("is upgrading to {s}") }));
     }
     let auto = r.policy == crate::updates::Policy::Auto;
+    if r.locked {
+        return Some(("off", format!("{s} is available; its machine refuses upgrades (its kiln config says [updates] accept = false)")));
+    }
     if r.policy == crate::updates::Policy::Off {
         return Some(("off", format!("{s} is available; its updates are off, so it stays as it is")));
     }
@@ -575,16 +597,36 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
         let target = refresh(&hub).await;
         crate::updates::measure(&hub).await;
         let Some(t) = target else { continue };
+        tell(&hub, &t).await;
         if hub.cfg.updates.follow {
             follow(&hub, &t).await;
         }
     }
 }
 
+/// Tell each runner behind the newest kiln that it is available, and where its build comes from,
+/// once a commit, whatever its policy (only runners that can hear it).
+async fn tell(hub: &Arc<Hub>, t: &Target) {
+    for r in crate::updates::runners(hub).await {
+        if !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) {
+            continue;
+        }
+        let key = (r.name.clone(), t.commit.clone());
+        if hub.updates.fleet.told.lock().contains(&key) {
+            continue;
+        }
+        let Some(peer) = hub.instances.lock().newest_with(&r.name, crate::proto::CAP_UPDATES) else { continue };
+        let from = r.from.clone().unwrap_or_else(|| format!("no build of it for {} yet", r.target.as_deref().unwrap_or("its platform")));
+        let msg = crate::proto::ServerMsg::UpdateAvailable { commit: t.commit.clone(), build: r.target_build.clone().unwrap_or_default(), from };
+        hub.send_peer(peer, &msg).await;
+        hub.updates.fleet.told.lock().insert(key);
+    }
+}
+
 async fn follow(hub: &Arc<Hub>, t: &Target) {
     for r in crate::updates::runners(hub).await {
         // Only runners whose policy is Automatic: the rest wait for their Upgrade, or are left alone.
-        if r.policy != crate::updates::Policy::Auto || !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) || hub.updates.running_for("runner", &r.name).is_some() {
+        if r.policy != crate::updates::Policy::Auto || r.locked || !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) || hub.updates.running_for("runner", &r.name).is_some() {
             continue;
         }
         if hub.updates.fleet.may_try(&r.name, &t.commit).is_err() {

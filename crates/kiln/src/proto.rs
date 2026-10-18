@@ -119,6 +119,10 @@ pub enum AgentMsg {
     /// Reach: a question for the server (JSON `{"op": "directory"}`), answered by
     /// [`ServerMsg::ReachAnswer`]. Appended last: postcard encodes variants by index.
     ReachAsk { req: u64, json: String },
+    /// Whether this machine takes upgrades from its server (its kiln config's `[updates] accept`):
+    /// `false` and the server never upgrades it, whatever its policy there. Sent on every
+    /// (re)connect, and when it changes. Appended last: postcard encodes variants by index.
+    UpdatePrefs { accept: bool },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -147,6 +151,9 @@ pub const CAP_REPOS: u32 = 1 << 18;
 /// to upgrade); the machine's terminals, AI sessions and agents work as a runner's do. It also
 /// carries [`OUTPOST_LABEL`], so it is known as one while it's away too.
 pub const CAP_OUTPOST: u32 = 32;
+/// [`AgentMsg::Build`] capability: it reports whether its machine takes upgrades
+/// ([`AgentMsg::UpdatePrefs`]) and takes the notice of a newer kiln ([`ServerMsg::UpdateAvailable`]).
+pub const CAP_UPDATES: u32 = 256;
 /// The label an outpost carries (see [`CAP_OUTPOST`]).
 pub const OUTPOST_LABEL: &str = "outpost";
 
@@ -311,6 +318,11 @@ pub enum ServerMsg {
     /// its container), its output on terminal session `session` (docs/ci.md W17-R05). Only to
     /// runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
     JobExec { job: String, session: String, command: String },
+    /// A newer kiln is available for this machine's runner: `commit` (`build`, its binary for this
+    /// platform, when there is one) and where it comes from. Said whatever its update policy, once a
+    /// commit; only to runners announcing [`CAP_UPDATES`]. Appended last: postcard encodes variants
+    /// by index.
+    UpdateAvailable { commit: String, build: String, from: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

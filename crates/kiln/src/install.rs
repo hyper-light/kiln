@@ -267,6 +267,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         shell: None,
         credentials: None,
         instance: None,
+        config: None,
         reach: Some(true),
         outpost: false,
     };
