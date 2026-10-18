@@ -232,6 +232,34 @@ pub fn live_alias(function: &str, answer: &Value, newest: Option<&str>) -> Optio
     Some(o)
 }
 
+/// Whether two versions' configurations (GetFunction's `Configuration` of each) run the same
+/// code with the same settings: a rollout between them changes nothing that runs.
+pub fn same_version(a: &Value, b: &Value) -> bool {
+    let fields = |c: &Value| -> Vec<Option<Value>> { std::iter::once("CodeSha256").chain(CONFIG_FIELDS.iter().copied()).map(|k| c.get(k).filter(|v| !v.is_null()).cloned()).collect() };
+    a.get("CodeSha256").is_some() && fields(a) == fields(b)
+}
+
+/// The alias as a rollout presents it: the version and routing kiln applied (where the rollout
+/// is taking traffic), the rest as Lambda has it, and where the rollout stands in its status.
+pub fn overlay(mut live: Value, desired: &Value, summary: &Value) -> Value {
+    if let Some(spec) = live.get_mut("spec").and_then(Value::as_object_mut) {
+        for k in ["FunctionVersion", "RoutingConfig"] {
+            match desired.pointer(&format!("/spec/{k}")) {
+                Some(v) => {
+                    spec.insert(k.into(), v.clone());
+                }
+                None => {
+                    spec.remove(k);
+                }
+            }
+        }
+    }
+    if let Some(st) = crate::obj::ensure_map(&mut live, &["status"]) {
+        st.insert("rollout".into(), summary.clone());
+    }
+    live
+}
+
 /// A FunctionUrl object from GetFunctionUrlConfig's answer.
 pub fn live_url(function: &str, qualifier: &str, answer: &Value) -> Option<Value> {
     let mut spec = Map::new();

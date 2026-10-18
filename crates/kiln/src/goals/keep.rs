@@ -146,7 +146,7 @@ fn judge(info: &Info, seen: &mut Seen, now: i64) -> Next {
         return Next::Keep { why: Why::Restarted, at };
     }
     let Some(t) = info.last_turn.as_ref() else { return Next::Leave { at } };
-    if now - t.at > STALE_MS || matches!(t.how.as_str(), "stopped" | "limit" | "refused") || t.asks {
+    if now - t.at > STALE_MS || matches!(t.how.as_str(), "stopped" | "limit" | "refused" | "blocked") || t.asks {
         return Next::Leave { at };
     }
     // Kept going enough: as many turns in a row as it may, or ones that did nothing.
@@ -259,6 +259,8 @@ mod tests {
         let now = 1_792_000_000_000;
         assert!(matches!(after_turn(ended("done", now - 12_000), "All done: 41/41 pass.", (3, 3), now), Next::Leave { .. }));
         assert!(matches!(after_turn(ended("stopped", now - 12_000), "", (0, 2), now), Next::Leave { .. }));
+        // What it needed wasn't allowed (a harness that can't ask): going on would be denied again.
+        assert!(matches!(after_turn(ended("blocked", now - 12_000), "", (0, 2), now), Next::Leave { .. }));
         let asks = TurnEnd { asks: true, ..ended("cut", now - 12_000) };
         assert!(matches!(after_turn(asks, "Merge it now?", (0, 2), now), Next::Leave { .. }));
         // Kept going enough already, or the turns kiln started did nothing.

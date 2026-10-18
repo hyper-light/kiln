@@ -63,6 +63,10 @@ const UNANSWERED_MS: u64 = 60_000;
 const LOG_LIMIT: usize = 200;
 const LOG_HEAD: usize = 20;
 
+/// Green's share as the server reads it when traffic goes to a version neither blue nor green:
+/// whatever the step wants, the rollout moves traffic back to its split.
+pub const FOREIGN: u8 = 255;
+
 // ------------------------------------------------------------------ what the deploy file says
 
 /// An app's `rollout:`.
@@ -856,6 +860,31 @@ impl Rollout {
         self.finished() && (self.state == State::Succeeded || self.reverted) && self.moving.is_none() && self.release.is_none_or(|r| r.done)
     }
 
+    /// Where it stands, as the object it rolls out shows it (`status.rollout`) and as health
+    /// reads it: its state and why, green's share, the step it's at, whether a person paused it.
+    pub fn summary(&self) -> Value {
+        let (state, why) = match &self.state {
+            State::Running => ("running", String::new()),
+            State::Paused { why } => ("paused", why.clone()),
+            State::Succeeded => ("succeeded", String::new()),
+            State::Aborted { why } => ("aborted", why.clone()),
+            State::Superseded { by } => ("superseded", format!("superseded by {by}")),
+        };
+        let waiting = if self.finished() {
+            String::new()
+        } else if !self.ready {
+            format!("green isn't ready: {}", self.unready)
+        } else if self.moving.is_some() {
+            "moving traffic".into()
+        } else {
+            String::new()
+        };
+        json!({
+            "state": state, "why": why, "held": self.held, "weight": self.weight.min(100), "target": self.target(),
+            "step": (self.step + 1).min(self.plan.steps.len()), "steps": self.plan.steps.len(), "waiting": waiting,
+        })
+    }
+
     /// Green's share the step wants: that of the last weight step up to it; all of it past the
     /// last step.
     pub fn target(&self) -> u8 {
@@ -1005,7 +1034,11 @@ impl Rollout {
         // steers (after it, it is the app's drift, as any). The first reading is where it starts.
         let steering = !self.finished() || !(self.reverted || self.state == State::Succeeded);
         if let Some(w) = weight.filter(|w| *w != self.weight && self.moving.is_none() && steering) {
-            self.note(now, json!({ "event": if self.read { "drifted" } else { "read" }, "from": self.weight, "to": w }));
+            if w == FOREIGN {
+                self.note(now, json!({ "event": "drifted", "from": self.weight, "why": "traffic went to a version neither blue nor green" }));
+            } else {
+                self.note(now, json!({ "event": if self.read { "drifted" } else { "read" }, "from": self.weight, "to": w }));
+            }
             self.weight = w;
         }
         self.read |= weight.is_some();

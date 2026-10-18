@@ -5,6 +5,7 @@
 use std::process::Command as Process;
 
 use super::acp::Acp;
+use super::antigravity::Agy;
 use super::claude::Claude;
 use super::codex::Codex;
 use super::core::Core;
@@ -34,6 +35,8 @@ pub enum Protocol {
     CodexAppServer,
     /// The Agent Client Protocol, started with these arguments.
     Acp(&'static [&'static str]),
+    /// Antigravity's headless multi-turn stream-json (`agy --input-format stream-json`).
+    AgyStreamJson,
     /// No structured mode: it runs as a terminal program, in a kiln terminal.
     Terminal,
 }
@@ -46,8 +49,7 @@ const KINDS: &[Kind] = &[
     Kind { id: "goose", name: "Goose", program: "goose", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["goose", "session"], screen_takes_command: false },
     // Amp has no ACP mode of its own; its ACP adapter (amp-acp) wraps the signed-in Amp CLI.
     Kind { id: "amp", name: "Amp", program: "amp-acp", verified: false, protocol: Protocol::Acp(&[]), screen: &["amp"], screen_takes_command: false },
-    // Antigravity's CLI has no documented structured mode: it runs in a terminal.
-    Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: false, protocol: Protocol::Terminal, screen: &["agy"], screen_takes_command: false },
+    Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: true, protocol: Protocol::AgyStreamJson, screen: &["agy"], screen_takes_command: false },
 ];
 
 impl Kind {
@@ -73,6 +75,7 @@ impl Kind {
         match self.protocol {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
+            Protocol::AgyStreamJson => Adapter::Agy(Box::new(Agy::new(spec))),
             Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::new(spec.resume.clone()).with_mode(spec.mode.as_deref()))),
         }
     }
@@ -121,6 +124,10 @@ impl Kind {
             }
             Protocol::Acp(args) => {
                 p.args(args);
+            }
+            // Model, effort, mode and the conversation are flags: a change starts it again.
+            Protocol::AgyStreamJson => {
+                p.args(super::antigravity::args(spec));
             }
             Protocol::Terminal => {}
         }
@@ -204,6 +211,7 @@ pub enum Adapter {
     Claude(Box<Claude>),
     Codex(Box<Codex>),
     Acp(Box<Acp>),
+    Agy(Box<Agy>),
 }
 
 /// An adapter written out whole, for this process's next image (an in-place upgrade).
@@ -213,6 +221,7 @@ pub enum Frozen {
     Claude(Box<Claude>),
     Codex(Box<Codex>),
     Acp(Box<Acp>),
+    Agy(Box<Agy>),
 }
 
 impl Adapter {
@@ -222,6 +231,7 @@ impl Adapter {
             Self::Claude(a) => Frozen::Claude(a),
             Self::Codex(a) => Frozen::Codex(a),
             Self::Acp(a) => Frozen::Acp(a),
+            Self::Agy(a) => Frozen::Agy(a),
         }
     }
 
@@ -230,6 +240,7 @@ impl Adapter {
             Frozen::Claude(a) => Self::Claude(a),
             Frozen::Codex(a) => Self::Codex(a),
             Frozen::Acp(a) => Self::Acp(a),
+            Frozen::Agy(a) => Self::Agy(a),
         }
     }
 
@@ -238,6 +249,7 @@ impl Adapter {
             Self::Claude(a) => a.start(core),
             Self::Codex(a) => a.start(core),
             Self::Acp(a) => a.start(core),
+            Self::Agy(a) => a.start(core),
         }
     }
 
@@ -246,6 +258,7 @@ impl Adapter {
             Self::Claude(a) => a.line(core, line),
             Self::Codex(a) => a.line(core, line),
             Self::Acp(a) => a.line(core, line),
+            Self::Agy(a) => a.line(core, line),
         }
     }
 
@@ -254,6 +267,7 @@ impl Adapter {
             Self::Claude(a) => a.command(core, c),
             Self::Codex(a) => a.command(core, c),
             Self::Acp(a) => a.command(core, c),
+            Self::Agy(a) => a.command(core, c),
         }
     }
 
@@ -262,6 +276,7 @@ impl Adapter {
             Self::Claude(a) => a.exited(core, code, error),
             Self::Codex(a) => a.exited(core, code, error),
             Self::Acp(a) => a.exited(core, code, error),
+            Self::Agy(a) => a.exited(core, code, error),
         }
     }
 
@@ -276,6 +291,7 @@ impl Adapter {
             Self::Claude(a) => a.run_done(core, job, code, output),
             Self::Codex(a) => a.run_done(core, job, code, output),
             Self::Acp(a) => a.run_done(core, job, code, output),
+            Self::Agy(a) => a.run_done(core, job, code, output),
         }
     }
 
@@ -292,6 +308,7 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.tick(core),
             Self::Codex(a) => a.tick(core),
+            Self::Agy(a) => a.tick(core),
             Self::Acp(_) => {}
         }
     }
@@ -307,6 +324,11 @@ impl Adapter {
                     a.go_on(core, p);
                 }
             }
+            Self::Agy(a) => {
+                if let Some(p) = super::pause::release(core, "The limit's reset time came; going on.") {
+                    a.go_on(core, p);
+                }
+            }
         }
     }
 
@@ -317,6 +339,7 @@ impl Adapter {
             Self::Claude(a) => a.go_on(core, p),
             Self::Codex(a) => a.go_on(core, p),
             Self::Acp(a) => a.go_on(core, p),
+            Self::Agy(a) => a.go_on(core, p),
         }
     }
 
@@ -332,7 +355,7 @@ impl Adapter {
     pub fn seeded(&self) -> bool {
         match self {
             Self::Codex(a) => a.seeded(),
-            Self::Claude(_) | Self::Acp(_) => true,
+            Self::Claude(_) | Self::Acp(_) | Self::Agy(_) => true,
         }
     }
 }
@@ -394,6 +417,7 @@ impl Kind {
                 (m, "default")
             }
             Protocol::CodexAppServer => (super::codex::modes(true), "auto"),
+            Protocol::AgyStreamJson => (super::antigravity::modes(), super::antigravity::DEFAULT_MODE),
             Protocol::Acp(_) | Protocol::Terminal => (Vec::new(), ""),
         }
     }
@@ -409,6 +433,7 @@ impl Kind {
         let levels: &[&str] = match self.protocol {
             Protocol::ClaudeStreamJson => super::claude::EFFORTS,
             Protocol::CodexAppServer => super::codex::EFFORTS,
+            Protocol::AgyStreamJson => super::antigravity::EFFORTS,
             Protocol::Acp(_) | Protocol::Terminal => &[],
         };
         levels

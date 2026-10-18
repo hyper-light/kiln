@@ -142,11 +142,10 @@ tracking marks.
 kiln owns. An object is out of sync when a field kiln sets differs from the live value, a field
 kiln sets is missing, or kiln owns a field it no longer sets. Fields other managers own (the HPA's
 `replicas`) are never drift unless kiln sets them too. Quantities, ports and empty values are
-compared by meaning, not spelling. When that can't decide (mutating webhooks, defaults kiln
-doesn't know), kiln asks the API server for a dry-run apply and compares the result. The answer is
-cached by the desired object's hash and the live `resourceVersion`, so it costs one call per change,
-not one per refresh. Objects applied before kiln (adopted from Argo CD or `kubectl apply`) are
-compared three ways against `last-applied-configuration` until kiln first applies them.
+compared by meaning, not spelling. Objects applied before kiln (adopted from Argo CD or `kubectl
+apply`) are compared three ways against `last-applied-configuration` until kiln first applies them.
+Asking the API server for a dry-run apply where that can't decide (a mutating webhook, a default
+kiln doesn't know), as Argo CD's `ServerSideDiff=true` does, is not built yet.
 
 Equality is checked on hashes first. Each object's normalized desired form and live form are
 hashed; a watch event or a new render recompares only the objects whose hashes moved. A
@@ -155,10 +154,11 @@ kiln predicts the live object after the apply (what it sets laid over what runs,
 sets dropped) and diffs the two, so defaults the cluster filled in never show as differences.
 Secrets are masked alike on both sides, so a changed value still shows as changed.
 
-**Ignoring differences.** `ignore` rules take JSON pointers, a jq-style path subset
-(`.spec.template.spec.containers[] | select(.name == "app") | .image`) and field managers, per
-app, per project or globally, as Argo CD's `ignoreDifferences` and `resource.customizations` do.
-`RespectIgnoreDifferences=true` keeps ignored fields out of the apply too.
+**Ignoring differences.** An app's `ignore` rules take JSON pointers, a jq-style path subset
+(`.spec.template.spec.containers[] | select(.name == "app") | .image`) and field managers, as
+Argo CD's `ignoreDifferences` does (an Argo CD Application's are imported with it).
+`RespectIgnoreDifferences=true` keeps ignored fields out of the apply too. Rules for every app,
+as Argo CD's `resource.customizations.ignoreDifferences.*` settings give, are not built yet.
 
 **Health.**
 

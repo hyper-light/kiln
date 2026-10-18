@@ -225,6 +225,11 @@ impl Response {
         self.inner.headers().get(name).and_then(|v| v.to_str().ok())
     }
 
+    /// Every header, names lowercase, values that aren't text left out.
+    pub fn headers(&self) -> Vec<(String, String)> {
+        self.inner.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned()))).collect()
+    }
+
     /// The whole body, refusing more than `limit` bytes.
     pub async fn bytes(self, limit: usize) -> anyhow::Result<Bytes> {
         let collected = http_body_util::Limited::new(self.inner.into_body(), limit)

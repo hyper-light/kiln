@@ -36,7 +36,7 @@ use anyhow::{Context as _, Result, bail};
 use kiln_cd::engine::{Input, LiveChange};
 use kiln_cd::obj::{self, GroupKind, ResKey};
 use kiln_cd::providers::{ProviderDef, Target};
-use kiln_cd::state::{Applied, Command, applied_key};
+use kiln_cd::state::{Applied, Command, ROLLOUT_REPLACED, RolloutRecord, applied_key, rollout_id};
 use parking_lot::Mutex;
 use serde_json::Value;
 
@@ -73,6 +73,12 @@ pub struct Conn {
 impl Conn {
     pub fn new(target: Target, def: &'static ProviderDef) -> Self {
         Conn { target, def, next: Mutex::new(Instant::now()), hot: Mutex::new(HashMap::new()), wake: crate::rt::Notify::new(), memo: Mutex::new(HashMap::new()), settle_every: Duration::from_secs(2), gap: GAP }
+    }
+
+    /// A connection for tests on a fake: no gap between requests, settling looked at often.
+    #[cfg(test)]
+    pub fn quick(target: Target, def: &'static ProviderDef) -> Self {
+        Conn { settle_every: Duration::from_millis(5), gap: Duration::ZERO, ..Conn::new(target, def) }
     }
 
     /// Waits for the target's budget.
@@ -122,12 +128,18 @@ pub enum Creds {
     Token { token: String, config: Value },
 }
 
-/// Where what kiln applied is kept: the CD store ([`Cd`]), or memory in tests.
+/// Where what kiln applied is kept, and the rollouts of what it applied (§5): the CD store
+/// ([`Cd`]), or memory in tests.
 pub trait Records: Send + Sync {
     /// What kiln last applied to `key` on `target`.
     fn get(&self, target: &str, key: &str) -> Option<Applied>;
     /// Keeps it, or forgets it.
     fn put<'a>(&'a self, target: &'a str, key: String, applied: Option<Applied>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+    /// The rollout of `key` on `target`, as kept.
+    fn rollout(&self, target: &str, key: &str) -> Option<RolloutRecord>;
+    /// Keeps it, or forgets it, if the one kept is still at `expect` (its version; none: whatever
+    /// is kept): whether it was kept.
+    fn keep_rollout<'a>(&'a self, target: &'a str, key: &'a str, record: Option<RolloutRecord>, expect: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>>;
 }
 
 impl Records for Cd {
@@ -140,6 +152,21 @@ impl Records for Cd {
             match self.store.submit(Command::Applied { target: target.to_owned(), key, applied: applied.map(Box::new) }).await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => bail!("keeping what kiln applied: {e}"),
+                Err(_) => bail!("the store stopped"),
+            }
+        })
+    }
+
+    fn rollout(&self, target: &str, key: &str) -> Option<RolloutRecord> {
+        self.store.read(|d| d.rollouts.get(&rollout_id(target, key)).cloned())
+    }
+
+    fn keep_rollout<'a>(&'a self, target: &'a str, key: &'a str, record: Option<RolloutRecord>, expect: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.store.submit(Command::Rollout { id: rollout_id(target, key), record: record.map(Box::new), expect }).await {
+                Ok(Ok(())) => Ok(true),
+                Ok(Err(e)) if e == ROLLOUT_REPLACED => Ok(false),
+                Ok(Err(e)) => bail!("keeping the rollout: {e}"),
                 Err(_) => bail!("the store stopped"),
             }
         })
@@ -175,6 +202,11 @@ impl Cx<'_> {
     /// What kiln last applied to an object here.
     pub fn applied(&self, group: &str, kind: &str, namespace: &str, name: &str) -> Option<Applied> {
         self.records.get(&self.conn.target.name(), &applied_key(group, kind, namespace, name))
+    }
+
+    /// The rollout of an object here (§5), as kept.
+    pub fn rollout(&self, group: &str, kind: &str, namespace: &str, name: &str) -> Option<RolloutRecord> {
+        self.records.rollout(&self.conn.target.name(), &applied_key(group, kind, namespace, name))
     }
 
     /// Keeps what kiln applied to an object here (or forgets it).
@@ -411,8 +443,9 @@ impl Cd {
 
     // ---------------------------------------------------------------- writing
 
-    /// Applies an object to a target: the object as it now reads.
-    pub(super) async fn target_apply(&self, cluster: &str, object: &Value, dry_run: bool) -> Result<Option<Value>, String> {
+    /// Applies an object to a target: the object as it now reads. One that carries traffic
+    /// rolls out when its app has a rollout (§5).
+    pub(super) async fn target_apply(self: &Arc<Self>, cluster: &str, object: &Value, dry_run: bool) -> Result<Option<Value>, String> {
         let conn = self.target(cluster).ok_or_else(|| format!("target {cluster} is not connected"))?;
         // No platform here checks a change without making it: a dry run answers with the object.
         if dry_run {
@@ -420,7 +453,10 @@ impl Cd {
         }
         let app = app_of(object);
         let result = async {
-            let cx = Cx { conn: &conn, creds: self.creds(&conn, app.as_deref(), "sync").await?, records: self, files: self.hub.as_ref() };
+            let cx = Cx { conn: &conn, creds: self.creds(&conn, app.as_deref(), "sync").await?, records: self.as_ref(), files: self.hub.as_ref() };
+            if super::rollouts::rolls_out(conn.def.name, obj::kind(object)) {
+                return self.rollout_apply(&cx, object).await.with_context(|| format!("{} {}", obj::kind(object), obj::name(object)));
+            }
             apply(&cx, object).await
         };
         let r = result.await.map(Some).map_err(|e| format!("{e:#}"));
@@ -434,6 +470,9 @@ impl Cd {
         let result = async {
             let cx = Cx { conn: &conn, creds: self.creds(&conn, None, "delete").await?, records: self, files: self.hub.as_ref() };
             delete(&cx, key).await?;
+            if super::rollouts::rolls_out(conn.def.name, &key.kind) {
+                super::rollouts::forget(&cx, key).await?;
+            }
             cx.record(&key.group, &key.kind, &key.namespace, &key.name, None).await
         };
         let r = result.await.map_err(|e| format!("{e:#}"));
@@ -443,7 +482,7 @@ impl Cd {
 }
 
 /// The app an object was applied for, by its tracking annotation (`<app>:<group>/<kind>:…`).
-fn app_of(o: &Value) -> Option<String> {
+pub(super) fn app_of(o: &Value) -> Option<String> {
     obj::annotation(o, kiln_cd::engine::TRACKING).and_then(|t| t.split_once(':')).map(|(app, _)| app.to_owned())
 }
 
@@ -471,8 +510,13 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
     Ok(objects.into_iter().map(|o| cx.with_applied(o)).collect())
 }
 
+/// An object as the watch reads it, or none if it's gone.
+pub(super) async fn read(cx: &Cx<'_>, o: &Value) -> Result<Option<Value>> {
+    Ok(list(cx, obj::kind(o), &[(obj::namespace(o).to_owned(), obj::name(o).to_owned())]).await?.into_iter().next())
+}
+
 /// Applies `desired`, keeping what was applied: the object as it now reads.
-async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
+pub(super) async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let live = match cx.conn.def.name {
         "aws-lambda" => aws_lambda::apply(cx, desired).await,
         "aws-ecs" => aws_ecs::apply(cx, desired).await,

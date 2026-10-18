@@ -1050,7 +1050,8 @@ pub struct TurnEnd {
     pub at: i64,
     /// "done": it ended as turns do; "cut": it stopped part-way (an unexpected stop, out of
     /// output, an error); "stopped": you stopped it; "limit": a turn or budget limit ended it;
-    /// "refused": the model wouldn't go on.
+    /// "refused": the model wouldn't go on; "blocked": what it needed to do wasn't allowed (a
+    /// harness that can't ask, denying it).
     pub how: String,
     /// The harness's own word for it ("end_turn", "stop_sequence", "max_tokens", "failed" …).
     #[serde(default, skip_serializing_if = "Option::is_none")]

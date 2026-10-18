@@ -20,6 +20,8 @@ import type {
   CdResource,
   CdResourceDetail,
   CdResourceKey,
+  CdRollout,
+  CdRolloutAction,
   CdSummary,
   CdTree,
 } from "./types";
@@ -109,6 +111,10 @@ export const cdApi = {
   rollback: (id: string, body: { to?: number; prune?: boolean }) =>
     request<{ to: number; revision: string | null }>("POST", `${appPath(id)}/rollback`, body),
   follow: (id: string) => request<unknown>("POST", `${appPath(id)}/follow`, {}),
+  /** The app's rollouts on targets, the one under way first. */
+  rollouts: (id: string, signal?: AbortSignal) => request<{ app: string; rollouts: CdRollout[] }>("GET", `${appPath(id)}/rollout`, undefined, { signal }),
+  rollout: (id: string, action: CdRolloutAction, body: { full?: boolean; check?: string; reason?: string; rollout?: string } = {}) =>
+    request<unknown>("POST", `${appPath(id)}/rollout/${action}`, body),
   remove: (id: string, cascade: "foreground" | "orphan") => request<unknown>("DELETE", `${appPath(id)}${qs({ cascade })}`),
   clusters: (signal?: AbortSignal) => request<{ clusters: CdCluster[] }>("GET", "/api/cd/clusters", undefined, { signal }),
   /** What a commit, a stack or a pull request would deploy. */

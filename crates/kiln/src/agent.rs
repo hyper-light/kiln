@@ -293,8 +293,7 @@ struct Moving {
 #[cfg(unix)]
 enum Item {
     Session {
-        id: String,
-        spec: Box<crate::harness::session::Spec>,
+        record: Box<crate::harness::host::Saved>,
         /// Its handover as sent (JSON) and this side's copies of its pipes; `None`: it couldn't
         /// be handed over running, and starts again from its record there.
         kept: Option<(Vec<u8>, [std::os::fd::OwnedFd; 3])>,
@@ -318,7 +317,7 @@ impl Item {
 
     fn id(&self) -> &str {
         match self {
-            Self::Session { id, .. } => id,
+            Self::Session { record, .. } => record.id(),
             Self::Terminal { session, .. } => session,
         }
     }
@@ -457,8 +456,9 @@ async fn roll_back(
                     problems.push(format!("terminal {session}"));
                 }
             }
-            Item::Session { id, spec, kept } => {
+            Item::Session { record, kept } => {
                 let Some(h) = harness else { continue };
+                let id = record.id().to_owned();
                 // The new build stopped it (and started it again, now gone with it): it starts again here.
                 let stopped = matches!(acks.get(i), Some(Ack::Refused(_)));
                 let handed = kept.filter(|_| !stopped).and_then(|(json, [i, o, e])| {
@@ -470,7 +470,7 @@ async fn roll_back(
                     hd.process.foreign = true;
                     Some(Box::new(hd))
                 });
-                if let Err(e) = h.move_in(id.clone(), *spec, handed) {
+                if let Err(e) = h.move_in(*record, handed) {
                     problems.push(format!("agent session {id}: {e:#}"));
                 }
             }
@@ -527,8 +527,8 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
             }
         };
         let (id, r) = match frame {
-            Frame::Session { id, spec, handed } => {
-                let r = take_session(harness.as_ref(), &id, *spec, handed, fds).await;
+            Frame::Session { id, record, handed } => {
+                let r = take_session(harness.as_ref(), &id, *record, handed, fds).await;
                 if r.is_ok() {
                     sessions += 1;
                 }
@@ -583,20 +583,20 @@ async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host:
 /// came as `fds` (stdin, stdout, stderr); else started again from its record. When its process
 /// can't go on here it is stopped and the session starts again from its record (an error, saying so).
 #[cfg(unix)]
-async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, spec: crate::harness::session::Spec, handed: Option<Box<crate::harness::session::Handed>>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
+async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, rec: crate::harness::host::Saved, handed: Option<Box<crate::harness::session::Handed>>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
     use std::os::fd::IntoRawFd as _;
     let Some(h) = h else { return Err("this runner runs no agent sessions".to_owned()) };
     if h.get(id).is_some() {
         return Ok(());
     }
     let Some(mut hd) = handed else {
-        return h.move_in(id.to_owned(), spec, None).map_err(|e| format!("{e:#}"));
+        return h.move_in(rec, None).map_err(|e| format!("{e:#}"));
     };
     let pid = hd.process.pid;
     let mut fds = fds.into_iter();
     let (Some(i), Some(o), Some(e)) = (fds.next(), fds.next(), fds.next()) else {
         let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-        let again = h.move_in(id.to_owned(), spec, None).map_err(|e| format!("{e:#}"));
+        let again = h.move_in(rec, None).map_err(|e| format!("{e:#}"));
         return Err(format!("its pipes didn't come with it, so its process was stopped{}", again.err().map_or_else(|| ": it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))));
     };
     hd.process.stdin = i.into_raw_fd();
@@ -604,7 +604,7 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, spe
     hd.process.stderr = e.into_raw_fd();
     hd.process.foreign = true;
     let raw = [hd.process.stdin, hd.process.stdout, hd.process.stderr];
-    match h.move_in(id.to_owned(), spec.clone(), Some(hd)) {
+    match h.move_in(rec.clone(), Some(hd)) {
         Ok(()) => Ok(()),
         // Refused before its pipes were taken: they close, its process is stopped.
         Err(e) => {
@@ -612,7 +612,7 @@ async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, spe
                 drop(crate::os::reclaim_fd(r));
             }
             let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
-            let again = h.move_in(id.to_owned(), spec, None).map_err(|e| format!("{e:#}"));
+            let again = h.move_in(rec, None).map_err(|e| format!("{e:#}"));
             Err(format!("{e:#}; its process was stopped{}", again.err().map_or_else(|| ", and it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))))
         }
     }
@@ -1031,7 +1031,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         if let Some(h) = &harness {
-                            for (id, spec, handed) in h.move_out().await {
+                            for (rec, handed) in h.move_out().await {
+                                let id = rec.id().to_owned();
                                 let mut handed = handed;
                                 let kept = match handed.as_ref() {
                                     Some(hd) => match keep_pipes(&hd.process) {
@@ -1048,9 +1049,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                     let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
                                 }
                                 let fds = kept.as_ref().map(|(_, p)| p.iter().map(|f| f.as_raw_fd()).collect()).unwrap_or_default();
-                                frames.push((Frame::Session { id: id.clone(), spec: Box::new(spec.clone()), handed }, fds));
-                                moved.insert(crate::instances::Owned::Agent(id.clone()));
-                                mv.items.push(Item::Session { id, spec: Box::new(spec), kept });
+                                frames.push((Frame::Session { id: id.clone(), record: Box::new(rec.clone()), handed }, fds));
+                                moved.insert(crate::instances::Owned::Agent(id));
+                                mv.items.push(Item::Session { record: Box::new(rec), kept });
                             }
                         }
                         let (sessions, terminals) = (mv.items.iter().filter(|i| matches!(i, Item::Session { .. })).count(), mv.items.iter().filter(|i| matches!(i, Item::Terminal { .. })).count());
@@ -1119,7 +1120,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                         (Item::Session { .. }, Ack::Taken) => sessions += 1,
                                         (Item::Terminal { .. }, Ack::Taken) => terminals += 1,
                                         // The new build started it again from its record.
-                                        (Item::Session { id, .. }, Ack::Refused(e) | Ack::Lost(e)) => said.push(format!("agent session {id} started again from its record there: {e}")),
+                                        (Item::Session { record, .. }, Ack::Refused(e) | Ack::Lost(e)) => said.push(format!("agent session {} started again from its record there: {e}", record.id())),
                                         // Back here: it ends with this runner (which waits for it).
                                         (Item::Terminal { session, state, fd, pid }, ack) => {
                                             moved.remove(&crate::instances::Owned::Terminal(session.clone()));

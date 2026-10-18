@@ -1547,9 +1547,11 @@ mod tests {
         for fresh in [AiSession { transcript: false, ..s.clone() }, AiSession { last_prompt: String::new(), ..s.clone() }] {
             assert_eq!((fresh.takeover(true), fresh.takeover(false), fresh.forkable()), (TakeOver::NoId, TakeOver::NoId, false));
         }
-        // Nothing to continue yet; a harness kiln cannot run as an agent session.
+        // Nothing to continue yet; a harness kiln cannot run as an agent session (Antigravity can
+        // now: it's taken over like the others).
         assert_eq!(AiSession { id: String::new(), ..s.clone() }.takeover(true), TakeOver::NoId);
-        assert_eq!(AiSession { tool: "antigravity".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
+        assert_eq!(AiSession { tool: "cursor-agent".into(), ..s.clone() }.takeover(true), TakeOver::Unsupported);
+        assert_eq!(AiSession { tool: "antigravity".into(), ..s.clone() }.takeover(true), TakeOver::Ready);
         assert_eq!(serde_json::to_value(TakeOver::NoId).ok(), Some(serde_json::json!("no_id")));
         assert_eq!(serde_json::to_value(TakeOver::Stop).ok(), Some(serde_json::json!("stop")));
     }

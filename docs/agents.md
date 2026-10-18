@@ -1,6 +1,6 @@
 # Agent sessions
 
-kiln runs coding agents (Claude Code, Codex, ACP agents) as structured sessions and is their
+kiln runs coding agents (Claude Code, Codex, ACP agents, the Antigravity CLI) as structured sessions and is their
 front end: it starts the harness in its structured mode, turns everything the harness says into
 one normalized model (timeline events, state, meta) and turns the console's commands into the
 harness's own protocol. A session runs on any machine (the server, or a runner) and outlives the
@@ -11,7 +11,20 @@ browsers watching it.
 | Claude Code | `claude -p` stream-json + control protocol | `harness/claude.rs` |
 | Codex | `codex app-server` (JSON-RPC v2) | `harness/codex.rs` |
 | Gemini CLI, opencode, Goose, Amp | Agent Client Protocol | `harness/acp.rs` |
-| Antigravity CLI | none (runs in a kiln terminal) | — |
+| Antigravity CLI | `agy` headless stream-json, one turn per message on stdin (agy 1.4 or newer) | `harness/antigravity.rs` |
+
+The Antigravity CLI runs as `agy --input-format stream-json --output-format stream-json`: kiln
+writes `{"event":"user","message":{"content":…}}` for each turn and reads `init` (its conversation,
+which a restart resumes with `--conversation`), `step_update`s (the reply as it streams, each tool
+call with its input and output) and one `result` per turn. In that mode it can't ask anything: a
+tool that needs your approval is denied, the turn's result lists it (`denied_actions`), and kiln
+says what was denied and which mode lets it go ahead. Its modes are Ask (its own default:
+everything that needs approval is denied), Accept edits (a new agent's: it edits files; commands
+that need approval are denied), Plan and Bypass (`--dangerously-skip-permissions`). It can't be
+stopped mid-turn either: a stop ends its process, which keeps the turn so far, and kiln starts it
+again on the same conversation. A new model, effort or mode is a flag, so it starts again with it
+between turns. Files you attach go to it as their paths on its machine; its models come from
+`agy models`.
 
 ## API
 

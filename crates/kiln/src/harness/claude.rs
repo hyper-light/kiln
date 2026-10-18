@@ -3558,8 +3558,8 @@ mod tests {
         c.streams.insert("msg_1".into(), Streamed { blocks: HashMap::from([(0, "e1".to_owned()), (2, "e2".to_owned())]), finals: 1 });
         let process = crate::proc::Detached { pid: 1, stdin: 10, stdout: 11, stderr: 12, foreign: false };
         let handed = crate::harness::session::Handed { kind: "claude".into(), process, core: crate::harness::core::Core::new().freeze(), adapter: crate::harness::kinds::Frozen::Claude(Box::new(c)), partial: String::new() };
-        let spec: crate::harness::session::Spec = serde_json::from_str(r#"{"kind":"claude"}"#)?;
-        let frame = crate::bluegreen::Frame::Session { id: "s".into(), spec: Box::new(spec), handed: Some(Box::new(handed)) };
+        let record: crate::harness::host::Saved = serde_json::from_str(r#"{"id":"s","spec":{"kind":"claude"}}"#)?;
+        let frame = crate::bluegreen::Frame::Session { id: "s".into(), record: Box::new(record), handed: Some(Box::new(handed)) };
         let back: crate::bluegreen::Frame = serde_json::from_slice(&serde_json::to_vec(&frame)?)?;
         let crate::bluegreen::Frame::Session { handed: Some(h), .. } = back else { anyhow::bail!("not a session") };
         let crate::harness::kinds::Frozen::Claude(c) = h.adapter else { anyhow::bail!("not Claude Code's") };

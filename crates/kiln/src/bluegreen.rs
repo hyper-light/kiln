@@ -34,9 +34,9 @@ pub const READY_WITHIN: Duration = Duration::from_secs(180);
 pub enum Frame {
     /// green → blue: connected to the server and welcomed; it takes over now.
     Ready { pid: u32, instance: String },
-    /// blue → green: an agent session, its harness process still running. Descriptors: its
-    /// stdin, stdout and stderr.
-    Session { id: String, spec: Box<crate::harness::session::Spec>, handed: Option<Box<crate::harness::session::Handed>> },
+    /// blue → green: an agent session, its harness process still running (descriptors: its stdin,
+    /// stdout and stderr), or (`handed` none) to start again from its record.
+    Session { id: String, record: Box<crate::harness::host::Saved>, handed: Option<Box<crate::harness::session::Handed>> },
     /// blue → green: a terminal, its shell still running. Descriptor: its PTY master.
     Terminal { session: String, command: Option<String>, cols: u16, rows: u16, replay: String, pid: u32 },
     /// blue → green: that's everything. Green serves the machine's local sockets (`kiln spawn`,
