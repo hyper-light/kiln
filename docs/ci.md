@@ -179,9 +179,9 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
-| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
+| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; environments, actions' declared secrets, the other stores, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
-| W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; next: secrets `from: integration:…` (W09-R08) |
+| W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
@@ -2483,10 +2483,31 @@ and masking), names to the editor's completion (W21; names only).
     environment; the step outputs that feed them are masked as their step ends.
   - `ACTIONS_STEP_DEBUG` and `ACTIONS_RUNNER_DEBUG` reach a leg whenever they're set, unmasked
     (W06-R13).
+- *Done.* R08, brokered secrets (`crates/kiln/src/ci/broker.rs`, migration
+  `20261018-2300_w09_brokered.sql`):
+  - **Defining one.** `PUT /api/ci/secrets/:name` with `{ "from": … }` (or `kiln secrets set NAME
+    --from …`) defines a secret by where its value comes from. The source is checked when it is
+    set.
+  - **The sources:**
+    - `integration:<name>`: a stored token as it is; AWS credentials as `credential_process`
+      JSON; a Google or Azure access token (Azure's `?scope=`, Resource Manager by default);
+    - `aws-sm:<arn>`: a Secrets Manager secret's string;
+    - `gcp-sm:projects/<p>/secrets/<s>[/versions/<v>]`: a Secret Manager version's payload,
+      `latest` by default;
+    - `azure-kv:<vault>/<secret>`: a Key Vault secret's value.
+
+    The stores are read through the repository's integration of their cloud (`@<integration>`
+    names one), which exchanges kiln's identity for the leg's workload (W11).
+  - **At leg start.** Its value is made then, never stored, and delivered and masked as any
+    secret. A more specific scope's definition wins as usual.
+  - **When one can't be made**, the leg goes on without it, with a warning that says why.
+  - **Verified end to end:** a secret brokered from a Cloudflare integration reached the leg
+    masked. One from Secrets Manager, through an AWS role that doesn't trust this server, left a
+    warning naming AWS's refusal. A `vault:` source was refused when set.
 - *Left.*
   - Environment secrets after approval, `SecretsFor` (R04, AC07), with W15.
   - R07 (kiln actions' declared secrets).
-  - R08 (brokered, W11).
+  - R08's other stores: Vault, Infisical, Doppler, 1Password (their integration kinds first).
   - The UI (W21).
   - AC02 as a route walk, AC06 as an integration test, AC08 (fork pull requests, with W18).
 

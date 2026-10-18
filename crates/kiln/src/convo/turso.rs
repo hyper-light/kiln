@@ -8,19 +8,28 @@ use std::sync::Arc;
 
 use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, Row as TRow, SqliteDialect, Statement, StepResult, Value};
 
-use super::rows::{EventRow, Row};
+use std::collections::HashMap;
+
+use super::rows::{EventRow, RecordRow, Row};
 use super::sql;
-use super::store::{Engine, Kept, Query, SEARCH_MAX};
+use super::store::{Change, Changes, Engine, Kept, Mark, Query, SEARCH_MAX, Took, Unended};
 
 /// How often a statement that finds the database busy tries again, and how long it waits between.
 const BUSY_TRIES: u32 = 50;
 const BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Rows of each kind a feed reads at once.
+const FEED_PAGE: usize = 512;
 
 /// A Turso database file.
 pub struct Turso {
     io: Arc<dyn IO>,
     _db: Arc<Database>,
     conn: Arc<Connection>,
+    /// Who the store is to its peers.
+    id: String,
+    /// The last number given to a write.
+    rev: u64,
 }
 
 fn fail(e: impl std::fmt::Display) -> anyhow::Error {
@@ -47,6 +56,11 @@ fn seq(v: u64) -> Value {
 impl Turso {
     /// The database at `path`, made and migrated as needed.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_at(path, sql::MIGRATIONS.len())
+    }
+
+    /// The database at `path`, migrated as far as schema `schema` (an older kiln's, in tests).
+    fn open_at(path: &Path, schema: usize) -> anyhow::Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -54,9 +68,77 @@ impl Turso {
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
         let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(fail)?;
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
-        let mut t = Self { io, _db: db, conn };
-        t.migrate()?;
+        let mut t = Self { io, _db: db, conn, id: String::new(), rev: 0 };
+        t.migrate(schema)?;
+        if schema < 2 {
+            return Ok(t);
+        }
+        t.id = match t.meta("id")? {
+            Some(id) => id,
+            None => {
+                let id = crate::util::new_id();
+                t.set_meta("id", &id)?;
+                id
+            }
+        };
+        let mut rev = t.meta("rev")?.and_then(|r| r.parse::<u64>().ok()).unwrap_or(0);
+        for q in sql::REV_MAX {
+            rev = rev.max(t.one_int(q, &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0));
+        }
+        t.rev = rev;
         Ok(t)
+    }
+
+    fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let mut stmt = self.prepare(sql::META_GET)?;
+        let mut out = None;
+        self.run(&mut stmt, &[Value::from_text(key.to_owned())], |r| {
+            out = r.get::<String>(0).ok();
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut stmt = self.prepare(sql::META_SET)?;
+        self.run(&mut stmt, &[Value::from_text(key.to_owned()), Value::from_text(value.to_owned())], |_| Ok(()))
+    }
+
+    /// The first column of the first row a query answers, as a number (None: no row, or NULL).
+    fn one_int(&self, sql: &str, params: &[Value]) -> anyhow::Result<Option<i64>> {
+        let mut stmt = self.prepare(sql)?;
+        let mut out = None;
+        self.run(&mut stmt, params, |r| {
+            if out.is_none() {
+                out = r.get::<i64>(0).ok();
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// `f` in one transaction: committed when it returns Ok, rolled back otherwise. The store's
+    /// last number is kept with what it wrote.
+    fn transaction<T>(&mut self, f: impl FnOnce(&mut Self) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let before = self.rev;
+        self.exec("BEGIN")?;
+        let done = f(self).and_then(|v| {
+            if self.rev != before {
+                self.set_meta("rev", &self.rev.to_string())?;
+            }
+            Ok(v)
+        });
+        match done {
+            Ok(v) => {
+                self.exec("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.exec("ROLLBACK");
+                self.rev = before;
+                Err(e)
+            }
+        }
     }
 
     /// Statements that answer nothing, one after another.
@@ -103,7 +185,7 @@ impl Turso {
         }
     }
 
-    fn migrate(&mut self) -> anyhow::Result<()> {
+    fn migrate(&mut self, schema: usize) -> anyhow::Result<()> {
         self.exec(sql::META)?;
         let mut get = self.prepare(sql::SCHEMA_GET)?;
         let mut have = 0usize;
@@ -111,7 +193,7 @@ impl Turso {
             have = r.get::<String>(0).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
             Ok(())
         })?;
-        for (i, m) in sql::MIGRATIONS.iter().enumerate().skip(have) {
+        for (i, m) in sql::MIGRATIONS.iter().enumerate().take(schema).skip(have) {
             self.exec("BEGIN")?;
             let done = self.exec(m).and_then(|()| {
                 let mut set = self.prepare(sql::SCHEMA_SET)?;
@@ -172,55 +254,299 @@ fn like(word: &str) -> String {
     p
 }
 
+/// The statements a transaction writes with, prepared once for it.
+struct Writes {
+    session: Statement,
+    open: Statement,
+    close: Statement,
+    event: Statement,
+    reset: Statement,
+    dropped: Statement,
+    record: Statement,
+    records_reset: Statement,
+}
+
+fn txt(s: &str) -> Value {
+    Value::from_text(s.to_owned())
+}
+
+impl Turso {
+    fn writes(&self) -> anyhow::Result<Writes> {
+        Ok(Writes {
+            session: self.prepare(sql::SESSION_UPSERT)?,
+            open: self.prepare(sql::SESSION_OPEN)?,
+            close: self.prepare(sql::SESSION_CLOSE)?,
+            event: self.prepare(sql::EVENT_UPSERT)?,
+            reset: self.prepare(sql::EVENTS_RESET)?,
+            dropped: self.prepare(sql::DROP_ADD)?,
+            record: self.prepare(sql::RECORD_UPSERT)?,
+            records_reset: self.prepare(sql::RECORDS_RESET)?,
+        })
+    }
+
+    /// One row, as write number `rev`.
+    fn write(&self, w: &mut Writes, row: &Row, rev: u64) -> anyhow::Result<()> {
+        let r = seq(rev);
+        let none = |_: &TRow| Ok(());
+        match row {
+            Row::Session { session, info, meta, state, changes, epoch, open, at } => {
+                self.run(
+                    &mut w.session,
+                    &[txt(session), text(info.as_deref()), text(meta.as_deref()), text(state.as_deref()), text(changes.as_deref()), int(*at), seq(epoch.unwrap_or(0)), r],
+                    none,
+                )?;
+                if *open {
+                    self.run(&mut w.open, &[txt(session)], none)?;
+                }
+            }
+            Row::Event(e) => self.run(
+                &mut w.event,
+                &[
+                    txt(&e.session),
+                    txt(&e.id),
+                    seq(e.seq),
+                    int(e.at),
+                    text(e.parent.as_deref()),
+                    text(e.by.as_deref()),
+                    txt(&e.kind),
+                    text(e.level.as_deref()),
+                    text(e.tool.as_deref()),
+                    text(e.status.as_deref()),
+                    txt(&e.text),
+                    txt(&e.body),
+                    r,
+                ],
+                none,
+            )?,
+            Row::Reset { session, from, at } => {
+                self.run(&mut w.reset, &[txt(session), seq(from.unwrap_or(0))], none)?;
+                self.run(&mut w.dropped, &[r, txt(session), txt("events"), Value::Null, from.map_or(Value::Null, seq), int(*at)], none)?;
+            }
+            Row::Closed { session, at } => self.run(&mut w.close, &[txt(session), int(*at), r], none)?,
+            Row::Record(rec) => self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), txt(&rec.line), r], none)?,
+            Row::RecordReset { session, source, at } => {
+                self.run(&mut w.records_reset, &[txt(session), txt(source)], none)?;
+                self.run(&mut w.dropped, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The epoch this store has for `session` (0: none yet).
+    fn epoch_of(&self, session: &str) -> anyhow::Result<u64> {
+        Ok(self.one_int(sql::SESSION_EPOCH, &[txt(session)])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
+    }
+
+    /// Rows of one kind after `from` (a page of them), each as `(rev, session, rows)`.
+    fn feed_page(&self, sql: &str, from: u64, each: impl Fn(&TRow) -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)>) -> anyhow::Result<Vec<(u64, String, Vec<Row>, Option<u64>)>> {
+        let mut stmt = self.prepare(sql)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[seq(from), int(i64::try_from(FEED_PAGE).unwrap_or(512))], |r| {
+            out.push(each(r)?);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+fn u(r: &TRow, i: usize) -> u64 {
+    r.get::<i64>(i).ok().and_then(|n| u64::try_from(n).ok()).unwrap_or(0)
+}
+
 impl Engine for Turso {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
-        self.exec("BEGIN")?;
-        let written = (|| -> anyhow::Result<()> {
-            let mut upsert_session = self.prepare(sql::SESSION_UPSERT)?;
-            let mut upsert_event = self.prepare(sql::EVENT_UPSERT)?;
-            let mut reset = self.prepare(sql::EVENTS_RESET)?;
-            let mut close = self.prepare(sql::SESSION_CLOSE)?;
+        self.transaction(|t| {
+            let mut w = t.writes()?;
             for row in rows {
-                match row {
-                    Row::Session { session, info, meta, state, changes, at } => self.run(
-                        &mut upsert_session,
-                        &[Value::from_text(session.clone()), text(info.as_deref()), text(meta.as_deref()), text(state.as_deref()), text(changes.as_deref()), int(*at)],
-                        |_| Ok(()),
-                    )?,
-                    Row::Event(e) => self.run(
-                        &mut upsert_event,
-                        &[
-                            Value::from_text(e.session.clone()),
-                            Value::from_text(e.id.clone()),
-                            seq(e.seq),
-                            int(e.at),
-                            text(e.parent.as_deref()),
-                            text(e.by.as_deref()),
-                            Value::from_text(e.kind.clone()),
-                            text(e.level.as_deref()),
-                            text(e.tool.as_deref()),
-                            text(e.status.as_deref()),
-                            Value::from_text(e.text.clone()),
-                            Value::from_text(e.body.clone()),
-                        ],
-                        |_| Ok(()),
-                    )?,
-                    Row::Reset { session, .. } => self.run(&mut reset, &[Value::from_text(session.clone())], |_| Ok(()))?,
-                    Row::Closed { session, at } => self.run(&mut close, &[Value::from_text(session.clone()), int(*at)], |_| Ok(()))?,
-                }
+                t.rev += 1;
+                t.write(&mut w, row, t.rev)?;
             }
             Ok(())
-        })();
-        match written {
-            Ok(()) => self.exec("COMMIT"),
-            Err(e) => {
-                let _ = self.exec("ROLLBACK");
-                Err(e)
+        })
+    }
+
+    fn changes(&mut self, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
+        if from >= self.rev {
+            return Ok(Changes { rows: Vec::new(), upto: from });
+        }
+        let s = |r: &TRow, i: usize| r.get::<String>(i).ok();
+        // Each kind's rows after `from`: (rev, session, the rows it makes, its epoch if it says).
+        let pages = [
+            self.feed_page(sql::FEED_SESSIONS, from, |r| {
+                let id = s(r, 0).unwrap_or_default();
+                let epoch = u(r, 7);
+                let closed = r.get::<i64>(6).ok();
+                let mut rows = vec![Row::Session { session: id.clone(), info: s(r, 1), meta: s(r, 2), state: s(r, 3), changes: s(r, 4), epoch: Some(epoch), open: closed.is_none(), at: r.get::<i64>(5).unwrap_or(0) }];
+                if let Some(at) = closed {
+                    rows.push(Row::Closed { session: id.clone(), at });
+                }
+                Ok((u(r, 8), id, rows, Some(epoch)))
+            })?,
+            self.feed_page(sql::FEED_EVENTS, from, |r| {
+                let e = event_of(r)?;
+                Ok((u(r, 12), e.session.clone(), vec![Row::Event(Box::new(e))], None))
+            })?,
+            self.feed_page(sql::FEED_RECORDS, from, |r| {
+                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line: s(r, 4).unwrap_or_default() };
+                Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
+            })?,
+            self.feed_page(sql::FEED_DROPS, from, |r| {
+                let session = s(r, 1).unwrap_or_default();
+                let at = r.get::<i64>(5).unwrap_or(0);
+                let row = match s(r, 2).as_deref() {
+                    Some("record") => Row::RecordReset { session: session.clone(), source: s(r, 3).unwrap_or_default(), at },
+                    _ => Row::Reset { session: session.clone(), from: r.get::<i64>(4).ok().and_then(|n| u64::try_from(n).ok()), at },
+                };
+                Ok((u(r, 0), session, vec![row], None))
+            })?,
+        ];
+        // Complete through `bound`: a kind that filled its page may have more after its last.
+        let mut bound = self.rev;
+        for p in &pages {
+            if p.len() >= FEED_PAGE
+                && let Some((last, ..)) = p.last()
+            {
+                bound = bound.min(*last);
             }
         }
+        let mut all: Vec<(u64, String, Vec<Row>, Option<u64>)> = pages.into_iter().flatten().filter(|(rev, ..)| *rev <= bound).collect();
+        all.sort_by_key(|(rev, ..)| *rev);
+        let mut epochs: HashMap<String, u64> = HashMap::new();
+        let mut out = Changes { rows: Vec::new(), upto: bound };
+        let mut bytes = 0usize;
+        for (rev, session, rows, epoch) in all {
+            if bytes >= max_bytes && !out.rows.is_empty() {
+                // The rest next time: read through the last one taken.
+                out.upto = out.rows.last().map_or(from, |c| c.rev);
+                break;
+            }
+            let epoch = match epoch {
+                Some(e) => e,
+                None => match epochs.get(&session) {
+                    Some(e) => *e,
+                    None => {
+                        let e = self.epoch_of(&session)?;
+                        epochs.insert(session.clone(), e);
+                        e
+                    }
+                },
+            };
+            for row in rows {
+                bytes += row.bytes();
+                out.rows.push(Change { rev, epoch, row });
+            }
+        }
+        Ok(out)
+    }
+
+    fn take(&mut self, peer: &str, machine: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        let have = self.peer(peer)?;
+        if from != have || batch.upto < from {
+            return Ok(Took { rev: have, gap: true, ..Took::default() });
+        }
+        let now = crate::util::now_ms();
+        let (peer, machine) = (peer.to_owned(), machine.to_owned());
+        self.transaction(|t| {
+            let mut w = t.writes()?;
+            let mut epochs: HashMap<String, u64> = HashMap::new();
+            let mut took = Took { rev: batch.upto, ..Took::default() };
+            for c in &batch.rows {
+                let session = c.row.session();
+                let current = match epochs.get(session) {
+                    Some(e) => *e,
+                    None => {
+                        let e = t.epoch_of(session)?;
+                        epochs.insert(session.to_owned(), e);
+                        e
+                    }
+                };
+                // A former writer's rows (it moved on elsewhere) never count again.
+                if c.epoch < current {
+                    took.fenced += 1;
+                    continue;
+                }
+                if c.epoch > current {
+                    // Its new writer, from here on: said before its rows (it may be new here).
+                    t.rev += 1;
+                    let r = t.rev;
+                    t.run(&mut w.session, &[txt(session), Value::Null, Value::Null, Value::Null, Value::Null, int(now), seq(c.epoch), seq(r)], |_| Ok(()))?;
+                    epochs.insert(session.to_owned(), c.epoch);
+                }
+                t.rev += 1;
+                let r = t.rev;
+                t.write(&mut w, &c.row, r)?;
+                took.applied += 1;
+            }
+            // Where each session it brought runs: the machine of this feed (a former writer's
+            // rows, left out, don't say so).
+            let mut at = t.prepare(sql::SESSION_MACHINE)?;
+            for (session, epoch) in &epochs {
+                let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
+                if theirs {
+                    t.run(&mut at, &[txt(session), txt(&machine)], |_| Ok(()))?;
+                }
+            }
+            let mut set = t.prepare(sql::PEER_SET)?;
+            t.run(&mut set, &[txt(&peer), seq(batch.upto), int(now)], |_| Ok(()))?;
+            Ok(took)
+        })
+    }
+
+    fn peer(&mut self, peer: &str) -> anyhow::Result<u64> {
+        Ok(self.one_int(sql::PEER_GET, &[txt(peer)])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
+    }
+
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        let mut sources = self.prepare(sql::RECORD_SOURCES)?;
+        let mut last: Vec<(String, u64)> = Vec::new();
+        self.run(&mut sources, &[txt(session)], |r| {
+            if let Ok(src) = r.get::<String>(0) {
+                last.push((src, u(r, 1)));
+            }
+            Ok(())
+        })?;
+        let mut line = self.prepare(sql::RECORD_LINE)?;
+        let mut out = Vec::new();
+        for (source, n) in last {
+            let mut found = None;
+            self.run(&mut line, &[txt(session), txt(&source), seq(n)], |r| {
+                found = Some((u(r, 0), r.get::<String>(1).unwrap_or_default()));
+                Ok(())
+            })?;
+            if let Some((end, l)) = found {
+                out.push(Mark { source, n, end, line: l });
+            }
+        }
+        Ok(out)
+    }
+
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        let mut stmt = self.prepare(sql::RECORD_LINES)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[txt(session), txt(source), seq(from), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
+            out.push((u(r, 0), r.get::<String>(1).unwrap_or_default()));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[int(since)], |r| {
+            if let (Ok(id), Ok(info)) = (r.get::<String>(0), r.get::<String>(1)) {
+                out.push(Unended { id, info, meta: r.get::<String>(2).ok(), state: r.get::<String>(3).ok(), machine: r.get::<String>(4).ok() });
+            }
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
@@ -286,8 +612,58 @@ mod tests {
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event, State};
 
+    fn seq_v(v: u64) -> Value {
+        super::seq(v)
+    }
+
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    #[test]
+    fn a_store_from_before_revisions_gets_them_and_its_feed_sends_everything_it_kept() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("conversations.db");
+        {
+            // Schema 1, as C1 left it, with what C1 kept.
+            let old = Turso::open_at(&path, 1)?;
+            let a = |id: &str, seq: u64| super::super::rows::of("a1", &said(id, seq, id), 5).into_iter().next();
+            old.exec("BEGIN")?;
+            for sql in [
+                "INSERT INTO sessions (id, info, state, updated_at) VALUES ('a1', '{}', '{\"title\":\"old\"}', 5)",
+                "INSERT INTO sessions (id, info, updated_at, closed_at) VALUES ('a2', '{}', 6, 7)",
+            ] {
+                old.exec(sql)?;
+            }
+            old.exec("COMMIT")?;
+            let mut up = old.prepare("INSERT INTO events (session, id, seq, at, kind, text, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
+            for (id, seq) in [("m1", 1u64), ("m2", 2)] {
+                let Some(Row::Event(e)) = a(id, seq) else { anyhow::bail!("no event row") };
+                old.run(&mut up, &[txt(&e.session), txt(&e.id), seq_v(e.seq), int(e.at), txt(&e.kind), txt(&e.text), txt(&e.body)], |_| Ok(()))?;
+            }
+        }
+        let mut t = Turso::open(&path)?;
+        assert!(!t.id().is_empty());
+        let all = t.changes(0, 1 << 20)?;
+        let mut kinds: Vec<String> = all.rows.iter().map(|c| format!("{}:{}", c.row.session(), match &c.row { Row::Session { .. } => "session", Row::Closed { .. } => "closed", Row::Event(_) => "event", _ => "other" })).collect();
+        kinds.sort();
+        assert_eq!(kinds, vec!["a1:event", "a1:event", "a1:session", "a2:closed", "a2:session"]);
+        // Numbers of their own, none twice, and what's written next comes after them.
+        let mut revs: Vec<u64> = all.rows.iter().filter(|c| !matches!(c.row, Row::Closed { .. })).map(|c| c.rev).collect();
+        revs.dedup();
+        assert_eq!(revs.len(), 4);
+        let top = all.upto;
+        t.apply(&[Row::Event(Box::new(super::super::rows::event("a1", &Event { id: "m3".into(), seq: 3, at: 9, parent: None, by: None, body: Body::Assistant { text: "new".into(), streaming: false } }).ok_or_else(|| anyhow::anyhow!("no row"))?))])?;
+        let next = t.changes(top, 1 << 20)?;
+        assert_eq!(next.rows.len(), 1);
+        assert!(next.rows.iter().all(|c| c.rev > top));
+        // Reopened: the same id, and numbering goes on.
+        let id = t.id();
+        drop(t);
+        let t = Turso::open(&path)?;
+        assert_eq!(t.id(), id);
+        assert_eq!(t.rev, next.upto);
+        Ok(())
     }
 
     #[test]
@@ -303,7 +679,7 @@ mod tests {
             store.send("a1", &said("m7", 7, "reply seven, revised"));
             store.send("a2", &said("x1", 1, "unrelated"));
             store.send("a3", &said("y1", 1, "one"));
-            store.send("a3", &Update::Reset);
+            store.send("a3", &Update::Reset { from: None });
             store.send("a3", &said("y2", 2, "two"));
             store.sync()?;
             let k = store.kept("a1", 10)?.ok_or_else(|| anyhow::anyhow!("nothing kept"))?;

@@ -179,6 +179,10 @@ it, mid-conversation, to another runner that has its harness installed and takes
 of it is lost on the way, and nothing waits on a person: what is sent meanwhile waits in kiln's queue
 and is answered over there.
 
+When the agent's machine is away, it can't hand the agent over. The move then goes on from the
+server's copy of the conversation instead, its transcript included (`{"from_store": true}`; see
+[conversations.md](conversations.md), "Resuming on another machine").
+
 1. **The folder** (`harness/relocate.rs`, on the server). An agent working in a git repository goes
    on in that repository's copy on the other machine, kept in step by sync (*Repositories on
    machines*, [sync.md](sync.md)): a copy there already, or one a sync task makes now — the source's

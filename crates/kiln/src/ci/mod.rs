@@ -4,6 +4,7 @@
 
 pub mod actions;
 pub mod api;
+pub mod broker;
 pub mod cli;
 pub mod compare;
 pub mod dispatch;

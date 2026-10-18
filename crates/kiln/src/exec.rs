@@ -26,6 +26,9 @@ pub enum Up {
     /// Reach links (`crate::reach`), on their own lane: never buffered across a disconnect (a link
     /// does not outlive the connection; its runs resume on the next one).
     Reach(AgentMsg),
+    /// The conversation feed (`crate::convo::feed`), on its own lane: never buffered across a
+    /// disconnect (the feed goes on from what the server says it has, on the next connection).
+    Convo(AgentMsg),
 }
 
 #[derive(Clone)]

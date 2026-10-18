@@ -34,9 +34,11 @@ impl Owned {
             | ServerMsg::TermResize { session, .. }
             | ServerMsg::TermClose { session }
             | ServerMsg::TermAttach { session } => Some(Self::Terminal(session.clone())),
-            ServerMsg::HarnessOpen { session, .. } | ServerMsg::HarnessCmd { session, .. } | ServerMsg::HarnessClose { session } => {
-                Some(Self::Agent(session.clone()))
-            }
+            ServerMsg::HarnessOpen { session, .. }
+            | ServerMsg::HarnessCmd { session, .. }
+            | ServerMsg::HarnessClose { session }
+            | ServerMsg::HarnessPackage { session, .. }
+            | ServerMsg::HarnessRelease { session } => Some(Self::Agent(session.clone())),
             ServerMsg::Assign(a) => Some(Self::Job(a.job_id.clone())),
             // The CI engine's assignment carries its leg's id inside its JSON (docs/ci.md §2.5).
             ServerMsg::AssignV2 { json } => assign_v2_job(json).map(Self::Job),
@@ -47,7 +49,7 @@ impl Owned {
 
     /// Messages that create the thing: whoever they are sent to owns it from then on.
     fn creates(msg: &ServerMsg) -> bool {
-        matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. } | ServerMsg::Assign(_) | ServerMsg::AssignV2 { .. })
+        matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. } | ServerMsg::HarnessPackage { .. } | ServerMsg::Assign(_) | ServerMsg::AssignV2 { .. })
     }
 }
 

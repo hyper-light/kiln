@@ -221,7 +221,17 @@ mod tests {
         assert_eq!(sweep(&root, 1000), 1);
         assert!(theirs.exists() && !stale.exists() && !lock_path(&stale).exists());
         drop(held);
-        assert_eq!(sweep(&root, 1000), 1, "once that leg ended");
+        // A process another test forks meanwhile holds a copy of the lock until it executes its
+        // program: for a moment the lock may still look held (the next sweep takes it then).
+        let mut swept = 0;
+        for _ in 0..200 {
+            swept += sweep(&root, 1000);
+            if swept > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(swept, 1, "once that leg ended");
         assert!(!theirs.exists() && !lock_path(&theirs).exists());
         Ok(())
     }

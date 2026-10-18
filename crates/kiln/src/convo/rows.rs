@@ -26,14 +26,46 @@ pub enum Row {
         state: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         changes: Option<String>,
+        /// Its writer's epoch ([`State::epoch`](crate::harness::model::State::epoch)), from its
+        /// state (None: unchanged). Epochs only rise: a session that moves counts one more.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
+        /// It (re)started: it isn't closed, whatever was kept.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open: bool,
         at: i64,
     },
     /// An event as it is now (upserted by id).
     Event(Box<EventRow>),
-    /// The timeline starts over (a rewind): the session's events go, those after come anew.
-    Reset { session: String, at: i64 },
+    /// The timeline starts over (a restart, a move, a rewind): the session's events from number
+    /// `from` on go (all of them: None), and those the snapshot after it brings come anew. Those
+    /// before `from` stay: the timeline no longer holds them in memory, but they are its history.
+    Reset {
+        session: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<u64>,
+        at: i64,
+    },
     /// The session is gone for good.
     Closed { session: String, at: i64 },
+    /// A line of the harness's own record of the conversation.
+    Record(Box<RecordRow>),
+    /// The harness's record from `source` starts over (its file was replaced): its lines go.
+    RecordReset { session: String, source: String, at: i64 },
+}
+
+/// A line of the harness's record: Claude Code's transcript, a Codex rollout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordRow {
+    pub session: String,
+    /// The file it is from: Claude Code's session id; a Codex rollout's file name.
+    pub source: String,
+    /// Its number among the file's non-empty lines, from 0 (a move carries those alone, so a
+    /// copy on another machine numbers them alike).
+    pub n: u64,
+    /// The byte just past it in the file: where reading goes on.
+    pub end: u64,
+    pub line: String,
 }
 
 /// An event, with what it is found by pulled out of its body.
@@ -67,8 +99,19 @@ pub struct EventRow {
 impl Row {
     pub fn session(&self) -> &str {
         match self {
-            Row::Session { session, .. } | Row::Reset { session, .. } | Row::Closed { session, .. } => session,
+            Row::Session { session, .. } | Row::Reset { session, .. } | Row::Closed { session, .. } | Row::RecordReset { session, .. } => session,
             Row::Event(e) => &e.session,
+            Row::Record(r) => &r.session,
+        }
+    }
+
+    /// Its size as a feed sends it, near enough.
+    pub fn bytes(&self) -> usize {
+        match self {
+            Row::Session { info, meta, state, changes, .. } => 64 + [info, meta, state, changes].iter().map(|p| p.as_ref().map_or(0, String::len)).sum::<usize>(),
+            Row::Event(e) => 128 + e.text.len() + e.body.len(),
+            Row::Record(r) => 64 + r.source.len() + r.line.len(),
+            Row::Reset { .. } | Row::Closed { .. } | Row::RecordReset { .. } => 64,
         }
     }
 }
@@ -78,12 +121,12 @@ impl Row {
 pub fn of(session: &str, update: &Update, now: i64) -> Vec<Row> {
     let s = || session.to_owned();
     match update {
-        Update::Open { info } => vec![Row::Session { session: s(), info: json(info.as_ref()), meta: None, state: None, changes: None, at: now }],
-        Update::State { state } => vec![Row::Session { session: s(), info: None, meta: None, state: json(state.as_ref()), changes: None, at: now }],
-        Update::Meta { meta } => vec![Row::Session { session: s(), info: None, meta: json(meta.as_ref()), state: None, changes: None, at: now }],
-        Update::Changes { files } => vec![Row::Session { session: s(), info: None, meta: None, state: None, changes: json(files), at: now }],
+        Update::Open { info } => vec![Row::Session { session: s(), info: json(info.as_ref()), meta: None, state: None, changes: None, epoch: None, open: true, at: now }],
+        Update::State { state } => vec![Row::Session { session: s(), info: None, meta: None, state: json(state.as_ref()), changes: None, epoch: Some(state.epoch), open: false, at: now }],
+        Update::Meta { meta } => vec![Row::Session { session: s(), info: None, meta: json(meta.as_ref()), state: None, changes: None, epoch: None, open: false, at: now }],
+        Update::Changes { files } => vec![Row::Session { session: s(), info: None, meta: None, state: None, changes: json(files), epoch: None, open: false, at: now }],
         Update::Events { events } => events.iter().filter_map(|e| event(session, e)).map(|e| Row::Event(Box::new(e))).collect(),
-        Update::Reset => vec![Row::Reset { session: s(), at: now }],
+        Update::Reset { from } => vec![Row::Reset { session: s(), from: *from, at: now }],
         Update::Closed => vec![Row::Closed { session: s(), at: now }],
         Update::Stream { .. } | Update::Reply { .. } => Vec::new(),
     }
@@ -149,11 +192,11 @@ pub fn coalesce(rows: Vec<Row>) -> Vec<Row> {
                 last.insert(key, out.len());
                 out.push(Some(row));
             }
-            Row::Session { session, info, meta, state, changes, at } => {
+            Row::Session { session, info, meta, state, changes, epoch, open, at } => {
                 let key = (session.clone(), "s".to_owned());
                 // A later part replaces the same part; the others carry over.
                 if let Some(i) = last.get(&key).copied()
-                    && let Some(Some(Row::Session { info: i0, meta: m0, state: s0, changes: c0, .. })) = out.get_mut(i).map(Option::take)
+                    && let Some(Some(Row::Session { info: i0, meta: m0, state: s0, changes: c0, epoch: e0, open: o0, .. })) = out.get_mut(i).map(Option::take)
                 {
                     let merged = Row::Session {
                         session: session.clone(),
@@ -161,6 +204,8 @@ pub fn coalesce(rows: Vec<Row>) -> Vec<Row> {
                         meta: meta.clone().or(m0),
                         state: state.clone().or(s0),
                         changes: changes.clone().or(c0),
+                        epoch: epoch.or(e0),
+                        open: *open || o0,
                         at: *at,
                     };
                     last.insert(key, out.len());
@@ -170,9 +215,38 @@ pub fn coalesce(rows: Vec<Row>) -> Vec<Row> {
                 last.insert(key, out.len());
                 out.push(Some(row));
             }
-            Row::Reset { session, .. } | Row::Closed { session, .. } => {
+            Row::Record(r) => {
+                let key = (r.session.clone(), format!("r:{}:{}", r.source, r.n));
+                if let Some(i) = last.get(&key).copied()
+                    && let Some(slot) = out.get_mut(i)
+                {
+                    *slot = None;
+                }
+                last.insert(key, out.len());
+                out.push(Some(row));
+            }
+            Row::RecordReset { session, source, .. } => {
+                // Its lines before it go with it: the reset would drop them anyway.
+                let prefix = format!("r:{source}:");
+                let s = session.clone();
+                last.retain(|(sess, k), i| {
+                    let cut = sess == &s && k.starts_with(&prefix);
+                    if cut && let Some(slot) = out.get_mut(*i) {
+                        *slot = None;
+                    }
+                    !cut
+                });
+                out.push(Some(row));
+            }
+            Row::Reset { session, .. } => {
                 let s = session.clone();
                 last.retain(|(sess, k), _| !(sess == &s && k.starts_with("e:")));
+                out.push(Some(row));
+            }
+            Row::Closed { session, .. } => {
+                // A part after the close is the session's next life (reopened): it stays after it.
+                let s = session.clone();
+                last.retain(|(sess, k), _| !(sess == &s && (k.starts_with("e:") || k == "s")));
                 out.push(Some(row));
             }
         }
@@ -276,7 +350,7 @@ mod tests {
     fn a_reset_cuts_what_came_before_it() {
         let a = |id: &str| Update::Events { events: vec![ev(id, 1, Body::Assistant { text: id.into(), streaming: false })] };
         let mut rows = of("a1", &a("m1"), 1);
-        rows.extend(of("a1", &Update::Reset, 2));
+        rows.extend(of("a1", &Update::Reset { from: None }, 2));
         rows.extend(of("a1", &a("m1"), 3));
         let out = coalesce(rows);
         // The event before the reset stays (the reset drops it in the store), and the one after
