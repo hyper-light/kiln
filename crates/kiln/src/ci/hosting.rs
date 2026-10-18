@@ -10,13 +10,18 @@
 //!     queue, unless `direct-push` there names the pusher; an empty repository takes its first
 //!     trunk from anyone who may push;
 //!   - other branches need `diffs.submit` (a leg: `contents: write`), tags `diffs.land`
-//!     (`contents: write`), and `refs/for/*` waits for diffs (W14-R03); kiln's own refs are kiln's.
+//!     (`contents: write`); kiln's own refs are kiln's;
+//!   - `refs/for/<trunk>` (`diffs.submit`) takes the commits between the trunk and the one pushed
+//!     as diffs (W14-R03, [`super::diffs`]): git stores them, kiln makes the diffs, git's report
+//!     says how it went with a link to each, and the ref itself is never kept.
 //!
 //! A native repository's row says so (`mode`), and its clone URL is its bare repository, so the
 //! mirror, polling and events of upstream repositories serve it too; a push wakes the poller at
 //! once.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use http::StatusCode;
 use serde::Deserialize;
@@ -77,9 +82,11 @@ pub async fn create(hub: &Hub, name: &str, branch: &str, import: Option<&str>) -
             crate::gitops::run_git(hub, &["init", "--quiet", "--bare", &format!("--initial-branch={branch}"), &p], crate::gitops::LS_REMOTE_TIMEOUT).await?;
         }
     }
-    // Every ref a push brings is kept; nothing is pruned behind kiln's back.
-    crate::gitops::run_git(hub, &["-C", &p, "config", "receive.denyNonFastForwards", "false"], crate::gitops::LS_REMOTE_TIMEOUT).await?;
-    crate::gitops::run_git(hub, &["-C", &p, "config", "gc.auto", "0"], crate::gitops::LS_REMOTE_TIMEOUT).await?;
+    // Every ref a push brings is kept; nothing is pruned behind kiln's back. The mirror fetches
+    // a diff's versions by their commits.
+    for (k, v) in [("receive.denyNonFastForwards", "false"), ("gc.auto", "0"), ("uploadpack.allowAnySHA1InWant", "true"), ("receive.advertisePushOptions", "true")] {
+        crate::gitops::run_git(hub, &["-C", &p, "config", k, v], crate::gitops::LS_REMOTE_TIMEOUT).await?;
+    }
     Ok(path)
 }
 
@@ -136,34 +143,133 @@ pub fn commands(body: &[u8]) -> Result<Option<(Vec<Update>, Vec<String>, usize)>
     }
 }
 
+/// The push options that follow a receive-pack request's commands (when the client sends them,
+/// `push-options`): pkt-lines to a flush, and how many bytes they took; `None` until all there.
+pub fn push_options(body: &[u8]) -> Result<Option<(Vec<String>, usize)>, String> {
+    let (mut at, mut out) = (0usize, Vec::new());
+    loop {
+        let Some(len) = body.get(at..at + 4) else { return Ok(None) };
+        let len = std::str::from_utf8(len).ok().and_then(|h| usize::from_str_radix(h, 16).ok()).ok_or("a malformed pkt-line")?;
+        if len == 0 {
+            return Ok(Some((out, at + 4)));
+        }
+        if len < 4 {
+            return Err("a malformed pkt-line".into());
+        }
+        let Some(line) = body.get(at + 4..at + len) else { return Ok(None) };
+        out.push(String::from_utf8_lossy(line).trim_end_matches('\n').to_owned());
+        at += len;
+    }
+}
+
 fn pkt(payload: &[u8]) -> Vec<u8> {
     let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
     out.extend_from_slice(payload);
     out
 }
 
-/// A receive-pack answer refusing `updates`, `why` each (and said once to the person pushing),
-/// in the bands the client asked for.
-pub fn refusal(updates: &[(Update, String)], caps: &[String], message: &str) -> Vec<u8> {
-    let mut report = pkt(b"unpack ok\n");
-    for (u, why) in updates {
-        report.extend(pkt(format!("ng {} {why}\n", u.name).as_bytes()));
+/// The payloads of `buf`'s pkt-lines, `None` for a flush (or a delimiter); to the end, or to
+/// framing that doesn't read.
+fn pkt_lines(buf: &[u8]) -> Vec<Option<&[u8]>> {
+    let (mut out, mut at) = (Vec::new(), 0usize);
+    while let Some(h) = buf.get(at..at + 4) {
+        let Some(len) = std::str::from_utf8(h).ok().and_then(|h| usize::from_str_radix(h, 16).ok()) else { break };
+        if len < 4 {
+            out.push(None);
+            at += 4;
+            continue;
+        }
+        let Some(p) = buf.get(at + 4..at + len) else { break };
+        out.push(Some(p));
+        at += len;
+    }
+    out
+}
+
+/// The most data a side-band packet carries for the client's capabilities (`side-band-64k`,
+/// `side-band`); `None`: the client takes the report alone.
+pub fn band_of(caps: &[String]) -> Option<usize> {
+    if caps.iter().any(|c| c == "side-band-64k") {
+        Some(65_515)
+    } else if caps.iter().any(|c| c == "side-band") {
+        Some(995)
+    } else {
+        None
+    }
+}
+
+/// A receive-pack answer, read: what it said along the way (its band 2 and 3 packets, as they
+/// came), and its report's lines (`unpack ok`, `ok <ref>`, `ng <ref> <why>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Report {
+    pub said: Vec<Vec<u8>>,
+    pub lines: Vec<String>,
+}
+
+pub fn read_report(body: &[u8], banded: bool) -> Report {
+    let mut r = Report::default();
+    let inner: Vec<u8> = if banded {
+        let mut inner = Vec::new();
+        for p in pkt_lines(body).into_iter().flatten() {
+            match p.first() {
+                Some(1) => inner.extend_from_slice(p.get(1..).unwrap_or_default()),
+                Some(2 | 3) => r.said.push(p.to_vec()),
+                _ => {}
+            }
+        }
+        inner
+    } else {
+        body.to_vec()
+    };
+    for p in pkt_lines(&inner) {
+        match p {
+            Some(l) => r.lines.push(String::from_utf8_lossy(l).trim_end_matches('\n').to_owned()),
+            None => break,
+        }
+    }
+    r
+}
+
+/// `r` as the client reads it, `extra` said after what git said (as `kiln: …` lines), in the
+/// bands it asked for (`band`, from [`band_of`]).
+pub fn write_report(r: &Report, extra: &[String], band: Option<usize>) -> Vec<u8> {
+    let mut report = Vec::new();
+    for l in &r.lines {
+        report.extend(pkt(format!("{l}\n").as_bytes()));
     }
     report.extend_from_slice(b"0000");
-    if !caps.iter().any(|c| c == "side-band-64k" || c == "side-band") {
-        return report;
-    }
+    let Some(max) = band else { return report };
     let mut out = Vec::new();
-    for line in message.lines() {
-        out.extend(pkt(format!("\x02kiln: {line}\n").as_bytes()));
+    for s in &r.said {
+        out.extend(pkt(s));
     }
-    for chunk in report.chunks(65_000) {
-        let mut band = vec![1u8];
-        band.extend_from_slice(chunk);
-        out.extend(pkt(&band));
+    for l in extra {
+        let line = format!("\x02kiln: {l}\n");
+        out.extend(pkt(line.as_bytes().get(..max + 1).unwrap_or(line.as_bytes())));
+    }
+    for chunk in report.chunks(max) {
+        let mut b = vec![1u8];
+        b.extend_from_slice(chunk);
+        out.extend(pkt(&b));
     }
     out.extend_from_slice(b"0000");
     out
+}
+
+/// A receive-pack answer refusing `updates`, `why` each (and said once to the person pushing),
+/// in the bands the client asked for.
+pub fn refusal(updates: &[(Update, String)], caps: &[String], message: &str) -> Vec<u8> {
+    let mut lines = vec!["unpack ok".to_owned()];
+    lines.extend(updates.iter().map(|(u, why)| format!("ng {} {why}", u.name)));
+    let said: Vec<String> = message.lines().map(str::to_owned).collect();
+    write_report(&Report { said: Vec::new(), lines }, &said, band_of(caps))
+}
+
+/// `refs/for/<trunk>[%opt,opt=v]`: the trunk, and Gerrit's options after `%`.
+pub fn for_ref(name: &str) -> Option<(&str, Vec<String>)> {
+    let rest = name.strip_prefix("refs/for/")?;
+    let (trunk, opts) = rest.split_once('%').unwrap_or((rest, ""));
+    Some((trunk, opts.split(',').map(str::trim).filter(|o| !o.is_empty()).map(str::to_owned).collect()))
 }
 
 /// `.kiln/review.yaml` as a push reads it (W14-R09): the trunks, and who may push to them.
@@ -215,8 +321,17 @@ pub fn refused(pusher: &Pusher, repo: &str, review: &Review, trunks: &[String], 
     if name.starts_with("refs/kiln/") || name.starts_with("refs/pull/") {
         return Some("kiln's own refs aren't pushed".into());
     }
-    if name.starts_with("refs/for/") {
-        return Some("diffs (refs/for/<trunk>) come with W14-R03; push a branch for now".into());
+    if let Some((target, _)) = for_ref(name) {
+        if u.deletes() {
+            return Some("refs/for/<trunk> takes commits to review; there is nothing to delete".into());
+        }
+        if target.contains("/branch/") {
+            return Some("change requests (refs/for/<trunk>/branch/<name>) come with W14-R04; submit diffs to refs/for/<trunk>".into());
+        }
+        if !trunks.iter().any(|t| t == target) {
+            return Some(format!("{target} isn't a trunk: submit to refs/for/<trunk> ({})", trunks.join(", ")));
+        }
+        return (!may("diffs.submit", write)).then(|| "submitting diffs needs `diffs.submit` (a job's token: `contents: write`)".to_owned());
     }
     if let Some(branch) = name.strip_prefix("refs/heads/") {
         // A trunk in another case is the trunk itself where the disk ignores case (macOS, Windows).
@@ -272,9 +387,38 @@ async fn trunks(hub: &Hub, path: &str) -> (Vec<String>, Review) {
     (list, review)
 }
 
+/// More of a push's start: its next chunk, into `head`.
+async fn more(head: &mut Vec<u8>, body: &mut hyper::body::Incoming) -> Result<(), Fail> {
+    if head.len() >= 1 << 20 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "too many ref updates in one push".into()));
+    }
+    match srv::next_chunk(body).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? {
+        Some(chunk) => {
+            head.extend_from_slice(&chunk);
+            Ok(())
+        }
+        None => Err((StatusCode::BAD_REQUEST, "the push ended before its ref updates did".into())),
+    }
+}
+
+/// One push at a time per repository takes `refs/for/*` (the ref is the push's way in, cleared
+/// before and after).
+fn lock_of(repo: &str) -> Arc<async_lock::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Default::default).lock().entry(repo.to_owned()).or_default().clone()
+}
+
+/// Removes `refs/for/*` left by a push that didn't finish.
+async fn clear_for_refs(hub: &Hub, path: &str) {
+    let Ok(out) = crate::gitops::run_git(hub, &["-C", path, "for-each-ref", "--format=%(refname)", "refs/for/"], crate::gitops::LS_REMOTE_TIMEOUT).await else { return };
+    for r in String::from_utf8_lossy(&out).lines().filter(|l| !l.is_empty()) {
+        let _ = crate::gitops::run_git(hub, &["-C", path, "update-ref", "-d", r], crate::gitops::LS_REMOTE_TIMEOUT).await;
+    }
+}
+
 /// `/<owner>/<name>.git/info/refs` and `…/git-upload-pack`, `…/git-receive-pack` of a native
 /// repository.
-pub async fn serve(hub: &Hub, repo: &Repo, path: &Path, tail: &[&str], req: Request) -> Result<Response, Fail> {
+pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req: Request) -> Result<Response, Fail> {
     let Some(who) = pusher(hub, req.headers()).await else { return Ok(unauthorized()) };
     let read = match &who {
         Pusher::Caller(c) => c.is_owner() || c.can("diffs.read", &Scope::Repo { repo: repo.name.clone() }),
@@ -291,10 +435,18 @@ pub async fn serve(hub: &Hub, repo: &Repo, path: &Path, tail: &[&str], req: Requ
     let (Some(root), Some(dir)) = (path.parent(), path.file_name()) else { return Err((StatusCode::INTERNAL_SERVER_ERROR, "the repository's path".into())) };
     let path_info = format!("/{}/{}", dir.to_string_lossy(), tail.join("/"));
     let user = who.name();
-    let configs: &[&str] = if pushing { &["http.receivepack=true"] } else { &["uploadpack.allowAnySHA1InWant=true", "uploadpack.allowFilter=true"] };
+    let configs: &[&str] = if pushing { &["http.receivepack=true", "receive.advertisePushOptions=true"] } else { &["uploadpack.allowAnySHA1InWant=true", "uploadpack.allowFilter=true"] };
     let cgi = super::facade::Cgi { root, path_info: &path_info, configs, user: &user, method: req.method().as_str().to_owned(), query: req.uri().query().unwrap_or_default().to_owned(), headers: req.headers().clone() };
+    let p = path.to_string_lossy().into_owned();
     if !matches!(tail, ["git-receive-pack"]) {
         let body = srv::body_bytes(req.into_body(), 64 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        if !pushing {
+            return super::facade::backend(&cgi, body.to_vec(), None).await;
+        }
+        // A push's advertisement never shows a `refs/for/*` (a client would take it for a branch).
+        let lock = lock_of(&repo.id);
+        let _held = lock.lock().await;
+        clear_for_refs(hub, &p).await;
         return super::facade::backend(&cgi, body.to_vec(), None).await;
     }
     if req.headers().get(http::header::CONTENT_ENCODING).is_some_and(|e| e.as_bytes() != b"identity") {
@@ -303,25 +455,21 @@ pub async fn serve(hub: &Hub, repo: &Repo, path: &Path, tail: &[&str], req: Requ
     // The ref updates, read before git sees any of the push.
     let mut body = req.into_body();
     let mut head: Vec<u8> = Vec::new();
-    let (updates, caps) = loop {
+    let (updates, caps, used) = loop {
         match commands(&head) {
-            Ok(Some((u, c, _))) => break (u, c),
-            Ok(None) => {}
+            Ok(Some(found)) => break found,
+            Ok(None) => more(&mut head, &mut body).await?,
             Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
         }
-        if head.len() >= 1 << 20 {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, "too many ref updates in one push".into()));
-        }
-        match srv::next_chunk(&mut body).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? {
-            Some(chunk) => head.extend_from_slice(&chunk),
-            None => return Err((StatusCode::BAD_REQUEST, "the push ended before its ref updates did".into())),
-        }
     };
-    let p = path.to_string_lossy().into_owned();
     let (trunk_list, review) = trunks(hub, &p).await;
     let branches = crate::gitops::run_git(hub, &["-C", &p, "for-each-ref", "--count=1", "--format=%(refname)", "refs/heads/"], crate::gitops::LS_REMOTE_TIMEOUT).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let empty = branches.iter().all(u8::is_ascii_whitespace);
-    let no: Vec<(Update, String)> = updates.iter().filter_map(|u| refused(&who, &repo.name, &review, &trunk_list, u, empty).map(|why| (u.clone(), why))).collect();
+    let mut no: Vec<(Update, String)> = updates.iter().filter_map(|u| refused(&who, &repo.name, &review, &trunk_list, u, empty).map(|why| (u.clone(), why))).collect();
+    let submitted: Vec<&Update> = updates.iter().filter(|u| u.name.starts_with("refs/for/")).collect();
+    if submitted.len() > 1 {
+        no.extend(submitted.iter().skip(1).map(|u| ((*u).clone(), "one refs/for/<trunk> a push".to_owned())));
+    }
     if !no.is_empty() {
         // Refused whole: what was allowed waits for the rest.
         let mut all: Vec<(Update, String)> = no.clone();
@@ -332,11 +480,83 @@ pub async fn serve(hub: &Hub, repo: &Repo, path: &Path, tail: &[&str], req: Requ
         hub.store.audit(user.clone(), "repo.push".into(), format!("{} refused: {}", repo.name, message.replace('\n', "; "))).await;
         return Ok(srv::response(StatusCode::OK, "application/x-git-receive-pack-result", srv::full(bytes::Bytes::from(refusal(&all, &caps, &message)))));
     }
-    let r = super::facade::backend(&cgi, head, Some(body)).await;
-    hub.store.audit(user, "repo.push".into(), format!("{}: {}", repo.name, updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", "))).await;
-    // The poller takes the new refs now: events, runs.
-    hub.gitops_kick.notify();
-    r
+    let summary = updates.iter().map(|u| format!("{} {}..{}", u.name, short(&u.old), short(&u.new))).collect::<Vec<_>>().join(", ");
+    let Some(target) = submitted.first().map(|u| (*u).clone()) else {
+        let r = super::facade::backend(&cgi, head, Some(body)).await;
+        hub.store.audit(user, "repo.push".into(), format!("{}: {summary}", repo.name)).await;
+        // The poller takes the new refs now: events, runs.
+        hub.gitops_kick.notify();
+        return r;
+    };
+
+    // Diffs (W14-R03): the push's options follow its commands.
+    let mut given: Vec<String> = Vec::new();
+    if caps.iter().any(|c| c == "push-options") {
+        loop {
+            match push_options(head.get(used..).unwrap_or_default()) {
+                Ok(Some((o, _))) => {
+                    given = o;
+                    break;
+                }
+                Ok(None) => more(&mut head, &mut body).await?,
+                Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+            }
+        }
+    }
+    let lock = lock_of(&repo.id);
+    let _held = lock.lock().await;
+    clear_for_refs(hub, &p).await;
+    let answer = super::facade::run(&cgi, head, Some(body)).await?;
+    if answer.status != StatusCode::OK {
+        let status = answer.status;
+        let ctype = answer.content_type.clone();
+        let text = answer.bytes(1 << 20).await.unwrap_or_default();
+        return Ok(srv::response(status, &ctype, srv::full(bytes::Bytes::from(text))));
+    }
+    let ctype = answer.content_type.clone();
+    let raw = answer.bytes(16 << 20).await?;
+    let band = band_of(&caps);
+    let mut report = read_report(&raw, band.is_some());
+    let mut said: Vec<String> = Vec::new();
+    let stored = format!("ok {}", target.name);
+    if let (Some(at), Some((trunk, suffix))) = (report.lines.iter().position(|l| *l == stored), for_ref(&target.name)) {
+        given.extend(suffix);
+        let options = kiln_ci::review::options(&given);
+        said.extend(options.unknown.iter().map(|o| format!("push option `{o}` isn't one kiln takes (draft, ready, reviewer=, message=, topic=); ignored")));
+        let author = match &who {
+            Pusher::Caller(c) => super::diffs::author_of(&c.name, Some(c.kind)),
+            Pusher::Job(j) => super::diffs::author_of(&format!("job:{}", j.leg), None),
+        };
+        let s = super::diffs::Submission { repo, path: &p, trunk, sha: &target.new, pushed_by: &user, author, options };
+        match super::diffs::submit(hub, s).await {
+            Ok(outcomes) => {
+                for o in outcomes {
+                    let what = match o.kind {
+                        "new" => "new",
+                        "rebased" => "rebased, nothing else changed",
+                        "reordered" => "moved in the stack",
+                        "unchanged" => "unchanged",
+                        _ => "updated",
+                    };
+                    said.push(format!("D{} v{} ({what})  {}", o.number, o.version, o.title));
+                    said.push(format!("  {}", o.url));
+                }
+            }
+            Err(why) => {
+                if let Some(l) = report.lines.get_mut(at) {
+                    *l = format!("ng {} {}", target.name, why.replace('\n', "; "));
+                }
+                said.push(why);
+            }
+        }
+    }
+    // The ref was only the push's way in.
+    let _ = crate::gitops::run_git(hub, &["-C", &p, "update-ref", "-d", &target.name], crate::gitops::LS_REMOTE_TIMEOUT).await;
+    hub.store.audit(user, "repo.push".into(), format!("{}: {summary}", repo.name)).await;
+    if updates.len() > 1 {
+        hub.gitops_kick.notify();
+    }
+    Ok(srv::response(StatusCode::OK, &ctype, srv::full(bytes::Bytes::from(write_report(&report, &said, band)))))
 }
 
 fn short(oid: &str) -> &str {
@@ -378,7 +598,12 @@ mod tests {
         assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/heads/main", &a, &b), false).is_none());
         assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/kiln/diffs/D1/v1", ZERO, &b), false).is_some());
         assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/heads/main", &a, ZERO), false).is_some(), "trunks aren't deleted");
-        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main", ZERO, &b), false).is_some());
+        // Submitting diffs: to a trunk, not deleted, not a change request yet.
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main", ZERO, &b), false).is_none());
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main%topic=x,wip", ZERO, &b), false).is_none());
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/release", ZERO, &b), false).is_some_and(|w| w.contains("isn't a trunk")));
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main", &b, ZERO), false).is_some());
+        assert!(refused(&owner, "acme/app", &review, &trunks, &up("refs/for/main/branch/topic", ZERO, &b), false).is_some_and(|w| w.contains("W14-R04")));
         // Someone with no rights.
         let nobody = Pusher::Caller(Caller::with(crate::authz::gate::Kind::Pat, "pat:x of user:ada", Some(crate::authz::Rights::default()), None));
         assert!(refused(&nobody, "acme/app", &review, &trunks, &up("refs/heads/topic", ZERO, &b), false).is_some());
@@ -393,6 +618,8 @@ mod tests {
         let grant = crate::authz::Grant { what: "developer".into(), scope: Scope::Repo { repo: "acme/app".into() }, deny: false };
         let dev = Pusher::Caller(Caller::with(crate::authz::gate::Kind::User, "user:ada", Some(crate::authz::Rights { grants: vec![grant], ..Default::default() }), None));
         assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/heads/topic", ZERO, &b), false).is_none());
+        assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/for/main", ZERO, &b), false).is_none());
+        assert!(refused(&nobody, "acme/app", &review, &trunks, &up("refs/for/main", ZERO, &b), false).is_some_and(|w| w.contains("diffs.submit")));
         assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/heads/main", &a, &b), false).is_some());
         assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/heads/main", ZERO, &b), true).is_none(), "an empty repository's first trunk");
         assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/tags/v1", ZERO, &b), false).is_some());
@@ -420,6 +647,44 @@ mod tests {
         for no in ["/etc", "file:///srv/other.git", "../other", "ext::sh -c touch% /tmp/x", "-uhack", "fd::3", "C:\\repos\\app"] {
             assert!(importable(no).is_err(), "{no}");
         }
+    }
+
+    #[test]
+    fn w14_r03_reports() {
+        assert_eq!(for_ref("refs/for/main%topic=x, wip"), Some(("main", vec!["topic=x".to_owned(), "wip".to_owned()])));
+        assert_eq!(for_ref("refs/heads/main"), None);
+        let mut opts = line("draft");
+        opts.extend(line("reviewer=ada"));
+        opts.extend_from_slice(b"0000PACK");
+        assert_eq!(push_options(&opts), Ok(Some((vec!["draft".to_owned(), "reviewer=ada".to_owned()], opts.len() - 4))));
+        assert_eq!(push_options(opts.get(..6).unwrap_or_default()), Ok(None));
+        // git's answer, in side-band: progress, then the report in band 1.
+        let mut inner = line("unpack ok\n");
+        inner.extend(line("ok refs/for/main\n"));
+        inner.extend_from_slice(b"0000");
+        let mut banded = pkt(b"\x02Resolving deltas: 100%\n");
+        let mut b1 = vec![1u8];
+        b1.extend_from_slice(&inner);
+        banded.extend(pkt(&b1));
+        banded.extend_from_slice(b"0000");
+        let mut r = read_report(&banded, true);
+        assert_eq!(r.lines, ["unpack ok", "ok refs/for/main"]);
+        assert_eq!(r.said.len(), 1);
+        // Rewritten: refused, saying why after git's own progress.
+        if let Some(l) = r.lines.get_mut(1) {
+            *l = "ng refs/for/main no Change-Id".into();
+        }
+        let out = write_report(&r, &["no Change-Id".to_owned()], Some(65_515));
+        let again = read_report(&out, true);
+        assert_eq!(again.lines, ["unpack ok", "ng refs/for/main no Change-Id"]);
+        assert_eq!(again.said.len(), 2);
+        assert!(String::from_utf8_lossy(&out).contains("kiln: no Change-Id"));
+        // Without side-band, the report alone.
+        assert_eq!(read_report(&inner, false).lines, ["unpack ok", "ok refs/for/main"]);
+        assert_eq!(write_report(&read_report(&inner, false), &["x".to_owned()], None), inner);
+        // `side-band` packets stay under 1000 bytes.
+        let long = Report { said: Vec::new(), lines: vec!["unpack ok".into(), format!("ng refs/for/main {}", "x".repeat(3000))] };
+        assert!(pkt_lines(&write_report(&long, &[], Some(995))).into_iter().flatten().all(|p| p.len() <= 996));
     }
 
     #[test]

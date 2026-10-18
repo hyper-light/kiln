@@ -70,6 +70,40 @@ pub(crate) struct Cgi<'a> {
 /// What `git http-backend` answers, its request body `prefix` and then, when given, the rest of
 /// the request as it arrives (a push's pack, never held whole).
 pub(crate) async fn backend(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<hyper::body::Incoming>) -> Result<Response, Fail> {
+    let a = run(cgi, prefix, rest).await?;
+    let mut r = srv::response(a.status, &a.content_type, srv::channel_body(a.body));
+    for (k, v) in a.extra {
+        if let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes()) {
+            r = srv::with_header(r, name, &v);
+        }
+    }
+    Ok(r)
+}
+
+/// `git http-backend`'s answer: its status and headers, and its body as it comes.
+pub(crate) struct Answer {
+    pub status: StatusCode,
+    pub content_type: String,
+    pub extra: Vec<(String, String)>,
+    pub body: async_channel::Receiver<Bytes>,
+}
+
+impl Answer {
+    /// The whole body, up to `cap` bytes.
+    pub async fn bytes(self, cap: usize) -> Result<Vec<u8>, Fail> {
+        let mut out = Vec::new();
+        while let Ok(chunk) = self.body.recv().await {
+            out.extend_from_slice(&chunk);
+            if out.len() > cap {
+                return Err((StatusCode::BAD_GATEWAY, "git's answer is too long".into()));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Runs `git http-backend` for `cgi`: [`backend`]'s, its answer not yet a response.
+pub(crate) async fn run(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<hyper::body::Incoming>) -> Result<Answer, Fail> {
     let header = |h: &str| cgi.headers.get(h).and_then(|v| v.to_str().ok()).map(str::to_owned);
     let mut cmd = Command::new("git");
     for c in cgi.configs {
@@ -156,13 +190,7 @@ pub(crate) async fn backend(cgi: &Cgi<'_>, prefix: Vec<u8>, rest: Option<hyper::
             }
         }
     });
-    let mut r = srv::response(status, &content_type, srv::channel_body(rx));
-    for (k, v) in extra {
-        if let Ok(name) = http::header::HeaderName::from_bytes(k.as_bytes()) {
-            r = srv::with_header(r, name, &v);
-        }
-    }
-    Ok(r)
+    Ok(Answer { status, content_type, extra, body: rx })
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {

@@ -154,6 +154,23 @@ enum Cmd {
     Env(kiln::ci::cli::EnvArgs),
     /// Repositories: list them; create one kiln hosts, or import one from upstream.
     Repo(kiln::ci::cli::RepoArgs),
+    /// Clone a repository kiln hosts, with kiln's credentials and the commit-msg hook that gives
+    /// each commit a Change-Id.
+    Clone(kiln::ci::review_cli::CloneArgs),
+    /// Send the commits between the trunk and HEAD for review: each a diff, or a new version of
+    /// its diff (`git push kiln HEAD:refs/for/<trunk>`).
+    Submit(kiln::ci::review_cli::SubmitArgs),
+    /// Fetch the trunk and rebase the stack onto it; landed diffs drop out.
+    Sync(kiln::ci::review_cli::SyncArgs),
+    /// A repository's diffs.
+    Diffs(kiln::ci::review_cli::DiffsArgs),
+    /// Check out a diff's version: `kiln checkout D12` (its latest) or `D12@v2`.
+    Checkout(kiln::ci::review_cli::CheckoutArgs),
+    /// kiln's commit-msg hook for this repository: install (or print) it.
+    Hook(kiln::ci::review_cli::HookArgs),
+    /// git's credential helper for kiln servers (`kiln clone` sets it up).
+    #[command(hide = true)]
+    GitCredential(kiln::ci::review_cli::GitCredentialArgs),
     /// Approve (or reject) a run's deployments waiting for review.
     Approve(kiln::ci::cli::ApproveArgs),
     /// A kept CI leg: keep it longer, or release it.
@@ -683,6 +700,13 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Env(a) => kiln::ci::cli::env(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Repo(a) => kiln::ci::cli::repo(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Clone(a) => kiln::ci::review_cli::clone(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Submit(a) => kiln::ci::review_cli::submit(a),
+        Cmd::Sync(a) => kiln::ci::review_cli::sync(a),
+        Cmd::Diffs(a) => kiln::ci::review_cli::diffs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Checkout(a) => kiln::ci::review_cli::checkout(a),
+        Cmd::Hook(a) => kiln::ci::review_cli::hook(a),
+        Cmd::GitCredential(a) => kiln::ci::review_cli::git_credential(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Approve(a) => kiln::ci::cli::approve(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Debug(a) => kiln::ci::cli::debug(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,

@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); diffs, review, landing left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); diffs, review, landing left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
@@ -3331,7 +3331,8 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** In progress: native hosting, the facade's git half, and the start of its REST half.
+**Progress.** In progress: native hosting, stacked diffs, the facade's git half, and the start
+of its REST half.
 
 - *Done.* R01 and R02's hosting, in `crates/kiln/src/ci/hosting.rs`:
   - native repositories: bare repositories in `<data_dir>/hosted/<owner>/<name>.git` (apart
@@ -3353,6 +3354,33 @@ adapts [review.md](review.md), which it replaces.
   - Checked end to end with real git (`crates/kiln/tests/hosting.rs`): clone and push by
     developer, viewer, owner and powerless tokens, trunk refusals, whole-push refusal, and the
     push's run.
+- *Done.* R03's stacked diffs, in `crates/kiln/src/ci/diffs.rs` (pure part:
+  `crates/kiln-ci/src/review.rs`):
+  - a push to `refs/for/<trunk>` (`diffs.submit`) makes each commit between the trunk and the
+    one pushed a diff (`D12`), or a new version of the diff with its `Change-Id`;
+  - git stores the push, kiln makes the diffs, git's report gives each a link (`remote: kiln:
+    D12 v3 (updated)`) or the whole push's refusal: no Change-Id, a merge, a landed or an
+    abandoned diff, not a trunk;
+  - only the diffs that changed get versions. A diff restacked on an amended one keeps its
+    version; one whose patch only moved to a new trunk base gets a rebase-only version, marked;
+    a reorder is seen and marked;
+  - every version is kept at `refs/kiln/diffs/D12/v3`; the push's `refs/for/*` ref is never kept;
+  - push options `draft`, `ready`, `reviewer=`, `message=`, `topic=` (and Gerrit's `%…`
+    suffix);
+  - each new version starts the `pull_request` (`opened`, then `synchronize`) and `diff`
+    workflows on its commit, with the diff in `github.event.kiln.diff`;
+  - the API: `/api/repos/:repo/diffs`, `/api/diffs/:id` (versions, reviewers, runs),
+    `/versions/:v/files`, `/interdiff?from=&to=` (`git range-diff`), `/api/stacks/:id`, and
+    `ready`, `abandon`, `reclaim`, `commandeer`, scoped to the diff's repository in the route
+    table;
+  - the CLI (`crates/kiln/src/ci/review_cli.rs`):
+    - `kiln clone` (kiln's git credential helper, and the commit-msg hook that adds Change-Ids);
+    - `kiln submit` (adds the Change-Ids commits lack, then pushes);
+    - `kiln sync`, `kiln diffs`, `kiln checkout D12[@v2]`, `kiln hook install`;
+  - tables `diffs`, `diff_versions`, `stacks`, `diff_reviewers`.
+  - Checked end to end with real git: W14-AC01 (`w14_ac01_stacks`: three commits as a stack,
+    D2 amended, the stack rebased and reordered, an interdiff, the refusals, the options, the
+    author's actions, the runs), and the CLI (`w14_r03_cli`).
 - *Done.* R11's git half, in `crates/kiln/src/ci/facade.rs`:
   - smart HTTP over the server's mirror, served by `git http-backend` (protocols v0 to v2,
     gzipped requests, fetches by SHA, filters);
@@ -3383,10 +3411,11 @@ adapts [review.md](review.md), which it replaces.
     - `actions/checkout` unpacking the tarball where git is missing.
 - *Left.* Everything else:
   - `native + mirror` (R01), with the land queue that moves trunk;
-  - `refs/for/<trunk>` diffs and branch protection rules (R02, with R03 and R09);
+  - branch protection rules (R02, with R09);
+  - R03's `kiln absorb`;
   - the rest of R11's REST subset and GraphQL;
-  - review, landing, the App, the rest of the schema;
-  - AC01 to AC07.
+  - change requests, review, landing, the App, the rest of the schema (R04 to R10, R13);
+  - AC02 to AC07.
 
 ### W15 Environments and deployments
 

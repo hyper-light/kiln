@@ -244,6 +244,10 @@ pub enum At {
     Job(usize),
     /// The runner at this segment.
     Runner(usize),
+    /// The diff at this segment (`D12`, `12`, or its id): its repository.
+    Diff(usize),
+    /// The stack at this segment: its repository.
+    Stack(usize),
     /// The `scope` query parameter (`repo:acme/app`, …), else the server.
     ScopeQuery,
     /// The `repo` query parameter, else the server.
@@ -287,6 +291,15 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/repos", "runs.read", At::Anywhere),
     r("POST", "/api/repos/*/trigger", "runs.trigger", At::Repo(2)),
     r("POST", "/api/repos/*/poll", "runs.trigger", At::Repo(2)),
+    // Diffs and stacks (W14).
+    r("GET", "/api/repos/*/diffs", "diffs.read", At::Repo(2)),
+    r("GET", "/api/diffs/*", "diffs.read", At::Diff(2)),
+    r("GET", "/api/diffs/*/**", "diffs.read", At::Diff(2)),
+    r("POST", "/api/diffs/*/ready", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/abandon", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
+    r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
     r("GET", "/api/runs", "runs.read", At::RepoQuery),
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),

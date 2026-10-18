@@ -1,0 +1,343 @@
+//! Diffs, versions and stacks (docs/ci.md W14-R03), the pure part: what a commit message says
+//! (its title, summary and `Change-Id`), a push's options, a diff's states, and what a submitted
+//! stack of commits does to the diffs there are. The server reads the commits and keeps the
+//! diffs.
+
+use std::collections::{BTreeMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+/// A diff's state (review.md): `draft` and `needs-review` to `landed`, or `abandoned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum State {
+    Draft,
+    NeedsReview,
+    ChangesRequested,
+    Accepted,
+    Landing,
+    Landed,
+    Abandoned,
+}
+
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            State::Draft => "draft",
+            State::NeedsReview => "needs-review",
+            State::ChangesRequested => "changes-requested",
+            State::Accepted => "accepted",
+            State::Landing => "landing",
+            State::Landed => "landed",
+            State::Abandoned => "abandoned",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<State> {
+        Some(match s {
+            "draft" => State::Draft,
+            "needs-review" => State::NeedsReview,
+            "changes-requested" => State::ChangesRequested,
+            "accepted" => State::Accepted,
+            "landing" => State::Landing,
+            "landed" => State::Landed,
+            "abandoned" => State::Abandoned,
+            _ => return None,
+        })
+    }
+
+    /// Still under review: a new version may come.
+    pub fn is_open(self) -> bool {
+        !matches!(self, State::Landed | State::Abandoned)
+    }
+}
+
+/// Whether `line` is a git trailer (`Key: value`, the key letters, digits and `-`).
+fn trailer(line: &str) -> Option<(&str, &str)> {
+    let (k, v) = line.split_once(':')?;
+    (!k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && v.starts_with(' ')).then(|| (k, v.trim()))
+}
+
+/// The message's paragraphs, without trailing blank lines.
+fn paragraphs(message: &str) -> Vec<Vec<&str>> {
+    let mut out: Vec<Vec<&str>> = vec![Vec::new()];
+    for line in message.trim_end().lines() {
+        if line.trim().is_empty() {
+            if out.last().is_some_and(|p| !p.is_empty()) {
+                out.push(Vec::new());
+            }
+        } else if let Some(p) = out.last_mut() {
+            p.push(line);
+        }
+    }
+    out.retain(|p| !p.is_empty());
+    out
+}
+
+/// The trailers of a message: its last paragraph, when every line of it is one (and it isn't
+/// the title).
+pub fn trailers(message: &str) -> Vec<(String, String)> {
+    let ps = paragraphs(message);
+    match ps.split_last() {
+        Some((last, rest)) if !rest.is_empty() && last.iter().all(|l| trailer(l).is_some()) => last.iter().filter_map(|l| trailer(l)).map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `id` is a Change-Id: `I` and 40 lowercase hex digits (Gerrit's).
+pub fn is_change_id(id: &str) -> bool {
+    id.len() == 41 && id.starts_with('I') && id.get(1..).is_some_and(|h| h.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)))
+}
+
+/// The commit's `Change-Id` trailer (the last one, as Gerrit reads it).
+pub fn change_id(message: &str) -> Option<String> {
+    trailers(message).into_iter().rev().find(|(k, v)| k.eq_ignore_ascii_case("Change-Id") && is_change_id(v)).map(|(_, v)| v)
+}
+
+/// A message with `Change-Id: <id>` among its trailers (a new trailer paragraph when it has none).
+pub fn with_change_id(message: &str, id: &str) -> String {
+    let body = message.trim_end();
+    if change_id(body).is_some() {
+        return format!("{body}\n");
+    }
+    if trailers(body).is_empty() { format!("{body}\n\nChange-Id: {id}\n") } else { format!("{body}\nChange-Id: {id}\n") }
+}
+
+/// A commit message's title (its first line) and summary (the rest, without its trailers).
+pub fn title_and_summary(message: &str) -> (String, String) {
+    let ps = paragraphs(message);
+    let title = ps.first().and_then(|p| p.first()).map(|l| l.trim().to_owned()).unwrap_or_default();
+    let has_trailers = !trailers(message).is_empty();
+    let end = if has_trailers { ps.len().saturating_sub(1) } else { ps.len() };
+    let mut body: Vec<String> = Vec::new();
+    for (i, p) in ps.iter().enumerate().take(end) {
+        let lines: Vec<&str> = if i == 0 { p.iter().skip(1).copied().collect() } else { p.clone() };
+        if !lines.is_empty() {
+            body.push(lines.join("\n"));
+        }
+    }
+    (title, body.join("\n\n"))
+}
+
+/// A push's options (`git push -o …`): `draft`, `reviewer=ada,agent:review` (repeatable),
+/// `message=…` (a note on the new versions), `topic=…`; unknown ones are said back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Options {
+    pub draft: bool,
+    pub ready: bool,
+    pub reviewers: Vec<String>,
+    pub message: Option<String>,
+    pub topic: Option<String>,
+    pub unknown: Vec<String>,
+}
+
+pub fn options<S: AsRef<str>>(given: &[S]) -> Options {
+    let mut o = Options::default();
+    for opt in given {
+        let opt = opt.as_ref().trim();
+        let (k, v) = opt.split_once('=').map_or((opt, None), |(k, v)| (k, Some(v.trim())));
+        match (k.trim(), v) {
+            ("draft" | "wip", None) => o.draft = true,
+            ("ready", None) => o.ready = true,
+            ("reviewer" | "reviewers" | "r", Some(v)) => o.reviewers.extend(v.split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned)),
+            ("message" | "m", Some(v)) => o.message = Some(v.to_owned()),
+            ("topic", Some(v)) if !v.is_empty() => o.topic = Some(v.to_owned()),
+            _ => o.unknown.push(opt.to_owned()),
+        }
+    }
+    o.reviewers.dedup();
+    o
+}
+
+/// A commit a push submits, bottom of the stack first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub message: String,
+    /// `git patch-id --stable`: the same patch on another base has the same one.
+    pub patch_id: String,
+}
+
+/// An open or closed diff with this Change-Id, as the server keeps it: its latest version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Known {
+    pub number: u32,
+    pub state: State,
+    pub version: u32,
+    pub commit: String,
+    pub parent: String,
+    /// The trunk commit the version was based on.
+    pub base: String,
+    /// The Change-Id of the diff below it in its stack (`None`: it sat on the trunk).
+    pub below: Option<String>,
+    pub patch_id: String,
+    pub message: String,
+}
+
+/// What a submitted commit does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// A new diff, version 1.
+    New,
+    /// A new version of diff `number`; `rebase_only`: the same patch and message, on a new base
+    /// or in a new place; `reordered`: the diff below it isn't the one that was.
+    Version { number: u32, n: u32, rebase_only: bool, reordered: bool },
+    /// Diff `number`'s latest version is this commit, or the same patch and message in the same
+    /// place on the same base (only the diffs below it changed): no new version.
+    Unchanged { number: u32, n: u32 },
+}
+
+/// One commit of a submission: what it does, and what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    pub sha: String,
+    pub parent: String,
+    pub change_id: String,
+    pub title: String,
+    pub summary: String,
+    pub step: Step,
+}
+
+/// The most commits one push submits.
+pub const MAX_STACK: usize = 100;
+
+/// What submitting `commits` (bottom first, everything between the trunk and the pushed commit,
+/// based on trunk commit `base`) does to the diffs there are (`known`, by Change-Id); refused
+/// whole, saying why, when any commit can't be a diff. Only the diffs that changed get versions
+/// (review.md): a diff restacked on a changed one below keeps its version; one whose patch only
+/// moved to a new base, or to a new place in the stack, gets a rebase-only version.
+pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> Result<Vec<Planned>, String> {
+    if commits.is_empty() {
+        return Err("nothing to submit: the commit is already on the trunk".into());
+    }
+    if commits.len() > MAX_STACK {
+        return Err(format!("{} commits: a push submits at most {MAX_STACK}; land or squash some first", commits.len()));
+    }
+    let mut seen = HashSet::new();
+    let mut out: Vec<Planned> = Vec::with_capacity(commits.len());
+    for c in commits {
+        let below = out.last().map(|p| p.change_id.clone());
+        let short = c.sha.get(..12).unwrap_or(&c.sha);
+        let [parent] = c.parents.as_slice() else {
+            return Err(format!("{short} is a merge: a diff is one commit on another (a branch with merges is a change request, refs/for/<trunk>/branch/<name>)"));
+        };
+        let Some(id) = change_id(&c.message) else {
+            return Err(format!("{short} has no Change-Id: install kiln's commit-msg hook (`kiln clone`, or `kiln hook install`) and amend, or submit with `kiln submit`, which adds them"));
+        };
+        if !seen.insert(id.clone()) {
+            return Err(format!("{short}: two commits of this push have Change-Id {id}; squash them, or give one a new Change-Id"));
+        }
+        let (title, summary) = title_and_summary(&c.message);
+        if title.is_empty() {
+            return Err(format!("{short} has no message"));
+        }
+        let step = match known.get(&id) {
+            None => Step::New,
+            Some(k) if k.state == State::Landed => return Err(format!("{short}: Change-Id {id} is D{}'s, which landed; give this commit a new Change-Id", k.number)),
+            Some(k) if k.state == State::Abandoned => return Err(format!("{short}: D{} is abandoned; reclaim it first (`kiln diff reclaim D{}`)", k.number, k.number)),
+            Some(k) if k.commit == c.sha => Step::Unchanged { number: k.number, n: k.version },
+            Some(k) => {
+                let same = !k.patch_id.is_empty() && k.patch_id == c.patch_id && k.message.trim_end() == c.message.trim_end();
+                let reordered = k.below != below;
+                if same && !reordered && k.base == base {
+                    Step::Unchanged { number: k.number, n: k.version }
+                } else {
+                    Step::Version { number: k.number, n: k.version + 1, rebase_only: same, reordered }
+                }
+            }
+        };
+        out.push(Planned { sha: c.sha.clone(), parent: parent.clone(), change_id: id, title, summary, step });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "I0123456789abcdef0123456789abcdef01234567";
+    const B: &str = "Ifedcba9876543210fedcba9876543210fedcba98";
+
+    #[test]
+    fn w14_r03_messages() {
+        let m = format!("pipeline: job outputs\n\nOutputs flow to `needs`.\n\nSecond paragraph.\n\nSigned-off-by: Ada <a@x>\nChange-Id: {A}\n");
+        assert_eq!(change_id(&m).as_deref(), Some(A));
+        assert_eq!(title_and_summary(&m), ("pipeline: job outputs".to_owned(), "Outputs flow to `needs`.\n\nSecond paragraph.".to_owned()));
+        // Not a trailer block: prose with a colon, or the title itself.
+        assert_eq!(change_id(&format!("Change-Id: {A}")), None, "a title isn't a trailer");
+        assert_eq!(change_id(&format!("t\n\nnote: Change-Id: {A} here\n")), None);
+        assert_eq!(change_id("t\n\nChange-Id: Inothex\n"), None);
+        // Adding one: into the trailers, or as their paragraph.
+        assert_eq!(with_change_id("fix: x\n", A), format!("fix: x\n\nChange-Id: {A}\n"));
+        assert_eq!(with_change_id("fix: x\n\nbody\n\nSigned-off-by: Ada <a@x>\n", A), format!("fix: x\n\nbody\n\nSigned-off-by: Ada <a@x>\nChange-Id: {A}\n"));
+        assert_eq!(with_change_id(&m, B), m, "one is enough");
+    }
+
+    #[test]
+    fn w14_r03_options() {
+        let o = options(&["draft", "reviewer=ada,agent:review", "r=bob", "message=addressed comments", "topic=outputs", "nonsense=1"]);
+        assert!(o.draft && !o.ready);
+        assert_eq!(o.reviewers, ["ada", "agent:review", "bob"]);
+        assert_eq!((o.message.as_deref(), o.topic.as_deref()), (Some("addressed comments"), Some("outputs")));
+        assert_eq!(o.unknown, ["nonsense=1"]);
+    }
+
+    fn commit(sha: &str, parent: &str, id: &str, title: &str, patch: &str) -> Commit {
+        Commit { sha: sha.repeat(40).get(..40).unwrap_or_default().to_owned(), parents: vec![parent.repeat(40).get(..40).unwrap_or_default().to_owned()], message: format!("{title}\n\nChange-Id: {id}\n"), patch_id: patch.into() }
+    }
+
+    #[test]
+    fn w14_r03_plan() -> Result<(), String> {
+        const C: &str = "I1111111111111111111111111111111111111111";
+        let (d1, d2, d3) = (commit("a", "t", A, "one", "p1"), commit("b", "a", B, "two", "p2"), commit("c", "b", C, "three", "p3"));
+        // W14-AC01: three commits, three new diffs, bottom first, each on the one below.
+        let p = plan(&[d1.clone(), d2.clone(), d3.clone()], &BTreeMap::new(), "t")?;
+        assert_eq!(p.iter().map(|x| &x.step).collect::<Vec<_>>(), [&Step::New, &Step::New, &Step::New]);
+        assert_eq!((p.first().map(|x| x.title.as_str()), p.get(1).map(|x| x.parent.as_str())), (Some("one"), Some(d1.sha.as_str())));
+        let known = |number, c: &Commit, below: Option<&str>, state| Known {
+            number,
+            state,
+            version: 1,
+            commit: c.sha.clone(),
+            parent: c.parents.first().cloned().unwrap_or_default(),
+            base: "t".into(),
+            below: below.map(str::to_owned),
+            patch_id: c.patch_id.clone(),
+            message: c.message.clone(),
+        };
+        let k: BTreeMap<String, Known> = [(A.to_owned(), known(1, &d1, None, State::NeedsReview)), (B.to_owned(), known(2, &d2, Some(A), State::NeedsReview)), (C.to_owned(), known(3, &d3, Some(B), State::NeedsReview))].into();
+        let steps = |p: Vec<Planned>| p.into_iter().map(|x| x.step).collect::<Vec<_>>();
+        // Amending D2 adds D2 v2 only: D3, restacked on it, keeps its version.
+        let d2b = Commit { sha: "d".repeat(40), patch_id: "p2-amended".into(), ..d2.clone() };
+        let d3b = Commit { sha: "e".repeat(40), parents: vec![d2b.sha.clone()], ..d3.clone() };
+        assert_eq!(steps(plan(&[d1.clone(), d2b, d3b], &k, "t")?), [Step::Unchanged { number: 1, n: 1 }, Step::Version { number: 2, n: 2, rebase_only: false, reordered: false }, Step::Unchanged { number: 3, n: 1 }]);
+        // The trunk moved and the stack with it: rebase-only versions, each marked.
+        let r1 = Commit { sha: "f".repeat(40), parents: vec!["u".repeat(40)], ..d1.clone() };
+        let r2 = Commit { sha: "9".repeat(40), parents: vec![r1.sha.clone()], ..d2.clone() };
+        let rebased = Step::Version { number: 1, n: 2, rebase_only: true, reordered: false };
+        assert_eq!(steps(plan(&[r1.clone(), r2], &k, "u")?), [rebased, Step::Version { number: 2, n: 2, rebase_only: true, reordered: false }]);
+        // Reordering is seen: D3 below D2 now.
+        let o3 = Commit { sha: "8".repeat(40), parents: vec![d1.sha.clone()], ..d3.clone() };
+        let o2 = Commit { sha: "7".repeat(40), parents: vec![o3.sha.clone()], ..d2.clone() };
+        assert_eq!(
+            steps(plan(&[d1.clone(), o3, o2], &k, "t")?),
+            [Step::Unchanged { number: 1, n: 1 }, Step::Version { number: 3, n: 2, rebase_only: true, reordered: true }, Step::Version { number: 2, n: 2, rebase_only: true, reordered: true }]
+        );
+        // A new message isn't rebase-only.
+        let m1 = Commit { sha: "6".repeat(40), message: format!("one, reworded\n\nChange-Id: {A}\n"), ..d1.clone() };
+        assert_eq!(steps(plan(&[m1], &k, "t")?), [Step::Version { number: 1, n: 2, rebase_only: false, reordered: false }]);
+        // Refusals: no Change-Id, a merge, the same Change-Id twice, landed and abandoned diffs.
+        let bare = Commit { message: "no id\n".into(), ..d1.clone() };
+        assert!(plan(&[bare], &k, "t").is_err_and(|e| e.contains("no Change-Id")));
+        let merge = Commit { parents: vec!["t".repeat(40), "s".repeat(40)], ..d1.clone() };
+        assert!(plan(&[merge], &k, "t").is_err_and(|e| e.contains("merge")));
+        assert!(plan(&[d1.clone(), Commit { sha: "5".repeat(40), ..d1.clone() }], &k, "t").is_err_and(|e| e.contains("two commits")));
+        let landed: BTreeMap<String, Known> = [(A.to_owned(), known(1, &d1, None, State::Landed))].into();
+        assert!(plan(&[Commit { sha: "4".repeat(40), ..d1.clone() }], &landed, "t").is_err_and(|e| e.contains("landed")));
+        let gone: BTreeMap<String, Known> = [(A.to_owned(), known(1, &d1, None, State::Abandoned))].into();
+        assert!(plan(&[Commit { sha: "4".repeat(40), ..d1.clone() }], &gone, "t").is_err_and(|e| e.contains("reclaim")));
+        assert!(plan(&[], &k, "t").is_err());
+        Ok(())
+    }
+}

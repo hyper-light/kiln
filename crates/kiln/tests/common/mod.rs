@@ -5,7 +5,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -47,6 +47,17 @@ pub struct Server {
     child: Child,
     pub port: u16,
     pub admin: String,
+    dir: std::path::PathBuf,
+}
+
+impl Server {
+    /// The end of the server's log.
+    #[allow(dead_code)]
+    pub fn log(&self) -> String {
+        let text = std::fs::read_to_string(self.dir.join("server.log")).unwrap_or_default();
+        let lines: Vec<&str> = text.lines().collect();
+        lines.iter().rev().take(60).rev().copied().collect::<Vec<_>>().join("\n")
+    }
 }
 
 impl Drop for Server {
@@ -123,12 +134,14 @@ enabled = true
     let home = dir.join("home");
     std::fs::create_dir_all(&home)?;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_kiln"));
-    cmd.args(["--config", &cfg.to_string_lossy(), "server"]).env("HOME", &home).stdout(Stdio::null()).stderr(Stdio::null());
+    // Its log, for a test that wants to say why it failed (`Server::log`).
+    let log = std::fs::File::create(dir.join("server.log"))?;
+    cmd.args(["--config", &cfg.to_string_lossy(), "server"]).env("HOME", &home).env("NO_COLOR", "1").stdout(log.try_clone()?).stderr(log);
     for var in ["KILN_CONFIG", "KILN_URL", "KILN_ADMIN_TOKEN", "KILN_SUPERVISED", "KILN_GENERATION", "KILN_LOG"] {
         cmd.env_remove(var);
     }
     let child = cmd.spawn()?;
-    let mut server = Server { child, port, admin: String::new() };
+    let mut server = Server { child, port, admin: String::new(), dir: dir.to_path_buf() };
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(t) = std::fs::read_to_string(data.join("admin.token"))

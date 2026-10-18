@@ -131,3 +131,259 @@ fn w14_r02_native_repository() -> anyhow::Result<()> {
     assert!(audit.contains("repo.push") && audit.contains("user:dev"), "{audit}");
     Ok(())
 }
+
+/// A commit of `file` holding `text`, with Change-Id `id` (as kiln's hook adds it): its SHA.
+fn commit(home: &Path, work: &Path, file: &str, text: &str, title: &str, id: &str) -> anyhow::Result<String> {
+    std::fs::write(work.join(file), text)?;
+    must(git(home, work, &["add", file]), "add")?;
+    must(git(home, work, &["commit", "-qm", &format!("{title}\n\nChange-Id: {id}")]), "commit")?;
+    Ok(must(git(home, work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned())
+}
+
+fn api(s: &Server, token: &str, method: &str, path: &str) -> anyhow::Result<Value> {
+    let empty = json!({});
+    let (st, body) = http(s.port, method, path, token, (method != "GET").then_some(&empty))?;
+    anyhow::ensure!(st == 200, "{method} {path}: {st} {body}");
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// The versions of a diff: (n, rebase_only).
+fn versions(d: &Value) -> Vec<(u64, bool)> {
+    d.get("versions").and_then(Value::as_array).into_iter().flatten().map(|v| (v.get("n").and_then(Value::as_u64).unwrap_or(0), v.get("rebase_only").and_then(Value::as_bool).unwrap_or(false))).collect()
+}
+
+fn text<'a>(v: &'a Value, key: &str) -> &'a str {
+    v.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// W14-AC01: submitting three commits makes D1–D3, a stack; amending D2 adds D2 v2 only; the
+/// stack rebased onto a moved trunk gets rebase-only versions, marked; reordering is seen; an
+/// interdiff of D2 v1..v2 shows the amend; every version is kept at its ref; and the push's
+/// refusals (no Change-Id, not a trunk, an abandoned diff, a viewer) say why. With real git.
+#[test]
+fn w14_ac01_stacks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let repo_id = serde_json::from_str::<Value>(&body)?.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let viewer = person(&s, "viewer", &["viewer@repo:acme/app"])?;
+
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".github/workflows/ci.yml"), "on: pull_request\njobs:\n  test:\n    runs-on: local\n    steps:\n      - run: echo tested\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    must(git(&home, &work, &["checkout", "-qb", "stack"]), "branch")?;
+
+    // Three commits: D1–D3, each on the one below.
+    let (i1, i2, i3) = ("I1111111111111111111111111111111111111111", "I2222222222222222222222222222222222222222", "I3333333333333333333333333333333333333333");
+    let c1 = commit(&home, &work, "a.txt", "one\n", "one: a", i1)?;
+    let c2 = commit(&home, &work, "b.txt", "two\n", "two: b", i2)?;
+    let c3 = commit(&home, &work, "c.txt", "three\n", "three: c", i3)?;
+    let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "submit")?;
+    for want in ["D1 v1 (new)", "D2 v1 (new)", "D3 v1 (new)", "/diffs/D1", "two: b"] {
+        assert!(out.contains(want), "{want} in {out}");
+    }
+    let listed = api(&s, &dev, "GET", &format!("/api/repos/{repo_id}/diffs"))?;
+    assert_eq!(listed.get("diffs").and_then(Value::as_array).map(Vec::len), Some(3), "{listed}");
+    let d2 = api(&s, &dev, "GET", "/api/diffs/D2")?;
+    assert_eq!((text(&d2, "parent"), text(&d2, "state"), text(&d2, "author"), text(&d2, "author_kind")), ("D1", "needs-review", "user:dev", "human"), "{d2}");
+    assert_eq!(versions(&d2), [(1, false)]);
+    let stack = api(&s, &dev, "GET", &format!("/api/stacks/{}", text(&d2, "stack")))?;
+    let order: Vec<&str> = stack.get("diffs").and_then(Value::as_array).into_iter().flatten().map(|d| text(d, "name")).collect();
+    assert_eq!(order, ["D1", "D2", "D3"]);
+    let refs = must(git(&home, &work, &["ls-remote", &url(&dev)]), "ls-remote")?;
+    for (r, sha) in [("refs/kiln/diffs/D1/v1", &c1), ("refs/kiln/diffs/D2/v1", &c2), ("refs/kiln/diffs/D3/v1", &c3)] {
+        assert!(refs.lines().any(|l| l == format!("{sha}\t{r}")), "{r} at {sha}: {refs}");
+    }
+    assert!(!refs.contains("refs/for/"), "the push's way in isn't kept: {refs}");
+
+    // Amending D2 adds D2 v2 only; D3, restacked on it, keeps its version.
+    must(git(&home, &work, &["checkout", "-q", &c2]), "checkout")?;
+    std::fs::write(work.join("b.txt"), "two, amended\n")?;
+    must(git(&home, &work, &["commit", "-q", "--amend", "--no-edit", "-a"]), "amend")?;
+    must(git(&home, &work, &["cherry-pick", &c3]), "restack")?;
+    let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "the amend")?;
+    for want in ["D1 v1 (unchanged)", "D2 v2 (updated)", "D3 v1 (unchanged)"] {
+        assert!(out.contains(want), "{want} in {out}");
+    }
+    let inter = api(&s, &dev, "GET", "/api/diffs/D2/interdiff?from=1&to=2")?;
+    assert_eq!(inter.get("same_patch"), Some(&json!(false)));
+    assert!(text(&inter, "range_diff").contains("amended"), "{inter}");
+    let files = api(&s, &dev, "GET", "/api/diffs/D2/versions/2/files")?;
+    assert!(files.get("files").and_then(Value::as_array).is_some_and(|f| f.iter().any(|x| text(x, "path") == "b.txt")) && text(&files, "patch").contains("+two, amended"), "{files}");
+    must(git(&home, &work, &["branch", "-qf", "stack", "HEAD"]), "keep it")?;
+    must(git(&home, &work, &["checkout", "-q", "stack"]), "back")?;
+
+    // The trunk moves; the stack, rebased onto it, gets rebase-only versions.
+    must(git(&home, &work, &["checkout", "-q", "main"]), "main")?;
+    std::fs::write(work.join("z.txt"), "elsewhere\n")?;
+    must(git(&home, &work, &["add", "z.txt"]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "trunk moves"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", &url(&s.admin), "HEAD:main"]), "the owner moves trunk")?;
+    must(git(&home, &work, &["checkout", "-q", "stack"]), "stack")?;
+    must(git(&home, &work, &["rebase", "-q", "main"]), "rebase")?;
+    let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "the rebase")?;
+    for want in ["D1 v2 (rebased", "D2 v3 (rebased", "D3 v2 (rebased"] {
+        assert!(out.contains(want), "{want} in {out}");
+    }
+    assert_eq!(versions(&api(&s, &dev, "GET", "/api/diffs/D2")?), [(1, false), (2, false), (3, true)]);
+
+    // Reordering is seen: D3 below D2.
+    let top = must(git(&home, &work, &["rev-parse", "HEAD"]), "top")?.trim().to_owned();
+    let mid = must(git(&home, &work, &["rev-parse", "HEAD~1"]), "mid")?.trim().to_owned();
+    must(git(&home, &work, &["reset", "-q", "--hard", "HEAD~2"]), "to D1")?;
+    must(git(&home, &work, &["cherry-pick", &top]), "D3 first")?;
+    must(git(&home, &work, &["cherry-pick", &mid]), "then D2")?;
+    let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "the reorder")?;
+    assert!(out.contains("D3 v3 (moved in the stack)") && out.contains("D2 v4 (moved in the stack)") && out.contains("D1 v2 (unchanged)"), "{out}");
+    assert_eq!((text(&api(&s, &dev, "GET", "/api/diffs/D3")?, "parent"), text(&api(&s, &dev, "GET", "/api/diffs/D2")?, "parent")), ("D1", "D3"));
+
+    // Refused, saying why, nothing kept: no Change-Id; not a trunk; a viewer.
+    std::fs::write(work.join("d.txt"), "four\n")?;
+    must(git(&home, &work, &["add", "d.txt"]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "no id"]), "commit")?;
+    let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/for/main"])?;
+    assert!(!ok && out.contains("no Change-Id") && out.contains("remote: kiln:"), "{out}");
+    let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/for/nope"])?;
+    assert!(!ok && out.contains("isn't a trunk"), "{out}");
+    must(git(&home, &work, &["reset", "-q", "--hard", "HEAD~1"]), "drop it")?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&viewer), "theirs"]), "the viewer's clone")?;
+    let (ok, out) = git(&home, &dir.path().join("theirs"), &["push", &url(&viewer), "HEAD:refs/for/main"])?;
+    assert!(!ok && out.contains("diffs.submit"), "{out}");
+    let refs = must(git(&home, &work, &["ls-remote", &url(&dev)]), "ls-remote")?;
+    assert!(!refs.contains("refs/for/"), "{refs}");
+
+    // Push options: a draft, a topic, a reviewer.
+    commit(&home, &work, "e.txt", "five\n", "five: e", "I4444444444444444444444444444444444444444")?;
+    let out = must(git(&home, &work, &["push", "-o", "draft", "-o", "topic=letters", "-o", "reviewer=user:viewer", "-o", "bogus", "origin", "HEAD:refs/for/main"]), "a draft")?;
+    assert!(out.contains("D4 v1 (new)") && out.contains("`bogus`"), "{out}");
+    let d4 = api(&s, &dev, "GET", "/api/diffs/D4")?;
+    assert_eq!((text(&d4, "state"), text(&d4, "topic"), text(&d4, "parent")), ("draft", "letters", "D2"), "{d4}");
+    assert!(d4.get("reviewers").and_then(Value::as_array).is_some_and(|r| r.iter().any(|x| text(x, "reviewer") == "user:viewer")), "{d4}");
+    // Its author's actions.
+    assert_eq!(text(&api(&s, &dev, "POST", "/api/diffs/D4/ready")?, "state"), "needs-review");
+    assert_eq!(text(&api(&s, &dev, "POST", "/api/diffs/D4/abandon")?, "state"), "abandoned");
+    std::fs::write(work.join("e.txt"), "five, again\n")?;
+    must(git(&home, &work, &["commit", "-q", "--amend", "--no-edit", "-a"]), "amend")?;
+    let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/for/main"])?;
+    assert!(!ok && out.contains("abandoned"), "{out}");
+    assert_eq!(text(&api(&s, &dev, "POST", "/api/diffs/D4/reclaim")?, "state"), "needs-review");
+    let (st, _) = http(s.port, "POST", "/api/diffs/D4/abandon", &viewer, Some(&json!({})))?;
+    assert_eq!(st, 403, "a viewer doesn't act on diffs");
+    let out = must(git(&home, &work, &["push", "origin", "HEAD:refs/for/main"]), "D4 v2")?;
+    assert!(out.contains("D4 v2 (updated)"), "{out}");
+
+    // Each new version's `pull_request` workflow starts, on the version's commit.
+    let d3 = api(&s, &dev, "GET", "/api/diffs/D3")?;
+    let latest = d3.get("versions").and_then(Value::as_array).and_then(|v| v.last()).map(|v| text(v, "commit").to_owned()).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let d = api(&s, &dev, "GET", "/api/diffs/D3")?;
+        if d.get("runs").and_then(Value::as_array).is_some_and(|r| r.iter().any(|x| text(x, "event") == "pull_request")) {
+            break;
+        }
+        anyhow::ensure!(Instant::now() < deadline, "no run for D3's latest version {latest}: {d}\n{}", s.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
+/// `kiln` with `args` in `dir`, as a developer whose token is `token` would run it.
+fn kiln(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> anyhow::Result<(bool, String)> {
+    let o = Command::new(env!("CARGO_BIN_EXE_kiln"))
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "Dev")
+        .env("GIT_AUTHOR_EMAIL", "dev@example.com")
+        .env("GIT_COMMITTER_NAME", "Dev")
+        .env("GIT_COMMITTER_EMAIL", "dev@example.com")
+        .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))
+        .env("KILN_TOKEN", token)
+        .env("KILN_ADMIN_TOKEN", token)
+        .env_remove("KILN_CONFIG")
+        .output()?;
+    Ok((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
+}
+
+/// The client side of W14-R03: `kiln clone` (kiln's credentials, the commit-msg hook), commits
+/// that get Change-Ids by themselves, `kiln submit` adding the ones a commit lacks, `kiln diffs`,
+/// `kiln checkout D2@v1`, and `kiln sync` dropping a diff the trunk already has.
+#[test]
+fn w14_r03_cli() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+
+    let out = must(kiln(&home, dir.path(), &s, &dev, &["clone", "acme/app", "work"]), "kiln clone")?;
+    assert!(out.contains("Change-Id"), "{out}");
+    let work = dir.path().join("work");
+    let g = |args: &[&str]| must(kiln_git(&home, &work, &s, &dev, args), &args.join(" "));
+    std::fs::write(work.join("README.md"), "app\n")?;
+    g(&["add", "README.md"])?;
+    g(&["commit", "-qm", "first"])?;
+    g(&["push", "-q", "origin", "HEAD:main"])?;
+    g(&["fetch", "-q", "origin"])?;
+    g(&["remote", "set-head", "origin", "main"])?;
+    // The hook gives commits their Change-Ids; one made without it gets one from `kiln submit`.
+    std::fs::write(work.join("a.txt"), "one\n")?;
+    g(&["add", "a.txt"])?;
+    g(&["commit", "-qm", "one: a"])?;
+    assert!(g(&["log", "-1", "--format=%B"])?.contains("Change-Id: I"), "the hook");
+    std::fs::write(work.join("b.txt"), "two\n")?;
+    g(&["add", "b.txt"])?;
+    g(&["commit", "-q", "--no-verify", "-m", "two: b"])?;
+    assert!(!g(&["log", "-1", "--format=%B"])?.contains("Change-Id"));
+    let out = must(kiln(&home, &work, &s, &dev, &["submit", "--draft", "-r", "user:dev"]), "kiln submit")?;
+    assert!(out.contains("gave 1 commit a Change-Id") && out.contains("D1 v1 (new)") && out.contains("D2 v1 (new)"), "{out}");
+    assert!(g(&["log", "-1", "--format=%B"])?.contains("Change-Id: I"), "HEAD moved to the rewritten commit");
+    assert_eq!(g(&["status", "--porcelain"])?, "", "the working tree is as it was");
+
+    let out = must(kiln(&home, &work, &s, &dev, &["diffs"]), "kiln diffs")?;
+    assert!(out.contains("D1") && out.contains("D2") && out.contains("draft") && out.contains("(on D1)"), "{out}");
+    let top = g(&["rev-parse", "HEAD"])?.trim().to_owned();
+    let out = must(kiln(&home, &work, &s, &dev, &["checkout", "D1@v1"]), "kiln checkout")?;
+    assert!(out.contains("D1 v1"), "{out}");
+    assert_eq!(g(&["rev-parse", "HEAD"])?.trim(), g(&["rev-parse", &format!("{top}~1")])?.trim());
+    g(&["checkout", "-q", &top])?;
+    g(&["checkout", "-qb", "stack"])?;
+
+    // D1 reaches the trunk (as landing will put it there); `kiln sync` drops it from the stack.
+    let d1 = g(&["rev-parse", "HEAD~1"])?.trim().to_owned();
+    must(git(&home, &work, &["push", "-q", &format!("http://x:{}@127.0.0.1:{}/git/acme/app.git", s.admin, s.port), &format!("{d1}:refs/heads/main")]), "the owner lands D1")?;
+    let out = must(kiln(&home, &work, &s, &dev, &["sync"]), "kiln sync")?;
+    let left = g(&["log", "--format=%s", "origin/main..HEAD"])?;
+    assert_eq!(left.trim(), "two: b", "{out}\n{left}");
+    Ok(())
+}
+
+/// git as the developer does it in a `kiln clone`: credentials from kiln's helper.
+fn kiln_git(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> anyhow::Result<(bool, String)> {
+    let o = Command::new("git")
+        .args(["-c", "user.name=Dev", "-c", "user.email=dev@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("KILN_URL", format!("http://127.0.0.1:{}", s.port))
+        .env("KILN_TOKEN", token)
+        .env_remove("KILN_CONFIG")
+        .output()?;
+    Ok((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
+}

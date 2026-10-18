@@ -105,6 +105,11 @@ impl Api {
         Ok(Api { client: Client::public()?, url: url.trim_end_matches('/').to_owned(), token: token.to_owned() })
     }
 
+    /// The server's URL.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
     /// A CI route (`/api/ci<path>`).
     pub(crate) async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         self.call_api(method, &format!("/api/ci{path}"), body).await
@@ -324,7 +329,7 @@ pub struct Conn {
 }
 
 impl Conn {
-    async fn api(&self, cfg: &Config) -> Result<Api> {
+    pub(crate) async fn api(&self, cfg: &Config) -> Result<Api> {
         Api::connect(cfg, self.url.as_deref(), self.token.as_deref()).await
     }
 }

@@ -305,6 +305,18 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
         At::Run(i) => repo_of(one("SELECT p.name FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.id = ?1", seg(i)).await),
         At::Job(i) => repo_of(one("SELECT p.name FROM jobs j JOIN runs r ON r.id = j.run_id JOIN repos p ON p.id = r.repo_id WHERE j.id = ?1", seg(i)).await),
         At::Runner(i) => Scope::Runner { runner: seg(i) },
+        At::Diff(i) => {
+            let key = seg(i);
+            let number = key.strip_prefix(['D', 'd']).unwrap_or(&key).parse::<u32>().ok();
+            let name = hub
+                .store
+                .call(move |c| Ok(c.query_row("SELECT p.name FROM diffs d JOIN repos p ON p.id = d.repo_id WHERE d.id = ?1 OR (d.kind = 'diff' AND d.number = ?2)", rusqlite::params![key, number], |r| r.get::<_, String>(0)).optional()?))
+                .await
+                .ok()
+                .flatten();
+            repo_of(name)
+        }
+        At::Stack(i) => repo_of(one("SELECT p.name FROM stacks s JOIN repos p ON p.id = s.repo_id WHERE s.id = ?1", seg(i)).await),
         At::ScopeQuery => match q.get("scope").map(|s| Scope::parse(s)) {
             Some(Ok(s)) => match s.repo().map(str::to_owned) {
                 Some(r) => {

@@ -33,6 +33,7 @@ pub mod oidc;
 pub mod plan;
 pub mod policy;
 pub mod results;
+pub mod review;
 pub mod runner;
 pub mod sbom;
 pub mod sched;
