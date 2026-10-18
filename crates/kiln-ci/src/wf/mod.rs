@@ -209,6 +209,25 @@ pub fn outline(wf: &Workflow) -> serde_json::Value {
                 Some(ir::RunsOn::Group { group, labels }) => group.iter().chain(labels).map(|t| t.src.clone()).collect(),
                 None => Vec::new(),
             };
+            // What the editor completes after `matrix.` and `steps.` (W21-R01).
+            let mut axes: Vec<String> = match j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
+                Some(ir::Matrix::Spec(m)) => {
+                    let mut a: Vec<String> = m.axes.iter().map(|(k, _)| k.clone()).collect();
+                    if m.platforms.is_some() {
+                        a.extend(["platform", "os", "arch"].map(str::to_owned));
+                    }
+                    for entry in m.include.as_ref().and_then(ir::YVal::as_seq).unwrap_or_default() {
+                        if let ir::YVal::Map(kv) = entry {
+                            a.extend(kv.iter().map(|(k, _)| k.clone()));
+                        }
+                    }
+                    a
+                }
+                _ => Vec::new(),
+            };
+            axes.sort();
+            axes.dedup();
+            let step_ids: Vec<&String> = j.steps.iter().filter_map(|s| s.id.as_ref()).collect();
             serde_json::json!({
                 "id": j.id,
                 "name": j.name.as_ref().map(|n| n.src.clone()),
@@ -217,13 +236,19 @@ pub fn outline(wf: &Workflow) -> serde_json::Value {
                 "uses": j.uses,
                 "legs_estimate": legs,
                 "steps": j.steps.len(),
+                "step_ids": step_ids,
+                "matrix_axes": axes,
+                "outputs": j.outputs.iter().map(|o| o.name.clone()).collect::<Vec<_>>(),
             })
         })
         .collect();
+    let inputs: Vec<&String> = wf.on.iter().flat_map(|t| t.inputs.iter().map(|i| &i.name)).collect();
     serde_json::json!({
         "name": wf.name,
         "dialect": wf.dialect,
         "events": wf.on.iter().map(|t| t.event.clone()).collect::<Vec<_>>(),
+        "inputs": inputs,
+        "env": wf.env.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
         "jobs": jobs,
     })
 }

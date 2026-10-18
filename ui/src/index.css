@@ -1684,6 +1684,13 @@ html.fills-window body {
     stroke-dashoffset: -18;
   }
 }
+/* The code editor (docs/ci.md W21-R01): the text area first, quiet gutters. */
+.code-editor {
+  min-height: 420px;
+}
+.code-editor .cm-editor {
+  min-height: 420px;
+}
 /* A CI run's critical path (docs/ci.md W21-R04): the chain that took longest, drawn heavier. */
 .dag-edge[data-critical="true"] {
   stroke: #8f96a3;

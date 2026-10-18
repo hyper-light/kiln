@@ -312,7 +312,8 @@ impl Dispatch {
         let view = RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(self.hub.runner_caps(agent)) };
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
-        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots.max(1), capacity: None };
+        // The hub keeps at least 1 for runners that take jobs; 0 (an outpost) takes no legs.
+        let r = RunnerIn { id: agent.to_owned(), view, slots: a.slots, capacity: None };
         let mut cmds = self.sched.handle(Input::RunnerUp(Box::new(r)), now_ms());
         for (leg, attempt) in gone {
             cmds.extend(self.sched.handle(Input::AttemptFinished { leg, attempt, outcome: Outcome::Failed(Failed { class: FailureClass::RunnerLost, exit_code: None, log_hits: Vec::new() }) }, now_ms()));

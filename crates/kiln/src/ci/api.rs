@@ -104,6 +104,14 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
         (&Method::GET, ["legs", id, "routing"]) => super::runs_api::routing(hub, id).await,
         (&Method::GET, ["repos", repo, "caches"]) => super::runs_api::caches(hub, repo, None).await,
+        // W21-R01: the secret and variable names a workflow sees (names only), for completion.
+        (&Method::GET, ["repos", repo, "names"]) => {
+            let path = q.get("path").cloned().unwrap_or_default();
+            let repo = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.id == *repo || r.name == *repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{repo}`")))?;
+            let secrets = super::secrets::names_for(hub, &repo, &path, None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let vars = super::secrets::vars_for(hub, &repo, &path, None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "secrets": secrets, "variables": vars.keys().collect::<Vec<_>>() })))
+        }
         (&Method::DELETE, ["repos", repo, "caches", id]) => super::runs_api::caches(hub, repo, Some(id)).await,
         // §4.1's names for the dispatches.
         (&Method::POST, ["repos", repo, "dispatch"]) => workflows::dispatch_named(hub, repo, req.into_body()).await,

@@ -132,7 +132,8 @@ export interface CiDiagnostic {
   severity: "error" | "warning" | "info" | string;
   message: string;
   path: string;
-  range: { start: { line: number; col: number; offset: number }; end: { line: number; col: number; offset: number } };
+  /** Lines and columns from 1; offsets (bytes) aren't always there. */
+  range: { start: { line: number; col: number; offset?: number }; end: { line: number; col: number; offset?: number } };
 }
 
 export interface CiPreview {
@@ -164,6 +165,63 @@ export interface CiPreview {
 
 export type RerunMode = "all" | "failed" | "job";
 
+/** What validation sees of a workflow (W02-R12): what the editor completes from. */
+export interface CiOutline {
+  name: string | null;
+  events: string[];
+  inputs: string[];
+  env: string[];
+  jobs: {
+    id: string;
+    name: string | null;
+    needs: string[];
+    runs_on: string[];
+    uses: string | null;
+    legs_estimate: number | string;
+    steps: number;
+    step_ids: string[];
+    matrix_axes: string[];
+    outputs: string[];
+  }[];
+}
+
+export interface CiChecked {
+  kind: string;
+  dialect: string;
+  diagnostics: CiDiagnostic[];
+  outline: CiOutline | null;
+}
+
+export interface CiWorkflowFile {
+  path: string;
+  dialect: string;
+  name: string;
+  runs: boolean;
+  errors: number;
+  warnings: number;
+}
+
+export interface CiWorkflowSource {
+  path: string;
+  ref: string;
+  sha: string;
+  source: string;
+  diagnostics: CiDiagnostic[];
+  outline: CiOutline | null;
+}
+
+export interface CiCatalogEntry {
+  uses: string;
+  versions: { ref: string; sha: string }[];
+  action: {
+    name: string | null;
+    description: string | null;
+    using: string;
+    inputs: { name: string; description: string | null; required: boolean; default: string | null }[];
+    outputs: { name: string; description: string | null }[];
+  } | null;
+}
+
 /** A CI run, or null when the run isn't the engine's (a v1 pipeline's, or gone). */
 export async function ciRun(id: string, attempt: number | undefined, signal?: AbortSignal): Promise<CiRunDetail | null> {
   try {
@@ -183,8 +241,14 @@ export const ci = {
   rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean) => request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug }),
   cancel: (id: string) => request<void>("POST", `/api/ci/runs/${enc(id)}/cancel`, {}),
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
-  validate: (path: string, content: string, signal?: AbortSignal) => request<{ diagnostics: CiDiagnostic[] }>("POST", `/api/ci/validate`, { path, content }, { signal }),
-  preview: (body: { repo: string; ref?: string; path?: string; content?: string; event?: string | { name: string; inputs?: Record<string, string> } }) =>
+  validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
+  workflows: (repo: string, ref: string, signal?: AbortSignal) =>
+    request<{ ref: string; sha: string; workflows: CiWorkflowFile[] }>("GET", `/api/ci/repos/${enc(repo)}/workflows${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
+  workflow: (repo: string, path: string, ref: string, signal?: AbortSignal) =>
+    request<CiWorkflowSource>("GET", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
+  names: (repo: string, path: string, signal?: AbortSignal) => request<{ secrets: string[]; variables: string[] }>("GET", `/api/ci/repos/${enc(repo)}/names?path=${enc(path)}`, undefined, { signal }),
+  catalog: (q: string, signal?: AbortSignal) => request<{ actions: CiCatalogEntry[] }>("GET", `/api/ci/actions?q=${enc(q)}`, undefined, { signal }),
+  preview: (body: { repo: string; ref?: string; sha?: string; path?: string; content?: string; event?: string | { name: string; inputs?: Record<string, string> } }) =>
     request<CiPreview>("POST", `/api/ci/plan-preview`, body),
 };
 

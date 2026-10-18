@@ -18,6 +18,7 @@ import { Route as AppSyncRouteImport } from './routes/_app.sync'
 import { Route as AppSystemRouteImport } from './routes/_app.system'
 import { Route as AppTelemetryRouteImport } from './routes/_app.telemetry'
 import { Route as AppTerminalRouteImport } from './routes/_app.terminal'
+import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppAgentsIndexRouteImport } from './routes/_app.agents.index'
 import { Route as AppAgentsIdRouteImport } from './routes/_app.agents.$id'
 import { Route as AppAgentsSessionsRouteImport } from './routes/_app.agents.sessions'
@@ -75,6 +76,11 @@ const AppTelemetryRoute = AppTelemetryRouteImport.update({
 const AppTerminalRoute = AppTerminalRouteImport.update({
   id: '/terminal',
   path: '/terminal',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppWorkflowsRoute = AppWorkflowsRouteImport.update({
+  id: '/workflows',
+  path: '/workflows',
   getParentRoute: () => AppRoute,
 } as any)
 const AppAgentsIndexRoute = AppAgentsIndexRouteImport.update({
@@ -158,6 +164,7 @@ export interface FileRoutesByFullPath {
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
   '/terminal': typeof AppTerminalRoute
+  '/workflows': typeof AppWorkflowsRoute
   '/agents/$id': typeof AppAgentsIdRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
@@ -181,6 +188,7 @@ export interface FileRoutesByTo {
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
   '/terminal': typeof AppTerminalRoute
+  '/workflows': typeof AppWorkflowsRoute
   '/': typeof AppIndexRoute
   '/agents/$id': typeof AppAgentsIdRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
@@ -207,6 +215,7 @@ export interface FileRoutesById {
   '/_app/system': typeof AppSystemRoute
   '/_app/telemetry': typeof AppTelemetryRoute
   '/_app/terminal': typeof AppTerminalRoute
+  '/_app/workflows': typeof AppWorkflowsRoute
   '/_app/': typeof AppIndexRoute
   '/_app/agents/$id': typeof AppAgentsIdRoute
   '/_app/agents/sessions': typeof AppAgentsSessionsRoute
@@ -234,6 +243,7 @@ export interface FileRouteTypes {
     | '/system'
     | '/telemetry'
     | '/terminal'
+    | '/workflows'
     | '/agents/$id'
     | '/agents/sessions'
     | '/deployments/plans'
@@ -257,6 +267,7 @@ export interface FileRouteTypes {
     | '/system'
     | '/telemetry'
     | '/terminal'
+    | '/workflows'
     | '/'
     | '/agents/$id'
     | '/agents/sessions'
@@ -282,6 +293,7 @@ export interface FileRouteTypes {
     | '/_app/system'
     | '/_app/telemetry'
     | '/_app/terminal'
+    | '/_app/workflows'
     | '/_app/'
     | '/_app/agents/$id'
     | '/_app/agents/sessions'
@@ -367,6 +379,13 @@ declare module '@tanstack/react-router' {
       path: '/terminal'
       fullPath: '/terminal'
       preLoaderRoute: typeof AppTerminalRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/workflows': {
+      id: '/_app/workflows'
+      path: '/workflows'
+      fullPath: '/workflows'
+      preLoaderRoute: typeof AppWorkflowsRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/agents/': {
@@ -478,6 +497,7 @@ interface AppRouteChildren {
   AppSystemRoute: typeof AppSystemRoute
   AppTelemetryRoute: typeof AppTelemetryRoute
   AppTerminalRoute: typeof AppTerminalRoute
+  AppWorkflowsRoute: typeof AppWorkflowsRoute
   AppIndexRoute: typeof AppIndexRoute
   AppAgentsIdRoute: typeof AppAgentsIdRoute
   AppAgentsSessionsRoute: typeof AppAgentsSessionsRoute
@@ -502,6 +522,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppSystemRoute: AppSystemRoute,
   AppTelemetryRoute: AppTelemetryRoute,
   AppTerminalRoute: AppTerminalRoute,
+  AppWorkflowsRoute: AppWorkflowsRoute,
   AppIndexRoute: AppIndexRoute,
   AppAgentsIdRoute: AppAgentsIdRoute,
   AppAgentsSessionsRoute: AppAgentsSessionsRoute,

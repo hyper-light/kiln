@@ -5,6 +5,7 @@ import { RotateCcw, Square } from "lucide-react";
 import { ci, waitSentence, type CiAnnotation, type CiRunDetail, type RerunMode } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField } from "@/components/ui/misc";
+import { Link } from "@/lib/router";
 import { toast } from "@/components/ui/toast";
 import { formatBytes } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
@@ -30,6 +31,17 @@ export function AttemptSelect({ current, shown, onChange }: { current: number; s
   if (current < 2) return null;
   const options = Array.from({ length: current }, (_, i) => current - i).map((n) => ({ value: String(n), label: n === current ? `Attempt ${n} (latest)` : `Attempt ${n}` }));
   return <SelectField label="Attempt" hideLabel value={String(shown)} onChange={(v) => onChange(Number(v))} options={options} className="w-44" />;
+}
+
+/** "Edit workflow": the run's workflow in the editor, at the run's branch (W21-R06). */
+export function EditWorkflowLink({ detail }: { detail: CiRunDetail }) {
+  const { run } = detail;
+  const to = `/workflows?repo=${encodeURIComponent(run.repo)}&path=${encodeURIComponent(run.workflow)}&ref=${encodeURIComponent(run.branch)}`;
+  return (
+    <Link to={to} className="text-link font-mono text-[11px]">
+      Edit workflow
+    </Link>
+  );
 }
 
 /** Rerun (all, failed, one job; with debug logging) and Cancel, where the run's header is. */
