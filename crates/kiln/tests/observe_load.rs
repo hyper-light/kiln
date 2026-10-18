@@ -248,6 +248,13 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
         }
         std::thread::sleep(Duration::from_secs(hold));
     }
+    // What each holds before the flood: the rest of kiln's, so what the flood adds reads apart.
+    let rss = |pid: u32| -> (f64, f64) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let kib = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0;
+        (kib("VmRSS:"), kib("RssAnon:"))
+    };
+    let (before_server, before_runner) = (rss(server_pid), rss(runner_pid));
     let (s_cpu0, _) = usage(server_pid);
     let s_flt0 = MINFLT.with(std::cell::Cell::get);
     let (r_cpu0, _) = usage(runner_pid);
@@ -392,12 +399,8 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     eprintln!("    by thread: {}", spent(&r_threads0, &r_threads1));
     // What each holds once the flood is over and its writes are done: memory kept, not used.
     std::thread::sleep(Duration::from_secs(5));
-    let rss = |pid: u32| -> (f64, f64) {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-        let kib = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0;
-        (kib("VmRSS:"), kib("RssAnon:"))
-    };
     let ((s_now, s_anon), (r_now, r_anon)) = (rss(server_pid), rss(runner_pid));
+    eprintln!("  before it  the server held {:.0} MiB ({:.0} anonymous), the runner {:.0} MiB ({:.0} anonymous)", before_server.0, before_server.1, before_runner.0, before_runner.1);
     eprintln!("  after it   the server holds {s_now:.0} MiB ({s_anon:.0} anonymous), the runner {r_now:.0} MiB ({r_anon:.0} anonymous)");
     let mib = |k: &str| at(&s, &[k]).as_u64().unwrap_or(0) as f64 / 1048576.0;
     eprintln!(

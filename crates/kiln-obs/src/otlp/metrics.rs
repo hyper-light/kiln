@@ -88,7 +88,8 @@ pub struct Keys {
 
 #[derive(Default)]
 struct Shard {
-    table: HashTable<SeriesKey>,
+    /// Each key with its hash: a table that grows moves its entries without hashing a key again.
+    table: HashTable<(u64, SeriesKey)>,
     bytes: usize,
 }
 
@@ -111,7 +112,7 @@ impl Keys {
     /// the shard's lock) and kept. None when `make` finds it is no key.
     fn get_or_make(&self, h: u64, key: &[u8], kind: Kind, make: impl FnOnce() -> Option<SeriesKey>) -> Option<SeriesKey> {
         let shard = self.shards.get((h >> 60) as usize % SHARDS)?;
-        if let Some(k) = shard.lock().unwrap_or_else(PoisonError::into_inner).table.find(h, |k| k.kind == kind && *k.key == *key) {
+        if let Some((_, k)) = shard.lock().unwrap_or_else(PoisonError::into_inner).table.find(h, |(eh, k)| *eh == h && k.kind == kind && *k.key == *key) {
             return Some(k.clone());
         }
         let made = make()?;
@@ -121,10 +122,9 @@ impl Keys {
             s.bytes = 0;
         }
         // Another thread may have made it meanwhile: one is kept.
-        if s.table.find(h, |k| k.kind == kind && *k.key == *key).is_none() {
+        if s.table.find(h, |(eh, k)| *eh == h && k.kind == kind && *k.key == *key).is_none() {
             s.bytes += made.key.len();
-            let hash = self.hash;
-            s.table.insert_unique(h, made.clone(), move |k| key_hash(&hash, &k.key, k.kind));
+            s.table.insert_unique(h, (h, made.clone()), |e| e.0);
         }
         Some(made)
     }
@@ -151,8 +151,9 @@ const UNIFIED: [(&str, &[&str]); 3] = [("service", &["service.name"]), ("env", &
 struct Sink<'a, 'k> {
     out: Decoded,
     keys: &'k Keys,
-    /// This request's series by their keys' hashes: their places in `out.keys`.
-    found: HashTable<usize>,
+    /// This request's series by their keys' hashes: each hash and its place in `out.keys` (kept
+    /// beside it, so a table that grows hashes no key again).
+    found: HashTable<(u64, usize)>,
     /// A point's attributes as read; its tags, merged and sorted; its canonical key.
     attrs: Vec<Tag<'a>>,
     tags: Vec<Tag<'a>>,
@@ -214,16 +215,15 @@ impl<'a> Sink<'a, '_> {
         }
         let h = key_hash(&keys.hash, key, kind);
         let made = &mut out.keys;
-        let place = match found.find(h, |&i| made.get(i).is_some_and(|k| k.kind == kind && *k.key == key[..])) {
-            Some(&i) => i,
+        let place = match found.find(h, |&(eh, i)| eh == h && made.get(i).is_some_and(|k| k.kind == kind && *k.key == key[..])) {
+            Some(&(_, i)) => i,
             None => {
                 let Some(k) = keys.get_or_make(h, key, kind, || SeriesKey::new(metric, merged(), kind).ok()) else {
                     out.dropped.invalid += 1;
                     return;
                 };
                 debug_assert_eq!(*k.key, key[..], "the canonical key as SeriesKey makes it");
-                let hash = keys.hash;
-                found.insert_unique(h, made.len(), |&i| made.get(i).map_or(0, |k| key_hash(&hash, &k.key, k.kind)));
+                found.insert_unique(h, (h, made.len()), |e| e.0);
                 made.push(k);
                 made.len() - 1
             }

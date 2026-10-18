@@ -979,6 +979,14 @@ reused buffer as the canonical key, and found by a keyed hash: first in the requ
 then in the node's keys. gzip's inflating is 6 to 12 ns a point. Since the samples went flat
 (§8) a warm request allocates twice, not once a series.
 
+perf then put an eighth of a request's time in its own series table growing: it starts empty and
+grows ten times for 1,000 series, and each growth hashed every key held again. Both tables (the
+request's and the node's keys) now keep each entry's hash beside it, so growing moves entries and
+hashes nothing. The same binary before and after, in turn, three runs each under the same load:
+warm 148–164 to 130 ns a point (the load test's request), 363–367 to 276–279 (the SDK's), 385–390 to
+285–306 (500 routes); cold 900–910 to 750–768 (the SDK's). A point's transient bytes grow by a
+fifth (166 to 199 the load test's: an entry is 16 bytes, not 8), its allocations not at all.
+
 ### 12.11 Under load, end to end
 
 2026-10-18, same machine (32 threads, shared: the load average stood at 30 to 36 from other work,
