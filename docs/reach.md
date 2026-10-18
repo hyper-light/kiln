@@ -238,6 +238,20 @@ server's copy of the conversation instead, its transcript included (`{"from_stor
    there and viewers stay on it. Only then does the first runner let go of it. A runner that can't take
    it over says why, and the session goes on where it was.
 
+**Into another harness.** `move {"to": …, "kind": "codex", "model": "…"}` moves it to a runner that
+has that harness instead of its own, the conversation carried over as a switch of harness carries it
+(Claude Code ⇄ Codex: read from the harness's own record, fitted, written the way the other keeps
+its own; the permission mode never wider, the nearest effort). The timeline says it goes on in the
+other harness, there too. Not from the server's copy: a machine that's away moves an agent only in its
+own harness.
+
+**A paused agent goes on there.** A pause for a usage limit is the old machine's account's: moved,
+the agent goes on (the turn the limit cut off first), and the old account's limits stay behind. This
+is how *Go on elsewhere at a limit* works ([agents.md](agents.md), "Usage limits: pause and resume"):
+the server picks the machine (its own harness signed in to another account with room first, then
+another harness it can be carried into) and moves it. Measured on one machine with two runners and
+two accounts: paused at its stop point, on the other runner 2.5 s later, the turn going on there.
+
 Measured on one machine with two runners, each with a home of its own: an idle agent moves in 1.6 s;
 one in a git repository in 6.9 s the first time (5.3 s of it copying the repository over, uncommitted
 work and all) and in about a second after that, either way, its copies being in step. One moved
