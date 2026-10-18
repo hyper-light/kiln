@@ -215,7 +215,8 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
                 return;
             }
         };
-        let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit } = duplex;
+        // (Windows' has more: its job object.)
+        let crate::os::proc::Duplex { pid, stdin, stdout, stderr, exit, .. } = duplex;
         if events.send(Event::Started { pid, cwd: cwd.to_string_lossy().into_owned() }).await.is_err() {
             signal_group(pid, Signal::Kill);
             return;
@@ -284,6 +285,7 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     async fn run(spec: RunSpec, cwd: &Path, shell: Option<PathBuf>) -> anyhow::Result<(Vec<u8>, Vec<u8>, Option<i32>, Option<String>)> {
         let (tx, rx) = async_channel::unbounded();
         let stdin = start(spec, cwd.to_path_buf(), shell, vec![("KILN_REACH_FROM".into(), "mac".into())], tx);

@@ -8,9 +8,13 @@
 //! kiln runners linux                           # the Linux runners, best first
 //! ```
 
+#[cfg(unix)]
 use std::io::Write as _;
 
-use super::local::{Ev, Req, RunReq};
+use super::local::{Ev, Req};
+#[cfg(unix)]
+use super::local::RunReq;
+#[cfg(unix)]
 use super::wire::Signal;
 
 /// The remote command's exit status, for `main` to exit with (no message: it said it all).
@@ -89,6 +93,7 @@ pub enum ReachCmd {
     Mcp,
 }
 
+#[cfg(unix)]
 fn in_git_repo(dir: &std::path::Path) -> bool {
     std::process::Command::new("git")
         .arg("-C")
@@ -100,6 +105,7 @@ fn in_git_repo(dir: &std::path::Path) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+#[cfg(unix)]
 fn human(n: u64) -> String {
     match n {
         n if n >= 1 << 30 => format!("{:.1} GB", n as f64 / f64::from(1u32 << 30)),
