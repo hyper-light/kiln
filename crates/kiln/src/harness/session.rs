@@ -193,6 +193,12 @@ pub struct Info {
     /// It waits for a usage limit to reset (as `State::pause`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<super::model::Pause>,
+    /// How its last turn ended (as `State::last_turn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<super::model::TurnEnd>,
+    /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_off: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -244,6 +250,7 @@ impl Info {
         self.left_behind = s.count_left_behind();
         self.reach.clone_from(&s.reach);
         self.pause.clone_from(&s.pause);
+        self.last_turn.clone_from(&s.last_turn);
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -564,6 +571,8 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         left_behind: 0,
         reach: spec.reach.clone(),
         pause: None,
+        last_turn: None,
+        keep_off: false,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -1874,6 +1883,8 @@ mod tests {
             left_behind: 0,
             reach: None,
             pause: None,
+            last_turn: None,
+            keep_off: false,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };
