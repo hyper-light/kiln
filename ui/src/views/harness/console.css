@@ -57,11 +57,12 @@
 }
 .ag-top {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
 }
 .ag-id {
+  flex: 1 1 auto;
   min-width: 0;
 }
 /* One line too: where it runs gives way (ellipsized) rather than wrap and push the page down. */
@@ -258,7 +259,11 @@
 .cp .hx-compose-live {
   border-color: #3a3550;
 }
+/* The field grows to ten lines (four on a phone, where the keyboard takes most of the screen),
+   then scrolls inside. A line is 1.55em; 16px is its padding. */
 .cp .hx-compose-input {
+  max-height: calc(10 * 1.55em + 16px);
+  overflow-y: auto;
   font-size: 15px;
 }
 @media (pointer: coarse) {
@@ -266,12 +271,10 @@
     font-size: 16px;
   }
 }
-.cp-warn {
-  padding: 4px 14px 0;
-  color: #d8bb95;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.5;
+@media (max-width: 640px), (max-height: 520px) {
+  .cp .hx-compose-input {
+    max-height: calc(4 * 1.55em + 16px);
+  }
 }
 .cp-bar {
   display: flex;
@@ -378,7 +381,9 @@
   color: #ededee;
   cursor: pointer;
 }
+/* As wide for Now as for Queue and Steer, so the pill keeps its size as the mode changes. */
 .cp-mode-value {
+  min-width: calc(5ch + 0.4em);
   font-family: var(--font-mono);
   font-size: 10.5px;
   letter-spacing: 0.08em;
@@ -1267,9 +1272,8 @@
   list-style: none;
 }
 
-/* The agent's name: tap it (or its pencil) to rename it, in place. */
+/* The agent's name: tap it to rename it, in place (Rename in the ⋯ menu does the same). */
 .ag-title-btn {
-  display: inline;
   padding: 0;
   border: 0;
   background: none;
@@ -1280,33 +1284,13 @@
   overflow-wrap: anywhere;
   cursor: text;
 }
+.ag-title-btn:hover:not(:disabled) {
+  text-decoration: underline dotted #6b6e78;
+  text-underline-offset: 5px;
+}
 /* A name it shows but wasn't given (its first ask, its harness's title): quieter. */
 .ag-title-unnamed {
   color: #b9bbc2;
-}
-.ag-rename {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: 10px;
-  padding: 3px 9px;
-  border: 1px solid #2c2f36;
-  border-radius: 999px;
-  color: #9a9da6;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 400;
-  letter-spacing: 0.09em;
-  line-height: 1;
-  text-transform: uppercase;
-  vertical-align: 0.3em;
-  white-space: nowrap;
-  transition: color 0.15s, border-color 0.15s;
-}
-.ag-title-btn:hover:not(:disabled) .ag-rename,
-.ag-title-btn:focus-visible .ag-rename {
-  border-color: rgb(186 176 227 / 45%);
-  color: #ededee;
 }
 .name-field.ag-title-field {
   margin-left: -9px;

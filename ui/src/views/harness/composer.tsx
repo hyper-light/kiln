@@ -256,14 +256,16 @@ export function Composer({
   const shellLine = Boolean(onTerminal) && text.trimStart().startsWith("!");
   const sendLabel = shellLine ? "Run" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
 
-  // Grow with the text, up to a third of the screen (measured as each change is shown).
+  // Grow with the text (measured as each change is shown) up to the stylesheet's most lines, ten,
+  // or four on a phone; past that it scrolls inside, so a long message never pushes the
+  // conversation off the screen.
   const grow = React.useCallback(
     (el: HTMLTextAreaElement | null) => {
       ta.current = el;
       if (!el) return;
       void text;
       el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight / 3))}px`;
+      el.style.height = `${el.scrollHeight}px`;
     },
     [text],
   );
@@ -532,7 +534,9 @@ export function Composer({
                   ? mode === "steer"
                     ? "Steer it — it reads this at its next step"
                     : mode === "now"
-                      ? "Stop and say…"
+                      ? approvals > 0
+                        ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                        : "Stop and say…"
                       : "Queue a message for when it finishes"
                   : "Tell the agent what to do"
           }
@@ -542,12 +546,6 @@ export function Composer({
           enterKeyHint="send"
           autoCapitalize="sentences"
         />
-        {running && mode === "now" && (
-          <div className="cp-warn" role="note">
-            Now stops the current turn
-            {approvals > 0 ? ` and cancels ${approvals === 1 ? "the request waiting on you" : `the ${approvals} requests waiting on you`}` : ""}, then sends this.
-          </div>
-        )}
         <div className="cp-bar">
           {canAttach && (
             <>

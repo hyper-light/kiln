@@ -70,6 +70,41 @@ function closeOnPressAway(close: () => void) {
   };
 }
 
+const NOT_TYPED = new Set(["button", "checkbox", "color", "file", "image", "radio", "range", "reset", "submit"]);
+
+/** A field a phone opens its keyboard for. */
+function typingInto(el: Element | null) {
+  if (el instanceof HTMLInputElement) return !NOT_TYPED.has(el.type);
+  return el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || (el instanceof HTMLElement && el.isContentEditable);
+}
+
+/**
+ * A page that fills the window never scrolls, but a phone pans it up to keep a field clear of its
+ * keyboard, and iOS can leave it there once the keyboard has gone: the composer stranded mid-screen
+ * over an empty band. Once nothing is being typed into (and the page isn't zoomed), it goes back.
+ */
+function settleWhenTyped(el: HTMLElement | null) {
+  if (!el) return;
+  const view = window.visualViewport;
+  let timer = 0;
+  const settle = () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      const zoomed = view ? Math.abs(view.scale - 1) > 0.01 : false;
+      if (window.scrollY !== 0 && !zoomed && !typingInto(document.activeElement)) window.scrollTo({ top: 0, behavior: "instant" });
+    }, 150);
+  };
+  view?.addEventListener("resize", settle);
+  window.addEventListener("scroll", settle, { passive: true });
+  document.addEventListener("focusout", settle);
+  return () => {
+    window.clearTimeout(timer);
+    view?.removeEventListener("resize", settle);
+    window.removeEventListener("scroll", settle);
+    document.removeEventListener("focusout", settle);
+  };
+}
+
 export function AppShell({ me }: { me: Me | null }) {
   const location = useLocation();
   const onTerminal = location.pathname.startsWith("/terminal");
@@ -188,7 +223,7 @@ export function AppShell({ me }: { me: Me | null }) {
         <CommandPalette />
       </header>
 
-      <main id="main" className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
+      <main id="main" ref={fullHeight ? settleWhenTyped : undefined} className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
         {!onTerminal && (
           <ErrorBoundary resetKey={location.pathname}>
             <React.Suspense fallback={<RouteFallback />}>
