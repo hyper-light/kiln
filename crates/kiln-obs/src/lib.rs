@@ -5,6 +5,13 @@
 //! Like hyper-raft's crates it does no I/O of its own beyond the files a store owns: it is fed
 //! write batches and asked queries, and kiln drives it (`crates/kiln/src/observe`).
 
+pub mod batch;
 pub mod bits;
+pub mod hash;
+pub mod head;
+pub mod index;
+pub mod store;
+pub mod symbols;
 pub mod gorilla;
 pub mod testkit;
+pub mod varint;

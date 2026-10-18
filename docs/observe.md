@@ -13,7 +13,7 @@ is what it is. A change in behaviour updates it in the same commit.
 
 | Milestone | What | State |
 | --- | --- | --- |
-| O-1 | Engine core: Gorilla chunks (done, §12.1–12.2), series index, head, query primitives; measured | in progress |
+| O-1 | Engine core: Gorilla chunks, symbols, series index and selection, head with late writes, write batches; measured (§12.1–12.3) | done |
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk | planned |
 | O-3 | Replication: the store as a hyper-durable state machine; kiln carries Raft between nodes | planned |
 | O-4 | Query language (metrics, logs, events) and the HTTP API | planned |
@@ -308,6 +308,26 @@ sample under each bucket set: Gorilla's 7/9/12, 3.710; Prometheus's 14/17/20, 2.
 for this corpus, 7/14/16, 2.089. Its 16-bit outer bucket (±32 s) would send a missed 60 s export to
 the 68-bit fallback, a workload this corpus lacks; the cheapest set that keeps Prometheus's ±524 s
 outer bucket is **7/14/20, 2.124** (`DOD_BITS`), 7% below Prometheus's.
+
+### 12.3 The store, ingesting
+
+2026-10-18, same machine: `KOBS_CORPUS=<corpus> cargo bench -p kiln-obs --bench store`. The corpus
+replayed as an ingest node would send it: each series' key made once and kept, a batch a 60 s
+window across every series (1,440 batches), each series defined in its first batch and named by
+fingerprint after; one replica applies them in order.
+
+| | |
+| --- | --- |
+| build a batch (the ingest node) | 74.1 ns a sample; 0.0001 allocations a sample (keys apart, made once) |
+| batch size (the Raft log, the wire) | 15.5 bytes a sample (first design, a key in every run: 130.0) |
+| apply (a replica) | 17.8 ns a sample; 0.0054 allocations, 0.0081 reallocations a sample; 0.00057 page faults a sample |
+| duplicates | 29,040 samples of 11 series exported twice, recognised and dropped; none refused |
+| memory | 28.3 MB: 1.57 bytes a sample, 486 bytes a series of index and symbols |
+| select a metric (2,022) | p50 0.1 µs, p99 0.6 µs |
+| select `job:apiserver` across every metric (756 series) | p50 0.1 µs, p99 0.3 µs |
+| select `node_*{instance:*:9100, !mode:idle}` (1,010 series) | p50 28.4 µs, p99 56.3 µs (first glob, allocating: 274 µs) |
+| read the last hour of every series | 678,336 samples, 9.1 ms, 13.4 ns a sample, 16 allocations in all |
+| read the whole day of every series | 16.2 M samples, 107.5 ms, 6.6 ns a sample, 10 allocations in all |
 
 ## 13. Scenarios
 

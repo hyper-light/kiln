@@ -1575,7 +1575,9 @@ dependencies = [
 name = "kiln-obs"
 version = "0.1.0"
 dependencies = [
+ "hashbrown 0.17.1",
  "hyper-measure",
+ "sha2",
  "thiserror 2.0.21",
 ]
 

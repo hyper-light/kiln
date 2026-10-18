@@ -181,6 +181,22 @@ impl Encoder {
         ChunkRef { bits: self.w.view(), count: self.count }
     }
 
+    /// Forgets its samples, keeping its allocation.
+    pub fn clear(&mut self) {
+        self.w.clear();
+        self.count = 0;
+        self.first = 0;
+        self.t = 0;
+        self.delta = 0;
+        self.v = 0;
+        self.window = None;
+    }
+
+    /// Appends the chunk's bytes to `out`, the encoder left as it was.
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        self.w.write_to(out);
+    }
+
     /// The finished chunk.
     pub fn finish(self) -> Chunk {
         Chunk { first: self.first, last: self.t, count: self.count, bytes: self.w.finish() }

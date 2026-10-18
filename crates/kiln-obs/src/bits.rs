@@ -80,6 +80,20 @@ impl BitWriter {
         Bits { head: &self.bytes, tail: self.acc, tail_bits: self.used }
     }
 
+    /// Forgets what was written, keeping the allocation.
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+        self.acc = 0;
+        self.used = 0;
+    }
+
+    /// Appends the bytes (the last padded with zero bits) to `out`, the writer left as it was.
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bytes);
+        let tail = self.acc.to_be_bytes();
+        out.extend(tail.iter().take(self.used.div_ceil(8) as usize));
+    }
+
     /// The bytes, the last padded with zero bits, in an allocation sized to them.
     pub fn finish(mut self) -> Vec<u8> {
         let tail = self.acc.to_be_bytes();
