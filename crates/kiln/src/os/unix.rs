@@ -91,13 +91,22 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 /// PTY masters to the new image so shells survive the upgrade.
 pub const IN_PLACE_UPGRADE: bool = true;
 
+/// macOS's local network privacy stops recognising a process that replaced its own image: after
+/// an `exec`, the runner's connections to the server fail with "No route to host" until kiln is
+/// started afresh. So on macOS nothing re-executes itself: a runner takes up a new binary as a
+/// fresh process its supervisor starts, handing its terminals over first
+/// ([`crate::os::supervise::Handover`]).
+pub const UPGRADE_BY_SUCCESSOR: bool = cfg!(target_os = "macos");
+
 /// Keep `fd` open across the next exec (clear close-on-exec).
 pub fn keep_across_exec(fd: &std::os::fd::OwnedFd) -> io::Result<()> {
     rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty()).map_err(io::Error::from)
 }
 
-/// Take ownership of a descriptor this process carried across its own re-exec (its number comes
-/// from the handoff file the previous image wrote). `None` when that number is not open.
+/// Take ownership of a descriptor this process was handed at start-up: carried across its own
+/// re-exec (its number comes from the handoff file the previous image wrote), or inherited from
+/// the supervisor that started it (the number in an environment variable it set). `None` when
+/// that number is not open.
 #[allow(unsafe_code)]
 pub fn reclaim_fd(raw: i32) -> Option<std::os::fd::OwnedFd> {
     use std::os::fd::{BorrowedFd, FromRawFd as _};
@@ -105,12 +114,18 @@ pub fn reclaim_fd(raw: i32) -> Option<std::os::fd::OwnedFd> {
         return None;
     }
     // SAFETY: the number was written by this same process's previous image just before it
-    // re-executed itself, for a descriptor it had cleared close-on-exec on; the handoff file is
-    // read once at start-up and deleted, and nothing else in the new image has claimed that
-    // number yet. The borrow only lives for the validity check.
+    // re-executed itself, or by the parent that started this process, for a descriptor it had
+    // cleared close-on-exec on; each is read once at start-up, and nothing else in this image has
+    // claimed that number yet. The borrow only lives for the validity check.
     let open = rustix::io::fcntl_getfd(unsafe { BorrowedFd::borrow_raw(raw) }).is_ok();
     // SAFETY: as above; the descriptor is open and owned by nobody else in this image.
     open.then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
+/// Close `fd` at the next exec again (after [`reclaim_fd`]: nothing this process starts inherits
+/// it).
+pub fn close_on_exec(fd: &std::os::fd::OwnedFd) -> io::Result<()> {
+    rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).map_err(io::Error::from)
 }
 
 /// Replace this process image with `exe` (same pid, same children). Returns only on failure.
@@ -155,6 +170,11 @@ pub fn stop_processes(pids: &[u32], keep: Option<u32>, grace: std::time::Duratio
     for g in &groups {
         let _ = killpg(*g, Signal::SIGKILL);
     }
+}
+
+/// The process that started this one (1 once that has exited).
+pub fn parent_pid() -> u32 {
+    std::os::unix::process::parent_id()
 }
 
 /// Whether `pid` is still running (and signalable by us). A zombie (dead, not yet reaped) is not.

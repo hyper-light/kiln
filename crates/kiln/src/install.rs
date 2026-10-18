@@ -446,7 +446,7 @@ fn xml_escape(s: &str) -> String {
 // ---------------------------------------------------------------------------------- launchd
 
 /// The launchd label of a unit (`kiln` → `io.github.hyper-light.kiln`).
-fn launchd_label(unit: &str) -> String {
+pub(crate) fn launchd_label(unit: &str) -> String {
     format!("io.github.hyper-light.{unit}")
 }
 
@@ -467,14 +467,58 @@ fn launchd_domains(system: bool) -> Vec<String> {
     }
 }
 
-/// A launchd job running `kiln supervise -- …` at load (login, or boot for a daemon). launchd
-/// restarts the supervisor only if it fails (a clean exit means it was stopped, or another
-/// supervisor already runs the service); the supervisor restarts kiln itself.
-fn launchd_body(i: &Install<'_>, log: &Path) -> String {
-    let mut program = vec![i.bin.display().to_string()];
-    program.extend(i.args.iter().cloned());
+/// The program a unit's launchd job runs: a copy of kiln that upgrades leave alone. macOS's local
+/// network privacy knows a job by the code it starts, and kiln's builds are ad hoc signed, so to
+/// macOS each one is a new program: a job that ran the `kiln` upgrades replace would be cut off
+/// from the local network (the kiln server) after every upgrade until someone allowed it again.
+/// The launcher stays the program macOS was told about once; it runs the `kiln` upgrades replace
+/// (`supervise --exe <kiln> -- …`), whose network use macOS counts as the launcher's.
+pub(crate) fn launcher_path(unit: &str) -> PathBuf {
+    crate::config::default_data_dir().join("launcher").join(unit)
+}
+
+/// The unit's launcher, made from `bin` if it has none that runs yet. One that runs is kept: a
+/// new one would be a new program to macOS, to be allowed onto the local network again.
+fn ensure_launcher(unit: &str, bin: &Path) -> anyhow::Result<PathBuf> {
+    let launcher = launcher_path(unit);
+    let runs = Command::new(&launcher)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success() && o.stdout.starts_with(b"kiln"));
+    if runs {
+        return Ok(launcher);
+    }
+    let dir = launcher.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let tmp = launcher.with_extension(format!("new.{}", std::process::id()));
+    std::fs::copy(bin, &tmp).with_context(|| format!("copy {} to {}", bin.display(), tmp.display()))?;
+    crate::os::make_executable(&tmp)?;
+    std::fs::rename(&tmp, &launcher).with_context(|| format!("install {}", launcher.display()))?;
+    Ok(launcher)
+}
+
+/// A launchd job running `kiln supervise -- …` at load (login, or boot for a daemon), from the
+/// unit's launcher when it has one (`<launcher> supervise --exe <bin> -- …`). launchd restarts
+/// the supervisor only if it fails (a clean exit means it was stopped, or another supervisor
+/// already runs the service); the supervisor restarts kiln itself.
+fn launchd_body(i: &Install<'_>, log: &Path, launcher: Option<&Path>) -> String {
+    let mut program = match launcher {
+        Some(l) => vec![l.display().to_string(), "supervise".to_owned(), "--exe".to_owned(), i.bin.display().to_string()],
+        None => vec![i.bin.display().to_string(), "supervise".to_owned()],
+    };
+    // `i.args` is `supervise -- …`.
+    program.extend(i.args.iter().skip(1).cloned());
     let program: String = program.iter().map(|a| format!("\n    <string>{}</string>", xml_escape(a))).collect();
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned());
+    let env: Vec<(String, String)> = match i.env {
+        Some(list) => list.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+        None => vec![
+            ("KILN_CONFIG".to_owned(), i.config.display().to_string()),
+            ("PATH".to_owned(), std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned())),
+        ],
+    };
+    let env: String = env.iter().map(|(k, v)| format!("\n    <key>{}</key>\n    <string>{}</string>", xml_escape(k), xml_escape(v))).collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -486,11 +530,7 @@ fn launchd_body(i: &Install<'_>, log: &Path) -> String {
   <array>{program}
   </array>
   <key>EnvironmentVariables</key>
-  <dict>
-    <key>KILN_CONFIG</key>
-    <string>{config}</string>
-    <key>PATH</key>
-    <string>{path}</string>
+  <dict>{env}
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -512,10 +552,186 @@ fn launchd_body(i: &Install<'_>, log: &Path) -> String {
 </plist>
 "#,
         label = xml_escape(&launchd_label(i.unit)),
-        config = xml_escape(&i.config.display().to_string()),
-        path = xml_escape(&path),
         log = xml_escape(&log.display().to_string()),
     )
+}
+
+/// Run `launchctl` quietly: `Ok` if it succeeded, else what it said.
+fn launchctl(args: &[&str]) -> Result<(), String> {
+    match Command::new("launchctl").args(args).stdin(Stdio::null()).output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let said = String::from_utf8_lossy(&o.stderr).trim().to_owned();
+            Err(if said.is_empty() { format!("launchctl {} exited with {}", args.join(" "), o.status) } else { said })
+        }
+        Err(e) => Err(format!("run launchctl: {e}")),
+    }
+}
+
+/// Whether `domain/label` is loaded, and its process if one runs (`Some(None)`: loaded, not running).
+fn launchd_job(domain: &str, label: &str) -> Option<Option<u32>> {
+    let out = Command::new("launchctl").args(["print", &format!("{domain}/{label}")]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(text.lines().find_map(|l| l.trim().strip_prefix("pid = ")).and_then(|p| p.trim().parse().ok()))
+}
+
+/// The parent of process `pid` (`ps`), for walking up from this process.
+fn parent_of(pid: u32) -> Option<u32> {
+    let out = Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Whether process `pid` is this process or one of its ancestors.
+fn is_ancestor_of_me(pid: u32) -> bool {
+    let mut p = std::process::id();
+    for _ in 0..64 {
+        if p == pid {
+            return true;
+        }
+        match parent_of(p) {
+            Some(next) if next > 1 && next != p => p = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Load `plist` (label `label`) afresh in `domain` from a one-shot launchd job of its own, which
+/// outlives what it stops: it stops `stop_first` (a supervisor launchd didn't start) if given,
+/// unloads the job, waits until launchd let go of it, loads it again, then unloads itself. Used
+/// when the caller runs inside the job it reloads, so it can't wait for that itself.
+fn reload_later(domain: &str, label: &str, plist: &Path, stop_first: Option<u32>, dir: &Path) -> anyhow::Result<()> {
+    const SCRIPT: &str = r#"sleep 2
+if [ -n "$SUP" ]; then
+  kill -TERM "$SUP" 2>/dev/null
+  i=0; while kill -0 "$SUP" 2>/dev/null && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
+  kill -KILL "$SUP" 2>/dev/null
+fi
+launchctl bootout "$D/$L" 2>/dev/null
+i=0; while launchctl print "$D/$L" >/dev/null 2>&1 && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
+i=0; until launchctl bootstrap "$D" "$P"; do i=$((i+1)); if [ $i -ge 60 ]; then echo "kiln: launchd would not load $P"; break; fi; sleep 1; done
+launchctl bootout "$D/$L.reload""#;
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let me = format!("{label}.reload");
+    let path = dir.join(format!("{me}.plist"));
+    let log = dir.join("reload.log");
+    let mut env = vec![("D", domain.to_owned()), ("L", label.to_owned()), ("P", plist.display().to_string())];
+    if let Some(pid) = stop_first {
+        env.push(("SUP", pid.to_string()));
+    }
+    let env: String = env.iter().map(|(k, v)| format!("\n    <key>{k}</key>\n    <string>{}</string>", xml_escape(v))).collect();
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{me}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>{script}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>{env}
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{log}</string>
+  <key>StandardErrorPath</key>
+  <string>{log}</string>
+</dict>
+</plist>
+"#,
+        me = xml_escape(&me),
+        script = xml_escape(SCRIPT),
+        log = xml_escape(&log.display().to_string()),
+    );
+    crate::util::write_secret(&path, body.as_bytes(), 0o644)?;
+    // One left from before (it unloads itself when done; one that failed may not have).
+    let _ = launchctl(&["bootout", &format!("{domain}/{me}")]);
+    let p = path.display().to_string();
+    launchctl(&["bootstrap", domain, &p]).map_err(|e| anyhow::anyhow!("load {}: {e}", path.display()))
+}
+
+/// Have launchd start this machine's runner afresh (macOS): its job rewritten to run from the
+/// unit's launcher if it doesn't yet, then reloaded from a one-shot job ([`reload_later`]),
+/// which also stops a runner launchd didn't start (one started by hand, or by an install whose
+/// load failed). For a runner that can't take a new binary up as a fresh process from its own
+/// supervisor. `false` when there is no launchd job for it. Blocking.
+pub fn relaunch_runner(state_dir: &Path, instance: Option<&str>) -> anyhow::Result<bool> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+    let unit = crate::updates::runner_service(state_dir, instance);
+    let Some(existing) = crate::upgrade::find_existing(&unit) else { return Ok(false) };
+    let label = launchd_label(&unit);
+    let plist = launchd_plist(existing.system, &unit);
+    if existing.launcher.is_none() {
+        let launcher = ensure_launcher(&unit, &existing.bin)?;
+        let mut args = vec!["supervise".to_owned(), "--".to_owned()];
+        args.extend(existing.args.iter().cloned());
+        let config = crate::config::default_config_path();
+        let env = (!existing.env.is_empty()).then_some(existing.env.as_slice());
+        let i = Install { system: existing.system, unit: &unit, bin: &existing.bin, args: &args, config: &config, state_dir, env };
+        crate::util::write_secret(&plist, launchd_body(&i, &state_dir.join("kiln.log"), Some(&launcher)).as_bytes(), 0o644)?;
+        tracing::info!(plist = %plist.display(), launcher = %launcher.display(), "the runner's launchd job runs from its launcher now");
+    }
+    let domains = launchd_domains(existing.system);
+    let loaded = domains.iter().find_map(|d| launchd_job(d, &label).map(|pid| (d.clone(), pid)));
+    // What to stop first when launchd isn't running this runner: its supervisor, or this process
+    // when nothing supervises it.
+    let parent = crate::os::parent_pid();
+    let ours = if parent > 1 { parent } else { std::process::id() };
+    let (domain, stop_first) = match loaded {
+        // launchd runs this runner's supervisor: unloading the job stops it.
+        Some((d, Some(pid))) if pid == parent => (d, None),
+        Some((d, _)) => (d, Some(ours)),
+        None => (domains.first().cloned().unwrap_or_else(|| "gui/0".to_owned()), Some(ours)),
+    };
+    let mut tried = Vec::new();
+    for d in std::iter::once(domain).chain(domains.iter().cloned()) {
+        if tried.contains(&d) {
+            continue;
+        }
+        match reload_later(&d, &label, &plist, stop_first, state_dir) {
+            Ok(()) => return Ok(true),
+            Err(e) => tried.push(format!("{d}: {e:#}")),
+        }
+    }
+    anyhow::bail!("launchd would not run the reload: {}", tried.join("; "))
+}
+
+/// Runner supervisors of this user for `state_dir` that launchd did not start (`job` is the one
+/// it did): one an install whose load failed started from a terminal, say. Two runners of one
+/// machine would share its state directory, so an install stops them first.
+fn stray_runners(state_dir: &Path, job: &[u32]) -> Vec<u32> {
+    let Ok(out) = Command::new("ps").args(["-x", "-o", "pid=", "-o", "command="]).stdin(Stdio::null()).stderr(Stdio::null()).output() else {
+        return Vec::new();
+    };
+    strays_in(&String::from_utf8_lossy(&out.stdout), state_dir, job, std::process::id())
+}
+
+/// [`stray_runners`] in `ps -o pid=,command=` output.
+fn strays_in(ps: &str, state_dir: &Path, job: &[u32], me: u32) -> Vec<u32> {
+    let ours = state_dir.canonicalize().unwrap_or_else(|_| state_dir.to_path_buf());
+    ps.lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            let pid: u32 = words.next()?.parse().ok()?;
+            let words: Vec<String> = words.map(str::to_owned).collect();
+            let sep = words.iter().position(|w| w == "--")?;
+            let (before, after) = (words.get(..sep)?, words.get(sep + 1..)?);
+            let theirs = crate::upgrade::arg_value(after, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);
+            let same = theirs.canonicalize().unwrap_or(theirs) == ours;
+            (before.iter().any(|w| w == "supervise") && after.first().is_some_and(|w| w == "agent") && same && pid != me && !job.contains(&pid)).then_some(pid)
+        })
+        .collect()
 }
 
 fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
@@ -523,27 +739,72 @@ fn launchd(i: &Install<'_>) -> anyhow::Result<bool> {
     let path = launchd_plist(i.system, i.unit);
     let log = i.state_dir.join("kiln.log");
     std::fs::create_dir_all(i.state_dir).with_context(|| format!("create {}", i.state_dir.display()))?;
-    crate::util::write_secret(&path, launchd_body(i, &log).as_bytes(), 0o644)?;
+    let launcher = match ensure_launcher(i.unit, i.bin) {
+        Ok(l) => {
+            say(format!("launcher    {} (macOS allows it onto the local network once; upgrades replace {})", l.display(), i.bin.display()));
+            Some(l)
+        }
+        Err(e) => {
+            say(format!("launcher    none ({e:#}): the job runs {} itself", i.bin.display()));
+            None
+        }
+    };
+    crate::util::write_secret(&path, launchd_body(i, &log, launcher.as_deref()).as_bytes(), 0o644)?;
     let kind = if i.system { "LaunchDaemon" } else { "LaunchAgent" };
-    // Unload an earlier install so the new plist and binary apply, then load it (RunAtLoad
-    // starts it now). A bootout finishes asynchronously, so the bootstrap is retried briefly.
     let domains = launchd_domains(i.system);
-    for d in &domains {
-        let _ = quiet(Command::new("launchctl").args(["bootout", &format!("{d}/{label}")]));
+    let job: Vec<u32> = domains.iter().filter_map(|d| launchd_job(d, &label).flatten()).collect();
+    let strays = if i.args.iter().skip_while(|a| *a != "--").nth(1).is_some_and(|a| a == "agent") { stray_runners(i.state_dir, &job) } else { Vec::new() };
+    // Run from one of the runner's own terminals or agents, stopping it would stop this process
+    // before it loads the job again: a one-shot job of its own does both instead.
+    let inside_stray = strays.iter().copied().find(|pid| is_ancestor_of_me(*pid));
+    let inside_job = job.iter().any(|pid| is_ancestor_of_me(*pid));
+    if inside_job || inside_stray.is_some() {
+        let others: Vec<u32> = strays.iter().copied().filter(|p| Some(*p) != inside_stray).collect();
+        crate::os::stop_processes(&others, None, Duration::from_secs(30));
+        let d = domains.iter().find(|d| launchd_job(d, &label).is_some()).or(domains.first()).cloned().unwrap_or_default();
+        reload_later(&d, &label, &path, inside_stray, i.state_dir)?;
+        say(format!("boot        launchd {kind} {} ({d}; loads in a moment, which ends this shell's runner)", path.display()));
+        return Ok(true);
     }
-    for attempt in 0..3 {
+    if !strays.is_empty() {
+        say(format!("stopping    a runner launchd didn't start (pid {})", strays.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
+        crate::os::stop_processes(&strays, None, Duration::from_secs(30));
+    }
+    // Unload an earlier install so the new plist and binary apply, and wait until launchd has let
+    // go of it (an unload finishes after the job's processes have stopped, which takes the
+    // supervisor's grace period at most), then load it (RunAtLoad starts it now).
+    for d in &domains {
+        if launchd_job(d, &label).is_some() {
+            let _ = launchctl(&["bootout", &format!("{d}/{label}")]);
+        }
+    }
+    let gone_by = std::time::Instant::now() + Duration::from_secs(40);
+    while domains.iter().any(|d| launchd_job(d, &label).is_some()) && std::time::Instant::now() < gone_by {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let mut said = String::new();
+    let load_by = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
         for d in &domains {
-            let _ = quiet(Command::new("launchctl").args(["enable", &format!("{d}/{label}")]));
-            if quiet(Command::new("launchctl").arg("bootstrap").arg(d).arg(&path)) {
-                say(format!("boot        launchd {kind} {} ({d})", path.display()));
-                return Ok(true);
+            let _ = launchctl(&["enable", &format!("{d}/{label}")]);
+            match launchctl(&["bootstrap", d, &path.display().to_string()]) {
+                Ok(()) => {
+                    say(format!("boot        launchd {kind} {} ({d})", path.display()));
+                    return Ok(true);
+                }
+                Err(e) => said = e,
             }
         }
-        if attempt < 2 {
-            std::thread::sleep(Duration::from_millis(500));
+        if std::time::Instant::now() >= load_by {
+            break;
         }
+        std::thread::sleep(Duration::from_millis(500));
     }
-    say(format!("boot        launchd {kind} {} (loads at next {})", path.display(), if i.system { "boot" } else { "login" }));
+    say(format!(
+        "boot        launchd {kind} {} not loaded ({said}); it loads at next {}",
+        path.display(),
+        if i.system { "boot" } else { "login" }
+    ));
     Ok(false)
 }
 
@@ -706,6 +967,7 @@ pub fn uninstall(agent: bool) -> anyhow::Result<()> {
             }
             paths.push(launchd_plist(system, unit));
         }
+        paths.push(launcher_path(unit));
     }
     if cfg!(windows) {
         if quiet(Command::new("schtasks").args(["/Delete", "/F", "/TN", unit])) {
@@ -743,6 +1005,66 @@ mod tests {
     }
 
     #[test]
+    fn runners_launchd_did_not_start_are_found() {
+        let state = Path::new("/nonexistent/kiln-state");
+        let ps = "  101 /Users/me/.local/bin/kiln supervise -- agent --server http://h:7070 --state-dir /nonexistent/kiln-state\n  \
+                   102 /Users/me/.local/bin/kiln agent --server http://h:7070 --state-dir /nonexistent/kiln-state\n  \
+                   103 /Users/me/.local/share/kiln/launcher/kiln-agent supervise --exe /Users/me/.local/bin/kiln -- agent --state-dir /nonexistent/kiln-state\n  \
+                   104 /usr/local/bin/kiln supervise -- server\n  \
+                   105 /Users/me/.local/bin/kiln supervise -- agent --state-dir /elsewhere\n  \
+                   106 /Users/me/.local/bin/kiln supervise -- agent --state-dir /nonexistent/kiln-state\n";
+        // 101 and 106: supervisors of this state directory; 103 too, unless launchd runs it;
+        // never the runner under one (102), a server (104), another machine's runner (105), or this process.
+        assert_eq!(strays_in(ps, state, &[], 0), [101, 103, 106]);
+        assert_eq!(strays_in(ps, state, &[103], 106), [101]);
+    }
+
+    /// launchd for real (macOS, by hand): a one-shot job reloads another and stops a process
+    /// first. Only throwaway jobs and processes of its own.
+    #[test]
+    #[ignore = "drives this Mac's launchd"]
+    fn a_reload_from_its_own_job_stops_and_reloads() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let uid = crate::os::uid();
+        let domain = format!("gui/{uid}");
+        let label = format!("io.github.hyper-light.kiln-reload-test-{}", std::process::id());
+        let plist = dir.path().join(format!("{label}.plist"));
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>{label}</string>\
+             <key>ProgramArguments</key><array><string>/bin/sleep</string><string>600</string></array><key>RunAtLoad</key><true/></dict></plist>\n"
+        );
+        std::fs::write(&plist, body)?;
+        launchctl(&["bootstrap", &domain, &plist.display().to_string()]).map_err(anyhow::Error::msg)?;
+        let first = (0..50).find_map(|_| launchd_job(&domain, &label).flatten().or_else(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            None
+        }));
+        let mut stray = Command::new("/bin/sleep").arg("600").spawn()?;
+        let stray_pid = stray.id();
+        let result = (|| -> anyhow::Result<()> {
+            let first = first.ok_or_else(|| anyhow::anyhow!("the test job never ran"))?;
+            reload_later(&domain, &label, &plist, Some(stray_pid), dir.path())?;
+            // The stray is stopped, then the job is loaded again: running, under another pid.
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let stopped = stray.try_wait()?.is_some();
+                let again = launchd_job(&domain, &label).flatten().filter(|p| *p != first);
+                let helper_gone = launchd_job(&domain, &format!("{label}.reload")).is_none();
+                if stopped && again.is_some() && helper_gone {
+                    return Ok(());
+                }
+                anyhow::ensure!(std::time::Instant::now() < deadline, "stopped {stopped}, reloaded {again:?}, helper gone {helper_gone}");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        })();
+        let _ = stray.kill();
+        let _ = stray.wait();
+        let _ = launchctl(&["bootout", &format!("{domain}/{label}")]);
+        let _ = launchctl(&["bootout", &format!("{domain}/{label}.reload")]);
+        result
+    }
+
+    #[test]
     fn boot_definitions() -> anyhow::Result<()> {
         let args = vec!["supervise".to_owned(), "--".to_owned(), "agent".to_owned(), "--name".to_owned(), "box <1> & co".to_owned()];
         let i = Install {
@@ -754,7 +1076,7 @@ mod tests {
             state_dir: Path::new("/Users/me/.local/share/kiln/agent"),
             env: None,
         };
-        let plist = launchd_body(&i, Path::new("/tmp/kiln.log"));
+        let plist = launchd_body(&i, Path::new("/tmp/kiln.log"), None);
         assert!(plist.contains("<string>io.github.hyper-light.kiln-agent</string>"));
         assert!(plist.contains("<string>supervise</string>\n    <string>--</string>\n    <string>agent</string>"));
         assert!(plist.contains("box &lt;1&gt; &amp; co"));
@@ -762,6 +1084,22 @@ mod tests {
         let e = crate::upgrade::parse_plist(&plist, "kiln-agent", false).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
         assert_eq!((e.boot.as_str(), e.bin.as_path()), ("launchd", Path::new("/Users/me/.local/bin/kiln")));
         assert_eq!(e.args, ["agent", "--name", "box <1> & co"]);
+        assert_eq!(e.launcher, None);
+        assert_eq!(e.env, ["KILN_CONFIG=/Users/me/.config/kiln/kiln.toml".to_owned(), format!("PATH={}", std::env::var("PATH").unwrap_or_default())]);
+        // From the unit's launcher: upgrades replace the binary it runs, never the launcher.
+        let launcher = Path::new("/Users/me/.local/share/kiln/launcher/kiln-agent");
+        let plist = launchd_body(&i, Path::new("/tmp/kiln.log"), Some(launcher));
+        assert!(plist.contains(
+            "<string>/Users/me/.local/share/kiln/launcher/kiln-agent</string>\n    <string>supervise</string>\n    <string>--exe</string>\n    <string>/Users/me/.local/bin/kiln</string>\n    <string>--</string>\n    <string>agent</string>"
+        ));
+        let e = crate::upgrade::parse_plist(&plist, "kiln-agent", false).ok_or_else(|| anyhow::anyhow!("not parsed"))?;
+        assert_eq!(e.bin, Path::new("/Users/me/.local/bin/kiln"), "what an upgrade replaces");
+        assert_eq!(e.launcher.as_deref(), Some(launcher));
+        assert_eq!(e.args, ["agent", "--name", "box <1> & co"]);
+        // Its environment carries over when the job is rewritten.
+        let env = e.env.clone();
+        let again = Install { env: Some(&env), ..i };
+        assert_eq!(crate::upgrade::parse_plist(&launchd_body(&again, Path::new("/tmp/kiln.log"), Some(launcher)), "kiln-agent", false).map(|e| e.env), Some(env));
         let xml = task_xml(&i);
         assert!(xml.contains("<Arguments>supervise --detach -- agent --name &quot;box &lt;1&gt; &amp; co&quot;</Arguments>"));
         assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
