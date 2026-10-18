@@ -697,6 +697,9 @@ function updates(ctx: PagesCtx): UpdatesOverview {
       const up = a.version === ctx.version && !mac;
       return {
         name: a.name,
+        policy: "auto" as const,
+        locked: false,
+        from: up || mac ? null : "built by release run #412",
         hostname: a.hostname,
         os: a.os,
         arch: a.arch,
