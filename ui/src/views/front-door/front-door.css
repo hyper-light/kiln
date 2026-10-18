@@ -14,7 +14,8 @@
   --fd-faint: #7b7e88;
   --fd-line: #222428;
   --fd-focus: #6b6290;
-  --fd-ctl: 30px;
+  /* The console's field height (.field, .select): the same controls as every page. */
+  --fd-ctl: 40px;
   margin-top: 56px;
   container: fd / inline-size;
   color: var(--fd-text);
@@ -46,11 +47,6 @@
   font-size: 0.92em;
   overflow-wrap: anywhere;
 }
-.fd-quiet {
-  margin: 0;
-  color: var(--fd-muted);
-  font-size: 12.5px;
-}
 
 /* ---------------------------------------------------------------- keys and the runner line */
 .fd-key {
@@ -59,7 +55,7 @@
   padding: 0;
   color: var(--fd-muted);
   font-family: var(--font-mono);
-  font-size: 9.5px;
+  font-size: 9px;
   font-weight: 400;
   letter-spacing: 0.1em;
   line-height: 16px;
@@ -363,12 +359,8 @@
   font-family: var(--font-mono);
   font-size: 12px;
 }
-/* Phones zoom into fields under 16px. On touch the controls stay 34px and their targets are
-   40px, past their edges. */
+/* Phones zoom into fields under 16px. On touch, the buttons' targets reach past their edges. */
 @media (pointer: coarse) {
-  .fd {
-    --fd-ctl: 34px;
-  }
   .fd .fd-btn,
   .fd .fd-download,
   .fd-file,
@@ -655,10 +647,10 @@
   line-height: 1.5;
 }
 .fd-msg[data-tone="ok"] {
-  color: #b9d6ca;
+  color: var(--color-ok);
 }
 .fd-msg[data-tone="error"] {
-  color: #e2c4c6;
+  color: #d8b9bb;
 }
 
 /* ---------------------------------------------------------------- downloads, devices, setup */

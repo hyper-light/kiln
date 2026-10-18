@@ -9,9 +9,10 @@ import { ArrowDown, ArrowRight, ArrowUpRight, Check, Pencil, Plus, Radar, Send, 
 import { api, discoveryApi } from "@/api/client";
 import type { DiscoveredInstance, DiscoveryInfo, JoinRequest, ScanState } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { ErrorState, SectionHeading, SkeletonRows } from "@/components/ui/misc";
+import { SectionHeading } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { errorMessage, useNow, type Resource } from "@/lib/hooks";
+import { errorMessage, useNow } from "@/lib/hooks";
+import type { SuspenseResource } from "@/lib/resource";
 import { Beam } from "@/views/harness/signals";
 import { RelTime } from "@/views/shared";
 import { STAND_RANK, STAND_WORD, VIA_TITLE, addressOf, cidrProblem, displayName, formatCode, jumpTo, roleWord, sortInstances, viaWord, type Stand } from "./data";
@@ -19,13 +20,13 @@ import { CopyText, Fold } from "./parts";
 
 type Probe = { address: string; state: "asking" } | { address: string; state: "done"; found: DiscoveredInstance[] } | { address: string; state: "error"; error: string };
 
-export function FoundSection({ index, discovery, requests, onRequestsChanged }: { index: string; discovery: Resource<DiscoveryInfo>; requests: JoinRequest[]; onRequestsChanged: () => void }) {
+export function FoundSection({ index, discovery, requests, onRequestsChanged }: { index: string; discovery: SuspenseResource<DiscoveryInfo>; requests: JoinRequest[]; onRequestsChanged: () => void }) {
   const d = discovery.data;
   const [probe, setProbe] = React.useState<Probe | null>(null);
   const { setData, reload } = discovery;
 
   const patch = React.useCallback(
-    (id: string, p: Partial<DiscoveredInstance>) => setData((prev) => prev && { ...prev, instances: prev.instances.map((i) => (i.id === id ? { ...i, ...p } : i)) }),
+    (id: string, p: Partial<DiscoveredInstance>) => setData((prev) => ({ ...prev, instances: prev.instances.map((i) => (i.id === id ? { ...i, ...p } : i)) })),
     [setData],
   );
   const changed = React.useCallback(() => {
@@ -33,19 +34,22 @@ export function FoundSection({ index, discovery, requests, onRequestsChanged }: 
     onRequestsChanged();
   }, [reload, onRequestsChanged]);
 
-  const selfId = d?.self.id;
-  const nativeLabel = d?.methods?.find((m) => m.id === "native")?.label;
-  const byId = new Map((d?.instances ?? []).map((i) => [i.id, i]));
+  const selfId = d.self.id;
+  const nativeLabel = d.methods?.find((m) => m.id === "native")?.label;
+  const byId = new Map(d.instances.map((i) => [i.id, i]));
   const reqById = new Map(requests.map((r) => [r.id, r]));
   // What a probe found is shown under the address field; the list below leaves it out meanwhile.
   const probed = probe?.state === "done" ? probe.found.map((i) => byId.get(i.id) ?? i) : [];
   const probedIds = new Set(probed.map((i) => i.id));
-  const sorted = sortInstances((d?.instances ?? []).filter((i) => !probedIds.has(i.id)), selfId);
+  const sorted = sortInstances(
+    d.instances.filter((i) => !probedIds.has(i.id)),
+    selfId,
+  );
   const fresh = sorted.filter((x) => STAND_RANK[x.stand] < STAND_RANK.here);
   const here = sorted.filter((x) => STAND_RANK[x.stand] >= STAND_RANK.here);
-  const heard = (d?.instances ?? []).filter((i) => i.id !== selfId).length;
+  const heard = d.instances.filter((i) => i.id !== selfId).length;
   const asking = fresh.filter((x) => x.stand === "asking").length + sortInstances(probed, selfId).filter((x) => x.stand === "asking").length;
-  const problems = d?.problems?.length ?? 0;
+  const problems = d.problems?.length ?? 0;
 
   const row = ({ i, stand }: { i: DiscoveredInstance; stand: Stand }) => (
     <InstanceRow
@@ -54,7 +58,7 @@ export function FoundSection({ index, discovery, requests, onRequestsChanged }: 
       stand={stand}
       request={i.request ? reqById.get(i.request) : undefined}
       nativeLabel={nativeLabel}
-      canInvite={d?.join_requests !== false}
+      canInvite={d.join_requests !== false}
       onPatch={patch}
       onChanged={changed}
     />
@@ -67,22 +71,16 @@ export function FoundSection({ index, discovery, requests, onRequestsChanged }: 
         label="Nearby"
         title={<span id="am-found">Found on your network</span>}
         aside={
-          d && (
-            <span className="am-aside">
-              {heard} heard{asking > 0 && <span className="am-aside-warn"> · {asking} asking</span>}
-            </span>
-          )
+          <span className="am-aside">
+            {heard} heard{asking > 0 && <span className="am-aside-warn"> · {asking} asking</span>}
+          </span>
         }
       />
-      {discovery.error && !d ? (
-        <ErrorState error={discovery.error} onRetry={discovery.reload} compact />
-      ) : !d ? (
-        <SkeletonRows rows={4} cols={4} />
-      ) : (
+      {
         <>
           {d.subnets !== undefined && (
             <div className="am-tools">
-              <ScanForm d={d} onStarted={(s) => setData((prev) => prev && { ...prev, scan: s })} />
+              <ScanForm d={d} onStarted={(s) => setData((prev) => ({ ...prev, scan: s }))} />
               <ProbeForm probe={probe} onProbe={setProbe} />
             </div>
           )}
@@ -123,7 +121,7 @@ export function FoundSection({ index, discovery, requests, onRequestsChanged }: 
             </Fold>
           )}
         </>
-      )}
+      }
     </section>
   );
 }

@@ -21,12 +21,6 @@
   text-underline-offset: 3px;
 }
 
-.sync-none {
-  margin: 0;
-  padding: 18px 4px;
-  color: #8c8f98;
-  font-size: 13px;
-}
 
 .sync-off {
   margin: 0;
@@ -157,19 +151,6 @@
   padding-left: 16px;
   color: var(--color-muted);
   font-size: 12px;
-}
-
-.sync-confirm {
-  max-width: 72ch;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-accent);
-  background: var(--color-surface);
-  color: var(--color-secondary);
-  font-size: 13px;
-}
-
-.sync-confirm p {
-  margin: 0 0 8px;
 }
 
 .sync-conflicts {

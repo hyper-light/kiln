@@ -1,18 +1,18 @@
 import * as React from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router";
 import { UpdateNotice } from "./update-notice";
-import { Dialog } from "radix-ui";
 import { ArrowUpRight, LogOut, Menu, Search, Settings, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Me, Status } from "@/api/types";
 import { Brand } from "./brand";
 import { ConnectionIndicator } from "./connection";
-import { CommandPalette, setPaletteOpen } from "./command-palette";
+import { CommandPalette, setPaletteOpen, usePalette } from "./command-palette";
 import { MotionToggle } from "./motion";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/misc";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
+import { Loading } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
 import { pad2, shortSha } from "@/lib/format";
@@ -57,17 +57,33 @@ function useRunFailureToasts() {
   });
 }
 
+/** A press or tap outside the header closes what is open in it. */
+function closeOnPressAway(close: () => void) {
+  return (el: HTMLElement | null) => {
+    if (!el) return;
+    const header = el.closest(".site-header") ?? el;
+    const onDown = (e: PointerEvent) => {
+      if (!header.contains(e.target as Node)) close();
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  };
+}
+
 export function AppShell({ me }: { me: Me | null }) {
   const location = useLocation();
   const onTerminal = location.pathname.startsWith("/terminal");
   // An agent's workspace fills the window like the terminal does (no footer, no page scroll).
   const fullHeight = onTerminal || /^\/agents\/(?!sessions(?:\/|$))[^/]+/.test(location.pathname);
+  // The terminal stays mounted once opened, so its sessions live on while you're elsewhere.
   const [termMounted, setTermMounted] = React.useState(onTerminal);
-  const [menuOpen, setMenuOpen] = React.useState(false);
-  React.useEffect(() => {
-    if (onTerminal) setTermMounted(true);
-  }, [onTerminal]);
-  React.useEffect(() => setMenuOpen(false), [location.pathname]);
+  if (onTerminal && !termMounted) setTermMounted(true);
+  // The phones' menu, open on the page it was opened on: going anywhere closes it.
+  const [menuAt, setMenuAt] = React.useState<string | null>(null);
+  const menuOpen = menuAt === location.pathname;
+  const closeMenu = React.useCallback(() => setMenuAt(null), []);
+  const menuAway = React.useMemo(() => closeOnPressAway(closeMenu), [closeMenu]);
+  const paletteOpen = usePalette((s) => s.open);
   useRunFailureToasts();
 
   return (
@@ -75,80 +91,82 @@ export function AppShell({ me }: { me: Me | null }) {
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <Dialog.Root open={menuOpen} onOpenChange={setMenuOpen}>
-        <header className="site-header">
-          <div className={onTerminal ? "header-inner px-4 sm:px-6" : "header-inner container-console"}>
-            <Link
-              to="/"
-              aria-label="kiln overview"
-              className="inline-flex min-h-11 items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:ring-offset-4 focus-visible:ring-offset-[#08090a]"
-            >
-              <Brand />
-            </Link>
-            <nav className="desktop-nav hidden xl:flex" aria-label="Main navigation">
-              {NAV.map((n, i) => (
-                <NavLink key={n.to} to={n.to} end={n.end}>
-                  <span className="nav-index" aria-hidden="true">
-                    {pad2(i + 1)}
-                  </span>
-                  {n.label}
-                </NavLink>
-              ))}
-            </nav>
-            <div className="ml-auto flex items-center gap-1.5">
-              <ConnectionIndicator />
-              <button
-                type="button"
-                onClick={() => setPaletteOpen(true)}
-                className="hidden min-h-11 items-center gap-2.5 rounded-full px-3 text-[12px] text-[#a5a5ac] transition-colors hover:bg-white/[0.05] hover:text-white sm:inline-flex"
-                aria-label="Open command palette"
-              >
-                <Search size={14} />
-                <span className="hidden xl:inline">Search</span>
-                <span className="flex gap-1">
-                  <Kbd>{isMac ? "⌘" : "Ctrl"}</Kbd>
-                  <Kbd>K</Kbd>
-                </span>
-              </button>
-              <Tip content="Settings">
-                <Link to="/settings" className="icon-btn hidden sm:inline-grid" data-variant="bare" aria-label="Settings">
-                  <Settings size={16} />
-                </Link>
-              </Tip>
-              <Tip content={me?.hostname ? `Sign out of ${me.hostname}` : "Sign out"}>
-                <button className="icon-btn hidden sm:inline-grid" data-variant="bare" aria-label="Sign out" onClick={() => void api.logout()}>
-                  <LogOut size={16} />
-                </button>
-              </Tip>
-              <Dialog.Trigger asChild>
-                <Button variant="ghost" size="icon" className="xl:hidden [&_svg]:size-5" aria-label="Open navigation">
-                  <Menu aria-hidden="true" />
-                </Button>
-              </Dialog.Trigger>
-            </div>
-          </div>
-        </header>
-        <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-[80] bg-black/65 backdrop-blur-sm" />
-          <Dialog.Content
-            className="nav-sheet fixed inset-x-0 top-0 z-[90] max-h-[100dvh] overflow-y-auto border-b border-white/10 bg-[#08090a] px-5 pt-[max(0.5rem,env(safe-area-inset-top))] pb-8 text-[#e4e5e7] shadow-2xl outline-none sm:px-8"
+      <header className="site-header">
+        {/* The same on every page (the terminal's too), so nothing in it moves between pages. */}
+        <div className="header-inner container-console">
+          <Link
+            to="/"
+            aria-label="kiln overview"
+            className="inline-flex min-h-11 items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:ring-offset-4 focus-visible:ring-offset-[#08090a]"
           >
-            <Dialog.Title className="sr-only">Navigation</Dialog.Title>
-            <Dialog.Description className="sr-only">kiln console sections</Dialog.Description>
-            <div className="flex min-h-16 items-center justify-between gap-4">
-              <Brand />
-              <Dialog.Close asChild>
-                <Button variant="ghost" size="icon" aria-label="Close navigation">
-                  <X aria-hidden="true" />
-                </Button>
-              </Dialog.Close>
-            </div>
-            <nav className="mt-4 flex flex-col" aria-label="Mobile navigation">
+            <Brand />
+          </Link>
+          <nav className="desktop-nav hidden xl:flex" aria-label="Main navigation">
+            {NAV.map((n, i) => (
+              <NavLink key={n.to} to={n.to} end={n.end}>
+                <span className="nav-index" aria-hidden="true">
+                  {pad2(i + 1)}
+                </span>
+                {n.label}
+              </NavLink>
+            ))}
+          </nav>
+          <div className="ml-auto flex items-center gap-1.5">
+            <UpdateNotice />
+            <ConnectionIndicator />
+            <button
+              type="button"
+              onClick={() => setPaletteOpen(!paletteOpen)}
+              aria-expanded={paletteOpen}
+              className="hidden min-h-11 items-center gap-2.5 rounded-full px-3 text-[12px] text-[#a5a5ac] transition-colors hover:bg-white/[0.05] hover:text-white sm:inline-flex"
+              aria-label="Open command palette"
+            >
+              <Search size={14} />
+              <span className="hidden xl:inline">Search</span>
+              <span className="flex gap-1">
+                <Kbd>{isMac ? "⌘" : "Ctrl"}</Kbd>
+                <Kbd>K</Kbd>
+              </span>
+            </button>
+            <Tip content="Settings">
+              <Link to="/settings" className="icon-btn hidden sm:inline-grid" data-variant="bare" aria-label="Settings">
+                <Settings size={16} />
+              </Link>
+            </Tip>
+            <Tip content={me?.hostname ? `Sign out of ${me.hostname}` : "Sign out"}>
+              <button className="icon-btn hidden sm:inline-grid" data-variant="bare" aria-label="Sign out" onClick={() => void api.logout()}>
+                <LogOut size={16} />
+              </button>
+            </Tip>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="xl:hidden [&_svg]:size-5"
+              aria-label={menuOpen ? "Close navigation" : "Open navigation"}
+              aria-expanded={menuOpen}
+              aria-controls="site-menu"
+              onClick={() => setMenuAt(menuOpen ? null : location.pathname)}
+            >
+              {menuOpen ? <X aria-hidden="true" /> : <Menu aria-hidden="true" />}
+            </Button>
+          </div>
+        </div>
+        {menuOpen && (
+          <div
+            ref={menuAway}
+            id="site-menu"
+            className="header-band xl:hidden"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") closeMenu();
+            }}
+          >
+            <nav className="container-console pb-6" aria-label="Mobile navigation">
               {[...NAV, { to: "/settings", label: "Settings", end: false }].map((n, i) => (
                 <NavLink
                   key={n.to}
                   to={n.to}
                   end={n.end}
+                  onClick={closeMenu}
                   className="flex min-h-14 items-center justify-between gap-4 border-b border-white/10 px-1 py-3 text-xl tracking-tight text-[#a3a5ad] transition-colors hover:text-white aria-[current=page]:text-white"
                 >
                   <span className="flex items-baseline gap-3">
@@ -158,18 +176,19 @@ export function AppShell({ me }: { me: Me | null }) {
                   <ArrowUpRight className="size-5" aria-hidden="true" />
                 </NavLink>
               ))}
+              <div className="mt-5 flex items-center justify-between">
+                <MotionToggle />
+                <button className="motion-toggle" onClick={() => void api.logout()}>
+                  <LogOut size={11} /> Sign out
+                </button>
+              </div>
             </nav>
-            <div className="mt-6 flex items-center justify-between">
-              <MotionToggle />
-              <button className="motion-toggle" onClick={() => void api.logout()}>
-                <LogOut size={11} /> Sign out
-              </button>
-            </div>
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
+          </div>
+        )}
+        <CommandPalette />
+      </header>
 
-      <main id="main" className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "flex-1"}>
+      <main id="main" className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
         {!onTerminal && (
           <ErrorBoundary resetKey={location.pathname}>
             <React.Suspense fallback={<RouteFallback />}>
@@ -204,18 +223,15 @@ export function AppShell({ me }: { me: Me | null }) {
           </div>
         </footer>
       )}
-      <CommandPalette />
-      <UpdateNotice />
     </div>
   );
 }
 
+/** A page whose code is still on its way: the header and the menu stay, the loader takes the page's place. */
 export function RouteFallback() {
   return (
     <div className="container-console page" aria-busy="true">
-      <div className="skeleton h-3 w-40" />
-      <div className="skeleton mt-6 h-10 w-80 max-w-full" />
-      <div className="skeleton mt-10 h-48 w-full" />
+      <Loading label="Loading the page" block />
     </div>
   );
 }

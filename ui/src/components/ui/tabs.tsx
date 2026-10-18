@@ -1,6 +1,5 @@
 import * as React from "react";
 import { Tabs as TabsPrimitive } from "radix-ui";
-import { useScrollEdges } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
 // Pill segmented control, verbatim styling from hyperlight-site.
@@ -10,16 +9,11 @@ export const Tabs = React.forwardRef<React.ComponentRef<typeof TabsPrimitive.Roo
 Tabs.displayName = "Tabs";
 
 export const TabsList = React.forwardRef<React.ComponentRef<typeof TabsPrimitive.List>, React.ComponentPropsWithoutRef<typeof TabsPrimitive.List>>(({ className, ...props }, ref) => {
-  const edges = useScrollEdges<HTMLDivElement>();
   return (
     <TabsPrimitive.List
-      ref={(el) => {
-        edges(el);
-        if (typeof ref === "function") ref(el);
-        else if (ref) ref.current = el;
-      }}
+      ref={ref}
       data-slot="tabs-list"
-      className={cn("inline-flex min-h-11 max-w-full items-center gap-1 overflow-x-auto rounded-full border border-white/10 bg-white/[0.02] p-1", className)}
+      className={cn("inline-flex min-h-11 max-w-full flex-wrap items-center gap-1 rounded-[22px] border border-white/10 bg-white/[0.02] p-1", className)}
       {...props}
     />
   );
@@ -58,18 +52,12 @@ export function Segmented<T extends string>({
   label: string;
   className?: string;
 }) {
-  const edges = useScrollEdges<HTMLDivElement>();
   return (
-    <div
-      ref={edges}
-      role="group"
-      aria-label={label}
-      className={cn("inline-flex min-h-11 max-w-full items-center gap-1 overflow-x-auto rounded-full border border-white/10 bg-white/[0.02] p-1", className)}
-    >
+    <div role="group" aria-label={label} className={cn("inline-flex min-h-11 max-w-full flex-wrap items-center gap-1 rounded-[22px] border border-white/10 bg-white/[0.02] p-1", className)}>
       {options.map((o) => (
         <button key={o.value} type="button" aria-pressed={o.value === value} onClick={() => onChange(o.value)} className={tabsTriggerClass}>
           {o.label}
-          {o.count !== undefined && <span className="ml-0.5 font-mono text-[9px] text-[#898d99]">{o.count}</span>}
+          {o.count !== undefined && <span className="ml-0.5 font-mono text-[9px] text-[#898d99] tabular-nums">{o.count}</span>}
         </button>
       ))}
     </div>

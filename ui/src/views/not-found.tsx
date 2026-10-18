@@ -2,12 +2,11 @@ import { Link } from "react-router";
 import { ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Optic } from "@/components/ui/misc";
-import { useDocumentTitle } from "@/lib/hooks";
 
 export default function NotFound() {
-  useDocumentTitle("Not found");
   return (
     <div className="container-console page flex flex-col items-center py-24 text-center">
+      <title>Not found · kiln</title>
       <Optic size={200} />
       <div className="eyebrow mt-8">
         <span className="spectrum-rule" /> 404 / Not found

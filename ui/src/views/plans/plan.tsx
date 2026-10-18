@@ -5,14 +5,17 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { api } from "@/api/client";
-import { harnessApi } from "@/api/harness";
+import { harnessApi, type KindInfo } from "@/api/harness";
 import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
-import { CopyButton, ErrorState, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
+import { Hold, RowsHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { Confirm, CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc";
+import { useAuth } from "@/lib/auth";
+import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
-import { errorMessage, useDocumentTitle, useResource } from "@/lib/hooks";
-import { useAgents } from "@/views/harness/use-agents";
+import { errorMessage } from "@/lib/hooks";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { Prose } from "@/views/harness/parts";
 import { PlanItemsEditor } from "./items";
 import { itemsMarkdown, planMarkdown, planSteps } from "./steps";
@@ -24,39 +27,86 @@ const tagList = (s: string) =>
     .map((t) => t.trim())
     .filter(Boolean);
 
+/** The harnesses each machine offers. */
+const kindsRes: Res<Record<string, KindInfo[]>> = { key: "harness/kinds", fetch: () => harnessApi.kindsAll(), opts: { pollMs: 60_000 } };
+
+/** A plan, or none for a new one. */
+const planRes = (id: string): Res<Plan | null> => ({ key: `plans/${id}`, fetch: (s) => (id === "new" ? Promise.resolve(null) : plansApi.get(id, s)) });
+
 export default function PlanPage() {
   const { id = "new" } = useParams();
+  return (
+    <div className="container-console page plan-page">
+      <Loadable label="the plan" fallback={<PlanHold />}>
+        <PlanEditor key={id} id={id} />
+      </Loadable>
+    </div>
+  );
+}
+
+function PlanCrumbs() {
+  return (
+    <Crumbs
+      index={6}
+      items={[
+        { label: "Agents", to: "/agents" },
+        { label: "Plans", to: "/agents/plans" },
+      ]}
+    />
+  );
+}
+
+/** The plan while it loads: the way back, its title's and text's space. */
+function PlanHold() {
+  return (
+    <>
+      <title>Plan · kiln</title>
+      <PlanCrumbs />
+      <Hold height={420} label="Loading the plan" />
+    </>
+  );
+}
+
+/** The saved plan the text here started from: changes are measured against it. */
+interface Base {
+  key: string;
+  title: string;
+  body: string;
+  items: string;
+  tags: string;
+}
+
+const baseOf = (p: Plan): Base => ({ key: keyOf(p), title: p.title, body: p.body, items: JSON.stringify(p.items ?? []), tags: p.tags.join(", ") });
+
+function PlanEditor({ id }: { id: string }) {
   const isNew = id === "new";
   const navigate = useNavigate();
-  const res = useResource((s) => (isNew ? Promise.resolve(null) : plansApi.get(id, s)), [id]);
-  const plan = res.data ?? null;
-  useDocumentTitle(plan ? plan.title : "New plan");
+  const res = useRes(planRes(id));
+  const plan = res.data;
+  if (plan) warm(harnessSessionsRes, kindsRes);
 
-  const [title, setTitle] = React.useState("");
-  const [body, setBody] = React.useState("");
-  const [items, setItems] = React.useState<PlanItem[]>([]);
-  const [tags, setTags] = React.useState("");
-  // The saved plan the text here started from: changes are measured against it.
-  const [base, setBase] = React.useState<{ key: string; title: string; body: string; items: string; tags: string } | null>(null);
+  const [base, setBase] = React.useState<Base | null>(() => (plan ? baseOf(plan) : null));
+  const [title, setTitle] = React.useState(base?.title ?? "");
+  const [body, setBody] = React.useState(base?.body ?? "");
+  const [items, setItems] = React.useState<PlanItem[]>(plan?.items ?? []);
+  const [tags, setTags] = React.useState(base?.tags ?? "");
   const [preview, setPreview] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  const take = React.useCallback((p: Plan) => {
-    const b = { key: keyOf(p), title: p.title, body: p.body, items: JSON.stringify(p.items ?? []), tags: p.tags.join(", ") };
+  const take = (p: Plan) => {
+    const b = baseOf(p);
     setBase(b);
     setTitle(b.title);
     setBody(b.body);
     setItems(p.items ?? []);
     setTags(b.tags);
-  }, []);
+  };
   const dirty = isNew
     ? body.trim() !== "" || title.trim() !== "" || items.length > 0
     : base !== null && (title !== base.title || body !== base.body || JSON.stringify(items) !== base.items || tagList(tags).join(",") !== tagList(base.tags).join(","));
-  // Take the plan in when it arrives or changes, unless there are unsaved changes here.
-  React.useEffect(() => {
-    if (plan && keyOf(plan) !== base?.key && !dirty) take(plan);
-  }, [plan, base, dirty, take]);
+  // A newer version saved elsewhere comes in, unless there are unsaved changes here.
+  if (plan && keyOf(plan) !== base?.key && !dirty) take(plan);
 
   const steps = items.length ? items.map((it) => it.title || "Untitled step") : planSteps(body);
 
@@ -66,11 +116,13 @@ export default function PlanPage() {
     try {
       if (isNew) {
         const p = await plansApi.create({ title, body, items, tags: tagList(tags) });
+        invalidate("plans");
         navigate(planHref(p.id), { replace: true });
       } else {
         const p = await plansApi.update(id, { title, body, items, tags: tagList(tags) });
         res.setData(() => p);
         take(p);
+        invalidate("plans");
       }
     } catch (e) {
       setError(errorMessage(e));
@@ -82,22 +134,17 @@ export default function PlanPage() {
     if (plan) take(plan);
   };
 
-  if (!isNew && res.error && !plan) return <ErrorState error={res.error} onRetry={res.reload} />;
-  if (!isNew && !plan) return <SkeletonRows rows={4} cols={2} />;
-
   return (
-    <div className="container-console page plan-page">
-      <div className="plan-crumbs">
-        <Link to="/agents/plans">Plans</Link>
-        {plan && (
-          <span>
-            {" "}
-            · v{plan.version} · changed {relativeTime(plan.updated_at)}
-            {plan.runs ? ` · run ${plan.runs}×` : ""}
-            {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
-          </span>
-        )}
-      </div>
+    <>
+      <title>{`${plan ? plan.title : "New plan"} · kiln`}</title>
+      <PlanCrumbs />
+      {plan && (
+        <p className="plan-dim plan-meta">
+          v{plan.version} · changed {relativeTime(plan.updated_at)}
+          {plan.runs ? ` · run ${plan.runs}×` : ""}
+          {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
+        </p>
+      )}
       <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder={isNew ? "From the first heading when left empty" : ""} />
       <div className="plan-edit" data-preview={preview}>
         <div className="plan-text">
@@ -136,7 +183,7 @@ export default function PlanPage() {
         )}
       </div>
       <label className="plan-check">
-        <input type="checkbox" checked={preview} onChange={(e) => setPreview(e.target.checked)} /> Show the preview and steps
+        <input type="checkbox" className="check" checked={preview} onChange={(e) => setPreview(e.target.checked)} /> Show the preview and steps
       </label>
       <TextField label="Tags" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="release, parser" hint="Separated by commas." />
       <div className="plan-actions">
@@ -152,20 +199,25 @@ export default function PlanPage() {
       </div>
       {plan && (
         <>
-          <RunPlan plan={plan} dirty={dirty} onRan={res.reload} />
+          <Loadable label="where it can run" fallback={<RunHold />}>
+            <RunPlan plan={plan} dirty={dirty} onRan={() => invalidate(`plans/${plan.id}`)} />
+          </Loadable>
           <SharePlan plan={plan} onChange={(p) => res.setData(() => p)} />
-          <Versions
-            plan={plan}
-            onRestored={(p) => {
-              res.setData(() => p);
-              take(p);
-            }}
-          />
-          <Runs plan={plan} />
+          <Loadable label="its versions and runs" fallback={<RowsHold rows={2} rowHeight={44} />}>
+            <Versions
+              plan={plan}
+              onRestored={(p) => {
+                res.setData(() => p);
+                take(p);
+                invalidate("plans");
+              }}
+            />
+            <Runs plan={plan} />
+          </Loadable>
           <DeletePlan plan={plan} />
         </>
       )}
-    </div>
+    </>
   );
 }
 
@@ -183,28 +235,35 @@ function machineOf(target: string) {
   return target === "local" ? "this server" : target.replace(/^agent:/, "");
 }
 
+function RunHold() {
+  return (
+    <section className="plan-section" aria-label="Run the plan">
+      <h2 className="plan-h">Run it</h2>
+      <Hold height={128} />
+    </section>
+  );
+}
+
 /** Run the plan on an agent. */
 function RunPlan({ plan, dirty, onRan }: { plan: Plan; dirty: boolean; onRan: () => void }) {
-  const agents = useAgents();
-  const kinds = useResource(() => harnessApi.kindsAll(), []);
+  warm(harnessSessionsRes, kindsRes);
+  const agents = useRes(harnessSessionsRes).data;
+  const kinds = useRes(kindsRes).data;
   const [where, setWhere] = React.useState("new");
   const [target, setTarget] = React.useState("local");
-  const [kind, setKind] = React.useState("");
+  const [kindChoice, setKind] = React.useState("");
   const [cwd, setCwd] = React.useState("");
-  const [mode, setMode] = React.useState<PlanMode>("message");
+  const [modeChoice, setMode] = React.useState<PlanMode>("message");
   const [busy, setBusy] = React.useState(false);
   const [ran, setRan] = React.useState<PlanRan | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
-  const live = (agents.list ?? []).filter((a) => a.status !== "exited");
-  const targets = Object.keys(kinds.data ?? {}).sort((a, b) => (a === "local" ? -1 : b === "local" ? 1 : a.localeCompare(b)));
-  const offered = (kinds.data?.[target] ?? []).filter((k) => k.available);
-  React.useEffect(() => {
-    if (offered.length > 0 && !offered.some((k) => k.id === kind)) setKind(offered[0]?.id ?? "");
-  }, [offered, kind]);
-  React.useEffect(() => {
-    if (plan.steps.length === 0) setMode("message");
-  }, [plan.steps.length]);
+  const live = agents.filter((a) => a.status !== "exited");
+  const targets = Object.keys(kinds).sort((a, b) => (a === "local" ? -1 : b === "local" ? 1 : a.localeCompare(b)));
+  const offered = (kinds[target] ?? []).filter((k) => k.available);
+  // A harness the machine doesn't offer gives way to the first it does; a plan without steps runs as one message.
+  const kind = offered.some((k) => k.id === kindChoice) ? kindChoice : (offered[0]?.id ?? "");
+  const mode: PlanMode = plan.steps.length === 0 ? "message" : modeChoice;
 
   const run = async () => {
     setBusy(true);
@@ -280,9 +339,9 @@ function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   // The address it is opened at, or another the server answers on (its front doors).
-  const me = useResource((s) => api.me(s), []);
+  const me = useAuth((s) => (s.kind === "authed" ? s.me : null));
   const [base, setBase] = React.useState(window.location.origin);
-  const bases = [...new Set([window.location.origin, ...(me.data?.origins ?? []), ...(me.data?.public_url ? [me.data.public_url.replace(/\/+$/, "")] : [])])];
+  const bases = [...new Set([window.location.origin, ...(me?.origins ?? []), ...(me?.public_url ? [me.public_url.replace(/\/+$/, "")] : [])])];
   const toggle = async (on: boolean) => {
     setBusy(true);
     setError(null);
@@ -306,7 +365,7 @@ function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void
     <section className="plan-section" aria-label="Share the plan">
       <h2 className="plan-h">Share it</h2>
       <label className="plan-check">
-        <input type="checkbox" checked={Boolean(plan.share)} disabled={busy} onChange={(e) => void toggle(e.target.checked)} /> Anyone with the link can read it
+        <input type="checkbox" className="check" checked={Boolean(plan.share)} disabled={busy} onChange={(e) => void toggle(e.target.checked)} /> Anyone with the link can read it
       </label>
       {plan.share && (
         <>
@@ -317,7 +376,7 @@ function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void
           </div>
           <p className="plan-dim plan-reach">
             It opens without signing in for anyone who can reach {hostOf(base)}: usually someone on your network or tailnet
-            {base.startsWith("https://") && (me.data?.origins ?? []).includes(base) ? ", on a device that trusts kiln's certificate" : ""}, unless you give kiln a public address.
+            {base.startsWith("https://") && (me?.origins ?? []).includes(base) ? ", on a device that trusts kiln's certificate" : ""}, unless you give kiln a public address.
           </p>
         </>
       )}
@@ -333,10 +392,9 @@ function SharePlan({ plan, onChange }: { plan: Plan; onChange: (p: Plan) => void
 
 /** Every version, newest first; any one can be read and made current again. */
 function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => void }) {
-  const res = useResource((s) => plansApi.versions(plan.id, s), [plan.id, plan.version]);
+  const versions = useSuspenseResource(`plans/${plan.id}/versions`, (s) => plansApi.versions(plan.id, s)).data;
   const [open, setOpen] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
-  const versions = res.data ?? [];
   if (versions.length <= 1) return null;
   return (
     <section className="plan-section" aria-label="Versions">
@@ -381,11 +439,10 @@ function Versions({ plan, onRestored }: { plan: Plan; onRestored: (p: Plan) => v
 }
 
 function Runs({ plan }: { plan: Plan }) {
-  const res = useResource((s) => plansApi.runs(plan.id, s), [plan.id, plan.runs]);
-  const agents = useAgents();
-  const runs = res.data ?? [];
+  const runs = useSuspenseResource(`plans/${plan.id}/runs`, (s) => plansApi.runs(plan.id, s)).data;
+  const agents = useRes(harnessSessionsRes).data;
   if (runs.length === 0) return null;
-  const nameOf = (session: string) => agents.list?.find((a) => a.id === session)?.name ?? `agent ${session.slice(-6)}`;
+  const nameOf = (session: string) => agents.find((a) => a.id === session)?.name ?? `agent ${session.slice(-6)}`;
   return (
     <section className="plan-section" aria-label="Runs">
       <h2 className="plan-h">Runs</h2>
@@ -416,31 +473,37 @@ function DeletePlan({ plan }: { plan: Plan }) {
           Delete plan
         </Button>
       ) : (
-        <div className="plan-confirm" role="group" aria-label="Confirm deleting the plan">
+        <Confirm
+          label="Confirm deleting the plan"
+          tone="danger"
+          actions={
+            <>
+              <Button
+                size="xs"
+                variant="danger"
+                onClick={async () => {
+                  try {
+                    await plansApi.remove(plan.id);
+                    invalidate("plans");
+                    navigate("/agents/plans", { replace: true });
+                  } catch (e) {
+                    setError(errorMessage(e));
+                  }
+                }}
+              >
+                Delete
+              </Button>
+              <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>
+                Keep it
+              </Button>
+            </>
+          }
+        >
           <p>
             Delete &ldquo;{plan.title}&rdquo;, its {plan.version} version{plan.version === 1 ? "" : "s"} and its runs? Agents keep what they were sent.
           </p>
-          <div className="plan-actions">
-            <Button
-              size="xs"
-              variant="danger"
-              onClick={async () => {
-                try {
-                  await plansApi.remove(plan.id);
-                  navigate("/agents/plans", { replace: true });
-                } catch (e) {
-                  setError(errorMessage(e));
-                }
-              }}
-            >
-              Delete
-            </Button>
-            <Button size="xs" variant="ghost" onClick={() => setAsking(false)}>
-              Keep it
-            </Button>
-          </div>
           {error && <p className="plan-error">{error}</p>}
-        </div>
+        </Confirm>
       )}
     </section>
   );

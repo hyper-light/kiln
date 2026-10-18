@@ -1,0 +1,814 @@
+/**
+ * Mock data for the pages the simulation in server.ts doesn't cover: deployments (apps, their
+ * trees, history, diffs, objects, events, logs, deploy plans), kept plans, Settings → Updates, the
+ * runners' front doors and the tailnet, synced folders, terminal and AI sessions, and the sign-in
+ * methods. Deterministic (seeded), so screenshots and layout measurements repeat.
+ */
+import type http from "node:http";
+import type {
+  Agent,
+  CdApp,
+  CdAppDetail,
+  CdDeployment,
+  CdDiff,
+  CdEvent,
+  CdHealth,
+  CdNode,
+  CdOperation,
+  CdPlan,
+  CdPlanRepo,
+  CdResourceDetail,
+  CdSummary,
+  CdSync,
+  CdTree,
+  FrontDoorView,
+  Run,
+  SyncView,
+  TailscaleView,
+  UpdatesOverview,
+} from "../src/api/types.ts";
+import { hashStr, mulberry32, pick } from "./data.ts";
+
+export interface PagesCtx {
+  agents: () => Agent[];
+  runs: () => Run[];
+  version: string;
+  hostname: string;
+  json: (res: http.ServerResponse, status: number, body: unknown) => void;
+  err: (res: http.ServerResponse, status: number, message: string) => void;
+  body: <T>(req: http.IncomingMessage) => Promise<T>;
+}
+
+const now = () => Math.floor(Date.now() / 1000);
+const T0 = now();
+const hex = (r: () => number, n: number) => Array.from({ length: n }, () => Math.floor(r() * 16).toString(16)).join("");
+
+/* ------------------------------------------------------------------ deployments */
+
+const CLUSTERS = ["prod-eu", "prod-us", "staging"];
+const PROJECTS = ["platform", "payments", "search", "web"];
+const NAMES = ["api", "gateway", "worker", "scheduler", "indexer", "frontend", "billing", "ledger", "auth", "notifier", "ingest", "cache", "exporter", "reports", "checkout"];
+const HEALTHS: CdHealth[] = ["Healthy", "Healthy", "Healthy", "Healthy", "Healthy", "Progressing", "Degraded", "Suspended", "Missing"];
+const SYNCS: CdSync[] = ["Synced", "Synced", "Synced", "Synced", "OutOfSync", "Unknown"];
+
+interface MockApp {
+  app: CdApp;
+  detail: CdAppDetail;
+  history: CdDeployment[];
+}
+
+const apps = new Map<string, MockApp>();
+{
+  const r = mulberry32(4242);
+  let n = 0;
+  for (const project of PROJECTS) {
+    for (const name of NAMES) {
+      if (r() < 0.25) continue;
+      const cluster = CLUSTERS[n % CLUSTERS.length]!;
+      n++;
+      const id = `${project}/${name}`;
+      const health = pick(r, HEALTHS);
+      const sync = health === "Missing" ? "OutOfSync" : pick(r, SYNCS);
+      const resources = 4 + Math.floor(r() * 9);
+      const revision = hex(r, 40);
+      const running = r() < 0.06;
+      const op: CdOperation | null = running
+        ? { id: 7, phase: "Running", trigger: "auto", attempt: 1, message: "waiting for healthy state of apps/Deployment/" + name, started_ms: Date.now() - 40_000, finished_ms: null }
+        : {
+            id: 6,
+            phase: health === "Degraded" && r() < 0.5 ? "Failed" : "Succeeded",
+            trigger: pick(r, ["manual", "auto", "self-heal"] as const),
+            attempt: 1,
+            message: "successfully synced (all tasks run)",
+            by: r() < 0.5 ? "ada" : null,
+            started_ms: Date.now() - Math.floor(r() * 86_400_000),
+            finished_ms: Date.now() - Math.floor(r() * 80_000_000),
+          };
+      const app: CdApp = {
+        app: id,
+        name,
+        project,
+        cluster,
+        namespace: `${project}-${name}`.slice(0, 24),
+        environment: cluster.startsWith("prod") ? "production" : "staging",
+        auto: r() < 0.7,
+        labels: { team: project },
+        origin: { kind: "deploy", repo: "https://github.com/hyper-light/deploy" },
+        shadow: r() < 0.08,
+        sync,
+        health,
+        revision,
+        resources,
+        out_of_sync: sync === "OutOfSync" ? 1 + Math.floor(r() * 3) : 0,
+        message: health === "Degraded" ? "Deployment " + name + " exceeded its progress deadline" : null,
+        operation: op,
+        pinned: null,
+      };
+      const detail: CdAppDetail = {
+        ...app,
+        definition: {
+          sources: [{ repo: "https://github.com/hyper-light/deploy", path: `apps/${project}/${name}`, revision: "main", chart: null, as_ref: null }],
+          sync: { auto: app.auto, prune: true, self_heal: app.auto, allow_empty: false },
+        },
+        commits: [revision],
+        children: [],
+        revision_info: {
+          sha: revision,
+          author: pick(r, ["ada", "mira.k", "jonas", "ines"]),
+          email: "dev@example.com",
+          at_ms: Date.now() - Math.floor(r() * 5 * 86_400_000),
+          subject: pick(r, ["Bump api to 1.42.0", "Raise worker memory limit", "Add canary for checkout", "Roll indexer back to v3 settings", "Tune HPA thresholds"]),
+          body: "",
+        },
+      };
+      const history: CdDeployment[] = Array.from({ length: 6 }, (_, i) => ({
+        app: id,
+        id: 6 - i,
+        op: 6 - i,
+        revision: i === 0 ? revision : hex(r, 40),
+        trigger: pick(r, ["manual", "auto", "self-heal"]),
+        by: r() < 0.4 ? "ada" : null,
+        succeeded: !(i === 2 && r() < 0.4),
+        message: i === 2 ? "one or more objects failed to apply" : "",
+        applied: resources,
+        pruned: i === 1 ? 1 : 0,
+        at_ms: Date.now() - (i + 1) * 9 * 3_600_000,
+        commit: { sha: revision, author: "ada", email: "dev@example.com", at_ms: Date.now() - (i + 1) * 9 * 3_600_000, subject: `Change ${6 - i} to ${name}`, body: "" },
+      }));
+      apps.set(id, { app, detail, history });
+    }
+  }
+}
+
+function listApps(q: URLSearchParams) {
+  const want = (k: string) => (q.get(k) ?? "").split(",").filter(Boolean);
+  const f = { sync: want("sync"), health: want("health"), cluster: want("cluster"), project: want("project"), namespace: want("namespace") };
+  const text = (q.get("q") ?? "").toLowerCase();
+  const match = (a: CdApp, skip?: keyof typeof f) =>
+    (skip === "sync" || !f.sync.length || f.sync.includes(a.sync)) &&
+    (skip === "health" || !f.health.length || f.health.includes(a.health)) &&
+    (skip === "cluster" || !f.cluster.length || f.cluster.includes(a.cluster)) &&
+    (skip === "project" || !f.project.length || f.project.includes(a.project)) &&
+    (skip === "namespace" || !f.namespace.length || f.namespace.includes(a.namespace)) &&
+    (!text || a.app.toLowerCase().includes(text));
+  const all = [...apps.values()].map((x) => x.app);
+  return { all, match, f };
+}
+
+function facets(q: URLSearchParams) {
+  const { all, match } = listApps(q);
+  const count = (key: "sync" | "health" | "cluster" | "project" | "namespace") => {
+    const m: Record<string, number> = {};
+    for (const a of all) if (match(a, key)) m[a[key]] = (m[a[key]] ?? 0) + 1;
+    return m;
+  };
+  return { total: all.filter((a) => match(a)).length, facets: { sync: count("sync"), health: count("health"), cluster: count("cluster"), project: count("project"), namespace: count("namespace") } };
+}
+
+function summary(): CdSummary {
+  const s: CdSummary = { apps: apps.size, sync: {}, health: {}, clusters: CLUSTERS.length };
+  for (const { app } of apps.values()) {
+    s.sync[app.sync] = (s.sync[app.sync] ?? 0) + 1;
+    s.health[app.health] = (s.health[app.health] ?? 0) + 1;
+  }
+  return s;
+}
+
+const HRANK: Record<string, number> = { Degraded: 0, Missing: 1, Progressing: 2, Suspended: 3, Unknown: 4, Healthy: 5 };
+const SRANK: Record<string, number> = { OutOfSync: 0, Unknown: 1, Synced: 2 };
+
+function node(r: () => number, p: Partial<CdNode> & Pick<CdNode, "kind" | "name" | "namespace">): CdNode {
+  return {
+    id: p.uid ?? `${p.group ?? ""}/${p.kind}:${p.namespace}/${p.name}`,
+    uid: null,
+    group: "",
+    version: "v1",
+    parents: [],
+    managed: false,
+    health: "Healthy",
+    message: null,
+    sync: null,
+    hook: false,
+    missing: false,
+    requires_pruning: false,
+    why: null,
+    created_at: new Date(Date.now() - Math.floor(r() * 9 * 86_400_000)).toISOString(),
+    info: [],
+    status: null,
+    ready: null,
+    restarts: null,
+    images: [],
+    containers: [],
+    node: null,
+    ...p,
+  };
+}
+
+function tree(id: string): CdTree | null {
+  const a = apps.get(id)?.app;
+  if (!a) return null;
+  const r = mulberry32(hashStr(id));
+  const ns = a.namespace;
+  const nodes: CdNode[] = [];
+  const managed = (kind: string, name: string, group = "", extra: Partial<CdNode> = {}) => {
+    const uid = `uid-${kind}-${name}`;
+    const n = node(r, {
+      kind,
+      name,
+      namespace: ns,
+      group,
+      uid,
+      id: uid,
+      managed: true,
+      sync: a.sync === "OutOfSync" && kind === "Deployment" ? "OutOfSync" : "Synced",
+      why: a.sync === "OutOfSync" && kind === "Deployment" ? ".spec.replicas differs" : null,
+      ...extra,
+    });
+    nodes.push(n);
+    return n;
+  };
+  const dep = managed("Deployment", a.name, "apps", { health: a.health === "Missing" ? "Missing" : a.health, ready: "3/3", info: [{ name: "Ready", value: "3/3" }] });
+  managed("Service", a.name);
+  managed("ConfigMap", `${a.name}-config`, "", { health: null, info: [{ name: "Keys", value: "4" }] });
+  managed("ServiceAccount", a.name, "", { health: null });
+  if (r() < 0.6) managed("Ingress", a.name, "networking.k8s.io");
+  if (r() < 0.5) managed("HorizontalPodAutoscaler", a.name, "autoscaling");
+  for (let rs = 0; rs < 2; rs++) {
+    const rsUid = `uid-rs-${a.name}-${rs}`;
+    const hash = hex(r, 9);
+    nodes.push(
+      node(r, {
+        kind: "ReplicaSet",
+        name: `${a.name}-${hash}`,
+        namespace: ns,
+        group: "apps",
+        uid: rsUid,
+        id: rsUid,
+        parents: [dep.uid!],
+        info: [{ name: "Revision", value: String(7 - rs) }],
+        ready: rs === 0 ? "3/3" : "0/0",
+      }),
+    );
+    if (rs > 0) continue;
+    for (let p = 0; p < 3; p++) {
+      const podUid = `uid-pod-${a.name}-${p}`;
+      const bad = a.health === "Degraded" && p === 2;
+      nodes.push(
+        node(r, {
+          kind: "Pod",
+          name: `${a.name}-${hash}-${hex(r, 5)}`,
+          namespace: ns,
+          uid: podUid,
+          id: podUid,
+          parents: [rsUid],
+          health: bad ? "Degraded" : "Healthy",
+          message: bad ? "back-off 5m0s restarting failed container" : null,
+          status: bad ? "CrashLoopBackOff" : "Running",
+          ready: bad ? "0/1" : "1/1",
+          restarts: bad ? 14 : 0,
+          node: pick(r, ["node-a1", "node-a2", "node-b1"]),
+          images: [`ghcr.io/hyper-light/${a.name}:1.42.0`],
+          containers: [
+            {
+              name: a.name,
+              image: `ghcr.io/hyper-light/${a.name}:1.42.0`,
+              init: false,
+              ready: !bad,
+              restarts: bad ? 14 : 0,
+              state: bad ? "waiting" : "running",
+              reason: bad ? "CrashLoopBackOff" : null,
+              last: bad ? "Error (exit 1)" : null,
+            },
+          ],
+        }),
+      );
+    }
+  }
+  nodes.push(
+    node(r, {
+      kind: "EndpointSlice",
+      name: `${a.name}-${hex(r, 5)}`,
+      namespace: ns,
+      group: "discovery.k8s.io",
+      uid: `uid-eps-${a.name}`,
+      id: `uid-eps-${a.name}`,
+      parents: [`uid-Service-${a.name}`],
+      health: null,
+      ready: "3",
+    }),
+  );
+  return { app: id, cluster: a.cluster, namespace: ns, nodes, truncated: false, errors: [], at_ms: Date.now() };
+}
+
+function yamlOf(n: CdNode, desired: boolean) {
+  return [
+    `apiVersion: ${n.group ? `${n.group}/` : ""}${n.version}`,
+    `kind: ${n.kind}`,
+    "metadata:",
+    `  name: ${n.name}`,
+    `  namespace: ${n.namespace}`,
+    "  labels:",
+    `    app.kubernetes.io/name: ${n.name}`,
+    ...(desired ? [] : [`  uid: ${n.uid ?? "?"}`, `  creationTimestamp: ${n.created_at}`]),
+    "spec:",
+    `  replicas: ${desired ? 3 : 2}`,
+  ].join("\n");
+}
+
+function resourceDetail(id: string, key: string): CdResourceDetail | null {
+  const t = tree(id);
+  if (!t) return null;
+  const [group, kind, namespace, name] = key.split("~");
+  const n = t.nodes.find((x) => x.kind === kind && x.name === name && x.group === (group ?? ""));
+  if (!n) return null;
+  const owners = n.parents.map((u) => t.nodes.find((x) => x.uid === u)).filter((x): x is CdNode => Boolean(x));
+  return {
+    key: { group: group ?? "", kind: kind ?? "", namespace: namespace ?? "", name: name ?? "" },
+    managed: n.managed,
+    node: n,
+    live: yamlOf(n, false),
+    desired: n.managed ? yamlOf(n, true) : null,
+    diff: n.managed
+      ? {
+          key: { group: n.group, kind: n.kind, namespace: n.namespace, name: n.name },
+          why: n.why,
+          live: "",
+          predicted: "",
+          hunks: n.sync === "OutOfSync" ? [{ old_start: 9, old_lines: 1, new_start: 9, new_lines: 1, lines: ["-  replicas: 2", "+  replicas: 3"] }] : [],
+        }
+      : null,
+    labels: { "app.kubernetes.io/name": n.name, "app.kubernetes.io/part-of": t.app.split("/")[0] ?? "" },
+    annotations: n.kind === "Deployment" ? { "deployment.kubernetes.io/revision": "7" } : {},
+    conditions:
+      n.kind === "Deployment" || n.kind === "Pod"
+        ? [
+            {
+              type: "Available",
+              status: n.health === "Degraded" ? "False" : "True",
+              reason: "MinimumReplicasAvailable",
+              message: "Deployment has minimum availability.",
+              last: new Date(Date.now() - 3_600_000).toISOString(),
+            },
+          ]
+        : [],
+    finalizers: [],
+    owners: owners.map((o) => ({ group: o.group, kind: o.kind, namespace: o.namespace, name: o.name, id: o.id, uid: o.uid })),
+    errors: [],
+  };
+}
+
+function events(): CdEvent[] {
+  const at = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+  return [
+    { type: "Normal", reason: "Scheduled", message: "Successfully assigned to node-a1", count: 1, first: at(40), last: at(40), source: "default-scheduler", object: { kind: "Pod", name: null } },
+    { type: "Normal", reason: "Pulled", message: "Container image already present on machine", count: 3, first: at(38), last: at(12), source: "kubelet", object: { kind: "Pod", name: null } },
+    { type: "Warning", reason: "BackOff", message: "Back-off restarting failed container", count: 14, first: at(30), last: at(2), source: "kubelet", object: { kind: "Pod", name: null } },
+  ];
+}
+
+function logs(name: string) {
+  const r = mulberry32(hashStr(name));
+  const lines = Array.from({ length: 80 }, (_, i) => ({
+    pod: `${name}-pod`,
+    ts: new Date(Date.now() - (80 - i) * 4000).toISOString(),
+    text: `${pick(r, ["INFO", "INFO", "INFO", "WARN", "DEBUG"])} ${pick(r, ["request served", "cache hit", "connected to db", "flushed 120 rows", "health check ok", "retrying upstream"])} id=${hex(r, 8)} took=${Math.floor(r() * 90)}ms`,
+  }));
+  return { pods: [`${name}-pod`], more_pods: 0, container: null, containers: [name], lines, errors: [] };
+}
+
+function diffOf(id: string): CdDiff[] {
+  const a = apps.get(id)?.app;
+  if (!a || a.sync !== "OutOfSync") return [];
+  return [
+    {
+      key: { group: "apps", kind: "Deployment", namespace: a.namespace, name: a.name },
+      why: ".spec.replicas differs",
+      live: "",
+      predicted: "",
+      hunks: [{ old_start: 7, old_lines: 3, new_start: 7, new_lines: 3, lines: [" spec:", "-  replicas: 2", "+  replicas: 3", "   revisionHistoryLimit: 5"] }],
+    },
+  ];
+}
+
+const PLAN_REPOS: CdPlanRepo[] = [
+  {
+    url: "https://github.com/hyper-light/deploy",
+    urls: ["https://github.com/hyper-light/deploy", "git@github.com:hyper-light/deploy.git"],
+    apps: apps.size,
+    default_branch: "main",
+    branches: [
+      { name: "main", commit: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", at_ms: Date.now() - 3_600_000 },
+      { name: "feature/checkout", commit: "b2c3d4e5f60718293a4b5c6d7e8f901234567890", at_ms: Date.now() - 7_200_000 },
+      { name: "fix/worker-memory", commit: "c3d4e5f60718293a4b5c6d7e8f90123456789012", at_ms: Date.now() - 86_400_000 },
+    ],
+  },
+];
+
+function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
+  const target = ask.head ?? ask.commit ?? `#${ask.pr ?? ""}`;
+  const app = (name: string, ok = true) => ({
+    app: `payments/${name}`,
+    cluster: "prod-eu",
+    namespace: `payments-${name}`,
+    auto: true,
+    auto_prune: false,
+    shadow: false,
+    touched: true,
+    ok,
+    error: null,
+    problems: ok ? [] : ["Deployment payments-checkout/checkout: spec.template.spec.containers[0].image: Required value"],
+    notes: [],
+    own: {
+      added: 0,
+      changed: 1,
+      removed: 0,
+      objects: [
+        {
+          key: { group: "apps", kind: "Deployment", namespace: `payments-${name}`, name },
+          change: "changed" as const,
+          why: ".spec.replicas differs",
+          hook: false,
+          added_lines: 1,
+          removed_lines: 1,
+          hunks: [{ old_start: 7, old_lines: 2, new_start: 7, new_lines: 2, lines: [" spec:", "-  replicas: 2", "+  replicas: 3"] }],
+        },
+      ],
+    },
+    stack: { added: 0, changed: 1, removed: 0, objects: [] },
+    sync: { create: 0, update: 1, prune: 0, hooks: 0, unchanged: 6, unread: 0, held: [], taken: [], steps: [] },
+  });
+  return {
+    repo: PLAN_REPOS[0]!.url,
+    trunk: { branch: "main", commit: PLAN_REPOS[0]!.branches[0]!.commit },
+    base: PLAN_REPOS[0]!.branches[0]!.commit,
+    ok: !target.includes("fail"),
+    apps: { affected: 2, planned: 2, unaffected: apps.size - 2, unplanned: [] },
+    notes: [],
+    diffs: [
+      { commit: { sha: "d4e5f60718293a4b5c6d7e8f90123456789012ab", author: "ada", at_ms: Date.now() - 5_400_000, subject: "Raise checkout replicas" }, ok: true, apps: [app("checkout")] },
+      {
+        commit: { sha: "e5f60718293a4b5c6d7e8f90123456789012abcd", author: "ada", at_ms: Date.now() - 3_600_000, subject: `Ledger on ${target}` },
+        ok: !target.includes("fail"),
+        apps: [app("ledger", !target.includes("fail"))],
+      },
+    ],
+  };
+}
+
+/* ------------------------------------------------------------------ plans */
+
+const PLANS = [
+  {
+    id: "pl_release",
+    title: "Cut the 0.2 release",
+    body: "Everything that has to happen before 0.2 ships.",
+    items: [
+      {
+        title: "Freeze main",
+        description: "Stop merging features; only fixes from here.",
+        examples: "",
+        acceptance: [{ kind: "qualitative", text: "Branch protection requires a release label." }],
+        testing: [],
+      },
+      {
+        title: "Run the full bench",
+        description: "Compare against 0.1 on the metal runners.",
+        examples: "",
+        acceptance: [{ kind: "quantitative", target: "p99 latency", op: "rises_at_most", value: "3", unit: "%", baseline: "0.1", measured: "kiln run bench --all" }],
+        testing: [{ scenario: "The full bench on metal-epyc-01", criteria: [{ kind: "qualitative", text: "Every case runs to the end." }] }],
+      },
+      { title: "Tag and publish", description: "", examples: "", acceptance: [], testing: [] },
+    ],
+    tags: ["release"],
+    source: null,
+    share: "shr_7f3a91",
+    version: 4,
+    created_at: T0 - 86_400 * 6,
+    updated_at: T0 - 3_600 * 5,
+    steps: ["Freeze main", "Run the full bench", "Tag and publish"],
+    runs: 2,
+  },
+  {
+    id: "pl_parser",
+    title: "Fix the YAML anchor parser",
+    body: "1. Read the failing test\n2. Fix the parser\n3. Run the suite",
+    items: [],
+    tags: ["parser", "bug"],
+    source: { harness: "claude", agent: "claude-7", machine: "metal-ryzen-01" },
+    share: null,
+    version: 1,
+    created_at: T0 - 86_400 * 2,
+    updated_at: T0 - 86_400 * 2,
+    steps: ["Read the failing test", "Fix the parser", "Run the suite"],
+    runs: 0,
+  },
+  {
+    id: "pl_docs",
+    title: "Docs: front door and certificates",
+    body: "Write up the one-time setup each platform needs.",
+    items: [],
+    tags: ["docs"],
+    source: null,
+    share: null,
+    version: 2,
+    created_at: T0 - 86_400 * 12,
+    updated_at: T0 - 86_400 * 3,
+    steps: [],
+    runs: 1,
+  },
+];
+
+/* ------------------------------------------------------------------ the rest */
+
+function updates(ctx: PagesCtx): UpdatesOverview {
+  const runners = ctx
+    .agents()
+    .filter((a) => !a.ephemeral)
+    .map((a) => {
+      const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
+      const up = a.version === ctx.version;
+      return {
+        name: a.name,
+        hostname: a.hostname,
+        os: a.os,
+        arch: a.arch,
+        connected: a.connected,
+        version: a.version,
+        target,
+        target_build: a.os === "macos" ? null : "0.1.0+a1b2c3d",
+        build: up ? "0.1.0+a1b2c3d" : "0.0.9+0f1e2d3",
+        up_to_date: up,
+        method: up ? ("native" as const) : ("terminal" as const),
+        terminal: true,
+        instances: [],
+      };
+    });
+  return {
+    server: {
+      version: ctx.version,
+      build: "0.1.0+a1b2c3d",
+      target: "x86_64-unknown-linux-gnu",
+      mode: "service",
+      deployment: null,
+      namespace: null,
+      image: null,
+      checking: false,
+      newer: false,
+      action: null,
+      replacement: null,
+      release: { latest: "0.1.0", newer: false, url: null, error: null, checked_at: T0 - 600 },
+      note: "This is the newest build: nothing to upgrade.",
+    },
+    runners,
+    jobs: [],
+    binaries: [
+      { target: "x86_64-unknown-linux-gnu", sha256: "ab".repeat(32), size: 38_200_000, build: "0.1.0+a1b2c3d", origin: "server", at: T0 - 86_400 },
+      { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
+    ],
+    targets: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"],
+    build: { repo: "hyper-light/kiln", pipeline: "release", last: null, commit: "a1b2c3d4e5f6", in_step: false, behind: ["aarch64-apple-darwin"], keeps_in_step: true },
+  };
+}
+
+function frontDoor(a: Agent): FrontDoorView {
+  const on = a.name === "metal-ryzen-01";
+  const listener = (state: "on" | "off", on: string[], to: string[] = []) => ({ state, on, error: null, to, served: on.length ? 1284 : 0, fix: null });
+  return {
+    runner: a.name,
+    connected: a.connected,
+    supported: a.connected ? true : null,
+    settings: {
+      domain: on ? "kiln.dev" : "",
+      aliases: on ? ["ci.home"] : [],
+      dns: { enabled: on, port: 53, mode: "resolver", upstream: [], addresses: [] },
+      https: { enabled: on, port: 443, http_port: 80, upstream: "" },
+      cert: { mode: "kiln" },
+      mdns: { enabled: false, name: "kiln" },
+    },
+    applied: on ? true : null,
+    status: a.connected
+      ? {
+          settings: "f00",
+          standby: false,
+          os: a.os,
+          server: "http://192.168.1.50:7070",
+          addresses: ["192.168.1.77", "fe80::1"],
+          dns: on ? listener("on", ["192.168.1.77:53"], ["1.1.1.1"]) : listener("off", []),
+          https: on ? listener("on", ["[::]:443"], ["http://192.168.1.50:7070"]) : listener("off", []),
+          http: on ? listener("on", ["[::]:80"]) : listener("off", []),
+          mdns: listener("off", []),
+          cert: on
+            ? {
+                mode: "kiln",
+                state: "on",
+                info: {
+                  subject: "kiln.dev",
+                  issuer: "kiln CA",
+                  names: ["kiln.dev", "*.kiln.dev", "ci.home"],
+                  not_before: T0 - 86_400 * 20,
+                  not_after: T0 + 86_400 * 70,
+                  sha256: "3f".repeat(32),
+                  server_auth: true,
+                },
+                kiln: true,
+                missing: [],
+                error: null,
+                renewing: false,
+              }
+            : { mode: "kiln", state: "off", info: null, kiln: true, missing: [], error: null, renewing: false },
+          want: [],
+          asked: T0 - 30,
+          fixes: [],
+        }
+      : null,
+    status_at: a.connected ? T0 - 30 : null,
+    origins: on ? ["https://kiln.dev"] : [],
+    ca: { subject: "kiln CA", sha256: "9a".repeat(32), not_after: T0 + 86_400 * 3650 },
+  };
+}
+
+const TAILSCALE: TailscaleView = {
+  configured: false,
+  kind: null,
+  id: null,
+  mode: null,
+  exit_nodes: null,
+  want: {},
+  pending: [],
+  owned: {},
+  synced_at: null,
+  ok: true,
+  error: null,
+  routes: {},
+  replaced: {},
+};
+
+function syncView(ctx: PagesCtx): SyncView {
+  const names = ctx
+    .agents()
+    .filter((a) => !a.ephemeral)
+    .map((a) => a.name);
+  const copy = (member: number, machine: string, path: string, state: SyncView["repos"][number]["copies"][number]["state"]) => ({
+    member,
+    machine,
+    path,
+    added: T0 - 86_400 * 3,
+    state,
+    status: { applied: 1820, behind: state === "catching up" ? 12 : 0, unsent: 0, waiting: 0, conflicts: 0, skipped: [], error: null, at: T0 - 5 },
+  });
+  return {
+    error: null,
+    repos: [
+      {
+        id: "sy_kiln",
+        error: null,
+        name: "kiln",
+        created: T0 - 86_400 * 9,
+        exclude: ["dist"],
+        files: 1834,
+        index: 41,
+        conflicts: [],
+        copies: [copy(1, names[0] ?? "server", "/home/ada/src/kiln", "in step"), copy(2, names[1] ?? "server", "/home/ada/src/kiln", "catching up")],
+      },
+      {
+        id: "sy_notes",
+        error: null,
+        name: "notes",
+        created: T0 - 86_400 * 30,
+        exclude: [],
+        files: 212,
+        index: 9,
+        conflicts: [{ path: "todo.sync-conflict-ryzen.md", beside: "todo.md" }],
+        copies: [copy(1, names[0] ?? "server", "/home/ada/notes", "in step"), copy(2, names[3] ?? "server", "/Users/ada/notes", "offline")],
+      },
+    ],
+  };
+}
+
+/** Handles the routes above; false when it doesn't know the route. */
+export async function handlePages(req: http.IncomingMessage, res: http.ServerResponse, url: URL, ctx: PagesCtx): Promise<boolean> {
+  const p = url.pathname;
+  const m = req.method ?? "GET";
+  const { json, err } = ctx;
+  let mm: RegExpMatchArray | null;
+
+  if (p === "/api/auth/methods") return (void json(res, 200, { password: false, token: true }), true);
+  if (p === "/api/sync" && m === "GET") return (void json(res, 200, syncView(ctx)), true);
+  if (p === "/api/terminal/sessions" && m === "GET") return (void json(res, 200, []), true);
+  if (p === "/api/ai-sessions" && m === "GET") return (void json(res, 200, []), true);
+  if (p === "/api/updates" && m === "GET") return (void json(res, 200, updates(ctx)), true);
+  if (p === "/api/updates/check" && m === "POST") return (void json(res, 200, updates(ctx)), true);
+  if (p === "/api/front-doors" && m === "GET")
+    return (
+      void json(
+        res,
+        200,
+        ctx
+          .agents()
+          .filter((a) => !a.ephemeral)
+          .map(frontDoor),
+      ),
+      true
+    );
+  if ((mm = p.match(/^\/api\/runners\/([^/]+)\/front-door$/)) && m === "GET") {
+    const a = ctx.agents().find((x) => x.name === decodeURIComponent(mm![1]!));
+    return (a ? json(res, 200, frontDoor(a)) : err(res, 404, "no such runner"), true);
+  }
+  if (p === "/api/tailscale" && m === "GET") return (void json(res, 200, TAILSCALE), true);
+  if (p === "/api/harness/kinds" && m === "GET") {
+    const kinds = [
+      { id: "claude", name: "Claude Code", verified: true, available: true },
+      { id: "codex", name: "Codex", verified: true, available: true },
+    ];
+    return (
+      void json(res, 200, {
+        local: kinds,
+        ...Object.fromEntries(
+          ctx
+            .agents()
+            .filter((a) => a.connected && !a.ephemeral)
+            .map((a) => [`agent:${a.name}`, kinds]),
+        ),
+      }),
+      true
+    );
+  }
+
+  // Deployments
+  if (p === "/api/cd/summary") return (void json(res, 200, summary()), true);
+  if (p === "/api/cd/facets") return (void json(res, 200, facets(url.searchParams)), true);
+  if (p === "/api/cd/apps" && m === "GET") {
+    const { all, match } = listApps(url.searchParams);
+    const sort = url.searchParams.get("sort") ?? "name";
+    const list = all
+      .filter((a) => match(a))
+      .sort((x, y) =>
+        sort === "health"
+          ? (HRANK[x.health] ?? 9) - (HRANK[y.health] ?? 9) || x.app.localeCompare(y.app)
+          : sort === "sync"
+            ? (SRANK[x.sync] ?? 9) - (SRANK[y.sync] ?? 9) || x.app.localeCompare(y.app)
+            : sort === "deployed"
+              ? (y.operation?.finished_ms ?? 0) - (x.operation?.finished_ms ?? 0)
+              : x.app.localeCompare(y.app),
+      );
+    return (void json(res, 200, { apps: list, next: null }), true);
+  }
+  if (p === "/api/cd/plans/repos") return (void json(res, 200, { repos: PLAN_REPOS }), true);
+  if (p === "/api/cd/plans" && m === "POST") {
+    const ask = await ctx.body<{ head?: string; commit?: string; pr?: number }>(req);
+    await new Promise((r) => setTimeout(r, 400));
+    return (void json(res, 200, plan(ask)), true);
+  }
+  if ((mm = p.match(/^\/api\/cd\/apps\/([^/]+)\/([^/]+)(\/.*)?$/))) {
+    const id = `${decodeURIComponent(mm[1]!)}/${decodeURIComponent(mm[2]!)}`;
+    const rest = mm[3] ?? "";
+    const a = apps.get(id);
+    if (!a) return (err(res, 404, `no app ${id}`), true);
+    if (m !== "GET") return (void json(res, 200, {}), true);
+    if (rest === "") return (void json(res, 200, a.detail), true);
+    if (rest === "/tree") return (void json(res, 200, tree(id)), true);
+    if (rest === "/history") return (void json(res, 200, { history: a.history }), true);
+    if (rest === "/diff") return (void json(res, 200, { diffs: diffOf(id) }), true);
+    if (rest === "/resources") return (void json(res, 200, { resources: [] }), true);
+    let rm: RegExpMatchArray | null;
+    if ((rm = rest.match(/^\/resources\/([^/]+)(\/events|\/logs)?$/))) {
+      const key = decodeURIComponent(rm[1]!);
+      if (rm[2] === "/events") return (void json(res, 200, { events: events() }), true);
+      if (rm[2] === "/logs") return (void json(res, 200, logs(key.split("~")[3] ?? "pod")), true);
+      const d = resourceDetail(id, key);
+      return (d ? json(res, 200, d) : err(res, 404, "no such object"), true);
+    }
+    return (err(res, 404, `no route for ${p}`), true);
+  }
+
+  // Plans
+  if (p === "/api/plans" && m === "GET") return (void json(res, 200, PLANS), true);
+  if ((mm = p.match(/^\/api\/plans\/([^/]+)(\/versions|\/runs)?$/)) && m === "GET") {
+    const pl = PLANS.find((x) => x.id === decodeURIComponent(mm![1]!));
+    if (!pl) return (err(res, 404, "no such plan"), true);
+    if (mm[2] === "/versions")
+      return (
+        void json(
+          res,
+          200,
+          Array.from({ length: pl.version }, (_, i) => ({ version: pl.version - i, title: pl.title, body: pl.body, at: pl.updated_at - i * 86_400, by: "ada" })),
+        ),
+        true
+      );
+    if (mm[2] === "/runs")
+      return (
+        void json(
+          res,
+          200,
+          Array.from({ length: pl.runs }, (_, i) => ({ id: `pr_${i}`, version: pl.version, session: `h_${i}abcdef`, mode: i ? "steps" : "message", at: pl.updated_at - i * 3_600, by: "ada" })),
+        ),
+        true
+      );
+    return (void json(res, 200, pl), true);
+  }
+  if ((mm = p.match(/^\/api\/shared\/plans\/([^/]+)$/))) {
+    const pl = PLANS.find((x) => x.share === decodeURIComponent(mm![1]!));
+    return (pl ? json(res, 200, { title: pl.title, body: pl.body, items: pl.items, steps: pl.steps, version: pl.version, updated_at: pl.updated_at }) : err(res, 404, "not shared"), true);
+  }
+  return false;
+}

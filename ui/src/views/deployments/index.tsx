@@ -15,8 +15,12 @@ import { useServerEvents } from "@/api/events";
 import type { CdApp, CdFacets, CdSummary } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { EmptyState, ErrorState, PageIntro, SelectField, SkeletonRows } from "@/components/ui/misc";
-import { errorMessage, useResource } from "@/lib/hooks";
+import { RowsHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { EmptyState, PageIntro, SelectField } from "@/components/ui/misc";
+import { errorMessage } from "@/lib/hooks";
+import { useRes, warm, type Res } from "@/lib/data";
+import { invalidate } from "@/lib/resource";
 import { useWindowedRows } from "@/lib/virtual";
 import { HEALTH_TONE, HealthPair, StatePair, SYNC_TONE, SyncPair, opWords, placeOf, running, shortRev } from "./parts";
 import "./deployments.css";
@@ -49,9 +53,20 @@ const ORDER: Partial<Record<FacetId, string[]>> = {
 
 const n = (x: number) => x.toLocaleString();
 
+/** The fleet's counts follow its statuses, read again at most every two seconds (statuses come in bursts). */
+let countsSoon: number | null = null;
+function countsLater() {
+  if (countsSoon !== null) return;
+  countsSoon = window.setTimeout(() => {
+    countsSoon = null;
+    invalidate("cd/summary");
+    invalidate("cd/facets");
+  }, 2_000);
+}
+
 /** The fleet at a glance: how many apps, and how many in each sync and health. */
-function Summary({ s }: { s: CdSummary | undefined }) {
-  if (!s || s.apps === 0) return null;
+function Summary({ s }: { s: CdSummary }) {
+  if (s.apps === 0) return null;
   const sync = ORDER.sync?.filter((k) => s.sync[k]) ?? [];
   const health = ORDER.health?.filter((k) => s.health[k]) ?? [];
   return (
@@ -70,10 +85,9 @@ function Summary({ s }: { s: CdSummary | undefined }) {
 }
 
 /** "6 apps · 1 out of sync · 1 degraded", or "2 of 6 apps" when filtered. */
-function countLine(f: CdFacets | undefined, all: number | undefined, filters: CdFilters) {
-  if (!f) return "";
-  const filtered = Object.values(filters).some((v) => (Array.isArray(v) ? v.length > 0 : Boolean(v)));
-  const parts = [filtered && all !== undefined ? `${n(f.total)} of ${n(all)} apps` : `${n(f.total)} ${f.total === 1 ? "app" : "apps"}`];
+function countLine(f: CdFacets, all: number, filters: CdFilters) {
+  const filtered = isFiltered(filters);
+  const parts = [filtered ? `${n(f.total)} of ${n(all)} apps` : `${n(f.total)} ${f.total === 1 ? "app" : "apps"}`];
   // A facet's counts describe what is shown only while it isn't filtered itself.
   if (!filters.sync?.length && f.facets.sync.OutOfSync) parts.push(`${n(f.facets.sync.OutOfSync)} out of sync`);
   if (!filters.health?.length) {
@@ -84,6 +98,8 @@ function countLine(f: CdFacets | undefined, all: number | undefined, filters: Cd
   }
   return parts.join(" · ");
 }
+
+const isFiltered = (filters: CdFilters) => Object.values(filters).some((v) => (Array.isArray(v) ? v.length > 0 : Boolean(v)));
 
 /** Runs `f` over `items`, `limit` at a time; every outcome, in order. */
 async function settleAll<T>(items: string[], limit: number, f: (x: string) => Promise<T>): Promise<PromiseSettledResult<T>[]> {
@@ -105,26 +121,49 @@ async function settleAll<T>(items: string[], limit: number, f: (x: string) => Pr
   return out;
 }
 
-export default function Deployments() {
+/** The filters the URL says, and the query string the server takes for them. */
+function useFilters() {
   const [params, setParams] = useSearchParams();
   const filters = React.useMemo<CdFilters>(() => {
     const list = (k: string) => (params.get(k) ?? "").split(",").filter(Boolean);
-    return {
-      sync: list("sync"),
-      health: list("health"),
-      cluster: list("cluster"),
-      project: list("project"),
-      namespace: list("namespace"),
-      q: params.get("q") ?? "",
-    };
+    return { sync: list("sync"), health: list("health"), cluster: list("cluster"), project: list("project"), namespace: list("namespace"), q: params.get("q") ?? "" };
   }, [params]);
   const sort = (SORTS.find((x) => x.value === params.get("sort"))?.value ?? "name") as CdSort;
-  const setSort = (v: string) => {
-    const next = new URLSearchParams(params);
-    if (v && v !== "name") next.set("sort", v);
-    else next.delete("sort");
-    setParams(next, { replace: true });
-  };
+  const key = [...FACETS.map((f) => `${f.id}=${(filters[f.id] ?? []).join(",")}`), `q=${filters.q ?? ""}`].join("&");
+  return { params, setParams, filters, sort, key };
+}
+
+export default function Deployments() {
+  return (
+    <div className="container-console page cd-page">
+      <title>Deployments · kiln</title>
+      <PageIntro
+        index={3}
+        label="Deployments"
+        title="Deployments."
+        lead="What git says, and what runs: every app's sync and health, live."
+        actions={
+          <Button asChild size="sm" variant="secondary">
+            <Link to={plansHref}>Plan a deploy</Link>
+          </Button>
+        }
+      />
+      <Loadable label="the apps" fallback={<DeploymentsHold />}>
+        <DeploymentsBody />
+      </Loadable>
+    </div>
+  );
+}
+
+/** The list as loaded: its apps by id (live statuses merged in place), their order, the next page. */
+interface List {
+  apps: Map<string, CdApp>;
+  order: string[];
+  next: string | null;
+}
+
+function DeploymentsBody() {
+  const { params, setParams, filters, sort, key } = useFilters();
   const choice: Chosen = {
     sync: filters.sync ?? [],
     health: filters.health ?? [],
@@ -141,23 +180,36 @@ export default function Deployments() {
     }
     setParams(next, { replace: true });
   };
+  const setSort = (v: string) => {
+    const next = new URLSearchParams(params);
+    if (v && v !== "name") next.set("sort", v);
+    else next.delete("sort");
+    setParams(next, { replace: true });
+  };
+  // What's typed filters at once here and reaches the URL (and the server) a moment later.
   const [query, setQuery] = React.useState(filters.q ?? "");
-  React.useEffect(() => {
-    const t = setTimeout(() => {
-      if (query === (filters.q ?? "")) return;
-      const next = new URLSearchParams(params);
-      if (query) next.set("q", query);
+  const typing = React.useRef<number | null>(null);
+  const onQuery = (q: string) => {
+    setQuery(q);
+    if (typing.current !== null) window.clearTimeout(typing.current);
+    typing.current = window.setTimeout(() => {
+      typing.current = null;
+      const next = new URLSearchParams(window.location.search);
+      if (q) next.set("q", q);
       else next.delete("q");
       setParams(next, { replace: true });
     }, 250);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query]);
+  };
 
-  const summary = useResource((s) => cdApi.summary(s), [], { pollMs: 30_000 });
-  const facets = useResource((s) => cdApi.facets(filters, s), [filters], { pollMs: 30_000 });
+  const summaryRes: Res<CdSummary> = { key: "cd/summary", fetch: (s) => cdApi.summary(s), opts: { pollMs: 30_000 } };
+  const facetsRes: Res<CdFacets> = { key: `cd/facets?${key}`, fetch: (s) => cdApi.facets(filters, s), opts: { pollMs: 30_000 } };
+  const appsRes: Res<{ apps: CdApp[]; next: string | null }> = { key: `cd/apps?${key}&sort=${sort}`, fetch: (s) => cdApi.apps({ ...filters, sort, limit: PAGE }, s) };
+  warm(summaryRes, facetsRes, appsRes);
+  const summary = useRes(summaryRes).data;
+  const facets = useRes(facetsRes).data;
+  const first = useRes(appsRes).data;
   const groups: Facet[] = FACETS.flatMap((f) => {
-    const counts = facets.data?.facets[f.id] ?? {};
+    const counts = facets.facets[f.id] ?? {};
     const order = ORDER[f.id];
     const rank = (v: string) => (order ? order.indexOf(v) + 1 || order.length + 1 : 0);
     const ids = [...new Set([...Object.keys(counts), ...(choice[f.id] ?? [])])].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
@@ -166,196 +218,132 @@ export default function Deployments() {
     return [{ id: f.id, label: f.label, options: ids.map((id) => ({ id, label: WORDS[id] ?? id, count: counts[id] ?? 0 })) }];
   });
 
-  // The list: pages in id order, kept in a map that live events update in place. `gen` drops
-  // pages of a list the filters have since replaced.
-  const apps = React.useRef(new Map<string, CdApp>());
-  const order = React.useRef<string[]>([]);
-  const gen = React.useRef(0);
-  const [version, setVersion] = React.useState(0);
-  const [next, setNext] = React.useState<string | null>(null);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState<Error | null>(null);
+  // The list: the first page as loaded (again on every refresh), the pages after it as you
+  // scroll, and the statuses events bring, merged in place and drawn once a frame.
+  const list = React.useMemo<List>(() => ({ apps: new Map(first.apps.map((a) => [a.app, a])), order: first.apps.map((a) => a.app), next: first.next }), [first]);
+  const [, setVersion] = React.useState(0);
   const [moreError, setMoreError] = React.useState<string | null>(null);
   const loadingMore = React.useRef(false);
   const failedAt = React.useRef(0);
-
-  React.useEffect(() => {
-    const ctl = new AbortController();
-    const g = ++gen.current;
-    setLoading(true);
-    setError(null);
-    cdApi
-      .apps({ ...filters, sort, limit: PAGE }, ctl.signal)
-      .then((page) => {
-        if (g !== gen.current) return;
-        apps.current = new Map(page.apps.map((a) => [a.app, a]));
-        order.current = page.apps.map((a) => a.app);
-        setNext(page.next);
-        setLoading(false);
+  const frame = React.useRef(0);
+  const redraw = () => {
+    if (!frame.current)
+      frame.current = requestAnimationFrame(() => {
+        frame.current = 0;
         setVersion((v) => v + 1);
-      })
-      .catch((e: unknown) => {
-        if (ctl.signal.aborted) return;
-        setError(e instanceof Error ? e : new Error(String(e)));
-        setLoading(false);
       });
-    return () => ctl.abort();
-  }, [filters, sort]);
+  };
 
   const loadMore = React.useCallback(() => {
-    if (!next || loadingMore.current || Date.now() - failedAt.current < 5_000) return;
+    if (!list.next || loadingMore.current || Date.now() - failedAt.current < 5_000) return;
     loadingMore.current = true;
-    const g = gen.current;
     cdApi
-      .apps({ ...filters, sort, limit: PAGE, cursor: next })
+      .apps({ ...filters, sort, limit: PAGE, cursor: list.next })
       .then((page) => {
-        if (g !== gen.current) return;
         for (const a of page.apps) {
-          if (!apps.current.has(a.app)) order.current.push(a.app);
-          apps.current.set(a.app, a);
+          if (!list.apps.has(a.app)) list.order.push(a.app);
+          list.apps.set(a.app, a);
         }
-        setNext(page.next);
+        list.next = page.next;
         setMoreError(null);
         setVersion((v) => v + 1);
       })
       .catch((e: unknown) => {
-        if (g !== gen.current) return;
         failedAt.current = Date.now();
         setMoreError(`More apps didn't load: ${errorMessage(e)}`);
       })
       .finally(() => {
         loadingMore.current = false;
       });
-  }, [filters, sort, next]);
+  }, [list, filters, sort]);
 
-  // Live: statuses arrive in batches; merge them and draw once a frame.
-  const frame = React.useRef(0);
-  const countsSoon = React.useRef<number | null>(null);
   useServerEvents((ev) => {
     if (ev.type === "cd_apps") {
       for (const s of ev.apps) {
-        const cur = apps.current.get(s.app);
-        if (cur) apps.current.set(s.app, { ...cur, ...s });
+        const cur = list.apps.get(s.app);
+        if (cur) list.apps.set(s.app, { ...cur, ...s });
       }
-      if (!frame.current) {
-        frame.current = requestAnimationFrame(() => {
-          frame.current = 0;
-          setVersion((v) => v + 1);
-        });
-      }
-      if (countsSoon.current === null) {
-        countsSoon.current = window.setTimeout(() => {
-          countsSoon.current = null;
-          summary.reload();
-          facets.reload();
-        }, 2_000);
-      }
+      redraw();
+      countsLater();
     } else if (ev.type === "cd_app_deleted") {
-      if (apps.current.delete(ev.app)) {
-        order.current = order.current.filter((id) => id !== ev.app);
-        setVersion((v) => v + 1);
+      if (list.apps.delete(ev.app)) {
+        list.order = list.order.filter((id) => id !== ev.app);
+        redraw();
       }
-      summary.reload();
-      facets.reload();
+      countsLater();
     }
   });
-  React.useEffect(
-    () => () => {
-      if (frame.current) cancelAnimationFrame(frame.current);
-      if (countsSoon.current !== null) clearTimeout(countsSoon.current);
-    },
-    [],
-  );
 
-  const listRef = React.useRef<HTMLDivElement>(null);
-  const count = order.current.length;
-  const win = useWindowedRows(listRef, count, ROW);
-  React.useEffect(() => {
-    if (win.end >= count - 50) loadMore();
-  }, [win.end, count, loadMore]);
+  const count = list.order.length;
+  const [listRef, win] = useWindowedRows(count, ROW, { onEnd: loadMore });
 
   // Selection: some rows, or everything the filters show (which the server acts on, loaded or
-  // not). A new filter starts a new selection.
-  const [selected, setSelected] = React.useState<ReadonlySet<string>>(() => new Set());
-  const [everything, setEverything] = React.useState(false);
+  // not). Another filter starts another selection.
+  const [sel, setSel] = React.useState<{ key: string; ids: ReadonlySet<string>; everything: boolean }>({ key, ids: new Set(), everything: false });
+  const selection = sel.key === key ? sel : { key, ids: new Set<string>(), everything: false };
   const [busy, setBusy] = React.useState(false);
-  const [note, setNote] = React.useState<{ tone: "ok" | "fail"; text: string } | null>(null);
-  React.useEffect(() => {
-    setSelected(new Set());
-    setEverything(false);
-  }, [filters]);
-  const check = React.useCallback((id: string, on: boolean) => {
-    setEverything(false);
-    setSelected((s) => {
-      const next = new Set(s);
-      if (on) next.add(id);
-      else next.delete(id);
-      return next;
-    });
-  }, []);
-  const selectAll = (on: boolean) => {
-    setEverything(false);
-    setSelected(on ? new Set(order.current) : new Set());
-  };
-  const allLoaded = count > 0 && selected.size >= count && order.current.every((id) => selected.has(id));
-  const total = facets.data?.total;
+  const [note, setNote] = React.useState<{ key: string; tone: "ok" | "fail"; text: string } | null>(null);
+  const check = React.useCallback(
+    (id: string, on: boolean) =>
+      setSel((s) => {
+        const ids = new Set(s.key === key ? s.ids : []);
+        if (on) ids.add(id);
+        else ids.delete(id);
+        return { key, ids, everything: false };
+      }),
+    [key],
+  );
+  const selectAll = (on: boolean) => setSel({ key, ids: on ? new Set(list.order) : new Set(), everything: false });
+  const allLoaded = count > 0 && selection.ids.size >= count && list.order.every((id) => selection.ids.has(id));
+  const total = facets.total;
 
   const bulk = async (what: "sync" | "refresh") => {
     setBusy(true);
     setNote(null);
     try {
-      if (everything) {
+      if (selection.everything) {
         if (what === "sync") {
           const r = await cdApi.syncMany(filters);
-          setNote({ tone: "ok", text: `Syncing ${n(r.started)} apps.` });
+          setNote({ key, tone: "ok", text: `Syncing ${n(r.started)} apps.` });
         } else {
           const r = await cdApi.refreshMany(filters);
-          setNote({ tone: "ok", text: `Comparing ${n(r.refreshing)} apps again.` });
+          setNote({ key, tone: "ok", text: `Comparing ${n(r.refreshing)} apps again.` });
         }
       } else {
-        const ids = [...selected];
+        const ids = [...selection.ids];
         const results = await settleAll(ids, 8, (id) => (what === "sync" ? cdApi.sync(id, {}) : cdApi.refresh(id, false)));
         const failed = results.flatMap((r, i) => (r.status === "rejected" ? [`${ids[i] ?? "?"}: ${errorMessage(r.reason)}`] : []));
         const done = ids.length - failed.length;
         const verb = what === "sync" ? "Syncing" : "Comparing again";
         setNote(
           failed.length
-            ? { tone: "fail", text: `${verb} ${n(done)} of ${n(ids.length)}. ${failed.slice(0, 3).join("; ")}${failed.length > 3 ? "; …" : ""}` }
-            : { tone: "ok", text: `${verb} ${n(done)} ${done === 1 ? "app" : "apps"}.` },
+            ? { key, tone: "fail", text: `${verb} ${n(done)} of ${n(ids.length)}. ${failed.slice(0, 3).join("; ")}${failed.length > 3 ? "; …" : ""}` }
+            : { key, tone: "ok", text: `${verb} ${n(done)} ${done === 1 ? "app" : "apps"}.` },
         );
       }
-      setSelected(new Set());
-      setEverything(false);
+      setSel({ key, ids: new Set(), everything: false });
+      invalidate("cd/");
     } catch (e) {
-      setNote({ tone: "fail", text: errorMessage(e) });
+      setNote({ key, tone: "fail", text: errorMessage(e) });
     } finally {
       setBusy(false);
     }
   };
 
-  const filtered = Object.values(filters).some((v) => (Array.isArray(v) ? v.length > 0 : Boolean(v)));
-  const some = everything || selected.size > 0;
+  const filtered = isFiltered(filters);
+  const some = selection.everything || selection.ids.size > 0;
+  // A note says what the last action did, in the count's place, until the next one or another filter.
+  const said = note?.key === key ? note : null;
 
   return (
-    <div className="container-console page cd-page">
-      <PageIntro
-        index={3}
-        label="Deployments"
-        title="Deployments."
-        lead="What git says, and what runs: every app's sync and health, live."
-        actions={
-          <Button asChild size="sm" variant="secondary">
-            <Link to={plansHref}>Plan a deploy</Link>
-          </Button>
-        }
-      />
-      <Summary s={summary.data} />
+    <>
+      <Summary s={summary} />
       <div className="cd-toolbar">
         <FacetBox
           label="Filter apps"
           placeholder="Filter by name, sync, health, project, cluster…"
           query={query}
-          onQuery={setQuery}
+          onQuery={onQuery}
           facets={groups}
           chosen={choice}
           onChosen={setChoice}
@@ -369,9 +357,9 @@ export default function Deployments() {
           <input
             type="checkbox"
             className="check"
-            checked={everything || allLoaded}
+            checked={selection.everything || allLoaded}
             ref={(el) => {
-              if (el) el.indeterminate = !everything && !allLoaded && selected.size > 0;
+              if (el) el.indeterminate = !selection.everything && !allLoaded && selection.ids.size > 0;
             }}
             onChange={(e) => selectAll(e.target.checked)}
             disabled={count === 0}
@@ -380,9 +368,9 @@ export default function Deployments() {
         </label>
         {some ? (
           <div className="cd-bulk">
-            <span className="cd-count">{everything && total !== undefined ? `All ${n(total)} matching` : `${n(selected.size)} selected`}</span>
-            {!everything && allLoaded && next && total !== undefined && (
-              <button type="button" className="cd-link" onClick={() => setEverything(true)}>
+            <span className="cd-count">{selection.everything ? `All ${n(total)} matching` : `${n(selection.ids.size)} selected`}</span>
+            {!selection.everything && allLoaded && list.next && (
+              <button type="button" className="cd-link" onClick={() => setSel({ key, ids: selection.ids, everything: true })}>
                 Select all {n(total)} matching
               </button>
             )}
@@ -396,47 +384,68 @@ export default function Deployments() {
               Clear
             </button>
           </div>
+        ) : said ? (
+          <p className="cd-notice cd-notice-inline" data-tone={said.tone} aria-live="polite">
+            {said.text}
+          </p>
         ) : (
           <span className="cd-count" aria-live="polite">
-            {countLine(facets.data, summary.data?.apps, filters)}
+            {countLine(facets, summary.apps, filters)}
           </span>
         )}
       </div>
-      {note && (
-        <p className="cd-notice" data-tone={note.tone} aria-live="polite">
-          {note.text}
-        </p>
-      )}
 
-      {error ? (
-        <ErrorState error={error} onRetry={() => setParams(new URLSearchParams(params), { replace: true })} />
-      ) : loading ? (
-        <SkeletonRows rows={8} cols={4} />
-      ) : count === 0 ? (
+      {count === 0 ? (
         <EmptyState icon={<Rocket size={20} />} title={filtered ? "No apps match." : "No apps yet."}>
           {filtered ? (
             "Clear the filters to see every app."
           ) : (
             <>
-              Add one with <code>kiln cd import app.yaml</code> (Argo CD Applications), the API, or an agent through kiln's MCP
-              server.
+              Add one with <code>kiln cd import app.yaml</code> (Argo CD Applications), the API, or an agent through kiln's MCP server.
             </>
           )}
         </EmptyState>
       ) : (
-        <div ref={listRef} className="cd-list" role="list" data-version={version}>
+        <div ref={listRef} className="cd-list" role="list">
           <div style={{ height: win.start * ROW }} aria-hidden="true" />
-          {order.current.slice(win.start, win.end).map((id, i) => {
-            const a = apps.current.get(id);
-            return a ? (
-              <AppRow key={id} app={a} pos={win.start + i + 1} size={next ? -1 : count} checked={everything || selected.has(id)} onCheck={check} />
-            ) : null;
+          {list.order.slice(win.start, win.end).map((id, i) => {
+            const a = list.apps.get(id);
+            return a ? <AppRow key={id} app={a} pos={win.start + i + 1} size={list.next ? -1 : count} checked={selection.everything || selection.ids.has(id)} onCheck={check} /> : null;
           })}
           <div style={{ height: Math.max(0, count - win.end) * ROW }} aria-hidden="true" />
         </div>
       )}
-      {moreError ? <p className="cd-notice" data-tone="fail">{moreError}</p> : next && !loading && <p className="cd-more">Loading more as you scroll…</p>}
-    </div>
+      {moreError ? (
+        <p className="cd-notice" data-tone="fail">
+          {moreError}
+        </p>
+      ) : (
+        list.next && <p className="cd-more">Loading more as you scroll…</p>
+      )}
+    </>
+  );
+}
+
+/** The list while it loads: the toolbar it will have, the head, the rows' space. */
+function DeploymentsHold() {
+  const { sort } = useFilters();
+  const noop = () => undefined;
+  return (
+    <>
+      <p className="cd-summary-line" aria-hidden="true">
+        <span className="cd-count">{" "}</span>
+      </p>
+      <div className="cd-toolbar">
+        <FacetBox label="Filter apps" placeholder="Filter by name, sync, health, project, cluster…" facets={[]} chosen={{}} onChosen={noop} className="cd-filter" />
+        <SelectField label="Sort apps" hideLabel value={sort} onChange={noop} options={SORTS} className="cd-sort" />
+      </div>
+      <div className="cd-list-head">
+        <label className="cd-pick">
+          <input type="checkbox" className="check" disabled aria-label="Select every app shown" />
+        </label>
+      </div>
+      <RowsHold rows={8} rowHeight={ROW} className="cd-list" label="Loading the apps" />
+    </>
   );
 }
 

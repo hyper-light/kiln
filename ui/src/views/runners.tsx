@@ -1,24 +1,28 @@
 import * as React from "react";
-import { Link, useNavigate, useSearchParams } from "react-router";
-import { Switch } from "radix-ui";
+import { Link, Navigate, useNavigate, useSearchParams } from "react-router";
 import { Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
-import type { Agent, HostSample, Job, RunnerInstance, RunnerUpdate } from "@/api/types";
+import type { Agent, Job, RunnerInstance, RunnerUpdate } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { FacetBox, type Chosen, type Facet } from "@/components/ui/facet-box";
-import { EmptyState, ErrorState, Facts, Meter, PageIntro, SelectField, Skeleton, SkeletonRows } from "@/components/ui/misc";
+import { Hold, TableHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { Confirm, EmptyState, Facts, Meter, PageIntro, SelectField } from "@/components/ui/misc";
 import { Chips, StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { Tip } from "@/components/ui/tooltip";
+import { agentsRes, historyRes, lastSamples, mergeJobs, updatesRes, useAgentsLive, useMetricsHistory, useRes, useUpdateJobs, warm } from "@/lib/data";
 import { absoluteTime, formatBytes, formatPct } from "@/lib/format";
-import { errorMessage, useDocumentTitle, useLocalStorage, useResource } from "@/lib/hooks";
+import { errorMessage } from "@/lib/hooks";
+import { usePref } from "@/lib/prefs";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
-import { FrontDoorSection } from "./front-door/front-door";
+import { FrontDoorSection, frontDoorsRes } from "./front-door/front-door";
 import { HostCharts } from "./host-charts";
-import { useJoinData } from "./add-machines/data";
+import { discoveryRes, joinRequestsRes } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
-import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct, upsert } from "./shared";
+import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
 
 /** The facets runners are filtered by, with each runner's values. */
 function facetValues(a: Agent): Record<string, string[]> {
@@ -38,53 +42,73 @@ export function agentStateLabel(a: Agent) {
   return !a.connected ? "offline" : a.draining ? "draining" : a.busy > 0 ? "busy" : "idle";
 }
 
+const LEAD = "Runners are long-lived machines that take CI jobs; Kubernetes job pods show up under their jobs.";
+
+function Intro({ lead }: { lead: React.ReactNode }) {
+  return (
+    <PageIntro
+      index={5}
+      label="Runners"
+      title="Fleet"
+      lead={lead}
+      actions={
+        <Button asChild>
+          <Link to="/runners/add">
+            <Plus /> Add machines
+          </Link>
+        </Button>
+      }
+    />
+  );
+}
+
 /** The machines that run CI jobs. Kubernetes job pods are not listed: they show under their job. */
 export default function Runners() {
-  useDocumentTitle("Runners");
+  const [params] = useSearchParams();
+  // Old links (`?join=1`) opened a dialog; adding machines has its own page now.
+  if (params.get("join") === "1") return <Navigate to="/runners/add" replace />;
+  return (
+    <div className="container-console page">
+      <title>Runners · kiln</title>
+      <Loadable label="the runners" fallback={<RunnersHold />}>
+        <RunnersBody />
+      </Loadable>
+    </div>
+  );
+}
+
+function RunnersBody() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  const agents = useResource((s) => api.agents(s), [], { pollMs: 30_000 });
-  const [history, setHistory] = React.useState<Record<string, HostSample[]>>({});
-  const [view, setView] = useLocalStorage<"table" | "cards">("kiln.agents.view", "table");
+  warm(agentsRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes);
+  const agents = useAgentsLive();
+  const history = useMetricsHistory().data;
+  const joinRequests = useRes(joinRequestsRes).data;
+  const discovery = useRes(discoveryRes).data;
+  const [view, setView] = usePref<"table" | "cards">("kiln.agents.view", "table");
   const [q, setQ] = React.useState("");
   const [chosen, setChosen] = React.useState<Chosen>({});
   const selected = params.get("agent");
-  const { requests: joinRequests, discovery } = useJoinData();
 
-  // Old links (`?join=1`) opened a dialog; adding machines has its own page now.
-  React.useEffect(() => {
-    if (params.get("join") === "1") navigate("/runners/add", { replace: true });
-  }, [params, navigate]);
-
-  React.useEffect(() => {
-    const ctl = new AbortController();
-    api
-      .metricsHistory(undefined, ctl.signal)
-      .then((h) => setHistory(Object.fromEntries(Object.entries(h).map(([k, v]) => [k, v.slice(-120)]))))
-      .catch(() => undefined);
-    return () => ctl.abort();
-  }, []);
-
-  useServerEvents((ev) => {
-    if (ev.type === "agent") agents.setData((l) => upsert(l, ev.agent, (a) => a.name, false));
-    if (ev.type === "sample" && ev.agent !== "server") {
-      agents.setData((l) => l?.map((a) => (a.name === ev.agent ? { ...a, sample: ev.sample } : a)));
-      setHistory((h) => ({ ...h, [ev.agent]: [...(h[ev.agent] ?? []), ev.sample].slice(-120) }));
-    }
-  });
+  const openAgent = (name: string | null) => {
+    const n = new URLSearchParams(params);
+    if (name) n.set("agent", name);
+    else n.delete("agent");
+    setParams(n, { replace: true });
+  };
 
   const drain = async (a: Agent, draining: boolean) => {
-    agents.setData((l) => l?.map((x) => (x.name === a.name ? { ...x, draining } : x)));
+    agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, draining } : x)));
     try {
       await api.drainAgent(a.name, draining);
       toast({ title: draining ? `Draining ${a.name}` : `${a.name} accepting jobs`, tone: "info" });
     } catch (e) {
-      agents.setData((l) => l?.map((x) => (x.name === a.name ? { ...x, draining: !draining } : x)));
+      agents.setData((l) => l.map((x) => (x.name === a.name ? { ...x, draining: !draining } : x)));
       toast.error("Drain failed", errorMessage(e));
     }
   };
 
-  const all = (agents.data ?? []).filter((a) => !a.ephemeral);
+  const all = agents.data.filter((a) => !a.ephemeral);
   const counts = { all: all.length, connected: all.filter((a) => a.connected).length };
   const ql = q.trim().toLowerCase();
   const matches = (a: Agent) => {
@@ -106,7 +130,7 @@ export default function Runners() {
   const forget = async (a: Agent) => {
     try {
       await api.forgetAgent(a.name);
-      agents.setData((l) => l?.filter((x) => x.name !== a.name));
+      agents.setData((l) => l.filter((x) => x.name !== a.name));
       if (selected === a.name) openAgent(null);
       toast({ title: `${a.name} forgotten`, tone: "info" });
     } catch (e) {
@@ -114,69 +138,27 @@ export default function Runners() {
     }
   };
   const details = (a: Agent) => (
-    <AgentDetails
-      agent={a}
-      onClose={() => openAgent(null)}
-      onDrain={drain}
-      onForget={forget}
-      onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
-    />
+    <Loadable label={`${a.name} in depth`} fallback={<Hold height={560} className="runner-details" />}>
+      <AgentDetails agent={a} onClose={() => openAgent(null)} onDrain={drain} onForget={forget} onTerminal={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)} />
+    </Loadable>
   );
 
-  const openAgent = (name: string | null) => {
-    const n = new URLSearchParams(params);
-    if (name) n.set("agent", name);
-    else n.delete("agent");
-    setParams(n, { replace: true });
-  };
-
   return (
-    <div className="container-console page">
-      <PageIntro
-        index={5}
-        label="Runners"
-        title="Fleet"
+    <>
+      <Intro
         lead={
-          agents.data ? (
-            <>
-              {counts.connected} of {counts.all} runners connected · {busy}/{slots} slots busy. Runners are long-lived machines that take CI jobs; Kubernetes job pods show up under their jobs.
-            </>
-          ) : (
-            "Runners are long-lived machines that take CI jobs; Kubernetes job pods show up under their jobs."
-          )
-        }
-        actions={
-          <Button asChild>
-            <Link to="/runners/add">
-              <Plus /> Add machines
-            </Link>
-          </Button>
+          <>
+            {counts.connected} of {counts.all} runners connected · {busy}/{slots} slots busy. {LEAD}
+          </>
         }
       />
 
-      <JoinNotice requests={joinRequests.data} discovery={discovery.data} />
+      <JoinNotice requests={joinRequests} discovery={discovery} />
       <Upgrades />
 
-      <div className="runners-tools">
-        <FacetBox className="runners-filter" label="Filter runners" placeholder="Filter by name, state, label, platform…" query={q} onQuery={setQ} facets={facets} chosen={chosen} onChosen={setChosen} />
-        <SelectField
-          className="runners-layout"
-          label="Layout"
-          hideLabel
-          value={view}
-          onChange={(v) => setView(v as "table" | "cards")}
-          options={[
-            { value: "table", label: "Table" },
-            { value: "cards", label: "Cards" },
-          ]}
-        />
-      </div>
+      <RunnersTools q={q} onQ={setQ} facets={facets} chosen={chosen} onChosen={setChosen} view={view} onView={setView} />
 
-      {agents.error && !agents.data ? (
-        <ErrorState error={agents.error} onRetry={agents.reload} />
-      ) : !agents.data ? (
-        <SkeletonRows rows={6} />
-      ) : all.length === 0 ? (
+      {all.length === 0 ? (
         <EmptyState
           icon={<Server size={24} />}
           title="No runners have enrolled."
@@ -191,12 +173,25 @@ export default function Runners() {
           Run the join command on a machine to enroll it as a runner. With Kubernetes configured, kiln also launches a pod per job.
         </EmptyState>
       ) : list.length === 0 ? (
-        <EmptyState title="No runners match." action={<Button variant="secondary" onClick={() => { setChosen({}); setQ(""); }}>Clear filters</Button>} />
+        <EmptyState
+          title="No runners match."
+          action={
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setChosen({});
+                setQ("");
+              }}
+            >
+              Clear filters
+            </Button>
+          }
+        />
       ) : view === "cards" ? (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
           {list.map((a) => (
             <React.Fragment key={a.name}>
-              <AgentMiniCard agent={a} history={history[a.name] ?? []} onOpen={() => openAgent(a.name === selected ? null : a.name)} />
+              <AgentMiniCard agent={a} history={lastSamples(history, a.name, 120)} onOpen={() => openAgent(a.name === selected ? null : a.name)} />
               {selected === a.name && <div className="col-span-full">{details(a)}</div>}
             </React.Fragment>
           ))}
@@ -204,22 +199,7 @@ export default function Runners() {
       ) : (
         <div className="table-wrap">
           <table className="data-table">
-            <thead>
-              <tr>
-                <th className="w-6" aria-label="State" />
-                <th>Runner</th>
-                <th className="hidden md:table-cell">Labels</th>
-                <th>Slots</th>
-                <th className="num hidden sm:table-cell">CPU</th>
-                <th className="num hidden lg:table-cell">Mem</th>
-                <th className="num hidden xl:table-cell">Disk</th>
-                <th className="num hidden xl:table-cell">Load</th>
-                <th className="hidden md:table-cell">Drain</th>
-                <th className="hidden w-0 sm:table-cell">
-                  <span className="sr-only">Terminal</span>
-                </th>
-              </tr>
-            </thead>
+            <RunnersHead />
             <tbody>
               {list.map((a) => {
                 const s = a.sample;
@@ -227,62 +207,72 @@ export default function Runners() {
                 const toggle = () => openAgent(open ? null : a.name);
                 return (
                   <React.Fragment key={a.name}>
-                  <tr
-                    data-href
-                    tabIndex={0}
-                    aria-expanded={open}
-                    onClick={(e) => !(e.target as HTMLElement).closest("button,a,[role=switch]") && toggle()}
-                    onKeyDown={(e) => e.key === "Enter" && toggle()}
-                  >
-                    <td>
-                      <StatusDot status={agentStatus(a)} title={agentStateLabel(a)} />
-                    </td>
-                    <td className="max-w-[260px]">
-                      <div className="truncate text-[#e4e5e7]">{a.name}</div>
-                      <div className="truncate font-mono text-[10px] text-[#7b7e88]">
-                        {a.connected ? `${a.hostname} · ${a.os}/${a.arch} · v${a.version}` : <>last seen <RelTime ts={a.last_seen} /></>}
-                      </div>
-                      <UpgradeNote agent={a} />
-                    </td>
-                    <td className="hidden md:table-cell">
-                      <Chips labels={a.labels} max={4} />
-                    </td>
-                    <td className="min-w-[90px]">
-                      <div className="font-mono text-[11px] text-[#c8cad0] tabular-nums">
-                        {a.busy}/{a.slots}
-                        {a.running.length > 0 && <span className="ml-1.5 text-[#7b7e88]">· {a.running.length} job{a.running.length > 1 ? "s" : ""}</span>}
-                      </div>
-                      <div className="mt-1 w-20">
-                        <Meter value={a.busy} max={Math.max(1, a.slots)} label="Slots busy" />
-                      </div>
-                    </td>
-                    <td className="num cell-mono hidden sm:table-cell">{s ? formatPct(s.cpu_pct) : "—"}</td>
-                    <td className="num cell-mono hidden lg:table-cell">{s ? formatPct(memPct(s)) : "—"}</td>
-                    <td className="num cell-mono hidden xl:table-cell">{s ? formatPct(diskPct(s)) : "—"}</td>
-                    <td className="num cell-mono hidden xl:table-cell">{s ? s.load1.toFixed(2) : "—"}</td>
-                    <td className="hidden md:table-cell">
-                      <DrainSwitch agent={a} onChange={(v) => drain(a, v)} />
-                    </td>
-                    <td className="hidden text-right whitespace-nowrap sm:table-cell">
-                      <Tip content={a.connected ? "Open terminal" : "Runner offline"}>
-                        <button
-                          className="icon-btn"
-                          data-variant="bare"
-                          data-size="sm"
-                          aria-label={`Open terminal on ${a.name}`}
-                          disabled={!a.connected}
-                          onClick={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
-                        >
-                          <SquareTerminal size={14} />
-                        </button>
-                      </Tip>
-                    </td>
-                  </tr>
-                  {open && (
-                    <tr className="runner-detail-row">
-                      <td colSpan={10}>{details(a)}</td>
+                    <tr
+                      data-href
+                      tabIndex={0}
+                      aria-expanded={open}
+                      onClick={(e) => !(e.target as HTMLElement).closest("button,a,input,label") && toggle()}
+                      onKeyDown={(e) => e.key === "Enter" && e.target === e.currentTarget && toggle()}
+                    >
+                      <td>
+                        <StatusDot status={agentStatus(a)} title={agentStateLabel(a)} />
+                      </td>
+                      <td className="max-w-[260px] max-sm:w-full max-sm:max-w-0">
+                        <div className="truncate text-[#e4e5e7]">{a.name}</div>
+                        <div className="truncate font-mono text-[10px] text-[#7b7e88]">
+                          {a.connected ? (
+                            `${a.hostname} · ${a.os}/${a.arch} · v${a.version}`
+                          ) : (
+                            <>
+                              last seen <RelTime ts={a.last_seen} />
+                            </>
+                          )}
+                        </div>
+                        <UpgradeNote agent={a} />
+                      </td>
+                      <td className="hidden md:table-cell">
+                        <Chips labels={a.labels} max={4} />
+                      </td>
+                      <td className="min-w-[90px]">
+                        <div className="font-mono text-[11px] text-[#c8cad0] tabular-nums">
+                          {a.busy}/{a.slots}
+                          {a.running.length > 0 && (
+                            <span className="ml-1.5 text-[#7b7e88]">
+                              · {a.running.length} job{a.running.length > 1 ? "s" : ""}
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-1 w-20">
+                          <Meter value={a.busy} max={Math.max(1, a.slots)} label="Slots busy" />
+                        </div>
+                      </td>
+                      <td className="num cell-mono hidden sm:table-cell">{s ? formatPct(s.cpu_pct) : "—"}</td>
+                      <td className="num cell-mono hidden lg:table-cell">{s ? formatPct(memPct(s)) : "—"}</td>
+                      <td className="num cell-mono hidden xl:table-cell">{s ? formatPct(diskPct(s)) : "—"}</td>
+                      <td className="num cell-mono hidden xl:table-cell">{s ? s.load1.toFixed(2) : "—"}</td>
+                      <td className="hidden md:table-cell">
+                        <DrainCheck agent={a} onChange={(v) => drain(a, v)} />
+                      </td>
+                      <td className="hidden text-right whitespace-nowrap sm:table-cell">
+                        <Tip content={a.connected ? "Open terminal" : "Runner offline"}>
+                          <button
+                            className="icon-btn"
+                            data-variant="bare"
+                            data-size="sm"
+                            aria-label={`Open terminal on ${a.name}`}
+                            disabled={!a.connected}
+                            onClick={() => navigate(`/terminal?open=${encodeURIComponent(`agent:${a.name}`)}`)}
+                          >
+                            <SquareTerminal size={14} />
+                          </button>
+                        </Tip>
+                      </td>
                     </tr>
-                  )}
+                    {open && (
+                      <tr className="runner-detail-row">
+                        <td colSpan={10}>{details(a)}</td>
+                      </tr>
+                    )}
                   </React.Fragment>
                 );
               })}
@@ -291,9 +281,77 @@ export default function Runners() {
         </div>
       )}
 
-      {agents.data && all.length > 0 && <FrontDoorSection agents={all} index="02" />}
+      {all.length > 0 && <FrontDoorSection agents={all} index="02" />}
+    </>
+  );
+}
 
+function RunnersTools({
+  q,
+  onQ,
+  facets,
+  chosen,
+  onChosen,
+  view,
+  onView,
+}: {
+  q: string;
+  onQ: (v: string) => void;
+  facets: Facet[];
+  chosen: Chosen;
+  onChosen: (c: Chosen) => void;
+  view: "table" | "cards";
+  onView: (v: "table" | "cards") => void;
+}) {
+  return (
+    <div className="runners-tools">
+      <FacetBox className="runners-filter" label="Filter runners" placeholder="Filter by name, state, label, platform…" query={q} onQuery={onQ} facets={facets} chosen={chosen} onChosen={onChosen} />
+      <SelectField
+        className="runners-layout"
+        label="Layout"
+        hideLabel
+        value={view}
+        onChange={(v) => onView(v as "table" | "cards")}
+        options={[
+          { value: "table", label: "Table" },
+          { value: "cards", label: "Cards" },
+        ]}
+      />
     </div>
+  );
+}
+
+function RunnersHead() {
+  return (
+    <thead>
+      <tr>
+        <th className="w-6" aria-label="State" />
+        <th>Runner</th>
+        <th className="hidden md:table-cell">Labels</th>
+        <th>Slots</th>
+        <th className="num hidden sm:table-cell">CPU</th>
+        <th className="num hidden lg:table-cell">Mem</th>
+        <th className="num hidden xl:table-cell">Disk</th>
+        <th className="num hidden xl:table-cell">Load</th>
+        <th className="hidden md:table-cell">Drain</th>
+        <th className="hidden w-0 sm:table-cell">
+          <span className="sr-only">Terminal</span>
+        </th>
+      </tr>
+    </thead>
+  );
+}
+
+/** The fleet while it loads: its intro, its tools, the table's head and its rows' space. */
+function RunnersHold() {
+  const [view] = usePref<"table" | "cards">("kiln.agents.view", "table");
+  const noop = () => undefined;
+  return (
+    <>
+      <Intro lead={LEAD} />
+      <RunnersTools q="" onQ={noop} facets={[]} chosen={{}} onChosen={noop} view={view} onView={noop} />
+      {view === "cards" ? <Hold height={196} label="Loading the runners" /> : <TableHold head={<RunnersHead />} rows={6} rowHeight={57} label="Loading the runners" />}
+    </>
   );
 }
 
@@ -345,21 +403,29 @@ function UpgradeNote({ agent, detailed }: { agent: Agent; detailed?: boolean }) 
   );
 }
 
-function DrainSwitch({ agent, onChange }: { agent: Agent; onChange: (v: boolean) => void }) {
+/** Drain as a checkbox: on, the runner takes no new jobs. */
+function DrainCheck({ agent, onChange }: { agent: Agent; onChange: (v: boolean) => void }) {
   return (
     <label className="inline-flex min-h-8 cursor-pointer items-center gap-2">
-      <Switch.Root
-        checked={agent.draining}
-        onCheckedChange={onChange}
-        disabled={!agent.connected}
-        aria-label={`Drain ${agent.name}`}
-        className="relative h-[18px] w-8 shrink-0 rounded-full border border-white/15 bg-white/[0.04] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-white/80 focus-visible:ring-offset-2 focus-visible:ring-offset-[#08090a] disabled:opacity-40 data-[state=checked]:border-[#cbb69a]/50 data-[state=checked]:bg-[#cbb69a]/20"
-      >
-        <Switch.Thumb className="block size-3 translate-x-[2px] rounded-full bg-[#a1a4ad] transition-transform duration-200 data-[state=checked]:translate-x-[15px] data-[state=checked]:bg-[#e3d2b8]" />
-      </Switch.Root>
+      <input type="checkbox" className="check" checked={agent.draining} disabled={!agent.connected} onChange={(e) => onChange(e.target.checked)} aria-label={`Drain ${agent.name}`} />
       <span className={cn("font-mono text-[10px]", agent.draining ? "text-[#cbb69a]" : "text-[#7b7e88]")}>{agent.draining ? "draining" : "off"}</span>
     </label>
   );
+}
+
+/** A runner's last hour of samples (5 s apart), growing as samples arrive. */
+function useAgentHistory(name: string) {
+  const res = useSuspenseResource(`metrics/history/${name}`, (s) => api.metricsHistory(name, s).then((h) => h[name] ?? []));
+  useServerEvents((ev) => {
+    if (ev.type === "sample" && ev.agent === name) res.setData((l) => [...l, ev.sample].slice(-720));
+  });
+  return res.data;
+}
+
+/** The jobs a runner runs now, read again as that list changes. */
+function useRunningJobs(ids: string[]): Job[] {
+  const key = ids.join(",");
+  return useSuspenseResource(`jobs/${key}`, async (s) => (key ? (await Promise.all(ids.map((id) => api.job(id, s).catch(() => null)))).filter((j): j is Job => j !== null) : [])).data;
 }
 
 /** One runner in depth, open in the page under its row: what it is, what it runs, its last hour. */
@@ -377,39 +443,8 @@ function AgentDetails({
   onTerminal: () => void;
 }) {
   const [forgetting, setForgetting] = React.useState(false);
-  const [samples, setSamples] = React.useState<HostSample[] | null>(null);
-  const [err, setErr] = React.useState<string | null>(null);
-  const [jobs, setJobs] = React.useState<Job[]>([]);
-  const name = agent?.name;
-  const running = agent?.running.join(",") ?? "";
-
-  React.useEffect(() => {
-    if (!name) return;
-    setSamples(null);
-    setErr(null);
-    const ctl = new AbortController();
-    api
-      .metricsHistory(name, ctl.signal)
-      .then((h) => setSamples(h[name] ?? []))
-      .catch((e) => !ctl.signal.aborted && setErr(errorMessage(e)));
-    return () => ctl.abort();
-  }, [name]);
-
-  React.useEffect(() => {
-    if (!running) {
-      setJobs([]);
-      return;
-    }
-    const ctl = new AbortController();
-    Promise.all(running.split(",").map((id) => api.job(id, ctl.signal).catch(() => null)))
-      .then((js) => setJobs(js.filter((j): j is Job => j !== null)))
-      .catch(() => undefined);
-    return () => ctl.abort();
-  }, [running]);
-
-  useServerEvents((ev) => {
-    if (ev.type === "sample" && ev.agent === name) setSamples((s) => (s ? [...s, ev.sample].slice(-720) : s));
-  });
+  const samples = useAgentHistory(agent.name);
+  const jobs = useRunningJobs(agent.running);
 
   const s = agent.sample;
   return (
@@ -426,79 +461,89 @@ function AgentDetails({
           <X /> Close
         </Button>
       </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Chips labels={agent.labels} max={12} />
-          </div>
-          <div className="mt-4 flex flex-wrap gap-2">
-            <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal}>
-              <SquareTerminal /> Open terminal
-            </Button>
-            <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
-              {agent.draining ? "Resume scheduling" : "Drain"}
-            </Button>
-            {!forgetting && (
-              <Button variant="ghost" size="xs" className="text-[#d1aaad]" onClick={() => setForgetting(true)}>
-                <Trash2 /> Forget
+      <div className="flex flex-wrap items-center gap-2">
+        <Chips labels={agent.labels} max={12} />
+      </div>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal}>
+          <SquareTerminal /> Open terminal
+        </Button>
+        <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
+          {agent.draining ? "Resume scheduling" : "Drain"}
+        </Button>
+        {!forgetting && (
+          <Button variant="ghost" size="xs" className="text-[#d1aaad]" onClick={() => setForgetting(true)}>
+            <Trash2 /> Forget
+          </Button>
+        )}
+      </div>
+      {forgetting && (
+        <Confirm
+          className="mt-3"
+          label={`Forget ${agent.name}`}
+          tone="danger"
+          actions={
+            <>
+              <Button size="xs" variant="danger" onClick={() => void onForget(agent).finally(() => setForgetting(false))}>
+                Forget runner
               </Button>
-            )}
-          </div>
-          {forgetting && (
-            <div className="runner-up-confirm mt-3" role="group" aria-label={`Forget ${agent.name}`}>
-              <p>
-                Forget {agent.name}?{" "}
-                {agent.connected ? "It is connected: it will be disconnected and must enroll again to come back." : "Its enrollment is removed: it must enroll again to come back."}
-              </p>
-              <div className="runner-up-actions">
-                <Button size="xs" variant="danger" onClick={() => void onForget(agent).finally(() => setForgetting(false))}>
-                  Forget runner
-                </Button>
-                <Button size="xs" variant="ghost" onClick={() => setForgetting(false)}>
-                  Keep it
-                </Button>
-              </div>
-            </div>
-          )}
+              <Button size="xs" variant="ghost" onClick={() => setForgetting(false)}>
+                Keep it
+              </Button>
+            </>
+          }
+        >
+          <p>
+            Forget {agent.name}? {agent.connected ? "It is connected: it will be disconnected and must enroll again to come back." : "Its enrollment is removed: it must enroll again to come back."}
+          </p>
+        </Confirm>
+      )}
 
-          <UpgradeNote agent={agent} detailed />
+      <UpgradeNote agent={agent} detailed />
 
-          <div className="mt-6">
-            <Facts
-              items={[
-                { label: "Slots", value: `${agent.busy} / ${agent.slots} busy` },
-                { label: "Connected", value: agent.connected ? "yes" : "no", tone: agent.connected ? "pass" : "fail" },
-                { label: "Last seen", value: <RelTime ts={agent.last_seen} /> },
-                { label: "Enrolled", value: absoluteTime(agent.enrolled_at) },
-                { label: "CPU", value: s ? `${formatPct(s.cpu_pct, 1)} · ${s.cpus} cores` : "—" },
-                { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
-                { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
-              ]}
-            />
-          </div>
+      <div className="mt-6">
+        <Facts
+          items={[
+            { label: "Slots", value: `${agent.busy} / ${agent.slots} busy` },
+            { label: "Connected", value: agent.connected ? "yes" : "no", tone: agent.connected ? "pass" : "fail" },
+            { label: "Last seen", value: <RelTime ts={agent.last_seen} /> },
+            { label: "Enrolled", value: absoluteTime(agent.enrolled_at) },
+            { label: "CPU", value: s ? `${formatPct(s.cpu_pct, 1)} · ${s.cpus} cores` : "—" },
+            { label: "Memory", value: s ? `${formatBytes(s.mem_used)} / ${formatBytes(s.mem_total)}` : "—" },
+            { label: "Disk", value: s ? `${formatBytes(s.disk_used)} / ${formatBytes(s.disk_total)}` : "—" },
+          ]}
+        />
+      </div>
 
-          <div className="mt-8">
-            <div className="label mb-2">Running jobs</div>
-            {agent.running.length === 0 ? (
-              <p className="text-[12.5px] text-[#8f939e]">Idle.</p>
-            ) : (
-              <div className="row-list">
-                {jobs.map((j) => (
-                  <Link key={j.id} to={`/runs/${j.run_id}/jobs/${j.id}`} className="flex min-h-11 items-center gap-3 px-1 text-[12.5px] hover:bg-[#101114]">
-                    <StatusDot status={j.status} />
-                    <span className="min-w-0 flex-1 truncate">{j.display}</span>
-                    <span className="font-mono text-[10px] text-[#8c8f98]">
-                      <LiveDuration start={j.started_at} end={j.finished_at} />
-                    </span>
-                  </Link>
-                ))}
-                {jobs.length === 0 && agent.running.map((id) => <div key={id} className="py-2 font-mono text-[11px] text-[#8c8f98]">{id}</div>)}
-              </div>
-            )}
+      <div className="mt-8">
+        <div className="label mb-2">Running jobs</div>
+        {agent.running.length === 0 ? (
+          <p className="empty-line">Idle.</p>
+        ) : (
+          <div className="row-list">
+            {jobs.map((j) => (
+              <Link key={j.id} to={`/runs/${j.run_id}/jobs/${j.id}`} className="flex min-h-11 items-center gap-3 px-1 text-[12.5px] hover:bg-[#101114]">
+                <StatusDot status={j.status} />
+                <span className="min-w-0 flex-1 truncate">{j.display}</span>
+                <span className="font-mono text-[10px] text-[#8c8f98]">
+                  <LiveDuration start={j.started_at} end={j.finished_at} />
+                </span>
+              </Link>
+            ))}
+            {jobs.length === 0 &&
+              agent.running.map((id) => (
+                <div key={id} className="py-2 font-mono text-[11px] text-[#8c8f98]">
+                  {id}
+                </div>
+              ))}
           </div>
+        )}
+      </div>
 
-          <div className="mt-8">
-            <div className="label mb-3">Last hour · 5 s resolution</div>
-            {err ? <ErrorState error={err} compact /> : !samples ? <Skeleton className="h-64 w-full" /> : samples.length < 2 ? <p className="text-[12.5px] text-[#8f939e]">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={2} />}
-          </div>
+      <div className="mt-8">
+        <div className="label mb-3">Last hour · 5 s resolution</div>
+        {samples.length < 2 ? <p className="empty-line">Not enough samples yet.</p> : <HostCharts samples={samples} height={130} columns={2} />}
+      </div>
     </section>
   );
 }
@@ -509,16 +554,15 @@ function AgentDetails({
  * by kiln's own release pipeline first.
  */
 function Upgrades() {
-  const res = useResource((s) => api.updates(s), [], { pollMs: 20_000 });
-  const reload = res.reload;
-  useServerEvents((ev) => {
-    if (ev.type === "updates" || ev.type === "update_job") reload();
-  });
+  const data = useRes(updatesRes).data;
+  const live = useUpdateJobs();
   const [asking, setAsking] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
-  const data = res.data;
-  if (!data) return null;
-  const upgrading = new Set(data.jobs.filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
+  const upgrading = new Set(
+    mergeJobs(data, live)
+      .filter((j) => j.kind === "runner" && j.state === "running")
+      .map((j) => j.target),
+  );
   const behind = data.runners.filter((r) => r.connected && !r.up_to_date);
   if (behind.length === 0) return null;
   const ready = behind.filter((r) => r.target_build && !upgrading.has(r.name) && !(r.method === "terminal" && !r.terminal));
@@ -536,7 +580,7 @@ function Upgrades() {
     } finally {
       setBusy(false);
       setAsking(null);
-      reload();
+      invalidate("updates");
     }
   };
   const build = async () => {
@@ -548,29 +592,31 @@ function Upgrades() {
       toast.error("Couldn't start the build", errorMessage(e));
     } finally {
       setBusy(false);
-      reload();
+      invalidate("updates");
     }
   };
   const confirm = (text: string, runners: RunnerUpdate[]) => (
-    <div className="runner-up-confirm" role="group" aria-label="Confirm the upgrade">
+    <Confirm
+      label="Confirm the upgrade"
+      actions={
+        <>
+          <Button size="xs" disabled={busy} onClick={() => void upgrade(runners)}>
+            Upgrade
+          </Button>
+          <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsking(null)}>
+            Cancel
+          </Button>
+        </>
+      }
+    >
       <p>{text}</p>
-      <div className="runner-up-actions">
-        <Button size="xs" disabled={busy} onClick={() => void upgrade(runners)}>
-          Upgrade
-        </Button>
-        <Button size="xs" variant="ghost" disabled={busy} onClick={() => setAsking(null)}>
-          Cancel
-        </Button>
-      </div>
-    </div>
+    </Confirm>
   );
 
   return (
     <section className="runner-up" aria-label="Upgrades">
       <div className="runner-up-head">
-        <p>
-          {behind.length === 1 ? "1 runner is" : `${behind.length} runners are`} on an older build than this server hands out.
-        </p>
+        <p>{behind.length === 1 ? "1 runner is" : `${behind.length} runners are`} on an older build than this server hands out.</p>
         {ready.length > 1 && asking !== "all" && (
           <Button size="xs" variant="secondary" onClick={() => setAsking("all")}>
             Upgrade all ({ready.length})
@@ -607,11 +653,12 @@ function Upgrades() {
           <p>
             {building ? (
               <>
-                Building every platform ·{" "}
-                <Link to={`/runs/${last?.id ?? ""}`}>run #{last?.number}</Link>; {lacking.map((r) => r.name).join(", ")} can be upgraded when it finishes.
+                Building every platform · <Link to={`/runs/${last?.id ?? ""}`}>run #{last?.number}</Link>; {lacking.map((r) => r.name).join(", ")} can be upgraded when it finishes.
               </>
             ) : (
-              <>kiln builds {[...new Set(lacking.map((r) => r.target ?? r.os))].join(", ")} itself, on the server&rsquo;s own runner, then {lacking.length === 1 ? "it" : "they"} can be upgraded.</>
+              <>
+                kiln builds {[...new Set(lacking.map((r) => r.target ?? r.os))].join(", ")} itself, on the server&rsquo;s own runner, then {lacking.length === 1 ? "it" : "they"} can be upgraded.
+              </>
             )}
           </p>
           {!building && (
