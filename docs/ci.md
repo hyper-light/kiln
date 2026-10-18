@@ -174,13 +174,13 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
-| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit); preview and fixtures left |
+| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote; preview and fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; background steps, matchers left |
 | W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local, Docker; `actions/checkout@v4` unmodified; `$/`, policy left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
-| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken); principals and roles left |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing); principals and roles left |
 | W11 | Integrations and credential broker | W10 | ready (OIDC issuer) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images; probes, pools, microVMs, k8s left |
@@ -1426,10 +1426,11 @@ contexts to every later evaluation, and plan previews to W20 and W21.
   - `preview` (R29's core).
   - Tests: 42 unit tests (AC03 to AC06, S01 to S05) and the AC02 property test.
   - `ci/runs.rs` persists runs and legs; `ci_plans` and `ci_plan_log` rebuild a plan by replay.
+  - Reusable workflows reach the planner (`ci/reusable.rs`): the commit's own files, and remote
+    ones pinned through W07's mirror, nested; checked end to end on a local server.
 - *Left.*
   - `POST /api/ci/plan-preview`.
   - Fixtures F-10 to F-15, AC07 and AC08 end to end.
-  - Remote reusable workflows (W07's mirror).
   - The live checks of AC04 and AC06.
 
 ### W05 Scheduler: queues, concurrency, priorities, routing, retries
@@ -2482,19 +2483,31 @@ elsewhere (G-24, G-33).
     - `crates/kiln/src/ci/oidc.rs`: RS256 keys sealed by the master key, the open discovery and
       JWKS documents, and `/_kiln/oidc/token` for legs granted `id-token: write` (R07);
     - untrusted runs get no ID tokens unless `[ci.oidc] untrusted` (R10).
+  - Workload tokens (R11, the CD half): `kiln_ci::oidc::workload_claims` gives a CD sync a deploy
+    job's subject (`repo:<owner>/<repo>:environment:<env>`), so one trust policy per environment
+    covers both; `kiln_source`, `kiln_app`, `kiln_deployment` and `kiln_trigger` tell them apart.
+    `ci::oidc::mint` signs them for the broker (W11).
+  - Publishing (R12): `/api/ci/oidc` (status, `jwks-export`, `rotate`, `publish`); `kiln oidc
+    status | jwks | publish --to <dir> | rotate [--now]`; `[ci.oidc] publish_dir`, rewritten by
+    the hourly upkeep and at each rotation, each file replaced by rename. AC07: a verifier that
+    reads only the published files accepts the signing and next keys' tokens and refuses
+    unpublished keys, forged bodies and other issuers.
   - Checked end to end on a local server:
     - AC03: `core.getIDToken('sts.amazonaws.com')` returns a token that verifies against the
       published keys, with GitHub's claims;
     - no ID token variables without the permission;
     - the token permissions;
-    - a token refused once its attempt ended.
+    - a token refused once its attempt ended;
+    - `kiln oidc` publishing to a directory, and a rotation's next key published at once.
 - *Left.*
   - R01, R02 and R05: principals, capabilities, roles, and the one route table, from access.md.
   - PATs and agent tokens (R03).
   - Kiln's own permission scopes (R04).
-  - Per-repository subject customization (R09; server-wide today), R11, R12 (`kiln oidc
-    publish`, `jwks`).
-  - AC01, AC02, AC04 (real federation, user-assisted), AC07.
+  - Per-repository subject customization (R09; server-wide today).
+  - R11's service and agent subjects (`kiln:<server-id>:service:<name>`, `kiln:agent:<session>`).
+  - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
+    issuer paths, and the Settings → OIDC page (W21).
+  - AC01, AC02, AC04 (real federation, user-assisted).
 
 ### W11 Integrations and the credential broker
 
@@ -2568,7 +2581,10 @@ catalog; this section is the machinery.
 - **W11-AC05 Model providers.** An agent kiln starts calls the Anthropic API with a federated
   token and no stored API key. *E2E, user-assisted.*
 
-**Progress.** Not started.
+**Progress.** Not started. Ownership, agreed 2026-10-18: the Kiln CD lane builds the registry and
+the exchanges (`crates/kiln/src/ci/integrations/`, each kind's `mint()`), on W10's
+`workload_claims` and `ci::oidc::mint`; this lane wires them into jobs (`integrations:`, `kiln
+auth`, W11-R03, R04).
 
 ### W12 Registries
 
