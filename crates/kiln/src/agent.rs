@@ -290,6 +290,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             max_series: 0,
         });
         crate::observe::api::set_global(obs.clone());
+        // Apps on this machine send OTLP here, as to a collector.
+        if let Some(addr) = crate::observe::otlp::local_addr() {
+            crate::rt::spawn(crate::observe::otlp::serve_local(addr, obs.clone(), shutdown.clone()));
+        }
         let (up, out) = (up_tx.clone(), obs.outgoing());
         crate::rt::spawn(async move {
             while let Ok(m) = out.recv().await {

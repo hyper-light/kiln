@@ -5,6 +5,7 @@
 pub mod api;
 pub mod hub;
 pub mod ingest;
+pub mod otlp;
 pub mod owner;
 pub mod wire;
 

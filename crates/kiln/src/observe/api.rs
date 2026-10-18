@@ -29,6 +29,30 @@ pub fn get() -> Option<&'static Observe> {
     OBSERVE.get()
 }
 
+/// The token OTLP exporters send the server (`Authorization: Bearer`), besides the admin's: one
+/// that writes and reads nothing else (`<data>/observe/ingest.token`).
+static INGEST: OnceLock<String> = OnceLock::new();
+
+pub fn set_ingest_token(t: String) {
+    let _ = INGEST.set(t);
+}
+
+/// Whether `token` may write over OTLP.
+pub fn ingest_allowed(token: &str, admin: &str) -> bool {
+    crate::util::ct_eq(token.as_bytes(), admin.as_bytes()) || INGEST.get().is_some_and(|t| crate::util::ct_eq(token.as_bytes(), t.as_bytes()))
+}
+
+/// `POST /v1/metrics` and `/v1/logs` on the server, for an authorised exporter.
+pub async fn otlp(signal: super::otlp::Signal, req: Request, authorised: bool) -> Response {
+    if !authorised {
+        return srv::text(StatusCode::UNAUTHORIZED, "an OTLP exporter sends `Authorization: Bearer <the ingest token>`");
+    }
+    match get() {
+        Some(o) => super::otlp::answer(o, signal, req).await,
+        None => srv::with_header(srv::text(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"), header::RETRY_AFTER, "1"),
+    }
+}
+
 /// A request's body, at the most: a query's text is 8,000 bytes (`kiln_obs::query::lex`), an
 /// ingest's points a few MB.
 const QUERY_BODY: usize = 64 << 10;

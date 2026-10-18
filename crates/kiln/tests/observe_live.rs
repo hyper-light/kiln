@@ -60,6 +60,8 @@ struct Fleet {
     admin: String,
     server: Option<Proc>,
     runners: BTreeMap<String, Option<Proc>>,
+    /// Each runner's OTLP receiver's port.
+    otlp: BTreeMap<String, u16>,
 }
 
 impl Fleet {
@@ -101,7 +103,7 @@ enabled = true
             data = data.display()
         );
         std::fs::write(root.path().join("kiln.toml"), cfg)?;
-        let mut f = Self { root, http, admin: String::new(), server: None, runners: BTreeMap::new() };
+        let mut f = Self { root, http, admin: String::new(), server: None, runners: BTreeMap::new(), otlp: BTreeMap::new() };
         f.start_server()?;
         f.admin = std::fs::read_to_string(data.join("admin.token"))?.trim().to_owned();
         Ok(f)
@@ -134,10 +136,16 @@ enabled = true
         let join = std::fs::read_to_string(self.root.path().join("server").join("join.token"))?.trim().to_owned();
         let dir = self.root.path().join(name);
         let log = self.root.path().join(format!("{name}.log"));
+        let otlp = match self.otlp.get(name) {
+            Some(&p) => p,
+            None => free_port()?,
+        };
+        self.otlp.insert(name.to_owned(), otlp);
         let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
         let child = self
             .command(&dir.join("home"))?
             .args(["agent", "--server", &format!("http://127.0.0.1:{}", self.http), "--token", &join, "--name", name, "--slots", "1", "--no-terminal", "--no-reach"])
+            .env("KILN_OTLP_ADDR", format!("127.0.0.1:{otlp}"))
             .arg("--state-dir")
             .arg(dir.join("state"))
             .arg("--work-dir")
@@ -175,12 +183,20 @@ enabled = true
 
     /// A request to the server: its status and its body.
     fn request(&self, method: &str, path: &str, body: Option<&Value>) -> anyhow::Result<(u16, Vec<u8>)> {
-        let mut s = TcpStream::connect(("127.0.0.1", self.http))?;
-        s.set_read_timeout(Some(Duration::from_secs(30)))?;
         let body = body.map(serde_json::to_vec).transpose()?.unwrap_or_default();
         let auth = if self.admin.is_empty() { String::new() } else { format!("Authorization: Bearer {}\r\n", self.admin) };
-        write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len())?;
-        s.write_all(&body)?;
+        raw(self.http, method, path, &format!("{auth}Content-Type: application/json\r\n"), &body)
+    }
+}
+
+/// A request to `127.0.0.1:port` with `headers` (each ending in CRLF) and `body`: its status and
+/// its body, chunked or not.
+fn raw(port: u16, method: &str, path: &str, headers: &str, body: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", port))?;
+        s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{headers}Content-Length: {}\r\n\r\n", body.len())?;
+        s.write_all(body)?;
         let mut raw = Vec::new();
         s.read_to_end(&mut raw)?;
         let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| anyhow::anyhow!("no header end"))?;
@@ -204,7 +220,9 @@ enabled = true
         }
         Ok((code, rest))
     }
+}
 
+impl Fleet {
     fn get_raw(&self, path: &str) -> anyhow::Result<(u16, Vec<u8>)> {
         self.request("GET", path, None)
     }
@@ -340,6 +358,70 @@ fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyh
         std::thread::sleep(Duration::from_millis(100));
     }
     f.until(Duration::from_secs(30), "both runners hold the logs too", |s| caught_up(s, &["r1", "r2"]))?;
+
+    // OTLP: the specification's own JSON example, gzip, to the server with the ingest token.
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    let example = include_str!("../src/observe/fixtures/otlp-metrics.json");
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(example.as_bytes())?;
+    let gz = gz.finish()?;
+    let (code, body) = raw(f.http, "POST", "/v1/metrics", &format!("Authorization: Bearer {ingest}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\n"), &gz)?;
+    anyhow::ensure!(code == 200 && body == b"{}", "OTLP/JSON: {code} {}", String::from_utf8_lossy(&body));
+    let (code, _) = raw(f.http, "POST", "/v1/metrics", "Authorization: Bearer wrong\r\nContent-Type: application/json\r\n", example.as_bytes())?;
+    anyhow::ensure!(code == 401, "a wrong token: {code}");
+    let (code, _) = raw(f.http, "POST", "/v1/metrics", &format!("Authorization: Bearer {ingest}\r\nContent-Type: application/x-protobuf\r\n"), &[0x0a, 0xff, 0x01])?;
+    anyhow::ensure!(code == 400, "a malformed body: {code}");
+    // The example's points are of 2018: past the samples' cutoff? No: 455 days is 15 months, and
+    // 2018 is older. They are taken and dropped as expired, alike everywhere; its names are not
+    // listed. Points of now, in protobuf, to a runner's own receiver, come through it.
+    let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    let now_ns = u64::try_from(crate_now()).unwrap_or(0) * 1_000_000;
+    let mut req = kiln_obs::otlp::pb::Writer::default();
+    req.message(1, |rl| {
+        rl.message(1, |res| {
+            res.message(1, |kv| {
+                kv.str(1, "service.name");
+                kv.message(2, |v| v.str(1, "checkout"));
+            });
+        });
+        rl.message(2, |sl| {
+            sl.message(2, |m| {
+                m.str(1, "e2e.otlp.requests");
+                m.message(5, |g| {
+                    g.message(1, |p| {
+                        p.fixed64(3, now_ns);
+                        p.double(4, 42.0);
+                    });
+                });
+            });
+        });
+    });
+    let (code, _) = raw(r1, "POST", "/v1/metrics", "Content-Type: application/x-protobuf\r\n", &req.buf)?;
+    anyhow::ensure!(code == 200, "the runner's receiver: {code}");
+    let mut logs = kiln_obs::otlp::pb::Writer::default();
+    logs.message(1, |rl| {
+        rl.message(2, |sl| {
+            sl.message(2, |r| {
+                r.fixed64(1, now_ns);
+                r.varint(2, 17);
+                r.message(5, |b| b.str(1, "otlp from an app on r1"));
+            });
+        });
+    });
+    let (code, _) = raw(r1, "POST", "/v1/logs", "Content-Type: application/x-protobuf\r\n", &logs.buf)?;
+    anyhow::ensure!(code == 200, "the runner's log receiver: {code}");
+    let start = Instant::now();
+    loop {
+        let q = f.query("sum:e2e.otlp.requests{service:checkout}", crate_now() - 120_000, crate_now() + 60_000)?;
+        let found = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "\"otlp from an app\"", "from": crate_now() - 120_000, "to": crate_now() + 60_000, "limit": 5 })))?;
+        let got_log = at(&found, &["records"]).as_array().is_some_and(|a| a.len() == 1);
+        if q.values().any(|v| v.contains(&Some(42.0))) && got_log {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "OTLP through r1 never arrived: {q:?} {found}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    f.until(Duration::from_secs(30), "both runners hold the OTLP points too", |s| caught_up(s, &["r1", "r2"]))?;
     let (index, digest) = f.verify(3)?;
     eprintln!("three replicas agree at index {index}: {digest:016x}");
 

@@ -203,6 +203,15 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let batch = (*batch).to_owned();
             return sync_bundle_put(&hub, &batch, req).await;
         }
+        // OTLP/HTTP (`crate::observe::otlp`), with the ingest token or the admin's.
+        (&Method::POST, ["v1", "metrics"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Metrics, req, ok).await);
+        }
+        (&Method::POST, ["v1", "logs"]) => {
+            let ok = bearer(req.headers()).is_some_and(|t| crate::observe::api::ingest_allowed(t, &hub.admin_token));
+            return Ok(crate::observe::api::otlp(crate::observe::otlp::Signal::Logs, req, ok).await);
+        }
         // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
         (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),

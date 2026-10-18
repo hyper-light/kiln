@@ -146,6 +146,10 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             max_series: cfg.observe.max_series,
         }));
         child!("observe", h => crate::observe::hub::send_loop(h));
+        match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {
+            Ok(t) => crate::observe::api::set_ingest_token(t),
+            Err(e) => tracing::warn!(error = %e, "observe's ingest token could not be made: OTLP takes the admin token alone"),
+        }
     }
     child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
     child!("in-step", h => crate::updates::in_step_loop(h));

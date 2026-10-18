@@ -138,6 +138,7 @@ enum Input {
 #[derive(Clone)]
 pub struct Observe {
     tx: Sender<Input>,
+    busy: Arc<AtomicBool>,
     store: Arc<Mutex<Option<Shared>>>,
     view: Arc<Mutex<View>>,
     out: async_channel::Receiver<Out>,
@@ -161,9 +162,10 @@ impl Observe {
             Role::Server { key } => Some(key.clone()),
             Role::Runner { .. } => None,
         };
-        let handle = Self { tx: tx.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key };
+        let busy = Arc::new(AtomicBool::new(false));
+        let handle = Self { tx: tx.clone(), busy: busy.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
-            let mut owner = Owner::new(settings, store, view, out_tx, tx);
+            let mut owner = Owner::new(settings, store, view, out_tx, tx, busy);
             owner.run(&rx);
         });
         if let Err(e) = spawned {
@@ -212,6 +214,11 @@ impl Observe {
     /// the view shows them as they come.
     pub fn verify(&self) {
         let _ = self.tx.send(Input::Verify);
+    }
+
+    /// Whether this node is too far behind on its writes to take more (`Batcher::busy`).
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Relaxed)
     }
 
     /// The store, for queries, once it is open.
@@ -302,6 +309,7 @@ struct Owner {
     wakeup: Arc<Wakeup>,
     waker: Waker,
     input: Sender<Input>,
+    busy: Arc<AtomicBool>,
     start: Instant,
     batcher: Batcher,
     joiner: Joiner,
@@ -337,7 +345,7 @@ fn now_ns(start: Instant) -> u64 {
 }
 
 impl Owner {
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, busy: Arc<AtomicBool>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -353,6 +361,7 @@ impl Owner {
             wakeup,
             waker,
             input,
+            busy,
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
             joiner: Joiner::default(),
@@ -494,6 +503,7 @@ impl Owner {
             self.writes();
             self.drive();
             self.periodic();
+            self.busy.store(self.batcher.busy(), Ordering::Relaxed);
         }
     }
 

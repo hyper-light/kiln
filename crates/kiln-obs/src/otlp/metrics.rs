@@ -445,7 +445,7 @@ fn format_f64(v: f64) -> String {
 }
 
 /// A `KeyValue`: its key and its value as text.
-fn key_value(msg: &[u8]) -> Result<Option<(String, String)>, OtlpError> {
+pub(crate) fn key_value(msg: &[u8]) -> Result<Option<(String, String)>, OtlpError> {
     let (mut key, mut value) = (None, None);
     for f in Fields::new(msg) {
         match f? {
@@ -457,9 +457,13 @@ fn key_value(msg: &[u8]) -> Result<Option<(String, String)>, OtlpError> {
     Ok(key.filter(|k| !k.is_empty()).map(|k| (truncate(k), value.unwrap_or_default())))
 }
 
-fn truncate(mut s: String) -> String {
-    if s.len() > MAX_NAME_BYTES {
-        let mut cut = MAX_NAME_BYTES;
+fn truncate(s: String) -> String {
+    truncate_to(s, MAX_NAME_BYTES)
+}
+
+fn truncate_to(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut cut = max;
         while !s.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -471,6 +475,12 @@ fn truncate(mut s: String) -> String {
 /// An `AnyValue` as text: scalars as themselves, bytes as hex, arrays and maps as compact JSON;
 /// nesting is walked with a stack of its own, at most [`MAX_DEPTH`] deep.
 fn any_value_text(msg: &[u8]) -> Result<String, OtlpError> {
+    any_value_text_within(msg, MAX_NAME_BYTES)
+}
+
+/// [`any_value_text`] of at most `max` bytes: a tag's value is a name's length, a log's body a
+/// message's.
+pub(crate) fn any_value_text_within(msg: &[u8], max: usize) -> Result<String, OtlpError> {
     let mut out = String::new();
     // Each frame: an array or a map being written, its fields left, whether one was written.
     enum Frame<'a> {
@@ -533,7 +543,7 @@ fn any_value_text(msg: &[u8]) -> Result<String, OtlpError> {
                     break;
                 }
             }
-            if out.len() > MAX_NAME_BYTES {
+            if out.len() > max {
                 break;
             }
         }
@@ -582,7 +592,7 @@ fn any_value_text(msg: &[u8]) -> Result<String, OtlpError> {
             },
         }
     }
-    Ok(truncate(out))
+    Ok(truncate_to(out, max))
 }
 
 fn push_json_str(out: &mut String, s: &str) {

@@ -108,6 +108,13 @@ impl Batcher {
         }
     }
 
+    /// Whether this node is too far behind to take more: three quarters of what may wait, waiting.
+    /// An OTLP request is then answered 503, which its exporter retries, rather than taken and
+    /// dropped.
+    pub fn busy(&self) -> bool {
+        self.waiting_points > WAITING_POINTS / 4 * 3 || self.log_bytes > WAITING_LOG_BYTES / 4 * 3
+    }
+
     /// Points and records waiting, and whether a write is out.
     pub fn backlog(&self) -> (u64, bool) {
         ((self.waiting_points + self.logs.len()) as u64, self.out.is_some())
