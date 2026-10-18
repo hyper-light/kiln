@@ -295,6 +295,39 @@ impl Host {
         n
     }
 
+    /// Every session, handed to another runner process of this machine (a blue/green upgrade,
+    /// `crate::bluegreen`): each with its spec and, still running, its harness process (`None`:
+    /// it couldn't be handed over, was stopped, and starts again there from its spec). They are no
+    /// longer this runner's.
+    pub async fn move_out(&self) -> Vec<(String, Spec, Option<Box<session::Handed>>)> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;
+        let mut out = Vec::new();
+        for (s, h) in handed {
+            if h.is_none()
+                && let Some(pid) = s.pid.lock().take()
+            {
+                stop_process(pid);
+                #[cfg(unix)]
+                let _ = crate::os::try_reap(pid);
+            }
+            let spec = s.resume_spec();
+            self.sessions.lock().remove(&s.id);
+            out.push((s.id.clone(), spec, h));
+        }
+        self.mark_dirty();
+        out
+    }
+
+    /// Take over a session another runner process of this machine handed over (blue/green): with
+    /// its process (its descriptors are this process's now), or started again from its spec.
+    pub fn move_in(&self, id: String, spec: Spec, handed: Option<Box<session::Handed>>) -> anyhow::Result<()> {
+        match handed {
+            Some(h) => self.open_seeded(Some(id), spec, None, Some(h)).map(|_| ()),
+            None => self.open(Some(id), spec).map(|_| ()),
+        }
+    }
+
     /// The image the sessions were handed to never came (the exec failed): this one goes on with
     /// them, their processes included.
     pub fn take_back(&self) {
@@ -405,7 +438,7 @@ impl Host {
 
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
 #[cfg(unix)]
-fn stop_process(pid: u32) {
+pub(crate) fn stop_process(pid: u32) {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     let Ok(p) = i32::try_from(pid) else { return };
@@ -423,7 +456,7 @@ fn stop_process(pid: u32) {
 }
 
 #[cfg(windows)]
-fn stop_process(pid: u32) {
+pub(crate) fn stop_process(pid: u32) {
     crate::os::proc::taskkill_tree(pid);
 }
 

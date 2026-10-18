@@ -215,6 +215,407 @@ enum Ev {
     Harness(String, crate::harness::core::Update),
     /// The front door's status changed.
     FrontDoor,
+    /// A blue/green upgrade step done off the loop (`crate::bluegreen`).
+    Bg(Bg),
+    /// A server frame about something another runner process of this machine handed over (or a
+    /// rollback took back), handled as if the server had sent it here.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Forwarded(Vec<u8>),
+}
+
+/// Blue/green upgrade steps (`crate::bluegreen`) done off the event loop, back to it (none on
+/// Windows, which has no blue/green upgrades).
+enum Bg {
+    /// (The runner being upgraded.) The new build is downloaded and checked: start it beside this one.
+    #[cfg(unix)]
+    Fetched { job: String, exe: PathBuf, build: String },
+    /// The new build's runner is connected and ready: hand it everything.
+    #[cfg(unix)]
+    Ready { job: String, conn: Arc<crate::bluegreen::Conn> },
+    /// Everything was sent: what the new build said of each, in order (`broke`: the connection
+    /// failed part-way).
+    #[cfg(unix)]
+    Moved { job: String, conn: Arc<crate::bluegreen::Conn>, acks: Vec<Ack>, broke: Option<String> },
+    /// The new build didn't come up: this runner goes on.
+    #[cfg(unix)]
+    Failed { job: String, why: String },
+    /// (The new build's runner.) A terminal handed over: take it, and say how it went.
+    #[cfg(unix)]
+    TakeTerminal { session: String, command: Option<String>, cols: u16, rows: u16, replay: Vec<u8>, fd: std::os::fd::OwnedFd, pid: u32, done: futures::channel::oneshot::Sender<Result<(), String>> },
+    /// (The new build's runner.) Everything handed over is in: the server hears what runs here.
+    #[cfg(unix)]
+    TookOver { sessions: usize, terminals: usize, refused: usize },
+    /// (The new build's runner.) The runner it took over from is gone (or never answered).
+    #[cfg(unix)]
+    TakeOverEnded,
+    /// (The new build's runner.) It is the runner now: the server hears it's the newest.
+    #[cfg(unix)]
+    Promoted,
+    /// A server frame for [`Ev::Forwarded`].
+    #[cfg(unix)]
+    Forwarded(Vec<u8>),
+}
+
+/// What the new build said of one thing handed to it (blue/green).
+#[cfg(unix)]
+enum Ack {
+    /// It holds it now.
+    Taken,
+    /// It didn't take it (an agent session it then started again from its record, if it could).
+    Refused(String),
+    /// No answer came: the connection broke on it.
+    Lost(String),
+    /// Never sent: the connection broke before.
+    Skipped,
+}
+
+/// A blue/green upgrade under way on the runner being upgraded (`crate::bluegreen`).
+#[cfg(unix)]
+struct Moving {
+    green: crate::bluegreen::Green,
+    /// The new build's instance (its own directory under `<state>/instances/`).
+    instance: String,
+    /// The `kiln::upgrade` spans: the whole upgrade, and the new build coming up.
+    root: tracing::Span,
+    healthy: Option<tracing::Span>,
+    /// The new build is ready and things are being handed to it: what the server opens here
+    /// meanwhile is held for it too.
+    handing: bool,
+    /// What was handed over, in the order it was sent, kept until the new build is promoted: a
+    /// rollback takes it back.
+    items: Vec<Item>,
+    /// Server frames about those that reached this runner meanwhile: for the new build once it's
+    /// promoted, else handled here.
+    held: Vec<Vec<u8>>,
+}
+
+/// One thing handed to the new build (blue/green), as this runner keeps it until then.
+#[cfg(unix)]
+enum Item {
+    Session {
+        id: String,
+        spec: Box<crate::harness::session::Spec>,
+        /// Its handover as sent (JSON) and this side's copies of its pipes; `None`: it couldn't
+        /// be handed over running, and starts again from its record there.
+        kept: Option<(Vec<u8>, [std::os::fd::OwnedFd; 3])>,
+    },
+    Terminal {
+        session: String,
+        state: Arc<crate::termsess::Session>,
+        fd: std::os::fd::OwnedFd,
+        pid: u32,
+    },
+}
+
+#[cfg(unix)]
+impl Item {
+    fn what(&self) -> &'static str {
+        match self {
+            Self::Session { .. } => "session",
+            Self::Terminal { .. } => "terminal",
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Session { id, .. } => id,
+            Self::Terminal { session, .. } => session,
+        }
+    }
+}
+
+/// After the new build is promoted, this runner waits this long (and as long once its last job
+/// ends) before it exits: what it sent last reaches the server, and the server has heard from the
+/// new build that it holds what was handed over.
+#[cfg(unix)]
+const RETIRE_QUIET: Duration = Duration::from_secs(8);
+
+/// This runner's arguments with `--instance` set to `id` (the new build runs as its own instance).
+#[cfg(unix)]
+fn with_instance(args: &[String], id: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if a == "--instance" {
+            skip = true;
+            continue;
+        }
+        if a.starts_with("--instance=") {
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out.push("--instance".to_owned());
+    out.push(id.to_owned());
+    out
+}
+
+/// This side's copies of a handed-over harness process's pipes, kept (not inherited by anything
+/// this runner starts) until the new build has them; `None` when one isn't open.
+#[cfg(unix)]
+fn keep_pipes(p: &crate::proc::Detached) -> Option<[std::os::fd::OwnedFd; 3]> {
+    let take = |raw: i32| {
+        let fd = crate::os::reclaim_fd(raw)?;
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC).ok()?;
+        Some(fd)
+    };
+    Some([take(p.stdin)?, take(p.stdout)?, take(p.stderr)?])
+}
+
+/// Go on with a terminal here from its PTY master (`fd`) and its shell (another process's child,
+/// or this one's still reaped where it was spawned): its output flows again, and it's kept with
+/// `state`. Whether it could.
+#[cfg(unix)]
+fn take_terminal_back(terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>, term_tx: &async_channel::Sender<(String, PtyOut)>, session: String, state: Arc<crate::termsess::Session>, fd: std::os::fd::OwnedFd, pid: u32) -> bool {
+    use std::os::fd::IntoRawFd as _;
+    let Some((pty, rx)) = terminal::adopt(terminal::Handover { fd: fd.into_raw_fd(), pid, foreign: true }) else { return false };
+    let (tx, s) = (term_tx.clone(), session.clone());
+    crate::rt::spawn(async move {
+        while let Ok(out) = rx.recv().await {
+            let exit = matches!(out, PtyOut::Exit(_));
+            if tx.send((s.clone(), out)).await.is_err() || exit {
+                break;
+            }
+        }
+    });
+    terms.insert(session, (pty, state));
+    true
+}
+
+/// The terminals this runner process holds, as the server is told of them.
+#[cfg(unix)]
+fn term_list(terms: &HashMap<String, (PtySession, Arc<crate::termsess::Session>)>) -> Vec<proto::TermInfo> {
+    terms
+        .iter()
+        .map(|(id, (_, s))| {
+            let i = s.info();
+            proto::TermInfo { session: id.clone(), cols: i.cols, rows: i.rows, command: s.command.clone() }
+        })
+        .collect()
+}
+
+/// Tell the server which terminals (`sessions`, [`term_list`]) and agent sessions this runner
+/// process holds: they're its own from now on (another process of the machine had them).
+#[cfg(unix)]
+async fn announce(sessions: Vec<proto::TermInfo>, harness: Option<&Arc<crate::harness::host::Host>>, uplink: &Uplink) {
+    uplink.0.send(Up::Term(AgentMsg::TermList { sessions })).await.ok();
+    if let Some(h) = harness
+        && let Ok(json) = serde_json::to_string(&h.inventory())
+    {
+        uplink.0.send(Up::Term(AgentMsg::HarnessInventory { json })).await.ok();
+    }
+}
+
+/// Serve the machine's local sockets (`kiln run`, `kiln spawn`) from this runner process: the new
+/// build once it has taken over, or the old one again after a rollback (the paths are the same).
+#[cfg(unix)]
+fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, state_dir: &std::path::Path) {
+    if let Some(r) = reach
+        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(name, state_dir))
+    {
+        tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine");
+    }
+    if let Some(h) = harness
+        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(name, state_dir))
+    {
+        tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
+    }
+}
+
+/// Take back everything handed to the new build (it didn't take over). The new build is killed
+/// first, so nothing of it hangs up a terminal or reads a pipe this runner takes back; then each
+/// terminal and agent session goes on here as it was (a session the new build had stopped
+/// starts again from its record). What couldn't come back.
+#[cfg(unix)]
+async fn roll_back(
+    mv: Moving,
+    acks: &[Ack],
+    why: &str,
+    harness: Option<&Arc<crate::harness::host::Host>>,
+    terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
+    term_tx: &async_channel::Sender<(String, PtyOut)>,
+    state_dir: &std::path::Path,
+) -> Vec<String> {
+    use std::os::fd::IntoRawFd as _;
+    let empty = tracing::field::Empty;
+    let span = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.rollback", reason = %why, result = empty, error = empty);
+    if let Some(sup) = crate::bluegreen::Supervisor::from_env() {
+        let green = mv.green;
+        if let Ok(Err(e)) | Err(e) = crate::rt::blocking(move || sup.kill(green)).await {
+            // Gone already (it exited, or it was never started).
+            tracing::debug!(error = %format!("{e:#}"), pid = green.pid, "stopping the new build");
+        }
+    }
+    let mut problems = Vec::new();
+    for (i, item) in mv.items.into_iter().enumerate() {
+        match item {
+            Item::Terminal { session, state, fd, pid } => {
+                if !take_terminal_back(terms, term_tx, session.clone(), state, fd, pid) {
+                    problems.push(format!("terminal {session}"));
+                }
+            }
+            Item::Session { id, spec, kept } => {
+                let Some(h) = harness else { continue };
+                // The new build stopped it (and started it again, now gone with it): it starts again here.
+                let stopped = matches!(acks.get(i), Some(Ack::Refused(_)));
+                let handed = kept.filter(|_| !stopped).and_then(|(json, [i, o, e])| {
+                    let mut hd: crate::harness::session::Handed = serde_json::from_slice(&json).ok()?;
+                    hd.process.stdin = i.into_raw_fd();
+                    hd.process.stdout = o.into_raw_fd();
+                    hd.process.stderr = e.into_raw_fd();
+                    // Still this runner's child, reaped where it was spawned: watched here.
+                    hd.process.foreign = true;
+                    Some(Box::new(hd))
+                });
+                if let Err(e) = h.move_in(id.clone(), *spec, handed) {
+                    problems.push(format!("agent session {id}: {e:#}"));
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(crate::upgrade::instance_dir(state_dir, &mv.instance));
+    if problems.is_empty() {
+        span.record("result", "ok");
+    } else {
+        span.record("result", "failed");
+        span.record("error", problems.join("; ").as_str());
+    }
+    mv.root.record("result", "rolled_back");
+    mv.root.record("error", why);
+    problems
+}
+
+/// (The new build's runner, blue/green.) Take over from the runner being upgraded, at `path`: say
+/// it's ready, take each agent session and terminal it hands over (saying how each went), then the
+/// server's frames about them that reached it meanwhile, until that runner ends. Terminals are
+/// taken on this runner's loop (`tx`), which also hears once everything is in.
+#[cfg(unix)]
+async fn take_over_from(path: PathBuf, harness: Option<Arc<crate::harness::host::Host>>, tx: async_channel::Sender<Bg>, me: String) -> anyhow::Result<()> {
+    use crate::bluegreen::Frame;
+    use base64::Engine as _;
+    let conn = Arc::new(crate::rt::blocking(move || crate::bluegreen::connect(&path)).await??);
+    let c = Arc::clone(&conn);
+    crate::rt::blocking(move || c.send(&Frame::Ready { pid: std::process::id(), instance: me }, &[])).await??;
+    tracing::info!(upgrade = %std::env::var("KILN_UPGRADE_ID").unwrap_or_default(), "connected to the runner being upgraded: taking over");
+    // Read on a thread of its own: once everything is in, the connection stays open (idle) until
+    // the old runner ends.
+    let (ftx, frx) = async_channel::unbounded::<anyhow::Result<(Frame, Vec<std::os::fd::OwnedFd>)>>();
+    let c = Arc::clone(&conn);
+    std::thread::Builder::new().name("kiln-take-over".into()).spawn(move || {
+        loop {
+            let got = c.recv();
+            let end = got.is_err();
+            if ftx.send_blocking(got).is_err() || end {
+                break;
+            }
+        }
+    })?;
+    let (mut sessions, mut terminals, mut refused) = (0usize, 0usize, 0usize);
+    let mut done = false;
+    while let Ok(got) = frx.recv().await {
+        let (frame, fds) = match got {
+            Ok(f) => f,
+            Err(e) => {
+                if !done {
+                    anyhow::bail!("the runner being upgraded broke off the handover: {e:#}");
+                }
+                tracing::info!("the runner this one took over from has ended");
+                break;
+            }
+        };
+        let (id, r) = match frame {
+            Frame::Session { id, spec, handed } => {
+                let r = take_session(harness.as_ref(), &id, *spec, handed, fds).await;
+                if r.is_ok() {
+                    sessions += 1;
+                }
+                (id, r)
+            }
+            Frame::Terminal { session, command, cols, rows, replay, pid } => {
+                let r = match fds.into_iter().next() {
+                    None => Err("its PTY didn't come with it".to_owned()),
+                    Some(fd) => {
+                        let replay = base64::engine::general_purpose::STANDARD.decode(replay.as_bytes()).unwrap_or_default();
+                        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+                        if tx.send(Bg::TakeTerminal { session: session.clone(), command, cols, rows, replay, fd, pid, done: done_tx }).await.is_err() {
+                            Err("this runner is stopping".to_owned())
+                        } else {
+                            done_rx.await.unwrap_or_else(|_| Err("this runner is stopping".to_owned()))
+                        }
+                    }
+                };
+                if r.is_ok() {
+                    terminals += 1;
+                }
+                (session, r)
+            }
+            Frame::Done => {
+                done = true;
+                let _ = tx.send(Bg::TookOver { sessions, terminals, refused }).await;
+                continue;
+            }
+            Frame::Promoted => {
+                let _ = tx.send(Bg::Promoted).await;
+                continue;
+            }
+            Frame::Forward { data } => {
+                if let Ok(d) = base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) {
+                    let _ = tx.send(Bg::Forwarded(d)).await;
+                }
+                continue;
+            }
+            Frame::Ready { .. } | Frame::Ack { .. } => continue,
+        };
+        if r.is_err() {
+            refused += 1;
+        }
+        let ack = Frame::Ack { id, ok: r.is_ok(), error: r.err() };
+        let c = Arc::clone(&conn);
+        crate::rt::blocking(move || c.send(&ack, &[])).await??;
+    }
+    Ok(())
+}
+
+/// (The new build's runner.) An agent session handed over: with its harness process, whose pipes
+/// came as `fds` (stdin, stdout, stderr); else started again from its record. When its process
+/// can't go on here it is stopped and the session starts again from its record (an error, saying so).
+#[cfg(unix)]
+async fn take_session(h: Option<&Arc<crate::harness::host::Host>>, id: &str, spec: crate::harness::session::Spec, handed: Option<Box<crate::harness::session::Handed>>, fds: Vec<std::os::fd::OwnedFd>) -> Result<(), String> {
+    use std::os::fd::IntoRawFd as _;
+    let Some(h) = h else { return Err("this runner runs no agent sessions".to_owned()) };
+    if h.get(id).is_some() {
+        return Ok(());
+    }
+    let Some(mut hd) = handed else {
+        return h.move_in(id.to_owned(), spec, None).map_err(|e| format!("{e:#}"));
+    };
+    let pid = hd.process.pid;
+    let mut fds = fds.into_iter();
+    let (Some(i), Some(o), Some(e)) = (fds.next(), fds.next(), fds.next()) else {
+        let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
+        let again = h.move_in(id.to_owned(), spec, None).map_err(|e| format!("{e:#}"));
+        return Err(format!("its pipes didn't come with it, so its process was stopped{}", again.err().map_or_else(|| ": it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))));
+    };
+    hd.process.stdin = i.into_raw_fd();
+    hd.process.stdout = o.into_raw_fd();
+    hd.process.stderr = e.into_raw_fd();
+    hd.process.foreign = true;
+    let raw = [hd.process.stdin, hd.process.stdout, hd.process.stderr];
+    match h.move_in(id.to_owned(), spec.clone(), Some(hd)) {
+        Ok(()) => Ok(()),
+        // Refused before its pipes were taken: they close, its process is stopped.
+        Err(e) => {
+            for r in raw {
+                drop(crate::os::reclaim_fd(r));
+            }
+            let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
+            let again = h.move_in(id.to_owned(), spec, None).map_err(|e| format!("{e:#}"));
+            Err(format!("{e:#}; its process was stopped{}", again.err().map_or_else(|| ", and it started again from its record".to_owned(), |e| format!(", and it couldn't start again: {e}"))))
+        }
+    }
 }
 
 /// Completes when the front door (if this runner has one) reports something new.
@@ -246,9 +647,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all(&own_dir);
     crate::updates::clean_leftovers(&own_dir);
     let instance_id = o.instance.clone().unwrap_or_else(|| crate::upgrade::MAIN.to_owned());
-    let instance_hello = proto::InstanceHello {
+    // A new build started to take over from the runner being upgraded (blue/green): ranked oldest
+    // until it's promoted, so new work stays with that runner, which also keeps the machine's
+    // local sockets until everything is handed over.
+    let take_over_pending: Option<PathBuf> = if cfg!(unix) { std::env::var_os(crate::bluegreen::TAKE_OVER_ENV).map(PathBuf::from) } else { None };
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    let real_created_at = crate::upgrade::created_at(&o.state_dir, &instance_id);
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut instance_hello = proto::InstanceHello {
         id: instance_id.clone(),
-        created_at: crate::upgrade::created_at(&o.state_dir, &instance_id),
+        created_at: if take_over_pending.is_some() { -1 } else { real_created_at },
         pid: std::process::id(),
     };
     // The certificate names this agent (the server checks Hello against it); an approved join may
@@ -310,9 +718,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             });
-            match crate::reach::local::serve(handle.clone(), name.clone(), crate::reach::local::path(&name, &own_dir)) {
-                Ok(p) => crate::reach::local::set_socket(p.to_string_lossy().into_owned()),
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine"),
+            let path = crate::reach::local::path(&name, &o.state_dir);
+            if take_over_pending.is_some() {
+                crate::reach::local::set_socket(path.to_string_lossy().into_owned());
+            } else {
+                match crate::reach::local::serve(handle.clone(), name.clone(), path) {
+                    Ok(p) => crate::reach::local::set_socket(p.to_string_lossy().into_owned()),
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine"),
+                }
             }
             Some(handle)
         }
@@ -351,17 +764,47 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
     let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
+    // Blue/green: this runner's upgrade under way (it is the old one), its steps' results, and (it is
+    // the new one) the runner it takes over from.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    let (bg_tx, bg_rx) = async_channel::unbounded::<Bg>();
+    #[cfg(unix)]
+    let mut moving: Option<Moving> = None;
+    #[cfg(unix)]
+    let mut take_over: Option<PathBuf> = take_over_pending.clone();
+    // Handed everything to the new build: it retires once its own jobs (and any terminal that
+    // couldn't go) end, `retire_at` at the soonest. What it handed over, and where the server's
+    // frames about those go meanwhile.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut retiring = false;
+    let mut retire_at: Option<Instant> = None;
+    let mut retire_span: Option<tracing::Span> = None;
+    let mut retire_job: Option<String> = None;
+    #[cfg(unix)]
+    let mut moved: std::collections::HashSet<crate::instances::Owned> = std::collections::HashSet::new();
+    #[cfg(unix)]
+    let mut forward: Option<async_channel::Sender<Vec<u8>>> = None;
+    // The local sockets (`kiln spawn`, `kiln run`) are the machine's: a new build taking over
+    // serves them once it holds the sessions.
+    #[cfg(unix)]
+    let mut sockets_served = take_over_pending.is_none();
     let harness = (!o.ephemeral && o.terminal).then(|| {
         let h = crate::harness::host::Host::new(harness_tx.clone(), Some(own_dir.join("harness.json")), Default::default());
         h.restore();
         h
     });
     // What `kiln spawn` in this machine's terminals talks to.
-    let harness_sock = harness.as_ref().and_then(|h| match crate::harness::socket::serve(h, crate::harness::socket::path(&name, &own_dir)) {
-        Ok(p) => Some(p.to_string_lossy().into_owned()),
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
-            None
+    let harness_sock = harness.as_ref().and_then(|h| {
+        let path = crate::harness::socket::path(&name, &o.state_dir);
+        if take_over_pending.is_some() {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        match crate::harness::socket::serve(h, path) {
+            Ok(p) => Some(p.to_string_lossy().into_owned()),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
+                None
+            }
         }
     });
     // Sessions moving here: taken over by this machine's session host (none: refused, saying why).
@@ -424,6 +867,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         if draining && jobs.is_empty() && o.ephemeral {
             return Ok(());
         }
+        if retiring && jobs.is_empty() && terms.is_empty() && retire_at.is_some_and(|t| Instant::now() >= t) {
+            tracing::info!("handed everything to the new build, and its own jobs are done: this runner retires");
+            if let Some(job) = retire_job.take() {
+                uplink.msg(AgentMsg::UpgradeLog { job, line: "the old runner's last jobs are done: it retired".to_owned() }).await;
+                crate::rt::sleep(Duration::from_millis(300)).await;
+            }
+            if let Some(sp) = retire_span.take() {
+                sp.record("result", "ok");
+            }
+            return Ok(());
+        }
         let ev = futures::select_biased! {
             () = shutdown.cancelled().fuse() => Ev::Shutdown,
             ev = events.recv().fuse() => Ev::Net(ev.ok()),
@@ -436,6 +890,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok((s, u)) => Ev::Harness(s, u), Err(_) => Ev::Watchdog },
             () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
+            b = bg_rx.recv().fuse() => match b {
+                #[cfg(unix)]
+                Ok(Bg::Forwarded(data)) => Ev::Forwarded(data),
+                Ok(b) => Ev::Bg(b),
+                Err(_) => Ev::Watchdog,
+            },
+            () = sleep_until_opt(retire_at.filter(|_| retiring && jobs.is_empty() && terms.is_empty())).fuse() => Ev::Watchdog,
         };
         match ev {
             Ev::Shutdown => {
@@ -443,6 +904,302 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     r.cancel.cancel();
                 }
                 return Ok(());
+            }
+            #[cfg(not(unix))]
+            Ev::Bg(b) => match b {},
+            #[cfg(unix)]
+            Ev::Bg(b) => {
+                use crate::bluegreen::Frame;
+                use std::os::fd::AsRawFd as _;
+                let empty = tracing::field::Empty;
+                match b {
+                    Bg::Fetched { job, exe, build } => {
+                        let root = tracing::info_span!(target: "kiln::upgrade", "upgrade", runner = %name, from = %crate::updates::own_build(), to = %build, upgrade_id = %job, result = empty, error = empty);
+                        let start = tracing::info_span!(target: "kiln::upgrade", parent: &root, "upgrade.start", result = empty, error = empty);
+                        // The new build runs as another instance of this machine, newer than this one.
+                        let gid = crate::util::new_id();
+                        let idir = crate::upgrade::instance_dir(&o.state_dir, &gid);
+                        let created_at = crate::util::now_unix().max(crate::upgrade::created_at(&o.state_dir, &instance_id) + 1);
+                        let rec = crate::upgrade::InstanceRecord { id: gid.clone(), created_at };
+                        let sock = crate::bluegreen::handover_path(&own_dir);
+                        let args = with_instance(&std::env::args().skip(1).collect::<Vec<_>>(), &gid);
+                        let env = vec![(crate::bluegreen::TAKE_OVER_ENV.to_owned(), sock.display().to_string()), ("KILN_UPGRADE_ID".to_owned(), job.clone())];
+                        let started: anyhow::Result<(crate::bluegreen::Green, crate::bluegreen::Listener)> = async {
+                            std::fs::create_dir_all(&idir)?;
+                            crate::util::write_secret(&idir.join("instance.json"), &serde_json::to_vec_pretty(&rec)?, 0o644)?;
+                            let listener = crate::bluegreen::Listener::bind(&sock)?;
+                            let sup = crate::bluegreen::Supervisor::from_env().context("this runner's supervisor can't start a new build beside it")?;
+                            let green = crate::rt::blocking(move || sup.start(&exe, &args, &env)).await??;
+                            Ok((green, listener))
+                        }
+                        .await;
+                        match started {
+                            Ok((green, listener)) => {
+                                start.record("result", "ok");
+                                drop(start);
+                                let healthy = tracing::info_span!(target: "kiln::upgrade", parent: &root, "upgrade.healthy", result = empty, error = empty);
+                                let line = format!("started the new build beside this runner (pid {}); it has {} s to connect to the server", green.pid, crate::bluegreen::READY_WITHIN.as_secs());
+                                uplink.msg(AgentMsg::UpgradeLog { job: job.clone(), line }).await;
+                                let (tx, j) = (bg_tx.clone(), job.clone());
+                                let waited = std::thread::Builder::new().name("kiln-upgrade".into()).spawn(move || {
+                                    let _ = match listener.ready(green.pid, Instant::now() + crate::bluegreen::READY_WITHIN) {
+                                        Ok((conn, _)) => tx.send_blocking(Bg::Ready { job: j, conn: Arc::new(conn) }),
+                                        Err(e) => tx.send_blocking(Bg::Failed { job: j, why: format!("{e:#}") }),
+                                    };
+                                });
+                                moving = Some(Moving { green, instance: gid, root, healthy: Some(healthy), handing: false, items: Vec::new(), held: Vec::new() });
+                                if let Err(e) = waited {
+                                    let _ = bg_tx.try_send(Bg::Failed { job, why: format!("couldn't wait for the new build: {e}") });
+                                }
+                            }
+                            Err(e) => {
+                                let why = format!("{e:#}");
+                                start.record("result", "failed");
+                                start.record("error", why.as_str());
+                                root.record("result", "failed");
+                                root.record("error", why.as_str());
+                                let _ = std::fs::remove_dir_all(&idir);
+                                tracing::warn!(%job, error = %why, "couldn't start the new build beside this runner");
+                                uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("couldn't start the new build beside this runner: {why}")) }).await;
+                            }
+                        }
+                    }
+                    Bg::Ready { job, conn } => {
+                        let Some(mv) = moving.as_mut() else { continue };
+                        if let Some(h) = mv.healthy.take() {
+                            h.record("result", "ok");
+                        }
+                        mv.handing = true;
+                        let mut frames: Vec<(Frame, Vec<std::os::fd::RawFd>)> = Vec::new();
+                        let ids: Vec<String> = terms.keys().cloned().collect();
+                        for id in ids {
+                            let Some((pty, state)) = terms.remove(&id) else { continue };
+                            match pty.hand_off() {
+                                Ok((fd, pid)) => {
+                                    use base64::Engine as _;
+                                    let info = state.info();
+                                    let a = state.attach();
+                                    state.detach();
+                                    let replay = base64::engine::general_purpose::STANDARD.encode(&a.replay);
+                                    frames.push((Frame::Terminal { session: id.clone(), command: state.command.clone(), cols: info.cols, rows: info.rows, replay, pid }, vec![fd.as_raw_fd()]));
+                                    moved.insert(crate::instances::Owned::Terminal(id.clone()));
+                                    mv.items.push(Item::Terminal { session: id, state, fd, pid });
+                                }
+                                // It can't go over: it stays here, and this runner with it until it ends.
+                                Err(pty) => {
+                                    tracing::warn!(session = %id, "a terminal couldn't be handed to the new build; it stays with this runner");
+                                    terms.insert(id, (pty, state));
+                                }
+                            }
+                        }
+                        if let Some(h) = &harness {
+                            for (id, spec, handed) in h.move_out().await {
+                                let mut handed = handed;
+                                let kept = match handed.as_ref() {
+                                    Some(hd) => match keep_pipes(&hd.process) {
+                                        Some(pipes) => serde_json::to_vec(hd).ok().map(|json| (json, pipes)),
+                                        None => None,
+                                    },
+                                    None => None,
+                                };
+                                // Not handed over running after all: stopped, it starts again from its record there.
+                                if kept.is_none()
+                                    && let Some(hd) = handed.take()
+                                {
+                                    let pid = hd.process.pid;
+                                    let _ = crate::rt::blocking(move || crate::harness::host::stop_process(pid)).await;
+                                }
+                                let fds = kept.as_ref().map(|(_, p)| p.iter().map(|f| f.as_raw_fd()).collect()).unwrap_or_default();
+                                frames.push((Frame::Session { id: id.clone(), spec: Box::new(spec.clone()), handed }, fds));
+                                moved.insert(crate::instances::Owned::Agent(id.clone()));
+                                mv.items.push(Item::Session { id, spec: Box::new(spec), kept });
+                            }
+                        }
+                        let (sessions, terminals) = (mv.items.iter().filter(|i| matches!(i, Item::Session { .. })).count(), mv.items.iter().filter(|i| matches!(i, Item::Terminal { .. })).count());
+                        let line = format!("the new build is connected to the server: handing it {sessions} agent session(s) and {terminals} terminal(s), their processes running on");
+                        uplink.msg(AgentMsg::UpgradeLog { job: job.clone(), line }).await;
+                        let tx = bg_tx.clone();
+                        let sent = std::thread::Builder::new().name("kiln-handover".into()).spawn(move || {
+                            let mut acks = Vec::with_capacity(frames.len());
+                            let mut broke: Option<String> = None;
+                            for (f, fds) in &frames {
+                                if broke.is_some() {
+                                    acks.push(Ack::Skipped);
+                                    continue;
+                                }
+                                match conn.send(f, fds).and_then(|()| conn.recv()) {
+                                    Ok((Frame::Ack { ok: true, .. }, _)) => acks.push(Ack::Taken),
+                                    Ok((Frame::Ack { error, .. }, _)) => acks.push(Ack::Refused(error.unwrap_or_else(|| "refused".to_owned()))),
+                                    Ok(_) => {
+                                        broke = Some("the new build answered out of turn".to_owned());
+                                        acks.push(Ack::Lost("an answer out of turn".to_owned()));
+                                    }
+                                    Err(e) => {
+                                        let e = format!("{e:#}");
+                                        acks.push(Ack::Lost(e.clone()));
+                                        broke = Some(e);
+                                    }
+                                }
+                            }
+                            if broke.is_none()
+                                && let Err(e) = conn.send(&Frame::Done, &[])
+                            {
+                                broke = Some(format!("{e:#}"));
+                            }
+                            let _ = tx.send_blocking(Bg::Moved { job, conn, acks, broke });
+                        });
+                        if let Err(e) = sent {
+                            tracing::error!(error = %e, "couldn't hand over to the new build");
+                        }
+                    }
+                    Bg::Moved { job, conn, acks, broke } => {
+                        let Some(mut mv) = moving.take() else { continue };
+                        for (item, ack) in mv.items.iter().zip(&acks) {
+                            let sp = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.move", what = item.what(), id = %item.id(), result = empty, error = empty);
+                            match ack {
+                                Ack::Taken => sp.record("result", "ok"),
+                                Ack::Skipped => sp.record("result", "skipped"),
+                                Ack::Refused(e) | Ack::Lost(e) => sp.record("result", "failed").record("error", e.as_str()),
+                            };
+                        }
+                        let promoted = match &broke {
+                            Some(e) => Err(format!("the handover broke off: {e}")),
+                            None => match crate::bluegreen::Supervisor::from_env() {
+                                Some(sup) => {
+                                    let green = mv.green;
+                                    crate::rt::blocking(move || sup.promote(green)).await.map_err(|e| format!("{e:#}")).and_then(|r| r.map_err(|e| format!("couldn't promote it: {e:#}")))
+                                }
+                                None => Err("this runner's supervisor is gone".to_owned()),
+                            },
+                        };
+                        match promoted {
+                            Ok(()) => {
+                                let mut said = Vec::new();
+                                let (mut sessions, mut terminals) = (0usize, 0usize);
+                                for (item, ack) in std::mem::take(&mut mv.items).into_iter().zip(acks) {
+                                    match (item, ack) {
+                                        (Item::Session { .. }, Ack::Taken) => sessions += 1,
+                                        (Item::Terminal { .. }, Ack::Taken) => terminals += 1,
+                                        // The new build started it again from its record.
+                                        (Item::Session { id, .. }, Ack::Refused(e) | Ack::Lost(e)) => said.push(format!("agent session {id} started again from its record there: {e}")),
+                                        // Back here: it ends with this runner (which waits for it).
+                                        (Item::Terminal { session, state, fd, pid }, ack) => {
+                                            moved.remove(&crate::instances::Owned::Terminal(session.clone()));
+                                            let why = match ack {
+                                                Ack::Refused(e) | Ack::Lost(e) => e,
+                                                _ => "not sent".to_owned(),
+                                            };
+                                            if take_terminal_back(&mut terms, &term_tx, session.clone(), state, fd, pid) {
+                                                said.push(format!("terminal {session} stays with this runner (it couldn't go: {why}); this runner ends with it"));
+                                            }
+                                        }
+                                        (Item::Session { .. }, Ack::Skipped) => {}
+                                    }
+                                }
+                                // What reached this runner meanwhile, then whatever still does, goes to the new build.
+                                let (ftx, frx) = async_channel::unbounded::<Vec<u8>>();
+                                for d in std::mem::take(&mut mv.held) {
+                                    let _ = ftx.try_send(d);
+                                }
+                                let c = Arc::clone(&conn);
+                                let fwd = std::thread::Builder::new().name("kiln-forward".into()).spawn(move || {
+                                    use base64::Engine as _;
+                                    // It is the runner now: it says so to the server, which sends it new work.
+                                    if c.send(&Frame::Promoted, &[]).is_err() {
+                                        return;
+                                    }
+                                    while let Ok(d) = frx.recv_blocking() {
+                                        let data = base64::engine::general_purpose::STANDARD.encode(&d);
+                                        if c.send(&Frame::Forward { data }, &[]).is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                                if fwd.is_ok() {
+                                    forward = Some(ftx);
+                                }
+                                for line in said {
+                                    uplink.msg(AgentMsg::UpgradeLog { job: job.clone(), line }).await;
+                                }
+                                let left = jobs.len();
+                                let line = format!("handed to the new build: {sessions} agent session(s) and {terminals} terminal(s), their processes still running; {}", if left == 0 { "this runner retires".to_owned() } else { format!("this runner finishes its {left} job(s), then retires") });
+                                uplink.msg(AgentMsg::UpgradeLog { job: job.clone(), line }).await;
+                                uplink.msg(AgentMsg::UpgradeDone { job: job.clone(), ok: true, error: None }).await;
+                                mv.root.record("result", "ok");
+                                retire_span = Some(tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.retire", jobs = left, result = empty, error = empty));
+                                tracing::info!(%job, sessions, terminals, jobs = left, "handed over to the new build; this runner retires once its jobs end");
+                                retiring = true;
+                                // No new jobs here: this runner finishes its own, then retires.
+                                draining = true;
+                                retire_at = Some(Instant::now() + RETIRE_QUIET);
+                                retire_job = Some(job);
+                            }
+                            Err(why) => {
+                                let mut held_back = std::mem::take(&mut mv.held);
+                                let problems = roll_back(mv, &acks, &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                                moved.clear();
+                                draining = false;
+                                serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                                announce(term_list(&terms), harness.as_ref(), &uplink).await;
+                                for d in held_back.drain(..) {
+                                    let _ = bg_tx.try_send(Bg::Forwarded(d));
+                                }
+                                let mut error = format!("the new build didn't take over ({why}): it was stopped, and this runner goes on with everything");
+                                if !problems.is_empty() {
+                                    error.push_str(&format!("; but these couldn't come back: {}", problems.join("; ")));
+                                }
+                                tracing::warn!(%job, %error, "blue/green upgrade rolled back");
+                                uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(error) }).await;
+                            }
+                        }
+                    }
+                    Bg::Failed { job, why } => {
+                        if let Some(mut mv) = moving.take() {
+                            if let Some(h) = mv.healthy.take() {
+                                h.record("result", "failed");
+                                h.record("error", why.as_str());
+                            }
+                            let held_back = std::mem::take(&mut mv.held);
+                            let _ = roll_back(mv, &[], &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                            for d in held_back {
+                                let _ = bg_tx.try_send(Bg::Forwarded(d));
+                            }
+                        }
+                        moved.clear();
+                        draining = false;
+                        tracing::warn!(%job, error = %why, "the new build didn't come up; this runner goes on");
+                        uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("the new build didn't come up ({why}): it was stopped, and this runner goes on as it was")) }).await;
+                    }
+                    Bg::TakeTerminal { session, command, cols, rows, replay, fd, pid, done } => {
+                        let state = crate::termsess::Session::detached(session.clone(), "agent".into(), command, cols, rows);
+                        state.output(&replay);
+                        let r = if take_terminal_back(&mut terms, &term_tx, session, state, fd, pid) { Ok(()) } else { Err("its PTY didn't come through".to_owned()) };
+                        let _ = done.send(r);
+                    }
+                    Bg::TookOver { sessions, terminals, refused } => {
+                        tracing::info!(sessions, terminals, refused, "took over from the runner being upgraded");
+                        // The server learns they run here now.
+                        announce(term_list(&terms), harness.as_ref(), &uplink).await;
+                        if !std::mem::replace(&mut sockets_served, true) {
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                        }
+                    }
+                    Bg::TakeOverEnded => {
+                        if !std::mem::replace(&mut sockets_served, true) {
+                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &o.state_dir);
+                        }
+                    }
+                    Bg::Promoted => {
+                        // Joined ranked oldest (new work stayed with the old runner): the newest now.
+                        tracing::info!("promoted: this runner is the machine's newest; new work comes here");
+                        instance_hello.created_at = real_created_at;
+                        draining = false;
+                        uplink.msg(AgentMsg::Instance(instance_hello.clone())).await;
+                    }
+                    // Turned into Ev::Forwarded as it's received.
+                    Bg::Forwarded(_) => {}
+                }
             }
             Ev::Redial => {
                 redial = None;
@@ -606,7 +1363,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 redial = Some(if at_once { now } else { now + crate::sup::jitter(dial_backoff) });
                 dial_backoff = (dial_backoff * 2).min(Duration::from_secs(30));
             }
-            Ev::Net(Some(NetEvent::Frame { data, .. })) => {
+            Ev::Net(Some(NetEvent::Frame { data, .. })) | Ev::Forwarded(data) => {
                 let msg: ServerMsg = match proto::decode(&data) {
                     Ok(m) => m,
                     Err(e) => {
@@ -614,9 +1371,30 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         continue;
                     }
                 };
+                // About something handed to the new build (blue/green), or new while this runner
+                // hands everything over or retires: it goes there.
+                #[cfg(unix)]
+                let opens = matches!(msg, ServerMsg::TermOpen { .. } | ServerMsg::HarnessOpen { .. }) && (retiring || moving.as_ref().is_some_and(|m| m.handing));
+                #[cfg(unix)]
+                if let Some(what) = crate::instances::Owned::of(&msg).filter(|w| moved.contains(w) || opens) {
+                    moved.insert(what.clone());
+                    match (&forward, moving.as_mut()) {
+                        (Some(f), _) => {
+                            let _ = f.try_send(data);
+                        }
+                        (None, Some(mv)) => mv.held.push(data),
+                        (None, None) => tracing::debug!(?what, "a frame about something handed over, with nowhere to go"),
+                    }
+                    continue;
+                }
                 match msg {
                     ServerMsg::Welcome { server_version, sample_seconds } => {
                         tracing::info!(%server_version, "server welcomed agent");
+                        // Drained or not is the server's to say again on each connection (it sends
+                        // Drain next when this one isn't the machine's newest).
+                        if !o.ephemeral && !retiring {
+                            draining = false;
+                        }
                         if o.instance.is_some() {
                             // `kiln install --agent --upgrade` waits for this.
                             let _ = std::fs::write(own_dir.join("connected"), crate::util::now_unix().to_string());
@@ -649,6 +1427,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             }
                         }
                         sample_tick = Interval::new(Duration::from_secs(u64::from(sample_seconds.max(1))));
+                        // A new build started to take over from the runner being upgraded (blue/green):
+                        // connected and welcomed, it says it's ready, and takes everything.
+                        #[cfg(unix)]
+                        if let Some(path) = take_over.take() {
+                            let (h, tx, me) = (harness.clone(), bg_tx.clone(), instance_id.clone());
+                            crate::rt::spawn(async move {
+                                if let Err(e) = take_over_from(path, h, tx.clone(), me).await {
+                                    tracing::warn!(error = %format!("{e:#}"), "couldn't take over from the runner being upgraded");
+                                }
+                                let _ = tx.send(Bg::TakeOverEnded).await;
+                            });
+                        }
                         // The server knows this runner now: reach may relay (its links resume).
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(true)).await;
@@ -887,6 +1677,29 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         tracing::info!(%job, "an upgrade refused: this machine's kiln config says [updates] accept = false");
                         let error = Some("this machine refuses upgrades: its kiln config says [updates] accept = false".to_owned());
                         uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error }).await;
+                    }
+                    #[cfg(unix)]
+                    ServerMsg::Upgrade { job, path, sha256, size } if moving.is_some() || retiring => {
+                        let _ = (path, sha256, size);
+                        let error = Some("this runner is already being upgraded".to_owned());
+                        uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error }).await;
+                    }
+                    #[cfg(unix)]
+                    ServerMsg::Upgrade { job, path, sha256, size } if !o.ephemeral && crate::bluegreen::Supervisor::from_env().is_some() => {
+                        // Blue/green: the new build is fetched beside this one and started next to
+                        // it by the supervisor; this runner goes on until it's ready.
+                        tracing::info!(%job, %path, "upgrading this runner: blue/green");
+                        let up = Uplink(uplink.0.clone());
+                        let (http, server_url, state, tx) = (Arc::clone(&http), o.server_url.clone(), o.state_dir.clone(), bg_tx.clone());
+                        crate::rt::spawn(async move {
+                            let order = crate::updates::Order { job: &job, path: &path, sha256: &sha256, size };
+                            match crate::updates::fetch_build(&http, &server_url, &order, &state, &up).await {
+                                Ok((exe, build)) => {
+                                    let _ = tx.send(Bg::Fetched { job, exe, build }).await;
+                                }
+                                Err(e) => up.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("{e:#}")) }).await,
+                            }
+                        });
                     }
                     ServerMsg::UpdateAvailable { commit, build, from } => {
                         if noticed.as_deref() != Some(commit.as_str()) {
@@ -1173,6 +1986,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
             }
             Ev::Done(r) => {
+                if retiring {
+                    retire_at = Some(Instant::now() + Duration::from_secs(5)).max(retire_at);
+                }
                 if jobs.remove(&r.job).is_some() {
                     tracing::info!(job = %r.job, status = r.status.as_str(), "job finished");
                     if jobs.is_empty() {
@@ -1187,7 +2003,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::Heartbeat => {
                 if connected {
-                    let free = if upgrade_pending { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
+                    let free = if upgrade_pending || retiring { 0 } else { o.slots.saturating_sub(u32::try_from(jobs.len()).unwrap_or(0)) };
                     uplink.msg(AgentMsg::Heartbeat { free_slots: free, running: jobs.keys().cloned().collect() }).await;
                     // Its machine's say on upgrades, read again: a change goes to the server at once.
                     if !o.ephemeral && !o.outpost {
@@ -1464,6 +2280,16 @@ mod tests {
             Ok(Update::Events { events }) => events,
             _ => Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_new_build_runs_as_an_instance_of_its_own() {
+        let args = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(with_instance(&args(&["agent", "--config", "/c.toml"]), "g1"), args(&["agent", "--config", "/c.toml", "--instance", "g1"]));
+        // An instance's own runner (upgraded before) gives way to the new one, in either spelling.
+        assert_eq!(with_instance(&args(&["agent", "--instance", "old", "--slots", "2"]), "g2"), args(&["agent", "--slots", "2", "--instance", "g2"]));
+        assert_eq!(with_instance(&args(&["agent", "--instance=old"]), "g3"), args(&["agent", "--instance", "g3"]));
     }
 
     #[test]

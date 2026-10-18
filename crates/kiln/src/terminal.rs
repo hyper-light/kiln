@@ -29,6 +29,10 @@ pub struct PtySession {
 pub struct Handover {
     pub fd: i32,
     pub pid: u32,
+    /// The shell is another process's child (handed over by another runner of this machine,
+    /// blue/green), not this one's: its exit is watched, not reaped.
+    #[serde(default)]
+    pub foreign: bool,
 }
 
 /// The shell for terminals: the configured one, else `$SHELL`, bash or sh on Unix; PowerShell 7,
@@ -179,7 +183,7 @@ pub fn adopt(h: Handover) -> Option<(PtySession, async_channel::Receiver<PtyOut>
         input: in_tx,
         master: None,
         killer: None,
-        handle: Some(crate::os::pty::adopt(crate::os::reclaim_fd(h.fd)?, h.pid, tx, in_rx)),
+        handle: Some(crate::os::pty::adopt(crate::os::reclaim_fd(h.fd)?, h.pid, h.foreign, tx, in_rx)),
         pid: Some(h.pid),
     };
     crate::metrics::global().terminal_sessions.add(1);
@@ -212,7 +216,24 @@ impl PtySession {
         if !crate::os::IN_PLACE_UPGRADE || h.keep_across_exec().is_err() {
             return None;
         }
-        Some(Handover { fd: h.raw_fd(), pid: h.pid() })
+        Some(Handover { fd: h.raw_fd(), pid: h.pid(), foreign: false })
+    }
+
+    /// Let this session go to another runner process of this machine (a blue/green upgrade): its
+    /// shell keeps running, nothing more is read here, and this side lets go of it without
+    /// hanging it up. A copy of its master for the other process, and the shell's pid; `None`
+    /// (the session is left as it is) where it can't be.
+    #[cfg(unix)]
+    pub fn hand_off(mut self) -> Result<(std::os::fd::OwnedFd, u32), Self> {
+        let Some(h) = self.handle.as_ref() else { return Err(self) };
+        let Ok(fd) = h.hand_off() else { return Err(self) };
+        let pid = h.pid();
+        // Neither killed nor hung up when this side is dropped.
+        self.handle = None;
+        if let Some(k) = self.killer.take() {
+            std::mem::forget(k);
+        }
+        Ok((fd, pid))
     }
 }
 

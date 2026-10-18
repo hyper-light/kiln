@@ -155,6 +155,52 @@ pub fn detach(args: &[String], state_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the supervisor runs as its child: a binary and its arguments.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ChildCmd {
+    exe: PathBuf,
+    args: Vec<String>,
+}
+
+/// A new build started beside the child for a blue/green upgrade (`crate::bluegreen`): it becomes
+/// the child once promoted and the old one has ended.
+struct Candidate {
+    pid: u32,
+    control: ChildControl,
+    exited: oneshot::Receiver<String>,
+    cmd: ChildCmd,
+    promoted: bool,
+}
+
+fn key_of(args: &[String]) -> String {
+    let key = crate::util::sha256_hex(args.join(" ").as_bytes());
+    key.get(..12).unwrap_or("x").to_owned()
+}
+
+/// Where the build a runner was last promoted to is kept: started again after this supervisor is.
+fn current_path(state_dir: &Path, args: &[String]) -> PathBuf {
+    state_dir.join(format!("supervise-{}.json", key_of(args)))
+}
+
+/// Where the child asks this supervisor to start, promote or stop a new build: in the user's
+/// runtime directory (Unix socket paths are short), named after the state directory and child.
+pub fn control_path(state_dir: &Path, args: &[String]) -> PathBuf {
+    let tag = crate::util::sha256_hex(format!("{}\n{}", state_dir.display(), args.join(" ")).as_bytes());
+    crate::harness::socket::runtime_path(&format!("supervise-{}.sock", tag.get(..16).unwrap_or("0")))
+}
+
+fn spawn_cmd(c: &ChildCmd, generation: u64, control: Option<&Path>, env: &[(String, String)]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&c.exe);
+    cmd.args(&c.args).env("KILN_SUPERVISED", "1").env("KILN_GENERATION", generation.to_string()).env_remove("KILN_SUPERVISE_CHILD");
+    if let Some(p) = control {
+        cmd.env(crate::bluegreen::SUPERVISOR_ENV, p);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 pub async fn run(opts: Options) -> anyhow::Result<()> {
     let Some(_lock) = single_instance(&opts.state_dir, &opts.args)? else {
         tracing::info!(args = ?opts.args, "already running under another supervisor; nothing to do");
@@ -170,6 +216,18 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         let (pid, generation) = v.split_once(':')?;
         Some((pid.parse().ok()?, generation.parse().ok()?))
     });
+    // The child it runs: its own binary, or the build a runner was last promoted to.
+    let own = ChildCmd { exe: exe.clone(), args: opts.args.clone() };
+    let saved = current_path(&opts.state_dir, &opts.args);
+    let mut current = std::fs::read(&saved).ok().and_then(|b| serde_json::from_slice::<ChildCmd>(&b).ok()).filter(|c| c.exe.is_file()).unwrap_or_else(|| own.clone());
+    let control_at = control_path(&opts.state_dir, &opts.args);
+    let ctl = control::listen(&control_at).map_err(|e| tracing::warn!(error = %format!("{e:#}"), "no control socket: upgrades of the child aren't blue/green")).ok();
+    let ctl_path = ctl.as_ref().map(|_| control_at.as_path());
+    let mut candidate: Option<Candidate> = None;
+    // When a promoted build that died was last started again, and how many times in a row the
+    // build the child was promoted to ended soon after it started.
+    let mut respawned: Option<Instant> = None;
+    let mut quick_ends = 0u32;
 
     loop {
         generation += 1;
@@ -183,24 +241,25 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             tracing::info!(generation, pid, "supervising the child carried over from the previous binary");
             (spawn_pid_waiter(pid), control)
         } else {
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.args(&opts.args)
-                .env("KILN_SUPERVISED", "1")
-                .env("KILN_GENERATION", generation.to_string())
-                .env_remove("KILN_SUPERVISE_CHILD");
+            let mut cmd = spawn_cmd(&current, generation, ctl_path, &[]);
             match ChildControl::spawn(&mut cmd) {
                 Ok((child, control)) => (spawn_waiter(child), control),
                 Err(e) => {
-                    tracing::error!(error = %e, exe = %exe.display(), "spawn failed");
+                    tracing::error!(error = %e, exe = %current.exe.display(), "spawn failed");
                     crash_log(&opts.state_dir, &format!("spawn failed: {e}"));
+                    // A promoted build that can't start: back to this supervisor's own.
+                    if current != own {
+                        current = own.clone();
+                        let _ = std::fs::remove_file(&saved);
+                    }
                     crate::rt::sleep(crate::sup::jitter(backoff)).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                     continue;
                 }
             }
         };
-        tracing::info!(generation, pid = ?control.pid(), "child started");
-        let started = Instant::now();
+        tracing::info!(generation, pid = ?control.pid(), exe = %current.exe.display(), "child started");
+        let mut started = Instant::now();
         let mut upgrade_check = Interval::new(Duration::from_secs(10));
         // Since when the child has run a binary that isn't the one on disk, and whether that was said.
         let mut stale_since: Option<Instant> = None;
@@ -215,21 +274,83 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             Exited(String),
             Signal(Option<i32>),
             UpgradeCheck,
+            CandidateExited(String),
+            Control(Option<control::Stream>),
         }
         let exit = loop {
             let ev = futures::select_biased! {
                 st = (&mut exited).fuse() => Ev::Exited(st.unwrap_or_else(|_| "waiter lost".to_owned())),
                 sig = signals.next().fuse() => Ev::Signal(sig),
+                st = candidate_exit(&mut candidate).fuse() => Ev::CandidateExited(st),
+                c = control::accept(ctl.as_ref()).fuse() => Ev::Control(c),
                 () = upgrade_check.tick().fuse() => Ev::UpgradeCheck,
             };
             match ev {
-                Ev::Exited(status) => break Exit::Child(status),
+                Ev::Exited(status) => {
+                    // The old runner ended after handing everything to the new build: it is the
+                    // child from now on.
+                    if candidate.as_ref().is_some_and(|c| c.promoted)
+                        && let Some(c) = candidate.take()
+                    {
+                        tracing::info!(pid = c.pid, %status, "the old runner ended; the new build is the runner now");
+                        control = c.control;
+                        exited = c.exited;
+                        current = c.cmd;
+                        started = Instant::now();
+                        stale_since = None;
+                        continue;
+                    }
+                    // It ended mid-upgrade: the new build, not ready, goes too.
+                    if let Some(mut c) = candidate.take() {
+                        tracing::warn!(pid = c.pid, "the runner ended before its new build took over: stopping that");
+                        stop_child(&mut c.exited, &mut c.control).await;
+                    }
+                    break Exit::Child(status);
+                }
+                Ev::CandidateExited(status) => {
+                    if let Some(c) = candidate.take() {
+                        let msg = format!("the new build's runner (pid {}) exited ({status}){}", c.pid, if c.promoted { " after it took over" } else { " before it took over" });
+                        tracing::warn!("{msg}");
+                        crash_log(&opts.state_dir, &msg);
+                        // Promoted, it holds the machine's sessions: started again at once (it
+                        // takes them up from its own records), unless it already was within the
+                        // minute. Then it is started once the old runner ends, as the child.
+                        if c.promoted {
+                            let again = respawned.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60));
+                            match again.then(|| ChildControl::spawn(&mut spawn_cmd(&c.cmd, generation, ctl_path, &[]))) {
+                                Some(Ok((child, control))) => {
+                                    respawned = Some(Instant::now());
+                                    let pid = child.id();
+                                    tracing::info!(pid, "the promoted build started again");
+                                    candidate = Some(Candidate { pid, control, exited: spawn_waiter(child), cmd: c.cmd, promoted: true });
+                                }
+                                other => {
+                                    if let Some(Err(e)) = other {
+                                        tracing::error!(error = %e, "the promoted build couldn't start again");
+                                    }
+                                    current = c.cmd;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ev::Control(Some(stream)) => {
+                    let req = stream.request().await;
+                    let answer = match req {
+                        Ok(r) => handle(r, &mut candidate, &saved, generation, ctl_path).await,
+                        Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }),
+                    };
+                    stream.answer(&answer).await;
+                }
+                Ev::Control(None) => {}
                 Ev::Signal(Some(crate::rt::SIGHUP)) => {
                     // HUP = reload: forward to the child, which re-reads its config.
                     control.reload();
                 }
                 Ev::Signal(Some(crate::rt::SIGINT)) => break Exit::Shutdown("interrupt"),
                 Ev::Signal(_) => break Exit::Shutdown("terminate"),
+                // Runs a promoted build (blue/green): its own binary changing on disk is nothing to it.
+                Ev::UpgradeCheck if current != own => {}
                 Ev::UpgradeCheck => {
                     if exe_mtime(&exe) != started_mtime && started.elapsed() > Duration::from_secs(5) {
                         if upgrades_itself(&opts.args)
@@ -274,6 +395,9 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
         match exit {
             Exit::Shutdown(sig) => {
                 tracing::info!(signal = sig, "shutdown requested; stopping child");
+                if let Some(mut c) = candidate.take() {
+                    stop_child(&mut c.exited, &mut c.control).await;
+                }
                 stop_child(&mut exited, &mut control).await;
                 return Ok(());
             }
@@ -286,6 +410,17 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
             Exit::Child(status) => {
                 if started.elapsed() >= HEALTHY {
                     backoff = MIN_BACKOFF;
+                    quick_ends = 0;
+                } else if current != own {
+                    quick_ends += 1;
+                    if quick_ends >= 3 {
+                        let msg = format!("the build the runner was upgraded to ({}) ended {quick_ends} times soon after it started: back to {}", current.exe.display(), own.exe.display());
+                        tracing::error!("{msg}");
+                        crash_log(&opts.state_dir, &msg);
+                        current = own.clone();
+                        let _ = std::fs::remove_file(&saved);
+                        quick_ends = 0;
+                    }
                 }
                 let msg = format!(
                     "generation {generation} exited ({status}) after {:?}; restarting in ~{:?}",
@@ -311,6 +446,182 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     }
 }
 
+/// The candidate's end, when there is one (never, else).
+async fn candidate_exit(c: &mut Option<Candidate>) -> String {
+    match c {
+        Some(c) => (&mut c.exited).await.unwrap_or_else(|_| "waiter lost".to_owned()),
+        None => std::future::pending().await,
+    }
+}
+
+/// What the child asks of its supervisor (`crate::bluegreen::Supervisor`).
+#[derive(serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum Request {
+    Start {
+        exe: PathBuf,
+        args: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+    },
+    Promote {
+        pid: u32,
+    },
+    Stop {
+        pid: u32,
+        /// At once (SIGKILL), not asked to shut down: a rollback.
+        #[serde(default)]
+        kill: bool,
+    },
+}
+
+async fn handle(r: Request, candidate: &mut Option<Candidate>, saved: &Path, generation: u64, ctl: Option<&Path>) -> serde_json::Value {
+    use serde_json::json;
+    match r {
+        Request::Start { exe, args, env } => {
+            if let Some(c) = candidate {
+                return json!({ "ok": false, "error": format!("a new build is already starting (pid {})", c.pid) });
+            }
+            let cmd = ChildCmd { exe, args };
+            let mut spawn = spawn_cmd(&cmd, generation, ctl, &env);
+            match ChildControl::spawn(&mut spawn) {
+                Ok((child, control)) => {
+                    let pid = child.id();
+                    tracing::info!(pid, exe = %cmd.exe.display(), "a new build started beside the runner");
+                    *candidate = Some(Candidate { pid, control, exited: spawn_waiter(child), cmd, promoted: false });
+                    json!({ "ok": true, "pid": pid })
+                }
+                Err(e) => json!({ "ok": false, "error": format!("couldn't start {}: {e}", cmd.exe.display()) }),
+            }
+        }
+        Request::Promote { pid } => match candidate {
+            Some(c) if c.pid == pid => {
+                c.promoted = true;
+                let written = serde_json::to_vec(&c.cmd).map_err(std::io::Error::other).and_then(|b| crate::util::write_secret(saved, &b, 0o600));
+                if let Err(e) = written {
+                    tracing::warn!(error = %e, "couldn't remember the promoted build: a restart of the supervisor starts its own");
+                }
+                tracing::info!(pid, "the new build is promoted: it is the runner once the old one ends");
+                json!({ "ok": true })
+            }
+            _ => json!({ "ok": false, "error": format!("no new build with pid {pid}") }),
+        },
+        Request::Stop { pid, kill } => match candidate.take() {
+            Some(mut c) if c.pid == pid => {
+                if kill {
+                    c.control.kill().await;
+                    let _ = crate::rt::timeout(Duration::from_secs(5), &mut c.exited).await;
+                } else {
+                    stop_child(&mut c.exited, &mut c.control).await;
+                }
+                tracing::info!(pid, kill, "the new build was stopped: the runner goes on as it was");
+                json!({ "ok": true })
+            }
+            other => {
+                *candidate = other;
+                json!({ "ok": false, "error": format!("no new build with pid {pid}") })
+            }
+        },
+    }
+}
+
+/// The control socket (Unix only: elsewhere upgrades of the child aren't blue/green).
+mod control {
+    use std::path::Path;
+
+    #[cfg(unix)]
+    pub struct Listener(std::os::unix::net::UnixListener);
+    #[cfg(not(unix))]
+    pub struct Listener;
+
+    #[cfg(unix)]
+    pub struct Stream(std::os::unix::net::UnixStream);
+    #[cfg(not(unix))]
+    pub struct Stream;
+
+    #[cfg(unix)]
+    pub fn listen(path: &Path) -> anyhow::Result<Listener> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::remove_file(path);
+        let l = std::os::unix::net::UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        l.set_nonblocking(true)?;
+        Ok(Listener(l))
+    }
+
+    #[cfg(not(unix))]
+    pub fn listen(_path: &Path) -> anyhow::Result<Listener> {
+        anyhow::bail!("no Unix sockets here")
+    }
+
+    /// The next connection (`None` on a failed accept); never, without a listener.
+    #[cfg(unix)]
+    pub async fn accept(l: Option<&Listener>) -> Option<Stream> {
+        use std::os::fd::AsRawFd as _;
+        let Some(Listener(l)) = l else { return std::future::pending().await };
+        loop {
+            match l.accept() {
+                Ok((s, _)) => return Some(Stream(s)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if hyper_rt::readiness::readable(l.as_raw_fd()).await.is_err() {
+                        crate::rt::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "supervisor control accept failed");
+                    crate::rt::sleep(std::time::Duration::from_millis(500)).await;
+                    return None;
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub async fn accept(_l: Option<&Listener>) -> Option<Stream> {
+        std::future::pending().await
+    }
+
+    impl Stream {
+        /// Its one request: a JSON line.
+        #[cfg(unix)]
+        pub async fn request(&self) -> anyhow::Result<super::Request> {
+            let s = self.0.try_clone()?;
+            let line = crate::rt::blocking(move || -> anyhow::Result<String> {
+                use std::io::BufRead as _;
+                s.set_nonblocking(false)?;
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                let mut line = String::new();
+                std::io::BufReader::new(s).read_line(&mut line)?;
+                Ok(line)
+            })
+            .await??;
+            Ok(serde_json::from_str(&line)?)
+        }
+
+        #[cfg(not(unix))]
+        pub async fn request(&self) -> anyhow::Result<super::Request> {
+            anyhow::bail!("no Unix sockets here")
+        }
+
+        #[cfg(unix)]
+        pub async fn answer(self, v: &serde_json::Value) {
+            let mut line = v.to_string();
+            line.push('\n');
+            let _ = crate::rt::blocking(move || {
+                use std::io::Write as _;
+                let mut s = self.0;
+                let _ = s.set_nonblocking(false);
+                s.write_all(line.as_bytes())
+            })
+            .await;
+        }
+
+        #[cfg(not(unix))]
+        pub async fn answer(self, _v: &serde_json::Value) {}
+    }
+}
+
 async fn stop_child(exited: &mut oneshot::Receiver<String>, control: &mut ChildControl) {
     control.stop();
     if crate::rt::timeout(GRACE, &mut *exited).await.is_err() {
@@ -323,6 +634,39 @@ async fn stop_child(exited: &mut oneshot::Receiver<String>, control: &mut ChildC
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
+
+    #[test]
+    fn a_new_build_is_started_promoted_and_killed_as_the_runner_asks() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let saved = dir.path().join("supervise-x.json");
+            let mut candidate = None;
+            let ask = |json: &str| serde_json::from_str::<Request>(json).map_err(anyhow::Error::from);
+            let start = ask(r#"{"op":"start","exe":"/bin/sleep","args":["60"],"env":[["KILN_TAKE_OVER_FROM","/x.sock"]]}"#)?;
+            let v = handle(start, &mut candidate, &saved, 1, None).await;
+            let pid = v.get("pid").and_then(serde_json::Value::as_u64).and_then(|p| u32::try_from(p).ok()).context("no pid")?;
+            assert!(crate::os::pid_alive(pid));
+            // One at a time.
+            let again = handle(ask(r#"{"op":"start","exe":"/bin/sleep","args":["60"]}"#)?, &mut candidate, &saved, 1, None).await;
+            assert_eq!(again.get("ok"), Some(&serde_json::Value::Bool(false)));
+            // Only the process it started is promoted; that is remembered for the supervisor's next start.
+            let wrong = handle(ask(&format!(r#"{{"op":"promote","pid":{}}}"#, pid + 1))?, &mut candidate, &saved, 1, None).await;
+            assert_eq!(wrong.get("ok"), Some(&serde_json::Value::Bool(false)));
+            let ok = handle(ask(&format!(r#"{{"op":"promote","pid":{pid}}}"#))?, &mut candidate, &saved, 1, None).await;
+            assert_eq!(ok.get("ok"), Some(&serde_json::Value::Bool(true)));
+            let kept: ChildCmd = serde_json::from_slice(&std::fs::read(&saved)?)?;
+            assert_eq!(kept, ChildCmd { exe: "/bin/sleep".into(), args: vec!["60".into()] });
+            // A rollback kills it outright.
+            let stop = ask(&format!(r#"{{"op":"stop","pid":{pid},"kill":true}}"#))?;
+            assert!(matches!(stop, Request::Stop { kill: true, .. }));
+            let v = handle(stop, &mut candidate, &saved, 1, None).await;
+            assert_eq!(v.get("ok"), Some(&serde_json::Value::Bool(true)));
+            assert!(candidate.is_none() && !crate::os::pid_alive(pid));
+            assert!(matches!(ask(r#"{"op":"stop","pid":1}"#)?, Request::Stop { kill: false, .. }));
+            Ok(())
+        })
+    }
 
     #[test]
     fn a_child_still_on_a_replaced_binary_is_seen_and_so_is_what_runs_under_it() -> anyhow::Result<()> {

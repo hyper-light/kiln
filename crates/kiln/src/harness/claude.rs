@@ -3531,6 +3531,24 @@ pub fn preview(tool: &str, input: &Value, cwd: &str) -> Vec<FileDiff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_streaming_as_its_runner_is_upgraded_goes_over_whole() -> anyhow::Result<()> {
+        // Mid-reply its content blocks are kept by index: a map keyed by numbers, carried in a
+        // blue/green handover frame (`crate::bluegreen`).
+        let mut c = Claude::new(false);
+        c.streams.insert("msg_1".into(), Streamed { blocks: HashMap::from([(0, "e1".to_owned()), (2, "e2".to_owned())]), finals: 1 });
+        let process = crate::proc::Detached { pid: 1, stdin: 10, stdout: 11, stderr: 12, foreign: false };
+        let handed = crate::harness::session::Handed { kind: "claude".into(), process, core: crate::harness::core::Core::new().freeze(), adapter: crate::harness::kinds::Frozen::Claude(Box::new(c)), partial: String::new() };
+        let spec: crate::harness::session::Spec = serde_json::from_str(r#"{"kind":"claude"}"#)?;
+        let frame = crate::bluegreen::Frame::Session { id: "s".into(), spec: Box::new(spec), handed: Some(Box::new(handed)) };
+        let back: crate::bluegreen::Frame = serde_json::from_slice(&serde_json::to_vec(&frame)?)?;
+        let crate::bluegreen::Frame::Session { handed: Some(h), .. } = back else { anyhow::bail!("not a session") };
+        let crate::harness::kinds::Frozen::Claude(c) = h.adapter else { anyhow::bail!("not Claude Code's") };
+        assert_eq!(c.streams.get("msg_1").map(|s| s.blocks.len()), Some(2));
+        Ok(())
+    }
     use crate::harness::core::Update;
 
     /// Lines Claude Code 2.1.296 printed in a session against a scripted API (paths shortened).

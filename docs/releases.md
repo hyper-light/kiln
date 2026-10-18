@@ -66,6 +66,46 @@ A runner with no binary of the server's commit yet doesn't wait on another machi
 while its own platform's job is building, and otherwise a Mac or Linux machine with a kiln checkout
 builds the commit itself (a Mac's build is kept for the other Macs).
 
+## How a runner is upgraded: blue/green
+
+A runner under `kiln supervise` on Linux or macOS (how `kiln install --agent` runs one) is never
+replaced while it runs. The new build comes up beside it, and takes over only once it works:
+
+1. The runner downloads the new build, checks it, and keeps it in `<state>/versions/<build>/`.
+2. Its supervisor starts the new build beside it, as another process of the same machine. The new
+   build has 3 minutes to connect to the server and say it's ready. Until then it ranks as the
+   machine's oldest process, so new work still goes to the runner it replaces.
+3. Once it's ready, the runner hands it every agent session and terminal over a local socket.
+   Their processes keep running: pipes and PTYs are passed across, not reopened. A reply that was
+   streaming goes on, and background commands never stop. Whatever reaches the old runner
+   meanwhile (a message for an agent, keystrokes, a new session) goes on to the new build.
+4. The supervisor promotes the new build, and the server sends it new work from then on. The old
+   runner finishes the jobs it's running (jobs aren't moved yet), then exits. The supervisor keeps
+   the new build, and starts it again after a restart or reboot.
+
+If the new build doesn't come up, the runner goes on with everything, as it was, and the machine
+never goes offline. That covers a build that can't connect, crashes, or can't take over in time.
+The new build is killed, and the upgrade's log says why it failed. A new build that ends soon after
+it starts, three times in a row, is dropped: the supervisor goes back to the binary it was
+installed with.
+
+The upgrade's log (Settings → Updates, and the Runners page) follows each step: the download, the
+new build starting and connecting, what was handed over and what couldn't be, and the old runner
+retiring. While the old runner finishes its jobs, the machine lists both processes, and what still
+keeps the old one running.
+
+For tracing (OTel), each upgrade is a span under `kiln::upgrade` named `upgrade`. Its children are
+`upgrade.start`, `upgrade.healthy`, one `upgrade.move` per session or terminal,
+`upgrade.retire`, and `upgrade.rollback`. Each records `result` (`ok`, `failed`, `skipped`, or
+`rolled_back` on the root) and `error`.
+
+The machine's local sockets, for `kiln spawn` and `kiln run`, are the same for every runner process
+of a machine. Shells opened before an upgrade keep using them.
+
+Some runners still upgrade as before: those not under a supervisor (`kiln agent` run by hand), and
+Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its
+terminals and agent sessions. Otherwise they upgrade through `kiln install --agent --upgrade`.
+
 ## Every platform in step with the server
 
 A server built knowing its commit (`KILN_COMMIT`) keeps every platform in step with itself. Every

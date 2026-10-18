@@ -272,6 +272,8 @@ pub struct Detached {
     pub stdin: i32,
     pub stdout: i32,
     pub stderr: i32,
+    #[serde(default)]
+    pub foreign: bool,
 }
 
 impl Duplex {

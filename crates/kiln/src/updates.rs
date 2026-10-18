@@ -94,6 +94,12 @@ pub struct Job {
     /// next line takes its place.
     #[serde(skip)]
     progress: bool,
+    /// The runner upgrades blue/green ([`crate::proto::CAP_BLUE_GREEN`]), and (`handed_over`) it
+    /// said the new build took over.
+    #[serde(skip)]
+    blue_green: bool,
+    #[serde(skip)]
+    handed_over: bool,
 }
 
 /// A binary kiln can hand out for a platform.
@@ -770,6 +776,12 @@ impl Updates {
         self.jobs.lock().iter().any(|j| j.id == id && j.reached)
     }
 
+    /// The upgrade is through: the new build reported in and, on a runner that upgrades
+    /// blue/green, the old one said it took over.
+    pub(crate) fn through(&self, id: &str) -> bool {
+        self.jobs.lock().iter().any(|j| j.id == id && j.reached && (!j.blue_green || j.handed_over))
+    }
+
     /// A job already running for `target`.
     pub(crate) fn running_for(&self, kind: &str, target: &str) -> Option<Job> {
         self.jobs.lock().iter().find(|j| j.kind == kind && j.target == target && j.state == JobState::Running).cloned()
@@ -853,7 +865,10 @@ impl Updates {
     /// in (the job's driver waits for that); a failure completes it now.
     pub fn on_done(&self, hub: &Hub, job: &str, ok: bool, error: Option<String>) {
         if ok {
-            self.say(hub, job, "the runner finished installing");
+            self.update(hub, job, |j| {
+                j.handed_over = j.blue_green;
+                push_line(j, if j.blue_green { "the new build took over" } else { "the runner finished installing" }.to_owned());
+            });
         } else {
             self.finish(hub, job, Err(error.unwrap_or_else(|| "the runner reported a failure".to_owned())));
         }
@@ -905,6 +920,8 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         log: Vec::new(),
         error: None,
         progress: false,
+        blue_green: false,
+        handed_over: false,
     }
 }
 
@@ -1174,14 +1191,20 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
         u.finish(hub, id, Err(format!("{machine} is not connected")));
         return;
     }
-    u.say(hub, id, "asked the runner to upgrade itself");
+    // A runner that upgrades blue/green is through once it says its new build took over.
+    let blue_green = {
+        let inst = hub.instances.lock();
+        inst.newest(machine).and_then(|p| inst.get(p)).is_some_and(|i| i.caps & crate::proto::CAP_BLUE_GREEN != 0)
+    };
+    u.update(hub, id, |j| j.blue_green = blue_green);
+    u.say(hub, id, if blue_green { "asked the runner to upgrade itself: the new build starts beside it and takes over" } else { "asked the runner to upgrade itself" });
     let deadline = Instant::now() + RUNNER_TIMEOUT;
     while Instant::now() < deadline {
         crate::rt::sleep(Duration::from_secs(1)).await;
         if !u.running(id) {
             return;
         }
-        if u.reached(id) {
+        if u.through(id) {
             u.finish(hub, id, Ok(String::new()));
             return;
         }
@@ -1703,8 +1726,9 @@ pub async fn run_on_runner(http: &crate::http::client::Client, server_url: &str,
     r
 }
 
-async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, own_dir: &Path, service: &str, up: &crate::exec::Uplink) -> anyhow::Result<()> {
-    use std::io::{Read as _, Seek as _, Write as _};
+/// Download the binary `order` names from the server into `bin`, and check it: Ok with its build.
+async fn download_verified(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, bin: &Path, up: &crate::exec::Uplink) -> anyhow::Result<String> {
+    use std::io::Write as _;
     let say = |line: String| up.msg(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
     let (path, sha256, size) = (order.path, order.sha256, order.size);
     anyhow::ensure!(path.starts_with("/dl/kiln/") && !path.contains(".."), "refusing to fetch {path}");
@@ -1713,15 +1737,14 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
     say(format!("downloading {url}")).await;
     let mut resp = http.get(&url).timeout(Duration::from_secs(600)).send().await?;
     anyhow::ensure!(resp.is_success(), "the server answered {} for {url}", resp.status());
-    let (bin, log_path) = upgrade_files(own_dir);
-    let mut file = std::fs::File::create(&bin).with_context(|| format!("create {}", bin.display()))?;
+    let mut file = std::fs::File::create(bin).with_context(|| format!("create {}", bin.display()))?;
     let mut h = Sha256::new();
     let mut got = 0u64;
     while let Some(chunk) = resp.chunk().await? {
         got += chunk.len() as u64;
         if got > size {
             drop(file);
-            let _ = std::fs::remove_file(&bin);
+            let _ = std::fs::remove_file(bin);
             anyhow::bail!("the download is larger than announced ({size} bytes)");
         }
         h.update(&chunk);
@@ -1731,11 +1754,61 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
     drop(file);
     let hash = hex::encode(h.finalize());
     if hash != sha256 || got != size {
-        let _ = std::fs::remove_file(&bin);
+        let _ = std::fs::remove_file(bin);
         anyhow::bail!("the download does not match: sha256 {hash}, {got} bytes; expected {sha256}, {size} bytes");
     }
-    crate::os::make_executable(&bin)?;
-    say(format!("verified build {} ({got} bytes)", build_id(&hash))).await;
+    crate::os::make_executable(bin)?;
+    let build = build_id(&hash);
+    say(format!("verified build {build} ({got} bytes)")).await;
+    Ok(build)
+}
+
+/// For a blue/green upgrade (`crate::bluegreen`): the binary `order` names, downloaded, checked and
+/// kept under `<state>/versions/<build>/`, where the new build's runner runs from (nothing that
+/// runs is replaced). Its path and build.
+pub async fn fetch_build(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, state_dir: &Path, up: &crate::exec::Uplink) -> anyhow::Result<(PathBuf, String)> {
+    anyhow::ensure!(!UPGRADING.swap(true, Ordering::AcqRel), "an upgrade is already running on this runner");
+    let r = async {
+        let versions = state_dir.join("versions");
+        let mut mk = std::fs::DirBuilder::new();
+        mk.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut mk, 0o700);
+        mk.create(&versions)?;
+        let part = versions.join(format!(".download-{}", std::process::id()));
+        let build = download_verified(http, server_url, order, &part, up).await?;
+        let dir = versions.join(&build);
+        mk.create(&dir)?;
+        let exe = dir.join(if cfg!(windows) { "kiln.exe" } else { "kiln" });
+        std::fs::rename(&part, &exe).with_context(|| format!("keep {}", exe.display()))?;
+        Ok((exe, build))
+    }
+    .await;
+    UPGRADING.store(false, Ordering::Release);
+    r
+}
+
+/// Every build kept under `<state>/versions/` but `keep`'s (the one running) and the newest few:
+/// removed.
+pub fn prune_versions(state_dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(state_dir.join("versions")) else { return };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n != keep && !n.starts_with('.')))
+        .filter_map(|e| Some((e.metadata().and_then(|m| m.modified()).ok()?, e.path())))
+        .collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
+    // The newest two besides the running one stay: what a rollback goes back to.
+    for (_, d) in dirs.into_iter().skip(2) {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, own_dir: &Path, service: &str, up: &crate::exec::Uplink) -> anyhow::Result<()> {
+    use std::io::{Read as _, Seek as _};
+    let say = |line: String| up.msg(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
+    let (bin, log_path) = upgrade_files(own_dir);
+    download_verified(http, server_url, order, &bin, up).await?;
     say(format!("kiln install --agent --upgrade --service {service}")).await;
 
     // Its output goes to a file, not a pipe: a runner that takes the binary in place re-executes
@@ -1810,7 +1883,9 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
 /// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
 pub fn runner_build() -> AgentMsg {
     let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker }
+    // Under a supervisor that can start a new build beside it (`kiln supervise` on Unix).
+    let blue_green = if crate::bluegreen::Supervisor::from_env().is_some() { crate::proto::CAP_BLUE_GREEN } else { 0 };
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | blue_green }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it

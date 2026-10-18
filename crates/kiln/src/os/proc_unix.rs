@@ -320,6 +320,10 @@ pub struct Detached {
     pub stdin: i32,
     pub stdout: i32,
     pub stderr: i32,
+    /// The process is another process's child (handed over by another runner of this machine,
+    /// blue/green): its exit is watched, not reaped, and how it ended isn't known.
+    #[serde(default)]
+    pub foreign: bool,
 }
 
 impl Duplex {
@@ -348,7 +352,7 @@ impl Duplex {
             let _ = crate::rt::timeout(Duration::from_secs(5), w).await;
         }
         use std::os::fd::IntoRawFd as _;
-        Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd() })
+        Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: false })
     }
     /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here).
     pub fn terminate(&self, grace: Duration) {
@@ -392,6 +396,13 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
     }
     let pid = d.pid;
     let (exit_tx, exit_rx) = oneshot::channel();
+    if d.foreign {
+        crate::rt::spawn(async move {
+            wait_foreign_exit(pid).await;
+            let _ = exit_tx.send(None);
+        });
+        return pump(pid, input, out, err, exit_rx);
+    }
     crate::rt::spawn(async move {
         let p = i32::try_from(pid).ok().and_then(rustix::process::Pid::from_raw);
         let status = wait_pid_exit(pid, || match p {
@@ -407,6 +418,39 @@ pub fn adopt_duplex(d: Detached) -> anyhow::Result<Duplex> {
         let _ = exit_tx.send(status.ok().flatten());
     });
     pump(pid, input, out, err, exit_rx)
+}
+
+/// Wait for `pid` to end when it isn't this process's child (another runner of this machine
+/// started it and handed it over): its pidfd says so on Linux; elsewhere it is polled, with its
+/// start time checked so a recycled pid isn't taken for it.
+pub async fn wait_foreign_exit(pid: u32) {
+    if let Some(fd) = pidfd(pid) {
+        // Readable once it has ended (as a zombie, if its parent hasn't reaped it yet).
+        loop {
+            if crate::rt::timeout(Duration::from_secs(5), ready(&fd, false)).await.is_ok() {
+                return;
+            }
+            if !crate::os::pid_alive(pid) {
+                return;
+            }
+        }
+    }
+    let born = started_at(pid);
+    loop {
+        if !crate::os::pid_alive(pid) || started_at(pid) != born {
+            return;
+        }
+        crate::rt::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// When `pid` started (seconds since the epoch), to tell it from a later process with its pid.
+fn started_at(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let p = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), false, ProcessRefreshKind::nothing());
+    sys.process(p).map(sysinfo::Process::start_time)
 }
 
 /// Serve a harness process's pipes: a reader for stdout and one for stderr, a writer for stdin.

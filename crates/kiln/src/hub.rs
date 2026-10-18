@@ -786,9 +786,14 @@ impl Hub {
         if let AgentMsg::Hello(h) = msg {
             return self.on_hello(peer, h).await;
         }
-        // Says which runner process of its machine this is; precedes Hello.
+        // Says which runner process of its machine this is; precedes Hello. Again later: a new
+        // build that has taken over (blue/green) says it's the newest now.
         if let AgentMsg::Instance(ih) = msg {
-            self.instances.lock().announce(peer, ih);
+            let again = self.instances.lock().reannounce(peer, &ih);
+            match again {
+                Some(drain) => self.instance_promoted(peer, drain).await,
+                None => self.instances.lock().announce(peer, ih),
+            }
             return Ok(());
         }
         let Some(agent) = self.agent_of(peer) else {
@@ -1212,7 +1217,24 @@ impl Hub {
         if !jobs.is_empty() {
             self.lost_instances.lock().insert(peer, (name.to_owned(), Instant::now(), jobs));
         }
-        // The newest process (maybe another one now) describes the machine.
+        self.newest_changed(name).await;
+    }
+
+    /// A runner process of `peer`'s machine, joined as the oldest (a blue/green upgrade's new
+    /// build), has taken over and is its newest now: the others take no new jobs, and new work
+    /// goes to it.
+    async fn instance_promoted(&self, peer: PeerId, drain: Vec<PeerId>) {
+        let Some(name) = self.agent_of(peer) else { return };
+        tracing::info!(agent = %name, peer, "a new runner process of this machine took over: new work goes to it");
+        for p in &drain {
+            self.send_peer(*p, &ServerMsg::Drain).await;
+        }
+        self.newest_changed(&name).await;
+        self.wake.notify();
+    }
+
+    /// The machine's newest process (maybe another one now) describes it, and runs its front door.
+    async fn newest_changed(&self, name: &str) {
         let newest = {
             let inst = self.instances.lock();
             inst.newest(name).and_then(|p| inst.get(p).map(|i| (p, i.hello.clone())))

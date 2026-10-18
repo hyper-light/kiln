@@ -105,6 +105,6 @@ impl Handle {
 }
 
 /// Never reached on Windows ([`crate::os::reclaim_fd`] yields nothing to adopt).
-pub fn adopt(_fd: (), _pid: u32, _out: async_channel::Sender<PtyOut>, _input: async_channel::Receiver<Vec<u8>>) -> Handle {
+pub fn adopt(_fd: (), _pid: u32, _foreign: bool, _out: async_channel::Sender<PtyOut>, _input: async_channel::Receiver<Vec<u8>>) -> Handle {
     Handle
 }

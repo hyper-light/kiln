@@ -7,6 +7,7 @@ pub mod aisessions;
 pub mod api;
 pub mod authz;
 pub mod autodetect;
+pub mod bluegreen;
 pub mod cd;
 pub mod ci;
 pub mod http;

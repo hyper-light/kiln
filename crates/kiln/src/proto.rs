@@ -154,6 +154,10 @@ pub const CAP_OUTPOST: u32 = 32;
 /// [`AgentMsg::Build`] capability: it reports whether its machine takes upgrades
 /// ([`AgentMsg::UpdatePrefs`]) and takes the notice of a newer kiln ([`ServerMsg::UpdateAvailable`]).
 pub const CAP_UPDATES: u32 = 256;
+/// [`AgentMsg::Build`] capability: it upgrades blue/green (`crate::bluegreen`): the new build comes
+/// up beside it as another instance, reports in, and takes over. An upgrade of it is done when it
+/// says so ([`AgentMsg::UpgradeDone`]), not when the new build reports in.
+pub const CAP_BLUE_GREEN: u32 = 512;
 /// The label an outpost carries (see [`CAP_OUTPOST`]).
 pub const OUTPOST_LABEL: &str = "outpost";
 
