@@ -36,6 +36,7 @@ function TurnLine({ state, activity, stopAt, onForce }: { state: State | null; a
         {stopAt == null ? doing : stuck ? "Still running" : "Stopping…"}
       </PrismLabel>
       {thinking && stopAt == null && state?.effort && <span className="ag-turn-meta">{state.effort} effort</span>}
+      {(state?.kept ?? 0) > 0 && stopAt == null && <span className="ag-turn-meta">kept going ×{state?.kept}</span>}
       {started != null && <span className="ag-turn-meta">{formatThought((now - started) / 1000)}</span>}
       {stuck && onForce && (
         <Button size="xs" variant="ghost-danger" onClick={onForce}>
