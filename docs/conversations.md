@@ -28,6 +28,10 @@ For each agent session (kiln's id):
   rewind. The store drops the session's events from number `from` on, then keeps the snapshot that
   follows. Events before `from` stay: the timeline no longer holds them in memory (it holds
   `MAX_EVENTS`, 4,000), but they are its history.
+- **A clear** (`/clear`) is a reset too: the timeline starts over from the line saying so, and
+  `State::cleared` holds that line's number. The events before it stay in the store, where search
+  finds them, but a timeline taken up again from the store (after a restart, a move, or in the
+  server's list of agents whose machine is away) leaves them out.
 - **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one

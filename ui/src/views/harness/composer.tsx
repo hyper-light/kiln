@@ -14,7 +14,8 @@ import { useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { Attachments } from "./controls";
-import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, type Reply } from "./palette";
+import { CommandList, findCommand, matchCommands, parseSlash, ReplyPanel, runCommand, slashAt, type Reply } from "./palette";
+import { commandNames, Marked } from "./marks";
 import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
@@ -253,6 +254,10 @@ export function Composer({
   const meta = useSession(store, (s) => s.meta);
   const [suggest, setSuggest] = React.useState<{ kind: "/" | "@"; items: { label: string; hint?: string }[]; index: number } | null>(null);
   const ta = React.useRef<HTMLTextAreaElement | null>(null);
+  /** The marked copy of the text under the field (its own text is clear). */
+  const mirror = React.useRef<HTMLDivElement>(null);
+  // Where the caret is, as the field last said; null: at the end (text put in, not typed).
+  const [caret, setCaret] = React.useState<number | null>(null);
   const features = meta?.features ?? NO_FEATURES;
   const running = status === "running" || status === "waiting";
   const modes = React.useMemo(() => MODES.filter((m) => !m.feature || features.includes(m.feature)), [features]);
@@ -280,28 +285,33 @@ export function Composer({
       void text;
       el.style.height = "auto";
       el.style.height = `${el.scrollHeight}px`;
+      if (mirror.current) mirror.current.scrollTop = el.scrollTop;
     },
     [text],
   );
 
-  // Commands, while a name is typed after "/": every one the agent's harness offers, by name,
-  // alias or what it does.
+  // Commands, while a name is typed after "/" (at the start of the message or anywhere after a
+  // space): every one the agent's harness offers, by name, alias or what it does.
   const commands = meta?.commands ?? NO_COMMANDS;
+  const names = React.useMemo(() => commandNames(commands), [commands]);
   const slash = parseSlash(text);
+  const token = slashAt(text, Math.min(caret ?? text.length, text.length));
   const [palIndex, setPalIndex] = React.useState(0);
   const [palClosed, setPalClosed] = React.useState(false);
   const [reply, setReply] = React.useState<Reply | "loading" | null>(null);
   const [note, setNote] = React.useState<string | null>(null);
   // Another command name: the list starts at its top again, open, and a new name replaces an old
   // note (clearing the field after one keeps it in view).
-  const [named, setNamed] = React.useState(slash?.name);
-  if (named !== slash?.name) {
-    setNamed(slash?.name);
+  const tokenKey = token ? `${token.start}/${token.name}` : undefined;
+  const [named, setNamed] = React.useState(tokenKey);
+  if (named !== tokenKey) {
+    setNamed(tokenKey);
     setPalIndex(0);
     setPalClosed(false);
-    if (slash?.name) setNote(null);
+    if (token?.name) setNote(null);
   }
-  const palItems = React.useMemo(() => (slash?.typingName && !palClosed ? matchCommands(commands, slash.name) : []), [slash?.typingName, slash?.name, palClosed, commands]);
+  const query = token && !palClosed ? token.name : null;
+  const palItems = React.useMemo(() => (query === null ? [] : matchCommands(commands, query)), [query, commands]);
   const typed = slash && !slash.typingName ? findCommand(commands, slash.name) : undefined;
 
   // @-file suggestions for the word being typed at the end, asked for a moment after typing stops.
@@ -329,10 +339,14 @@ export function Composer({
     },
     [features, store],
   );
-  /** The text changed here (typed, completed, cleared): its suggestions follow it. */
+  /**
+   * The text changed here (typed, completed, cleared): its suggestions follow it. `caretAt`: where
+   * the caret is in it (by default its end).
+   */
   const write = React.useCallback(
-    (t: string) => {
+    (t: string, caretAt: number | null = null) => {
       setText(t);
+      setCaret(caretAt);
       suggestFor(t);
     },
     [setText, suggestFor],
@@ -365,20 +379,29 @@ export function Composer({
     return true;
   };
 
-  /** Pick a command from the list: one that takes no words runs; otherwise its name goes in the field. */
+  /**
+   * Pick a command from the list. When it's the whole message, one that takes no words runs;
+   * otherwise its name goes in where it was typed, the caret after it.
+   */
   const pick = (entry: NonNullable<ReturnType<typeof findCommand>>) => {
     if (entry.route?.kind === "unsupported") {
       setNote(`/${entry.name}: ${entry.route.reason}`);
       return;
     }
-    if (entry.args === "none" || (!entry.args && entry.route?.kind === "view")) {
+    const { start, end } = token ?? { start: 0, end: text.length };
+    const rest = text.slice(end);
+    if (start === 0 && !rest.trim() && (entry.args === "none" || (!entry.args && entry.route?.kind === "view"))) {
       const r = runEntry(entry, "");
       if (r !== true) sendText(r);
       return;
     }
-    write(`/${entry.name} `);
+    const pos = start + entry.name.length + 2;
+    write(`${text.slice(0, start)}/${entry.name}${/^\s/.test(rest) ? "" : " "}${rest}`, pos);
     setPalClosed(true);
-    ta.current?.focus();
+    const el = ta.current;
+    el?.focus();
+    // Once the field has the new text (which puts the caret at its end).
+    requestAnimationFrame(() => el?.setSelectionRange(pos, pos));
   };
 
   const submit = () => {
@@ -521,33 +544,42 @@ export function Composer({
         {canOverride && (withOpen || override.model || override.effort) && (
           <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />
         )}
-        <textarea
-          ref={grow}
-          className="hx-compose-input"
-          rows={1}
-          value={text}
-          disabled={disabled}
-          placeholder={
-            disabled
-              ? "Not connected"
-              : toMain
-                ? "Message the main agent"
-                : running
-                  ? mode === "steer"
-                    ? "Steer it — it reads this at its next step"
-                    : mode === "now"
-                      ? approvals > 0
-                        ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
-                        : "Stop and say…"
-                      : "Queue a message for when it finishes"
-                  : "Tell the agent what to do"
-          }
-          onChange={(e) => write(e.target.value)}
-          onKeyDown={onKeyDown}
-          aria-label="Message to the agent"
-          enterKeyHint="send"
-          autoCapitalize="sentences"
-        />
+        <div className="cp-field">
+          <div ref={mirror} className="hx-compose-input cp-mirror" aria-hidden="true" data-off={disabled || undefined}>
+            <Marked text={text} names={names} />
+          </div>
+          <textarea
+            ref={grow}
+            className="hx-compose-input cp-input"
+            rows={1}
+            value={text}
+            disabled={disabled}
+            placeholder={
+              disabled
+                ? "Not connected"
+                : toMain
+                  ? "Message the main agent"
+                  : running
+                    ? mode === "steer"
+                      ? "Steer it — it reads this at its next step"
+                      : mode === "now"
+                        ? approvals > 0
+                          ? `Cancel ${approvals === 1 ? "the request" : `the ${approvals} requests`}, stop and say…`
+                          : "Stop and say…"
+                        : "Queue a message for when it finishes"
+                    : "Tell the agent what to do"
+            }
+            onChange={(e) => write(e.target.value, e.target.selectionStart)}
+            onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
+            onScroll={(e) => {
+              if (mirror.current) mirror.current.scrollTop = e.currentTarget.scrollTop;
+            }}
+            onKeyDown={onKeyDown}
+            aria-label="Message to the agent"
+            enterKeyHint="send"
+            autoCapitalize="sentences"
+          />
+        </div>
         <div className="cp-bar">
           {canAttach && (
             <>

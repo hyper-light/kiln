@@ -369,6 +369,85 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
     max-height: calc(4 * 1.55em + 16px);
   }
 }
+/* What's typed, marked (marks.tsx): drawn under the field, whose own text is clear, in its box,
+   size and font. Both keep a scrollbar's room alike, so lines break in the same places. */
+.cp-field {
+  position: relative;
+}
+.cp .cp-input {
+  position: relative;
+  color: transparent;
+  caret-color: var(--color-foreground);
+  scrollbar-gutter: stable;
+}
+.cp .cp-input::selection {
+  background: rgb(186 176 227 / 30%);
+}
+.cp .hx-compose-input.cp-mirror {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  scrollbar-gutter: stable;
+  color: var(--color-foreground);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  pointer-events: none;
+  user-select: none;
+}
+.cp-mirror[data-off] {
+  opacity: 0.5;
+}
+/* iOS sets a field's text in from where a box's is: there it stays plain. */
+@supports (-webkit-touch-callout: none) {
+  .cp .hx-compose-input.cp-mirror {
+    display: none;
+  }
+  .cp .cp-input {
+    color: var(--color-foreground);
+  }
+}
+.cp-mirror .md-m {
+  color: #6d707a;
+}
+.cp-mirror .md-b,
+.cp-mirror .md-h {
+  color: var(--color-bright);
+  -webkit-text-stroke: 0.35px currentColor;
+}
+.cp-mirror .md-i {
+  font-style: italic;
+}
+.cp-mirror .md-s {
+  color: var(--color-secondary);
+  text-decoration: line-through;
+}
+.cp-mirror .md-code {
+  border-radius: 4px;
+  background: #191b22;
+  box-shadow: 0 0 0 1px #2a2d38;
+  color: #cdc4e0;
+}
+.cp-mirror .md-pre {
+  color: #cdc4e0;
+}
+.cp-mirror .md-q {
+  color: var(--color-secondary);
+}
+.cp-mirror .md-li {
+  color: #bab0e3;
+}
+.cp-mirror .md-a {
+  color: var(--color-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/* A command the agent has, wherever it is in the message. */
+.cp-mirror .md-cmd {
+  border-radius: 4px;
+  background: rgb(186 176 227 / 14%);
+  box-shadow: 0 0 0 1px rgb(186 176 227 / 24%);
+  color: #d9d2f5;
+}
 .cp-bar {
   display: flex;
   align-items: center;

@@ -267,7 +267,9 @@ feedback that uploads the conversation, and handing this session to the cloud, a
   and user skills, plugins' and MCP servers' commands), sent as text, except where kiln does the
   job itself: `/compact`, `/clear` (with its aliases `/reset`, `/new`), `/rename`, `/model`,
   `/effort`, `/context`, `/mcp`, `/usage`, `/reload-skills`, `/reload-plugins` (a control
-  request: the CLI binds the command to its terminal). Then the commands of its terminal
+  request: the CLI binds the command to its terminal). `/clear` starts the conversation over: once
+  Claude Code says it has (`conversation_reset`, then an init under its new session id), so does
+  the timeline (docs/conversations.md, "A clear"). Then the commands of its terminal
   interface: those kiln runs with the CLI's control requests (`/btw` a side question, its answer
   kept out of the conversation; `/cost`; `/export`; `/plan`; `/permission-rules` the rules in force
   and their sources; `/memory` the instruction files and memory folders; `/git-diff` the

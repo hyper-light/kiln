@@ -1446,8 +1446,19 @@ impl Claude {
             "result" => self.result(core, &v),
             "command_lifecycle" => self.lifecycle(core, &v),
             "rate_limit_event" => self.rate_limit(core, &v),
+            "conversation_reset" => self.conversation_reset(core),
             _ => {}
         }
+    }
+
+    /// The CLI started the conversation over (`/clear`; a new session id follows in an init): so
+    /// does the timeline, and with it what was asked and planned in the one before.
+    fn conversation_reset(&mut self, core: &mut Core) {
+        self.entries.clear();
+        core.clear();
+        core.state.goal.clear();
+        core.state.todos.clear();
+        self.notice(core, Level::Info, "Conversation cleared", None);
     }
 
     fn control_response(&mut self, core: &mut Core, v: &Value) {
@@ -3734,6 +3745,65 @@ mod tests {
         core.state.objective = Some(Objective::new("again", "unmet", Some("still set".into())));
         run(&mut c, &mut core, "clear", "Goal cleared: again");
         assert_eq!(status(&core), Some(("cleared".into(), None)));
+    }
+
+    #[test]
+    fn clear_starts_the_timeline_over_and_what_came_before_stays_history() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        c.line(&mut core, r#"{"type":"system","subtype":"init","cwd":"/work","session_id":"old-1","model":"claude-opus-5-5","permissionMode":"default"}"#);
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "fix the flaky test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        feed(&mut c, &mut core, &[
+            r#"{"type":"user","message":{"role":"user","content":"fix the flaky test"},"session_id":"old-1","parent_tool_use_id":null,"uuid":"m1","isReplay":true}"#,
+            r#"{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Fixed."}]},"parent_tool_use_id":null,"session_id":"old-1","uuid":"a1"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Fixed.","session_id":"old-1"}"#,
+            r#"{"type":"command_lifecycle","command_uuid":"m1","state":"completed","session_id":"old-1"}"#,
+        ]);
+        let old: Vec<_> = core.events().cloned().collect();
+        assert_eq!(old.len(), 2);
+        core.take_out();
+        core.take_writes();
+
+        // /clear goes as a message; Claude Code 2.1.302 answers with a reset, then an init under
+        // the new session id, the command's replay (context, not words) and its result.
+        c.command(&mut core, Command::Control { id: "clear".into(), value: None });
+        let sent: Value = serde_json::from_str(core.take_writes().last().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(sent.pointer("/message/content").and_then(Value::as_str), Some("/clear"));
+        let uuid = sent.get("uuid").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let replay = json!({"type": "user", "message": {"role": "user", "content": "<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>"}, "session_id": "new-2", "parent_tool_use_id": null, "uuid": uuid, "isReplay": true}).to_string();
+        let reset = json!({"type": "conversation_reset", "new_conversation_id": "r1", "uuid": "r1", "trigger": "clear", "user_message_uuid": uuid, "session_id": "old-1"}).to_string();
+        let done = json!({"type": "command_lifecycle", "command_uuid": uuid, "state": "completed", "session_id": "new-2"}).to_string();
+        feed(&mut c, &mut core, &[
+            &reset,
+            r#"{"type":"system","subtype":"init","cwd":"/work","session_id":"new-2","model":"claude-opus-5-5","permissionMode":"default"}"#,
+            &replay,
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":0,"session_id":"new-2"}"#,
+            &done,
+        ]);
+
+        // The timeline holds only the line saying so; viewers start over from it, and the store
+        // keeps everything before it.
+        let left: Vec<&Body> = core.events().map(|e| &e.body).collect();
+        assert!(matches!(left.as_slice(), [Body::Notice { text, .. }] if text == "Conversation cleared"), "{left:?}");
+        let cleared = core.state.cleared.ok_or_else(|| anyhow::anyhow!("not marked cleared"))?;
+        assert!(old.iter().all(|e| e.seq < cleared) && core.events().all(|e| e.seq >= cleared));
+        assert!(matches!(core.take_out().first(), Some(Update::Reset { from: Some(n) }) if *n == cleared));
+        assert_eq!(core.state.harness_session.as_deref(), Some("new-2"));
+        assert!(core.state.goal.is_empty());
+
+        // Taken up again (a restart, a move) from all the store kept: the cleared part stays out,
+        // and new events come after it.
+        let mut again = Core::new();
+        again.adopt(old.into_iter().chain(core.events().cloned()).collect(), core.state.clone());
+        assert_eq!(again.events().map(|e| e.id.clone()).collect::<Vec<_>>(), core.events().map(|e| e.id.clone()).collect::<Vec<_>>());
+        again.upsert("next", None, Body::Notice { level: Level::Info, text: "x".into() });
+        assert!(again.get("next").is_some_and(|e| e.seq > cleared));
+
+        // The next message goes to the new session.
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "now the docs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        assert!(core.take_writes().last().is_some_and(|w| w.contains("\"session_id\":\"new-2\"")));
+        Ok(())
     }
 
     #[test]
