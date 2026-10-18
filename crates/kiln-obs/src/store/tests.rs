@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::batch::{Builder, SeriesKey};
 use crate::logs::record::Record;
@@ -625,4 +627,143 @@ fn an_image_installed_elsewhere_answers_as_its_source() {
         source.link_snapshot(snaps.path()).unwrap();
     }
     assert_eq!(std::fs::read_dir(snaps.path()).unwrap().count(), KEEP_SNAPSHOTS);
+}
+
+#[test]
+fn rewrites_built_apart_while_the_store_goes_on_answer_alike() {
+    let seeds: u64 = std::env::var("KILN_OBS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    for seed in 1..=seeds {
+        let entries = stream(seed + 100, 400);
+        let d = tempfile::tempdir().unwrap();
+        let mut c = Store::new(Keyed::with_keys(1, 1));
+        let mut s = Store::open(d.path(), Keyed::with_keys(2, 2)).unwrap();
+        let mut rng = Rng::new(seed);
+        // Rewrites planned and not yet built: the store goes on applying and cutting meanwhile.
+        let mut planned: Vec<Rewrite> = Vec::new();
+        let mut taken = 0;
+        for i in 0..entries.len() {
+            apply_at(&mut c, &entries, i, i + 1);
+            apply_at(&mut s, &entries, i, i + 1);
+            if rng.below(6) == 0 {
+                s.cut(Point { index: i as u64 + 1, term: 1 }).unwrap();
+                s.drop_expired().unwrap();
+            }
+            if rng.below(4) == 0
+                && let Some(p) = if rng.below(2) == 0 { s.plan_merge() } else { s.plan_retention() }
+            {
+                planned.push(p);
+            }
+            if !planned.is_empty() && rng.below(3) == 0 {
+                // A plan another rewrite overtook cannot be built: it is dropped, as maintenance
+                // drops it.
+                let p = planned.remove(rng.below(planned.len() as u64) as usize);
+                if let Ok(built) = p.build() {
+                    taken += s.commit(built).unwrap().blocks_removed;
+                }
+            }
+            if i % 50 == 49 {
+                assert_eq!(view(&s), view(&c), "seed {seed} after entry {}", i + 1);
+            }
+        }
+        for p in planned.drain(..) {
+            if let Ok(built) = p.build() {
+                s.commit(built).unwrap();
+            }
+        }
+        assert_eq!(view(&s), view(&c), "seed {seed} at the end");
+        assert!(taken > 0, "seed {seed}: some rewrite was taken in");
+        // Nothing left behind: every block file is the manifest's.
+        let files: BTreeSet<String> = std::fs::read_dir(d.path()).unwrap().filter_map(Result::ok).map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".block")).collect();
+        assert_eq!(files.len(), s.block_count(), "seed {seed}: orphan blocks {files:?}");
+        drop(s);
+        let s = Store::open(d.path(), Keyed::with_keys(3, 3)).unwrap();
+        let mut r = Store::new(Keyed::with_keys(4, 4));
+        apply_at(&mut r, &entries, 0, s.durable().index as usize);
+        assert_eq!(view(&s), view(&r), "seed {seed} reopened");
+    }
+}
+
+#[test]
+fn a_rewrite_planned_before_an_install_is_not_taken_in_after() {
+    let entries = stream(7, 200);
+    let (da, db, staging, snaps) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut a = Store::open(da.path(), Keyed::with_keys(1, 1)).unwrap();
+    for i in 0..120 {
+        apply_at(&mut a, &entries, i, i + 1);
+        if i % 20 == 19 {
+            a.cut(Point { index: i as u64 + 1, term: 1 }).unwrap();
+        }
+    }
+    let mut b = Store::open(db.path(), Keyed::with_keys(2, 2)).unwrap();
+    for i in 0..60 {
+        apply_at(&mut b, &entries, i, i + 1);
+        if i % 10 == 9 {
+            b.cut(Point { index: i as u64 + 1, term: 1 }).unwrap();
+        }
+    }
+    let plan = b.plan_merge().expect("B has blocks to merge");
+    // B installs A's image meanwhile.
+    let image = a.image();
+    let snap = a.link_snapshot(snaps.path()).unwrap();
+    for f in &image.files {
+        std::fs::copy(snap.join(&f.name), staging.path().join(&f.name)).unwrap();
+    }
+    b.install(staging.path(), &image, a.durable(), Membership::default()).unwrap();
+    let before = view(&b);
+    // The plan's inputs are gone (or of another store): its build fails or is not taken in.
+    if let Ok(built) = plan.build() {
+        assert_eq!(b.commit(built).unwrap(), Maintained::default());
+    }
+    assert_eq!(view(&b), before);
+    let blocks = std::fs::read_dir(db.path()).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().ends_with(".block")).count();
+    assert_eq!(blocks, b.block_count(), "the rewrite's file was deleted");
+}
+
+#[test]
+fn a_maintenance_thread_rewrites_while_the_store_applies_and_cuts() {
+    use std::sync::{Arc, RwLock};
+    let entries = stream(21, 600);
+    let d = tempfile::tempdir().unwrap();
+    let shared = Arc::new(RwLock::new(Store::open(d.path(), Keyed::with_keys(1, 1)).unwrap()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker = {
+        let (shared, stop) = (shared.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut taken = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                // Planned under the lock, built without it, taken in under it.
+                let plan = {
+                    let mut s = shared.write().unwrap();
+                    s.drop_expired().unwrap();
+                    s.plan_merge().or_else(|| s.plan_retention())
+                };
+                match plan {
+                    Some(p) => {
+                        let built = p.build().unwrap();
+                        taken += shared.write().unwrap().commit(built).unwrap().blocks_removed;
+                    }
+                    None => std::thread::yield_now(),
+                }
+            }
+            taken
+        })
+    };
+    let mut c = Store::new(Keyed::with_keys(2, 2));
+    for i in 0..entries.len() {
+        apply_at(&mut c, &entries, i, i + 1);
+        let mut s = shared.write().unwrap();
+        apply_at(&mut s, &entries, i, i + 1);
+        if i % 5 == 4 {
+            s.cut(Point { index: i as u64 + 1, term: 1 }).unwrap();
+        }
+        drop(s);
+        if i % 100 == 99 {
+            // A reader meanwhile, as a query.
+            assert_eq!(view(&shared.read().unwrap()), view(&c), "after entry {}", i + 1);
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let taken = worker.join().unwrap();
+    assert!(taken > 0, "the thread took rewrites in");
+    assert_eq!(view(&shared.read().unwrap()), view(&c));
 }

@@ -15,6 +15,7 @@
 //! this replica holding another state. The owner says why ([`Machine::fault`]).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use hyper_durable::{EntryRef, Fatal, StateMachine};
 use hyper_raft::proto::{ConfChangeV2, ConfState, EntryType};
@@ -29,8 +30,13 @@ pub const SNAPSHOTS: &str = "snap";
 /// The subfolder files are staged in for an install.
 pub const STAGING: &str = "install";
 
+/// A store as its machine and its readers share it: the machine writes under the lock an entry at
+/// a time, queries read under it. std's lock prefers a waiting writer to new readers, so queries
+/// never hold the group's applying off for longer than one query takes.
+pub type Shared = Arc<RwLock<Store>>;
+
 pub struct Machine {
-    store: Store,
+    store: Shared,
     applied: hyper_durable::Point,
     conf: ConfState,
     snaps: PathBuf,
@@ -62,15 +68,22 @@ impl Machine {
             store.set_membership(membership_of(founding));
         }
         let conf = conf_of(store.membership());
-        Ok(Self { applied: point(durable), conf, snaps: dir.join(SNAPSHOTS), staging: dir.join(STAGING), store, fault: None })
+        Ok(Self { applied: point(durable), conf, snaps: dir.join(SNAPSHOTS), staging: dir.join(STAGING), store: Arc::new(RwLock::new(store)), fault: None })
     }
 
-    pub fn store(&self) -> &Store {
-        &self.store
+    /// The store, for readers on any thread.
+    pub fn shared(&self) -> Shared {
+        self.store.clone()
     }
 
-    pub fn store_mut(&mut self) -> &mut Store {
-        &mut self.store
+    /// The store, read. A lock a panic poisoned still holds a whole store: nothing in it panics
+    /// mid-write (the crate's lints), so the store is taken as it is.
+    pub fn read(&self) -> RwLockReadGuard<'_, Store> {
+        self.store.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Store> {
+        self.store.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Where the owner stages an image's files before stepping the snapshot that names them.
@@ -102,7 +115,8 @@ impl StateMachine for Machine {
         if entry.kind != EntryType::EntryNormal {
             return Ok(());
         }
-        match self.store.apply_entry(entry.index, entry.data) {
+        let applied = self.write().apply_entry(entry.index, entry.data);
+        match applied {
             Ok(answer) => {
                 answers.push((entry.index, answer));
                 Ok(())
@@ -114,12 +128,12 @@ impl StateMachine for Machine {
     fn apply_change(&mut self, at: hyper_durable::Point, _change: &ConfChangeV2, configuration: &ConfState) -> Result<(), Fatal> {
         self.applied = at;
         self.conf = configuration.clone();
-        self.store.set_membership(membership_of(configuration));
+        self.write().set_membership(membership_of(configuration));
         Ok(())
     }
 
     fn durable(&self) -> hyper_durable::Point {
-        point(self.store.durable())
+        point(self.read().durable())
     }
 
     fn configuration(&self) -> &ConfState {
@@ -132,16 +146,20 @@ impl StateMachine for Machine {
 
     /// What is durable, at its point: after a compaction's persist, everything applied.
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(hyper_durable::Point, ConfState), Fatal> {
-        if let Err(e) = self.store.link_snapshot(&self.snaps) {
-            return Err(self.failed("the store's files could not be linked into a snapshot", e));
+        let store = self.read();
+        let linked = store.link_snapshot(&self.snaps);
+        store.image().encode(into);
+        let at = (point(store.durable()), conf_of(store.durable_membership()));
+        drop(store);
+        match linked {
+            Ok(_) => Ok(at),
+            Err(e) => Err(self.failed("the store's files could not be linked into a snapshot", e)),
         }
-        self.store.image().encode(into);
-        Ok((point(self.store.durable()), conf_of(self.store.durable_membership())))
     }
 
     fn image_bytes(&self) -> Option<u64> {
         let mut bytes = Vec::new();
-        self.store.image().encode(&mut bytes);
+        self.read().image().encode(&mut bytes);
         Some(bytes.len() as u64)
     }
 
@@ -151,12 +169,14 @@ impl StateMachine for Machine {
             Err(e) => return Err(self.failed("a snapshot that is no store's image", e)),
         };
         let at_point = Point { index: at.index, term: at.term };
-        if let Err(e) = self.store.install(&self.staging, &image, at_point, membership_of(configuration)) {
+        let installed = self.write().install(&self.staging, &image, at_point, membership_of(configuration));
+        if let Err(e) = installed {
             return Err(self.failed("an image could not be installed", e));
         }
         // This member serves the image it installed until it compacts: its files are linked as
         // its own would be.
-        if let Err(e) = self.store.link_snapshot(&self.snaps) {
+        let linked = self.read().link_snapshot(&self.snaps);
+        if let Err(e) = linked {
             return Err(self.failed("an installed image's files could not be linked into a snapshot", e));
         }
         self.applied = at;
@@ -166,7 +186,8 @@ impl StateMachine for Machine {
 
     fn persist(&mut self) -> Result<(), Fatal> {
         let at = Point { index: self.applied.index, term: self.applied.term };
-        match self.store.cut(at) {
+        let cut = self.write().cut(at);
+        match cut {
             Ok(_) => Ok(()),
             Err(e) => Err(self.failed("the store could not be cut", e)),
         }

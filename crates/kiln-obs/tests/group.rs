@@ -376,8 +376,8 @@ impl Cluster {
         self.nodes.values().filter_map(|n| n.live.as_ref()).all(|l| l.replica.applied().index == commit && l.replica.in_flight() == 0)
     }
 
-    fn store(&self, id: u64) -> &Store {
-        self.nodes[&id].live.as_ref().unwrap().replica.machine().store()
+    fn store(&self, id: u64) -> std::sync::RwLockReadGuard<'_, Store> {
+        self.nodes[&id].live.as_ref().unwrap().replica.machine().read()
     }
 
     /// What every live member answers, alike and as a store that applied the committed log does;
@@ -413,7 +413,7 @@ impl Cluster {
         let want = view(&reference);
         for (&id, n) in &self.nodes {
             if n.live.is_some() {
-                assert_eq!(view(self.store(id)), want, "member {id}");
+                assert_eq!(view(&self.store(id)), want, "member {id}");
             }
         }
     }

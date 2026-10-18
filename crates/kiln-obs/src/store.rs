@@ -200,6 +200,8 @@ pub struct Store {
     sessions: BTreeMap<u64, Session>,
     conf: Membership,
     totals: Counts,
+    /// Installs this store took: a rewrite planned before one is not taken in after.
+    epoch: u64,
     pending: Vec<Pending>,
     /// `pending` by fingerprint (a fingerprint is a hash already: it is its own).
     pending_at: HashTable<u32>,
@@ -249,6 +251,109 @@ pub struct Maintained {
     pub series_dropped: u64,
 }
 
+impl std::ops::AddAssign for Maintained {
+    fn add_assign(&mut self, o: Self) {
+        self.blocks_written += o.blocks_written;
+        self.blocks_removed += o.blocks_removed;
+        self.bytes_written += o.bytes_written;
+        self.series_dropped += o.series_dropped;
+    }
+}
+
+/// A rewrite of blocks (a merge's two, or one retention cuts short), planned under the store's
+/// lock with its file's name reserved, built from the files alone ([`Rewrite::build`]), and taken
+/// in under the lock again ([`Store::commit`]): the building, which reads and writes whole blocks,
+/// holds nothing, so the group goes on applying meanwhile.
+#[derive(Debug)]
+pub struct Rewrite {
+    dir: PathBuf,
+    /// Its inputs, in write order.
+    from: Vec<(u64, String)>,
+    /// Samples older are left out: the durable cutoff when it was planned.
+    keep_from: i64,
+    file: String,
+    /// Its place in write order: its newest input's.
+    seq: u64,
+    epoch: u64,
+}
+
+/// A rewrite built, to be taken in.
+#[derive(Debug)]
+pub struct Built {
+    rewrite: Rewrite,
+    block: Block,
+}
+
+impl Rewrite {
+    /// Reads every input whole and writes the rewritten block: every series of any input, its
+    /// samples merged (a later input's winning at a time) without those older than the cutoff,
+    /// and a series left with none left out; its kind the newest input's, as the index had it when
+    /// that block was cut. An input gone since the plan (another rewrite or an install took it)
+    /// is an error, and so the plan is stale: nothing of it is left on disk.
+    pub fn build(self) -> Result<Built, StoreError> {
+        let out = self.dir.join(&self.file);
+        match self.build_inner() {
+            Ok(block) => Ok(Built { rewrite: self, block }),
+            Err(e) => {
+                let _ = std::fs::remove_file(&out);
+                Err(e)
+            }
+        }
+    }
+
+    fn build_inner(&self) -> Result<Block, StoreError> {
+        let blocks: Vec<Block> = self.from.iter().map(|(_, f)| Block::open(&self.dir.join(f))).collect::<Result<_, _>>()?;
+        let mut keys: Vec<(u64, Kind, Vec<u8>)> = Vec::new();
+        for blk in blocks.iter().rev() {
+            for s in blk.series() {
+                let (fp, kind, key) = s?;
+                keys.push((fp, kind, key.to_vec()));
+            }
+        }
+        // Stable: of one fingerprint, the newest input's first.
+        keys.sort_by_key(|k| k.0);
+        keys.dedup_by_key(|k| k.0);
+        let mut buf = Vec::new();
+        let mut chunks_of: Vec<Vec<Chunk>> = Vec::with_capacity(keys.len());
+        let (mut ts, mut vs) = (Vec::new(), Vec::new());
+        for (fp, _, _) in &keys {
+            ts.clear();
+            vs.clear();
+            let mut parts: Vec<(Vec<i64>, Vec<f64>)> = Vec::new();
+            for blk in &blocks {
+                if let Some(i) = blk.find(*fp) {
+                    let (mut t, mut v) = (Vec::new(), Vec::new());
+                    blk.read(i, self.keep_from, i64::MAX, &mut buf, &mut t, &mut v)?;
+                    parts.push((t, v));
+                }
+            }
+            if parts.len() == 1 {
+                if let Some((t, v)) = parts.pop() {
+                    chunks_of.push(rechunk(&t, &v));
+                }
+            } else {
+                merge_parts(parts, &mut ts, &mut vs);
+                chunks_of.push(rechunk(&ts, &vs));
+            }
+        }
+        let series: Vec<SeriesData<'_>> = keys.iter().zip(&chunks_of).map(|((fp, kind, key), chunks)| SeriesData { fp: *fp, kind: *kind, key, chunks: chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect() }).collect();
+        Ok(block::write(&self.dir.join(&self.file), series)?)
+    }
+
+    /// Bytes its inputs hold.
+    pub fn input_bytes(&self) -> u64 {
+        self.from.iter().filter_map(|(_, f)| std::fs::metadata(self.dir.join(f)).ok()).map(|m| m.len()).sum()
+    }
+}
+
+fn remove_if_there(path: &Path) -> Result<(), StoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StoreError::Io { path: path.to_owned(), source }),
+    }
+}
+
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
     move |source| StoreError::Io { path: path.to_owned(), source }
 }
@@ -278,6 +383,7 @@ impl Store {
             sessions: BTreeMap::new(),
             conf: Membership::default(),
             totals: Counts::default(),
+            epoch: 0,
             pending: Vec::new(),
             pending_at: HashTable::new(),
         }
@@ -678,163 +784,123 @@ impl Store {
     /// Compacts blocks by the logarithmic method (Bentley and Saxe, "Decomposable searching
     /// problems I: static-to-dynamic transformation", J. Algorithms 1980): the two newest blocks
     /// are merged while the newer holds at least half of what the older does, so a store keeps
-    /// O(log n) blocks of n samples and a sample is rewritten O(log n) times.
+    /// O(log n) blocks of n samples and a sample is rewritten O(log n) times. Here, under the
+    /// caller's hold of the store; [`Store::plan_merge`] does it a merge at a time apart.
     pub fn compact(&mut self) -> Result<Maintained, StoreError> {
         let mut done = Maintained::default();
-        while let [.., older, newer] = self.blocks.as_slice()
-            && newer.block.bytes.saturating_mul(2) >= older.block.bytes
-        {
-            let (a, b) = (self.blocks.len() - 2, self.blocks.len() - 1);
-            let d = self.merge_from(a, b, self.manifest.cutoff)?;
-            done.blocks_written += d.blocks_written;
-            done.blocks_removed += d.blocks_removed;
-            done.bytes_written += d.bytes_written;
+        while let Some(plan) = self.plan_merge() {
+            done += self.commit(plan.build()?)?;
         }
         Ok(done)
     }
 
-    /// Merges blocks `a` and `b` (adjacent in write order, `a` the older) into one; samples older
-    /// than `keep_from` are left out, and a series left with none.
-    fn merge_from(&mut self, a: usize, b: usize, keep_from: i64) -> Result<Maintained, StoreError> {
-        let dir = self.dir.clone().ok_or(StoreError::NoDir)?;
-        let (Some(older), Some(newer)) = (self.blocks.get(a), self.blocks.get(b)) else { return Ok(Maintained::default()) };
-        // Every series of either, its samples merged (the newer's winning at a time), re-chunked;
-        // its kind the newer's, as the index had it when the newer was cut.
-        let mut keys: Vec<(u64, Kind, Vec<u8>)> = Vec::new();
-        for blk in [&newer.block, &older.block] {
-            for s in blk.series() {
-                let (fp, kind, key) = s?;
-                keys.push((fp, kind, key.to_vec()));
-            }
+    /// The merge the logarithmic method calls for now, if any ([`Store::compact`]): its file's
+    /// name reserved, to be built apart from the store ([`Rewrite::build`]) and taken in after
+    /// ([`Store::commit`]).
+    pub fn plan_merge(&mut self) -> Option<Rewrite> {
+        let dir = self.dir.clone()?;
+        let [.., older, newer] = self.blocks.as_slice() else { return None };
+        if newer.block.bytes.saturating_mul(2) < older.block.bytes {
+            return None;
         }
-        keys.sort_by_key(|k| k.0);
-        keys.dedup_by_key(|k| k.0);
-        let mut buf = Vec::new();
-        let mut chunks_of: Vec<Vec<Chunk>> = Vec::with_capacity(keys.len());
-        for (fp, _, _) in &keys {
-            let (mut ts, mut vs) = (Vec::new(), Vec::new());
-            let mut parts: Vec<(Vec<i64>, Vec<f64>)> = Vec::new();
-            for blk in [&older.block, &newer.block] {
-                if let Some(i) = blk.find(*fp) {
-                    let (mut t, mut v) = (Vec::new(), Vec::new());
-                    blk.read(i, keep_from, i64::MAX, &mut buf, &mut t, &mut v)?;
-                    parts.push((t, v));
-                }
-            }
-            merge_parts(parts, &mut ts, &mut vs);
-            chunks_of.push(rechunk(&ts, &vs));
-        }
+        let from = vec![(older.seq, older.file.clone()), (newer.seq, newer.file.clone())];
         let seq = newer.seq;
-        let file = manifest::block_file(self.manifest.next_seq);
-        let series: Vec<SeriesData<'_>> = keys.iter().zip(&chunks_of).map(|((fp, kind, key), chunks)| SeriesData { fp: *fp, kind: *kind, key, chunks: chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect() }).collect();
-        let block = block::write(&dir.join(&file), series)?;
-        let bytes = block.bytes;
-        let removed: Vec<String> = vec![older.file.clone(), newer.file.clone()];
-        let mut manifest = self.manifest.clone();
-        manifest.next_seq += 1;
-        manifest.blocks.retain(|e| !removed.contains(&e.file));
-        manifest.blocks.push(BlockEntry { seq, file: file.clone() });
-        manifest.blocks.sort_by_key(|e| e.seq);
-        manifest::sync_dir(&dir).map_err(io_err(&dir))?;
-        manifest.save(&dir)?;
-        self.manifest = manifest;
-        self.blocks.remove(b);
-        self.blocks.remove(a);
-        let at = self.blocks.partition_point(|x| x.seq < seq);
-        self.blocks.insert(at, OpenBlock { seq, file, block });
-        for f in &removed {
-            let p = dir.join(f);
-            std::fs::remove_file(&p).map_err(io_err(&p))?;
-        }
-        Ok(Maintained { blocks_written: 1, blocks_removed: 2, bytes_written: bytes, series_dropped: 0 })
+        Some(self.reserve(dir, from, seq))
     }
 
-    /// Deletes what the durable cutoff left behind: files wholly older are removed, and a block
-    /// partly older is rewritten without its older samples once that is more than half of it. The
+    /// The rewrite retention calls for now, if any: a block more than half older than the durable
+    /// cutoff, rewritten without its older samples.
+    pub fn plan_retention(&mut self) -> Option<Rewrite> {
+        let dir = self.dir.clone()?;
+        let cutoff = self.manifest.cutoff;
+        let b = self.blocks.iter().find(|b| {
+            let span = i128::from(b.block.max_ts) - i128::from(b.block.min_ts);
+            let expired = i128::from(cutoff) - i128::from(b.block.min_ts);
+            span > 0 && expired * 2 > span
+        })?;
+        let (from, seq) = (vec![(b.seq, b.file.clone())], b.seq);
+        Some(self.reserve(dir, from, seq))
+    }
+
+    fn reserve(&mut self, dir: PathBuf, from: Vec<(u64, String)>, seq: u64) -> Rewrite {
+        let file = manifest::block_file(self.manifest.next_seq);
+        self.manifest.next_seq += 1;
+        Rewrite { dir, from, keep_from: self.manifest.cutoff, file, seq, epoch: self.epoch }
+    }
+
+    /// Takes a built rewrite in: its block in its inputs' place, the manifest saved, the inputs
+    /// deleted, if the store still holds every input; else (an install replaced the store, or the
+    /// inputs went) its file is deleted. Under the caller's hold of the store, and quick: the
+    /// building was done apart.
+    pub fn commit(&mut self, built: Built) -> Result<Maintained, StoreError> {
+        let Built { rewrite: r, block } = built;
+        let held = r.epoch == self.epoch && r.from.iter().all(|(seq, f)| self.blocks.iter().any(|b| b.seq == *seq && b.file == *f));
+        let path = r.dir.join(&r.file);
+        if !held {
+            drop(block);
+            remove_if_there(&path)?;
+            return Ok(Maintained::default());
+        }
+        let bytes = block.bytes;
+        let empty = block.is_empty();
+        let mut manifest = self.manifest.clone();
+        manifest.blocks.retain(|e| !r.from.iter().any(|(_, f)| *f == e.file));
+        if !empty {
+            manifest.blocks.push(BlockEntry { seq: r.seq, file: r.file.clone() });
+            manifest.blocks.sort_by_key(|e| e.seq);
+        }
+        manifest::sync_dir(&r.dir).map_err(io_err(&r.dir))?;
+        manifest.save(&r.dir)?;
+        // The manifest's numbering went on while this was built: keep what this store reserved.
+        manifest.next_seq = manifest.next_seq.max(self.manifest.next_seq);
+        self.manifest = manifest;
+        self.blocks.retain(|b| !r.from.iter().any(|(_, f)| *f == b.file));
+        if empty {
+            drop(block);
+            remove_if_there(&path)?;
+        } else {
+            let at = self.blocks.partition_point(|x| x.seq < r.seq);
+            self.blocks.insert(at, OpenBlock { seq: r.seq, file: r.file.clone(), block });
+        }
+        for (_, f) in &r.from {
+            remove_if_there(&r.dir.join(f))?;
+        }
+        Ok(Maintained { blocks_written: u64::from(!empty), blocks_removed: r.from.len() as u64, bytes_written: if empty { 0 } else { bytes }, series_dropped: 0 })
+    }
+
+    /// Deletes the files wholly older than the durable cutoff (quick: no file is rewritten). The
     /// index is the cutoff's already ([`Store::retain_logical`]); only the files change.
-    pub fn retain_files(&mut self) -> Result<Maintained, StoreError> {
+    pub fn drop_expired(&mut self) -> Result<Maintained, StoreError> {
         let dir = self.dir.clone().ok_or(StoreError::NoDir)?;
         let cutoff = self.manifest.cutoff;
         let mut done = Maintained::default();
         let logs_gone = self.logs.retain(cutoff.saturating_mul(1_000_000));
-        if !logs_gone.is_empty() {
-            let mut manifest = self.manifest.clone();
-            manifest.logs.retain(|e| !logs_gone.contains(&e.file));
-            manifest.save(&dir)?;
-            self.manifest = manifest;
-            for f in &logs_gone {
-                let p = dir.join(f);
-                std::fs::remove_file(&p).map_err(io_err(&p))?;
-            }
-            done.blocks_removed += logs_gone.len() as u64;
-        }
         let gone: Vec<String> = self.blocks.iter().filter(|b| b.block.max_ts < cutoff).map(|b| b.file.clone()).collect();
-        if !gone.is_empty() {
-            let mut manifest = self.manifest.clone();
-            manifest.blocks.retain(|e| !gone.contains(&e.file));
-            manifest.save(&dir)?;
-            self.manifest = manifest;
-            self.blocks.retain(|b| !gone.contains(&b.file));
-            for f in &gone {
-                let p = dir.join(f);
-                std::fs::remove_file(&p).map_err(io_err(&p))?;
-            }
-            done.blocks_removed += gone.len() as u64;
+        if logs_gone.is_empty() && gone.is_empty() {
+            return Ok(done);
         }
-        // A block more than half expired: rewritten alone (merged with nothing).
-        let mut i = 0;
-        while let Some(b) = self.blocks.get(i) {
-            let span = i128::from(b.block.max_ts) - i128::from(b.block.min_ts);
-            let expired = i128::from(cutoff) - i128::from(b.block.min_ts);
-            if span > 0 && expired * 2 > span {
-                let d = self.rewrite_alone(i, cutoff)?;
-                done.blocks_written += d.blocks_written;
-                done.bytes_written += d.bytes_written;
-            }
-            i += 1;
+        let mut manifest = self.manifest.clone();
+        manifest.logs.retain(|e| !logs_gone.contains(&e.file));
+        manifest.blocks.retain(|e| !gone.contains(&e.file));
+        manifest.save(&dir)?;
+        self.manifest = manifest;
+        self.blocks.retain(|b| !gone.contains(&b.file));
+        for f in logs_gone.iter().chain(&gone) {
+            remove_if_there(&dir.join(f))?;
         }
+        done.blocks_removed = (logs_gone.len() + gone.len()) as u64;
         Ok(done)
     }
 
-    fn rewrite_alone(&mut self, i: usize, keep_from: i64) -> Result<Maintained, StoreError> {
-        // Merging a block with itself: one input, the older samples left out.
-        let dir = self.dir.clone().ok_or(StoreError::NoDir)?;
-        let Some(b) = self.blocks.get(i) else { return Ok(Maintained::default()) };
-        let mut buf = Vec::new();
-        let mut keys = Vec::new();
-        let mut chunks_of = Vec::new();
-        for s in b.block.series() {
-            let (fp, kind, key) = s?;
-            let (mut ts, mut vs) = (Vec::new(), Vec::new());
-            if let Some(j) = b.block.find(fp) {
-                b.block.read(j, keep_from, i64::MAX, &mut buf, &mut ts, &mut vs)?;
-            }
-            keys.push((fp, kind, key.to_vec()));
-            chunks_of.push(rechunk(&ts, &vs));
+    /// Deletes what the durable cutoff left behind: files wholly older are removed, and a block
+    /// partly older is rewritten without its older samples once that is more than half of it.
+    pub fn retain_files(&mut self) -> Result<Maintained, StoreError> {
+        let mut done = self.drop_expired()?;
+        while let Some(plan) = self.plan_retention() {
+            done += self.commit(plan.build()?)?;
         }
-        let (seq, old_file) = (b.seq, b.file.clone());
-        let file = manifest::block_file(self.manifest.next_seq);
-        let series: Vec<SeriesData<'_>> = keys.iter().zip(&chunks_of).map(|((fp, kind, key), chunks)| SeriesData { fp: *fp, kind: *kind, key, chunks: chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect() }).collect();
-        let block = block::write(&dir.join(&file), series)?;
-        let bytes = block.bytes;
-        let mut manifest = self.manifest.clone();
-        manifest.next_seq += 1;
-        for e in &mut manifest.blocks {
-            if e.file == old_file {
-                e.file = file.clone();
-            }
-        }
-        manifest::sync_dir(&dir).map_err(io_err(&dir))?;
-        manifest.save(&dir)?;
-        self.manifest = manifest;
-        if let Some(slot) = self.blocks.get_mut(i) {
-            *slot = OpenBlock { seq, file, block };
-        }
-        let p = dir.join(&old_file);
-        std::fs::remove_file(&p).map_err(io_err(&p))?;
-        Ok(Maintained { blocks_written: 1, blocks_removed: 1, bytes_written: bytes, series_dropped: 0 })
+        Ok(done)
     }
-
     /// The image of what is durable: its replicated state and its files, in write order.
     pub fn image(&self) -> Image {
         let mut files: Vec<ImageFile> = Vec::with_capacity(self.blocks.len() + self.logs.files.len());
@@ -922,14 +988,11 @@ impl Store {
         manifest::sync_dir(&dir).map_err(io_err(&dir))?;
         manifest.save(&dir)?;
         for e in self.manifest.blocks.iter().chain(&self.manifest.logs) {
-            let p = dir.join(&e.file);
-            match std::fs::remove_file(&p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(StoreError::Io { path: p, source: e }),
-            }
+            remove_if_there(&dir.join(&e.file))?;
         }
+        let epoch = self.epoch + 1;
         *self = Self::open(&dir, self.hash)?;
+        self.epoch = epoch;
         Ok(())
     }
 
