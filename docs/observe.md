@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; next: anomaly, forecast, composite | in progress |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub done; next: AWS, GCP, Azure | in progress |
-| O-10 | Load, soak and fault scenarios end to end; profiles; allocation and fault passes | continuous |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Next: full disks, clock skew, soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
 
 ## 1. Rules
 
@@ -126,18 +126,37 @@ of percentiles are not. Explicit-bucket histograms are re-binned at query time w
 
 ### 4.5 Head and blocks
 
-The head holds recent samples in memory: each series' open chunk and its closed chunks. When the
-head spans `BLOCK_SPAN` of time or holds `HEAD_BYTES`, it is cut into an immutable **block** file:
+The head holds recent samples in memory: each series' open chunk and its closed chunks. The head is
+cut into an immutable **block** file when the group compacts its log (§5: the log is the
+write-ahead log, so a cut is what lets it be trimmed):
 
 ```
-block = header | symbols | series table | postings | chunk index | chunk data | footer(crc32c)
+block  = MAGIC | FORMAT 2 | data | index | footer
+data   = each series' region, by fingerprint
+region = table length | table (chunks | per chunk: first, last-first, count, length) | chunks
+index  = per series, by fingerprint: fp | kind | key | region offset, length, crc32c | first, last
+footer = index offset, length | min ts | max ts | crc32c(index, footer) | TAIL
 ```
 
-Columnar within the block: the series table, postings and chunk index are each one contiguous,
-sorted column; a query reads the index columns once and then only the chunks it needs, with
-positioned reads (`pread`), letting the page cache keep hot blocks. Blocks are compacted into larger
-ones by time (levels of spans, Prometheus's TSDB layout), and dropped past retention. A manifest
-(rewritten by rename) lists the live blocks and the Raft point the head was cut at.
+An open block holds, of each series, its fingerprint and where its region is (some 48 bytes):
+nothing a chunk or a key, so what a store holds in memory grows with its series and its blocks, not
+its samples (Prometheus's blocks and ClickHouse's parts read their marks from disk the same way). A
+read is one positioned read of a series' region, checked against its own CRC-32C, its table first
+and its length before it, so the chunks a range wants are found without reading the table twice.
+Keys are read from the index when the store opens (to rebuild its index of series) and when blocks
+merge.
+
+Blocks merge by the logarithmic method (Bentley and Saxe 1980): the oldest neighbouring pair whose
+newer block holds at least half the older's is merged, in its place, until none is, so a store keeps
+O(log n) blocks and a sample is rewritten O(log n) times. (Merging only the newest pair stalled: a
+busy group cuts a big block and then a small one, a compaction's and a snapshot's, and a small cut
+always sat at the newest end.) A merge is written as it is read, a series at a time: a series one
+input holds is copied whole; inputs whose spans of a series follow one another have their chunks
+appended (a Gorilla chunk stands alone); only overlap (late writes), retention and chunks under half
+full are decoded and packed anew. Maintenance runs on a thread of its own, told of every cut, and
+takes a merge in only if its inputs are still there. A manifest (rewritten by rename) lists the live
+blocks and the log point the head was cut at; files wholly past retention are deleted, a block more
+than half past it rewritten.
 
 ### 4.6 Logs and events
 
@@ -290,8 +309,7 @@ time, sent again until answered; §5), from:
   put into protobuf's wire format and read by the one decoder), gzip or not, up to 20 MiB (the
   OpenTelemetry Collector's default). The server asks the ingest token (`<data>/observe/
   ingest.token`) or the admin's; every runner takes OTLP on `127.0.0.1:4318` (OTLP/HTTP's port;
-  `KILN_OTLP_ADDR`, or `off`) as a local collector would. A node three quarters full of waiting
-  points answers 503 with `Retry-After`, which exporters retry. Metrics map by type (gauges;
+  `KILN_OTLP_ADDR`, or `off`) as a local collector would. Metrics map by type (gauges;
   sums by temporality and monotonicity; histograms' count, sum, min, max and buckets;
   exponential histograms' quantiles too; summaries); logs keep their time, severity, body,
   attributes and trace context, `service` and `host` from the resource.
@@ -316,6 +334,24 @@ time, sent again until answered; §5), from:
 
 To come: AWS CloudWatch, GCP Cloud Monitoring and Azure Monitor pulled on a schedule (§10);
 Prometheus endpoints scraped.
+
+**Taking what comes, and refusing** (`crate::observe::owner`, `crate::observe::ingest`): a request
+is answered 200 only once its points have room, taken where it is answered (an atomic reservation
+against the batcher's bound, 4 M points and 64 MiB of logs; released as writes are cut), so nothing
+answered 200 is ever dropped for room. Exporters' requests may take three quarters of it, kiln's
+own figures the rest. And a queue is held to a wait, as CoDel holds one (Nichols and Jacobson,
+"Controlling Queue Delay", 2012; RFC 8289): series go into writes oldest first, which bounds each
+series' wait by the queue's, and while the oldest waiting point has waited more than a second
+(`TARGET`, five flushes) for a whole second (`INTERVAL`: its least over it, so a burst that drains
+in time is no reason), exporters are refused with 503 and `Retry-After: 1` until it drains; an
+exporter keeps a refused batch and sends it again. Measured live (§13): a runner whose server went
+away refused within 0.5 s at full rate (the bound) and within 2.4 s at 100 k points a second (the
+wait), and stored everything it had taken once the server was back.
+
+A decoded OTLP request is its series' keys once and its samples flat, each with its series' place;
+the batcher keeps what waits the same way, one buffer, sorted by series with a counting sort when a
+write is cut. A series' key is made (checked, sorted, fingerprinted) once in a node's life: a
+sharded cache of keys by their canonical bytes, shared (`Arc`) with every write that holds one.
 
 ## 9. Monitors
 
@@ -618,6 +654,50 @@ timeout after a write was answered before sending the next (up to the owner's 10
 owner now waits exactly until the earliest of its tick, the batcher's next write and the replica's
 own wake.
 
+### 12.10 OTLP decoded
+
+2026-10-18, same machine: `cargo bench -p kiln-obs --bench otlp`. A request decoded into series,
+the median of 51; allocations and page faults counted over one; "warm" is a receiver's steady
+state, its series' keys made by the requests before (the node's key cache).
+
+| request | points | before: ns, allocations a point | cold | warm |
+| --- | --- | --- | --- | --- |
+| the load test's: 1 resource attribute, 1,000 series of a gauge | 1,000 | 328, 18.0 | 309, 4.1 | 158, 1.04 |
+| an SDK's: 9 resource attributes, a histogram of 14 bounds and a sum by method, route and status, 4 runtime gauges (50 routes) | 904 | 1,134, 40.6 | 895, 6.2 | 361, 1.09 |
+
+Before, every point's tags were cloned three times (the attributes, the merge over the resource's,
+the scratch) and its series' key made again, SHA-256 and all. Tags are read borrowed from the
+request now (a value is copied only when it is not text), merged into a reused list, written into a
+reused buffer as the canonical key, and found by a keyed hash: first in the request's own series,
+then in the node's keys. gzip's inflating is 6 to 12 ns a point. Since the samples went flat
+(§8) a warm request allocates twice, not once a series.
+
+### 12.11 Under load, end to end
+
+2026-10-18, same machine (32 threads, shared: the load average stood at 30 to 36 from other work,
+so absolute rates vary between runs; what a point costs varies less): `cargo test --release -p
+kiln --test observe_load -- --ignored --nocapture`. A server and a runner as processes; 8 senders,
+half to each, of OTLP/HTTP protobuf, gzip, kept-alive connections, 1,000 points a request, as fast
+as they are answered; no reader (`KOBS_LOAD_READ=0`) unless said. Every point answered 200 was
+stored exactly once and every replica agreed at the end of every run below.
+
+| | 20 s, at first | 20 s, samples flat (§8) | 40 s, blocks of format 2 (§4.5) |
+| --- | --- | --- | --- |
+| points taken | 174 M (8.7 M/s) | 400 M (20.0 M/s) | 536 M (13.4 M/s, maintenance merging; the machine loaded) |
+| a request | p50 0.28 ms, p99 0.72 ms | p50 0.24, p99 0.55 | — |
+| the newest points readable | — | 225 ms after the flood | 237 ms |
+| server: peak RSS | 691 MiB | 418 | 297 |
+| runner: peak RSS | 629 MiB | 331 | 187 |
+| the server's store | — | 22 blocks, index 105 MiB | 3 blocks, index 2.6 MiB |
+| maintenance, CPU a node | — | none ran (the stall) | 1.9 s |
+
+What the runs found: a flood taken and then dropped (fixed by admission, §8); glibc's per-thread
+arenas keeping freed request buffers (`arena_max=2` alone halved the server's memory; samples flat
+removed the cause: a thousand blocks a request allocated on one thread and freed on another);
+merges that stopped, an index that grew with samples, and merges that held whole blocks (§4.5).
+With a reader alongside (a dashboard's two queries every 250 ms: one series, and all 8,000 summed by
+host over 15 minutes), one series answered in 0.19 ms at the median, all of them by host in 335 ms.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -666,7 +746,12 @@ all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch); and e
 loads in both with no error, failed request or sideways overflow, against a server holding two
 hours of metrics, an hour of logs, events, and three monitors alerting to a webhook and to Slack.
 
-To come: full disks, clock skew, load and soak.
+**Under load** (`crates/kiln/tests/observe_load.rs`): the flood of §12.11, every point taken
+stored exactly once, the replicas alike; and a runner flooded while its server is killed (SIGKILL)
+and later started again: it refuses in time (0.5 s at full rate, 2.4 s at 100 k points a second),
+its memory bounded, and everything it took is stored once the server is back.
+
+To come: full disks, clock skew, soak.
 
 ## 14. References
 
