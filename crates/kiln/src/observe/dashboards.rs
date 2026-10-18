@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 /// Widgets a dashboard holds at the most, and bytes it may be.
 const WIDGETS: usize = 100;
 pub const BYTES: usize = 1 << 20;
-const KINDS: &[&str] = &["timeseries", "query_value", "toplist", "table", "logs", "events", "monitors", "note"];
+const KINDS: &[&str] = &["timeseries", "query_value", "toplist", "table", "heatmap", "distribution", "logs", "events", "monitors", "note"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Dashboard {

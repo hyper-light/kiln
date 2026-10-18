@@ -181,6 +181,48 @@ const scenarios = {
     expect([23, 24, 25].includes(max), `a whole day's hours at the most: ${max}`);
   },
 
+  /** A distribution on a dashboard: two hosts' values, a heatmap of them and their bars, the bars'
+   * p50 and p99 marked; a cell tapped says its range and count. */
+  async "a distribution is drawn as a heatmap and as bars, its percentiles marked"() {
+    const metric = `e2e.dist.${run}`;
+    const now = Date.now();
+    // Six points of 200 values a host over the last half hour (deterministic, a host each level).
+    const points = (level) =>
+      Array.from({ length: 6 }, (_, k) => [(now - (30 - 5 * k) * 60_000) / 1000, Array.from({ length: 200 }, (_, i) => Math.exp(level + Math.sin(i * 12.9898 + k * 7.233) * 0.8))]);
+    const posted = await api("POST", "/api/observe/v1/distribution_points", {
+      series: [
+        { metric, host: "a", points: points(-3) },
+        { metric, host: "b", points: points(-2) },
+      ],
+    });
+    expect(posted.status === 202, `posting the values: ${posted.status}`);
+    await until(
+      "all 2,400 counted",
+      async () => (await api("POST", "/api/observe/v1/query", { query: `count:${metric}{*}`, from: now - 3_600_000, to: now + 60_000, points: 1 })).body?.series?.[0]?.values?.[0] === 2400,
+    );
+    const widget = (id, title, kind, query, y) => ({ id, title, kind, queries: [query], search: "", text: "", layout: { x: 0, y, w: 12, h: 4 }, options: { unit: "s" } });
+    const d = await api("POST", "/api/observe/v1/dashboards", {
+      title: `e2e distribution ${run}`,
+      description: "",
+      template_variables: [],
+      widgets: [widget("h", "Its heatmap", "heatmap", `p50:${metric}{*}`, 0), widget("d", "Its distribution", "distribution", `p50:${metric}{*} by {host}`, 4)],
+    });
+    expect(d.status === 200 || d.status === 201, `the dashboard: ${d.status}`);
+    const id = d.body.id;
+    await page.goto(`${BASE}/observe/dashboards/${id}?range=1h`);
+    const heat = page.getByRole("img", { name: /^A heatmap: \d+ rows of values/ });
+    await heat.waitFor({ timeout: 20_000 });
+    const bars = page.getByRole("img", { name: /^A distribution of 2,400 values, p50 .+, p99 .+/ });
+    await bars.waitFor({ timeout: 20_000 });
+    // The busiest cell is a tap away from saying what it holds.
+    const box = await heat.boundingBox();
+    await heat.click({ position: { x: Math.max(70, box.width * 0.95), y: box.height * 0.5 } });
+    await page.locator(".obs-tooltip").first().waitFor({ timeout: 5_000 });
+    const said = await page.locator(".obs-tooltip").first().textContent();
+    expect(/ – .+: [\d,]+$/.test(said?.trim() ?? ""), `a cell's range and count: ${said}`);
+    await api("DELETE", `/api/observe/v1/dashboards/${id}`);
+  },
+
   /** kiln's own dashboard narrowed to one host by its template variable. */
   async "a template variable narrows every widget to its value"() {
     const hosts = (await api("GET", "/api/observe/v1/tags?key=host")).body.values;

@@ -17,6 +17,7 @@ import {
   dataOf,
   firstLine,
   formatValue,
+  heatmapRes,
   logsOnly,
   monitorsRes,
   queriesRes,
@@ -26,6 +27,8 @@ import {
   within,
   type Range,
 } from "./parts";
+
+import { DistributionChart, HeatmapChart } from "./heatmap";
 
 // Markdown's renderer is big: only a dashboard with a note loads it.
 const MarkdownBody = React.lazy(() => import("@/lib/markdown").then((m) => ({ default: m.MarkdownBody })));
@@ -40,6 +43,8 @@ export const KIND_WORDS: Record<Widget["kind"], string> = {
   query_value: "Query value",
   toplist: "Top list",
   table: "Table",
+  heatmap: "Heatmap",
+  distribution: "Distribution",
   logs: "Log stream",
   events: "Event stream",
   monitors: "Monitors",
@@ -60,6 +65,10 @@ export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: R
       return queries.length ? <TopList queries={queries} range={range} height={height} unit={unit} how={aggregator(w)} /> : <Empty height={height} what="a query" />;
     case "table":
       return queries.length ? <SeriesTable queries={queries} range={range} height={height} unit={unit} /> : <Empty height={height} what="a query" />;
+    case "heatmap":
+      return queries[0] ? <Heat query={queries[0]} range={range} height={height - 18} unit={unit} /> : <Empty height={height} what="a query" />;
+    case "distribution":
+      return queries[0] ? <Spread query={queries[0]} range={range} height={height} unit={unit} /> : <Empty height={height} what="a query" />;
     case "logs":
       return <Stream query={logsOnly(fillSearch(w.search))} range={range} height={height} kind="logs" />;
     case "events":
@@ -73,6 +82,44 @@ export function WidgetBody({ w, range, fill, fillSearch }: { w: Widget; range: R
         </div>
       );
   }
+}
+
+/** The first query's heatmap over the range. */
+function Heat({ query, range, height, unit }: { query: string; range: Range; height: number; unit?: string }) {
+  const h = useRes(heatmapRes(query, range)).data;
+  return <HeatmapChart h={h} height={height} unit={unit} day={range === "7d" || range === "30d"} />;
+}
+
+/** A plain metric query (`[agg:]metric[{…}][ by {…}]`) as its `p`th percentile's over all of its
+ * series together (its groups' bars are counted together); none for another kind of query. */
+export function asPercentile(query: string, p: string): string | null {
+  const plain = /^\s*(?:[a-z]+[\d.]*:)?[\w.*?-]+(?:\{[^}]*\})?(?:\s+by\s+\{[^}]*\})?\s*$/i;
+  if (!plain.test(query)) return null;
+  const ungrouped = query.replace(/\s+by\s+\{[^}]*\}\s*$/i, "").trim();
+  return /^[a-z]+[\d.]*:/i.test(ungrouped) ? ungrouped.replace(/^[a-z]+[\d.]*:/i, `${p}:`) : `${p}:${ungrouped}`;
+}
+
+/** The first query's values over the whole range, counted by their row, its median and 99th
+ * percentile the server's. */
+function Spread({ query, range, height, unit }: { query: string; range: Range; height: number; unit?: string }) {
+  const h = useRes(heatmapRes(query, range, 40, 1)).data;
+  const asked = ["p50", "p99"].map((p) => asPercentile(query, p));
+  const plain = asked.filter((q): q is string => q !== null);
+  const answers = useRes(queriesRes(plain, range, 1)).data;
+  // The percentile of every series together: a single answer's own (the query's groups are bars here).
+  const value = (i: number) => {
+    const a = answers[i];
+    const vs = (a?.series ?? []).flatMap((s) => s.values).filter((v): v is number => v !== null && Number.isFinite(v));
+    return a && a.series.length === 1 ? (vs[0] ?? null) : null;
+  };
+  const percentiles =
+    plain.length === 2
+      ? [
+          { label: "p50", v: value(0) },
+          { label: "p99", v: value(1) },
+        ]
+      : [];
+  return <DistributionChart h={h} height={height} unit={unit} percentiles={percentiles} />;
 }
 
 const aggregator = (w: Widget) => (w.options as { aggregator?: string } | null)?.aggregator ?? "avg";

@@ -20,7 +20,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
-| O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time, heatmaps); next: the heatmap and distribution widgets | in progress |
+| O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); next: CloudWatch Metric Streams, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Next: hours-long soaks; a rollup tier for long ranges | continuous |
 
@@ -735,8 +735,14 @@ time range and the search in the address (a page is a link).
   is and whether it holds the same (its full digest at the server's index; "Compare replicas" asks
   for them).
 - **Dashboards**: Datadog's model near enough. Widgets on a grid of twelve columns (one column on a
-  phone): timeseries (lines, areas or bars), query value, top list, table, log stream, event
-  stream, monitors, note (Markdown). Template variables above them (`$host` in a query stands for
+  phone): timeseries (lines, areas or bars), query value, top list, table, heatmap, distribution,
+  log stream, event stream, monitors, note (Markdown). A heatmap is its query's values counted in
+  each bucket of time by the row they fall in (a distribution's rows its buckets, §4.4; another
+  query's equal ranges of its series' values), each cell in one hue, brighter for more, on a log
+  scale (a few busy cells do not wash the rest out), its scale beside it; a distribution widget is
+  the whole range's counts as bars, its p50 and p99 marked (the server's percentiles of the same
+  query, not read again from bars that may be coarser than the buckets they came of). A cell or a
+  bar, hovered or tapped, says its range and count. Template variables above them (`$host` in a query stands for
   `host:<value>`, or any), chosen from the tag's values, kept in the address. Your own are edited in
   place: add, change, move, resize, remove, then save; kiln's own (hosts, CI, CD) are copied to be
   changed.
@@ -1358,7 +1364,10 @@ service's never; paused, what comes waits (said how many) and resuming shows it;
 pauses; a
 monitor made from the form, muted, unmuted and deleted; a composite made from the form of two
 monitors grouped by host (web01–03 and web02–04), alerting web02 and web03 alone, listing what it
-reads, and one of them refused deletion from its page while the composite reads it; a signed webhook
+reads, and one of them refused deletion from its page while the composite reads it; a distribution
+posted as Datadog's distribution points drawn on a dashboard as a heatmap and as bars, both
+p50 and p99 marked, a cell tapped saying its range and count; a scrape target tested, added, seen
+up and removed; a signed webhook
 added, tested (the receiver checks the signature) and removed. Each makes its own records and checks through the API,
 not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a

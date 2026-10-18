@@ -289,7 +289,7 @@ const UNITS = [
   { value: "B/s", label: "Bytes a second" },
   { value: "s", label: "Seconds" },
 ];
-const isMetric = (k: WidgetKind) => k === "timeseries" || k === "query_value" || k === "toplist" || k === "table";
+const isMetric = (k: WidgetKind) => k === "timeseries" || k === "query_value" || k === "toplist" || k === "table" || k === "heatmap" || k === "distribution";
 
 /** A widget's kind, title, what it shows, and its size. */
 function WidgetDialog({ w, onClose, onSave }: { w: Widget; onClose: () => void; onSave: (w: Widget) => void }) {

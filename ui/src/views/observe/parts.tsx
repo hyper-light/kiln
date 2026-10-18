@@ -17,6 +17,7 @@ import {
   type ObserveStatus,
   type QueryAnswer,
   type Scrape,
+  type HeatmapAnswer,
 } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES, type Band } from "@/components/charts/types";
@@ -120,6 +121,16 @@ export const queryRes = (query: string, range: Range, points = 240): Res<QueryAn
   opts: { pollMs: pollFor(range) },
 });
 
+/** A query's heatmap over the last `range`: `rows` rows at the most, `points` buckets of time. */
+export const heatmapRes = (query: string, range: Range, rows = 40, points = 120): Res<HeatmapAnswer> => ({
+  key: `observe/heatmap/${range}/${rows}/${points}/${query}`,
+  fetch: (signal) => {
+    const now = Date.now();
+    return observeApi.heatmap({ query, from: now - RANGES[range], to: now, points, heatmap: rows }, signal);
+  },
+  opts: { pollMs: pollFor(range) },
+});
+
 /** What several queries answer over one range, read together (a widget's, the explorer's). */
 export const queriesRes = (queries: string[], range: Range, points = 240, ahead?: number): Res<QueryAnswer[]> => ({
   key: `observe/queries/${range}/${points}/${ahead ?? ""}/${queries.join("\n")}`,
@@ -173,7 +184,7 @@ export function formatValue(v: number | null | undefined, unit?: string): string
     case "MiB":
       return formatBytes(v * 1024 * 1024);
     case "s":
-      return formatDuration(v);
+      return formatSeconds(v);
     case "%":
       return `${compact(v)}%`;
     case "fraction":
@@ -181,6 +192,18 @@ export function formatValue(v: number | null | undefined, unit?: string): string
     default:
       return unit ? `${compact(v)} ${unit}` : compact(v);
   }
+}
+
+/** A metric's seconds: a latency's ns, µs or ms below a second (0.052 → "52 ms"), seconds below a
+ * minute, then as a job's duration reads ("4m 12s"). */
+export function formatSeconds(v: number): string {
+  const a = Math.abs(v);
+  if (a === 0) return "0 s";
+  if (a < 1e-6) return `${compact(v * 1e9)} ns`;
+  if (a < 1e-3) return `${compact(v * 1e6)} µs`;
+  if (a < 1) return `${compact(v * 1e3)} ms`;
+  if (a < 60) return `${compact(v)} s`;
+  return v < 0 ? `-${formatDuration(-v)}` : formatDuration(v);
 }
 
 /** 1234567 → 1.23M, 0.000123 → 1.23e-4: a number in a few characters. */

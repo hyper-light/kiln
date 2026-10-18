@@ -334,7 +334,16 @@ export interface CloudTest {
   warnings?: string[];
 }
 
-export type WidgetKind = "timeseries" | "query_value" | "toplist" | "table" | "logs" | "events" | "monitors" | "note";
+export type WidgetKind = "timeseries" | "query_value" | "toplist" | "table" | "heatmap" | "distribution" | "logs" | "events" | "monitors" | "note";
+
+/** A query's heatmap: each row's `[lo, hi]`, and each bucket of time's count in each row (a
+ * distribution's rows its buckets). */
+export interface HeatmapAnswer {
+  grid: { from: number; step: number; n: number; times?: number[] };
+  heatmap: { rows: [number, number][]; counts: number[][]; distribution: boolean };
+  applied: number;
+  took_ms: number;
+}
 
 export interface Widget {
   id: string;
@@ -375,6 +384,7 @@ export interface DashboardSummary {
 
 export const observeApi = {
   query: (body: { query: string; from: number; to: number; step?: number; points?: number }, signal?: AbortSignal) => request<QueryAnswer>("POST", `${BASE}/query`, body, { signal }),
+  heatmap: (body: { query: string; from: number; to: number; points?: number; heatmap: number }, signal?: AbortSignal) => request<HeatmapAnswer>("POST", `${BASE}/query`, body, { signal }),
   metrics: (match: string | undefined, signal?: AbortSignal) =>
     request<{ metrics: string[] }>("GET", `${BASE}/metrics${match ? `?match=${enc(match)}&limit=200` : "?limit=200"}`, undefined, { signal }),
   tagValues: (key: string, signal?: AbortSignal) => request<{ key: string; values: string[] }>("GET", `${BASE}/tags?key=${enc(key)}&limit=500`, undefined, { signal }),
