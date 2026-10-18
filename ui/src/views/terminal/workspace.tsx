@@ -455,7 +455,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
         />
       )}
       {/* tab strip */}
-      <div className={cn("flex h-10 shrink-0 items-stretch border-b border-[#1d1f23]", narrow && "hidden")}>
+      <div className={cn("h-10 shrink-0 items-stretch border-b border-[#1d1f23]", narrow ? "hidden" : "flex")}>
         <div role="tablist" aria-label="Terminal sessions" className="term-tabs flex min-w-0 flex-1 items-stretch overflow-x-auto">
           {tabs.map((t, i) => (
             <div

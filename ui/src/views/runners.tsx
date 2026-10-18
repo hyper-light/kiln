@@ -472,7 +472,7 @@ function AgentDetails({
           {agent.draining ? "Resume scheduling" : "Drain"}
         </Button>
         {!forgetting && (
-          <Button variant="ghost" size="xs" className="text-[#d1aaad]" onClick={() => setForgetting(true)}>
+          <Button variant="ghost-danger" size="xs" onClick={() => setForgetting(true)}>
             <Trash2 /> Forget
           </Button>
         )}

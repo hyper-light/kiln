@@ -175,8 +175,8 @@ export function AppShell({ me }: { me: Me | null }) {
             </Tip>
             <Button
               variant="ghost"
-              size="icon"
-              className="xl:hidden [&_svg]:size-5"
+              size="icon-lg"
+              className="xl:hidden"
               aria-label={menuOpen ? "Close navigation" : "Open navigation"}
               aria-expanded={menuOpen}
               aria-controls="site-menu"
