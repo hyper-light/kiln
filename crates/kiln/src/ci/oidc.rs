@@ -272,7 +272,7 @@ pub async fn admin(hub: &Hub, method: &http::Method, rest: &[&str], body: Value)
                 .iter()
                 .map(|k| json!({ "kid": k.times.kid, "created_at": k.times.created_at, "sign_from": k.times.sign_from, "signing": plan.sign.as_deref() == Some(k.times.kid.as_str()), "published": plan.publish.contains(&k.times.kid) }))
                 .collect();
-            Ok(srv::json(StatusCode::OK, &json!({ "issuer": i, "discovery": format!("{i}/.well-known/openid-configuration"), "jwks_uri": format!("{i}/jwks"), "serving": hub.ci.enabled(), "keys": list, "subject_claims": hub.cfg.ci.oidc.subject_claims })))
+            Ok(srv::json(StatusCode::OK, &json!({ "issuer": i, "discovery": format!("{i}/.well-known/openid-configuration"), "jwks_uri": format!("{i}/jwks"), "serving": active(hub).await, "keys": list, "subject_claims": hub.cfg.ci.oidc.subject_claims })))
         }
         (&http::Method::GET, ["jwks-export"]) => {
             let set = jwks(hub).await.map_err(fail)?;

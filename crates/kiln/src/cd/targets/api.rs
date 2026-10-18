@@ -180,3 +180,35 @@ async fn render_provider(cx: &Cx, def: &apps::AppDef, mirror: &Mirror, commit: &
     let input = providers::RenderInput { spec: &spec, target: &p.target, app: &def.name, namespace: &def.destination.namespace, revision: commit, read: &read };
     providers::render(&p.provider, &input)
 }
+
+/// `cd.apps.keep`: the apps a deploy file defines, kept in kiln rather than in the repository
+/// (§8.2 step 7, "Keep in kiln"). They read the repository's files as any app does; they are
+/// marked as kiln's own.
+pub async fn keep(cx: Cx, v: Value) -> Out {
+    let text = s(&v, "deploy").ok_or_else(|| bad("`deploy` is required: the deploy file's text"))?;
+    let envs: BTreeMap<String, EnvironmentSpec> = match s(&v, "environments") {
+        Some(e) => serde_yaml::from_str(e).map_err(|e| bad(format!(".kiln/environments.yaml: {e}")))?,
+        None => BTreeMap::new(),
+    };
+    let repo_name = s(&v, "repo").ok_or_else(|| bad("`repo` is required: the repository its files come from"))?;
+    let repos = cx.hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let repo = repos.iter().find(|r| r.name == repo_name || r.clone_url == repo_name).ok_or_else(|| bad(format!("{repo_name} isn't one of kiln's repositories")))?;
+    let trunk = repo.branches.first().cloned().unwrap_or_else(|| "main".into());
+    if cx.actor.starts_with("agent:") && !cx.hub.cfg.cd.agents_deploy {
+        return Err((StatusCode::FORBIDDEN, "agents may not create apps: ask a person to, or have them allow agents to deploy ([cd] agents_deploy = true)".into()));
+    }
+    let defs = apps::from_deploy_file(text, &repo.clone_url, &trunk, &envs, &apps::Scope::default()).map_err(|e| bad(e.0))?;
+    let mut kept = Vec::new();
+    for mut def in defs {
+        def.origin = apps::Origin::Api;
+        def.labels.insert("kiln.dev/kept".into(), "true".into());
+        let id = def.id();
+        match cx.cd.store.submit(kiln_cd::state::Command::PutApp(Box::new(def))).await {
+            Ok(Ok(())) => kept.push(id),
+            Ok(Err(e)) => return Err(bad(e)),
+            Err(_) => return Err((StatusCode::SERVICE_UNAVAILABLE, "the store stopped".into())),
+        }
+    }
+    cx.hub.store.audit(cx.actor.clone(), "cd.apps.keep".into(), kept.join(",")).await;
+    Ok(json!({ "apps": kept }))
+}
