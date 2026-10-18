@@ -13,6 +13,7 @@ pub mod hash;
 pub mod head;
 pub mod index;
 pub mod manifest;
+pub mod otlp;
 pub mod query;
 pub mod store;
 pub mod symbols;
