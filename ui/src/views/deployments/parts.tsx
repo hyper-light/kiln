@@ -151,7 +151,7 @@ export function KindBadge({ kind, group, className }: { kind: string; group?: st
  * A node's health and sync, compact: a dot each, and a word only where it says something
  * (not healthy, or out of sync). Children have no sync.
  */
-export function NodeMarks({ n, words = true }: { n: Pick<CdNode, "health" | "sync" | "managed" | "hook">; words?: boolean }) {
+export function NodeMarks({ n, words = true }: { n: Pick<CdNode, "health" | "sync" | "managed" | "hook" | "tracked_by">; words?: boolean }) {
   const h = n.health;
   const htone = h ? (HEALTH_TONE[h] ?? "skipped") : null;
   const s = n.managed ? n.sync : null;
@@ -171,6 +171,11 @@ export function NodeMarks({ n, words = true }: { n: Pick<CdNode, "health" | "syn
         </span>
       ) : null}
       {n.hook ? <span className="cd-hook">hook</span> : null}
+      {n.tracked_by ? (
+        <span className="cd-owner" title={`${n.tracked_by}'s tracking is on it: a sync of this app takes it over`}>
+          {n.tracked_by.slice(n.tracked_by.indexOf("/") + 1)}'s
+        </span>
+      ) : null}
     </span>
   );
 }

@@ -827,6 +827,7 @@ impl Cd {
         for p in &inputs.pull_secrets {
             objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
+        apps::stamp_rollout(def, &mut objects);
         let _ = std::fs::remove_dir_all(&views);
         let (children, objects): (Vec<Value>, Vec<Value>) =
             objects.into_iter().partition(|o| obj::group(o) == "argoproj.io" && obj::kind(o) == "Application");
@@ -1234,6 +1235,10 @@ pub fn summary_json(s: &Summary) -> Value {
         "revision": s.revision.as_deref(),
         "resources": s.resources,
         "out_of_sync": s.out_of_sync,
+        "shared": s.shared,
+        "missing": s.missing,
+        "prune": s.prune,
+        "unmarked": s.unmarked,
         "message": s.message,
         "operation": s.operation.as_ref().map(|o| json!({
             "id": o.id,

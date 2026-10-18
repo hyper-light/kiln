@@ -17,6 +17,7 @@
 //! - [`providers`]: every platform beyond Kubernetes, as clusters of objects (docs/cd-targets.md).
 //! - [`diff`]: comparing desired and live objects by field ownership.
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
+//! - [`rollout`]: canary, linear and blue/green rollouts with checks, as a state machine.
 //! - [`engine`]: the controller.
 //! - [`tree`]: an app's resource tree: its objects and the live objects they own.
 //! - [`state`] and [`store`]: what is kept durably, replicated by hyper-raft on hyper-log.
@@ -35,6 +36,7 @@ pub mod model;
 pub mod obj;
 pub mod providers;
 pub mod render;
+pub mod rollout;
 pub mod sim;
 pub mod state;
 pub mod store;

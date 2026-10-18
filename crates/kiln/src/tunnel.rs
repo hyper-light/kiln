@@ -18,7 +18,9 @@
 //!
 //! An agent ([`Paths`]) dials UDP first, takes the tunnel after [`DIRECT_TRIES`] direct dials in a
 //! row get no answer (or [`DIRECT_PATIENCE`] of them), and while tunnelled checks every
-//! [`PROBE_EVERY`] whether UDP answers again ([`udp_answers`]), switching back when it does.
+//! [`PROBE_EVERY`] whether UDP answers again ([`udp_answers`]), switching back when it does. It
+//! remembers which path it last connected by ([`Paths::remembering`]): on a network that drops
+//! UDP, a restart or an upgrade takes the tunnel at once instead of waiting for UDP again.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -559,6 +561,8 @@ pub struct Paths {
     probe: Option<futures::channel::oneshot::Receiver<bool>>,
     /// The path last reported connected (logged once per change).
     reported: Option<Transport>,
+    /// Where the path last connected by is kept, for the next process.
+    memory: Option<std::path::PathBuf>,
 }
 
 impl Paths {
@@ -574,7 +578,20 @@ impl Paths {
             next_probe: None,
             probe: None,
             reported: None,
+            memory: None,
         }
+    }
+
+    /// [`Self::new`], starting with the path it last connected by, as kept in `file`: the tunnel
+    /// first, if that is what it last took (UDP is checked again a while after connecting).
+    pub fn remembering(server_url: &str, quic: &str, file: std::path::PathBuf) -> Self {
+        let mut p = Self::new(server_url, quic);
+        if std::fs::read_to_string(&file).is_ok_and(|s| s.trim() == "tunnel") {
+            tracing::info!(quic = %quic, "this runner last reached the server through the HTTP tunnel; taking it first");
+            p.via = Transport::Tunnel;
+        }
+        p.memory = Some(file);
+        p
     }
 
     /// The path the next dial takes.
@@ -674,6 +691,14 @@ impl Paths {
                     tracing::info!("connected through the HTTP tunnel (UDP {} unreachable)", self.quic);
                 }
             }
+        }
+        if self.reported != Some(self.via)
+            && let Some(file) = &self.memory
+        {
+            let _ = match self.via {
+                Transport::Tunnel => std::fs::write(file, "tunnel\n"),
+                Transport::Direct => std::fs::remove_file(file).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
+            };
         }
         self.reported = Some(self.via);
     }
@@ -816,6 +841,28 @@ mod tests {
         assert_eq!(reg.transport(5), Transport::Direct);
         reg.closed(5);
         assert_eq!(reg.transport(5), Transport::Direct);
+        Ok(())
+    }
+
+    #[test]
+    fn the_path_last_connected_by_is_taken_first_next_time() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("transport");
+        let now = Instant::now();
+        // Nothing kept: UDP first, as ever.
+        assert_eq!(Paths::remembering("http://server:7070", "server:7071", file.clone()).via(), Transport::Direct);
+        // Connected through the tunnel: kept, and the next process starts with it.
+        let mut p = Paths::remembering("http://server:7070", "server:7071", file.clone());
+        p.via = Transport::Tunnel;
+        p.connected(None, now);
+        assert_eq!(std::fs::read_to_string(&file)?.trim(), "tunnel");
+        let mut next = Paths::remembering("http://server:7070", "server:7071", file.clone());
+        assert_eq!(next.via(), Transport::Tunnel);
+        // Once UDP answers again and it connects directly, the next one starts direct again.
+        next.take(Transport::Direct);
+        next.connected(None, now);
+        assert!(!file.exists());
+        assert_eq!(Paths::remembering("http://server:7070", "server:7071", file).via(), Transport::Direct);
         Ok(())
     }
 

@@ -99,7 +99,13 @@ const apps = new Map<string, MockApp>();
         health,
         revision,
         resources,
-        out_of_sync: sync === "OutOfSync" ? 1 + Math.floor(r() * 3) : 0,
+        // Out of sync, every kind of difference: a change, one missing, one another app's
+        // tracking is on, one lacking kiln's marks, one to prune.
+        out_of_sync: sync === "OutOfSync" ? 5 : 0,
+        shared: sync === "OutOfSync" ? 1 : 0,
+        missing: sync === "OutOfSync" ? 1 : 0,
+        unmarked: sync === "OutOfSync" ? 1 : 0,
+        prune: sync === "OutOfSync" ? 1 : 0,
         message: health === "Degraded" ? "Deployment " + name + " exceeded its progress deadline" : null,
         operation: op,
         pinned: null,
@@ -228,8 +234,13 @@ function tree(id: string): CdTree | null {
     return n;
   };
   const dep = managed("Deployment", a.name, "apps", { health: a.health === "Missing" ? "Missing" : a.health, ready: "3/3", info: [{ name: "Ready", value: "3/3" }] });
-  managed("Service", a.name);
-  managed("ConfigMap", `${a.name}-config`, "", { health: null, info: [{ name: "Keys", value: "4" }] });
+  const off = a.sync === "OutOfSync";
+  managed("Service", a.name, "", off ? { sync: "OutOfSync", tracked_by: `default/${a.name}-argo`, shared_with: [`default/${a.name}-argo`], marks_only: true, why: `app default/${a.name}-argo's tracking is on it: a sync takes it over` } : {});
+  managed("ConfigMap", `${a.name}-config`, "", { health: null, info: [{ name: "Keys", value: "4" }], ...(off ? { sync: "OutOfSync" as const, marks_only: true, why: ".metadata.labels.kiln.dev/app is missing live" } : {}) });
+  if (off) {
+    managed("PodDisruptionBudget", a.name, "policy", { health: "Missing", sync: "OutOfSync", missing: true, why: "not in the cluster" });
+    managed("ConfigMap", `${a.name}-old`, "", { health: null, sync: "OutOfSync", requires_pruning: true, why: "not in git: requires pruning" });
+  }
   managed("ServiceAccount", a.name, "", { health: null });
   if (r() < 0.6) managed("Ingress", a.name, "networking.k8s.io");
   if (r() < 0.5) managed("HorizontalPodAutoscaler", a.name, "autoscaling");
@@ -379,14 +390,20 @@ function logs(name: string) {
 function diffOf(id: string): CdDiff[] {
   const a = apps.get(id)?.app;
   if (!a || a.sync !== "OutOfSync") return [];
+  const ns = a.namespace;
+  const marks = (app: string) => [{ old_start: 4, old_lines: 3, new_start: 4, new_lines: 3, lines: ["   labels:", `-    app.kubernetes.io/instance: ${app}`, `+    kiln.dev/app: 0123456789abcdef`, `   name: ${a.name}`] }];
   return [
     {
-      key: { group: "apps", kind: "Deployment", namespace: a.namespace, name: a.name },
+      key: { group: "apps", kind: "Deployment", namespace: ns, name: a.name },
       why: ".spec.replicas differs",
       live: "",
       predicted: "",
       hunks: [{ old_start: 7, old_lines: 3, new_start: 7, new_lines: 3, lines: [" spec:", "-  replicas: 2", "+  replicas: 3", "   revisionHistoryLimit: 5"] }],
     },
+    { key: { group: "", kind: "Service", namespace: ns, name: a.name }, why: `app default/${a.name}-argo's tracking is on it: a sync takes it over`, live: "", predicted: "", hunks: marks(`${a.name}-argo`), tracked_by: `default/${a.name}-argo`, marks_only: true },
+    { key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-config` }, why: ".metadata.labels.kiln.dev/app is missing live", live: "", predicted: "", hunks: marks(""), marks_only: true },
+    { key: { group: "policy", kind: "PodDisruptionBudget", namespace: ns, name: a.name }, why: "not in the cluster", live: "", predicted: "", hunks: [{ old_start: 0, old_lines: 0, new_start: 1, new_lines: 2, lines: ["+kind: PodDisruptionBudget", `+name: ${a.name}`] }], missing: true },
+    { key: { group: "", kind: "ConfigMap", namespace: ns, name: `${a.name}-old` }, why: "not in git: requires pruning", live: "", predicted: "", hunks: [{ old_start: 1, old_lines: 2, new_start: 0, new_lines: 0, lines: ["-kind: ConfigMap", `-name: ${a.name}-old`] }], requires_pruning: true },
   ];
 }
 
@@ -435,7 +452,7 @@ function plan(ask: { head?: string; commit?: string; pr?: number }): CdPlan {
       ],
     },
     stack: { added: 0, changed: 1, removed: 0, objects: [] },
-    sync: { create: 0, update: 1, prune: 0, hooks: 0, unchanged: 6, unread: 0, held: [], taken: [], steps: [] },
+    sync: { create: 0, update: 1, prune: 0, hooks: 0, unchanged: 6, unread: 0, held: [], shared: [], steps: [] },
   });
   return {
     repo: PLAN_REPOS[0]!.url,

@@ -87,8 +87,9 @@ pub struct Plan {
     pub unchanged: u32,
     /// Objects of kinds not read from the cluster yet: what a sync does to them isn't known.
     pub unread: Vec<ResKey>,
-    /// Objects another app deploys already, with that app's id. That app keeps them.
-    pub taken: Vec<(ResKey, Str)>,
+    /// Objects another app deploys too, or whose live object carries another app's tracking,
+    /// with that app's id: a sync of this one takes them over.
+    pub shared: Vec<(ResKey, Str)>,
 }
 
 /// Objects the owner read from a cluster itself, by key: `None`, not there.
@@ -165,12 +166,13 @@ impl Engine {
                 cands.push(Candidate { key: p.key.clone(), desired: Some(i), live: None, out_of_sync: true, change: create(), why: None });
                 continue;
             }
-            let res = cl.index.get(&p.key).and_then(|ix| self.res(c, *ix));
-            if let Some(other) = res.and_then(|r| r.app.filter(|o| *o != a && r.desired.is_some())) {
-                plan.taken.push((p.key.clone(), self.app(other).map(|x| x.cfg.id.clone()).unwrap_or_else(|| Str::from(""))));
-                continue;
+            let slots: Vec<_> = self.slots(c, &p.key).iter().collect();
+            let seen = slots.iter().filter_map(|ix| self.res(c, *ix)).find_map(|r| r.live.as_ref());
+            let other = slots.iter().filter_map(|ix| self.res(c, *ix)).find(|r| r.app != Some(a) && r.desired.is_some()).and_then(|r| r.app).or_else(|| seen.and_then(|l| l.tracked).filter(|t| *t != a));
+            if let Some(o) = other {
+                plan.shared.push((p.key.clone(), self.app(o).map(|x| x.cfg.id.clone()).unwrap_or_else(|| Str::from(""))));
             }
-            let watched = res.and_then(|r| r.live.as_ref()).and_then(|l| l.blob.decode().ok());
+            let watched = seen.and_then(|l| l.blob.decode().ok());
             let live = match watched {
                 Some(live) => Some(live),
                 None if cl.listed.contains(&p.key.group_kind()) => None,
@@ -178,8 +180,7 @@ impl Engine {
                     // Read by the owner: kept as a watch keeps it, and claimed as a watch claims it.
                     Some(Some(v)) => {
                         if let Some(other) = self.owner_of(&p.key, v).filter(|o| *o != a) {
-                            plan.taken.push((p.key.clone(), self.app(other).map(|x| x.cfg.id.clone()).unwrap_or_else(|| Str::from(""))));
-                            continue;
+                            plan.shared.push((p.key.clone(), self.app(other).map(|x| x.cfg.id.clone()).unwrap_or_else(|| Str::from(""))));
                         }
                         let keep = |m: &str| app.cfg.ignore.iter().any(|r| r.managers.iter().any(|x| x == m));
                         Some(recombine(LiveView::keeping(v.clone(), &app.cfg.manager, keep)))
@@ -211,7 +212,9 @@ impl Engine {
         let mut gone: Vec<Candidate> = Vec::new();
         for ix in &app.resources {
             let Some(res) = self.res(c, *ix) else { continue };
-            if res.app != Some(a) || kept.contains(&res.key) {
+            // Pruned only when it carries this app's tracking and no other app deploys it.
+            let own = res.live.as_ref().is_some_and(|l| l.tracked == Some(a));
+            if res.app != Some(a) || kept.contains(&res.key) || !own || self.other_deployer(c, &res.key, a).is_some() {
                 continue;
             }
             let Some(live) = res.live.as_ref().filter(|l| !l.hook).and_then(|l| l.blob.decode().ok()) else { continue };

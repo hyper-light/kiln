@@ -122,6 +122,22 @@ it watch only its own objects, filtered by the API server; the annotation is che
 label claims nothing. It reads Argo CD's tracking (label, annotation, or both, with the
 installation id) to adopt what Argo CD deployed.
 
+**Objects two apps deploy.** As in Argo CD, every app compares everything it renders, whatever
+other apps render the same objects: the tracking an object carries says which app it belongs
+to. An app whose object carries another app's tracking shows it out of sync ("app X's tracking
+is on it: a sync takes it over") and counts it as shared, Argo CD's `SharedResourceWarning`; a
+sync of it takes the object over, and `FailOnSharedResource=true` fails that sync before it
+applies anything. kiln goes further where Argo CD loses objects:
+- an app prunes only what carries its tracking, and never while another app deploys it, so one
+  app dropping an object can't delete it from under another;
+- deleting an app with its objects leaves those another app deploys;
+- automatic syncs and self-heal never take an object from another app (two apps would take it
+  from each other for ever, as two Argo CD apps do): a person's sync takes it over.
+
+Taking an app over from Argo CD is this case: Argo CD's app (shadowed) and kiln's deploy the
+same objects; kiln's shows them as Argo CD's, and says whether a sync changes anything but the
+tracking marks.
+
 **Diffs.** By default kiln applies with server-side apply, so the API server records which fields
 kiln owns. An object is out of sync when a field kiln sets differs from the live value, a field
 kiln sets is missing, or kiln owns a field it no longer sets. Fields other managers own (the HPA's
@@ -190,7 +206,7 @@ They run in their phase and are deleted as `hook-delete-policy` says (`HookSucce
 | `RespectIgnoreDifferences=true` | keep ignored fields out of the apply |
 | `SkipDryRunOnMissingResource=true` | skip the dry run for kinds whose CRD the same sync creates |
 | `Validate=false` | no schema validation |
-| `FailOnSharedResource=true` | fail when another app already tracks an object |
+| `FailOnSharedResource=true` | fail, before applying anything, when an object the app deploys carries another app's tracking |
 | `Delete=false` | keep the object when the app is deleted |
 
 **Automation.** `sync.auto` syncs when git moves. `self-heal` syncs again when the cluster drifts,
@@ -397,8 +413,14 @@ gets a **Deploy** panel with its plan.
 
 An app's page does what Argo CD's application view does, in the console's own look. Its head says
 the sync and health, the revision with its commit message, author and time, the last sync's
-result, and where the app comes from and goes to; its actions (Sync with prune, dry run or only
-chosen objects; Refresh and Hard refresh; Diff; History and rollback; Delete) open in the page.
+result, and where the app comes from and goes to; its actions (Sync with prune, dry run, Argo
+CD's sync options, or only chosen objects; Refresh and Hard refresh; Diff; History and rollback;
+Delete) open in the page. When it differs from git, **Why it differs from git** says how, by what
+a sync does about it: fields that differ, objects missing, objects carrying another app's
+tracking (to take over, and whether anything but the marks changes), objects lacking only kiln's
+marks, objects git no longer has. Each kind has its diff and the sync that deals with it, those
+objects chosen. The list of apps says the same in a line: `14 changed · 92 to take over · 1 to
+prune`.
 Below, its objects and every live object they own as a tree (a left-to-right graph on wide
 screens, an indented list with guide lines on phones, alike siblings folded into "12 pods"), a
 list sortable by kind, name, namespace, health, sync and age, or its pods by owner or node, chosen

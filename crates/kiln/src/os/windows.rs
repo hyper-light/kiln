@@ -104,6 +104,9 @@ pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<
 /// Windows has no exec: upgrades restart the process (and its terminals).
 pub const IN_PLACE_UPGRADE: bool = false;
 
+/// Terminals are never handed to a successor on Windows (see the Unix layer).
+pub const UPGRADE_BY_SUCCESSOR: bool = false;
+
 pub fn keep_across_exec(_fd: &()) -> io::Result<()> {
     Err(io::Error::other("in-place upgrade is not supported on Windows"))
 }
@@ -121,6 +124,11 @@ pub fn start_reaper() {}
 
 pub fn pid_alive(_pid: u32) -> bool {
     false
+}
+
+/// Not needed on Windows (no launchd); 0.
+pub fn parent_pid() -> u32 {
+    0
 }
 
 /// Process trees are job objects on Windows; nothing to stop one by one.

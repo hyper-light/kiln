@@ -700,6 +700,8 @@ mod tests {
             cascade: true,
             managed_namespace: None,
             artifacts: BTreeMap::new(),
+            rollout: None,
+            checks: BTreeMap::new(),
         }
     }
 
