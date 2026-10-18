@@ -547,8 +547,8 @@ impl Claude {
         for id in self.tools.keys().cloned().collect::<Vec<_>>() {
             finish_tool(core, &id, ToolStatus::Cancelled, None);
         }
-        // What it ran ends with it.
-        for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+        // What it ran ends with it (what kiln took back over runs apart from it: `survivors`).
+        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }

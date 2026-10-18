@@ -26,6 +26,21 @@ again on the same conversation. A new model, effort or mode is a flag, so it sta
 between turns. Files you attach go to it as their paths on its machine; its models come from
 `agy models`.
 
+## What an agent left running
+
+Every harness kiln starts carries `KILN_AGENT=<session id>` in its environment, and so does every
+process it starts, however it's parented later. Every ten seconds the runner notes what runs under
+each harness and what carries its mark apart from it, and keeps that in its record of its sessions
+(beside each one's harness process). What an agent started that runs on apart from its harness (a
+server started with `&` or `setsid`, a script left going) shows with its background tasks as "left
+running" (task id `left-<pid>`), until it ends; stopping that task stops it and what runs under it.
+
+When the runner starts again (an upgrade, a crash, the system stopping it, a re-join), a harness
+that outlived it is stopped before the session resumes (what it started is kept), so two harnesses
+never work one conversation; then whatever the session started that still runs is taken back over
+the same way, and named to the agent if kiln tells it to pick up a turn the restart cut short.
+Ending the agent stops what it left running. kiln's own helpers and MCP servers aren't counted.
+
 ## API
 
 | Method | Path | |
