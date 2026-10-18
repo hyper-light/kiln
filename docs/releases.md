@@ -28,6 +28,20 @@ Build every platform** (or the Runners page, when a machine's platform has no bu
    from it on any machine, with no GitHub involved. A runner of the server's own platform gets the
    server's own build.
 
+**Each runner has an update policy, and nothing is forced.** Settings → Updates sets it for one
+runner, any selection of them, or all:
+- **Automatic**: upgraded as soon as there is a build of the newest kiln for its platform.
+- **Notify** (the default): its row says a newer kiln is available and where the build comes from
+  (this server's own build, a release run, a machine that built it); it's upgraded when you choose.
+- **Off**: left alone. It isn't upgraded, on its own or with *Upgrade all*, until its policy
+  changes.
+
+`PUT /api/updates/runners/{name}` with `{"policy": "auto" | "notify" | "off"}` sets one;
+`PUT /api/updates/policy` with `{"policy": …, "runners": [...]}` (or `"all": true`) sets many.
+`[updates] follow = false` still turns automatic upgrades off for every runner. The server exports
+each runner's state as Prometheus gauges: `kiln_runner_up`, `kiln_runner_behind`,
+`kiln_runner_update_policy{policy}` and `kiln_runner_version_info{version}`.
+
 A runner with no binary of the server's commit yet doesn't wait on another machine: it waits only
 while its own platform's job is building, and otherwise a Mac or Linux machine with a kiln checkout
 builds the commit itself (a Mac's build is kept for the other Macs).

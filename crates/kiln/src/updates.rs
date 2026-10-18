@@ -944,7 +944,84 @@ pub struct RunnerInfo {
     pub method: &'static str,
     /// Terminals are allowed on it (an older runner is upgraded through one).
     pub terminal: bool,
+    /// What it does with a newer kiln, as chosen for it.
+    pub policy: Policy,
+    /// Where the build it would get comes from ("this server's own build", "built by release run
+    /// #141", "built by adas-macbook", ...), when there is one.
+    pub from: Option<String>,
     pub instances: Vec<crate::instances::InstanceView>,
+}
+
+/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in Settings → Updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Policy {
+    /// Upgraded as soon as there is a build of the newest kiln for it.
+    Auto,
+    /// Told a newer kiln is available, and where it comes from; upgraded when someone chooses to.
+    #[default]
+    Notify,
+    /// Left alone: never upgraded, on its own or with the others, until its policy changes.
+    Off,
+}
+
+impl Policy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Notify => "notify",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "notify" => Some(Self::Notify),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Where a runner's policy is kept (none: the default).
+fn policy_key(machine: &str) -> String {
+    format!("updates/policy/{machine}")
+}
+
+/// `machine`'s update policy: Notify unless someone chose otherwise.
+pub async fn policy(hub: &Hub, machine: &str) -> Policy {
+    hub.store.kv_get(policy_key(machine)).await.ok().flatten().and_then(|v| Policy::parse(&v)).unwrap_or_default()
+}
+
+/// Set `machine`'s update policy.
+pub async fn set_policy(hub: &Hub, machine: &str, p: Policy) -> anyhow::Result<()> {
+    if p == Policy::default() { hub.store.kv_delete(policy_key(machine)).await } else { hub.store.kv_set(policy_key(machine), p.as_str().to_owned()).await }
+}
+
+/// The runners' gauges (`crate::metrics`): up, behind, update policy and the kiln each runs.
+pub async fn measure(hub: &Arc<Hub>) {
+    let rs = runners(hub).await;
+    let m = crate::metrics::global();
+    m.runner_up.replace(rs.iter().map(|r| (vec![r.name.clone()], i64::from(r.connected))));
+    m.runner_behind.replace(rs.iter().map(|r| (vec![r.name.clone()], i64::from(matches!(r.standing, Some(crate::fleet::Standing::Behind | crate::fleet::Standing::Unknown))))));
+    m.runner_update_policy.replace(rs.iter().map(|r| (vec![r.name.clone(), r.policy.as_str().to_owned()], 1)));
+    m.runner_version_info.replace(rs.iter().map(|r| {
+        let version = r.commit.as_deref().map(|c| short(c).to_owned()).or_else(|| r.build.clone()).unwrap_or_else(|| "unknown".to_owned());
+        (vec![r.name.clone(), version], 1)
+    }));
+}
+
+/// Where a build kiln hands out comes from, said for a person.
+pub fn from_words(b: &Binary) -> String {
+    match b.origin.as_str() {
+        "server" => "this server's own build".to_owned(),
+        "built" => b.run.map_or_else(|| "built by kiln's release pipeline".to_owned(), |n| format!("built by release run #{n}")),
+        "machine" => b.by.as_ref().map_or_else(|| "built by one of its machines".to_owned(), |m| format!("built by {m}")),
+        "upload" => "uploaded here".to_owned(),
+        "release" => "a GitHub release".to_owned(),
+        other => other.to_owned(),
+    }
 }
 
 pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
@@ -965,6 +1042,8 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 up_to_date: build.is_some() && build == target_build,
                 method: if newest.is_some_and(|i| i.can_upgrade) { "native" } else { "terminal" },
                 terminal: a.terminal,
+                policy: Policy::default(),
+                from: None,
                 target,
                 target_build,
                 build,
@@ -987,10 +1066,13 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
     // Against the newest kiln, when there is one: the commit each runs, and how it gets there.
     let newest = hub.updates.fleet.target();
     for r in &mut out {
+        r.policy = policy(hub, &r.name).await;
         r.commit = crate::fleet::runner_commit(hub, &r.name, r.build.as_deref());
         r.checkout = crate::fleet::reported(hub, &r.name).and_then(|k| k.checkout);
         let Some(t) = &newest else { continue };
-        r.target_build = r.target.as_deref().and_then(|target| crate::fleet::binary_for(hub, target, &t.commit)).map(|b| b.build);
+        let b = r.target.as_deref().and_then(|target| crate::fleet::binary_for(hub, target, &t.commit));
+        r.from = b.as_ref().map(from_words);
+        r.target_build = b.map(|b| b.build);
         let s = crate::fleet::standing(hub, r, t).await;
         r.up_to_date = s == crate::fleet::Standing::Current;
         r.standing = Some(s);
@@ -1013,6 +1095,7 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job
         return Ok(j);
     }
     let r = runners(hub).await.into_iter().find(|r| r.name == machine).ok_or_else(|| anyhow::anyhow!("there is no runner called {machine}"))?;
+    anyhow::ensure!(r.policy != Policy::Off, "updates are off for {machine}: turn them on to upgrade it");
     anyhow::ensure!(r.connected, "{machine} is not connected");
     if let Some(t) = hub.updates.fleet.target() {
         anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
@@ -1353,7 +1436,8 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
 pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     let mut out = Vec::new();
     for r in runners(hub).await {
-        if r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
+        // Runners whose updates are off are left alone, with the others too.
+        if r.policy != Policy::Off && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
             out.push(upgrade_runner(hub, &r.name).await.map_err(|e| format!("{}: {e:#}", r.name)));
         }
     }

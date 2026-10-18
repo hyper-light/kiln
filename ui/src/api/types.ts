@@ -598,8 +598,15 @@ export interface ServerUpdate {
   note: string;
 }
 
+/** What a runner does with a newer kiln: upgraded by itself ("auto"), told it's available and
+ * upgraded when you choose ("notify", the default), or left alone ("off"). */
+export type UpdatePolicy = "auto" | "notify" | "off";
+
 export interface RunnerUpdate {
   name: string;
+  policy: UpdatePolicy;
+  /** Where the build it would get comes from ("built by release run #141", "built by a Mac", ...). */
+  from: string | null;
   hostname: string;
   os: string;
   arch: string;

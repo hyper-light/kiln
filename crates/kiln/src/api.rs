@@ -293,6 +293,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
         (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
         (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name).await,
+        (&Method::PUT, ["api", "updates", "runners", name]) => set_runner_policy(&hub, name, req).await,
+        (&Method::PUT, ["api", "updates", "policy"]) => set_policies(&hub, req).await,
         (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
         (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => delete_binary(&hub, target).await,
@@ -2191,6 +2193,50 @@ async fn upgrade_runner(hub: &Arc<Hub>, name: &str) -> R {
         Ok(job) => Ok(srv::json(StatusCode::ACCEPTED, &job)),
         Err(e) => Err(err(StatusCode::CONFLICT, format!("{e:#}"))),
     }
+}
+
+#[derive(Deserialize)]
+struct RunnerPolicy {
+    policy: crate::updates::Policy,
+}
+
+/// `PUT /api/updates/runners/{name}` `{"policy": "auto" | "notify" | "off"}`: what that machine's
+/// runner does with a newer kiln (Notify unless chosen otherwise).
+async fn set_runner_policy(hub: &Arc<Hub>, name: &str, req: Request) -> R {
+    let b: RunnerPolicy = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    apply_policy(hub, &[name.to_owned()], b.policy).await
+}
+
+#[derive(Deserialize)]
+struct Policies {
+    policy: crate::updates::Policy,
+    /// These runners; or every one, with `all`.
+    #[serde(default)]
+    runners: Vec<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// `PUT /api/updates/policy` `{"policy": "off", "runners": ["a", "b"]}` (or `"all": true`): the same
+/// update policy for any number of runners at once.
+async fn set_policies(hub: &Arc<Hub>, req: Request) -> R {
+    let b: Policies = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let names = if b.all { crate::updates::runners(hub).await.into_iter().map(|r| r.name).collect() } else { b.runners };
+    if names.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name the runners, or say all"));
+    }
+    apply_policy(hub, &names, b.policy).await
+}
+
+async fn apply_policy(hub: &Arc<Hub>, names: &[String], policy: crate::updates::Policy) -> R {
+    for name in names {
+        crate::updates::set_policy(hub, name, policy).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    }
+    hub.store.audit("admin".into(), "upgrade.policy".into(), format!("updates {} for {}", policy.as_str(), names.join(", "))).await;
+    hub.emit(&json!({ "type": "updates" }));
+    // Its gauges at once, and an automatic one brought up to date.
+    hub.updates.fleet.wake();
+    Ok(srv::status(StatusCode::NO_CONTENT))
 }
 
 /// `POST /api/updates/runners`: upgrade every connected runner that isn't up to date.

@@ -534,12 +534,18 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
     if let Some(j) = hub.updates.running_for("runner", &r.name) {
         return Some(("upgrading", if j.method == "build" { format!("is building {s} itself") } else { format!("is upgrading to {s}") }));
     }
-    if let Err(why) = hub.updates.fleet.may_try(&r.name, &t.commit) {
+    let auto = r.policy == crate::updates::Policy::Auto;
+    if r.policy == crate::updates::Policy::Off {
+        return Some(("off", format!("{s} is available; its updates are off, so it stays as it is")));
+    }
+    if auto && let Err(why) = hub.updates.fleet.may_try(&r.name, &t.commit) {
         return Some(("wait", why));
     }
+    // Not upgraded by itself: what its Upgrade does.
+    let when = if auto { "" } else { " when you upgrade it" };
     Some(match plan(hub, r, t).await {
-        Plan::Download(b) => ("download", format!("downloads build {} ({s})", b.build)),
-        Plan::Build(_) => ("build", format!("builds {s} itself")),
+        Plan::Download(b) => ("download", format!("downloads build {} ({s}){when}", b.build)),
+        Plan::Build(_) => ("build", format!("builds {s} itself{when}")),
         Plan::Wait(why) => ("wait", why),
     })
 }
@@ -566,7 +572,9 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 remember(&hub, &b.build, &b.target, c);
             }
         }
-        let Some(t) = refresh(&hub).await else { continue };
+        let target = refresh(&hub).await;
+        crate::updates::measure(&hub).await;
+        let Some(t) = target else { continue };
         if hub.cfg.updates.follow {
             follow(&hub, &t).await;
         }
@@ -575,7 +583,8 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 
 async fn follow(hub: &Arc<Hub>, t: &Target) {
     for r in crate::updates::runners(hub).await {
-        if !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) || hub.updates.running_for("runner", &r.name).is_some() {
+        // Only runners whose policy is Automatic: the rest wait for their Upgrade, or are left alone.
+        if r.policy != crate::updates::Policy::Auto || !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) || hub.updates.running_for("runner", &r.name).is_some() {
             continue;
         }
         if hub.updates.fleet.may_try(&r.name, &t.commit).is_err() {

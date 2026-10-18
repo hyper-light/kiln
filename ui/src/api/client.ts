@@ -1,34 +1,4 @@
-import type {
-  Agent,
-  AiSession,
-  AiTranscriptEntry,
-  AuditEntry,
-  DirListing,
-  DiscoveryInfo,
-  Job,
-  JoinInfo,
-  JoinRequest,
-  KilnBinary,
-  OutpostInvite,
-  Me,
-  MetricsHistory,
-  NewRepo,
-  Overview,
-  PlaceAsk,
-  PlacesView,
-  PlaceTask,
-  ReachRunner,
-  Repo,
-  Run,
-  RunDetail,
-  SyncKeep,
-  SyncView,
-  SystemInfo,
-  TaskKind,
-  TerminalSessionInfo,
-  UpdateJob,
-  UpdatesOverview,
-} from "./types";
+import type { Agent, AiSession, AiTranscriptEntry, AuditEntry, DirListing, DiscoveryInfo, Job, JoinInfo, JoinRequest, KilnBinary, Me, MetricsHistory, NewRepo, OutpostInvite, Overview, PlaceAsk, PlacesView, PlaceTask, ReachRunner, Repo, Run, RunDetail, SyncKeep, SyncView, SystemInfo, TaskKind, TerminalSessionInfo, UpdateJob, UpdatePolicy, UpdatesOverview } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -263,6 +233,10 @@ export const api = {
   /** Ask GitHub (and, in Kubernetes, the image on the node) again; an `updates` event follows. */
   checkUpdates: () => post<UpdatesOverview>("/api/updates/check"),
   upgradeRunner: (name: string) => post<UpdateJob>(`/api/updates/runners/${enc(name)}`),
+  /** What that runner does with a newer kiln. */
+  setRunnerPolicy: (name: string, policy: UpdatePolicy) => request<void>("PUT", `/api/updates/runners/${enc(name)}`, { policy }),
+  /** The same update policy for these runners, or every one. */
+  setPolicies: (policy: UpdatePolicy, runners: string[] | "all") => request<void>("PUT", "/api/updates/policy", runners === "all" ? { policy, all: true } : { policy, runners }),
   upgradeAllRunners: () => post<{ jobs: UpdateJob[]; errors: string[] }>("/api/updates/runners"),
   /** Run the pipeline that builds kiln for every platform; its binaries are kept when it succeeds. */
   buildEveryPlatform: () => post<Run>("/api/updates/build"),
