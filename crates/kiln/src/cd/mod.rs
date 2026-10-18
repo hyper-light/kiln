@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod cli;
+pub mod guard;
 pub mod kube;
 pub mod live;
 pub mod ops;
@@ -164,6 +165,8 @@ pub struct Cd {
     pub deploy_errors: Mutex<BTreeMap<String, String>>,
     /// Each repository's environments (`.kiln/environments.yaml` at trunk), by its URL.
     pub environments: RwLock<BTreeMap<String, BTreeMap<String, apps::EnvironmentSpec>>>,
+    /// The latest sync each app started, for a self-deploy's record.
+    pub started: Mutex<HashMap<String, guard::Started>>,
 }
 
 impl Cd {
@@ -889,8 +892,13 @@ impl Cd {
                     for (gk, r) in &d.kinds {
                         self.input(Input::Scope { cluster: def.name.as_str().into(), kind: gk.clone(), namespaced: r.namespaced });
                     }
-                    self.clusters.write().insert(def.name.clone(), cluster);
+                    self.clusters.write().insert(def.name.clone(), cluster.clone());
                     self.input(Input::ClusterReachable { name: def.name.as_str().into(), reachable: true });
+                    // kiln's own cluster: a self-deploy in flight before this start finishes here.
+                    if def.name == apps::IN_CLUSTER {
+                        let this = self.clone();
+                        crate::rt::spawn(async move { this.finish_self_deploy(&cluster).await });
+                    }
                     self.connecting.lock().remove(&def.name);
                     self.kick();
                     return;
@@ -1060,7 +1068,12 @@ impl Cd {
                                 let gk = GroupKind::new(obj::group(&object), obj::kind(&object));
                                 let wait = if dry_run { Duration::ZERO } else { Duration::from_secs(15) };
                                 this.serves(&c, &gk, wait).await;
-                                c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}"))
+                                // kiln's own Deployment: a guard watches the restart first.
+                                let guarded = if dry_run || cluster.as_ref() != apps::IN_CLUSTER { Ok(()) } else { this.before_self_apply(&object, &c).await };
+                                match guarded {
+                                    Ok(()) => c.apply(&object, &manager, dry_run).await.map(Some).map_err(|e| format!("{e:#}")),
+                                    Err(e) => Err(format!("not deploying kiln itself without its guard: {e:#}")),
+                                }
                             }
                             None => Err(format!("cluster {cluster} is not connected")),
                         };
@@ -1083,7 +1096,13 @@ impl Cd {
                     self.statuses.write().insert(app.clone(), s);
                     self.dirty.lock().insert(app);
                 }
-                Action::Record(r) => self.record(r),
+                Action::Record(r) => {
+                    if let kiln_cd::engine::Record::Started { app, op, revision, trigger, by, at_ms } = &r {
+                        let s = guard::Started { op: *op, revision: revision.as_ref().map(|r| r.to_string()), trigger: trigger.as_str().to_owned(), by: by.clone(), at_ms: *at_ms };
+                        self.started.lock().insert(app.to_string(), s);
+                    }
+                    self.record(r)
+                }
             }
         }
     }
@@ -1271,6 +1290,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         artifacts: Mutex::new(HashMap::new()),
         deploy_errors: Mutex::new(BTreeMap::new()),
         environments: RwLock::new(BTreeMap::new()),
+        started: Mutex::new(HashMap::new()),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

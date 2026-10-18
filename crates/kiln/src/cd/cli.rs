@@ -100,6 +100,32 @@ enum CdCmd {
     },
     /// Let a rolled-back app follow git again.
     Follow { id: String },
+    /// Watch a rollout of kiln's own Deployment, putting the previous image back if it isn't
+    /// available in time (run by kiln as a Job before it deploys itself).
+    #[command(hide = true)]
+    Guard {
+        #[arg(long)]
+        namespace: String,
+        #[arg(long)]
+        deployment: String,
+        #[arg(long)]
+        container: String,
+        /// The image to put back.
+        #[arg(long)]
+        previous: String,
+        /// The image being deployed.
+        #[arg(long)]
+        expect: String,
+        /// Seconds the new version has to become available.
+        #[arg(long, default_value_t = 600)]
+        deadline: u64,
+        /// From outside the cluster: a kubeconfig context.
+        #[arg(long)]
+        context: Option<String>,
+        /// The kubeconfig file for `--context` (default: the usual one).
+        #[arg(long, default_value = "")]
+        kubeconfig: String,
+    },
     /// What a commit, or every diff of a stack, would deploy: for each app it touches, its own
     /// change, the stack's change against trunk, and the steps a sync would take against what
     /// runs. Exits non-zero when the plan fails.
@@ -267,6 +293,10 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
         println!("{report}");
         return Ok(());
     }
+    if let CdCmd::Guard { namespace, deployment, container, previous, expect, deadline, context, kubeconfig } = args.cmd {
+        let a = super::guard::Args { namespace, deployment, container, previous, expect, deadline: std::time::Duration::from_secs(deadline), context: context.map(|c| (c, kubeconfig)) };
+        return super::guard::run(&a).await;
+    }
     let t = crate::access::resolve(cfg, args.url.as_deref(), args.token.as_deref()).await?;
     let api = Api { client: Client::public()?, url: t.url, token: t.token };
     let out = match args.cmd {
@@ -429,7 +459,7 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
             api.call(Method::Post, "/repos", Some(json!({"url": url, "kind": "Git", "username": username, "password": password, "insecure": insecure}))).await?
         }
         CdCmd::Repo { cmd: RepoCmd::Rm { url } } => api.call(Method::Delete, &format!("/repos?url={}", kiln_cd::kube::enc(&url)), None).await?,
-        CdCmd::Bench { .. } => Value::Null,
+        CdCmd::Bench { .. } | CdCmd::Guard { .. } => Value::Null,
     };
     if !out.is_null() {
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());

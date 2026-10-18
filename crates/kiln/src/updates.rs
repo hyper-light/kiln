@@ -1299,7 +1299,7 @@ pub fn deployment_of(pod: &str) -> Option<String> {
 }
 
 /// (Deployment, namespace) when this server runs as a pod.
-fn kube_identity() -> Option<(String, String)> {
+pub(crate) fn kube_identity() -> Option<(String, String)> {
     std::env::var("KUBERNETES_SERVICE_HOST").ok()?;
     let pod = std::env::var("POD_NAME").or_else(|_| std::env::var("HOSTNAME")).ok()?;
     let ns = std::env::var("POD_NAMESPACE")
