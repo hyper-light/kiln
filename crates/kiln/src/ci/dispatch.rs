@@ -113,6 +113,43 @@ fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool
     }
 }
 
+/// The secrets kiln actions in `steps` declare (W09-R07): (the action, the declared name, the
+/// job's secret it reads, whether it's required). A step's `with-secrets` maps a declared name
+/// to another of the job's; else it reads its own name.
+fn declared_sources(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTreeMap<String, wire::ActionRef>) -> Vec<(String, String, String, bool)> {
+    let mut out = Vec::new();
+    for step in steps {
+        let Some((uses, a)) = step.uses.as_deref().and_then(|u| actions.get(u).map(|a| (u, a))) else { continue };
+        for (name, required) in &a.secrets {
+            let from = step.kiln.with_secrets.iter().find(|(d, _)| d.eq_ignore_ascii_case(name)).map_or_else(|| name.clone(), |(_, f)| f.to_ascii_uppercase());
+            out.push((uses.to_owned(), name.clone(), from, *required));
+        }
+    }
+    out
+}
+
+/// `KCI4031` (W07-R11): the scopes a kiln action in `steps` needs that `granted` gives less of.
+fn short_permissions(steps: &[kiln_ci::wf::ir::Step], actions: &std::collections::BTreeMap<String, wire::ActionRef>, granted: &kiln_ci::plan::perms::Resolved) -> Option<String> {
+    let mut lines = Vec::new();
+    for step in steps {
+        let Some((uses, need)) = step.uses.as_deref().and_then(|u| actions.get(u).and_then(wire::ActionRef::needs).map(|n| (u, n))) else { continue };
+        for (scope, level) in &need.0 {
+            if *level > granted.level(scope) {
+                lines.push(format!("KCI4031: `{uses}` needs `{scope}: {}`, and the job grants `{}`. Give the job `permissions: {{ {scope}: {} }}`.", word(*level), word(granted.level(scope)), word(*level)));
+            }
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn word(l: kiln_ci::plan::perms::Level) -> &'static str {
+    match l {
+        kiln_ci::plan::perms::Level::None => "none",
+        kiln_ci::plan::perms::Level::Read => "read",
+        kiln_ci::plan::perms::Level::Write => "write",
+    }
+}
+
 /// `debug: { keep-on-failure: 30m }` (W17-R02): minutes (a bare number is minutes), at most a day.
 fn keep_minutes(debug: Option<&kiln_ci::wf::ir::YVal>) -> Option<u32> {
     use kiln_ci::wf::ir::YVal;
@@ -128,7 +165,13 @@ fn keep_minutes(debug: Option<&kiln_ci::wf::ir::YVal>) -> Option<u32> {
 /// What the scheduler gets of a leg: its route, priority, concurrency group and retries.
 fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, local: bool) -> LegIn {
     let job = spec.def();
-    let route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, local);
+    let mut route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, local);
+    // What kiln actions' steps need of the runner (W07-R11).
+    for step in job.map(|j| j.steps.as_slice()).unwrap_or_default() {
+        if let Some(a) = step.uses.as_deref().and_then(|u| r.actions.get(u)) {
+            route.requires.extend(a.requires.iter().filter(|q| !route.requires.contains(q)).cloned().collect::<Vec<_>>());
+        }
+    }
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
     LegIn {
@@ -590,8 +633,9 @@ impl Dispatch {
     /// environment, with the scopes searched and how to add them; `None` when all do.
     async fn missing_secrets(&self, s: &Start) -> Option<String> {
         let wf = &s.workflow;
+        let mut lines = self.missing_action_secrets(s).await;
         if wf.secrets.is_empty() || !wf.secrets.iter().any(|d| d.required) {
-            return None;
+            return (!lines.is_empty()).then(|| lines.join("\n"));
         }
         let mut envs: Vec<Option<String>> = vec![None];
         for j in &wf.jobs {
@@ -601,7 +645,6 @@ impl Dispatch {
                 envs.push(Some(e));
             }
         }
-        let mut lines = Vec::new();
         for env in envs {
             let have = super::secrets::names_for(&self.hub, &s.repo, &s.path, env.as_deref()).await.unwrap_or_default();
             for name in kiln_ci::secrets::missing_required(&wf.secrets, &have) {
@@ -614,6 +657,38 @@ impl Dispatch {
             }
         }
         (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// `KCI4040` for kiln actions (W09-R07): each required secret an action a job uses declares,
+    /// that doesn't resolve for that job (as the job's own name, or the one `with-secrets` maps).
+    async fn missing_action_secrets(&self, s: &Start) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut have: HashMap<Option<String>, std::collections::BTreeSet<String>> = HashMap::new();
+        for j in &s.workflow.jobs {
+            let wanted: Vec<_> = declared_sources(&j.steps, &s.actions).into_iter().filter(|d| d.3).collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            let env = j.environment.as_ref().map(|e| e.name.src.clone()).filter(|n| !n.contains("${{"));
+            if !have.contains_key(&env) {
+                let names = super::secrets::names_for(&self.hub, &s.repo, &s.path, env.as_deref()).await.unwrap_or_default();
+                have.insert(env.clone(), names);
+            }
+            let names = have.get(&env).cloned().unwrap_or_default();
+            for (uses, name, from, _) in wanted {
+                if !names.contains(&from) {
+                    let mapped = if from == name { String::new() } else { format!(" (as {from}, through `with-secrets`)") };
+                    lines.push(format!(
+                        "KCI4040: `{uses}` in job `{}` needs the secret {name}{mapped}, which isn't set{}: searched {}. Add it: kiln secrets set {from} --scope repo:{}",
+                        j.id,
+                        env.as_deref().map(|e| format!(" for environment `{e}`")).unwrap_or_default(),
+                        super::secrets::searched(&s.repo, &s.path, env.as_deref()),
+                        s.repo.name
+                    ));
+                }
+            }
+        }
+        lines
     }
 
     /// `workflow_run` for this run (W03-R02): `requested`, `in_progress` or `completed`, to the
@@ -1014,6 +1089,14 @@ impl Dispatch {
         }
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // KCI4031 (W07-R11): a kiln action that needs more permissions than the job grants.
+        if let Some(m) = l.spec.def().and_then(|j| short_permissions(&j.steps, &r.actions, &l.spec.permissions)) {
+            runs::annotation(&self.hub, leg, None, "error", Some("permissions".into()), &m, None, None, None, None, None).await?;
+            let failed = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
+            let cmds = self.sched.handle(Input::AttemptFinished { leg: leg.to_owned(), attempt, outcome: failed }, now_ms());
+            Box::pin(self.commands(cmds)).await;
+            return Ok(());
+        }
         // Its integrations (W11-R03); one it may not use fails it before it starts.
         match self.leg_integrations(l, r, a.runtime.id_token_url.is_some()).await {
             Ok(list) => a.integrations = list,
@@ -1108,7 +1191,11 @@ impl Dispatch {
         if !r.trusted && r.given.secrets.is_empty() {
             return (vec![token_secret], Vec::new(), vars, unmade);
         }
-        let used = spec.def().map(kiln_ci::secrets::used).unwrap_or_default();
+        let mut used = spec.def().map(kiln_ci::secrets::used).unwrap_or_default();
+        // A kiln action's declared secrets: the job's of that name, or the one it maps (W09-R07).
+        if let Some(j) = spec.def() {
+            used.names.extend(declared_sources(&j.steps, &r.actions).into_iter().map(|(_, _, from, _)| from));
+        }
         let needed = kiln_ci::secrets::needed(&spec.secrets, &used);
         // An untrusted run gets none of the server's secrets: only those given with it (W17-R06).
         let resolved = if !r.trusted {
