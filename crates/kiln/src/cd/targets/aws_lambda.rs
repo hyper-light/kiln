@@ -121,6 +121,65 @@ pub async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result
     Ok(out)
 }
 
+/// What the account holds in the region: its functions (§8.2, §8.3).
+pub async fn discover(cx: &Cx<'_>) -> Result<Value> {
+    let mut out = Vec::new();
+    let mut marker: Option<String> = None;
+    loop {
+        let mut q = vec![("MaxItems".to_owned(), "50".to_owned())];
+        if let Some(m) = &marker {
+            q.push(("Marker".to_owned(), m.clone()));
+        }
+        cx.conn.budget().await;
+        let page = cx.aws()?.rest("lambda", Method::Get, &format!("{FUNCTIONS}/"), &q, None).await?;
+        for f in page.get("Functions").and_then(Value::as_array).into_iter().flatten() {
+            let s = |k: &str| f.get(k).and_then(Value::as_str).unwrap_or_default();
+            let what = if s("PackageType") == "Image" { "image".to_owned() } else { s("Runtime").to_owned() };
+            out.push(json!({ "kind": "Function", "name": s("FunctionName"), "summary": format!("{what} · {} MB", f.get("MemorySize").and_then(Value::as_u64).unwrap_or(0)), "updated": s("LastModified"), "description": s("Description") }));
+        }
+        marker = page.get("NextMarker").and_then(Value::as_str).filter(|m| !m.is_empty()).map(str::to_owned);
+        if marker.is_none() || out.len() >= 1000 {
+            break;
+        }
+    }
+    Ok(json!({ "resources": out }))
+}
+
+/// A function as it runs now, as the definition that adopts it (§8.2 step 2).
+pub async fn adopt(cx: &Cx<'_>, name: &str) -> Result<Value> {
+    let Some(answer) = get_function(cx, name).await? else { bail!("no function {name} here") };
+    let cfg = answer.get("Configuration").cloned().unwrap_or(Value::Null);
+    let mut config = serde_json::Map::new();
+    for k in p::CONFIG_FIELDS {
+        if let Some(v) = cfg.get(*k).filter(|v| !v.is_null()) {
+            config.insert((*k).to_owned(), v.clone());
+        }
+    }
+    if let Some(Value::Array(layers)) = config.get("Layers").cloned() {
+        config.insert("Layers".into(), Value::Array(layers.iter().filter_map(|l| l.get("Arn").cloned()).collect()));
+    }
+    if let Some(vpc) = config.get_mut("VpcConfig").and_then(Value::as_object_mut) {
+        vpc.remove("VpcId");
+    }
+    let image = answer.pointer("/Code/ImageUri").and_then(Value::as_str);
+    cx.conn.budget().await;
+    let aliases = cx.aws()?.rest("lambda", Method::Get, &format!("{}/aliases", function_path(name)), &[], None).await?;
+    let alias = aliases.get("Aliases").and_then(Value::as_array).and_then(|a| a.iter().filter_map(|x| x.get("Name").and_then(Value::as_str)).find(|n| *n == "live").or_else(|| a.first().and_then(|x| x.get("Name").and_then(Value::as_str)))).unwrap_or("live");
+    let mut def = json!({ "function": name, "alias": alias, "config": config });
+    let note = match (image, def.as_object_mut()) {
+        (Some(uri), Some(m)) => {
+            m.insert("code".into(), json!(uri));
+            None
+        }
+        (_, Some(m)) => {
+            m.insert("code".into(), json!("${{ artifacts.zip }}"));
+            Some("Lambda doesn't say where a zip came from: point code at the zip CI builds (an artifact) or an s3:// key")
+        }
+        _ => None,
+    };
+    Ok(json!({ "definition": def, "note": note, "live": p::live_function(&answer, None) }))
+}
+
 pub async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     match obj::kind(desired) {
         "Function" => apply_function(cx, desired).await,
@@ -366,6 +425,13 @@ mod tests {
             let d = drifted.first().cloned().unwrap_or_default();
             assert_eq!(d.pointer("/spec/Code"), Some(&json!({ "CodeSha256": "handmade=" })));
             assert!(!p::code_matches(&f2, &d));
+
+            // What the account holds, and the function adopted as it runs.
+            let found = discover(&cx).await?;
+            assert_eq!(found.pointer("/resources/0/name"), Some(&json!("thumbs")));
+            let adopted = adopt(&cx, "thumbs").await?;
+            assert_eq!((adopted.pointer("/definition/alias"), adopted.pointer("/definition/config/MemorySize")), (Some(&json!("live")), Some(&json!(1024))));
+            assert!(adopted.get("note").is_some_and(|n| n.as_str().is_some_and(|n| n.contains("zip"))));
 
             // Gone: the alias, then the function; their records with them.
             delete(&cx, &key_of(&a2)).await?;

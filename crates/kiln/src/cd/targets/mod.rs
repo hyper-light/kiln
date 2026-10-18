@@ -19,6 +19,7 @@
 //!   apps on the target: their repository and environment (§6), cached by W11 until shortly
 //!   before they expire.
 
+pub mod api;
 pub mod aws_ecs;
 pub mod aws_lambda;
 #[cfg(test)]

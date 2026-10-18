@@ -198,11 +198,11 @@ impl Cd {
         self.kick.notify();
     }
 
-    fn mirror_dir(&self, url: &str) -> PathBuf {
+    pub(crate) fn mirror_dir(&self, url: &str) -> PathBuf {
         self.dir.join("git").join(format!("{:016x}.git", obj::hash_bytes(url.as_bytes())))
     }
 
-    fn git_auth(&self, url: &str) -> GitAuth {
+    pub(crate) fn git_auth(&self, url: &str) -> GitAuth {
         // The longest matching repository entry's credentials (Argo CD's credential templates).
         self.store.read(|d| {
             d.repos

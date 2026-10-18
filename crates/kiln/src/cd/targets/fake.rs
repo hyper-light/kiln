@@ -104,6 +104,14 @@ const CONFIG: &[&str] = &["Role", "Handler", "Description", "Timeout", "MemorySi
 fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collections::HashMap<String, String>, body: &Value) -> Response {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (method.as_str(), parts.as_slice()) {
+        ("GET", ["2015-03-31", "functions", ""]) => {
+            let all: Vec<Value> = st.functions.iter().map(|(n, f)| config_of(n, f)).collect();
+            ok(json!({ "Functions": all }))
+        }
+        ("GET", ["2015-03-31", "functions", name, "aliases"]) => match st.functions.get(*name) {
+            Some(f) => ok(json!({ "Aliases": f.aliases.values().cloned().collect::<Vec<_>>() })),
+            None => err(404, "ResourceNotFoundException", "Function not found"),
+        },
         ("POST", ["2015-03-31", "functions"]) => {
             let name = body.get("FunctionName").and_then(Value::as_str).unwrap_or_default().to_owned();
             if st.functions.contains_key(&name) {
@@ -417,6 +425,16 @@ fn ecs(st: &mut State, op: &str, body: &Value) -> Response {
                 .flat_map(|(_, revs)| revs.iter().filter(|t| t.get("status").and_then(Value::as_str) == Some("ACTIVE")).filter_map(|t| t.get("taskDefinitionArn").cloned()))
                 .collect();
             ok(json!({ "taskDefinitionArns": arns }))
+        }
+        "ListClusters" => {
+            let mut names: Vec<&String> = st.services.keys().map(|(c, _)| c).collect();
+            names.dedup();
+            ok(json!({ "clusterArns": names.iter().map(|c| format!("arn:aws:ecs:us-east-1:1:cluster/{c}")).collect::<Vec<_>>() }))
+        }
+        "ListServices" => {
+            let cluster = s("cluster");
+            let arns: Vec<Value> = st.services.iter().filter(|((c, _), v)| *c == cluster && v.get("status").and_then(Value::as_str) == Some("ACTIVE")).filter_map(|(_, v)| v.get("serviceArn").cloned()).collect();
+            ok(json!({ "serviceArns": arns }))
         }
         "DeregisterTaskDefinition" => {
             let arn = s("taskDefinition");

@@ -104,6 +104,67 @@ pub async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result
     Ok(out)
 }
 
+/// Names from ARNs (`…:cluster/main` → `main`).
+fn names_of(arns: Option<&Value>) -> Vec<String> {
+    arns.and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|a| a.rsplit('/').next()).map(str::to_owned).collect()
+}
+
+/// What the account holds in the region: its ECS clusters, and the services of `cluster` (or
+/// of every cluster, up to 20) (§8.2, §8.3).
+pub async fn discover(cx: &Cx<'_>, cluster: Option<&str>) -> Result<Value> {
+    let clusters = names_of(call(cx, "ListClusters", &json!({ "maxResults": 100 })).await?.get("clusterArns"));
+    let wanted: Vec<String> = match cluster {
+        Some(c) => vec![c.to_owned()],
+        None => clusters.iter().take(20).cloned().collect(),
+    };
+    let mut out = Vec::new();
+    for c in &wanted {
+        let mut names = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut body = json!({ "cluster": c, "maxResults": 100 });
+            if let (Some(t), Value::Object(m)) = (&token, &mut body) {
+                m.insert("nextToken".into(), Value::String(t.clone()));
+            }
+            let page = call(cx, "ListServices", &body).await?;
+            names.extend(names_of(page.get("serviceArns")));
+            token = page.get("nextToken").and_then(Value::as_str).map(str::to_owned);
+            if token.is_none() || names.len() >= 500 {
+                break;
+            }
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        for svc in describe_services(cx, c, &refs).await? {
+            let s = |k: &str| svc.get(k).and_then(Value::as_str).unwrap_or_default();
+            let n = |k: &str| svc.get(k).and_then(Value::as_i64).unwrap_or(0);
+            let launch = if s("launchType").is_empty() { "capacity providers" } else { s("launchType") };
+            out.push(json!({ "kind": "Service", "scope": c, "name": s("serviceName"), "summary": format!("{launch} · {} of {} running · {}", n("runningCount"), n("desiredCount"), s("taskDefinition").rsplit('/').next().unwrap_or_default()) }));
+        }
+    }
+    Ok(json!({ "scopes": clusters, "resources": out }))
+}
+
+/// A service as it runs now, as the definition that adopts it (§8.2 step 2): its task
+/// definition's revision as the task, and its settings.
+pub async fn adopt(cx: &Cx<'_>, cluster: &str, name: &str) -> Result<Value> {
+    if cluster.is_empty() {
+        bail!("name the ECS cluster (`scope`)");
+    }
+    let Some(svc) = describe_services(cx, cluster, &[name]).await?.into_iter().next() else { bail!("no service {name} in {cluster}") };
+    let td_arn = svc.get("taskDefinition").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let td = call(cx, "DescribeTaskDefinition", &json!({ "taskDefinition": td_arn })).await?;
+    let mut task = p::live_task_definition(&td).and_then(|o| o.get("spec").cloned()).unwrap_or(Value::Null);
+    if let Some(m) = task.as_object_mut() {
+        m.remove("tags");
+    }
+    let mut settings = p::live_service(&svc, None).and_then(|o| o.get("spec").cloned()).unwrap_or(Value::Null);
+    if let Some(m) = settings.as_object_mut() {
+        m.remove("taskDefinition");
+        m.remove("tags");
+    }
+    Ok(json!({ "definition": { "cluster": cluster, "service": name, "task": task, "service-spec": settings }, "note": Value::Null }))
+}
+
 pub async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     match obj::kind(desired) {
         "TaskDefinition" => apply_task_definition(cx, desired).await,
@@ -274,6 +335,15 @@ mod tests {
             let mut ec2 = svc2.clone();
             kiln_cd::providers::set_path(&mut ec2, "spec.launchType", json!("EC2")).map_err(|e| anyhow::anyhow!("{e}"))?;
             assert!(apply(&cx, &ec2).await.is_err_and(|e| format!("{e:#}").contains("launchType")));
+
+            // What the account holds, and a service adopted as it runs.
+            let found = discover(&cx, None).await?;
+            assert_eq!(found.pointer("/scopes/0"), Some(&json!("main")));
+            assert_eq!(found.pointer("/resources/0/name"), Some(&json!("api")));
+            let adopted = adopt(&cx, "main", "api").await?;
+            assert_eq!(adopted.pointer("/definition/task/containerDefinitions/0/image"), Some(&json!("acme/api@sha256:bbb")));
+            assert_eq!(adopted.pointer("/definition/service-spec/desiredCount"), Some(&json!(2)));
+            assert_eq!(adopted.pointer("/definition/task/revision"), None);
 
             delete(&cx, &key_of(&svc2)).await?;
             delete(&cx, &key_of(&td2)).await?;
