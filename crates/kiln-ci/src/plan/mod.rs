@@ -363,7 +363,7 @@ pub struct RunPlan {
     seq: u64,
     output_bytes: usize,
     run_env: Vec<(usize, String, String)>,
-    /// What `where:` removed, by job: for the preview.
+    /// The combinations `exclude` and `where:` removed, by job, with why: for the preview.
     removed: BTreeMap<String, Vec<(serde_json::Value, String)>>,
 }
 
@@ -611,7 +611,7 @@ impl RunPlan {
             .collect()
     }
 
-    /// The legs `where:` removed, by job, with why (W04-R29).
+    /// The combinations `exclude` and `where:` removed, by job, with why (W04-R29).
     pub fn removed(&self) -> &BTreeMap<String, Vec<(serde_json::Value, String)>> {
         &self.removed
     }
@@ -1123,6 +1123,7 @@ impl RunPlan {
         let limit = if dialect == Dialect::Gha { 256 } else { self.settings.max_legs };
         let strategy = job.strategy.as_ref();
         let what = "strategy";
+        let mut excluded: Vec<(Combo, usize)> = Vec::new();
         let (mut combos, filter, platforms, emulate): (Vec<Combo>, Option<Tpl>, bool, Vec<String>) = match strategy.and_then(|s| s.matrix.as_ref()) {
             None => (vec![Vec::new()], None, false, Vec::new()),
             Some(Matrix::Expr(t)) => {
@@ -1140,7 +1141,9 @@ impl RunPlan {
                         axes.push((k.to_string(), items));
                     }
                 }
-                (matrix::expand(&axes, &inc, &exc, limit)?, None, false, Vec::new())
+                let (combos, gone) = matrix::expand_all(&axes, &inc, &exc, limit)?;
+                excluded = gone;
+                (combos, None, false, Vec::new())
             }
             Some(Matrix::Spec(m)) => {
                 let mut axes: Vec<(String, Vec<Value>)> = Vec::new();
@@ -1160,9 +1163,18 @@ impl RunPlan {
                     }
                 };
                 let (inc, exc) = (list(&m.include, "include")?, list(&m.exclude, "exclude")?);
-                (matrix::expand(&axes, &inc, &exc, limit)?, m.filter.clone(), m.platforms.is_some(), m.emulate.clone())
+                let (combos, gone) = matrix::expand_all(&axes, &inc, &exc, limit)?;
+                excluded = gone;
+                (combos, m.filter.clone(), m.platforms.is_some(), m.emulate.clone())
             }
         };
+        if !excluded.is_empty() {
+            let id = self.nodes.get(n).map(|x| x.id.clone()).unwrap_or_default();
+            let list = self.removed.entry(id).or_default();
+            for (c, i) in excluded {
+                list.push((json(&combo_value(&c)), format!("removed by exclude entry {}", i + 1)));
+            }
+        }
         // `where:` (W04-R11).
         if let Some(f) = &filter {
             let mut kept = Vec::new();
@@ -1650,7 +1662,8 @@ impl RunPlan {
     }
 
     /// The plan without running it (W04-R29): every leg the run would queue if each succeeded
-    /// with no outputs, what the plan decided along the way, and what `where:` removed. Jobs
+    /// with no outputs, what the plan decided along the way, and what `exclude` and `where:`
+    /// removed. Jobs
     /// whose `if` or matrix read needs are marked: what a real run decides for them may differ.
     pub fn preview(wf: Arc<Workflow>, input: RunInput, settings: Settings, src: &dyn PlanSource) -> Result<Preview, String> {
         let reads_needs: Vec<String> = wf

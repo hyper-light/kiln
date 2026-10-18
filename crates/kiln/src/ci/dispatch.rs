@@ -54,6 +54,27 @@ pub enum Msg {
     Cancel { run: String, reason: String },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
+    /// The plan `Start` would make, without a run (W04-R29).
+    Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+}
+
+/// What a leg asks of routing (W05-R20).
+fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str) -> LegRoute {
+    let job = spec.def();
+    let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
+    let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
+    let caps = u64::from(CAP_CI2) | if uses { u64::from(CAP_ACTIONS) } else { 0 } | if docker { u64::from(CAP_DOCKER) } else { 0 };
+    LegRoute {
+        job: spec.job.clone(),
+        job_name: spec.job_name.clone(),
+        workflow: workflow.to_owned(),
+        repo: repo.to_owned(),
+        event: event.to_owned(),
+        labels: spec.runs_on.labels.clone(),
+        group: spec.runs_on.group.clone(),
+        requires: spec.requires.clone(),
+        caps,
+    }
 }
 
 /// The hub's handle on the dispatcher.
@@ -245,6 +266,11 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
+            Msg::Preview { start, reply } => {
+                let v = self.preview(&start).await;
+                let _ = reply.try_send(v);
+                Ok(())
+            }
         };
         if let Err(e) = r {
             tracing::warn!(error = %format!("{e:#}"), "CI dispatcher");
@@ -402,6 +428,37 @@ impl Dispatch {
         crate::rt::spawn(async move { super::events::workflow_run(&hub, &repo, &action, &summary, depth).await });
     }
 
+    /// What [`Self::start`] would plan for `s`, without a run: the `github` context of run 0,
+    /// the variables and reusable workflows a run would get, and each leg's routing against the
+    /// runners connected now.
+    async fn preview(&mut self, s: &Start) -> serde_json::Value {
+        let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
+        let github = self.github_context(s, 0, 0, &name);
+        let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
+        let vars = super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await.map(serde_json::Value::Object).unwrap_or_else(|_| serde_json::json!({}));
+        let input = RunInput { github, inputs, vars, changed: s.event.changed.clone().map(Arc::new), trusted: s.event.trusted };
+        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
+        let p = match RunPlan::preview(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files }) {
+            Ok(p) => p,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let workflow = s.workflow.name.clone().unwrap_or_default();
+        let legs: Vec<serde_json::Value> = p
+            .legs
+            .iter()
+            .map(|spec| {
+                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name));
+                let mut v = serde_json::to_value(spec).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    let constraints: Vec<&String> = req.constraints.iter().map(|(text, _)| text).collect();
+                    o.insert("routing".into(), serde_json::json!({ "labels": req.labels, "group": req.group, "constraints": constraints, "executors": req.executors, "image": req.image, "rules": req.rules, "runners": runners }));
+                }
+                v
+            })
+            .collect();
+        serde_json::json!({ "name": p.name, "legs": legs, "decided": p.decided, "removed": p.removed, "later": p.later })
+    }
+
     fn settings(&self) -> Settings {
         Settings { default_runs_on: vec!["k8s".into()], ..Settings::default() }
     }
@@ -506,20 +563,7 @@ impl Dispatch {
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
         let job = spec.def();
-        let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
-        let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
-        let caps = u64::from(CAP_CI2) | if uses { u64::from(CAP_ACTIONS) } else { 0 } | if docker { u64::from(CAP_DOCKER) } else { 0 };
-        let route = LegRoute {
-            job: spec.job.clone(),
-            job_name: spec.job_name.clone(),
-            workflow: r.wf.name.clone().unwrap_or_default(),
-            repo: r.repo.name.clone(),
-            event: r.event.name.clone(),
-            labels: spec.runs_on.labels.clone(),
-            group: spec.runs_on.group.clone(),
-            requires: spec.requires.clone(),
-            caps,
-        };
+        let route = route_of(&spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name);
         let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
         let leg = LegIn {

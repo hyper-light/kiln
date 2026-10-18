@@ -244,6 +244,61 @@ async fn named_ref(hub: &Hub, repo: &Repo, r: &str) -> Result<(String, String), 
     Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, format!("No ref found for: {r}")))
 }
 
+/// The ref and commit a plan preview (W04-R29) is for: `git_ref` (a branch, a tag, a `refs/…`
+/// name; the default branch when empty), at `sha` when given.
+pub async fn preview_ref(hub: &Hub, repo: &Repo, git_ref: &str, sha: Option<&str>) -> Result<(String, String), Refused> {
+    let r = if git_ref.is_empty() { facts(hub, repo).await.default_branch } else { git_ref.to_owned() };
+    match (named_ref(hub, repo, &r).await, sha) {
+        (Ok((full, _)), Some(sha)) => Ok((full, sha.to_owned())),
+        (Ok(found), None) => Ok(found),
+        (Err(_), Some(sha)) => Ok((if r.starts_with("refs/") { r } else { format!("refs/heads/{r}") }, sha.to_owned())),
+        (Err(e), None) => Err(e),
+    }
+}
+
+/// The event a plan preview stands for: `name` at `full_ref` and `sha` as kiln would see it. A
+/// push brings what its commit changed; a pull request targets the default branch. A `payload`
+/// (a webhook's, say) is taken as GitHub's. `workflow_dispatch` inputs are checked against what
+/// the workflow declares; the typed inputs come back with the event.
+#[allow(clippy::too_many_arguments)]
+pub async fn preview_event(hub: &Hub, repo: &Repo, name: &str, full_ref: &str, sha: &str, payload: Option<&serde_json::Value>, given: &serde_json::Map<String, serde_json::Value>, declared: Option<&[kiln_ci::wf::ir::Input]>, path: &str) -> Result<(Event, serde_json::Value), Refused> {
+    let f = facts(hub, repo).await;
+    if let Some(p) = payload {
+        let mut e = kiln_ci::trigger::github::event(name, p, &f.default_branch, sha).ok_or_else(|| refused(http::StatusCode::UNPROCESSABLE_ENTITY, format!("The payload isn't a {name} event's")))?;
+        if e.sha.is_empty() {
+            e.sha = sha.to_owned();
+        }
+        return Ok((e, serde_json::Value::Null));
+    }
+    let short = full_ref.strip_prefix("refs/heads/").or_else(|| full_ref.strip_prefix("refs/tags/")).unwrap_or(full_ref).to_owned();
+    match name {
+        "push" => {
+            let parent = gitops::run_git(hub, &["-C", &f.mirror, "rev-parse", "--verify", "--quiet", &format!("{sha}^")], LS_REMOTE_TIMEOUT).await.ok().map(|o| String::from_utf8_lossy(&o).trim().to_owned()).filter(|s| !s.is_empty());
+            let event = if full_ref.starts_with("refs/tags/") { "tag" } else { "push" };
+            Ok((synthesize(hub, repo, &Trigger { event, branch: short, sha: sha.to_owned(), before: parent, pipeline: None, payload: None }).await, serde_json::Value::Null))
+        }
+        "pull_request" | "pull_request_target" => {
+            let mut e = synthesize(hub, repo, &Trigger { event: "pull_request", branch: "pr/0".into(), sha: sha.to_owned(), before: None, pipeline: None, payload: None }).await;
+            e.name = name.to_owned();
+            Ok((e, serde_json::Value::Null))
+        }
+        "workflow_dispatch" => {
+            let declared = declared.ok_or_else(|| refused(http::StatusCode::UNPROCESSABLE_ENTITY, "Workflow does not have 'workflow_dispatch' trigger"))?;
+            let (typed, strings) = kiln_ci::trigger::dispatch::inputs(declared, given).map_err(|m| refused(http::StatusCode::UNPROCESSABLE_ENTITY, m))?;
+            let mut e = Event { name: name.to_owned(), repo: repo.name.clone(), git_ref: full_ref.to_owned(), sha: sha.to_owned(), actor: "kiln".into(), trusted: true, source: Source::Api, ..Event::default() };
+            e.payload = context::workflow_dispatch(&e, &f.repo, path, &strings);
+            Ok((e, typed))
+        }
+        other => {
+            let mut e = Event { name: other.to_owned(), repo: repo.name.clone(), git_ref: full_ref.to_owned(), sha: sha.to_owned(), actor: "kiln".into(), trusted: true, source: Source::Api, ..Event::default() };
+            if other == "schedule" {
+                e.payload = context::schedule("", &f.repo);
+            }
+            Ok((e, serde_json::Value::Null))
+        }
+    }
+}
+
 /// `workflow_dispatch` (W03-R11): runs workflow `which` (its path, or its file name as GitHub's
 /// API takes it) at `git_ref` with `inputs`, checked against what it declares.
 pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<(), Refused> {

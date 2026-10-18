@@ -793,6 +793,32 @@ impl Scheduler {
             .collect()
     }
 
+    /// How each runner measures up against a leg that isn't queued (W04-R29's preview): the
+    /// requirement routing makes of `route`, and each runner's checks.
+    pub fn explain_route(&self, route: &LegRoute) -> (Requirement, Vec<Explained>) {
+        let req = self.requirement(&LegIn { route: route.clone(), ..LegIn::default() });
+        let views: Vec<&RunnerView> = self.runners.values().map(|r| &r.input.view).collect();
+        let scores = routing::scores(&req.prefer, &views);
+        let list = self
+            .runners
+            .values()
+            .enumerate()
+            .map(|(i, r)| {
+                let checks = routing::checks(&req, &r.input.view);
+                Explained {
+                    runner: r.input.id.clone(),
+                    name: r.input.view.name.clone(),
+                    connected: r.connected,
+                    eligible: checks.iter().all(|c| c.pass),
+                    room: r.connected && !r.draining && r.running.len() < r.input.slots as usize,
+                    score: scores.get(i).copied(),
+                    checks,
+                }
+            })
+            .collect();
+        (req, list)
+    }
+
     /// The current wait reason of a leg, if it waits.
     pub fn reason(&self, id: &str) -> Option<&WaitReason> {
         self.legs.get(id).and_then(|l| l.reason.as_ref())

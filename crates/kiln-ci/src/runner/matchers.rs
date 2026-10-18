@@ -19,14 +19,14 @@ use serde_json::Value;
 const PROPS: [&str; 9] = ["file", "line", "column", "severity", "code", "message", "fromPath", "endLine", "endColumn"];
 const MESSAGE: usize = 5;
 
-/// A pattern's regular expression. GitHub's are .NET's, and most matcher files use only what the
-/// two engines share.
+/// A pattern's regular expression. GitHub's are .NET's: lookaround and backreferences included
+/// (setup-dotnet's `(?<!MSB)`), so a backtracking engine where they appear.
 #[derive(Debug)]
-struct Re(regex::Regex);
+struct Re(fancy_regex::Regex);
 
 impl Re {
     fn new(p: &str) -> Result<Re, String> {
-        regex::Regex::new(p).map(Re).map_err(|e| e.to_string())
+        fancy_regex::RegexBuilder::new(p).backtrack_limit(100_000).build().map(Re).map_err(|e| e.to_string())
     }
 
     /// The groups' count, group 0 included.
@@ -34,10 +34,11 @@ impl Re {
         self.0.captures_len()
     }
 
-    /// Each group's text when `line` matches: `Some("")` for a group that took no part, as .NET
-    /// has it.
+    /// Each group's text when `line` matches: `""` for a group that took no part, as .NET has
+    /// it. A line that runs past the backtracking limit doesn't match (GitHub times such a line
+    /// out).
     fn captures(&self, line: &str) -> Option<Vec<String>> {
-        let c = self.0.captures(line)?;
+        let c = self.0.captures(line).ok()??;
         Some((0..c.len()).map(|i| c.get(i).map_or(String::new(), |m| m.as_str().to_owned())).collect())
     }
 }
@@ -438,6 +439,17 @@ mod tests {
         assert_eq!(s.line("error|1|   "), None, "nor a blank message");
         assert_eq!(s.line("ERROR|+1|x").map(|i| (i.level, i.line)), Some(("error", None)), "lines are digits only");
         assert_eq!(s.line("Notice|007|x").map(|i| (i.level, i.line)), Some(("notice", Some(7))));
+        Ok(())
+    }
+
+    #[test]
+    fn w06_ac02_dotnet_s_matcher_and_its_lookbehind() -> Result<(), String> {
+        // setup-dotnet's `.github/csc.json`.
+        let csc = r#"{ "problemMatcher": [ { "owner": "csc", "pattern": [ { "regexp": "^([^\\s].*)\\((\\d+)(?:,\\d+|,\\d+,\\d+)?\\):\\s+(error|warning)\\s+([a-zA-Z]+(?<!MSB)\\d+):\\s*(.*?)\\s+\\[(.*?)\\]$", "file": 1, "line": 2, "severity": 3, "code": 4, "message": 5, "fromPath": 6 } ] } ] }"#;
+        let mut s = job(&[csc])?.step();
+        let i = s.line("Program.cs(5,13): error CS0103: The name 'x' does not exist in the current context [/w/app/app.csproj]").ok_or("no issue")?;
+        assert_eq!((i.file.as_deref(), i.line, i.code.as_deref(), i.from_path.as_deref()), (Some("Program.cs"), Some(5), Some("CS0103"), Some("/w/app/app.csproj")));
+        assert_eq!(s.line("Build.proj(3,5): error MSB4019: The imported project was not found. [/w/app/app.csproj]"), None, "MSB codes are MSBuild's, not the compiler's");
         Ok(())
     }
 
