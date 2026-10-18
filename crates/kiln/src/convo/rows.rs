@@ -52,6 +52,9 @@ pub enum Row {
     Record(Box<RecordRow>),
     /// The harness's record from `source` starts over (its file was replaced): its lines go.
     RecordReset { session: String, source: String, at: i64 },
+    /// The machine the session runs on, as the store it came from has it (a mirror of the
+    /// server's store keeps where each session runs).
+    Machine { session: String, machine: String },
 }
 
 /// A line of the harness's record: Claude Code's transcript, a Codex rollout.
@@ -99,7 +102,7 @@ pub struct EventRow {
 impl Row {
     pub fn session(&self) -> &str {
         match self {
-            Row::Session { session, .. } | Row::Reset { session, .. } | Row::Closed { session, .. } | Row::RecordReset { session, .. } => session,
+            Row::Session { session, .. } | Row::Reset { session, .. } | Row::Closed { session, .. } | Row::RecordReset { session, .. } | Row::Machine { session, .. } => session,
             Row::Event(e) => &e.session,
             Row::Record(r) => &r.session,
         }
@@ -111,7 +114,7 @@ impl Row {
             Row::Session { info, meta, state, changes, .. } => 64 + [info, meta, state, changes].iter().map(|p| p.as_ref().map_or(0, String::len)).sum::<usize>(),
             Row::Event(e) => 128 + e.text.len() + e.body.len(),
             Row::Record(r) => 64 + r.source.len() + r.line.len(),
-            Row::Reset { .. } | Row::Closed { .. } | Row::RecordReset { .. } => 64,
+            Row::Reset { .. } | Row::Closed { .. } | Row::RecordReset { .. } | Row::Machine { .. } => 64,
         }
     }
 }
@@ -211,6 +214,16 @@ pub fn coalesce(rows: Vec<Row>) -> Vec<Row> {
                     last.insert(key, out.len());
                     out.push(Some(merged));
                     continue;
+                }
+                last.insert(key, out.len());
+                out.push(Some(row));
+            }
+            Row::Machine { session, .. } => {
+                let key = (session.clone(), "m".to_owned());
+                if let Some(i) = last.get(&key).copied()
+                    && let Some(slot) = out.get_mut(i)
+                {
+                    *slot = None;
                 }
                 last.insert(key, out.len());
                 out.push(Some(row));

@@ -204,7 +204,7 @@ They run in their phase and are deleted as `hook-delete-policy` says (`HookSucce
 | `Prune=true` / `false` / `confirm` | delete what git no longer holds; `false` on an object keeps it; `confirm` waits for a person |
 | `PruneLast=true` | prune after every wave has synced |
 | `PrunePropagationPolicy=foreground` / `background` / `orphan` | how deletes cascade |
-| `CreateNamespace=true` | create the destination namespace (with `managedNamespaceMetadata`) |
+| `CreateNamespace=true` | make the destination namespace when it's missing, as Argo CD does: it is no object of the app's, so it is never compared, counted, tracked or pruned, and a namespace another app deploys stays that app's alone. With `managedNamespaceMetadata`, every sync applies its labels and annotations beside what others set |
 | `ServerSideApply=true` / `false` | kiln's default is `true`; `false` uses client-side apply with `last-applied-configuration` |
 | `Replace=true`, `Force=true` | replace instead of apply; delete and recreate when replace fails |
 | `ApplyOutOfSyncOnly=true` | apply only what differs |
