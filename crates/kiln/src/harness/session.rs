@@ -472,8 +472,8 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
-        let here = crate::config::Config::hostname();
-        let mut text = format!("Moved here ({here}, {}) from {} ({}) — the conversation, its timeline and queue came along", core.state.cwd, sd.from, sd.from_cwd);
+        let folder = if core.state.cwd == sd.from_cwd { String::new() } else { format!(" (it works in {} here; it was in {})", core.state.cwd, sd.from_cwd) };
+        let mut text = format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from);
         if let Some(n) = &sd.note {
             text.push_str(". ");
             text.push_str(n);
@@ -1191,7 +1191,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
     let spec = s.resume_spec();
     let (events, state, from_cwd, session) = {
         let core = s.core.lock();
-        (core.events().cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone(), core.state.harness_session.clone())
+        // The note that it was about to move is this machine's alone.
+        (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone(), core.state.harness_session.clone())
     };
     let mut note = format!("This conversation moved from {me} (where it worked in {from_cwd}) to {} (it works in {} now).", mv.to, mv.cwd);
     if let Some(n) = &mv.note {

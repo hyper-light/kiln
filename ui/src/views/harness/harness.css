@@ -3009,3 +3009,46 @@ textarea.hx-input {
   margin-top: 18px;
 }
 
+
+/* Move to… */
+.mv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.mv-choice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid #2a2c33;
+  border-radius: 12px;
+  background: #0e0f12;
+  text-align: left;
+  transition:
+    border-color 0.15s,
+    background-color 0.15s;
+}
+.mv-choice:hover {
+  border-color: #3d3a52;
+  background: #121119;
+}
+.mv-choice-on {
+  border-color: #8a80b8;
+  background: #15131d;
+}
+.mv-name {
+  font-size: 14px;
+  color: var(--color-foreground);
+}
+.mv-meta {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--color-subtle);
+}
+.mv-none {
+  font-size: 13px;
+  color: var(--color-secondary);
+}

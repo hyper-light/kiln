@@ -672,6 +672,8 @@ export const harnessApi = {
   fork: (machine: string, pid: number) => call<AgentInfo[]>("POST", `/api/ai-sessions/${encodeURIComponent(machine)}/${pid}/fork`),
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
+  /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
+  move: (id: string, to: string) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to }),
   /** A command without opening the session's socket (inbox answers). */
   command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
   /** Upload a file for a later message (the agent's socket caps a message at 16 MB). */
