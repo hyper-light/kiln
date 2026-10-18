@@ -524,6 +524,11 @@ impl Registry {
         self.mirrors.lock().get(id).is_none_or(|m| matches!(&m.location, Location::Machine(at) if at == machine))
     }
 
+    /// Session `id` is one kiln knows, and it runs on `machine`.
+    pub fn located_on(&self, id: &str, machine: &str) -> bool {
+        self.mirrors.lock().get(id).is_some_and(|m| matches!(&m.location, Location::Machine(at) if at == machine))
+    }
+
     /// A copy of session `id` at `epoch` is from before it went on elsewhere: its machine lets go
     /// of it.
     pub fn stale(&self, id: &str, epoch: u64) -> bool {

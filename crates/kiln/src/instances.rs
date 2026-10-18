@@ -188,6 +188,28 @@ impl Instances {
         Joined { stale, drain, newest }
     }
 
+    /// An instance that has joined says again when it was set up: a blue/green upgrade's new build
+    /// (`crate::bluegreen`) joins ranked oldest, so new work stays with the runner it takes over
+    /// from, and once promoted says when it really was set up, which makes it the newest. `None`
+    /// when `peer` hasn't joined (its hello is still to come); else the machine's instances that
+    /// should stop taking jobs now (Drain).
+    pub fn reannounce(&mut self, peer: PeerId, ih: &InstanceHello) -> Option<Vec<PeerId>> {
+        let i = self.by_peer.get_mut(&peer)?;
+        i.created_at = ih.created_at;
+        i.pid = Some(ih.pid);
+        let name = i.name.clone();
+        let newest = self.newest_of(&name);
+        let mut drain = Vec::new();
+        for (p, i) in &mut self.by_peer {
+            if i.name == name && Some(*p) != newest && !i.drained {
+                i.drained = true;
+                drain.push(*p);
+            }
+        }
+        drain.sort_unstable();
+        Some(drain)
+    }
+
     fn newest_of(&self, name: &str) -> Option<PeerId> {
         self.by_peer.iter().filter(|(_, i)| i.name == name).max_by(|a, b| a.1.rank().cmp(&b.1.rank())).map(|(p, _)| *p)
     }
@@ -374,6 +396,25 @@ mod tests {
         assert_eq!(m.newest("box"), Some(20));
         assert!(m.crowded().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn a_new_build_takes_new_work_once_it_says_it_has_taken_over() {
+        let mut inst = Instances::default();
+        inst.announce(1, ih("main", 0));
+        inst.join(1, "m", hello("1"), 0);
+        // The new build joins ranked oldest: new work stays with the runner it takes over from.
+        inst.announce(2, ih("green", -1));
+        let joined = inst.join(2, "m", hello("2"), 0);
+        assert!(!joined.newest);
+        assert_eq!(joined.drain, vec![2]);
+        assert_eq!(inst.newest("m"), Some(1));
+        // Promoted, it says when it was set up: the newest now, and the old runner is drained.
+        assert_eq!(inst.reannounce(2, &ih("green", 100)), Some(vec![1]));
+        assert_eq!(inst.newest("m"), Some(2));
+        assert_eq!(inst.reannounce(2, &ih("green", 100)), Some(vec![]), "drained once");
+        // Before its hello, an announcement is the one its hello comes with.
+        assert_eq!(inst.reannounce(3, &ih("other", 5)), None);
     }
 
     #[test]

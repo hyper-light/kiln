@@ -39,6 +39,7 @@ sha2 = "0.11.1"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
 toml = "1.1.8"
+toml_edit = "0.25"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.28.0", features = ["v7", "serde"] }
@@ -72,7 +73,7 @@ rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 
 # Unix (Linux and macOS): signals and process groups, pidfd exit waits, PTY masters on readiness.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net"] }
+nix = { version = "0.31.3", features = ["signal", "process", "fs", "user", "term", "feature", "hostname", "net", "socket", "uio"] }
 rustix = { version = "1.1", features = ["process", "termios", "net"] }
 filedescriptor = "0.8"
 

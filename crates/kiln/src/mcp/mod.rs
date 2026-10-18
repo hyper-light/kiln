@@ -45,13 +45,7 @@ pub fn kit() -> Option<&'static Kit> {
 pub fn init_kit(hub: &Hub, local_url: &str) -> anyhow::Result<()> {
     let dir = hub.cfg.server.data_dir.join("agents");
     let plugin = dir.join("kiln-plugin");
-    std::fs::create_dir_all(plugin.join(".claude-plugin"))?;
-    std::fs::write(
-        plugin.join(".claude-plugin").join("plugin.json"),
-        serde_json::to_vec_pretty(&json!({"name": "kiln", "version": env!("CARGO_PKG_VERSION"),
-            "description": "kiln's skills: deploying, diagnosing deployments, defining apps, moving from Argo CD."}))?,
-    )?;
-    skills::install(&plugin.join("skills"))?;
+    write_plugin(&plugin)?;
     let config = dir.join("kiln-mcp.json");
     let body = json!({"mcpServers": {"kiln": {"type": "http", "url": format!("{}/api/mcp", local_url.trim_end_matches('/')),
         "headers": {"Authorization": format!("Bearer {}", token(&hub.admin_token, "local-agents"))}}}});
@@ -65,6 +59,89 @@ pub fn init_kit(hub: &Hub, local_url: &str) -> anyhow::Result<()> {
     std::fs::rename(&tmp, &config)?;
     let _ = KIT.set(Kit { claude_mcp_config: config, plugin_dir: plugin });
     Ok(())
+}
+
+/// Where kiln keeps whom agent session `id` acts for (`owner` or `user:<id>`), from whoever
+/// started it.
+pub fn opener_key(id: &str) -> String {
+    format!("agents/opener/{id}")
+}
+
+/// The most an answer to a runner may be (it goes over the runner's control lane).
+const RUNNER_ANSWER_MAX: usize = 4 << 20;
+
+/// What a runner asks for one of its agent sessions' MCP server (`kiln reach mcp`, whose code
+/// mode runs on the runner, `crate::reach::mcp`): `{"op": "registry", "session"}` for the
+/// operations, or `{"op": "call", "session", "name", "input"}` to run one. The session must be one
+/// kiln knows on that runner, which mustn't be a job's; it acts for whoever started it (the owner
+/// on a kiln nobody else signs in to), audited as `agent:<session>@<runner> for <them>`. The
+/// answer: `{"registry", "skills"}`, `{"ok": <answer>}`, or `{"error", "status"?}`.
+pub async fn runner_ask(hub: &Arc<Hub>, runner: &str, ask: &Value) -> Value {
+    if hub.agents.lock().get(runner).is_none_or(|a| a.ephemeral || a.outpost) {
+        return json!({"error": "kiln's operations are for its agents' runners, not a job's"});
+    }
+    let session = ask.get("session").and_then(Value::as_str).unwrap_or("");
+    if session.is_empty() || !hub.harness.located_on(session, runner) {
+        return json!({"error": format!("kiln knows no agent session {session:?} on {runner}: its operations are for the agents it runs")});
+    }
+    let opener = match hub.store.kv_get(opener_key(session)).await.ok().flatten() {
+        Some(o) => o,
+        None if !crate::authz::gate::has_users(hub).await => "owner".to_owned(),
+        None => return json!({"error": "kiln doesn't know who started this agent, so it can't act for them: start the agent from Agents"}),
+    };
+    let short: String = session.chars().take(8).collect();
+    let Some(caller) = crate::authz::gate::agent_for(hub, &format!("agent:{short}@{runner}"), &opener).await else {
+        return json!({"error": "whoever started this agent can't sign in here any more"});
+    };
+    let answer = match ask.get("op").and_then(Value::as_str) {
+        Some("registry") => {
+            let skills: Vec<Value> = skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();
+            json!({"registry": code::registry(hub), "skills": skills})
+        }
+        Some("call") => {
+            let name = ask.get("name").and_then(Value::as_str).unwrap_or("");
+            let input = ask.get("input").cloned().unwrap_or(Value::Null);
+            match crate::ops::call(crate::ops::Cx { hub: Arc::clone(hub), caller }, name, input).await {
+                Ok(v) => json!({"ok": v}),
+                Err((status, msg)) => json!({"error": msg, "status": status.as_u16()}),
+            }
+        }
+        _ => json!({"error": "an unknown question"}),
+    };
+    let size = answer.to_string().len();
+    if size > RUNNER_ANSWER_MAX {
+        return json!({"error": format!("the answer is {size} bytes, more than the {RUNNER_ANSWER_MAX} a runner is sent: filter or page on the server")});
+    }
+    answer
+}
+
+/// kiln's skills as a Claude Code plugin directory at `dir`.
+fn write_plugin(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir.join(".claude-plugin"))?;
+    std::fs::write(
+        dir.join(".claude-plugin").join("plugin.json"),
+        serde_json::to_vec_pretty(&json!({"name": "kiln", "version": env!("CARGO_PKG_VERSION"),
+            "description": "kiln's skills: deploying, diagnosing deployments, defining apps, moving from Argo CD."}))?,
+    )?;
+    skills::install(&dir.join("skills"))?;
+    Ok(())
+}
+
+/// kiln's skills for the agents a runner starts, where the server's kit isn't (another machine):
+/// a plugin directory under this machine's kiln data, written once per process.
+pub fn plugin_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = crate::config::default_data_dir().join("agents").join("kiln-plugin");
+        match write_plugin(&dir) {
+            Ok(()) => Some(dir),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "couldn't write kiln's skills for agents");
+                None
+            }
+        }
+    })
+    .as_deref()
 }
 
 /// Protocol versions kiln speaks, newest first.

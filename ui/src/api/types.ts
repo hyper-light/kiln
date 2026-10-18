@@ -632,8 +632,18 @@ export interface ServerUpdate {
   note: string;
 }
 
+/** What a runner does with a newer kiln: upgraded by itself ("auto"), told it's available and
+ * upgraded when you choose ("notify", the default), or left alone ("off"). */
+export type UpdatePolicy = "auto" | "notify" | "off";
+
 export interface RunnerUpdate {
   name: string;
+  policy: UpdatePolicy;
+  /** Its machine refuses upgrades (its own kiln config: `[updates] accept = false`): never upgraded,
+   * whatever its policy here. */
+  locked: boolean;
+  /** Where the build it would get comes from ("built by release run #141", "built by a Mac", ...). */
+  from: string | null;
   hostname: string;
   os: string;
   arch: string;
@@ -654,9 +664,20 @@ export interface RunnerUpdate {
   standing?: "current" | "behind" | "unknown" | "branch" | "local" | null;
   /** What it does next to reach the newest kiln, as the end of a sentence about it. */
   next?: string | null;
-  how?: "download" | "build" | "wait" | "upgrading" | "left" | null;
+  how?: "download" | "build" | "wait" | "upgrading" | "left" | "off" | null;
+  /** The release run it waits for, and how far that is. */
+  waits_on?: ReleaseWait | null;
   /** Its kiln checkout, as it reports it. */
   checkout?: string | null;
+}
+
+/** A release run building what a runner waits for: its job's step under way, since when, and where. */
+export interface ReleaseWait {
+  run: string;
+  number: number;
+  step: string | null;
+  since: number | null;
+  on: string | null;
 }
 
 /** The newest kiln: the commit of the release branch every runner is brought to. */

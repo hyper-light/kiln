@@ -53,7 +53,7 @@ pub enum Update {
 }
 
 /// How a file was before the agent first changed it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Baseline {
     /// It did not exist.
     Absent,
@@ -196,6 +196,28 @@ impl Default for Core {
     }
 }
 
+/// A session's core written out whole, for this process's next image (an in-place upgrade): the
+/// session goes on there, with the same harness process, where it was.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Frozen {
+    state: State,
+    meta: Meta,
+    events: Vec<Event>,
+    next_seq: u64,
+    baselines: HashMap<String, Baseline>,
+    changes: std::collections::BTreeMap<String, super::model::FileChange>,
+    /// Task output kiln keeps itself: its bytes (base64), and how many there have been.
+    task_output: HashMap<String, (String, u64)>,
+    stream: Vec<(String, String)>,
+    changed: Vec<String>,
+    /// Updates not sent yet, and lines for the harness not written yet: the next image sends them.
+    out: Vec<Update>,
+    writes: Vec<String>,
+    hold: bool,
+    harness: Option<String>,
+}
+
+
 impl Core {
     pub fn new() -> Self {
         Self {
@@ -221,6 +243,54 @@ impl Core {
             hold: false,
             harness: None,
         }
+    }
+
+    /// Everything in it, for this process's next image ([`Core::thaw`]).
+    pub fn freeze(&self) -> Frozen {
+        use base64::Engine as _;
+        Frozen {
+            state: self.state.clone(),
+            meta: self.meta.clone(),
+            events: self.events.iter().cloned().collect(),
+            next_seq: self.next_seq,
+            baselines: self.baselines.clone(),
+            changes: self.changes.clone(),
+            task_output: self.task_output.iter().map(|(id, t)| (id.clone(), (base64::engine::general_purpose::STANDARD.encode(t.data.iter().copied().collect::<Vec<u8>>()), t.total))).collect(),
+            stream: self.stream.clone(),
+            changed: self.changed.clone(),
+            out: self.out.clone(),
+            writes: self.writes.clone(),
+            hold: self.hold,
+            harness: self.harness.clone(),
+        }
+    }
+
+    /// The core a previous image of this process froze ([`Core::freeze`]), whole. What it hadn't
+    /// sent yet goes out with the next flush; viewers get it all again from the session's
+    /// announcement.
+    pub fn thaw(f: Frozen) -> Self {
+        use base64::Engine as _;
+        let mut c = Self::new();
+        c.index = f.events.iter().map(|e| (e.id.clone(), e.seq)).collect();
+        c.events = f.events.into();
+        c.next_seq = f.next_seq;
+        c.state = f.state;
+        c.meta = f.meta;
+        c.baselines = f.baselines;
+        c.changes = f.changes;
+        c.changes_dirty = !c.changes.is_empty();
+        c.task_output = f
+            .task_output
+            .into_iter()
+            .map(|(id, (data, total))| (id, TaskOutput { data: base64::engine::general_purpose::STANDARD.decode(data).unwrap_or_default().into(), total }))
+            .collect();
+        c.stream = f.stream;
+        c.changed = f.changed;
+        c.out = f.out;
+        c.writes = f.writes;
+        c.hold = f.hold;
+        c.harness = f.harness;
+        c
     }
 
     /// Take over the timeline and state the session had on another machine (it moved here): its

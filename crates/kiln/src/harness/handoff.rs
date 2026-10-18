@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use super::model::{Todo, ToolKind, clip_middle};
+use super::model::{Body, Event, Todo, ToolKind, ToolStatus, clip_middle};
 
 /// A conversation as any harness can take it up: what was said and done, oldest first.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -798,6 +798,76 @@ pub fn fit(c: &mut Conversation, budget: usize) -> usize {
     dropped
 }
 
+// ---------------------------------------------------------------------- written as words
+
+/// The most a conversation in words takes ([`as_words`]): about 50k tokens.
+pub const WORDS_BUDGET: usize = 200 * 1024;
+
+/// The conversation from kiln's own timeline, for a harness whose own record kiln doesn't keep
+/// (ACP agents, Antigravity): what was said, and each tool call with what kiln kept of its output
+/// (kiln shortens long ones). A subagent's events and kiln's own notes to the agent (task
+/// notifications, reminders) are left out; the person's attachments go by name.
+pub fn from_events(events: &[Event]) -> Conversation {
+    let mut c = Conversation::default();
+    for e in events.iter().filter(|e| e.parent.is_none()) {
+        match &e.body {
+            Body::User { text, origin, attachments, .. } if origin.as_deref() != Some("system") && (!text.trim().is_empty() || !attachments.is_empty()) => {
+                let mut text = text.clone();
+                if !attachments.is_empty() {
+                    text.push_str(&format!("\n[attached: {}]", attachments.join(", ")));
+                }
+                c.entries.push(Entry::User { text, images: Vec::new() });
+            }
+            Body::Assistant { text, .. } if !text.trim().is_empty() => c.entries.push(Entry::Assistant(text.clone())),
+            Body::Tool(t) => {
+                let mut call = Call::new(&t.tool_id, &t.name, t.tool, t.input.clone());
+                call.output = t.output.clone().unwrap_or_default();
+                call.exit_code = t.exit_code;
+                call.error = matches!(t.status, ToolStatus::Error | ToolStatus::Denied | ToolStatus::Cancelled);
+                if t.tool == ToolKind::Shell && !t.title.trim().is_empty() {
+                    call.command = Some(t.title.clone());
+                }
+                c.entries.push(Entry::Call(Box::new(call)));
+            }
+            _ => {}
+        }
+    }
+    c
+}
+
+/// `c` in words, for a harness that takes a conversation only as text (its first message's
+/// context): `note` first, then each entry, oldest first, all in one `<kiln_handoff>` block. Made
+/// to fit `budget` bytes first ([`fit`]: long outputs shortened, then the oldest left out).
+pub fn as_words(mut c: Conversation, note: &str, budget: usize) -> String {
+    fit(&mut c, budget);
+    let mut s = format!("<kiln_handoff>\n{note}\nThis is the conversation so far, oldest first, as kiln kept it; go on from where it ends.\n\n");
+    if let Some(sum) = &c.summary {
+        s.push_str(&format!("[What came before, in short]\n{sum}\n\n"));
+    }
+    for e in &c.entries {
+        match e {
+            Entry::User { text, .. } => s.push_str(&format!("The person said:\n{text}\n\n")),
+            Entry::Assistant(t) => s.push_str(&format!("You said:\n{t}\n\n")),
+            Entry::Call(call) => {
+                let out = if call.output.trim().is_empty() { "(nothing)".to_owned() } else { clip_middle(call.output.trim_end(), 16 * 1024).0 };
+                let how = if call.error { "it failed" } else { "it returned" };
+                match call.command.as_deref().filter(|c| !c.trim().is_empty()) {
+                    Some(cmd) => {
+                        let exit = call.exit_code.map(|c| format!(" (exit code {c})")).unwrap_or_default();
+                        s.push_str(&format!("You ran `{cmd}`{exit}; {how}:\n{out}\n\n"));
+                    }
+                    None => {
+                        let input = clip_middle(&call.input.to_string(), 4 * 1024).0;
+                        s.push_str(&format!("You used the {} tool with {input}; {how}:\n{out}\n\n", call.name));
+                    }
+                }
+            }
+        }
+    }
+    s.push_str("</kiln_handoff>");
+    s
+}
+
 // ---------------------------------------------------------------------- written for Codex
 
 /// How a call goes to the target: as its own tool's call, or in words.
@@ -1314,6 +1384,38 @@ pub fn write_claude(env: &[(String, String)], cwd: &str, session: &str, records:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kilns_timeline_in_words_for_a_harness_whose_record_kiln_doesnt_keep() -> anyhow::Result<()> {
+        use crate::harness::model::{Event, ToolCall};
+        let ev = |id: &str, parent: Option<&str>, body: Body| Event { id: id.into(), seq: 0, at: 0, parent: parent.map(str::to_owned), by: None, body };
+        let user = |text: &str, origin: Option<&str>| Body::User { text: text.into(), images: 0, client_id: None, origin: origin.map(str::to_owned), attachments: vec![] };
+        let tool: ToolCall = serde_json::from_value(json!({"tool_id": "t1", "name": "run_shell_command", "tool": "shell", "title": "cargo test", "input": {"command": "cargo test"}, "status": "error", "output": "1 failed", "exit_code": 101, "started": 0}))?;
+        let events = vec![
+            ev("u1", None, user("fix the build", Some("human"))),
+            ev("a1", None, Body::Assistant { text: "Running the tests.".into(), streaming: false }),
+            ev("t1", None, Body::Tool(Box::new(tool))),
+            ev("s1", None, user("a reminder kiln sent", Some("system"))),
+            ev("x1", Some("t9"), Body::Assistant { text: "a subagent's words".into(), streaming: false }),
+            ev("n1", None, Body::Notice { level: crate::harness::model::Level::Info, text: "compacted".into() }),
+        ];
+        let c = from_events(&events);
+        assert_eq!(c.entries.len(), 3, "{:?}", c.entries);
+        let words = as_words(c, "It went on from mac, which is gone.", WORDS_BUDGET);
+        assert!(words.starts_with("<kiln_handoff>\nIt went on from mac, which is gone."));
+        assert!(words.ends_with("</kiln_handoff>"));
+        let (asked, said, ran) = (words.find("The person said:\nfix the build"), words.find("You said:\nRunning the tests."), words.find("You ran `cargo test` (exit code 101); it failed:\n1 failed"));
+        assert!(asked.is_some() && said.is_some() && ran.is_some(), "{words}");
+        assert!(asked < said && said < ran, "oldest first");
+        assert!(!words.contains("a reminder kiln sent") && !words.contains("a subagent's words") && !words.contains("compacted"));
+        // Too long for its budget: the oldest go (the first thing asked stays), and it says so.
+        let many: Vec<Event> = (0..400).map(|i| ev(&format!("a{i}"), None, Body::Assistant { text: format!("{i} {}", "x".repeat(1000)), streaming: false })).collect();
+        let mut all = vec![ev("u0", None, user("the goal", Some("human")))];
+        all.extend(many);
+        let words = as_words(from_events(&all), "", 50 * 1024);
+        assert!(words.len() < 60 * 1024 && words.contains("the goal") && words.contains("left out") && words.contains("399 "));
+        Ok(())
+    }
 
     fn lines(v: &[Value]) -> Vec<String> {
         v.iter().map(Value::to_string).collect()

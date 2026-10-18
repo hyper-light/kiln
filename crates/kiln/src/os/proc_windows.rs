@@ -264,11 +264,34 @@ pub struct Duplex {
     job: Arc<Mutex<GroupChild>>,
 }
 
+/// A harness process handed from one image of this process to the next: never on Windows, which
+/// has no in-place upgrade.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Detached {
+    pub pid: u32,
+    pub stdin: i32,
+    pub stdout: i32,
+    pub stderr: i32,
+    #[serde(default)]
+    pub foreign: bool,
+}
+
 impl Duplex {
     /// Windows has no SIGTERM for a job: kill it at once.
     pub fn terminate(&self, _grace: Duration) {
         let _ = self.job.lock().kill();
     }
+
+    /// Never handed over on Windows (no in-place upgrade).
+    #[allow(clippy::unused_async)]
+    pub async fn detach(&mut self) -> Option<Detached> {
+        None
+    }
+}
+
+/// Never on Windows (no in-place upgrade).
+pub fn adopt_duplex(_d: Detached) -> anyhow::Result<Duplex> {
+    anyhow::bail!("Windows has no in-place upgrade to hand a process across")
 }
 
 /// Spawn `cmd` with piped stdin/stdout/stderr in its own job.

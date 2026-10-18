@@ -33,8 +33,12 @@ fn lines_of(store: &Store, session: &str, source: &str) -> anyhow::Result<Vec<St
     }
 }
 
-/// The harness's record of `session` as the harness on the machine it goes to takes it.
-fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str>, note: &str) -> anyhow::Result<Carry> {
+/// The harness's record of `session` as the harness on the machine it goes to takes it; `events`,
+/// kiln's timeline, for a harness whose own record kiln doesn't keep.
+fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str>, events: &[Event], note: &str) -> anyhow::Result<Carry> {
+    if matches!(kind.protocol, Protocol::Acp(_) | Protocol::AgyStreamJson) {
+        return Ok(moving::words(events, note));
+    }
     let Some(own) = harness_session.filter(|h| !h.is_empty()) else { return Ok(Carry::Nothing) };
     match kind.protocol {
         Protocol::ClaudeStreamJson => {
@@ -52,7 +56,8 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
             let conv = crate::harness::handoff::codex_of_lines(&files, own).ok_or_else(|| anyhow::anyhow!("the server has no copy of Codex's record of this thread (its machine never sent it)"))?;
             Ok(Carry::Seed { items: crate::harness::handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))) })
         }
-        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => anyhow::bail!("{}'s sessions can't go on on another machine yet", kind.name),
+        Protocol::Acp(_) | Protocol::AgyStreamJson => Ok(moving::words(events, note)),
+        Protocol::Terminal => anyhow::bail!("{}'s sessions can't go on on another machine yet", kind.name),
     }
 }
 
@@ -68,7 +73,7 @@ pub fn package(store: &Store, id: &str, from: &str, to: &str, cwd: Option<&str>)
     let goes_on_in = cwd.map(str::trim).filter(|c| !c.is_empty()).map_or_else(|| from_cwd.clone(), str::to_owned);
     let own = state.harness_session.clone().or_else(|| info.harness_session.clone());
     let note = format!("This conversation went on from {from} (where it worked in {from_cwd}), which is gone, to {to} (it works in {goes_on_in} now). It was kept on the kiln server.");
-    let carry = carry(store, id, kind, own.as_deref(), &note)?;
+    let carry = carry(store, id, kind, own.as_deref(), &events, &note)?;
     // What starts it there: its settings as last chosen. Its environment was its machine's, and
     // stays there (the machine it goes to runs it with its own).
     let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());

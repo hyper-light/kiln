@@ -11,6 +11,9 @@
 //!   folder; it resumes the same session.
 //! - Codex: the conversation, as items for a new thread (the record of a thread is Codex's own
 //!   database's), as a switch of harness carries it.
+//! - ACP agents and Antigravity, whose own records kiln doesn't keep: the conversation in words,
+//!   from kiln's timeline, which the harness there is given with the first message it gets
+//!   ([`super::handoff::as_words`]).
 
 use std::collections::HashSet;
 
@@ -21,8 +24,20 @@ use super::kinds::Protocol;
 use super::model::{Event, State};
 use super::session::Spec;
 
-/// The package's format; one of another version is refused, never guessed at.
-pub const VERSION: u32 = 1;
+/// The package's format, newest: one of a version this runner doesn't know is refused, never
+/// guessed at. 2 added [`Carry::Words`]; a package without it stays 1, so older runners still take
+/// it.
+pub const VERSION: u32 = 2;
+
+/// The format a package with `carry` is.
+fn version_of(carry: &Carry) -> u32 {
+    if matches!(carry, Carry::Words { .. }) { 2 } else { 1 }
+}
+
+/// Whether a runner taking packages up to [`VERSION`] reads one of `version`.
+pub fn takes(version: u32) -> bool {
+    (1..=VERSION).contains(&version)
+}
 
 /// The harness's record of the conversation, as the harness there takes it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -34,6 +49,9 @@ pub enum Carry {
     Seed { items: Vec<Value> },
     /// Nothing to carry (the harness never started a conversation).
     Nothing,
+    /// The conversation in words, from kiln's timeline, for a harness whose own record kiln
+    /// doesn't keep: it's given them with the first message it gets.
+    Words { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,8 +83,22 @@ fn portable(env: &[(String, String)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The harness's record of `session` on this machine, for `protocol` (blocking: reads files).
-pub fn record(protocol: &Protocol, env: &[(String, String)], session: Option<&str>, note: &str) -> Result<Carry, String> {
+/// The conversation of a session whose harness's own record kiln doesn't keep: in words, from
+/// `events` (kiln's timeline). Nothing when nothing was said yet.
+pub fn words(events: &[Event], note: &str) -> Carry {
+    let c = super::handoff::from_events(events);
+    if c.entries.is_empty() {
+        return Carry::Nothing;
+    }
+    Carry::Words { text: super::handoff::as_words(c, note, super::handoff::WORDS_BUDGET) }
+}
+
+/// The harness's record of `session` on this machine, for `protocol` (blocking: reads files);
+/// `events`, kiln's timeline, for a harness whose own record kiln doesn't keep.
+pub fn record(protocol: &Protocol, env: &[(String, String)], session: Option<&str>, events: &[Event], note: &str) -> Result<Carry, String> {
+    if matches!(protocol, Protocol::Acp(_) | Protocol::AgyStreamJson) {
+        return Ok(words(events, note));
+    }
     let Some(session) = session.filter(|s| !s.is_empty()) else { return Ok(Carry::Nothing) };
     match protocol {
         Protocol::ClaudeStreamJson => {
@@ -78,7 +110,8 @@ pub fn record(protocol: &Protocol, env: &[(String, String)], session: Option<&st
             let conv = super::handoff::read_codex(env, session).ok_or_else(|| format!("Codex's record of thread {session} is not on this machine"))?;
             Ok(Carry::Seed { items: super::handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))) })
         }
-        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => Err("this harness's sessions can't move between machines yet".into()),
+        Protocol::Acp(_) | Protocol::AgyStreamJson => Ok(words(events, note)),
+        Protocol::Terminal => Err("this harness's sessions can't move between machines yet".into()),
     }
 }
 
@@ -97,9 +130,9 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
     spec.fork = false;
     match &carry {
         Carry::ClaudeLines { session, .. } => spec.resume = Some(session.clone()),
-        Carry::Seed { .. } | Carry::Nothing => spec.resume = None,
+        Carry::Seed { .. } | Carry::Words { .. } | Carry::Nothing => spec.resume = None,
     }
-    Package { version: VERSION, id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms(), picks_up: false }
+    Package { version: version_of(&carry), id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms(), picks_up: false }
 }
 
 /// Every message of transcript `had` is among `lines`: `had` is an earlier copy of the same
@@ -143,13 +176,41 @@ pub fn install(pkg: &Package, cwd: &str) -> Result<Option<Vec<Value>>, String> {
             Ok(None)
         }
         Carry::Seed { items } => Ok(Some(items.clone())),
+        // Given to the harness with the first message it gets (`Adapter::seed`).
+        Carry::Words { text } => Ok(Some(vec![serde_json::json!({"type": CONTEXT, "text": text})])),
         Carry::Nothing => Ok(None),
     }
 }
 
+/// The item a seed carries the conversation in words as ([`Carry::Words`]).
+pub const CONTEXT: &str = "kiln_context";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_harness_whose_record_kiln_doesnt_keep_moves_with_its_conversation_in_words() -> anyhow::Result<()> {
+        use crate::harness::model::Body;
+        let said = |text: &str| Event { id: text.into(), seq: 0, at: 0, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } };
+        let protocol = Protocol::Acp(&["--acp"]);
+        // Nothing said yet: nothing to carry.
+        assert_eq!(record(&protocol, &[], None, &[], "moved").map_err(anyhow::Error::msg)?, Carry::Nothing);
+        let carry = record(&protocol, &[], None, &[said("half way there")], "moved").map_err(anyhow::Error::msg)?;
+        let Carry::Words { text } = &carry else { anyhow::bail!("not in words: {carry:?}") };
+        assert!(text.contains("moved") && text.contains("half way there"));
+        let spec = Spec { kind: "gemini".into(), resume: Some("acp-1".into()), ..Spec::default() };
+        let pkg = pack("s1", spec, "/home/b/w", "a", "/home/a/w", carry, vec![], State::default());
+        // A new conversation there, given the words; a package an older runner can tell it can't take.
+        assert_eq!((pkg.spec.resume.as_deref(), pkg.version), (None, 2));
+        assert!(takes(pkg.version) && takes(1) && !takes(3));
+        let items = install(&pkg, "/home/b/w").map_err(anyhow::Error::msg)?.unwrap_or_default();
+        assert_eq!(items.first().and_then(|i| i.get("type")).and_then(Value::as_str), Some(CONTEXT));
+        // Claude Code's and Codex's packages stay as older runners read them.
+        let claude = pack("s2", Spec { kind: "claude".into(), ..Spec::default() }, "/w", "a", "/w", Carry::Nothing, vec![], State::default());
+        assert_eq!(claude.version, 1);
+        Ok(())
+    }
 
     #[test]
     fn a_package_carries_what_travels_and_leaves_the_machine_behind() -> anyhow::Result<()> {

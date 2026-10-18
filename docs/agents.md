@@ -408,6 +408,30 @@ turn (`harness/pause.rs`):
 Repeated identical notices in a turn (such as a limit said over and over by a build before this)
 show once in the timeline, with a count.
 
+### Runner upgrades: agents keep their processes
+
+A runner under `kiln supervise` (how `kiln install --agent` runs one on Linux and macOS) upgrades
+blue/green (docs/releases.md): the new build starts beside it, and once it's connected, every
+agent session is handed to it over a local socket, its harness process still running. Its pipes are
+passed across, not reopened. A runner upgraded in place (a new kiln binary where its own is, run
+without a supervisor) re-executes itself instead, same pid, and hands every agent session to its
+new image the same way. Either way nothing the agent is doing stops:
+- a turn mid-reply goes on;
+- a permission prompt waiting stays waiting, and is answered as before;
+- the commands it left running in the background keep running;
+- its timeline, queue and pause are where they were.
+
+The upgrade doesn't wait for turns to end. If a blue/green upgrade's new build doesn't come up, the
+sessions never leave the runner.
+
+How: each session stops reading its harness's output at a line boundary. What was read is taken
+in; the rest waits in the pipe. It writes out its whole state: the timeline, and the adapter's
+(requests in flight, prompts waiting, streaming state). Then it keeps its pipes open, across the
+exec or passed to the new build (`SCM_RIGHTS`), and the new process takes the harness over by its
+pipes and its pid, and reads on. Some sessions can't be handed over: a switch, move or setting
+waiting for its turn to end, or on Windows, which has neither upgrade. Those are stopped and start
+again from their record, continuing the conversation, as every session did before.
+
 ### Messages while its machine is away
 
 When an agent's machine is offline (or the connection to the server drops), the composer keeps
@@ -488,6 +512,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | start | ✓ | ✓ | ✓ | ? |
 | resume, with the history | ✓ | ✓ (latest 100 turns, paged) | unit (when the agent loads sessions) | ? |
 | survives server and runner restarts | ✓ | ? | ? | ? |
+| a runner upgrade keeps its process (mid-turn, background commands) | ✓ | unit | unit | ? |
 | send, queue | ✓ | ✓ | ✓ | ? |
 | steer into a running turn | ✓ | ✓ | — (waits for the turn) | — |
 | a queued message steered in (`queue_steer`) | ✓ | ✓ | — | — |

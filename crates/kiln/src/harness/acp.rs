@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::core::{Baseline, Core};
@@ -60,7 +61,7 @@ fn status_rows(init: &Value) -> Vec<StatusItem> {
     rows
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
     Session,
@@ -69,13 +70,16 @@ enum Pending {
     SetModel(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ask {
     rpc: Value,
     /// (option id, kind) as the agent offered them.
     options: Vec<(String, String)>,
 }
 
+/// Its whole state is plain data, written out when this process re-executes itself (an in-place
+/// upgrade) and read back by the next image, which goes on with the same process.
+#[derive(Serialize, Deserialize)]
 pub struct Acp {
     next_id: u64,
     pending: HashMap<u64, Pending>,
@@ -99,6 +103,13 @@ pub struct Acp {
     befores: HashMap<String, Vec<(String, Option<String>)>>,
     /// kiln's Bypass: every request to go ahead is answered yes by kiln, at once.
     bypass: bool,
+    /// The MCP servers its session is given (kiln's own, `crate::reach::mcp`).
+    #[serde(default)]
+    mcp: Vec<Value>,
+    /// The conversation so far, in words, given with the first message it sends (a session that
+    /// went on here from another machine, `super::moving`).
+    #[serde(default)]
+    context: Option<String>,
 }
 
 /// kiln's own permission modes, for agents whose own all keep their checks: kiln asks you, or
@@ -133,7 +144,19 @@ impl Acp {
             notice_seq: 0,
             befores: HashMap::new(),
             bypass: false,
+            mcp: Vec::new(),
+            context: None,
         }
+    }
+
+    /// The conversation so far, in words, to give with the first message it sends.
+    pub fn offer_context(&mut self, text: Option<String>) {
+        self.context = text.filter(|t| !t.is_empty());
+    }
+
+    /// Its session gets these MCP servers (ACP's `mcpServers`, stdio).
+    pub fn offer_mcp(&mut self, servers: Vec<Value>) {
+        self.mcp = servers;
     }
 
     /// Starts in this mode: kiln's Bypass goes on at once (the agent's own modes it is told of).
@@ -350,8 +373,12 @@ impl Acp {
     fn prompt(&mut self, core: &mut Core, m: QueueItem) {
         let Some(s) = self.session.clone() else { return };
         self.close_streams(core);
-        // Images inline where the agent takes them; everything else as a link to the file.
+        // Images inline where the agent takes them; everything else as a link to the file. The
+        // conversation so far comes first, once, when it went on here from another machine.
         let mut blocks = Vec::new();
+        if let Some(c) = self.context.take() {
+            blocks.push(json!({"type": "text", "text": c}));
+        }
         if !m.text.is_empty() {
             blocks.push(json!({"type": "text", "text": m.text}));
         }
@@ -517,13 +544,13 @@ impl Acp {
                     Some(sid) => {
                         self.session = Some(sid.clone());
                         core.state.harness_session = Some(sid.clone());
-                        self.request(core, Pending::Session, "session/load", json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}));
+                        self.request(core, Pending::Session, "session/load", json!({"sessionId": sid, "cwd": cwd, "mcpServers": self.mcp}));
                     }
                     None => {
                         if self.resume.is_some() {
                             self.notice(core, Level::Warn, "This agent cannot load earlier sessions; starting a new one.");
                         }
-                        self.request(core, Pending::Session, "session/new", json!({"cwd": cwd, "mcpServers": []}));
+                        self.request(core, Pending::Session, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
                     }
                 }
             }
@@ -578,7 +605,7 @@ impl Acp {
                             ms.iter()
                                 .filter_map(|m| {
                                     let id = m.get("modelId")?.as_str()?.to_owned();
-                                    Some(ModelOption { label: m.get("name").and_then(Value::as_str).unwrap_or(&id).to_owned(), description: m.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), id, efforts: Vec::new() })
+                                    Some(ModelOption { label: m.get("name").and_then(Value::as_str).unwrap_or(&id).to_owned(), description: m.get("description").and_then(Value::as_str).unwrap_or("").to_owned(), id, ..ModelOption::default() })
                                 })
                                 .collect()
                         })
@@ -1049,6 +1076,34 @@ mod tests {
         feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s2"}})]);
         assert_eq!(core.meta.modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), [KILN_ASK, KILN_BYPASS]);
         assert_eq!(core.state.mode, KILN_BYPASS);
+        Ok(())
+    }
+
+    #[test]
+    fn a_session_that_went_on_here_gives_its_conversation_with_its_first_message_once() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/w".into();
+        let mut a = Acp::new(None);
+        a.offer_context(Some("<kiln_handoff>earlier</kiln_handoff>".into()));
+        // Through a re-execution (an in-place upgrade) it still has it.
+        let mut a: Acp = serde_json::from_str(&serde_json::to_string(&a)?)?;
+        a.start(&mut core);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
+        let _ = written(&mut core);
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let w = written(&mut core);
+        let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
+        assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("<kiln_handoff>earlier</kiln_handoff>"));
+        assert_eq!(prompt.pointer("/params/prompt/1/text").and_then(Value::as_str), Some("go on"));
+        // The timeline shows what the person said, not the conversation it went with.
+        assert!(core.events().any(|e| matches!(&e.body, Body::User { text, .. } if text == "go on")));
+        let pid = prompt.get("id").cloned().unwrap_or_default();
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "end_turn"}})]);
+        a.command(&mut core, Command::Send { id: "m2".into(), text: "and then".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let w = written(&mut core);
+        let prompt = w.iter().find(|v| v.get("method").and_then(Value::as_str) == Some("session/prompt")).cloned().unwrap_or_default();
+        assert_eq!(prompt.pointer("/params/prompt/0/text").and_then(Value::as_str), Some("and then"), "only the first message carries it");
         Ok(())
     }
 

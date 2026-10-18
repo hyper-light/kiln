@@ -23,6 +23,9 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// kiln's own code signature on a Mac, so macOS knows every upgrade as one program.
+pub mod macsign;
+
 /// Child processes: [`crate::proc`]'s implementation.
 #[cfg(unix)]
 #[path = "proc_unix.rs"]

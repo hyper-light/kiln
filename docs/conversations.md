@@ -136,7 +136,10 @@ the server's store (`convo/resume.rs`):
    - its state, queue included;
    - its timeline;
    - the harness's record: Claude Code's transcript lines, or for Codex the conversation as a new
-     thread's history.
+     thread's history. For a harness whose own record kiln doesn't keep (Gemini CLI, opencode,
+     Goose, Amp, Antigravity), the conversation in words from kiln's timeline
+     (`handoff::as_words`): the harness there starts a new conversation and is given it, once, with
+     the first message it gets. The timeline shows that message as the person wrote it.
 2. It raises the session's epoch, here and in its store.
 3. It sends the package to the target runner in pieces on the feed's lane (`HarnessPackage`).
 4. That runner installs the record where its harness looks for it, and takes the session over under
@@ -145,6 +148,14 @@ the server's store (`convo/resume.rs`):
 The agent's folder is mapped as a move maps it: a copy of its repository kept in step there, else
 the same place under that machine's home. Its files stay on the machine that's away. Its environment
 stays there too: the machine it goes to runs it with its own.
+
+**A machine that's gone.** Once a machine has been offline for two minutes with agents on it,
+Mission Control says so above the list: if it's gone, **Move them on** moves every agent of it
+that hasn't ended at once, each to the machine that suits it best (connected, its harness
+installed, the same platform first, then the one running the fewest agents) or all to one machine
+picked there (`POST /api/harness/machines/:machine/recover {"to"?}`; a machine that's connected is
+refused, since its own runner hands its agents over). Each goes on as Move does, and the answer says
+where each went or why it couldn't.
 
 **After a server restart**, the agents of machines that are away (not ended, heard of in the last 30
 days) are listed from the store, as away, with their recent timeline, so they can be moved on. A
@@ -242,7 +253,7 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
 |---|---|
 | C1 store | live (1a59fad, 2026-10-18): the Turso engine, each runner's store of its sessions, the server's store of every session, the writer, restore from the store, search and paging API |
 | C2 replication | live (dfbbd1a, 2026-10-18): revisions, the feed on its lane, the harness's record followed, epochs, resets that keep history. Lab with a real Claude Code: the server's store matches the runner's and the transcript line for line; a server killed mid-turn catches up; a runner killed comes back and goes on |
-| C3 resume elsewhere | live (dfbbd1a, 2026-10-18): Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context |
+| C3 resume elsewhere | live (dfbbd1a, 2026-10-18): Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context. Built since (e1bb7f2): every harness (ACP agents and Antigravity with their conversation in words), and a gone machine's agents moved on at once (Mission Control's Move them on). Lab (`~/.cache/kiln-mcp-lab/recover_e2e.py`, 12 checks): an ACP agent's runner killed outright, its agent moved on to the other runner, which answers from the conversation it was given |
 | C4 search UI | live (dfbbd1a, 2026-10-18): Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked against the UI mock on desktop Chromium, and on phone-sized Chromium and WebKit |
 | C5 mirrors | live (dfbbd1a, 2026-10-18): the server picks runners to keep a copy of its store and feeds them; a copy restores the server's store. Lab with two runners and a real Claude Code: the source runner killed and the server's store deleted, the store restored from the mirror, the agent listed away on its machine, moved on, its conversation going on with its context |
 | Compression | built (2540397): transcript lines of 256 bytes or more kept brotli-compressed, older ones compressed in the background under the same numbers; feed batches compressed to a taker that says it takes them. Labs C2, C3 and C5 pass on compressed stores |

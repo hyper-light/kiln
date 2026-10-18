@@ -164,6 +164,13 @@ enum Cmd {
     Roles(kiln::authz::cli::RolesArgs),
     /// Personal access tokens and agent tokens: create (shown once), list, revoke, rotate.
     Tokens(kiln::authz::cli::TokensArgs),
+    /// The fleet's kiln versions and update policies: list, policy, upgrade, build.
+    Updates(kiln::updates_cli::UpdatesArgs),
+    /// This machine's kiln config: path, show, get, set, unset (by dotted key).
+    Config(kiln::config_cli::ConfigArgs),
+    /// kiln's own code signature on a Mac: `setup` once, so macOS keeps kiln's local network
+    /// access across upgrades (status by default).
+    Signing(kiln::os::macsign::SigningArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -432,6 +439,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 shell: a.shell,
                 credentials: None,
                 instance: a.instance,
+                config: Some(config_path.clone()),
                 // Commands from other runners are a terminal's worth of access: not without one.
                 reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
                 outpost: false,
@@ -475,6 +483,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 shell: a.shell,
                 credentials: None,
                 instance: None,
+                config: None,
                 // It runs no other machine's commands (reach), and for now sends none.
                 reach: None,
                 outpost: true,
@@ -686,6 +695,9 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Grants(a) => kiln::authz::cli::grants(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Roles(a) => kiln::authz::cli::roles(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Tokens(a) => kiln::authz::cli::tokens(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Updates(a) => kiln::updates_cli::run(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Config(a) => kiln::config_cli::run(a, &config_path),
+        Cmd::Signing(a) => kiln::os::macsign::run(a),
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;

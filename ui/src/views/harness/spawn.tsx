@@ -45,10 +45,20 @@ const MODES: Record<string, ModeChoice[]> = {
 const modesFor = (k: KindInfo | undefined): ModeChoice[] => k?.modes?.map((m) => ({ id: m.id, label: m.label, hint: m.description, dangerous: m.dangerous })) ?? MODES[k?.id ?? ""] ?? [];
 
 /** Each harness's effort levels, lowest first, for runners that don't report them yet. */
-const EFFORTS: Record<string, string[]> = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["low", "medium", "high"] };
+const EFFORTS: Record<string, string[]> = { claude: ["low", "medium", "high", "xhigh", "max"], codex: ["low", "medium", "high", "xhigh", "max", "ultra"] };
 const capital = (v: string) => v.charAt(0).toUpperCase() + v.slice(1);
-const effortsFor = (k: KindInfo | undefined): { id: string; label: string; hint?: string }[] =>
-  k?.efforts?.map((e) => ({ id: e.id, label: e.label || capital(e.id), hint: e.description || undefined })) ?? (EFFORTS[k?.id ?? ""] ?? []).map((id) => ({ id, label: capital(id) }));
+/** An effort level as people read it: "xhigh" is "Extra high". */
+const effortLabel = (id: string) => (id === "xhigh" ? "Extra high" : capital(id));
+/** The levels a new agent can start at: the chosen model's, when its harness says which it takes;
+ * else the harness's own (its default model's). */
+const effortsFor = (k: KindInfo | undefined, model = ""): { id: string; label: string; hint?: string }[] => {
+  const chosen = model.trim() ? k?.models?.find((m) => m.id === model.trim()) : undefined;
+  if (chosen?.efforts?.length) {
+    const named = new Map((k?.efforts ?? []).map((e) => [e.id, e]));
+    return chosen.efforts.map((id) => ({ id, label: named.get(id)?.label || effortLabel(id), hint: named.get(id)?.description || undefined }));
+  }
+  return k?.efforts?.map((e) => ({ id: e.id, label: e.label || effortLabel(e.id), hint: e.description || undefined })) ?? (EFFORTS[k?.id ?? ""] ?? []).map((id) => ({ id, label: effortLabel(id) }));
+};
 
 const COUNTS = [1, 2, 3, 4, 6, 8, 12];
 
@@ -531,7 +541,7 @@ function Setup({
     setUnchecked("");
     setModeByKind({ ...modeByKind, [kind]: id });
   };
-  const efforts = effortsFor(kindInfo);
+  const efforts = effortsFor(kindInfo, model);
   const effort = efforts.some((e) => e.id === effortByKind[kind]) ? (effortByKind[kind] ?? "") : "";
   const effortInfo = efforts.find((e) => e.id === effort);
   const shellInfo = shell ? shells.find((s) => s.id === shell) : undefined;

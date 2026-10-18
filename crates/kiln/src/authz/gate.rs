@@ -81,6 +81,18 @@ impl Caller {
         self.rights.is_none() && self.limit.is_none()
     }
 
+    /// Whom an agent session it starts acts for: `owner`, or `user:<id>`. `None` for a job, or a
+    /// token whose own grant is narrower than its owner (its agents would do more than it may).
+    pub fn opener(&self) -> Option<String> {
+        match (&self.kind, &self.user) {
+            (Kind::Job, _) => None,
+            (Kind::Owner, _) => Some("owner".to_owned()),
+            (_, Some(u)) if self.limit.is_none() => Some(format!("user:{u}")),
+            (_, None) if self.is_owner() => Some("owner".to_owned()),
+            _ => None,
+        }
+    }
+
     /// Whether it may use `capability` in `target`.
     pub fn can(&self, capability: &str, target: &Scope) -> bool {
         capability == SIGNED_IN || [&self.rights, &self.limit].into_iter().all(|r| r.as_ref().is_none_or(|r| r.allows(capability, target)))
@@ -121,6 +133,29 @@ pub async fn caller(hub: &Hub, bearer: Option<&str>, session: Option<&str>) -> O
 fn store_err(e: anyhow::Error) -> Option<Caller> {
     tracing::warn!(error = %e, "reading a caller's rights failed");
     None
+}
+
+/// An agent session acting for whoever started it (`opener`: `owner`, or `user:<id>`), as kiln
+/// answers the operations its MCP server asks for through its runner (`crate::mcp::runner_ask`).
+/// Audited as `<name> for <who>`. `None`: that user is gone or disabled.
+pub async fn agent_for(hub: &Hub, name: &str, opener: &str) -> Option<Caller> {
+    if opener == "owner" {
+        return Some(Caller { kind: Kind::Agent, name: format!("{name} for admin"), user: None, token: None, rights: None, limit: None });
+    }
+    let uid = opener.strip_prefix("user:")?.to_owned();
+    let name = name.to_owned();
+    hub.store
+        .call(move |c| {
+            let Some((who, rights)) = user_rights(c, &uid)? else { return Ok(None) };
+            Ok(Some(Caller { kind: Kind::Agent, name: format!("{name} for user:{who}"), user: Some(uid), token: None, rights: Some(rights), limit: None }))
+        })
+        .await
+        .unwrap_or_else(store_err)
+}
+
+/// Whether anyone but the owner can sign in here.
+pub async fn has_users(hub: &Hub) -> bool {
+    hub.store.call(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)", [], |r| r.get::<_, bool>(0))?)).await.unwrap_or(true)
 }
 
 /// Custom roles, by name.
