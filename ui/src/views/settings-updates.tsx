@@ -583,7 +583,7 @@ function RunnerPlan({ r, newest: target }: { r: RunnerUpdate; newest: FleetTarge
             ) : (
               "Its kiln checkout is left as it is."
             )}{" "}
-            The build takes its CPU for a few minutes.
+            It brings its stable Rust toolchain up to date first (kiln needs a recent one), and the build takes its CPU for a few minutes.
           </li>
           {r.os === "macos" && <li>The binary comes back to this server, so other Macs download it instead of building.</li>}
         </>
