@@ -1,5 +1,6 @@
-//! HTTP/1.1 server: hyper's runtime-agnostic connection state machine, driven on hyper-rt. Each
-//! accepted connection becomes one hyper-rt task; upgrades (WebSocket) are supported.
+//! HTTP/1.1 and HTTP/2 server: hyper's runtime-agnostic connection state machines, driven on
+//! hyper-rt. Each accepted connection becomes one hyper-rt task (an HTTP/2 connection's requests
+//! each one more); upgrades (WebSocket) are HTTP/1.1's.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -10,7 +11,7 @@ use http::{HeaderValue, StatusCode, header};
 use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Frame, Incoming};
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 
 /// Response bodies: whole buffers or streams of chunks, boxed to one type.
@@ -50,27 +51,74 @@ where
 const FIRST_BYTE: std::time::Duration = std::time::Duration::from_secs(30);
 const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Serve a connection in whichever of TLS and plain HTTP it starts with: a TLS handshake begins
-/// with a handshake record (0x16), which no HTTP request does. So `server.https` adds HTTPS
-/// without taking plain HTTP from runners and scripts that use it.
-pub async fn serve_tls_or_plain<H: Handler>(stream: hyper_rt::tcp::TcpStream, handler: Arc<H>, remote: Option<std::net::SocketAddr>, tls: &super::tls::ServerTls) {
-    let mut first = [0u8; 1];
-    let n = match crate::rt::timeout(FIRST_BYTE, stream.read(&mut first)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return,
-    };
-    let head = first.get(..n).unwrap_or_default().to_vec();
-    let is_tls = head.first() == Some(&0x16);
-    let io = super::tls::Prefixed::new(head, super::io::RtFuturesIo::new(stream));
-    if !is_tls {
-        serve_connection_with(super::tls::HyperIo::new(io), handler, remote, false).await;
-        return;
+/// What a client speaking HTTP/2 without TLS sends first (RFC 9113 §3.4): the front door, which
+/// ends a browser's TLS and passes its bytes on, passes HTTP/2 on this way.
+pub const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// What a new connection of kiln's listener speaks, from its first bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum Opening {
+    /// A TLS handshake record (0x16), which no HTTP request starts with.
+    Tls,
+    /// HTTP/2's preface.
+    H2,
+    Http1,
+    /// Not decided yet: the bytes so far begin HTTP/2's preface.
+    Unsure,
+}
+
+fn opening(head: &[u8]) -> Opening {
+    match head {
+        [0x16, ..] => Opening::Tls,
+        _ if head.len() >= H2_PREFACE.len() && head.starts_with(H2_PREFACE) => Opening::H2,
+        _ if H2_PREFACE.starts_with(head) => Opening::Unsure,
+        _ => Opening::Http1,
     }
-    let Ok(config) = tls.config() else { return };
-    match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
-        Ok(Ok(s)) => serve_connection_with(s, handler, remote, true).await,
-        Ok(Err(e)) => tracing::debug!(error = %e, ?remote, "TLS handshake failed"),
-        Err(_) => tracing::debug!(?remote, "TLS handshake timed out"),
+}
+
+/// Serve a connection of kiln's listener in whatever it speaks: TLS when `tls` is set (with
+/// `server.https`; plain HTTP stays for the runners and scripts that use it), and HTTP/1.1 or
+/// HTTP/2 inside. Over TLS the client says which (ALPN); in the clear, HTTP/2 starts with its
+/// preface. Nearly every connection tells by its first byte; only those starting with `P` take more.
+pub async fn serve_accepted<H: Handler>(stream: hyper_rt::tcp::TcpStream, handler: Arc<H>, remote: Option<std::net::SocketAddr>, tls: Option<&super::tls::ServerTls>) {
+    let mut head = Vec::with_capacity(H2_PREFACE.len());
+    let mut buf = [0u8; 32];
+    let kind = loop {
+        let want = if head.is_empty() { 1 } else { H2_PREFACE.len().saturating_sub(head.len()) };
+        let n = match crate::rt::timeout(FIRST_BYTE, stream.read(buf.get_mut(..want).unwrap_or_default())).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => return,
+        };
+        head.extend_from_slice(buf.get(..n).unwrap_or_default());
+        match opening(&head) {
+            Opening::Unsure => {}
+            kind => break kind,
+        }
+    };
+    let io = super::tls::Prefixed::new(head, super::io::RtFuturesIo::new(stream));
+    match (kind, tls) {
+        (Opening::Tls, Some(tls)) => {
+            let Ok(config) = tls.config_alpn(&[super::tls::H2, super::tls::HTTP11]) else { return };
+            match crate::rt::timeout(HANDSHAKE, super::tls::ServerTlsStream::accept(io, config)).await {
+                Ok(Ok(s)) if s.alpn_protocol() == Some(super::tls::H2) => serve_h2(s, handler, remote, true).await,
+                Ok(Ok(s)) => serve_connection_with(s, handler, remote, true).await,
+                Ok(Err(e)) => tracing::debug!(error = %e, ?remote, "TLS handshake failed"),
+                Err(_) => tracing::debug!(?remote, "TLS handshake timed out"),
+            }
+        }
+        (Opening::H2, _) => serve_h2(super::tls::HyperIo::new(io), handler, remote, false).await,
+        // HTTP/1.1, or TLS without a certificate here: HTTP/1.1 answers what it can.
+        _ => serve_connection_with(super::tls::HyperIo::new(io), handler, remote, false).await,
+    }
+}
+
+/// What every request of a connection carries: where it came from, and whether over TLS.
+fn mark(req: &mut Request, remote: Option<std::net::SocketAddr>, secure: bool) {
+    if let Some(r) = remote {
+        req.extensions_mut().insert(RemoteAddr(r));
+    }
+    if secure {
+        req.extensions_mut().insert(Secure);
     }
 }
 
@@ -82,12 +130,7 @@ where
 {
     let service = service_fn(move |mut req: Request| {
         let h = handler.clone();
-        if let Some(r) = remote {
-            req.extensions_mut().insert(RemoteAddr(r));
-        }
-        if secure {
-            req.extensions_mut().insert(Secure);
-        }
+        mark(&mut req, remote, secure);
         async move { Ok::<_, Infallible>(h.handle(req).await) }
     });
     let conn = http1::Builder::new()
@@ -101,6 +144,55 @@ where
         .with_upgrades();
     if let Err(e) = conn.await {
         tracing::debug!(error = %e, "http connection ended with an error");
+    }
+}
+
+/// Serve an HTTP/2 connection: every request at once over the one connection, each its own task.
+/// Requests reach the handler shaped as HTTP/1.1's ([`as_http1`]). WebSockets stay HTTP/1.1's: no
+/// extended CONNECT is offered, so a browser opens an HTTP/1.1 connection for them.
+async fn serve_h2<I, H>(io: I, handler: Arc<H>, remote: Option<std::net::SocketAddr>, secure: bool)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    H: Handler,
+{
+    let service = service_fn(move |mut req: Request| {
+        let h = handler.clone();
+        as_http1(&mut req);
+        mark(&mut req, remote, secure);
+        async move { Ok::<_, Infallible>(h.handle(req).await) }
+    });
+    let conn = http2::Builder::new(super::io::RtExec)
+        .timer(super::io::RtTimer)
+        // A connection whose client has gone quiet without closing is found and ended.
+        .keep_alive_interval(Some(std::time::Duration::from_secs(30)))
+        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        // Windows sized to the link (a phone over a tunnel, a long log) rather than fixed.
+        .adaptive_window(true)
+        .max_header_list_size(64 << 10)
+        .serve_connection(io, service);
+    if let Err(e) = conn.await {
+        tracing::debug!(error = %e, "http/2 connection ended with an error");
+    }
+}
+
+/// An HTTP/2 request shaped as the HTTP/1.1 request it stands for, so handlers see one shape:
+/// its authority (`:authority`) as `Host`, its cookies in one `Cookie` (a browser sends them
+/// separately over HTTP/2, RFC 9113 §8.2.3), and its target as a path (origin form).
+fn as_http1<B>(req: &mut http::Request<B>) {
+    if !req.headers().contains_key(header::HOST)
+        && let Some(v) = req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok())
+    {
+        req.headers_mut().insert(header::HOST, v);
+    }
+    if req.headers().get_all(header::COOKIE).iter().nth(1).is_some() {
+        let joined = req.headers().get_all(header::COOKIE).iter().map(HeaderValue::as_bytes).collect::<Vec<_>>().join(&b"; "[..]);
+        if let Ok(v) = HeaderValue::from_bytes(&joined) {
+            req.headers_mut().insert(header::COOKIE, v);
+        }
+    }
+    if req.uri().scheme().is_some() || req.uri().authority().is_some() {
+        let target = req.uri().path_and_query().cloned().unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+        *req.uri_mut() = http::Uri::from(target);
     }
 }
 
@@ -239,5 +331,110 @@ mod tests {
     fn decodes_queries() {
         assert_eq!(decode("a%2Fb+c%zz"), "a/b c%zz");
         assert_eq!(decode("agent%3Abench-1"), "agent:bench-1");
+    }
+
+    #[test]
+    fn a_connection_says_what_it_speaks_by_its_first_bytes() {
+        assert_eq!(opening(&[0x16]), Opening::Tls);
+        assert_eq!(opening(b"G"), Opening::Http1);
+        // Only `P` needs another look: POST, PUT and PATCH part from the preface at once.
+        assert_eq!(opening(b"P"), Opening::Unsure);
+        assert_eq!(opening(b"POST /api/runs HTTP/1.1\r\n"), Opening::Http1);
+        assert_eq!(opening(b"PUT "), Opening::Http1);
+        assert_eq!(opening(b"PRI * HTTP/2.0\r\n"), Opening::Unsure);
+        assert_eq!(opening(H2_PREFACE), Opening::H2);
+        assert_eq!(opening(b"PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n"), Opening::Http1);
+    }
+
+    #[test]
+    fn an_http2_request_reaches_handlers_shaped_as_http1() -> anyhow::Result<()> {
+        let mut req = http::Request::builder().uri("https://kiln.dev:8443/api/runs?limit=5").header(header::COOKIE, "kiln_session=abc").header(header::COOKIE, "theme=dark").body(())?;
+        as_http1(&mut req);
+        assert_eq!(req.headers().get(header::HOST).and_then(|v| v.to_str().ok()), Some("kiln.dev:8443"));
+        assert_eq!(req.headers().get_all(header::COOKIE).iter().count(), 1);
+        assert_eq!(req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()), Some("kiln_session=abc; theme=dark"));
+        assert_eq!(req.uri().to_string(), "/api/runs?limit=5");
+        // A Host the client sent stands, and one cookie stays as it is.
+        let mut req = http::Request::builder().uri("http://a.test/").header(header::HOST, "b.test").header(header::COOKIE, "x=1").body(())?;
+        as_http1(&mut req);
+        assert_eq!(req.headers().get(header::HOST).and_then(|v| v.to_str().ok()), Some("b.test"));
+        assert_eq!(req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()), Some("x=1"));
+        assert_eq!(req.uri().to_string(), "/");
+        Ok(())
+    }
+
+    /// Says what it was asked, as the handler saw it.
+    struct Echo;
+
+    impl Handler for Echo {
+        async fn handle(self: Arc<Self>, req: Request) -> Response {
+            let host = header_str(&req, &header::HOST).unwrap_or("-").to_owned();
+            let cookie = header_str(&req, &header::COOKIE).unwrap_or("-").to_owned();
+            let secure = req.extensions().get::<Secure>().is_some();
+            text(StatusCode::OK, &format!("{:?} {host} {} [{cookie}] secure={secure}", req.version(), req.uri()))
+        }
+    }
+
+    /// kiln's listener, serving [`Echo`] on a free port: with `tls`, TLS or plain.
+    fn listener(tls: Option<super::super::tls::ServerTls>) -> anyhow::Result<std::net::SocketAddr> {
+        let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::rt::spawn(async move {
+            while let Ok(stream) = tcp.accept().await {
+                let (tls, remote) = (tls.clone(), stream.peer_addr().ok());
+                crate::rt::spawn(async move { serve_accepted(stream, Arc::new(Echo), remote, tls.as_ref()).await });
+            }
+        });
+        Ok(addr)
+    }
+
+    /// One HTTP/2 request over `io`, its body as text.
+    async fn h2_get<I>(io: I, uri: &str) -> anyhow::Result<String>
+    where
+        I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    {
+        let (mut send, conn) = hyper::client::conn::http2::handshake(super::super::io::RtExec, io).await?;
+        crate::rt::spawn(conn);
+        let req = http::Request::builder().uri(uri).header(header::COOKIE, "kiln_session=abc").header(header::COOKIE, "theme=dark").body(http_body_util::Empty::<Bytes>::new())?;
+        let resp = send.send_request(req).await?;
+        anyhow::ensure!(resp.version() == http::Version::HTTP_2, "answered over {:?}", resp.version());
+        Ok(String::from_utf8_lossy(&resp.into_body().collect().await?.to_bytes()).into_owned())
+    }
+
+    /// HTTP/2 in the clear (as the front door passes it on) and over TLS (ALPN), and HTTP/1.1 still,
+    /// on the one listener; handlers see the same request whichever.
+    #[test]
+    fn the_listener_speaks_http2_and_http1() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let key = crate::pki::new_key_pem()?;
+            let csr = crate::pki::front_door_csr(&["kiln.test".to_owned()], &key)?;
+            let cert = pki.sign_front_door(&csr, &["kiln.test".to_owned()], 30)?;
+            let addr = listener(Some(super::super::tls::ServerTls::from_pem(&cert, &key)?))?;
+
+            // In the clear, with prior knowledge.
+            let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let said = h2_get(super::super::io::RtIo::new(tcp), "http://kiln.test/api/runs?limit=5").await?;
+            assert_eq!(said, "HTTP/2.0 kiln.test /api/runs?limit=5 [kiln_session=abc; theme=dark] secure=false");
+
+            // Over TLS, agreed by ALPN.
+            let roots = super::super::tls::ClientTls::new(super::super::client::Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?;
+            let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let config = roots.config_alpn(&[super::super::tls::H2, super::super::tls::HTTP11])?;
+            let tls = super::super::tls::TlsStream::connect(super::super::io::RtFuturesIo::new(tcp), config, super::super::tls::server_name("kiln.test")?).await?;
+            assert_eq!(tls.alpn_protocol(), Some(super::super::tls::H2));
+            let said = h2_get(tls, "https://kiln.test/").await?;
+            assert_eq!(said, "HTTP/2.0 kiln.test / [kiln_session=abc; theme=dark] secure=true");
+
+            // HTTP/1.1, in the clear and over TLS.
+            let plain = crate::http::client::Client::public()?;
+            let resp = plain.get(&format!("http://{addr}/x")).send().await?;
+            assert_eq!(String::from_utf8_lossy(&resp.bytes(1 << 16).await?), format!("HTTP/1.1 {addr} /x [-] secure=false"));
+            let tcp = hyper_rt::tcp::TcpStream::connect(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let tls = super::super::tls::TlsStream::connect(super::super::io::RtFuturesIo::new(tcp), roots.config()?, super::super::tls::server_name("kiln.test")?).await?;
+            assert_eq!(tls.alpn_protocol(), Some(super::super::tls::HTTP11));
+            Ok(())
+        })
     }
 }

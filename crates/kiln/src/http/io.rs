@@ -220,6 +220,22 @@ impl hyper::rt::Timer for RtTimer {
     }
 }
 
+/// `hyper::rt::Executor` for HTTP/2: each request of a connection runs as its own hyper-rt task
+/// (the connection's own task does the reading and writing).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RtExec;
+
+impl<F> hyper::rt::Executor<F> for RtExec
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        // Detached: it ends with its request.
+        drop(crate::rt::spawn(fut));
+    }
+}
+
 /// Time allowed for each address's TCP connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
