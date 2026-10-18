@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place; heatmap and distribution widgets), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time) | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); next: CloudWatch Metric Streams, the clouds' logs | in progress |
-| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Next: hours-long soaks; a rollup tier for long ranges | continuous |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Rollups (§4.7): five-minute and hour tiers in blocks, every replica's answers the same to the bit, read rolled up or not; a month 17 times faster; part of a long region read without the rest (§4.5, §12.16). Next: hours-long soaks; merges that join their inputs' rollups rather than make them anew | continuous |
 
 ## 1. Rules
 
@@ -158,29 +158,39 @@ cut into an immutable **block** file when the group compacts its log (§5: the l
 write-ahead log, so a cut is what lets it be trimmed):
 
 ```
-block  = MAGIC | FORMAT 2 | data | index | footer
-data   = each series' region, by fingerprint
-region = table length | table (chunks | per chunk: first, last-first, count, length) | chunks
-index  = per series, by fingerprint: fp | kind | key | region offset, length, crc32c | first, last
-footer = index offset, length | min ts | max ts | crc32c(index, footer) | TAIL
+block   = MAGIC | FORMAT 3 | data | index | footer
+data    = each series' region and its rollups, by fingerprint
+region  = table length, table crc32c | table (chunks | per chunk: first, last-first, count, length,
+          crc32c) | chunks
+rollups = crc32c | its rollups (§4.7), right after its region
+index   = per series, by fingerprint: fp | kind | key | region offset, length, crc32c | first, last
+          | rollups length
+footer  = index offset, length | min ts | max ts | crc32c(index, footer) | TAIL
 ```
 
 An open block holds, of each series, its fingerprint and where its region is (some 48 bytes):
 nothing a chunk or a key, so what a store holds in memory grows with its series and its blocks, not
-its samples (Prometheus's blocks and ClickHouse's parts read their marks from disk the same way). A
-read is one positioned read of a series' region, checked against its own CRC-32C, its table first
-and its length before it, so the chunks a range wants are found without reading the table twice.
-Keys are read from the index when the store opens (to rebuild its index of series) and when blocks
-merge.
+its samples (Prometheus's blocks and ClickHouse's parts read their marks from disk the same way).
+A read of a series' whole region, or of a region of a page or less (`block::READ_WHOLE`), is one
+positioned read checked against the region's CRC-32C. A read of part of a longer one (a day of a
+month's block) reads the table, checked against its own CRC-32C, and then the run of chunks the
+range overlaps, each checked against its own: a day of a month's block reads a thirtieth of it,
+not all of it, and damage in a chunk is found by a read that wants that chunk (a page is the
+measured break-even, §12.16; the checksums cost 4 bytes a chunk, 1.1% of a block). Keys are read
+from the index when the store opens (to rebuild its index of series) and when blocks merge. Blocks
+of format 2 (a table after its length as a varint, without its checksum or its chunks', no
+rollups) are still read, whole, until a merge rewrites them; a build before format 3 cannot open
+format 3's, and a replica that fetches one (§5) refuses it until it is upgraded too.
 
 Blocks merge by the logarithmic method (Bentley and Saxe 1980): the oldest neighbouring pair whose
 newer block holds at least half the older's is merged, in its place, until none is, so a store keeps
 O(log n) blocks and a sample is rewritten O(log n) times. (Merging only the newest pair stalled: a
 busy group cuts a big block and then a small one, a compaction's and a snapshot's, and a small cut
 always sat at the newest end.) A merge is written as it is read, a series at a time: a series one
-input holds is copied whole; inputs whose spans of a series follow one another have their chunks
-appended (a Gorilla chunk stands alone); only overlap (late writes), retention and chunks under half
-full are decoded and packed anew. Maintenance runs on a thread of its own, told of every cut, and
+input holds is copied whole, its rollups with it; inputs whose spans of a series follow one another
+have their chunks appended (a Gorilla chunk stands alone; their rollups are made from the samples,
+§4.7); only overlap (late writes), retention, chunks under half full and format 2's regions are
+decoded and packed anew. Maintenance runs on a thread of its own, told of every cut, and
 takes a merge in only if its inputs are still there. A manifest (rewritten by rename) lists the live
 blocks and the log point the head was cut at; files wholly past retention are deleted, a block more
 than half past it rewritten.
@@ -206,6 +216,60 @@ every follower has read them or the bound passes them by (a follower that fell t
 told how many rows it missed; none holds the replica up). With no one following, applying costs a
 load. What a replica applies again is not published again: opening, it applies the entries after its
 last cut once more, and the feed skips every entry its log held as it opened.
+
+### 4.7 Rollups
+
+A query over a month would read every sample of it if nothing stood in for them. Each series in a
+merged block keeps **rollups** (`kiln_obs::rollup`): for each tier, each window of the tier's width
+it has samples in, their count and what its kind's rollup functions read of them (a gauge's or a
+count's sum, least, most and last; a counter's first, last and its increases after its first). The
+tiers are five minutes and an hour, Thanos's downsampling resolutions (Mimir's and Cortex's too):
+every step of five minutes or more on the grid's ladder (§6) is a multiple of five minutes, every
+one of an hour or more of an hour, and a grid begins at a multiple of its step, so the buckets of a
+long range are whole windows. So are a calendar's days in every timezone in use (offsets are whole
+quarter hours): New York's are whole hours, Kathmandu's (+5:45) whole five minutes.
+
+**The same answer, rolled up or not.** Replicas cut and merge their blocks at their own times, so
+which windows a replica holds rolled up is its own. Floating-point addition does not associate:
+a bucket summed from one window's aggregate on one replica and from that window's samples on
+another would differ in its last bits, and every replica answers to the bit (§5). So a query whose
+buckets are whole windows of a tier is *defined* window by window: each window's samples folded in
+time order, then each bucket's windows folded in time order (§6). A window's rollup is that fold,
+made once; read from it or from the samples, the window is the same. The tier is a query's, not a
+store's: the coarsest whose width divides every bucket edge. A grid of finer steps, `.weighted()`
+(its interval is learned from the samples' gaps) and a shift by other than a multiple of the tier
+read samples as before. A scenario holds it (`rollups_answer_to_the_bit_as_samples_do_whatever_the_blocks`):
+three replicas given the same writes, two cutting and merging on schedules of their own and one
+holding all in its head, answer every such query alike to the bit, rollups read or not (§13).
+
+**What a read takes from rollups** (`Store::read_rolled`): a window wholly in the range that one
+block alone holds of the series (no other block's span, nor the head's, reaches into it), so all
+its samples are there. A window a cut fell inside is read from both blocks' samples, as is one
+with a sample that is not finite (kept as a count of 0), a window at the range's edge, the head,
+and a series whose blocks overlap (late writes not yet merged). With O(log n) blocks, that is a few
+windows a series, read in part (§4.5).
+
+**Which tiers a block keeps.** A tier is kept for a series when it takes at most a quarter of the
+bytes of the samples it stands for, weighed at each merge from the encoded sizes
+(`rollup::KEEP_RATIO`). On kiln's corpus (§12.16) the hour's tier is kept for 98% of the samples and
+the five minutes' for 6% (a 30 s scrape's five minutes are ten samples, which Gorilla packs nearly
+as tightly as their aggregates), adding 7.4% to the samples' bytes. A ratio of 2 would add 26% for
+11 more points of the five minutes'; 8 would drop the hour's to 88%: 4 is the knee.
+
+**Encoded.** A tier is its windows (each one's index and count, varints) and a column of each
+aggregate, Gorilla's XOR of each window's value with the one before (`gorilla::write_xor`, the
+chunks' own coding): a series that holds its level writes a bit a window. Each tier and its window
+list lead with their byte lengths, so a reader finds its tier and the columns it wants (an average
+its sums, a counter its first, last and increases) without reading the rest.
+
+**Made at merges, checked when fetched.** A cut writes none (it decodes nothing, under the store's
+hold); the first merge to take its block makes them. A merge that copies a series' region whole
+copies its rollups; one that appends or packs anew makes them from the merged samples (17% more
+merging time, measured). A block fetched from another replica (§5) is verified with every series'
+rollups recomputed from its samples, window by window, to the bit (which tiers it keeps is its
+writer's to choose): a replica's rollups are what keeps its answers its peers', so they are
+recomputed, not trusted. Measured on 30 days of kiln's cluster (§12.16): a month at a chart's 240
+points 17 times faster (634 ms to 36 ms for every node series by instance), a week 10 times.
 
 ## 5. Replication
 
@@ -347,6 +411,14 @@ first); the answer says each bucket's start (`grid.times`) and the period. Rates
 period's own length. Every rollup of a query names the same calendar. The timezones are the tz
 database's, carried in kiln's binary (jiff's copy, already kiln's), never the machine's: every
 machine answers alike, Windows and containers without a zoneinfo too.
+
+**Window by window.** When every bucket of a query's grid is whole windows of a rollup tier (§4.7:
+a step of five minutes or more, a calendar's periods), a bucket is folded window by window: each
+window's samples in time order, then the bucket's windows in time order (a sum is the sum of its
+windows' sums; an average that over their counts; a counter's increase into a window from the
+sample before it, then its increases after its first sample). It is what lets a window be read
+from its rollup or from its samples alike; it differs from folding the bucket's samples in one run
+only in the last bits of a sum.
 
 `calendar_shift(q, '-1d', 'America/New_York')` reads the same local time a day (or weeks, or
 months) before: on a calendar grid of its timezone shifted by whole periods (`-1d` of days, `-1w` of
@@ -1323,6 +1395,80 @@ trend it is near exact (a filling disk, §13). A series costs 0.8 ms (hourly) an
 ten allocations: the model's buffers kept across the 800 smoothings it tries (160 without a
 season), each stopped once it errs more than the best (11 times faster).
 
+### 12.16 Rollups and long ranges
+
+2026-10-18, same machine, loaded (load average 12–20 from other work unless said).
+
+**Tiers on the corpus** (`KOBS_CHUNK=240 KOBS_CORPUS=<corpus> cargo bench -p kiln-obs --bench codec
+-- rollups`): 5,666 series, 16.27 M samples, 19.0 MB in chunks of 240.
+
+| tier | windows | samples a window | bytes a window | were every series to keep it |
+| --- | --- | --- | --- | --- |
+| 5 min | 1,587,768 | 10.2 | 6.54 | 0.547 of the samples' bytes |
+| 1 h | 137,498 | 118.4 | 8.91 | 0.065 |
+
+What each keep ratio keeps (a tier kept for a series when its bytes times the ratio are at most
+the samples'):
+
+| ratio | bytes added, of the samples' | samples the 5 min tier serves | the hour's |
+| --- | --- | --- | --- |
+| 1 | 0.533 | 0.930 | 1.000 |
+| 2 | 0.264 | 0.170 | 0.999 |
+| **4** | **0.074** | **0.059** | **0.981** |
+| 8 | 0.056 | 0.022 | 0.883 |
+| 16 | 0.027 | 0.014 | 0.219 |
+
+A tier read whole: the five minutes' 11.3 ns a window for its sums (1.11 ns a sample it stands
+for), 27.2 every column; the hour's 19.1 (0.16), 34.8 (0.29); decoding a sample is 4.1 ns (§12.1).
+Without the byte lengths before each tier and window list, finding the hour's meant reading the five
+minutes' windows and finding a column every window: 21.0 and 95.0 ns a window.
+
+**Long ranges** (`KOBS_DIR=<a folder> KOBS_CORPUS=<corpus> cargo bench -p kiln-obs --bench query --
+long`): the corpus's node and apiserver series (1,033) replayed for 30 days, 88.1 M samples, into a
+store on disk cut every six hours of data (120 cuts) and merged as maintenance merges: 4 blocks,
+139.1 MB (1.58 bytes a sample), rollups 4.2% of them. The same store asked with rollups read and not
+(`Store::set_read_rollups`), every answer checked the same to the bit; p50 of five runs.
+
+| query | range | points | samples | samples read | rollups read |
+| --- | --- | --- | --- | --- | --- |
+| `avg:node_*{*} by {instance}` | 1 d | 240 | 2.94 M | 24.9 ms | 24.9 ms |
+| | 7 d | 240 | 20.6 M | 152.8 ms | 15.6 ms |
+| | 30 d | 240 | 87.8 M | 634.5 ms | 36.4 ms |
+| | 7 d | 1,200 | 20.5 M | 152.4 ms | 152.9 ms |
+| | 30 d | 1,200 | 87.8 M | 641.5 ms | 38.0 ms |
+| `avg:node_load1{*} by {instance}` | 7 d | 240 | 60,755 | 0.69 ms | 0.06 ms |
+| | 30 d | 240 | 259,200 | 2.94 ms | 0.13 ms |
+| `max:node_memory_MemAvailable_bytes{*}` | 30 d | 240 | 259,200 | 2.28 ms | 0.10 ms |
+| `sum:node_cpu_seconds_total{mode:idle} by {instance}` (a counter's rate) | 30 d | 240 | 86,400 | 0.91 ms | 0.05 ms |
+| `sum:apiserver_request_total{*} by {verb}` | 7 d | 240 | 81,488 | 0.47 ms | 0.06 ms |
+| | 30 d | 240 | 345,600 | 1.96 ms | 0.12 ms |
+
+A chart's 240 points make a week's buckets hours and a month's three hours: the hour's tier. A day's
+are ten minutes (the five minutes' tier, where kept), and a week at the API's default 1,200 points
+ten minutes too: on this corpus, mostly samples. Allocations are the same either way (the month of
+node series 108 read as samples, 127 rolled up; the windows' columns are sized once from the range,
+176 when they grew a window at a time).
+
+The month first took 78 ms rolled up: half of it loading whole regions to read the windows cuts
+split (perf: `Block::load` 46%, the kernel's copies 11%). Tables and chunks checked on their own,
+read in part (§4.5), brought it to 36 ms, and a day read as samples from month-long blocks from 0.15
+to 0.11 ms (`node_load1`). What remains (perf): reading the tiers' windows 34%, folding them 12%,
+small regions read whole 10%. How long a region is read whole at most (`block::READ_WHOLE`), each
+build in turn, two rounds (one 1 KiB and one 4 KiB run of the second hit a load spike and are left
+out):
+
+| read whole at most | `node_load1` 1 d | `node_*` 1 d | `node_*` 30 d rolled up |
+| --- | --- | --- | --- |
+| 1 KiB | 0.18–0.19 ms | 28.1–28.2 ms | 35.5 ms |
+| **4 KiB** | **0.11** | **24.7–24.8** | **35.8–36.5** |
+| 16 KiB | 0.11 | 24.9 | 37.3–38.5 |
+| 64 KiB | 0.14 | 25.7–26.7 | 47.1–47.3 |
+
+**Merging.** Making rollups at merges, the same binary with and without (an environment switch in
+a copy of the tree, in turn, load average 58–76): merges 7.6 s and 8.9 s of the 30 days' writing
+(+17%), all of it 12.0 and 12.2 s. Joining inputs' rollups instead of making them anew from the
+samples is what would take that back.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -1352,6 +1498,21 @@ back as another kind) applied to an in-memory store and to two on disk that cut,
 restart on schedules of their own, and to rewrites built apart while the store goes on (planned,
 held across entries, taken in later; a real maintenance thread beside the applying one): all agree
 at every checkpoint, over 1,000 seeds (`KILN_OBS_SEEDS=1000`), digests included.
+
+**Rollups change no answer** (`kiln_obs::query` tests,
+`rollups_answer_to_the_bit_as_samples_do_whatever_the_blocks`): 50 hours of gauges of noise, a
+level, counts of fractions, counters that reset, samples that are not finite, a distribution of two
+hosts, writes late into merged time and late writes not merged; three replicas, two on disk cutting
+and merging every five and every two hours of writes, one holding all in its head. Every query whose
+buckets are whole windows (steps of five minutes to three hours; calendar days in UTC, New York and
+Kathmandu; every rollup function, rates and counts, a percentile across series, a distribution's
+percentiles by host, shifts by an hour and a day) answers alike on all three to the bit, rollups
+read or not, with every kind read from rollups somewhere (the test says so: a tier unread would
+prove nothing). 2026-10-18: passes over 100 seeds (`KILN_OBS_SEEDS=100`, each its own writes and
+cut schedules), and the replicas-alike scenarios above over 1,000 with blocks of format 3. Blocks' own tests: rollups read back exactly; a series' rollups given another's
+found by `verify` though their checksum holds; a long region read in part, 300 random sets of
+ranges, exactly as whole; a damaged chunk found by the read that wants it and not by one that does
+not; format 2 still read.
 
 Also live: OTLP/JSON gzip to the server (a wrong token refused, a malformed body refused) and
 protobuf to a runner's receiver, which arrive and replicate; a CI pipeline run on a runner from a

@@ -92,6 +92,68 @@ fn main() {
     if std::env::args().any(|a| a == "sweep") {
         sweep(&series, samples);
     }
+    if std::env::args().any(|a| a == "rollups") {
+        rollups(&series, samples);
+    }
+}
+
+/// §12.16: each rollup tier's bytes against the samples' it stands for, what each keep ratio keeps
+/// and adds, and a window's read against its samples'.
+fn rollups(series: &[corpus::Series], samples: usize) {
+    use kiln_obs::batch::Kind;
+    use kiln_obs::rollup::{self, Builder, Col, Rolled, TIERS};
+    let chunks = encode_all(series, 240);
+    let kind = |s: &corpus::Series| if s.kind == 1 { Kind::Counter } else { Kind::Gauge };
+    let mut b = Builder::default();
+    // (raw bytes, samples, [(windows, bytes) a tier]) a series.
+    let sized: Vec<(usize, usize, [(usize, usize); 2])> = series.iter().zip(&chunks).map(|(s, c)| (c.iter().map(|c| c.bytes.len()).sum(), s.ts.len(), rollup::sizes(kind(s), &s.ts, &s.values, &mut b))).collect();
+    let raw: usize = sized.iter().map(|s| s.0).sum();
+    println!("\nrollups: {} series, {samples} samples, {raw} bytes in chunks of 240", series.len());
+    for (t, w) in TIERS.iter().enumerate() {
+        let windows: usize = sized.iter().map(|s| s.2[t].0).sum();
+        let bytes: usize = sized.iter().map(|s| s.2[t].1).sum();
+        println!("  {:>4} min: {windows} windows, {:.1} samples a window, {:.2} bytes a window, {:.3} of the samples' bytes if every series kept it", w / 60_000, samples as f64 / windows as f64, bytes as f64 / windows as f64, bytes as f64 / raw as f64);
+    }
+    println!("  keep ratio: bytes added (of the samples'), samples a tier serves (of all), each tier");
+    for ratio in [1usize, 2, 4, 8, 16] {
+        let mut added = 0usize;
+        let mut served = [0usize; 2];
+        for (raw_s, n, tiers) in &sized {
+            for (t, &(_, bytes)) in tiers.iter().enumerate() {
+                if bytes.saturating_mul(ratio) <= *raw_s {
+                    added += bytes;
+                    served[t] += n;
+                }
+            }
+        }
+        println!("  {ratio:>4}: {:.3} added; served {:.3} by 5 min, {:.3} by 1 h", added as f64 / raw as f64, served[0] as f64 / samples as f64, served[1] as f64 / samples as f64);
+    }
+    // A window's read: every tier kept, read whole, the sum alone (an average's) and every column.
+    let mut built = Vec::with_capacity(series.len());
+    for s in series {
+        let mut out = Vec::new();
+        rollup::build(kind(s), &s.ts, &s.values, usize::MAX / rollup::KEEP_RATIO, &mut b, &mut out);
+        built.push(out);
+    }
+    for (t, &w) in TIERS.iter().enumerate() {
+        for (what, cols) in [("sum", &[Col::Sum][..]), ("every column", &[Col::Sum, Col::Min, Col::Max, Col::Last, Col::First, Col::Inc][..])] {
+            let mut out = Rolled::default();
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = Instant::now();
+                let mut windows = 0usize;
+                for (s, r) in series.iter().zip(&built) {
+                    if let Ok(Some(tier)) = rollup::tier(r, w, kind(s)) {
+                        out.clear();
+                        tier.read(i64::MIN / 2, i64::MAX / 2, cols, &mut out).unwrap();
+                        windows += out.len();
+                    }
+                }
+                best = best.min(start.elapsed().as_nanos() as f64 / windows.max(1) as f64);
+            }
+            println!("  {:>4} min, {what}: {best:.1} ns a window ({:.2} ns a sample it stands for)", w / 60_000, best / (samples as f64 / sized.iter().map(|s| s.2[t].0).sum::<usize>() as f64));
+        }
+    }
 }
 
 /// §12.2: bytes a sample against chunk length, and the timestamp buckets the corpus makes cheapest.

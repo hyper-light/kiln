@@ -133,27 +133,7 @@ impl Encoder {
 
     #[inline]
     fn write_value(&mut self, bits: u64) {
-        let x = bits ^ self.v;
-        if x == 0 {
-            self.w.write_bit(false);
-            return;
-        }
-        let leading = x.leading_zeros().min(LEADING_MAX);
-        let trailing = x.trailing_zeros();
-        if let Some((wl, wt)) = self.window
-            && leading >= wl
-            && trailing >= wt
-        {
-            self.w.write(0b10, 2);
-            self.w.write(x >> wt, 64 - wl - wt);
-            return;
-        }
-        let len = 64 - leading - trailing;
-        self.w.write(0b11, 2);
-        self.w.write(u64::from(leading), LEADING_BITS);
-        self.w.write(u64::from(len % 64), LENGTH_BITS);
-        self.w.write(x >> trailing, len);
-        self.window = Some((leading, trailing));
+        write_xor(&mut self.w, self.v, bits, &mut self.window);
     }
 
     /// Samples in the chunk.
@@ -200,6 +180,58 @@ impl Encoder {
     /// The finished chunk.
     pub fn finish(self) -> Chunk {
         Chunk { first: self.first, last: self.t, count: self.count, bytes: self.w.finish() }
+    }
+}
+
+/// Writes `bits` as its XOR with `prev` (Gorilla §4.1.2): a zero bit when equal; else the
+/// meaningful bits inside `window` (the leading and trailing zeros of the last value written with
+/// its own), or their own window and then them. A chunk's values, and a rollup's columns
+/// (`crate::rollup`).
+#[inline]
+pub(crate) fn write_xor(w: &mut BitWriter, prev: u64, bits: u64, window: &mut Option<(u32, u32)>) {
+    let x = bits ^ prev;
+    if x == 0 {
+        w.write_bit(false);
+        return;
+    }
+    let leading = x.leading_zeros().min(LEADING_MAX);
+    let trailing = x.trailing_zeros();
+    if let Some((wl, wt)) = *window
+        && leading >= wl
+        && trailing >= wt
+    {
+        w.write(0b10, 2);
+        w.write(x >> wt, 64 - wl - wt);
+        return;
+    }
+    let len = 64 - leading - trailing;
+    w.write(0b11, 2);
+    w.write(u64::from(leading), LEADING_BITS);
+    w.write(u64::from(len % 64), LENGTH_BITS);
+    w.write(x >> trailing, len);
+    *window = Some((leading, trailing));
+}
+
+/// Reads a value [`write_xor`] wrote after `prev`.
+#[inline]
+pub(crate) fn read_xor(r: &mut BitReader<'_>, prev: u64, window: &mut (u32, u32)) -> Result<u64, Truncated> {
+    if !r.read_bit()? {
+        return Ok(prev);
+    }
+    if r.read_bit()? {
+        let leading = r.read(LEADING_BITS)? as u32;
+        let len = match r.read(LENGTH_BITS)? as u32 {
+            0 => 64,
+            l => l,
+        };
+        let trailing = 64u32.saturating_sub(leading).saturating_sub(len);
+        let bits = r.read(len)?;
+        *window = (leading, trailing);
+        Ok(prev ^ bits.checked_shl(trailing).unwrap_or(0))
+    } else {
+        let (wl, wt) = *window;
+        let bits = r.read(64u32.saturating_sub(wl).saturating_sub(wt))?;
+        Ok(prev ^ bits.checked_shl(wt).unwrap_or(0))
     }
 }
 
@@ -327,23 +359,7 @@ impl<'a> Decoder<'a> {
         }
         self.t = t;
         self.delta = delta;
-        if self.r.read_bit()? {
-            if self.r.read_bit()? {
-                let leading = self.r.read(LEADING_BITS)? as u32;
-                let len = match self.r.read(LENGTH_BITS)? as u32 {
-                    0 => 64,
-                    l => l,
-                };
-                let trailing = 64u32.saturating_sub(leading).saturating_sub(len);
-                let bits = self.r.read(len)?;
-                self.v ^= bits.checked_shl(trailing).unwrap_or(0);
-                self.window = (leading, trailing);
-            } else {
-                let (wl, wt) = self.window;
-                let bits = self.r.read(64u32.saturating_sub(wl).saturating_sub(wt))?;
-                self.v ^= bits.checked_shl(wt).unwrap_or(0);
-            }
-        }
+        self.v = read_xor(&mut self.r, self.v, &mut self.window)?;
         Ok((self.t, f64::from_bits(self.v)))
     }
 

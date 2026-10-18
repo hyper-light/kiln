@@ -14,7 +14,8 @@ use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseEr
 use crate::anomaly::{Algorithm, Scorer};
 use crate::batch::Kind;
 use crate::index::{NameMatch, Selector};
-use crate::store::{Scratch, Store, StoreError};
+use crate::rollup::{self, Agg, Col, Rolled};
+use crate::store::{Roll, Scratch, Store, StoreError};
 
 /// The most buckets a series: Prometheus's cap on a range query's resolution (11,000 points a
 /// series, `promql` engine, "exceeded maximum resolution of 11,000 points per timeseries").
@@ -1214,15 +1215,27 @@ fn dist_counts(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, mem
     let (mut ts, mut vs, mut each) = (std::mem::take(&mut table.ts), std::mem::take(&mut table.vs), std::mem::take(&mut table.each));
     each.clear();
     each.resize(grid.n, f64::NAN);
+    let tier = tier_for(spans);
+    let (mut rolled, mut window_n) = (rolled_for(tier, from, end, &counted), Vec::new());
     for &(id, at, b) in members {
         let Some(s) = store.series(id) else { continue };
         ts.clear();
         vs.clear();
         let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
+        let row = table.row(b.coarser(u32::try_from(at - scale).unwrap_or(0)));
+        if let Some(width) = tier {
+            rolled.clear();
+            let roll = Roll { width, from, to: end, kind: s.kind(), cols: columns_for(s.kind(), &counted) };
+            store.read_rolled(id, from.saturating_sub(lookback), end.saturating_sub(1), &roll, scratch, &mut ts, &mut vs, &mut rolled)?;
+            scanned.0 += 1;
+            scanned.1 += ts.len() as u64 + rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>();
+            rollup_windows(s.kind(), &counted, spans, width, &ts, &vs, &rolled, &mut each, &mut window_n);
+            table.add(row, &each);
+            continue;
+        }
         store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
         scanned.0 += 1;
         scanned.1 += ts.len() as u64;
-        let row = table.row(b.coarser(u32::try_from(at - scale).unwrap_or(0)));
         if s.kind() == Kind::Count {
             table.add_samples(row, spans, &ts, &vs);
         } else {
@@ -1338,6 +1351,10 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
     let mut counts = if q.weighted { vec![0.0; grid.n] } else { Vec::new() };
     let (mut gaps, mut intervals) = if q.weighted { (Vec::with_capacity(INTERVAL_GAPS), Vec::with_capacity(ids.len())) } else { (Vec::new(), Vec::new()) };
     let mut pending: Vec<(usize, usize, f64, f64)> = Vec::new();
+    // A grid of whole windows of a tier is read window by window (`crate::rollup`): from rollups
+    // where a block holds them.
+    let tier = if q.weighted { None } else { tier_for(spans) };
+    let (mut rolled, mut window_n) = (rolled_for(tier, from, end, q), Vec::new());
     for &id in &ids {
         let Some(s) = store.series(id) else { continue };
         key.clear();
@@ -1359,11 +1376,20 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_seri
         vs.clear();
         // A counter's increase into the first bucket needs the sample before it.
         let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
-        store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
-        scanned.0 += 1;
-        scanned.1 += ts.len() as u64;
         let weighted = q.weighted && s.kind() == Kind::Gauge;
-        rollup(s.kind(), q, spans, &ts, &vs, &mut buckets, if weighted { Some(&mut counts) } else { None });
+        if let Some(width) = tier.filter(|_| !weighted) {
+            rolled.clear();
+            let roll = Roll { width, from, to: end, kind: s.kind(), cols: columns_for(s.kind(), q) };
+            store.read_rolled(id, from.saturating_sub(lookback), end.saturating_sub(1), &roll, scratch, &mut ts, &mut vs, &mut rolled)?;
+            scanned.0 += 1;
+            scanned.1 += ts.len() as u64 + rolled.n.iter().map(|&n| u64::from(n)).sum::<u64>();
+            rollup_windows(s.kind(), q, spans, width, &ts, &vs, &rolled, &mut buckets, &mut window_n);
+        } else {
+            store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
+            scanned.0 += 1;
+            scanned.1 += ts.len() as u64;
+            rollup(s.kind(), q, spans, &ts, &vs, &mut buckets, if weighted { Some(&mut counts) } else { None });
+        }
         let Some(a) = acc.get_mut(g) else { continue };
         if !weighted {
             a.add(&buckets, None);
@@ -1447,6 +1473,175 @@ fn weigh(counts: &mut [f64], d: i64, spans: Spans<'_>) {
     for (i, c) in counts.iter_mut().enumerate() {
         *c = weight(*c, d, spans.width_ms(i));
     }
+}
+
+/// The coarsest tier (`crate::rollup::TIERS`) of which every bucket of `spans` is whole windows: a
+/// step of five minutes or more on the grid's ladder, a calendar's periods, shifted by a multiple
+/// of the tier. None: the buckets are read sample by sample ([`rollup`]).
+fn tier_for(spans: Spans<'_>) -> Option<i64> {
+    rollup::TIERS.iter().rev().copied().find(|&w| match spans.edges {
+        Some(e) => e.get(..=spans.n).is_some_and(|e| e.iter().all(|x| x.rem_euclid(w) == 0)),
+        None => spans.from.rem_euclid(w) == 0 && spans.step % w == 0,
+    })
+}
+
+/// Room for a series' windows of `tier` in `[from, end)` in the columns `q` reads of a gauge, a count
+/// or a counter; none without a tier.
+fn rolled_for(tier: Option<i64>, from: i64, end: i64, q: &MetricQuery) -> Rolled {
+    let Some(w) = tier else { return Rolled::default() };
+    let n = usize::try_from(end.saturating_sub(from) / w).unwrap_or(0).saturating_add(1).min(MAX_POINTS * 12);
+    let mut cols: Vec<Col> = [Kind::Gauge, Kind::Count, Kind::Counter].iter().flat_map(|&k| columns_for(k, q).iter().copied()).collect();
+    cols.dedup();
+    Rolled::with_capacity(n, &cols)
+}
+
+/// The rollup columns a query of a series of `kind` reads (`crate::rollup::columns`).
+fn columns_for(kind: Kind, q: &MetricQuery) -> &'static [Col] {
+    if kind == Kind::Counter {
+        return rollup::columns(Kind::Counter);
+    }
+    match q.rollup.map(|r| r.0).unwrap_or(if kind == Kind::Count { Rollup::Sum } else { Rollup::Avg }) {
+        Rollup::Avg | Rollup::Sum => &[Col::Sum],
+        Rollup::Min => &[Col::Min],
+        Rollup::Max => &[Col::Max],
+        Rollup::Last => &[Col::Last],
+        Rollup::Count => &[],
+    }
+}
+
+/// A window's fold, from its samples or its rollup: whether it held any sample, its finite ones'
+/// count and aggregates; a counter's increase into it from the sample before (`cross`) and its
+/// increases after its first (`inc`).
+#[derive(Clone, Copy)]
+struct Window {
+    has: bool,
+    agg: Agg,
+    cross: f64,
+}
+
+/// One series' samples and rolled windows into `buckets` (NaN where none), window by window
+/// (`crate::rollup`): each window of `width` folded in time order, from its rollup or from its
+/// samples alike, then each bucket's windows in time order. Every bucket is whole windows
+/// ([`tier_for`]), so a bucket's value does not depend on which of its windows were rolled up:
+/// what keeps replicas' answers alike to the bit. Its functions are [`rollup`]'s; `n`, room for a
+/// bucket's count.
+#[allow(clippy::too_many_arguments)]
+fn rollup_windows(kind: Kind, q: &MetricQuery, spans: Spans<'_>, width: i64, ts: &[i64], vs: &[f64], rolled: &Rolled, buckets: &mut [f64], n: &mut Vec<f64>) {
+    buckets.fill(f64::NAN);
+    n.clear();
+    n.resize(buckets.len(), 0.0);
+    let f = q.rollup.map(|r| r.0).unwrap_or(match kind {
+        Kind::Count => Rollup::Sum,
+        _ => Rollup::Avg,
+    });
+    let empty = Agg { n: 0, sum: f64::NAN, min: f64::NAN, max: f64::NAN, first: f64::NAN, last: f64::NAN, inc: f64::NAN };
+    // A counter's last finite sample before the window.
+    let mut prev: Option<f64> = None;
+    let (mut i, mut j) = (0usize, 0usize);
+    loop {
+        let raw = ts.get(i).map(|&t| t.div_euclid(width).saturating_mul(width));
+        let up = rolled.start.get(j).copied();
+        let (start, w) = match (raw, up) {
+            (None, None) => break,
+            (Some(r), Some(u)) if r < u => (r, None),
+            (Some(r), None) => (r, None),
+            (_, Some(u)) => (u, rolled.agg(j)),
+        };
+        let w = match w {
+            Some(agg) => {
+                j += 1;
+                let cross = prev.map_or(f64::NAN, |p| increase_into(p, agg.first));
+                prev = Some(agg.last);
+                Window { has: true, agg, cross }
+            }
+            None if up == Some(start) => {
+                // A window rolled up without a count: not one a reader keeps.
+                j += 1;
+                continue;
+            }
+            None => {
+                // The window's samples, folded as a rollup folds them; a counter's from the sample
+                // before.
+                let end = start.saturating_add(width);
+                let mut w = Window { has: false, agg: empty, cross: f64::NAN };
+                let mut first = true;
+                while let (Some(&t), Some(&v)) = (ts.get(i), vs.get(i)) {
+                    if t >= end {
+                        break;
+                    }
+                    i += 1;
+                    w.has = true;
+                    if kind == Kind::Counter {
+                        if let Some(p) = prev {
+                            let inc = increase_into(p, v);
+                            if first {
+                                w.cross = inc;
+                            } else {
+                                w.agg.inc = rollup::join(w.agg.inc, inc);
+                            }
+                        }
+                        first = false;
+                        if v.is_finite() {
+                            prev = Some(v);
+                        }
+                        continue;
+                    }
+                    if !v.is_finite() {
+                        continue;
+                    }
+                    let a = &mut w.agg;
+                    a.n += 1;
+                    a.sum = rollup::join(a.sum, v);
+                    a.min = if a.min.is_nan() { v } else { a.min.min(v) };
+                    a.max = if a.max.is_nan() { v } else { a.max.max(v) };
+                    a.last = v;
+                }
+                w
+            }
+        };
+        let Some(b) = spans.index(start) else { continue };
+        let (Some(slot), Some(count)) = (buckets.get_mut(b), n.get_mut(b)) else { continue };
+        if kind == Kind::Counter {
+            *slot = rollup::join(*slot, rollup::join(w.cross, w.agg.inc));
+            continue;
+        }
+        let a = w.agg;
+        match f {
+            Rollup::Avg | Rollup::Sum => *slot = rollup::join(*slot, a.sum),
+            Rollup::Min if !a.min.is_nan() => *slot = if slot.is_nan() { a.min } else { slot.min(a.min) },
+            Rollup::Max if !a.max.is_nan() => *slot = if slot.is_nan() { a.max } else { slot.max(a.max) },
+            Rollup::Last if !a.last.is_nan() => *slot = a.last,
+            Rollup::Count if w.has => *slot = (if slot.is_nan() { 0.0 } else { *slot }) + f64::from(a.n),
+            _ => {}
+        }
+        *count += f64::from(a.n);
+    }
+    match (kind, f) {
+        (Kind::Counter, _) => {
+            if q.mode != Some(CountMode::Count) {
+                for (i, b) in buckets.iter_mut().enumerate() {
+                    *b /= spans.width_s(i);
+                }
+            }
+        }
+        (_, Rollup::Avg) => {
+            for (b, &c) in buckets.iter_mut().zip(n.iter()) {
+                *b = if c > 0.0 { *b / c } else { f64::NAN };
+            }
+        }
+        _ => {}
+    }
+    if kind == Kind::Count && q.mode == Some(CountMode::Rate) {
+        for (i, b) in buckets.iter_mut().enumerate() {
+            *b /= spans.width_s(i);
+        }
+    }
+}
+
+/// A counter's increase into a sample from the one before (`crate::rollup::increase`).
+#[inline]
+fn increase_into(p: f64, v: f64) -> f64 {
+    rollup::increase(p, v)
 }
 
 /// One series' samples into `buckets` (NaN where none): its rollup function, by its kind unless
@@ -2126,6 +2321,200 @@ mod tests {
 
     fn by_tag<'a>(a: &'a Answer, k: &str, v: &str) -> &'a Series {
         a.series.iter().find(|s| s.tags.iter().any(|(tk, tv)| tk == k && tv == v)).unwrap()
+    }
+
+    /// Rollups change no answer: three replicas given the same writes, two cutting and merging
+    /// their blocks on schedules of their own (so a window one holds rolled up the other reads
+    /// as samples) and one holding everything in its head, answer every query whose buckets are
+    /// whole windows to the bit, rollups read or not: gauges of noise, counts of fractions,
+    /// counters that reset, samples that are not finite, writes late into merged time and late
+    /// writes not yet merged, a distribution; steps of five minutes to three hours, calendar days
+    /// in three timezones (Kathmandu's +5:45 a five-minute tier's, New York's an hour's), every
+    /// rollup function, shifts.
+    #[test]
+    fn rollups_answer_to_the_bit_as_samples_do_whatever_the_blocks() {
+        // `KILN_OBS_SEEDS=n` runs n seeds, each its own writes and cut schedules; one by default.
+        let seeds: u64 = std::env::var("KILN_OBS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        for seed in 0..seeds {
+            rollups_alike(seed);
+        }
+    }
+
+    fn rollups_alike(seed: u64) {
+        let start: i64 = 1_700_006_400_000; // a UTC midnight
+        let hours = 50i64;
+        let mut rng = crate::testkit::Rng::new(41 + seed);
+        let schedules = [5 + (seed % 3) as usize, 2 + (seed % 2) as usize];
+        // An hour of writes a batch; at the end, late writes into hour 10 (merged by then) and hour
+        // 48 (still in the head).
+        let mut batches = Vec::new();
+        let keys: Vec<SeriesKey> = vec![
+            SeriesKey::new("noise", [("host", "a")], Kind::Gauge).unwrap(),
+            SeriesKey::new("noise", [("host", "b")], Kind::Gauge).unwrap(),
+            SeriesKey::new("level", [("host", "a")], Kind::Gauge).unwrap(),
+            SeriesKey::new("frac", [("host", "a")], Kind::Count).unwrap(),
+            SeriesKey::new("frac", [("host", "b")], Kind::Count).unwrap(),
+            SeriesKey::new("req", [("host", "a")], Kind::Counter).unwrap(),
+            SeriesKey::new("req", [("host", "b")], Kind::Counter).unwrap(),
+        ];
+        let mut counters = [0.0f64; 2];
+        for h in 0..hours {
+            let mut b = Builder::new();
+            for k in &keys {
+                b.define(k);
+            }
+            for (ki, k) in keys.iter().enumerate() {
+                let mut pts = Vec::new();
+                let mut t = start + h * 3_600_000;
+                while t < start + (h + 1) * 3_600_000 {
+                    let v = match ki {
+                        0 | 1 => rng.f64() * 100.0 - 50.0,
+                        2 => 7.25,
+                        3 | 4 => 0.1 * (1 + rng.below(9)) as f64,
+                        _ => {
+                            let c = &mut counters[ki - 5];
+                            *c = if rng.below(700) == 0 { rng.f64() } else { *c + rng.f64() * 3.0 };
+                            *c
+                        }
+                    };
+                    let v = if rng.below(3_000) == 0 { f64::NAN } else { v };
+                    pts.push((t, v));
+                    // Ten seconds, jittered, a gap now and then.
+                    t += 10_000 + rng.below(7) as i64 - 3 + if rng.below(400) == 0 { 600_000 } else { 0 };
+                }
+                b.run(k.fp, pts);
+            }
+            // A distribution beside them: each host's values of the hour, a minute at a time.
+            for host in ["a", "b"] {
+                let points: Vec<(i64, Vec<f64>)> = (0..60).map(|m| (start + h * 3_600_000 + m * 60_000, (0..20).map(|_| (rng.f64() * 6.0).exp()).collect())).collect();
+                for (key, pts) in crate::dist::series_of("lat", &[("host", host)], &points).unwrap() {
+                    b.define(&key);
+                    b.run(key.fp, pts);
+                }
+            }
+            batches.push(b.finish());
+        }
+        for late_hour in [10i64, 48] {
+            let mut b = Builder::new();
+            for k in keys.iter().take(1) {
+                b.define(k);
+                b.run(k.fp, (0..30).map(|i| (start + late_hour * 3_600_000 + 1_234 + i * 61_000, rng.f64())));
+            }
+            batches.push(b.finish());
+        }
+        let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+        let mut stores: Vec<Store> = dirs.iter().map(|d| Store::open(d.path(), Keyed::with_keys(1, 2)).unwrap()).collect();
+        stores.push(Store::new(Keyed::with_keys(1, 2)));
+        for (i, batch) in batches.iter().enumerate() {
+            for (si, st) in stores.iter_mut().enumerate() {
+                st.apply(batch).unwrap();
+                let every = schedules.get(si).copied();
+                // The last late write stays in the head: a source overlapping a block's.
+                if let Some(e) = every
+                    && i % e == e - 1
+                    && i + 1 < batches.len()
+                {
+                    st.cut(crate::manifest::Point { index: i as u64 + 1, term: 1 }).unwrap();
+                    st.compact().unwrap();
+                }
+            }
+        }
+        // Rollups are there to be read: some blocks hold each tier of the gauges, and some tier
+        // of every kind.
+        for (metric, kind) in [("noise", Kind::Gauge), ("frac", Kind::Count), ("req", Kind::Counter), ("lat.dist", Kind::Count)] {
+            let mut found = [0usize; 2];
+            for (t, &w) in rollup::TIERS.iter().enumerate() {
+                let mut rolled = Rolled::default();
+                for st in &stores[..2] {
+                    let mut ids = Vec::new();
+                    st.select(&Selector::metric(metric), &mut ids);
+                    for &id in &ids {
+                        let (mut ts, mut vs) = (Vec::new(), Vec::new());
+                        rolled.clear();
+                        let roll = Roll { width: w, from: start, to: start + hours * 3_600_000, kind, cols: rollup::columns(kind) };
+                        st.read_rolled(id, start, start + hours * 3_600_000, &roll, &mut Scratch::default(), &mut ts, &mut vs, &mut rolled).unwrap();
+                        found[t] += rolled.len();
+                    }
+                }
+            }
+            assert!(found.iter().any(|&n| n > 0), "{metric}: no window read from rollups");
+            if metric == "noise" {
+                assert!(found.iter().all(|&n| n > 0), "{metric}: a tier never read from rollups: {found:?}");
+            }
+        }
+        let queries = [
+            "avg:noise{*}",
+            "sum:noise{*} by {host}",
+            "max:noise{*}.rollup(min)",
+            "min:noise{*}.rollup(max)",
+            "avg:noise{*}.rollup(last)",
+            "sum:noise{*}.rollup(count)",
+            "avg:noise{*}.rollup(sum)",
+            "p90:noise{*}",
+            "avg:level{*}",
+            "sum:frac{*}",
+            "sum:frac{*}.as_rate()",
+            "sum:frac{*} by {host}.rollup(avg)",
+            "sum:req{*}",
+            "sum:req{*}.as_count()",
+            "sum:req{*} by {host}",
+            "p99:lat{*}",
+            "p50:lat{*} by {host}",
+            "avg:lat{*}",
+            "timeshift(avg:noise{*}, -3600)",
+            "avg:noise{*} - timeshift(avg:noise{*}, -86400)",
+        ];
+        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+        let mut checked = 0usize;
+        for step in [300_000i64, 600_000, 3_600_000, 10_800_000] {
+            for query in queries {
+                let mut r = Request::new(query, start + 3 * 3_600_000 + 17, start + hours * 3_600_000);
+                r.step = Some(step);
+                let mut answers = Vec::new();
+                for st in stores.iter_mut() {
+                    for on in [true, false] {
+                        st.set_read_rollups(on);
+                        answers.push(eval(st, &r).unwrap());
+                    }
+                    st.set_read_rollups(true);
+                }
+                let first = &answers[0];
+                assert!(first.series.iter().any(|s| s.values.iter().any(|v| v.is_finite())), "{query} at {step}: nothing to compare");
+                for (n, other) in answers.iter().enumerate().skip(1) {
+                    assert_eq!(other.series.len(), first.series.len(), "{query} at {step}, answer {n}");
+                    assert_eq!(other.scanned_samples, first.scanned_samples, "{query} at {step}, answer {n}");
+                    for (x, y) in first.series.iter().zip(&other.series) {
+                        assert_eq!(x.tags, y.tags);
+                        for (i, (a, b)) in x.values.iter().zip(&y.values).enumerate() {
+                            assert!(same(*a, *b), "{query} at {step}, answer {n} (store {}, rollups {}), bucket {i}: {a} against {b}", n / 2, n % 2 == 0);
+                        }
+                    }
+                }
+                checked += 1;
+            }
+        }
+        // Calendar days: whole hours in UTC and New York, whole quarter hours in Kathmandu.
+        for tz in ["UTC", "America/New_York", "Asia/Kathmandu"] {
+            for query in ["avg:noise{*}", "sum:frac{*}", "sum:req{*}", "p99:lat{*}"] {
+                let full = format!("{query}.rollup({}, daily, '{tz}')", if query.starts_with("avg") { "avg" } else { "sum" });
+                let r = Request::new(&full, start, start + hours * 3_600_000);
+                let mut answers = Vec::new();
+                for st in stores.iter_mut() {
+                    for on in [true, false] {
+                        st.set_read_rollups(on);
+                        answers.push(eval(st, &r).unwrap());
+                    }
+                    st.set_read_rollups(true);
+                }
+                for other in &answers[1..] {
+                    for (x, y) in answers[0].series.iter().zip(&other.series) {
+                        assert!(x.values.iter().zip(&y.values).all(|(a, b)| same(*a, *b)), "{full}: {:?} against {:?}", x.values, y.values);
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4 * queries.len() + 12);
     }
 
     /// Ten days of a daily cycle every five minutes and a spike at its end: `anomalies()` over the

@@ -29,6 +29,7 @@ pub mod otlp;
 pub mod outlier;
 pub mod prom;
 pub mod query;
+pub mod rollup;
 pub mod store;
 pub mod symbols;
 pub mod testkit;

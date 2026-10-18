@@ -34,7 +34,7 @@ use hashbrown::HashTable;
 use crate::batch::{BatchError, Item, Kind, Reader};
 use crate::block::{self, Block, BlockError, SeriesData};
 use crate::command::{self, Command, CommandError};
-use crate::gorilla::{Chunk, DecodeError, Encoder};
+use crate::gorilla::{Chunk, ChunkRef, DecodeError, Encoder};
 use crate::hash::Keyed;
 use crate::head::{Appended, CHUNK_SAMPLES, HeadSeries};
 use crate::image::{FileKind, Image, ImageFile};
@@ -44,6 +44,7 @@ use crate::logs::search::Search;
 use crate::logs::store::{Found, HeldFile, LogStore, LogStoreError};
 use crate::logs::tail::Feed;
 use crate::manifest::{self, BlockEntry, Manifest, ManifestError, Membership, Point, Session};
+use crate::rollup::{self, Col, Rolled};
 use crate::symbols::Symbols;
 
 /// Senders a store keeps sessions for at the most; past it, the one whose last write is oldest in
@@ -227,6 +228,8 @@ pub struct Store {
     /// new to them.
     feed: Option<Arc<Feed>>,
     publishing: bool,
+    /// Whether [`Store::read_rolled`] reads rollups (always, but to measure or check against them).
+    read_rollups: bool,
 }
 
 impl Default for Store {
@@ -338,10 +341,13 @@ impl Rewrite {
         keys.sort_by_key(|k| k.0);
         keys.dedup_by_key(|k| k.0);
         // Written as it is read, a series at a time: what a merge holds is a series, not a block.
+        // Each series' rollups (`crate::rollup`) are its input's when it is copied whole and its
+        // input has them; else made here, from its samples.
         let mut w = block::Writer::create(&self.dir.join(&self.file))?;
         let mut buf = Vec::new();
         let mut regions: Vec<Vec<u8>> = blocks.iter().map(|_| Vec::new()).collect();
         let (mut ts, mut vs) = (Vec::new(), Vec::new());
+        let (mut builder, mut rollups, mut held) = (rollup::Builder::default(), Vec::new(), Vec::new());
         let mut holders: Vec<(&Block, usize, (i64, i64))> = Vec::with_capacity(blocks.len());
         for (fp, kind, key) in &keys {
             holders.clear();
@@ -354,9 +360,24 @@ impl Rewrite {
             // decoded or encoded.
             if let [(blk, i, span)] = holders.as_slice()
                 && uncut
+                && blk.format() == block::FORMAT
             {
                 let crc = blk.load(*i, &mut buf)?;
-                w.region(*fp, *kind, key, &buf, crc, *span)?;
+                let had = blk.rollups(*i, &mut held)?;
+                if !had.is_empty() && blk.kind(*i) == Some(*kind) {
+                    w.region(*fp, *kind, key, &buf, crc, *span, had)?;
+                    continue;
+                }
+                ts.clear();
+                vs.clear();
+                let mut bytes = 0usize;
+                for c in blk.chunks_in(*i, &buf, i64::MIN, i64::MAX)? {
+                    let (_, _, count, chunk) = c?;
+                    ChunkRef::new(chunk, count).decode_into(&mut ts, &mut vs).map_err(|e| BlockError::Decode(blk.path().to_owned(), e))?;
+                    bytes += chunk.len();
+                }
+                rollup::build(*kind, &ts, &vs, bytes, &mut builder, &mut rollups);
+                w.region(*fp, *kind, key, &buf, crc, *span, &rollups)?;
                 continue;
             }
             // Several, each input's after the one before (the samples came in order), none cut:
@@ -374,7 +395,17 @@ impl Rewrite {
                 }
                 let samples: u64 = chunks.iter().map(|c| u64::from(c.2)).sum();
                 if !chunks.is_empty() && samples / chunks.len() as u64 >= u64::from(CHUNK_SAMPLES / 2) {
-                    w.series(*fp, *kind, key, &chunks)?;
+                    ts.clear();
+                    vs.clear();
+                    for ((blk, i, _), region) in holders.iter().zip(&regions) {
+                        for c in blk.chunks_in(*i, region, i64::MIN, i64::MAX)? {
+                            let (_, _, count, chunk) = c?;
+                            ChunkRef::new(chunk, count).decode_into(&mut ts, &mut vs).map_err(|e| BlockError::Decode(blk.path().to_owned(), e))?;
+                        }
+                    }
+                    let bytes = chunks.iter().map(|c| c.3.len()).sum();
+                    rollup::build(*kind, &ts, &vs, bytes, &mut builder, &mut rollups);
+                    w.series(*fp, *kind, key, &chunks, &rollups)?;
                     continue;
                 }
             }
@@ -384,17 +415,17 @@ impl Rewrite {
                 blk.read(*i, self.keep_from, i64::MAX, &mut buf, &mut t, &mut v)?;
                 parts.push((t, v));
             }
-            let chunks = if parts.len() == 1 {
-                let (t, v) = parts.pop().unwrap_or_default();
-                rechunk(&t, &v)
+            ts.clear();
+            vs.clear();
+            if parts.len() == 1 {
+                (ts, vs) = parts.pop().unwrap_or_default();
             } else {
-                ts.clear();
-                vs.clear();
                 merge_parts(parts, &mut ts, &mut vs);
-                rechunk(&ts, &vs)
-            };
+            }
+            let chunks = rechunk(&ts, &vs);
             let refs: Vec<(i64, i64, u32, &[u8])> = chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect();
-            w.series(*fp, *kind, key, &refs)?;
+            rollup::build(*kind, &ts, &vs, chunks.iter().map(|c| c.bytes.len()).sum(), &mut builder, &mut rollups);
+            w.series(*fp, *kind, key, &refs, &rollups)?;
         }
         Ok(w.finish()?)
     }
@@ -449,6 +480,7 @@ impl Store {
             pending_at: HashTable::new(),
             feed: None,
             publishing: false,
+            read_rollups: true,
         }
     }
 
@@ -870,7 +902,9 @@ impl Store {
                     .iter()
                     .filter_map(|(id, chunks)| {
                         let info = self.index.info(*id)?;
-                        Some(SeriesData { fp: self.index.fp(*id)?, kind: info.kind, key: self.index.key(*id)?, chunks: chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect() })
+                        // A cut writes no rollups (it decodes nothing, under the store's hold): the
+                        // first merge to take its block makes them.
+                        Some(SeriesData { fp: self.index.fp(*id)?, kind: info.kind, key: self.index.key(*id)?, chunks: chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect(), rollups: &[] })
                     })
                     .collect();
                 block::write(&dir.join(&file), series)
@@ -1204,6 +1238,98 @@ impl Store {
         Ok(())
     }
 
+    /// Whether [`Store::read_rolled`] reads rollups or every sample: the same answers either way
+    /// (`crate::rollup`), so only to measure the one against the other, or check it.
+    pub fn set_read_rollups(&mut self, on: bool) {
+        self.read_rollups = on;
+    }
+
+    /// [`Store::read_with`], but a window of `roll`'s tier that lies wholly in `roll`'s range and
+    /// that one block alone holds of the series (no other block, nor the head, has a sample in
+    /// it) is read from that block's rollups into `rolled`, its samples not read; every other
+    /// sample in `[from, to]` is read as `read_with` reads it. `ts` and `rolled` are each in time
+    /// order, and no window of `rolled` holds a sample of `ts`. Sources that overlap in time (late
+    /// writes not yet merged) are read as samples.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_rolled(&self, id: u32, from: i64, to: i64, roll: &Roll<'_>, scratch: &mut Scratch, ts: &mut Vec<i64>, values: &mut Vec<f64>, rolled: &mut Rolled) -> Result<(), StoreError> {
+        let from = from.max(self.cutoff);
+        if to < from {
+            return Ok(());
+        }
+        let Some(fp) = self.index.fp(id) else { return Ok(()) };
+        if !self.read_rollups {
+            return self.read_with(id, from, to, scratch, ts, values);
+        }
+        let head = self.head.get(id as usize);
+        let sources = &mut scratch.sources;
+        sources.clear();
+        for (bi, b) in self.blocks.iter().enumerate() {
+            if let Some(i) = b.block.find(fp)
+                && let Some((f, l)) = b.block.span(i)
+                && l >= from
+                && f <= to
+            {
+                sources.push((Some(bi), f, l));
+            }
+        }
+        if let Some((f, l)) = head.and_then(HeadSeries::span)
+            && l >= from
+            && f <= to
+        {
+            sources.push((None, f, l));
+        }
+        if !sources.windows(2).all(|w| matches!(w, [a, b] if a.2 < b.1)) {
+            return self.read_with(id, from, to, scratch, ts, values);
+        }
+        let width = roll.width;
+        for (si, &(src, f, l)) in sources.iter().enumerate() {
+            let block = src.and_then(|bi| self.blocks.get(bi)).and_then(|b| Some((&b.block, b.block.find(fp)?)));
+            let Some((blk, i)) = block else {
+                if let Some(h) = head {
+                    h.read(from, to, ts, values)?;
+                }
+                continue;
+            };
+            let rollups = blk.rollups(i, &mut scratch.rollups)?;
+            let damaged = |_| BlockError::Damaged(blk.path().to_owned(), "series rollups");
+            let tier = if blk.kind(i) == Some(roll.kind) { rollup::tier(rollups, width, roll.kind).map_err(damaged)? } else { None };
+            let Some(tier) = tier else {
+                blk.read(i, from, to, &mut scratch.buf, ts, values)?;
+                continue;
+            };
+            // Its neighbours' spans: a window either reaches is not this block's alone.
+            let before = si.checked_sub(1).and_then(|p| sources.get(p)).map(|s| s.2);
+            let after = sources.get(si + 1).map(|s| s.1);
+            let base = rolled.len();
+            tier.read(from.max(f), to.min(l), roll.cols, rolled).map_err(damaged)?;
+            // Each window kept, or what of the range it covers read as samples: every sample of
+            // the block lies in a window it lists.
+            let ranges = &mut scratch.ranges;
+            ranges.clear();
+            let mut kept = base;
+            for j in base..rolled.len() {
+                let (Some(&start), Some(&n)) = (rolled.start.get(j), rolled.n.get(j)) else { continue };
+                let end = start.saturating_add(width);
+                let alone = before.is_none_or(|b| b < start) && after.is_none_or(|a| a >= end);
+                if n > 0 && alone && start >= roll.from && end <= roll.to && start >= from {
+                    rolled.keep(j, kept);
+                    kept += 1;
+                    continue;
+                }
+                let (a, b) = (start.max(from), end.saturating_sub(1).min(to));
+                match ranges.last_mut() {
+                    Some(last) if last.1.saturating_add(1) >= a => last.1 = b,
+                    _ => ranges.push((a, b)),
+                }
+            }
+            rolled.truncate(kept);
+            if !ranges.is_empty() {
+                blk.read_ranges(i, ranges, &mut scratch.buf, ts, values)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The newest `limit` log records in `[from, to]` (ns, none older than the logs' cutoff) that
     /// `search` matches.
     pub fn search_logs(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
@@ -1258,6 +1384,11 @@ impl Store {
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Bytes the blocks take, and of them their rollups'.
+    pub fn block_bytes(&self) -> (u64, u64) {
+        self.blocks.iter().fold((0, 0), |(b, r), o| (b + o.block.bytes, r + o.block.rollups_bytes()))
     }
 
     /// The blocks' places (their sequence numbers), files and bytes, oldest first.
@@ -1343,6 +1474,21 @@ pub fn snapshot_name(at: Point) -> String {
 pub struct Scratch {
     buf: Vec<u8>,
     sources: Vec<(Option<usize>, i64, i64)>,
+    rollups: Vec<u8>,
+    /// What [`Store::read_rolled`] reads of a block as samples.
+    ranges: Vec<(i64, i64)>,
+}
+
+/// What [`Store::read_rolled`] may read from rollups: windows of a tier's `width` (one of
+/// `crate::rollup::TIERS`) wholly in `[from, to)`, of a series of `kind` (a block that held it as
+/// another kind is read as samples), the columns `cols`.
+#[derive(Debug, Clone, Copy)]
+pub struct Roll<'c> {
+    pub width: i64,
+    pub from: i64,
+    pub to: i64,
+    pub kind: Kind,
+    pub cols: &'c [Col],
 }
 
 fn restore(head: &mut [HeadSeries], taken: Vec<(u32, Vec<Chunk>)>) {

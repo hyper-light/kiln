@@ -42,6 +42,10 @@ fn main() {
             return;
         }
     };
+    if std::env::args().any(|a| a == "long") {
+        long_ranges(&series);
+        return;
+    }
     let t_min = series.iter().filter_map(|s| s.ts.first()).min().copied().unwrap_or(0);
     let t_max = series.iter().filter_map(|s| s.ts.last()).max().copied().unwrap_or(0);
     let store = load::store_of(&series);
@@ -93,6 +97,113 @@ fn main() {
             allocs
         );
     }
+}
+
+/// Long ranges (`docs/observe.md` §4.7, §12.16): the corpus's node and apiserver series replayed for
+/// 30 days into a store on disk (`KOBS_DIR`, else the system's temporary folder), cut every six
+/// hours of data and merged as a replica's maintenance merges; queries over the last day, week and
+/// month at 240 points, rollups read and not.
+fn long_ranges(series: &[corpus::Series]) {
+    use kiln_obs::batch::{Builder, Kind, SeriesKey};
+    use kiln_obs::manifest::Point;
+    let keep: Vec<&corpus::Series> = series.iter().filter(|s| s.name.starts_with("node_") || s.name.starts_with("apiserver_request_total")).collect();
+    let keys: Vec<SeriesKey> = keep
+        .iter()
+        .map(|s| {
+            let (m, tags) = load::parse_series(&s.name);
+            SeriesKey::new(&m, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), if s.kind == 1 { Kind::Counter } else { Kind::Gauge }).unwrap()
+        })
+        .collect();
+    let t0 = keep.iter().filter_map(|s| s.ts.first()).min().copied().unwrap_or(0);
+    let day: i64 = 86_400_000;
+    let days = 30i64;
+    let base = std::env::var_os("KOBS_DIR").map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let mut store = kiln_obs::store::Store::open(dir.path(), kiln_obs::hash::Keyed::with_keys(1, 2)).unwrap();
+    let (mut samples, mut cuts) = (0u64, 0u64);
+    let six = 6 * 3_600_000;
+    let mut cursors = vec![0usize; keep.len()];
+    let started = Instant::now();
+    let mut merging = std::time::Duration::ZERO;
+    for d in 0..days {
+        cursors.iter_mut().for_each(|c| *c = 0);
+        for part in 0..4 {
+            let (lo, hi) = (t0 + part * six, t0 + (part + 1) * six);
+            let mut b = Builder::new();
+            for ((s, k), c) in keep.iter().zip(&keys).zip(cursors.iter_mut()) {
+                b.define(k);
+                let start = *c;
+                while s.ts.get(*c).is_some_and(|&t| t < hi) {
+                    *c += 1;
+                }
+                let run: Vec<(i64, f64)> = s.ts[start..*c].iter().zip(&s.values[start..*c]).filter(|(t, _)| **t >= lo).map(|(&t, &v)| (t + d * day, v)).collect();
+                samples += run.len() as u64;
+                b.run(k.fp, run);
+            }
+            store.apply(&b.finish()).unwrap();
+            cuts += 1;
+            store.cut(Point { index: cuts, term: 1 }).unwrap();
+            let m = Instant::now();
+            store.compact().unwrap();
+            merging += m.elapsed();
+        }
+    }
+    let (bytes, rolled) = store.block_bytes();
+    println!(
+        "long ranges: {} series, {samples} samples over {days} days, {cuts} cuts; {} blocks, {:.1} MB ({:.2} bytes a sample), rollups {:.1}% of them; written in {:.1} s, merges {:.1} s",
+        keep.len(),
+        store.block_count(),
+        bytes as f64 / 1e6,
+        bytes as f64 / samples as f64,
+        100.0 * rolled as f64 / bytes as f64,
+        started.elapsed().as_secs_f64(),
+        merging.as_secs_f64()
+    );
+    let end = t0 + days * day;
+    // `KOBS_PROFILE=<query>`: that query alone, over the month at 240 points, rollups read, again
+    // and again (what a sampling profile is taken of).
+    if let Ok(q) = std::env::var("KOBS_PROFILE") {
+        let mut req = Request::new(&q, end - 30 * day, end);
+        req.points = 240;
+        let n: u32 = std::env::var("KOBS_PROFILE_N").ok().and_then(|n| n.parse().ok()).unwrap_or(40);
+        let t = Instant::now();
+        for _ in 0..n {
+            eval(&store, &req).unwrap();
+        }
+        println!("{q}: {:.2} ms a query", t.elapsed().as_secs_f64() * 1e3 / f64::from(n));
+        return;
+    }
+    println!("{:<54} {:>5} {:>6} {:>7} {:>11} {:>10} {:>10} {:>8} {:>8}", "query", "range", "points", "series", "samples", "raw p50", "rolled p50", "allocs", "(rolled)");
+    for q in ["avg:node_load1{*} by {instance}", "max:node_memory_MemAvailable_bytes{*}", "avg:node_*{*} by {instance}", "sum:node_cpu_seconds_total{mode:idle} by {instance}", "sum:apiserver_request_total{*} by {verb}"] {
+        for ((label, range), points) in [("1 d", day), ("7 d", 7 * day), ("30 d", 30 * day)].into_iter().flat_map(|r| [(r, 240usize), (r, 1_200)]) {
+            let mut req = Request::new(q, end - range, end);
+            req.points = points;
+            let mut p50 = [0.0f64; 2];
+            let mut allocs = [0u64; 2];
+            let mut answers = Vec::new();
+            for (k, on) in [false, true].into_iter().enumerate() {
+                store.set_read_rollups(on);
+                let mut ns = Vec::new();
+                for i in 0..5 {
+                    let t = Instant::now();
+                    alloc::begin();
+                    let a = eval(&store, &req).unwrap();
+                    let c = alloc::end();
+                    ns.push(t.elapsed().as_nanos() as u64);
+                    if i == 1 {
+                        allocs[k] = c.calls();
+                        answers.push(a);
+                    }
+                }
+                ns.sort_unstable();
+                p50[k] = ns[ns.len() / 2] as f64 / 1e6;
+            }
+            let same = answers[0].series.len() == answers[1].series.len() && answers[0].series.iter().zip(&answers[1].series).all(|(a, b)| a.values.iter().zip(&b.values).all(|(x, y)| x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan())));
+            assert!(same, "{q} over {label}: the answers differ");
+            println!("{q:<54} {label:>5} {points:>6} {:>7} {:>11} {:>8.2}ms {:>8.2}ms {:>8} {:>8}", answers[1].series.len(), answers[1].scanned_samples, p50[0], p50[1], allocs[0], allocs[1]);
+        }
+    }
+    store.set_read_rollups(true);
 }
 
 /// Distributions (`docs/observe.md` §4.4): 50 hosts' latencies, 100 values every 10 s for an hour
