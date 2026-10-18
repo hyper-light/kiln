@@ -11,6 +11,13 @@
 #
 #   irm @@KILN_SERVER@@/install.ps1 | iex
 #   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Join [-Labels windows] [-Name box1]
+#
+# With -Outpost and a one-time invite (Machines -> Add an outpost), nothing is installed: kiln, its
+# certificate and its files go in %LOCALAPPDATA%\kiln-outpost, nothing starts at logon, and it runs
+# in this window as an outpost until you stop it (Ctrl-C). Its terminals, AI sessions and agents
+# show up in kiln; it takes no jobs.
+#
+#   & ([scriptblock]::Create((irm @@KILN_SERVER@@/install.ps1))) -Outpost -Token <invite> [-Name box1]
 param(
   [string]$Token = $env:KILN_JOIN_TOKEN,
   [string]$Server = $(if ($env:KILN_SERVER) { $env:KILN_SERVER } else { '@@KILN_SERVER@@' }),
@@ -18,7 +25,8 @@ param(
   [string]$Name = $env:KILN_AGENT_NAME,
   [string]$Slots = $env:KILN_SLOTS,
   [string]$Quic = $env:KILN_QUIC,
-  [switch]$Join = ($env:KILN_JOIN -eq '1')
+  [switch]$Join = ($env:KILN_JOIN -eq '1'),
+  [switch]$Outpost = ($env:KILN_OUTPOST -eq '1')
 )
 $ErrorActionPreference = 'Stop'
 # Invoke-WebRequest's progress bar makes downloads very slow in Windows PowerShell 5.1.
@@ -36,7 +44,8 @@ switch -Regex ($arch) {
 }
 $target = "$cpu-pc-windows-msvc"
 
-$dir = Join-Path $env:LOCALAPPDATA 'Programs\kiln'
+# An outpost keeps kiln, its certificate and its files in a folder of its own.
+$dir = if ($Outpost) { Join-Path $env:LOCALAPPDATA 'kiln-outpost' } else { Join-Path $env:LOCALAPPDATA 'Programs\kiln' }
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $exe = Join-Path $dir 'kiln.exe'
 $tmp = Join-Path $dir (".kiln.{0}.exe" -f $PID)
@@ -52,6 +61,14 @@ try {
   Move-Item -Force -Path $tmp -Destination $exe
 } finally {
   if (Test-Path $tmp) { Remove-Item -Force $tmp }
+}
+if ($Outpost) {
+  Write-Host "kiln ($target) is in $dir, not installed: it runs here as an outpost until you stop it (Ctrl-C)"
+  $outpostArgs = @('outpost', '--server', $Server, '--state-dir', $dir)
+  if ($Token) { $outpostArgs += @('--token', $Token) }
+  if ($Name) { $outpostArgs += @('--name', $Name) }
+  & $exe @outpostArgs
+  return
 }
 Write-Host "kiln ($target) installed to $exe"
 

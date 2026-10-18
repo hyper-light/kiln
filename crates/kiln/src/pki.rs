@@ -24,6 +24,9 @@ const LEAF_DAYS: i64 = 365;
 pub const EPHEMERAL_DAYS: i64 = 2;
 /// Renew a leaf when it has less than this left.
 const RENEW_DAYS: i64 = 30;
+/// An outpost's certificate (`kiln outpost`). A new invite renews it, never the outpost itself,
+/// so it lasts well past [`RENEW_DAYS`].
+pub const OUTPOST_DAYS: i64 = 90;
 /// How long a front door's certificate (HTTPS on a runner) lasts: a year, renewed when it has
 /// less than [`RENEW_DAYS`] left.
 pub const FRONT_DOOR_DAYS: i64 = 365;
@@ -426,6 +429,11 @@ pub fn make_csr_with_key(name: &str, key_pem: &str) -> anyhow::Result<String> {
 }
 
 /// Does this leaf need renewing?
+/// The certificate hasn't expired yet.
+pub fn still_valid(cert_pem: &str) -> bool {
+    not_after_of(cert_pem).is_some_and(|na| na > OffsetDateTime::now_utc())
+}
+
 pub fn needs_renewal(cert_pem: &str) -> bool {
     not_after_of(cert_pem)
         .is_none_or(|na| na - OffsetDateTime::now_utc() < Duration::days(RENEW_DAYS))
