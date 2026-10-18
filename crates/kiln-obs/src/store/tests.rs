@@ -95,7 +95,7 @@ fn a_definition_takes_effect_with_its_first_sample_kept() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
     let (alone, expired, kept) = (gauge("m", "alone"), gauge("m", "expired"), gauge("m", "kept"));
-    s.retain_logical(1_000);
+    s.retain_logical(1_000, 1_000);
     let mut b = Builder::new();
     b.define(&alone);
     b.define(&expired);
@@ -138,7 +138,7 @@ fn a_write_sent_twice_is_applied_once() {
     assert!(applied(s.apply_entry(4, &b.finish_write(78, 1, 1_002)).unwrap()));
     assert_eq!(s.sessions().get(&77), Some(&Session { seq: 2, at: 1_001, index: 3 }));
     // A session goes once its last write is older than the cutoff.
-    s.retain_logical(1_002);
+    s.retain_logical(1_002, 1_002);
     assert_eq!(s.sessions().keys().copied().collect::<Vec<_>>(), vec![78]);
     // An entry of a command this build does not know is never skipped.
     assert_eq!(s.apply_entry(5, &[200, 1, 2, 3]), Err(Newer::Command(200)));
@@ -311,7 +311,7 @@ fn retention_drops_series_at_its_entry_and_files_once_it_is_durable() {
     s.apply(&b.finish()).unwrap();
     s.cut(Point { index: 2, term: 1 }).unwrap();
     // The entry: the series goes at once, and nothing older is read; the files stay.
-    assert_eq!(s.retain_logical(1000), 1);
+    assert_eq!(s.retain_logical(1000, 1000), 1);
     assert_eq!(s.tag_values("host"), vec!["live"]);
     let mut ids = Vec::new();
     s.select(&Selector::metric("m"), &mut ids);
@@ -359,7 +359,7 @@ fn logs_ride_batches_through_cuts_a_reopen_and_retention() {
     assert!(s.log_bytes() > 0);
     // Retention: nothing before the cutoff is found at once; files wholly before it (0–5,999 and
     // 6,000–11,999 s) go once it is durable, and the one holding 12,000–17,999 stays whole.
-    s.retain_logical(13_000_000);
+    s.retain_logical(13_000_000, 13_000_000);
     let all = crate::logs::search::parse("*").unwrap();
     assert!(s.search_logs(&all, 0, 12_999_999_999_999, 1).unwrap().records.is_empty());
     assert_eq!(s.search_logs(&all, 0, 13_000_000_000_000, 1).unwrap().records.len(), 1);
@@ -379,6 +379,7 @@ struct View {
     names: Vec<String>,
     hosts: Vec<String>,
     cutoff: i64,
+    logs_cutoff: i64,
     max_series: u64,
     sessions: BTreeMap<u64, Session>,
     logs: Vec<Record>,
@@ -406,6 +407,7 @@ fn view(s: &Store) -> View {
         names: s.metric_names().into_iter().map(str::to_owned).collect(),
         hosts: s.tag_values("host").into_iter().map(str::to_owned).collect(),
         cutoff: s.cutoff(),
+        logs_cutoff: s.logs_cutoff(),
         max_series: s.max_series(),
         sessions: s.sessions().clone(),
         logs: s.search_logs(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
@@ -433,7 +435,7 @@ fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
             out.push(crate::command::limits(0));
         }
         match rng.below(25) {
-            0 => out.push(crate::command::retain(now - 60_000 + rng.below(10_000) as i64, now)),
+            0 => out.push(crate::command::retain(now - 60_000 + rng.below(10_000) as i64, now - 40_000 + rng.below(10_000) as i64, now)),
             1 => {
                 let i = rng.below(3) as usize;
                 if let Some(e) = &sent[i] {
@@ -553,6 +555,11 @@ fn replicas_that_cut_compact_retain_and_restart_differently_answer_alike() {
                 assert_eq!(view(&a), want, "seed {seed}: A after entry {}", i + 1);
                 assert_eq!(view(&b), want, "seed {seed}: B after entry {}", i + 1);
             }
+        }
+        for full in [false, true] {
+            let want = c.digest(full).unwrap();
+            assert_eq!(a.digest(full).unwrap(), want, "seed {seed}: A's digest, full {full}");
+            assert_eq!(b.digest(full).unwrap(), want, "seed {seed}: B's digest, full {full}");
         }
         let v = view(&c);
         assert!(restarts > 5 && v.cutoff > 0 && !v.logs.is_empty(), "seed {seed}: the stream exercised too little ({restarts} restarts)");
@@ -681,6 +688,38 @@ fn rewrites_built_apart_while_the_store_goes_on_answer_alike() {
         apply_at(&mut r, &entries, 0, s.durable().index as usize);
         assert_eq!(view(&s), view(&r), "seed {seed} reopened");
     }
+}
+
+#[test]
+fn a_digest_tells_apart_stores_that_differ_in_any_sample_or_record() {
+    let entries = stream(5, 200);
+    let mut a = Store::new(Keyed::with_keys(1, 1));
+    let mut b = Store::new(Keyed::with_keys(2, 2));
+    apply_at(&mut a, &entries, 0, entries.len());
+    apply_at(&mut b, &entries, 0, entries.len());
+    assert_eq!(a.digest(true).unwrap(), b.digest(true).unwrap());
+    // One sample's value corrected on one of them: the full digest differs, the index's does not.
+    let mut bld = Builder::new();
+    let mut ids = Vec::new();
+    b.select(&Selector::metric("m0"), &mut ids);
+    let r = b.series(ids[0]).unwrap();
+    let k = SeriesKey::new(r.metric(), r.tags().collect::<Vec<_>>(), r.kind()).unwrap();
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    b.read(ids[0], i64::MIN, i64::MAX, &mut ts, &mut vs).unwrap();
+    bld.run(k.fp, [(ts[0], vs[0] + 1.0)]);
+    assert_eq!(b.apply(&bld.finish()).unwrap().counts.late, 1);
+    assert_eq!(a.digest(false).unwrap(), b.digest(false).unwrap());
+    assert_ne!(a.digest(true).unwrap(), b.digest(true).unwrap());
+    // One log record more, past the logs' cutoff: the full digest differs. One older than the
+    // cutoff is never seen, and counts for nothing.
+    let mut c = Store::new(Keyed::with_keys(3, 3));
+    apply_at(&mut c, &entries, 0, entries.len());
+    bld.logs(&[Record { ts: 1, message: "too old".into(), ..Record::default() }]);
+    c.apply(&bld.finish()).unwrap();
+    assert_eq!(a.digest(true).unwrap(), c.digest(true).unwrap());
+    bld.logs(&[Record { ts: (c.logs_cutoff() + 1) * 1_000_000, message: "one more".into(), ..Record::default() }]);
+    c.apply(&bld.finish()).unwrap();
+    assert_ne!(a.digest(true).unwrap(), c.digest(true).unwrap());
 }
 
 #[test]

@@ -136,6 +136,17 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("cd", h => crate::cd::run(h));
     }
     child!("sync", h => h.sync_loop());
+    if cfg.observe.enabled {
+        let days = |d: u32| std::time::Duration::from_secs(u64::from(d.max(1)) * 86_400);
+        crate::observe::api::set_global(crate::observe::Observe::start(crate::observe::Settings {
+            dir: cfg.data("observe"),
+            role: crate::observe::Role::Server { key: hub.admin_token.clone() },
+            metrics_retention: days(cfg.observe.metrics_retention_days),
+            logs_retention: days(cfg.observe.logs_retention_days),
+            max_series: cfg.observe.max_series,
+        }));
+        child!("observe", h => crate::observe::hub::send_loop(h));
+    }
     child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
     child!("in-step", h => crate::updates::in_step_loop(h));
     child!("ui-server", h => crate::uiserver::run(h));
@@ -232,6 +243,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             credentials: Some(creds),
             instance: None,
             reach: None,
+            // The server holds the group's store itself.
+            observe: false,
         };
         sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), shutdown_child()));
     }

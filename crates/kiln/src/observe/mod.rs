@@ -3,6 +3,7 @@
 //! observe lane ([`wire`]), the writes a node gathers ([`ingest`]), and the API ([`api`]).
 
 pub mod api;
+pub mod hub;
 pub mod ingest;
 pub mod owner;
 pub mod wire;

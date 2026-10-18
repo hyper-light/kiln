@@ -203,6 +203,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let batch = (*batch).to_owned();
             return sync_bundle_put(&hub, &batch, req).await;
         }
+        // A snapshot's file for a runner's replica, with that machine's token (`crate::observe`).
+        (&Method::GET, ["api", "observe", "v1", "snapshot", snap, file]) => return crate::observe::api::snapshot(snap, file, &req).map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
@@ -243,6 +245,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     match (&method, s.as_slice()) {
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        (_, ["api", "observe", "v1", rest @ ..]) => crate::observe::api::route(rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,

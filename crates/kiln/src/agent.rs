@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_OBSERVE, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -51,6 +51,9 @@ pub struct Opts {
     /// Reach (`crate::reach`): None leaves it off (the server's own in-process agent); otherwise
     /// whether this runner takes commands from other runners (it can always send them).
     pub reach: Option<bool>,
+    /// Observe (`crate::observe`): whether this runner keeps a replica of the observe group and
+    /// writes into it (off in a job pod and in the server's own in-process agent).
+    pub observe: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -276,6 +279,28 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         });
         sync
     });
+    // Observe: this machine's replica of the observe group and its writes (none in a job pod).
+    let observe = (o.observe && !o.ephemeral).then(|| {
+        let obs = crate::observe::Observe::start(crate::observe::Settings {
+            dir: o.state_dir.join("observe"),
+            role: crate::observe::Role::Runner { me: name.clone(), http: http.clone(), server: o.server_url.clone() },
+            // The server moves the cutoffs and states the bound.
+            metrics_retention: Duration::ZERO,
+            logs_retention: Duration::ZERO,
+            max_series: 0,
+        });
+        crate::observe::api::set_global(obs.clone());
+        let (up, out) = (up_tx.clone(), obs.outgoing());
+        crate::rt::spawn(async move {
+            while let Ok(m) = out.recv().await {
+                let msg = AgentMsg::Observe { json: crate::observe::wire::encode(&m.msg), bytes: m.bytes };
+                if up.send(Up::Observe(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        obs
+    });
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
@@ -483,6 +508,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     if let Some(s) = &sync {
                         s.connected(false);
                     }
+                    if let Some(ob) = &observe {
+                        ob.up("", false);
+                    }
                     if let Some(r) = &reach {
                         r.feed(crate::reach::node::In::Server(false)).await;
                     }
@@ -508,7 +536,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it).
                 if !o.ephemeral
-                    && let Ok(b) = proto::encode(&crate::updates::runner_build())
+                    && let Ok(b) = proto::encode(&match crate::updates::runner_build() {
+                        // A runner that keeps no replica does not say it replicates.
+                        AgentMsg::Build { build, caps } if observe.is_none() => AgentMsg::Build { build, caps: caps & !proto::CAP_OBSERVE },
+                        m => m,
+                    })
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
@@ -527,6 +559,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 connected = true;
                 if let Some(s) = &sync {
                     s.connected(true);
+                }
+                if let Some(ob) = &observe {
+                    ob.up("", true);
                 }
                 while let Some((lane, kind, data)) = buffer.pop_front() {
                     buffered = buffered.saturating_sub(data.len());
@@ -555,6 +590,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 connected = false;
                 if let Some(s) = &sync {
                     s.connected(false);
+                }
+                if let Some(ob) = &observe {
+                    ob.up("", false);
                 }
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
@@ -619,6 +657,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         connected = false;
                         if let Some(s) = &sync {
                             s.connected(false);
+                        }
+                        if let Some(ob) = &observe {
+                            ob.up("", false);
                         }
                         if let Some(r) = &reach {
                             r.feed(crate::reach::node::In::Server(false)).await;
@@ -888,6 +929,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             s.heard(&json, raft);
                         }
                     }
+                    ServerMsg::Observe { json, bytes } => {
+                        if let Some(ob) = &observe {
+                            ob.heard("", json, bytes);
+                        }
+                    }
                     ServerMsg::DirList { req, path } => {
                         // The console's folder picker: this machine's folders, read off this loop.
                         let up = uplink.0.clone();
@@ -993,11 +1039,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
+                    Up::Observe(m) => (LANE_OBSERVE, Kind::Control, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH {
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_OBSERVE {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.
@@ -1040,6 +1087,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
+                    if let Some(ob) = &observe {
+                        crate::observe::hub::process_figures(ob, &name, "runner");
+                    }
                     if let Some(ai) = &ai {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());

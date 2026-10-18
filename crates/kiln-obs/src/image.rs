@@ -10,7 +10,7 @@
 //! never are.
 //!
 //! ```text
-//! image := MAGIC 8 | cutoff i64-le | max series varint
+//! image := MAGIC 8 | metrics' cutoff i64-le | logs' cutoff i64-le | max series varint
 //!        | sessions varint | (sender u64-le | seq varint | at zigzag | index varint)*
 //!        | files varint | (kind u8 | seq varint | bytes varint | crc u32-le | name varint-length)*
 //!        | crc32c of everything before u32-le
@@ -50,6 +50,7 @@ pub struct ImageFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Image {
     pub cutoff: i64,
+    pub logs_cutoff: i64,
     pub max_series: u64,
     pub sessions: BTreeMap<u64, Session>,
     /// In write order.
@@ -71,6 +72,7 @@ impl Image {
         let start = out.len();
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&self.cutoff.to_le_bytes());
+        out.extend_from_slice(&self.logs_cutoff.to_le_bytes());
         varint::put(out, self.max_series);
         varint::put(out, self.sessions.len() as u64);
         for (sender, s) in &self.sessions {
@@ -103,8 +105,9 @@ impl Image {
         }
         let d = ImageError::Damaged;
         let (cutoff, rest) = at.split_first_chunk::<8>().ok_or(d("cutoff"))?;
+        let (logs_cutoff, rest) = rest.split_first_chunk::<8>().ok_or(d("cutoff"))?;
         at = rest;
-        let mut image = Self { cutoff: i64::from_le_bytes(*cutoff), max_series: varint::get(&mut at).ok_or(d("max series"))?, ..Self::default() };
+        let mut image = Self { cutoff: i64::from_le_bytes(*cutoff), logs_cutoff: i64::from_le_bytes(*logs_cutoff), max_series: varint::get(&mut at).ok_or(d("max series"))?, ..Self::default() };
         let sessions = varint::get(&mut at).ok_or(d("sessions"))?;
         // Each session takes 11 bytes at least: a count past that is damage.
         if sessions > (at.len() / 11) as u64 {
@@ -164,6 +167,7 @@ mod tests {
     fn an_image_round_trips_and_damage_is_refused() {
         let image = Image {
             cutoff: 1_700_000_000_000,
+            logs_cutoff: 1_700_000_000_007,
             max_series: 100_000,
             sessions: [(u64::MAX, Session { seq: 9, at: -4, index: 77 }), (3, Session { seq: 1, at: 1_700_000_000_001, index: 5 })].into(),
             files: vec![

@@ -95,6 +95,14 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         }
         (&Method::POST, ["logs", "search"]) => search(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::GET, ["status"]) => Ok(srv::json(StatusCode::OK, &observe()?.view())),
+        (&Method::POST, ["compact"]) => {
+            observe()?.compact();
+            Ok(srv::json(StatusCode::ACCEPTED, &json!({ "compacting": true })))
+        }
+        (&Method::POST, ["verify"]) => {
+            observe()?.verify();
+            Ok(srv::json(StatusCode::ACCEPTED, &json!({ "verifying": true })))
+        }
         (&Method::POST, ["series"]) => ingest_series(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::POST, ["logs"]) => ingest_logs(read_json(req.into_body(), INGEST_BODY).await?),
         _ => Err(fail(StatusCode::NOT_FOUND, "no such observe route")),

@@ -399,6 +399,11 @@ pub struct RowScratch {
 }
 
 impl Search {
+    /// The search that matches every record.
+    pub fn all() -> Self {
+        Self { nodes: vec![Node::Leaf(Leaf::All)], root: 0 }
+    }
+
     /// Whether a block may hold a match, from its summary alone.
     pub fn block(&self, b: &LogBlock) -> Maybe {
         let mut v: Vec<Maybe> = Vec::with_capacity(self.nodes.len());

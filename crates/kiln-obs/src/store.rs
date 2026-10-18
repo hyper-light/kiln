@@ -8,9 +8,9 @@
 //! - a series is defined with the first of its samples kept, never alone, so every series a
 //!   replica holds is in its head or its blocks, and a replica that opens from its blocks holds
 //!   the series the others hold;
-//! - retention is an entry ([`crate::command`]): the cutoff moves at one point of the log on every
-//!   replica, and a series goes once its newest sample is older; files are deleted only behind the
-//!   cutoff that is durable;
+//! - retention is an entry ([`crate::command`]): the cutoffs (one for samples, one for log records)
+//!   move at one point of the log on every replica, and a series goes once its newest sample is
+//!   older; files are deleted only behind the cutoffs that are durable;
 //! - nothing older than the cutoff is kept by an entry or read by a query, so what a replica's files
 //!   still hold past it is never seen;
 //! - each sender's last write is kept with the rest ([`Session`]), so a write sent twice is applied
@@ -158,7 +158,7 @@ pub enum Answer {
     /// A leader's empty entry.
     Empty,
     Write { sender: u64, seq: u64, outcome: Written },
-    Retain { cutoff: i64, series_dropped: u64 },
+    Retain { cutoff: i64, logs_cutoff: i64, series_dropped: u64 },
     Limits { max_series: u64 },
     /// An entry that holds no command whole: applied as nothing, alike on every replica.
     Malformed(CommandError),
@@ -196,12 +196,15 @@ pub struct Store {
     manifest: Manifest,
     /// The replicated state as of the last entry applied.
     cutoff: i64,
+    logs_cutoff: i64,
     max_series: u64,
     sessions: BTreeMap<u64, Session>,
     conf: Membership,
     totals: Counts,
     /// Installs this store took: a rewrite planned before one is not taken in after.
     epoch: u64,
+    /// The last entry of the group's log applied (its index), as the machine says.
+    applied: u64,
     pending: Vec<Pending>,
     /// `pending` by fingerprint (a fingerprint is a hash already: it is its own).
     pending_at: HashTable<u32>,
@@ -379,11 +382,13 @@ impl Store {
             dir: None,
             manifest: Manifest::default(),
             cutoff: i64::MIN,
+            logs_cutoff: i64::MIN,
             max_series: 0,
             sessions: BTreeMap::new(),
             conf: Membership::default(),
             totals: Counts::default(),
             epoch: 0,
+            applied: 0,
             pending: Vec::new(),
             pending_at: HashTable::new(),
         }
@@ -406,9 +411,11 @@ impl Store {
             store.logs.files.push(HeldFile { seq: e.seq, file: e.file.clone(), log });
         }
         store.cutoff = manifest.cutoff;
+        store.logs_cutoff = manifest.logs_cutoff;
         store.max_series = manifest.max_series;
         store.sessions = manifest.sessions.clone();
         store.conf = manifest.conf.clone();
+        store.applied = manifest.durable.index;
         store.manifest = manifest;
         store.remove_orphans()?;
         store.rebuild_from_blocks()?;
@@ -491,9 +498,14 @@ impl Store {
         self.manifest.durable
     }
 
-    /// Nothing older is kept or read (ms), as of the last entry applied.
+    /// No sample older is kept or read (ms), as of the last entry applied.
     pub fn cutoff(&self) -> i64 {
         self.cutoff
+    }
+
+    /// No log record older is kept or read (ms), as of the last entry applied.
+    pub fn logs_cutoff(&self) -> i64 {
+        self.logs_cutoff
     }
 
     pub fn max_series(&self) -> u64 {
@@ -519,8 +531,20 @@ impl Store {
         self.conf = conf;
     }
 
+    /// The last entry applied was `index` (the machine says so of every entry, a change of
+    /// configuration's and a leader's empty one's too).
+    pub fn note_applied(&mut self, index: u64) {
+        self.applied = index;
+    }
+
+    /// The last entry applied, as the machine said: what a digest is of.
+    pub fn applied(&self) -> u64 {
+        self.applied
+    }
+
     /// Applies the command an entry at `index` holds.
     pub fn apply_entry(&mut self, index: u64, data: &[u8]) -> Result<Answer, Newer> {
+        self.applied = index;
         let c = match command::decode(data) {
             Ok(c) => c,
             Err(CommandError::Unknown(tag)) => return Err(Newer::Command(tag)),
@@ -534,7 +558,10 @@ impl Store {
                 }
                 Answer::Write { sender, seq, outcome: self.write(index, sender, seq, at, batch) }
             }
-            Command::Retain { cutoff, .. } => Answer::Retain { cutoff, series_dropped: self.retain_logical(cutoff) },
+            Command::Retain { metrics, logs, .. } => {
+                let series_dropped = self.retain_logical(metrics, logs);
+                Answer::Retain { cutoff: self.cutoff, logs_cutoff: self.logs_cutoff, series_dropped }
+            }
             Command::Limits { max_series } => {
                 self.max_series = max_series;
                 Answer::Limits { max_series }
@@ -560,15 +587,19 @@ impl Store {
         }
     }
 
-    /// Moves the cutoff to `cutoff` (never back): series whose newest sample is older leave the
-    /// index, and sessions whose last write is older go. The files are left to
-    /// [`Store::retain_files`], once a cut has made this cutoff durable.
-    pub fn retain_logical(&mut self, cutoff: i64) -> u64 {
-        if cutoff <= self.cutoff {
+    /// Moves the cutoffs on to `metrics` and `logs` (never back): series whose newest sample is
+    /// older than `metrics` leave the index, and sessions whose last write is older than the later
+    /// of the two go. The files are left to [`Store::retain_files`], once a cut has made these
+    /// cutoffs durable.
+    pub fn retain_logical(&mut self, metrics: i64, logs: i64) -> u64 {
+        self.logs_cutoff = self.logs_cutoff.max(logs);
+        let sessions = self.cutoff.max(metrics).max(self.logs_cutoff);
+        self.sessions.retain(|_, s| s.at >= sessions);
+        if metrics <= self.cutoff {
             return 0;
         }
+        let cutoff = metrics;
         self.cutoff = cutoff;
-        self.sessions.retain(|_, s| s.at >= cutoff);
         let keep: Vec<bool> = self.last.iter().map(|&l| l >= cutoff).collect();
         if keep.iter().all(|&k| k) {
             return 0;
@@ -718,6 +749,7 @@ impl Store {
         let mut manifest = self.manifest.clone();
         manifest.durable = at;
         manifest.cutoff = self.cutoff;
+        manifest.logs_cutoff = self.logs_cutoff;
         manifest.max_series = self.max_series;
         manifest.sessions.clone_from(&self.sessions);
         manifest.conf.clone_from(&self.conf);
@@ -874,7 +906,7 @@ impl Store {
         let dir = self.dir.clone().ok_or(StoreError::NoDir)?;
         let cutoff = self.manifest.cutoff;
         let mut done = Maintained::default();
-        let logs_gone = self.logs.retain(cutoff.saturating_mul(1_000_000));
+        let logs_gone = self.logs.retain(self.manifest.logs_cutoff.saturating_mul(1_000_000));
         let gone: Vec<String> = self.blocks.iter().filter(|b| b.block.max_ts < cutoff).map(|b| b.file.clone()).collect();
         if logs_gone.is_empty() && gone.is_empty() {
             return Ok(done);
@@ -911,7 +943,7 @@ impl Store {
             files.push(ImageFile { kind: FileKind::Logs, seq: l.seq, name: l.file.clone(), bytes: l.log.bytes, crc: l.log.crc });
         }
         files.sort_by_key(|f| f.seq);
-        Image { cutoff: self.manifest.cutoff, max_series: self.manifest.max_series, sessions: self.manifest.sessions.clone(), files }
+        Image { cutoff: self.manifest.cutoff, logs_cutoff: self.manifest.logs_cutoff, max_series: self.manifest.max_series, sessions: self.manifest.sessions.clone(), files }
     }
 
     /// Bytes of the files the durable state is in.
@@ -968,7 +1000,7 @@ impl Store {
                 return Err(StoreError::Staged(f.name.clone()));
             }
         }
-        let mut manifest = Manifest { durable: at, next_seq: self.manifest.next_seq, cutoff: image.cutoff, max_series: image.max_series, conf, sessions: image.sessions.clone(), blocks: Vec::new(), logs: Vec::new() };
+        let mut manifest = Manifest { durable: at, next_seq: self.manifest.next_seq, cutoff: image.cutoff, logs_cutoff: image.logs_cutoff, max_series: image.max_series, conf, sessions: image.sessions.clone(), blocks: Vec::new(), logs: Vec::new() };
         let mut files: Vec<&ImageFile> = image.files.iter().collect();
         files.sort_by_key(|f| f.seq);
         for f in files {
@@ -1079,10 +1111,10 @@ impl Store {
         Ok(())
     }
 
-    /// The newest `limit` log records in `[from, to]` (ns, none older than the cutoff) that
+    /// The newest `limit` log records in `[from, to]` (ns, none older than the logs' cutoff) that
     /// `search` matches.
     pub fn search_logs(&self, search: &Search, from: i64, to: i64, limit: usize) -> Result<Found, StoreError> {
-        Ok(self.logs.search(search, from.max(self.cutoff.saturating_mul(1_000_000)), to, limit)?)
+        Ok(self.logs.search(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, limit)?)
     }
 
     /// Bytes of logs on disk.
@@ -1132,6 +1164,51 @@ impl Store {
 
     pub fn kind_conflicts(&self) -> u64 {
         self.index.kind_conflicts
+    }
+
+    /// A digest of what this replica holds, the same on every replica that applied the same
+    /// entries however its files fell: of every series (its fingerprint and newest sample's
+    /// time), the cutoffs, the bound and the sessions, and with `full` of every sample and every
+    /// log record too (a read of everything: asked for, not kept). A sum of mixed terms, so the
+    /// order series are visited in, each replica's own, does not count.
+    pub fn digest(&self, full: bool) -> Result<u64, StoreError> {
+        let mix = |x: u64| {
+            // SplitMix64's finaliser (Steele, Lea and Flood 2014): every input bit moves every
+            // output bit, so terms that differ anywhere sum apart.
+            let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut d = mix(self.cutoff as u64).wrapping_add(mix(self.logs_cutoff as u64 ^ 0x1)).wrapping_add(mix(self.max_series ^ 0x2));
+        for (sender, s) in &self.sessions {
+            d = d.wrapping_add(mix(mix(*sender) ^ s.seq));
+        }
+        let mut scratch = Scratch::default();
+        let (mut ts, mut vs) = (Vec::new(), Vec::new());
+        for id in 0..self.index.len() as u32 {
+            let Some(fp) = self.index.fp(id) else { continue };
+            let last = self.last.get(id as usize).copied().unwrap_or(i64::MIN);
+            let mut term = mix(fp ^ mix(last as u64));
+            if full {
+                ts.clear();
+                vs.clear();
+                self.read_with(id, i64::MIN, i64::MAX, &mut scratch, &mut ts, &mut vs)?;
+                for (&t, &v) in ts.iter().zip(&vs) {
+                    term = mix(term ^ mix(t as u64) ^ v.to_bits());
+                }
+            }
+            d = d.wrapping_add(term);
+        }
+        if full {
+            let all = crate::logs::search::Search::all();
+            for r in self.search_logs(&all, i64::MIN, i64::MAX, usize::MAX)?.records {
+                let mut row = Vec::new();
+                crate::logs::record::put_row(&mut row, &r, 0);
+                d = d.wrapping_add(mix(crate::crc32c::checksum(&row) as u64 ^ mix(r.ts as u64)));
+            }
+        }
+        Ok(d)
     }
 
     pub fn dir(&self) -> Option<&Path> {

@@ -23,6 +23,9 @@ pub const LANE_SYNC: u32 = 3;
 /// Reach's lane (`crate::reach`): links between runners, relayed by the server. Interactive class:
 /// a remote command's output must not queue behind job logs.
 pub const LANE_REACH: u32 = 4;
+/// Observe's lane (`crate::observe`): the observe group's messages and writes, a queue of their own
+/// so replication never sheds a job's, a terminal's or sync's frames, nor waits behind them.
+pub const LANE_OBSERVE: u32 = 5;
 
 /// Protocol version; bumped on incompatible changes. Agents with another version are refused.
 pub const VERSION: u32 = 1;
@@ -119,6 +122,10 @@ pub enum AgentMsg {
     /// Reach: a question for the server (JSON `{"op": "directory"}`), answered by
     /// [`ServerMsg::ReachAnswer`]. Appended last: postcard encodes variants by index.
     ReachAsk { req: u64, json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
+    /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
+    /// runners announcing [`CAP_OBSERVE`]. Appended last: postcard encodes variants by index.
+    Observe { json: String, bytes: Vec<u8> },
 }
 
 /// [`AgentMsg::Build`] capability: the runner takes [`ServerMsg::Upgrade`].
@@ -134,6 +141,9 @@ pub const CAP_DIRS: u32 = 4;
 pub const CAP_TAKEOVER_STOP: u32 = 8;
 /// [`AgentMsg::Build`] capability: the runner syncs repos ([`ServerMsg::Sync`], `crate::sync`).
 pub const CAP_SYNC: u32 = 64;
+/// [`AgentMsg::Build`] capability: the runner replicates the observe group and writes into it
+/// ([`ServerMsg::Observe`], `crate::observe`).
+pub const CAP_OBSERVE: u32 = 128;
 /// [`AgentMsg::Build`] capability: the runner runs a front door ([`ServerMsg::FrontDoor`]: DNS for
 /// a domain, HTTPS in front of the server, a `.local` name) and reports it with
 /// [`AgentMsg::FrontDoorStatus`].
@@ -293,6 +303,9 @@ pub enum ServerMsg {
     /// Reach: the answer to [`AgentMsg::ReachAsk`] (JSON). Appended last: postcard encodes
     /// variants by index.
     ReachAnswer { req: u64, json: String },
+    /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
+    /// announcing [`CAP_OBSERVE`]. Appended last: postcard encodes variants by index.
+    Observe { json: String, bytes: Vec<u8> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -451,6 +464,21 @@ mod tests {
             assert!(c.is_power_of_two() && c & others == 0 && c & seen == 0, "{c} is a bit of its own");
             seen |= c;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
+        let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
+        let b = encode(&s)?;
+        assert_eq!(b.first(), Some(&30), "ServerMsg::Observe is variant 30 on the wire, after ReachAnswer");
+        assert_eq!(decode::<ServerMsg>(&b)?, s);
+        let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
+        let b = encode(&a)?;
+        assert_eq!(b.first(), Some(&32), "AgentMsg::Observe is variant 32 on the wire, after ReachAsk");
+        assert_eq!(decode::<AgentMsg>(&b)?, a);
+        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_REPOS, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH];
+        assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
         Ok(())
     }
 }

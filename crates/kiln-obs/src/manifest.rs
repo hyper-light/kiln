@@ -10,7 +10,7 @@
 //! kiln-obs manifest 2
 //! durable <index> <term>
 //! next <seq>
-//! cutoff <ms>
+//! cutoff <metrics' ms> <logs' ms>
 //! max_series <n>
 //! conf <voters> <learners> <outgoing voters> <next learners> <auto leave 0|1>   (ids, commas; "-")
 //! session <sender, hex> <seq> <at ms> <index>
@@ -71,8 +71,9 @@ pub struct Session {
 pub struct Manifest {
     pub durable: Point,
     pub next_seq: u64,
-    /// Nothing older is kept (ms).
+    /// No sample older is kept (ms), and no log record older than `logs_cutoff`.
     pub cutoff: i64,
+    pub logs_cutoff: i64,
     /// 0: no bound.
     pub max_series: u64,
     pub conf: Membership,
@@ -84,7 +85,7 @@ pub struct Manifest {
 
 impl Default for Manifest {
     fn default() -> Self {
-        Self { durable: Point::default(), next_seq: 0, cutoff: i64::MIN, max_series: 0, conf: Membership::default(), sessions: BTreeMap::new(), blocks: Vec::new(), logs: Vec::new() }
+        Self { durable: Point::default(), next_seq: 0, cutoff: i64::MIN, logs_cutoff: i64::MIN, max_series: 0, conf: Membership::default(), sessions: BTreeMap::new(), blocks: Vec::new(), logs: Vec::new() }
     }
 }
 
@@ -134,7 +135,7 @@ impl Manifest {
         let _ = writeln!(body, "{FIRST_LINE}");
         let _ = writeln!(body, "durable {} {}", self.durable.index, self.durable.term);
         let _ = writeln!(body, "next {}", self.next_seq);
-        let _ = writeln!(body, "cutoff {}", self.cutoff);
+        let _ = writeln!(body, "cutoff {} {}", self.cutoff, self.logs_cutoff);
         let _ = writeln!(body, "max_series {}", self.max_series);
         let _ = writeln!(body, "conf {} {} {} {} {}", ids(&c.voters), ids(&c.learners), ids(&c.voters_outgoing), ids(&c.learners_next), u8::from(c.auto_leave));
         for (sender, s) in &self.sessions {
@@ -169,7 +170,10 @@ impl Manifest {
             match f.as_slice() {
                 ["durable", i, t] => m.durable = Point { index: i.parse().map_err(|_| damaged("durable"))?, term: t.parse().map_err(|_| damaged("durable"))? },
                 ["next", n] => m.next_seq = n.parse().map_err(|_| damaged("next"))?,
-                ["cutoff", c] => m.cutoff = c.parse().map_err(|_| damaged("cutoff"))?,
+                ["cutoff", c, l] => {
+                    m.cutoff = c.parse().map_err(|_| damaged("cutoff"))?;
+                    m.logs_cutoff = l.parse().map_err(|_| damaged("cutoff"))?;
+                }
                 ["max_series", n] => m.max_series = n.parse().map_err(|_| damaged("max_series"))?,
                 ["conf", v, l, vo, ln, al] => {
                     let p = |s: &str| parse_ids(s).ok_or_else(|| damaged("conf"));
@@ -250,6 +254,7 @@ mod tests {
             durable: Point { index: 42, term: 3 },
             next_seq: 7,
             cutoff: 1_700_000_000_000,
+            logs_cutoff: 1_700_000_500_000,
             max_series: 250_000,
             conf: Membership { voters: vec![1, 2, 3], learners: vec![9], voters_outgoing: Vec::new(), learners_next: vec![4], auto_leave: true },
             sessions: [(0xdead_beef, Session { seq: 5, at: 1_700_000_000_123, index: 40 }), (7, Session { seq: 1, at: -1, index: 2 })].into(),

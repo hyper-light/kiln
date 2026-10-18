@@ -26,6 +26,9 @@ pub enum Up {
     /// Reach links (`crate::reach`), on their own lane: never buffered across a disconnect (a link
     /// does not outlive the connection; its runs resume on the next one).
     Reach(AgentMsg),
+    /// The observe group (`crate::observe`), on its own lane: never buffered across a disconnect
+    /// (Raft sends again, and a write is sent again until answered).
+    Observe(AgentMsg),
 }
 
 #[derive(Clone)]

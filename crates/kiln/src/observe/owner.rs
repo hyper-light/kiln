@@ -65,8 +65,9 @@ pub struct Settings {
     /// The node's observe folder: the group's log and the store.
     pub dir: PathBuf,
     pub role: Role,
-    /// Nothing older is kept (the server moves the cutoff).
-    pub retention: Duration,
+    /// How long samples and log records are kept (the server moves the cutoffs).
+    pub metrics_retention: Duration,
+    pub logs_retention: Duration,
     /// The bound on series the server states (0: none).
     pub max_series: u64,
 }
@@ -102,6 +103,11 @@ pub struct View {
     pub learners: Vec<u64>,
     /// The server's view of each machine's replica.
     pub machines: Vec<MachineView>,
+    /// This replica's digest of its series as of `applied`, and the full digest last asked for
+    /// (`verify`) with the index it is of.
+    pub digest: u64,
+    pub digest_at: u64,
+    pub verified: Option<(u64, u64)>,
     pub error: Option<String>,
 }
 
@@ -121,6 +127,11 @@ enum Input {
     Logs(Vec<Record>),
     Staged { generation: u64, msg: Box<Message>, ok: bool },
     Fetched { generation: u64, done: u64, of: u64 },
+    /// Cut the store and compact the log now, keeping nothing (an operator's, or a test's).
+    Compact,
+    /// Take the full digest, and on the server ask every replica for theirs.
+    Verify,
+    Verified { at: u64, digest: u64 },
 }
 
 /// The node's handle on the group.
@@ -189,6 +200,18 @@ impl Observe {
         if !records.is_empty() {
             let _ = self.tx.send(Input::Logs(records));
         }
+    }
+
+    /// Cuts the store and compacts the group's log now, keeping nothing: a member behind takes an
+    /// image after this.
+    pub fn compact(&self) {
+        let _ = self.tx.send(Input::Compact);
+    }
+
+    /// Takes the full digest of this replica, and on the server asks every replica for theirs;
+    /// the view shows them as they come.
+    pub fn verify(&self) {
+        let _ = self.tx.send(Input::Verify);
     }
 
     /// The store, for queries, once it is open.
@@ -269,7 +292,7 @@ struct Fetching {
 struct Owner {
     dir: PathBuf,
     role: Role,
-    retention: Duration,
+    retention: (Duration, Duration),
     max_series: u64,
     rep: Option<Rep>,
     store: Arc<Mutex<Option<Shared>>>,
@@ -287,6 +310,8 @@ struct Owner {
     maintain: Option<Maintenance>,
     /// When the replica was last tried, while it is not open.
     tried: Option<Instant>,
+    compact_asked: bool,
+    verified: Option<(u64, u64)>,
     // The server's.
     members: Members,
     up: HashSet<String>,
@@ -316,7 +341,7 @@ impl Owner {
         let mut o = Self {
             dir: settings.dir,
             role: settings.role,
-            retention: settings.retention,
+            retention: (settings.metrics_retention, settings.logs_retention),
             max_series: settings.max_series,
             rep: None,
             store,
@@ -333,6 +358,8 @@ impl Owner {
             error: None,
             maintain: None,
             tried: None,
+            compact_asked: false,
+            verified: None,
             members: Members::default(),
             up: HashSet::new(),
             statuses: HashMap::new(),
@@ -492,6 +519,24 @@ impl Owner {
                     f.progress = (done, of);
                 }
             }
+            Input::Compact => self.compact_asked = true,
+            Input::Verify => {
+                self.digest_full();
+                if self.is_server() {
+                    let up: Vec<String> = self.up.iter().cloned().collect();
+                    for m in up {
+                        self.send(&m, Msg::Verify, Vec::new());
+                    }
+                }
+            }
+            Input::Verified { at, digest } => {
+                self.verified = Some((at, digest));
+                // A runner says so at once.
+                if !self.is_server() && self.server_up {
+                    let status = self.status();
+                    self.send("", Msg::Status(status), Vec::new());
+                }
+            }
         }
     }
 
@@ -563,7 +608,7 @@ impl Owner {
             Msg::Status(s) => {
                 self.statuses.insert(machine.to_owned(), s);
             }
-            Msg::Written { .. } | Msg::Member { .. } | Msg::Release => {}
+            Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify => {}
         }
     }
 
@@ -603,8 +648,8 @@ impl Owner {
         }
         if self.retained.is_none_or(|t| t.elapsed() >= RETAIN_EVERY) {
             let now = crate::util::now_ms();
-            let cutoff = now.saturating_sub(i64::try_from(self.retention.as_millis()).unwrap_or(i64::MAX));
-            if rep.r.propose(Vec::new(), kiln_obs::command::retain(cutoff, now)).is_ok() {
+            let back = |d: Duration| now.saturating_sub(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+            if rep.r.propose(Vec::new(), kiln_obs::command::retain(back(self.retention.0), back(self.retention.1), now)).is_ok() {
                 self.retained = Some(Instant::now());
             }
         }
@@ -648,6 +693,7 @@ impl Owner {
                 }
             }
             Msg::Release => self.close(),
+            Msg::Verify => self.digest_full(),
             Msg::Write { .. } | Msg::Status(_) => {}
         }
     }
@@ -720,7 +766,10 @@ impl Owner {
             self.open(id);
             return;
         }
-        if group::due(&rep.r) && rep.r.compact(group::keep(&rep.r, rep.compacted), now, &self.waker).unwrap_or(false) {
+        let asked = self.compact_asked && rep.r.in_flight() == 0;
+        let keep = if asked { 0 } else { group::keep(&rep.r, rep.compacted) };
+        if (asked || group::due(&rep.r)) && rep.r.compact(keep, now, &self.waker).unwrap_or(false) {
+            self.compact_asked = false;
             rep.compacted = rep.r.applied().index;
             if let Some(m) = &self.maintain {
                 m.poke();
@@ -790,16 +839,34 @@ impl Owner {
         }
     }
 
+    /// The full digest of the replica, taken on a thread of its own under the store's read lock
+    /// (a read of everything), said when it is done.
+    fn digest_full(&mut self) {
+        let Some(rep) = &self.rep else { return };
+        let (store, input) = (rep.r.machine().shared(), self.input.clone());
+        let spawned = std::thread::Builder::new().name("kiln-observe-digest".into()).spawn(move || {
+            let s = store.read().unwrap_or_else(PoisonError::into_inner);
+            if let Ok(digest) = s.digest(true) {
+                let _ = input.send(Input::Verified { at: s.applied(), digest });
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "observe's digest did not start");
+        }
+    }
+
     fn status(&self) -> Status {
         let mut s = Status { error: self.error.clone(), at: crate::util::now_unix(), ..Status::default() };
         let (waiting, _) = self.batcher.backlog();
         s.queued = waiting;
         s.dropped = self.batcher.dropped;
         s.fetching = self.fetching.as_ref().map(|f| f.progress);
+        s.verified = self.verified;
         if let Some(rep) = &self.rep {
             let store = rep.r.machine().read();
             s.member = rep.r.id();
-            s.applied = rep.r.applied().index;
+            s.digest = store.digest(false).unwrap_or(0);
+            s.applied = store.applied();
             s.durable = store.durable().index;
             s.series = store.series_count() as u64;
             s.blocks = store.block_count() as u64;
@@ -825,7 +892,10 @@ impl Owner {
             v.cutoff_ms = store.cutoff();
             v.voters = rep.r.configuration().voters.clone();
             v.learners = rep.r.configuration().learners.clone();
+            v.digest = store.digest(false).unwrap_or(0);
+            v.digest_at = store.applied();
         }
+        v.verified = self.verified;
         if self.is_server() {
             v.machines = self.members.machines.iter().map(|(machine, &member)| MachineView { machine: machine.clone(), member, up: self.up.contains(machine), status: self.statuses.get(machine).cloned() }).collect();
         }

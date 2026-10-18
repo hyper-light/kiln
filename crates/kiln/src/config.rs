@@ -30,6 +30,8 @@ pub struct Config {
     pub cd: Cd,
     /// CI (docs/ci.md).
     pub ci: ci::Ci,
+    /// kiln's own metrics, logs and events (docs/observe.md).
+    pub observe: Observe,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
@@ -366,6 +368,26 @@ impl Default for Discovery {
 impl Default for Terminal {
     fn default() -> Self {
         Self { enabled: true, shell: None, max_sessions: 32, idle_minutes: 720 }
+    }
+}
+
+/// Observe (docs/observe.md): the group the server leads and runners replicate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Observe {
+    pub enabled: bool,
+    /// How long samples are kept: Datadog's, 15 months at full resolution ("Data retention
+    /// periods", docs.datadoghq.com), as days.
+    pub metrics_retention_days: u32,
+    /// How long log records are kept: Datadog's default index retention, 15 days.
+    pub logs_retention_days: u32,
+    /// The most series the group holds (0: no bound); past it, new series are refused and counted.
+    pub max_series: u64,
+}
+
+impl Default for Observe {
+    fn default() -> Self {
+        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, max_series: 0 }
     }
 }
 

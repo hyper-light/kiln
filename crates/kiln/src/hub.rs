@@ -351,6 +351,16 @@ impl Hub {
         }
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
+            crate::observe::hub::host_sample(agent, &s);
+        } else {
+            let host = crate::os::hostname();
+            // The server's machine, unless its own runner reports it already.
+            if !self.cfg.local_agent.enabled {
+                crate::observe::hub::host_sample(&host, &s);
+            }
+            if let Some(o) = crate::observe::api::get() {
+                crate::observe::hub::process_figures(o, &host, "server");
+            }
         }
         self.emit(&serde_json::json!({"type": "sample", "agent": agent, "sample": s}));
     }
@@ -628,6 +638,7 @@ impl Hub {
                     // Sync moves to another runner process of the machine that syncs, if any.
                     let syncing = self.instances.lock().newest_with(&name, proto::CAP_SYNC).is_some();
                     self.sync.machine(&name, syncing);
+                    crate::observe::hub::lost(self, &name);
                     if self.instances.lock().of(&name).is_empty() {
                         self.agent_lost(&name, &reason).await;
                     } else {
@@ -852,10 +863,14 @@ impl Hub {
                 if caps & proto::CAP_SYNC != 0 {
                     self.sync_announced(&agent).await;
                 }
+                if caps & proto::CAP_OBSERVE != 0 {
+                    crate::observe::hub::announced(self, &agent).await;
+                }
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
             }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
+            AgentMsg::Observe { json, bytes } => crate::observe::hub::heard(&agent, json, bytes),
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             AgentMsg::JobEvent { job, json } => {

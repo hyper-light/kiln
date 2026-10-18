@@ -4,7 +4,7 @@
 //! ```text
 //! entry := (nothing: a leader's empty entry, applied as nothing)
 //!        | WRITE u8 | sender u64-le | seq u64-le | at i64-le | batch          (crate::batch)
-//!        | RETAIN u8 | cutoff i64-le | at i64-le
+//!        | RETAIN u8 | metrics' cutoff i64-le | logs' cutoff i64-le | at i64-le
 //!        | LIMITS u8 | max series u64-le
 //! ```
 //!
@@ -27,8 +27,10 @@ pub enum Command<'a> {
     /// A leader's empty entry.
     Empty,
     Write { sender: u64, seq: u64, at: i64, batch: &'a [u8] },
-    /// Nothing older than `cutoff` (ms) is kept from here on.
-    Retain { cutoff: i64, at: i64 },
+    /// No sample older than `metrics` (ms) and no log record older than `logs` (ms) is kept from
+    /// here on: metrics and logs are kept for their own times (a sample is a byte or two, a log
+    /// line a few hundred).
+    Retain { metrics: i64, logs: i64, at: i64 },
     /// At most `max_series` series from here on (0: no bound).
     Limits { max_series: u64 },
 }
@@ -59,10 +61,11 @@ pub fn write(sender: u64, seq: u64, at: i64, batch: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn retain(cutoff: i64, at: i64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(17);
+pub fn retain(metrics: i64, logs: i64, at: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(25);
     out.push(RETAIN);
-    out.extend_from_slice(&cutoff.to_le_bytes());
+    out.extend_from_slice(&metrics.to_le_bytes());
+    out.extend_from_slice(&logs.to_le_bytes());
     out.extend_from_slice(&at.to_le_bytes());
     out
 }
@@ -90,7 +93,7 @@ pub fn decode(data: &[u8]) -> Result<Command<'_>, CommandError> {
             let at_ms = i64::from_le_bytes(word(&mut at)?);
             return Ok(Command::Write { sender, seq, at: at_ms, batch: at });
         }
-        RETAIN => Command::Retain { cutoff: i64::from_le_bytes(word(&mut at)?), at: i64::from_le_bytes(word(&mut at)?) },
+        RETAIN => Command::Retain { metrics: i64::from_le_bytes(word(&mut at)?), logs: i64::from_le_bytes(word(&mut at)?), at: i64::from_le_bytes(word(&mut at)?) },
         LIMITS => Command::Limits { max_series: u64::from_le_bytes(word(&mut at)?) },
         t => return Err(CommandError::Unknown(t)),
     };
@@ -105,14 +108,14 @@ mod tests {
     fn commands_round_trip_and_damage_is_an_error() {
         let w = write(7, 9, 1_700_000_000_000, b"batch bytes");
         assert_eq!(decode(&w), Ok(Command::Write { sender: 7, seq: 9, at: 1_700_000_000_000, batch: b"batch bytes" }));
-        assert_eq!(decode(&retain(-5, 6)), Ok(Command::Retain { cutoff: -5, at: 6 }));
+        assert_eq!(decode(&retain(-5, 3, 6)), Ok(Command::Retain { metrics: -5, logs: 3, at: 6 }));
         assert_eq!(decode(&limits(100_000)), Ok(Command::Limits { max_series: 100_000 }));
         assert_eq!(decode(&[]), Ok(Command::Empty));
         assert_eq!(decode(&[9, 1, 2]), Err(CommandError::Unknown(9)));
         for cut in 1..WRITE_HEADER {
             assert_eq!(decode(&w[..cut]), Err(CommandError::Short));
         }
-        let mut r = retain(1, 2);
+        let mut r = retain(1, 2, 3);
         r.push(0);
         assert_eq!(decode(&r), Err(CommandError::Trailing));
     }

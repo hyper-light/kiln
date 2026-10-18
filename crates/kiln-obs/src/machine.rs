@@ -113,6 +113,7 @@ impl StateMachine for Machine {
     fn apply(&mut self, entry: &EntryRef<'_>, answers: &mut Vec<Self::Answer>) -> Result<(), Fatal> {
         self.applied = hyper_durable::Point { index: entry.index, term: entry.term };
         if entry.kind != EntryType::EntryNormal {
+            self.write().note_applied(entry.index);
             return Ok(());
         }
         let applied = self.write().apply_entry(entry.index, entry.data);
@@ -128,7 +129,9 @@ impl StateMachine for Machine {
     fn apply_change(&mut self, at: hyper_durable::Point, _change: &ConfChangeV2, configuration: &ConfState) -> Result<(), Fatal> {
         self.applied = at;
         self.conf = configuration.clone();
-        self.write().set_membership(membership_of(configuration));
+        let mut store = self.write();
+        store.set_membership(membership_of(configuration));
+        store.note_applied(at.index);
         Ok(())
     }
 

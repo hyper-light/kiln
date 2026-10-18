@@ -59,6 +59,9 @@ pub enum Msg {
     },
     /// Server → runner: another runner process of this machine replicates now: let go.
     Release,
+    /// Server → runner: take the full digest of the replica (every sample and record) and say it
+    /// in the next status: what an operator, or a test, checks replicas by.
+    Verify,
     /// Runner → server: how this machine's replica is doing.
     Status(Status),
 }
@@ -106,6 +109,10 @@ pub struct Status {
     /// Writes of this machine's waiting to be sent, and points dropped for room.
     pub queued: u64,
     pub dropped: u64,
+    /// The replica's digest (`kiln_obs::store::Store::digest`) as of `applied`: of its series.
+    pub digest: u64,
+    /// The full digest last asked for ([`Msg::Verify`]), and the index it is of.
+    pub verified: Option<(u64, u64)>,
     pub error: Option<String>,
     /// Unix seconds.
     pub at: i64,

@@ -1000,6 +1000,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             credentials: None,
             instance: None,
             reach: Some(true),
+            observe: true,
         }));
     }
     crate::install::install(crate::install::InstallArgs {

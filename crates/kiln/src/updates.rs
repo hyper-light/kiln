@@ -1658,7 +1658,8 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_FRONT_DOOR
     | crate::proto::CAP_CI2
     | crate::proto::CAP_ACTIONS
-    | crate::proto::CAP_REACH;
+    | crate::proto::CAP_REACH
+    | crate::proto::CAP_OBSERVE;
 
 #[cfg(test)]
 mod tests {

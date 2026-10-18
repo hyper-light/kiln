@@ -198,6 +198,10 @@ struct AgentArgs {
     /// Take no commands from other runners (reach); this runner can still send them.
     #[arg(long, env = "KILN_NO_REACH")]
     no_reach: bool,
+    /// Keep no replica of the observe group here (docs/observe.md): queries from this machine go
+    /// to the server; its writes still go through it.
+    #[arg(long, env = "KILN_NO_OBSERVE")]
+    no_observe: bool,
     #[arg(long, env = "KILN_SHELL")]
     shell: Option<String>,
 }
@@ -364,6 +368,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 instance: a.instance,
                 // Commands from other runners are a terminal's worth of access: not without one.
                 reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
+                observe: !a.ephemeral && !a.no_observe,
             };
             let result = run_agent(opts, shutdown).await;
             if let Some(ann) = announcer {
