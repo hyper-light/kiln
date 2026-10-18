@@ -289,6 +289,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl Observe {
     /// Starts the node's group (its thread, and its maintenance thread).
     pub fn start(settings: Settings) -> Self {
+        // The node's receivers begin now (`super::otlp::keys`).
+        let _ = super::otlp::keys();
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, out_rx) = async_channel::bounded(16_384);
         let store = Arc::new(Mutex::new(None));

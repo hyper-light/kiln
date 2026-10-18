@@ -1059,3 +1059,109 @@ fn calendar_rollups_and_weights_read_as_the_calendar_and_the_pods_say() -> anyho
     anyhow::ensure!(code == 400 && body.contains("Mars/Olympus_Mons"), "{code} {body}");
     Ok(())
 }
+
+/// Distributions (docs/observe.md §4.4, §13): three hosts' latencies posted as Datadog's
+/// distribution points, two more hosts' as OTLP exponential histograms (one delta; one cumulative,
+/// exported twice). p50, p99 and p99.9 across all of them are within the buckets' relative error of
+/// the exact percentiles, and each host's p99 of its own; the average and the count exact; and a
+/// heatmap holds every value once.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    // After the server began: a cumulative series begun now is new to its receiver.
+    let begun_ns = (crate_now() as u64) * 1_000_000;
+    // Every point in one bucket of the query's grid, its step's own, wholly past: the last ten
+    // minutes' bucket before this one.
+    const STEP: i64 = 600_000;
+    let end = crate_now() / STEP * STEP;
+    let (from, t) = (end - STEP, end - 60_000);
+    let mut seed = 77u64;
+    let mut uniform = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64).max(1e-300)
+    };
+    let mut lognormal = |level: f64| -> f64 { ((-2.0 * uniform().ln()).sqrt() * (std::f64::consts::TAU * uniform()).cos() * 0.5 + level).exp() };
+    let mut hosts: Vec<(&str, Vec<f64>)> = Vec::new();
+    // Datadog's distribution points: hosts a, b, c.
+    let mut series = Vec::new();
+    for (h, level) in [("a", -4.0), ("b", -3.0), ("c", -2.5)] {
+        let values: Vec<f64> = (0..2000).map(|_| lognormal(level)).collect();
+        series.push(json!({ "metric": "e2e.lat", "host": h, "points": [[t as f64 / 1000.0, values]] }));
+        hosts.push((h, values));
+    }
+    let posted = f.call("POST", "/api/observe/v1/distribution_points", Some(&json!({ "series": series })))?;
+    anyhow::ensure!(posted["values"] == 6000, "{posted}");
+    // OTLP: d's delta histogram; e's cumulative, exported twice (the second all the first's and more).
+    let histogram = |host: &str, cumulative: bool, start_ns: u64, at_ms: i64, values: &[f64]| -> Value {
+        let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
+        for &v in values {
+            if let Some(kiln_obs::dist::Bucket::Pos(i)) = kiln_obs::dist::bucket_of(v, 5) {
+                *counts.entry(i).or_default() += 1;
+            }
+        }
+        let (lo, hi) = (counts.keys().next().copied().unwrap_or(0), counts.keys().next_back().copied().unwrap_or(0));
+        let dense: Vec<String> = (lo..=hi).map(|i| counts.get(&i).copied().unwrap_or(0).to_string()).collect();
+        let point = json!({
+            "startTimeUnixNano": start_ns.to_string(), "timeUnixNano": (at_ms as u64 * 1_000_000).to_string(),
+            "count": values.len().to_string(), "sum": values.iter().sum::<f64>(), "scale": 5, "zeroCount": "0",
+            "positive": { "offset": lo, "bucketCounts": dense },
+            "min": values.iter().copied().fold(f64::MAX, f64::min), "max": values.iter().copied().fold(f64::MIN, f64::max),
+        });
+        json!({ "resourceMetrics": [{ "resource": { "attributes": [{ "key": "host.name", "value": { "stringValue": host } }] },
+            "scopeMetrics": [{ "metrics": [{ "name": "e2e.lat", "exponentialHistogram": { "aggregationTemporality": if cumulative { 2 } else { 1 }, "dataPoints": [point] } }] }] }] })
+    };
+    let send = |body: &Value| -> anyhow::Result<()> {
+        let (code, answer) = raw(f.http, "POST", "/v1/metrics", &format!("Authorization: Bearer {ingest}\r\nContent-Type: application/json\r\n"), body.to_string().as_bytes())?;
+        anyhow::ensure!(code == 200, "{code} {}", String::from_utf8_lossy(&answer));
+        Ok(())
+    };
+    let d: Vec<f64> = (0..3000).map(|_| lognormal(-3.5)).collect();
+    send(&histogram("d", false, 0, t, &d))?;
+    let e1: Vec<f64> = (0..1000).map(|_| lognormal(-2.0)).collect();
+    let e2: Vec<f64> = (0..1500).map(|_| lognormal(-2.0)).collect();
+    send(&histogram("e", true, begun_ns, t - 30_000, &e1))?;
+    let both: Vec<f64> = e1.iter().chain(&e2).copied().collect();
+    send(&histogram("e", true, begun_ns, t, &both))?;
+    hosts.push(("d", d));
+    hosts.push(("e", both));
+    let mut all: Vec<f64> = hosts.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    all.sort_by(f64::total_cmp);
+    let ask = |q: &str| -> anyhow::Result<Vec<(String, f64)>> {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": end, "step": STEP })))?;
+        Ok(at(&a, &["series"]).as_array().into_iter().flatten().map(|s| (at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned(), s["values"][0].as_f64().unwrap_or(f64::NAN))).collect())
+    };
+    let start = Instant::now();
+    loop {
+        let n = ask("count:e2e.lat{*}")?.first().map_or(0.0, |x| x.1);
+        if n == all.len() as f64 {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{n} of {} values counted\n{}", all.len(), f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let exact = |v: &[f64], q: f64| v[((v.len() - 1) as f64 * q).floor() as usize];
+    let bound = ((2f64).powi(-kiln_obs::dist::SCALE) * 0.5).exp2() - 1.0;
+    for (q, p) in [("p50", 0.5), ("p99", 0.99), ("p99.9", 0.999)] {
+        let got = ask(&format!("{q}:e2e.lat{{*}}"))?;
+        let want = exact(&all, p);
+        anyhow::ensure!(got.len() == 1 && ((got[0].1 - want) / want).abs() <= bound, "{q}: {got:?} for {want} (within {bound})");
+    }
+    let by_host = ask("p99:e2e.lat{*} by {host}")?;
+    for (h, values) in &mut hosts {
+        values.sort_by(f64::total_cmp);
+        let want = exact(values, 0.99);
+        let got = by_host.iter().find(|(x, _)| x == h).map_or(f64::NAN, |x| x.1);
+        anyhow::ensure!(((got - want) / want).abs() <= bound, "host {h}: {got} for {want}");
+    }
+    let mean = all.iter().sum::<f64>() / all.len() as f64;
+    let avg = ask("avg:e2e.lat{*}")?.first().map_or(f64::NAN, |x| x.1);
+    anyhow::ensure!(((avg - mean) / mean).abs() < 1e-9, "avg {avg} for {mean}");
+    // A heatmap of it: every value once, in rows of its buckets.
+    let h = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "p50:e2e.lat{*}", "from": from, "to": end, "step": STEP, "heatmap": 40 })))?;
+    let total: f64 = h["heatmap"]["counts"].as_array().into_iter().flatten().flat_map(|row| row.as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_f64()).sum();
+    anyhow::ensure!(h["heatmap"]["distribution"] == true && total == all.len() as f64 && h["heatmap"]["rows"].as_array().is_some_and(|r| r.len() <= 40), "{total} of {} in the heatmap: {}", all.len(), h["heatmap"]["rows"]);
+    Ok(())
+}

@@ -368,7 +368,9 @@ pub enum Answer {
 
 /// The node's series keys, made once each, for every receiver of the node (the server's and a
 /// runner's, on whichever thread decodes).
-fn keys() -> &'static kiln_obs::otlp::metrics::Keys {
+/// The node's receivers' keys (and their cumulative distributions' state), made as observe starts:
+/// a cumulative series begun after this is new to the node, its first point's counts all of it.
+pub(crate) fn keys() -> &'static kiln_obs::otlp::metrics::Keys {
     static KEYS: std::sync::OnceLock<kiln_obs::otlp::metrics::Keys> = std::sync::OnceLock::new();
     KEYS.get_or_init(kiln_obs::otlp::metrics::Keys::new)
 }
