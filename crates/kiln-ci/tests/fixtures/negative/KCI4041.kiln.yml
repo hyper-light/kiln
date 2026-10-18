@@ -1,0 +1,8 @@
+on: push
+secrets:
+  NPM_TOKEN: { required: true }
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - run: echo ${{ secrets.OTHER }} ${{ secrets.npm_token }}

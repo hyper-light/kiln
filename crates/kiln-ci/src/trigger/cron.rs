@@ -9,7 +9,7 @@
 //! decides alike.
 
 use jiff::civil::DateTime;
-use jiff::tz::TimeZone;
+pub use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
 
 /// A parsed schedule.
@@ -141,6 +141,21 @@ impl Cron {
     }
 }
 
+/// A humane duration in seconds: `90`, `90s`, `15m`, `2h`, `1d` (`jitter:`, W03-R10).
+pub fn seconds(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, ""), |i| (s.get(..i).unwrap_or_default(), s.get(i..).unwrap_or_default()));
+    let n: u64 = num.parse().ok()?;
+    let mult = match unit.trim() {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
 /// A time zone by IANA name (`Europe/Berlin`); `UTC` when `None`.
 pub fn zone(name: Option<&str>) -> Result<TimeZone, String> {
     match name {
@@ -172,6 +187,18 @@ mod tests {
 
     fn at(s: &str) -> i64 {
         s.parse::<Timestamp>().map(|t| t.as_second()).unwrap_or(0)
+    }
+
+    #[test]
+    fn humane_durations() {
+        assert_eq!(seconds("90"), Some(90));
+        assert_eq!(seconds("90s"), Some(90));
+        assert_eq!(seconds("15m"), Some(900));
+        assert_eq!(seconds("2h"), Some(7200));
+        assert_eq!(seconds("1d"), Some(86_400));
+        assert_eq!(seconds("5 m"), Some(300));
+        assert_eq!(seconds("m"), None);
+        assert_eq!(seconds("3w"), None);
     }
 
     #[test]

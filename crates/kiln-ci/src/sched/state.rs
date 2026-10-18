@@ -149,7 +149,8 @@ pub enum WaitReason {
 pub enum Command {
     StartRun { run: String },
     CancelRun { run: String, reason: String },
-    Assign { leg: String, runner: String, attempt: u32, executor: Option<String> },
+    /// `image` is the routing rule's, for container and microVM executors (W13).
+    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String> },
     /// Stop a leg's attempt on its runner.
     Cancel { leg: String, attempt: u32, reason: String },
     /// A failed attempt will be retried at `at` as `attempt`.
@@ -539,6 +540,7 @@ impl Scheduler {
         l.last_runner = Some(runner.to_owned());
         let (attempt, request, exclusive, repo, fair) = (l.attempt, l.input.request, l.input.exclusive, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
         let executors = l.req.executors.clone();
+        let image = l.req.image.clone();
         self.vtime = self.vtime.max(fair as f64 / 1000.0);
         *self.in_progress.entry(repo).or_default() += 1;
         let mut executor = None;
@@ -546,9 +548,9 @@ impl Scheduler {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
             r.exclusive = exclusive;
-            executor = executors.iter().find(|e| r.input.view.facts.executors.contains_key(e.as_str())).cloned();
+            executor = executors.iter().find(|e| super::routing::has_executor(&r.input.view.facts, e)).cloned();
         }
-        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor });
+        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image });
     }
 
     fn release(&mut self, id: &str) -> Option<String> {
@@ -789,6 +791,32 @@ impl Scheduler {
                 }
             })
             .collect()
+    }
+
+    /// How each runner measures up against a leg that isn't queued (W04-R29's preview): the
+    /// requirement routing makes of `route`, and each runner's checks.
+    pub fn explain_route(&self, route: &LegRoute) -> (Requirement, Vec<Explained>) {
+        let req = self.requirement(&LegIn { route: route.clone(), ..LegIn::default() });
+        let views: Vec<&RunnerView> = self.runners.values().map(|r| &r.input.view).collect();
+        let scores = routing::scores(&req.prefer, &views);
+        let list = self
+            .runners
+            .values()
+            .enumerate()
+            .map(|(i, r)| {
+                let checks = routing::checks(&req, &r.input.view);
+                Explained {
+                    runner: r.input.id.clone(),
+                    name: r.input.view.name.clone(),
+                    connected: r.connected,
+                    eligible: checks.iter().all(|c| c.pass),
+                    room: r.connected && !r.draining && r.running.len() < r.input.slots as usize,
+                    score: scores.get(i).copied(),
+                    checks,
+                }
+            })
+            .collect();
+        (req, list)
     }
 
     /// The current wait reason of a leg, if it waits.

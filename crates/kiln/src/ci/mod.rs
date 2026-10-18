@@ -4,12 +4,20 @@
 
 pub mod actions;
 pub mod api;
+pub mod cli;
 pub mod dispatch;
 pub mod events;
 pub mod facade;
+pub mod hooks;
 pub mod load;
+pub mod oidc;
+pub mod preview;
 pub mod rest;
+pub mod reusable;
 pub mod runs;
+pub mod runs_api;
+pub mod schedule;
+pub mod secrets;
 pub mod services;
 pub mod token;
 pub mod workflows;

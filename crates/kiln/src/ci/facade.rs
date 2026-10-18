@@ -28,8 +28,12 @@ pub async fn git(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Response
     if !matches!(tail, ["info", "refs"] | ["git-upload-pack"]) {
         return Err((StatusCode::FORBIDDEN, "this code host serves fetches only".into()));
     }
-    let Some(tok) = token::from_headers(req.headers()) else { return Ok(unauthorized()) };
-    let Some(leg) = token::verify(hub, &tok).map(|c| c.sub) else { return Ok(unauthorized()) };
+    // A leg's GITHUB_TOKEN, with `contents: read` (W10-R04).
+    let Some(job) = token::job_of_request(hub, req.headers()).await else { return Ok(unauthorized()) };
+    if !job.may("contents", kiln_ci::plan::perms::Level::Read) {
+        return Err((StatusCode::FORBIDDEN, "this job's token lacks `contents: read`".into()));
+    }
+    let leg = job.leg;
     let run = runs::run_of(hub, &leg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.ok_or((StatusCode::UNAUTHORIZED, "the leg is gone".to_owned()))?;
     if !run.repo_name.eq_ignore_ascii_case(&full) {
         return Err((StatusCode::FORBIDDEN, format!("this leg's token reads {} only", run.repo_name)));

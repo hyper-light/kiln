@@ -15,7 +15,8 @@ pub enum Command {
     StopCommands(String),
     Echo(bool),
     AddMatcher(String),
-    RemoveMatcher(String),
+    /// By `owner`, or by the owners of the matcher file the data names.
+    RemoveMatcher { owner: String, file: String },
     /// Deprecated: honoured, with a warning.
     SetOutput { name: String, value: String },
     SaveState { name: String, value: String },
@@ -180,7 +181,7 @@ impl Processor {
                 other => return Line::Refused(format!("Invalid echo command value '{other}'. Expected 'on' or 'off'.")),
             },
             "add-matcher" => Command::AddMatcher(p.data.clone()),
-            "remove-matcher" => Command::RemoveMatcher(prop(&p, "owner").unwrap_or_default().to_owned()),
+            "remove-matcher" => Command::RemoveMatcher { owner: prop(&p, "owner").unwrap_or_default().to_owned(), file: p.data.trim().to_owned() },
             "set-output" => Command::SetOutput { name: prop(&p, "name").unwrap_or_default().to_owned(), value: p.data.clone() },
             "save-state" => Command::SaveState { name: prop(&p, "name").unwrap_or_default().to_owned(), value: p.data.clone() },
             "set-env" | "add-path" if !self.allow_unsecure => {
@@ -232,7 +233,8 @@ mod tests {
         assert!(matches!(p.line("::add-path::/x"), Line::Refused(_)));
         assert_eq!(Processor::new(true).line("::set-env name=A::b"), Line::Command(Command::SetEnv { name: "A".into(), value: "b".into() }));
         assert_eq!(p.line("::add-matcher::.github/tsc.json"), Line::Command(Command::AddMatcher(".github/tsc.json".into())));
-        assert_eq!(p.line("::remove-matcher owner=tsc::"), Line::Command(Command::RemoveMatcher("tsc".into())));
+        assert_eq!(p.line("::remove-matcher owner=tsc::"), Line::Command(Command::RemoveMatcher { owner: "tsc".into(), file: String::new() }));
+        assert_eq!(p.line("::remove-matcher::.github/tsc.json"), Line::Command(Command::RemoveMatcher { owner: String::new(), file: ".github/tsc.json".into() }));
         assert_eq!(p.line("::bogus::x"), Line::Unknown);
         // The older form.
         assert_eq!(p.line("##[set-output name=y;]2"), Line::Command(Command::SetOutput { name: "y".into(), value: "2".into() }));

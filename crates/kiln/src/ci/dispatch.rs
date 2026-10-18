@@ -37,6 +37,8 @@ pub struct Start {
     pub author: String,
     /// The run's remote actions, resolved when it started (W07-R02).
     pub actions: std::collections::BTreeMap<String, wire::ActionRef>,
+    /// The `inputs` context, typed (`workflow_dispatch`, W03-R11); null takes the payload's.
+    pub inputs: serde_json::Value,
 }
 
 /// What the dispatcher hears.
@@ -50,6 +52,29 @@ pub enum Msg {
     Finished { agent: String, result: JobResult },
     Rejected { agent: String, leg: String },
     Cancel { run: String, reason: String },
+    /// Why a leg waits, and how each runner measures up against it (W05-R11).
+    Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
+    /// The plan `Start` would make, without a run (W04-R29).
+    Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+}
+
+/// What a leg asks of routing (W05-R20).
+fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str) -> LegRoute {
+    let job = spec.def();
+    let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
+    let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
+    let caps = u64::from(CAP_CI2) | if uses { u64::from(CAP_ACTIONS) } else { 0 } | if docker { u64::from(CAP_DOCKER) } else { 0 };
+    LegRoute {
+        job: spec.job.clone(),
+        job_name: spec.job_name.clone(),
+        workflow: workflow.to_owned(),
+        repo: repo.to_owned(),
+        event: event.to_owned(),
+        labels: spec.runs_on.labels.clone(),
+        group: spec.runs_on.group.clone(),
+        requires: spec.requires.clone(),
+        caps,
+    }
 }
 
 /// The hub's handle on the dispatcher.
@@ -97,6 +122,13 @@ struct RunSt {
     plan: RunPlan,
     repo: Repo,
     event: Event,
+    /// The workflow's file, and when the run was created (for `workflow_run`).
+    path: String,
+    created: i64,
+    /// Whether `workflow_run` `in_progress` went out.
+    in_progress: bool,
+    /// The reusable workflows it may call (W04-R18).
+    files: Arc<HashMap<String, Arc<Workflow>>>,
     wf: Arc<Workflow>,
     github: serde_json::Value,
     vars: serde_json::Value,
@@ -129,7 +161,7 @@ struct Source<'a> {
 impl PlanSource for Source<'_> {
     fn workflow(&self, uses: &str) -> Result<Arc<Workflow>, String> {
         let path = uses.trim_start_matches("./").trim_start_matches("$/");
-        self.files.get(path).cloned().ok_or_else(|| format!("`{uses}`: reusable workflows from other repositories arrive with docs/ci.md W07"))
+        self.files.get(uses).or_else(|| self.files.get(path)).cloned().ok_or_else(|| format!("`{uses}`: no such workflow (or it couldn't be fetched when the run started)"))
     }
 }
 
@@ -139,8 +171,6 @@ struct Dispatch {
     runs: HashMap<String, RunSt>,
     legs: HashMap<String, LegSt>,
     timers: BTreeSet<i64>,
-    /// Workflows of each run's commit, for reusable workflows.
-    files: HashMap<String, HashMap<String, Arc<Workflow>>>,
 }
 
 fn now_ms() -> i64 {
@@ -183,7 +213,7 @@ pub fn spawn(hub: Arc<Hub>) {
         if hub.cfg.ci.github_labels {
             rules.extend(routing::github_label_rules());
         }
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), files: HashMap::new() };
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -231,6 +261,16 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
+            Msg::Explain { leg, reply } => {
+                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "runners": self.sched.explain(&leg) });
+                let _ = reply.try_send(v);
+                Ok(())
+            }
+            Msg::Preview { start, reply } => {
+                let v = self.preview(&start).await;
+                let _ = reply.try_send(v);
+                Ok(())
+            }
         };
         if let Err(e) = r {
             tracing::warn!(error = %format!("{e:#}"), "CI dispatcher");
@@ -248,7 +288,13 @@ impl Dispatch {
 
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), ..kiln_ci::facts::RunnerFacts::default() };
+        // Executors it has: the host always, Docker when it announced it (W13-R01's probes, for now).
+        let mut executors = std::collections::BTreeMap::new();
+        executors.insert("host".to_owned(), kiln_ci::facts::Executor::default());
+        if self.hub.runner_caps(agent) & CAP_DOCKER != 0 {
+            executors.insert("docker".to_owned(), kiln_ci::facts::Executor::default());
+        }
+        let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() };
         let view = RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(self.hub.runner_caps(agent)) };
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
@@ -284,10 +330,25 @@ impl Dispatch {
             input: String::new(),
         };
         let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
+        // A kiln workflow that declares its secrets needs every required one (W09-R06).
+        if let Some(why) = self.missing_secrets(&s).await {
+            runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
+            self.hub.emit_run(&id).await;
+            return Ok(());
+        }
         let github = self.github_context(&s, number, rowid, &name);
-        let input = RunInput { github: github.clone(), inputs: s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null), vars: serde_json::json!({}), changed: s.event.changed.clone().map(Arc::new), trusted };
-        self.save_input(&id, &input, &s.actions).await?;
-        let files = self.files.get(&s.event.sha).cloned().unwrap_or_default();
+        let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
+        // The `vars` context (W09-R09): every scope but environments', which legs add.
+        let vars = match super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await {
+            Ok(v) => serde_json::Value::Object(v),
+            Err(e) => {
+                tracing::warn!(run = %id, error = %format!("{e:#}"), "variables could not be read");
+                serde_json::json!({})
+            }
+        };
+        let input = RunInput { github: github.clone(), inputs, vars: vars.clone(), changed: s.event.changed.clone().map(Arc::new), trusted };
+        self.save_input(&id, &input, &s.actions, &s.event).await?;
+        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
         let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files });
         let (plan, actions) = match started {
             Ok(x) => x,
@@ -299,7 +360,9 @@ impl Dispatch {
         };
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-        self.runs.insert(id.clone(), RunSt { plan, repo: s.repo, event: s.event, wf: s.workflow, github, vars: serde_json::json!({}), trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0 });
+        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0 };
+        self.workflow_run(&st, "requested", None);
+        self.runs.insert(id.clone(), st);
         self.hub.ci.runs.lock().insert(id.clone());
         self.hub.emit_run(&id).await;
         let cmds = self.sched.handle(Input::RunQueued { run: id, group, supersede: None }, now_ms());
@@ -307,12 +370,101 @@ impl Dispatch {
         Ok(())
     }
 
+    /// `KCI4040`: the required secrets a kiln workflow declares that don't resolve for each job's
+    /// environment, with the scopes searched and how to add them; `None` when all do.
+    async fn missing_secrets(&self, s: &Start) -> Option<String> {
+        let wf = &s.workflow;
+        if wf.secrets.is_empty() || !wf.secrets.iter().any(|d| d.required) {
+            return None;
+        }
+        let mut envs: Vec<Option<String>> = vec![None];
+        for j in &wf.jobs {
+            if let Some(e) = j.environment.as_ref().map(|e| e.name.src.clone()).filter(|n| !n.contains("${{"))
+                && !envs.contains(&Some(e.clone()))
+            {
+                envs.push(Some(e));
+            }
+        }
+        let mut lines = Vec::new();
+        for env in envs {
+            let have = super::secrets::names_for(&self.hub, &s.repo, &s.path, env.as_deref()).await.unwrap_or_default();
+            for name in kiln_ci::secrets::missing_required(&wf.secrets, &have) {
+                lines.push(format!(
+                    "KCI4040: the workflow requires the secret {name}, which isn't set{}: searched {}. Add it: kiln secrets set {name} --scope repo:{}",
+                    env.as_deref().map(|e| format!(" for environment `{e}`")).unwrap_or_default(),
+                    super::secrets::searched(&s.repo, &s.path, env.as_deref()),
+                    s.repo.name
+                ));
+            }
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// `workflow_run` for this run (W03-R02): `requested`, `in_progress` or `completed`, to the
+    /// default branch's workflows that listen for it, off the dispatcher's loop.
+    fn workflow_run(&self, r: &RunSt, action: &str, conclusion: Option<&str>) {
+        let g = &r.github;
+        let num = |k: &str| g.get(k).and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64())).unwrap_or(0);
+        let rfc = |t: i64| time::OffsetDateTime::from_unix_timestamp(t).ok().and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_default();
+        let summary = kiln_ci::trigger::context::RunSummary {
+            id: num("run_id"),
+            name: g.get("workflow").and_then(serde_json::Value::as_str).unwrap_or(&r.path).to_owned(),
+            path: r.path.clone(),
+            display_title: r.plan.name.clone().unwrap_or_else(|| r.event.message.clone().unwrap_or_default().lines().next().unwrap_or_default().to_owned()),
+            run_number: num("run_number"),
+            run_attempt: u32::try_from(num("run_attempt")).unwrap_or(1).max(1),
+            event: r.event.name.clone(),
+            status: if action == "completed" { "completed".into() } else if action == "in_progress" { "in_progress".into() } else { "queued".into() },
+            conclusion: conclusion.map(str::to_owned),
+            head_branch: r.event.ref_name().to_owned(),
+            head_sha: r.event.sha.clone(),
+            head_message: r.event.message.clone().unwrap_or_default(),
+            actor: r.event.actor.clone(),
+            created_at: rfc(r.created),
+            updated_at: rfc(crate::util::now_unix()),
+        };
+        let depth = r.event.payload.pointer("/kiln/depth").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let (hub, repo, action) = (Arc::clone(&self.hub), r.repo.clone(), action.to_owned());
+        crate::rt::spawn(async move { super::events::workflow_run(&hub, &repo, &action, &summary, depth).await });
+    }
+
+    /// What [`Self::start`] would plan for `s`, without a run: the `github` context of run 0,
+    /// the variables and reusable workflows a run would get, and each leg's routing against the
+    /// runners connected now.
+    async fn preview(&mut self, s: &Start) -> serde_json::Value {
+        let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
+        let github = self.github_context(s, 0, 0, &name);
+        let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
+        let vars = super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await.map(serde_json::Value::Object).unwrap_or_else(|_| serde_json::json!({}));
+        let input = RunInput { github, inputs, vars, changed: s.event.changed.clone().map(Arc::new), trusted: s.event.trusted };
+        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
+        let p = match RunPlan::preview(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files }) {
+            Ok(p) => p,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let workflow = s.workflow.name.clone().unwrap_or_default();
+        let legs: Vec<serde_json::Value> = p
+            .legs
+            .iter()
+            .map(|spec| {
+                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name));
+                let mut v = serde_json::to_value(spec).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    let constraints: Vec<&String> = req.constraints.iter().map(|(text, _)| text).collect();
+                    o.insert("routing".into(), serde_json::json!({ "labels": req.labels, "group": req.group, "constraints": constraints, "executors": req.executors, "image": req.image, "rules": req.rules, "runners": runners }));
+                }
+                v
+            })
+            .collect();
+        serde_json::json!({ "name": p.name, "legs": legs, "decided": p.decided, "removed": p.removed, "later": p.later })
+    }
+
     fn settings(&self) -> Settings {
         Settings { default_runs_on: vec!["k8s".into()], ..Settings::default() }
     }
 
-    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>) -> anyhow::Result<()> {
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions }).to_string();
+    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event) -> anyhow::Result<()> {
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -322,7 +474,8 @@ impl Dispatch {
         // The code host is kiln's facade; each runner sees it at its own address of the server.
         let base = self.hub.cfg.server.public_url.trim_end_matches('/').to_owned();
         let server_url = base.clone();
-        let repo = kiln_ci::trigger::context::Repo { full_name: s.repo.name.clone(), id: 0, owner_id: 0, default_branch: String::new(), private: false, server_url };
+        let default_branch = s.event.payload.pointer("/repository/default_branch").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        let repo = kiln_ci::trigger::context::Repo { full_name: s.repo.name.clone(), id: 0, owner_id: 0, default_branch, private: false, server_url };
         let run = kiln_ci::trigger::context::RunFacts {
             run_id: u64::try_from(rowid).unwrap_or(0),
             run_number: u64::try_from(number).unwrap_or(0),
@@ -330,8 +483,8 @@ impl Dispatch {
             workflow: name.to_owned(),
             workflow_ref: format!("{}/{}@{}", s.repo.name, s.path, s.event.git_ref),
             workflow_sha: s.event.sha.clone(),
-            api_url: format!("{base}/_kiln/api"),
-            graphql_url: format!("{base}/_kiln/api/graphql"),
+            api_url: format!("{base}/api/v3"),
+            graphql_url: format!("{base}/api/graphql"),
             retention_days: 90,
             actor_id: 0,
             triggering_actor: String::new(),
@@ -387,6 +540,7 @@ impl Dispatch {
                     runs::finish_run(&self.hub, run, status_of(c), c.result(), None).await?;
                     let cmds = self.sched.handle(Input::RunFinished { run: run.to_owned() }, now_ms());
                     if let Some(r) = self.runs.remove(run) {
+                        self.workflow_run(&r, "completed", Some(c.result()));
                         let mut g = self.hub.ci.legs.lock();
                         for id in r.keys.values() {
                             g.remove(id);
@@ -409,20 +563,7 @@ impl Dispatch {
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
         let job = spec.def();
-        let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
-        let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
-        let caps = u64::from(CAP_CI2) | if uses { u64::from(CAP_ACTIONS) } else { 0 } | if docker { u64::from(CAP_DOCKER) } else { 0 };
-        let route = LegRoute {
-            job: spec.job.clone(),
-            job_name: spec.job_name.clone(),
-            workflow: r.wf.name.clone().unwrap_or_default(),
-            repo: r.repo.name.clone(),
-            event: r.event.name.clone(),
-            labels: spec.runs_on.labels.clone(),
-            group: spec.runs_on.group.clone(),
-            requires: spec.requires.clone(),
-            caps,
-        };
+        let route = route_of(&spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name);
         let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
         let leg = LegIn {
@@ -452,7 +593,7 @@ impl Dispatch {
                     self.actions(&run, held).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
-                Command::Assign { leg, runner, attempt, executor } => self.assign(&leg, &runner, attempt, executor).await,
+                Command::Assign { leg, runner, attempt, executor, image } => self.assign(&leg, &runner, attempt, executor, image).await,
                 Command::Cancel { leg, reason, .. } => {
                     if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
                         self.hub.send_to_agent(&agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason }).await;
@@ -489,12 +630,29 @@ impl Dispatch {
     }
 
     /// Sends a leg to its runner (W05, W06).
-    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, executor: Option<String>) -> anyhow::Result<()> {
+    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, executor: Option<String>, image: Option<String>) -> anyhow::Result<()> {
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
-        let a = self.assignment(leg, l, r, attempt, executor.clone());
+        let (cache_mode, cache) = cache_access(&l.spec, r);
+        let ttl = (i64::from(l.spec.timeout_minutes) + 60) * 60;
+        let token = super::token::mint(&self.hub, &super::token::Leg { leg, run: &l.run, repo: &r.repo.id, cache, cache_mode: cache_mode.as_str(), ttl });
+        // GITHUB_TOKEN: a job token with the job's permissions, revoked when the attempt ends
+        // (W10-R03, R04).
+        let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl).await?;
+        let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
+        let a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
         let json = serde_json::to_string(&a)?;
+        if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
+            tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
+        }
         runs::claim(&self.hub, leg, runner, executor.as_deref().unwrap_or("host"), attempt).await?;
+        // The run's first leg to start: `workflow_run` `in_progress`.
+        if let Some(run) = self.legs.get(leg).map(|l| l.run.clone()) {
+            let first = self.runs.get_mut(&run).is_some_and(|r| !std::mem::replace(&mut r.in_progress, true));
+            if first && let Some(r) = self.runs.get(&run) {
+                self.workflow_run(r, "in_progress", None);
+            }
+        }
         {
             let mut g = self.hub.agents.lock();
             if let Some(ag) = g.get_mut(runner) {
@@ -520,18 +678,48 @@ impl Dispatch {
         Ok(())
     }
 
-    fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>) -> AssignmentV2 {
+    /// What a leg is given (W09-R04, W09-R05): the secrets its expressions read, resolved by scope
+    /// and followed through the calls that brought it, plus `GITHUB_TOKEN`. Untrusted runs get
+    /// only the token. Also returns the secrets' rows (for their uses) and the leg's `vars`
+    /// (its environment's included).
+    async fn leg_secrets(&self, l: &LegSt, r: &RunSt, token: &str) -> (Vec<wire::Secret>, Vec<String>, serde_json::Value) {
+        let spec = &l.spec;
+        let env = spec.environment.as_ref().map(|e| e.name.clone());
+        let vars = match &env {
+            Some(e) => match super::secrets::vars_for(&self.hub, &r.repo, &r.path, Some(e)).await {
+                Ok(v) => serde_json::Value::Object(v),
+                Err(_) => r.vars.clone(),
+            },
+            None => r.vars.clone(),
+        };
+        let token_secret = wire::Secret { name: "GITHUB_TOKEN".into(), value: token.to_owned() };
+        if !r.trusted {
+            return (vec![token_secret], Vec::new(), vars);
+        }
+        let used = spec.def().map(kiln_ci::secrets::used).unwrap_or_default();
+        let needed = kiln_ci::secrets::needed(&spec.secrets, &used);
+        let resolved = match super::secrets::for_leg(&self.hub, &r.repo, &r.path, env.as_deref(), &needed).await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "secrets could not be read; the leg gets none");
+                Default::default()
+            }
+        };
+        let mut run: std::collections::BTreeMap<String, String> = resolved.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect();
+        run.insert("GITHUB_TOKEN".into(), token.to_owned());
+        let given = kiln_ci::secrets::deliver(&spec.secrets, &used, &run);
+        let ids: Vec<String> = resolved.values().filter_map(|v| v.id.clone()).collect();
+        let mut out: Vec<wire::Secret> = given.into_iter().filter(|(k, _)| k != "GITHUB_TOKEN").map(|(name, value)| wire::Secret { name, value }).collect();
+        out.push(token_secret);
+        (out, ids, vars)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>, image: Option<String>, token: String, job_token: String, cache_mode: kiln_ci::store::cache::Mode, secrets: Vec<wire::Secret>, vars: serde_json::Value) -> AssignmentV2 {
         let spec = &l.spec;
         let wf = &spec.workflow;
         let job = spec.def();
-        let (cache_mode, cache) = cache_access(spec, r);
-        let ttl = (i64::from(spec.timeout_minutes) + 60) * 60;
-        let token = super::token::mint(&self.hub, &super::token::Leg { leg, run: &l.run, repo: &r.repo.id, cache, cache_mode: cache_mode.as_str(), ttl });
-        let mut secrets: Vec<wire::Secret> = Vec::new();
-        if r.trusted {
-            secrets.extend(self.hub.ci_secrets().into_iter().map(|(name, value)| wire::Secret { name, value }));
-        }
-        secrets.push(wire::Secret { name: "GITHUB_TOKEN".into(), value: token.clone() });
+        let id_tokens = spec.permissions.level("id-token") == kiln_ci::plan::perms::Level::Write && (r.trusted || self.hub.cfg.ci.oidc.untrusted);
         let num = |k: &str| spec.strategy.get(k).and_then(serde_json::Value::as_f64).map_or(0, |v| v as u32);
         let mut env_from = spec.env_from.clone();
         env_from.extend(spec.run_env.iter().map(|(k, v)| (format!("KILN_RUN_{k}"), v.clone())));
@@ -544,16 +732,18 @@ impl Dispatch {
             git_ref: r.event.git_ref.clone(),
             dialect: if wf.dialect == Some(kiln_ci::expr::Dialect::Kiln) { "kiln".into() } else { "gha".into() },
             leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total") },
-            executor: wire::ExecutorSpec { kind: executor.unwrap_or_else(|| "host".into()), image: None, options: serde_json::Value::Null },
+            executor: wire::ExecutorSpec { image: if executor.as_deref() == Some("docker") { image } else { None }, kind: executor.unwrap_or_else(|| "host".into()), options: serde_json::Value::Null },
             container: spec.container.clone(),
             services: spec.services.iter().cloned().collect(),
+            job_container: job.and_then(|j| j.container.clone()),
+            job_services: job.map(|j| j.services.clone()).unwrap_or_default(),
             steps: job.map(|j| j.steps.clone()).unwrap_or_default(),
             workflow_env: wf.env.clone(),
             job_env: job.map(|j| j.env.clone()).unwrap_or_default(),
             workflow_defaults: wf.defaults.clone(),
             job_defaults: job.map(|j| j.defaults.clone()).unwrap_or_default(),
             outputs: job.map(|j| j.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect()).unwrap_or_default(),
-            contexts: wire::Contexts { github: r.github.clone(), vars: r.vars.clone(), needs: spec.needs.clone(), strategy: spec.strategy.clone(), matrix: spec.matrix.clone(), inputs: spec.inputs.clone() },
+            contexts: wire::Contexts { github: r.github.clone(), vars, needs: spec.needs.clone(), strategy: spec.strategy.clone(), matrix: spec.matrix.clone(), inputs: spec.inputs.clone() },
             secrets,
             masks: Vec::new(),
             env_from,
@@ -566,15 +756,16 @@ impl Dispatch {
                 results_url: "/".into(),
                 runtime_token: token.clone(),
                 cache_url: "/".into(),
-                id_token_url: None,
-                id_token_request_token: None,
+                // ID tokens only with `permissions: id-token: write` (W10-R07, GitHub-exact).
+                id_token_url: id_tokens.then(|| "/_kiln/oidc/token?api-version=1".to_owned()),
+                id_token_request_token: id_tokens.then(|| token.clone()),
                 // The code host: kiln's mirror, which the leg's token reads (W14), at the
                 // server's root (`actions/checkout` keeps only the origin).
                 facade_url: "/".into(),
                 // GitHub's API as GHES serves it (W14-R11).
                 api_url: "/api/v3".into(),
                 graphql_url: "/api/graphql".into(),
-                github_token: token,
+                github_token: job_token,
                 cache_mode: Some(cache_mode.as_str().into()),
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
@@ -639,6 +830,10 @@ impl Dispatch {
     async fn finished(&mut self, agent: &str, r: JobResult) -> anyhow::Result<()> {
         self.hub.release_slot(agent, &r.job);
         self.hub.logs.finish(&r.job);
+        // The attempt's GITHUB_TOKEN dies with it (W10-R03).
+        if let Err(e) = super::token::revoke_leg(&self.hub, &r.job).await {
+            tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the job token could not be revoked");
+        }
         let Some(l) = self.legs.get(&r.job) else { return Ok(()) };
         let attempt = l.attempt;
         let outcome = match r.status {
@@ -675,7 +870,8 @@ impl Dispatch {
         let Some(run) = self.runs.get_mut(&l.run) else { return Ok(()) };
         run.seq += 1;
         let seq = run.seq;
-        let acts = run.plan.on_leg_finished(&l.key, report.clone(), &Source { files: &HashMap::new() });
+        let files = Arc::clone(&run.files);
+        let acts = run.plan.on_leg_finished(&l.key, report.clone(), &Source { files: &files });
         runs::log(&self.hub, &l.run, seq, "leg", Some(l.key.clone()), Some(report_json(&report))).await?;
         self.actions(&l.run, acts).await
     }
@@ -690,7 +886,8 @@ impl Dispatch {
         }
         r.seq += 1;
         let seq = r.seq;
-        let acts = r.plan.on_cancel(&Source { files: &HashMap::new() });
+        let files = Arc::clone(&r.files);
+        let acts = r.plan.on_cancel(&Source { files: &files });
         runs::log(&self.hub, run, seq, "cancel", None, Some(serde_json::json!({ "reason": reason }).to_string())).await?;
         Box::pin(self.actions(run, acts)).await
     }
@@ -726,7 +923,8 @@ impl Dispatch {
         };
         let row = self.hub.store.run(run.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("no run"))?;
         let repo = self.hub.store.repos().await?.into_iter().find(|r| r.id == row.repo_id).ok_or_else(|| anyhow::anyhow!("no repository"))?;
-        let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &HashMap::new() }).map_err(|e| anyhow::anyhow!(e))?;
+        let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
+        let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &files }).map_err(|e| anyhow::anyhow!(e))?;
         let run_owned = run.to_owned();
         let log: Vec<(i64, String, Option<String>, Option<String>)> = self.hub.store.call(move |c| {
             let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 ORDER BY seq")?;
@@ -738,11 +936,11 @@ impl Dispatch {
             seq = s;
             match kind.as_str() {
                 "cancel" => {
-                    let _ = plan.on_cancel(&Source { files: &HashMap::new() });
+                    let _ = plan.on_cancel(&Source { files: &files });
                 }
                 _ => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
-                    let _ = plan.on_leg_finished(leg.as_deref().unwrap_or_default(), rep, &Source { files: &HashMap::new() });
+                    let _ = plan.on_leg_finished(leg.as_deref().unwrap_or_default(), rep, &Source { files: &files });
                 }
             }
         }
@@ -753,9 +951,10 @@ impl Dispatch {
             Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
-        let event = Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() };
+        let event = v.get("event").and_then(|e| serde_json::from_value::<Event>(e.clone()).ok()).unwrap_or_else(|| Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() });
         let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq };
+        let path = run_path(&input.github);
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
@@ -893,4 +1092,11 @@ fn cache_access(spec: &kiln_ci::plan::LegSpec, r: &RunSt) -> (kiln_ci::store::ca
         }
     }
     (mode, access)
+}
+
+/// A run's workflow file, from `github.workflow_ref` (`owner/repo/<path>@<ref>`).
+fn run_path(github: &serde_json::Value) -> String {
+    let r = github.get("workflow_ref").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let repo = github.get("repository").and_then(serde_json::Value::as_str).unwrap_or_default();
+    r.strip_prefix(repo).map(|x| x.trim_start_matches('/')).and_then(|x| x.rsplit_once('@')).map(|(p, _)| p.to_owned()).unwrap_or_default()
 }

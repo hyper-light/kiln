@@ -4,7 +4,9 @@
 //! - [`commands`]: workflow commands.
 //! - [`envfiles`]: `$GITHUB_ENV`, `$GITHUB_OUTPUT`, `$GITHUB_STATE`, `$GITHUB_PATH`, summaries.
 //! - [`mask`]: masking, across chunks.
+//! - [`matchers`]: problem matchers.
 
 pub mod commands;
 pub mod envfiles;
 pub mod mask;
+pub mod matchers;

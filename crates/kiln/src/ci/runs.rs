@@ -101,15 +101,31 @@ pub async fn insert_leg(hub: &Hub, run: &str, id: &str, spec: &LegSpec, status: 
     let index = spec.strategy.get("job-index").and_then(serde_json::Value::as_f64).map(|v| v as i64);
     let group = spec.concurrency.as_ref().map(|g| g.group.clone());
     let steps: Vec<String> = spec.def().map(|j| j.steps.iter().map(step_name).collect()).unwrap_or_default();
+    // The jobs it needs, as their full ids: a called workflow's jobs need their siblings.
+    let prefix = spec.job.rsplit_once('/').map(|(p, _)| format!("{p}/")).unwrap_or_default();
+    let needed: Vec<String> = spec.needs.as_object().map(|o| o.keys().map(|k| format!("{prefix}{k}")).collect()).unwrap_or_default();
     hub.store
         .call(move |c| {
             let tx = c.transaction()?;
             let now = crate::util::now_unix();
             let terminal = status.is_terminal();
+            // The legs of those jobs, by key, which is what the run's graph links (W21).
+            let mut needs: Vec<String> = Vec::new();
+            for n in &needed {
+                let mut q = tx.prepare("SELECT key FROM jobs WHERE run_id = ?1 AND job_id = ?2 ORDER BY rowid")?;
+                for k in q.query_map(params![run, n], |r| r.get::<_, String>(0))? {
+                    needs.push(k?);
+                }
+            }
+            let needs_json = serde_json::to_string(&needs).unwrap_or_else(|_| "[]".into());
+            let mut planned: serde_json::Value = serde_json::from_str(&planned).unwrap_or_default();
+            if let Some(o) = planned.as_object_mut() {
+                o.insert("needs".into(), serde_json::json!(needs));
+            }
             tx.execute(
                 "INSERT INTO jobs (id, run_id, key, display, status, labels, needs, spec, attempt, queued_at, finished_at, error, job_id, matrix, leg_index, leg, concurrency_group)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![id, run, key, display, status.as_str(), labels, planned, (!terminal).then_some(now), terminal.then_some(now), error, job, matrix, index, leg, group],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?16, ?7, 1, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![id, run, key, display, status.as_str(), labels, planned.to_string(), (!terminal).then_some(now), terminal.then_some(now), error, job, matrix, index, leg, group, needs_json],
             )?;
             for (i, name) in steps.iter().enumerate() {
                 let st = if terminal { "skipped" } else { "pending" };

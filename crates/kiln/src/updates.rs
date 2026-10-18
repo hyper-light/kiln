@@ -402,7 +402,7 @@ fn short(commit: &str) -> &str {
 /// every other platform upgrade to once it succeeds (`adopts`).
 pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) -> anyhow::Result<crate::store::Run> {
     let u = &hub.cfg.updates;
-    let t = crate::gitops::Trigger { event: "manual", branch: u.release_branch.clone(), sha: commit.to_owned(), before: None, pipeline: Some(u.release_pipeline.clone()) };
+    let t = crate::gitops::Trigger { event: "manual", branch: u.release_branch.clone(), sha: commit.to_owned(), before: None, pipeline: Some(u.release_pipeline.clone()), payload: None };
     let runs = crate::gitops::trigger(hub, repo, t).await?;
     runs.into_iter().next().ok_or_else(|| anyhow::anyhow!("{} has no pipeline called {} at {}", u.release_repo, u.release_pipeline, short(commit)))
 }
@@ -1610,9 +1610,11 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
     "kiln-agent".to_owned()
 }
 
-/// What a runner announces after Hello ([`AgentMsg::Build`]).
+/// What a runner announces after Hello ([`AgentMsg::Build`]): what this build can do, and
+/// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
 pub fn runner_build() -> AgentMsg {
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS }
+    let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it

@@ -173,26 +173,26 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | --- | --- | --- | --- | --- |
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
-| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; push, tag, PR, manual from polling |
-| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit); preview and fixtures left |
+| W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
+| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host executor; background steps, matchers, containers left |
-| W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local; `actions/checkout@v4` unmodified; Docker, `$/`, policy left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps left |
+| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
-| W09 | Secrets and variables | W01 | ready | |
-| W10 | Identity, tokens, OIDC issuer | none | ready | |
-| W11 | Integrations and credential broker | W10 | blocked (W10) | |
+| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing); principals and roles left |
+| W11 | Integrations and credential broker | W10 | ready (OIDC issuer) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
-| W13 | Runners and executors | W06 | ready (facts, docker) | |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (artifacts, 501s); hosting, review left |
+| W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images; probes, pools, microVMs, k8s left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | blocked (W04) | |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
 | W17 | Debugging | W06, W13 | blocked (W06) | |
 | W18 | Supply chain, untrusted code | W10, W13 | blocked (W10) | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
-| W21 | UI | each backend it shows | ready (runs and DAG, editor) | |
-| W22 | Conformance, e2e, performance | grows with the rest | ready (harness) | |
+| W21 | UI | each backend it shows | in progress | the CI API the pages read (runs, graph, legs, annotations, summaries, artifacts, routing explain); the pages left |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC02: 39 of F-21's 50 green, the rest waiting on W14, W18, accounts |
 
 ---
 
@@ -1135,27 +1135,52 @@ creates runs. The schedule loop moves to `ci/schedule.rs` with a time-zone-aware
 **Progress.** In progress.
 
 - *Done.*
-  - `kiln_ci::trigger`:
-    - `event` (R01);
-    - `matcher` (R03, R09, every "no" with its reason);
-    - `pattern` (R04, every row of GitHub's cheat sheet, AC02);
-    - `skip` (R06, AC03);
-    - `cron` (R10 with time zones and DST, AC06's two 2026 transitions in Berlin and New York;
-      `jitter`);
-    - `context`: the `github` context, and payloads for push, pull request, dispatch and schedule
-      (R07).
-  - `crates/kiln/src/ci/events.rs`: the server path. gitops' push, tag, pull-request and manual
-    triggers become events, with changed files (R05), commit messages and payloads. Matching
-    workflows start runs. A broken workflow gets a `startup_failure` run listing its diagnostics.
-    v1's auto-detected pipeline stands aside when GitHub workflows run. All of this is behind
-    `[ci] enabled`.
-  - Checked end to end on a local server: push → matrix legs → needs → outputs.
+  - `kiln_ci::trigger`, pure code:
+    - `event` (R01).
+    - `matcher` (R03, R09), with a reason for every "no".
+    - `pattern` (R04): every row of GitHub's cheat sheet (AC02).
+    - `skip` (R06, AC03).
+    - `cron` (R10): time zones and DST, with AC06's two 2026 transitions in Berlin and New York;
+      `jitter`; humane durations.
+    - `context`: the `github` context, and payloads for push, pull request, dispatch, schedule and
+      `workflow_run` (R07).
+    - `dispatch`: `workflow_dispatch` inputs, typed and checked, with GitHub's messages (R11).
+    - `github`: webhook deliveries as events, with GitHub's ref and commit for each event and
+      forks untrusted (R07, R08).
+  - `crates/kiln/src/ci/`:
+    - `events.rs`, the one path from an event and a workflow to a run:
+      - polled pushes, tags, pull requests and manual runs, with changed files (R05);
+      - `startup_failure` runs for broken workflows;
+      - `workflow_dispatch` and `repository_dispatch` (R11);
+      - `workflow_run` (`requested`, `in_progress` and `completed`), with chains stopping at
+        three levels (R13).
+    - `schedule.rs` (R10): every entry fires once a minute at most, recorded in
+      `ci_schedule_fires`, with kiln's opt-in `timezone`, `jitter`, `branch`, `inputs`,
+      `skip-if-unchanged` and `catch-up`.
+    - `hooks.rs`:
+      - GitHub's webhooks with their payloads;
+      - one trigger for a move a webhook and a poll both see, via a ref compare-and-set
+        (`Store::advance_ref`) that polls use too;
+      - redeliveries ignored for 24 hours (R14).
+    - The dispatch routes: `/api/ci/repos/:repo/workflows/<path>/dispatches`,
+      `/api/ci/repos/:repo/dispatches`, and the facade's `/api/v3/…/dispatches` for a trusted
+      run's token.
+  - All of it is behind `[ci] enabled`. With it off, a webhook only hints that a poll is due, as
+    before.
+  - Checked end to end on a local server:
+    - push, then matrix legs, needs and outputs;
+    - a per-minute schedule firing once a minute;
+    - dispatches with typed inputs, and their refusals;
+    - `repository_dispatch`;
+    - `workflow_run` after each run;
+    - an `issue_comment` delivery, and its redelivery doing nothing;
+    - a push both delivered and polled, running once.
 - *Left.*
-  - Webhook and App payloads passed through (today the webhook only wakes the poll).
-  - The schedule loop for GitHub workflows, dedup (R14) and `repository_dispatch`.
-  - `workflow_run` and `pipeline` events from finished runs.
-  - kiln's native events, with W14, W15 and W20.
-  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05.
+  - The App's events (with W14-R10).
+  - kiln's native events (with W14, W15 and W20).
+  - kiln dialect raising the `workflow_run` depth.
+  - AC01's full documentation table, AC04 (the vendored webhook schemas), AC05 as an integration
+    test, AC07 to AC09.
 
 ### W04 Planner: graph, matrices, reusable workflows, outputs
 
@@ -1401,10 +1426,19 @@ contexts to every later evaluation, and plan previews to W20 and W21.
   - `preview` (R29's core).
   - Tests: 42 unit tests (AC03 to AC06, S01 to S05) and the AC02 property test.
   - `ci/runs.rs` persists runs and legs; `ci_plans` and `ci_plan_log` rebuild a plan by replay.
+  - Reusable workflows reach the planner (`ci/reusable.rs`): the commit's own files, and remote
+    ones pinned through W07's mirror, nested; checked end to end on a local server.
+  - R29: `POST /api/ci/plan-preview` (`crates/kiln/src/ci/preview.rs`). It takes a workflow
+    being edited or a commit's, for any event at a ref and commit. It returns:
+    - diagnostics;
+    - whether the event starts it, and why not, including action-policy refusals;
+    - the plan the dispatcher makes with a real run's contexts, variables and reusable
+      workflows, each leg with its routing against the runners connected now (W05-R20);
+    - the decisions and their reasons;
+    - the combinations `exclude` and `where` removed;
+    - the jobs decided only once their needs finish.
 - *Left.*
-  - `POST /api/ci/plan-preview`.
   - Fixtures F-10 to F-15, AC07 and AC08 end to end.
-  - Remote reusable workflows (W07's mirror).
   - The live checks of AC04 and AC06.
 
 ### W05 Scheduler: queues, concurrency, priorities, routing, retries
@@ -1879,9 +1913,21 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     - a step's background processes kept until the leg ends.
   - `uses:` steps (W07), with pre and post steps (R11).
   - Runners announce `CAP_CI2` and `CAP_ACTIONS`.
+  - Problem matchers (R06), GitHub-exact, in `kiln_ci::runner::matchers`:
+    - matchers last the job; newer ones come first and replace an owner's;
+    - multi-line patterns, with `loop`;
+    - .NET's regular expressions (lookaround included);
+    - GitHub's validation messages.
+    A matched line becomes an annotation in its place. Its file is kept when it is one of the
+    repository's. setup-node's tsc matcher annotated a real type error end to end.
+  - A command that fails fails its step, as on GitHub, with "Unable to process command '…'
+    successfully.": an unreadable matcher file, a disabled `set-env`, a bad `echo` value.
 - *Left.*
-  - Background steps (R17), problem matchers, `KILN_OUTPUT_JSON` and `exports`.
-  - Job containers and services (W13), debug (R13).
+  - Background steps (R17). The plan: a background step's process runs in its own task, with
+    its own masker and command processor. Its environment, path and outputs are applied at its
+    `wait`, in declared order.
+  - `KILN_OUTPUT_JSON` and `exports`.
+  - Debug (R13).
   - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.
 
 ### W07 Actions
@@ -2005,13 +2051,27 @@ Gives step execution for `uses:`.
       - `pre`, `post`, `pre-if`, `post-if` and `STATE_*` (W06-R11).
     - R07: composite actions, with their own `steps` context, inputs, outputs and nesting.
     - R08: outputs.
+    - R06: Docker actions (Dockerfile and `docker://`), on hosts with Docker (W13).
   - `actions/checkout@v4` runs unmodified end to end against the git facade (W14).
+  - R01's `$/path`: resolved to the run's own commit and served from the repository's mirror,
+    to that repository's legs only. No checkout is needed.
+  - R02 through reusable workflows: their calls are followed when the run starts, and the
+    actions of the workflows they call are pinned with the rest.
+  - R04 (`kiln_ci::policy`, AC05's unit tests):
+    - `[ci.actions] allow`, `deny`, `require_sha_pins` (`KCI4021`) and `prefetch`;
+    - repositories' own narrower policies (`/api/ci/actions/policy?repo=`, `kiln actions
+      policy`);
+    - checked on every call and action before the run starts; a refusal is the run's startup
+      failure, and the plan preview lists refusals too;
+    - each run's resolutions audited: who, which ref, which commit;
+    - `kiln actions sync` mirrors `prefetch`.
+  - R12: `GET /api/ci/actions?q=` (`kiln actions list`): the mirrored actions, their newest
+    versions and their `action.yml`.
 - *Left.*
-  - R01's `$/path`, `docker://`, `kiln://` and `kiln/*`.
-  - R06 Docker actions, with W13.
+  - R01's `kiln://` and `kiln/*`.
   - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
     tarballs in W08's store (today they are files under `<data>/actions/tar`).
-  - R04, R09 beyond checkout (with W14's REST facade), R10, R11, R12.
+  - R09 beyond checkout (with W14's REST facade), R10, R11, R12's built-ins.
   - musl Node for Alpine job containers, with W13.
   - AC01 to AC06.
 
@@ -2311,7 +2371,38 @@ and masking), names to the editor's completion (W21; names only).
 - **W09-AC09 Rotation.** `rotate-key` re-wraps every value; runs keep working throughout.
   *Integration test.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - `kiln_ci::secrets`, pure code:
+    - names and scopes, and which scope wins (R01, R02, AC03);
+    - which secrets a job reads, and what a called workflow's leg gets (R04, R05);
+    - declared secrets (R06): `KCI4041` from the validator, `KCI4040` at run start.
+  - `crates/kiln/src/ci/secrets.rs` (R03, R09):
+    - AES-256-GCM under a data key wrapped by the master key file, ciphertexts bound to scope and
+      name;
+    - rotation;
+    - the config's `[secrets]` as server scope;
+    - uses recorded;
+    - variables.
+  - Each trusted leg gets exactly the secrets it references, plus `GITHUB_TOKEN`; untrusted runs
+    get only the token (R04).
+  - The API (names only) and the CLI: `kiln secrets`, `kiln vars` (R11).
+  - Checked end to end on a local server:
+    - resolution across the repository, server, workflow and organization scopes;
+    - AC05, a workflow-scoped secret invisible to another workflow;
+    - AC04, each leg receiving only its references, read from the recorded uses;
+    - masking;
+    - `vars` by scope;
+    - AC01, no stored value anywhere in the data directory;
+    - AC09, rotation with runs still working.
+- *Left.*
+  - Environment secrets after approval, `SecretsFor` (R04, AC07), with W15.
+  - R07 (kiln actions' declared secrets).
+  - R08 (brokered, W11).
+  - R10 (secret outputs).
+  - The UI (W21).
+  - AC02 as a route walk, AC06 as an integration test, AC08 (fork pull requests, with W18).
 
 ### W10 Identity: tokens, principals, OIDC issuer
 
@@ -2407,7 +2498,50 @@ elsewhere (G-24, G-33).
   reading them over HTTPS accepts (checked by a verifier that fetches only from that location).
   *Integration test.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - Job tokens (R03, R04):
+    - `GITHUB_TOKEN` is `kiln_job_<leg>_<random>`, stored as its SHA-256 hash with its last use,
+      carrying the job's permissions;
+    - it is revoked when its attempt ends;
+    - the facade checks it with GitHub's mapping (git fetches need `contents: read`, and so on),
+      refusing with "Resource not accessible by integration";
+    - `ACTIONS_RUNTIME_TOKEN` stays the leg's signed JWT (W08-R04).
+  - The OIDC issuer:
+    - `kiln_ci::oidc`: rotation, claims, subjects and the discovery document (R06, R08, R09, AC05,
+      AC06);
+    - `crates/kiln/src/ci/oidc.rs`: RS256 keys sealed by the master key, the open discovery and
+      JWKS documents, and `/_kiln/oidc/token` for legs granted `id-token: write` (R07);
+    - untrusted runs get no ID tokens unless `[ci.oidc] untrusted` (R10).
+  - Workload tokens (R11, the CD half): `kiln_ci::oidc::workload_claims` gives a CD sync a deploy
+    job's subject (`repo:<owner>/<repo>:environment:<env>`), so one trust policy per environment
+    covers both; `kiln_source`, `kiln_app`, `kiln_deployment` and `kiln_trigger` tell them apart.
+    `ci::oidc::mint` signs them for the broker (W11).
+  - Publishing (R12): `/api/ci/oidc` (status, `jwks-export`, `rotate`, `publish`); `kiln oidc
+    status | jwks | publish --to <dir> | rotate [--now]`; `[ci.oidc] publish_dir`, rewritten by
+    the hourly upkeep and at each rotation, each file replaced by rename. AC07: a verifier that
+    reads only the published files accepts the signing and next keys' tokens and refuses
+    unpublished keys, forged bodies and other issuers.
+  - Checked end to end on a local server:
+    - AC03: `core.getIDToken('sts.amazonaws.com')` returns a token that verifies against the
+      published keys, with GitHub's claims;
+    - no ID token variables without the permission;
+    - the token permissions;
+    - a token refused once its attempt ended;
+    - `kiln oidc` publishing to a directory, and a rotation's next key published at once;
+    - AC04's Vault case: unmodified `hashicorp/vault-action` logged in to a Vault dev server whose
+      JWT auth trusts kiln's issuer by discovery, and read a secret (a role bound to the
+      branch's subject).
+- *Left.*
+  - R01, R02 and R05: principals, capabilities, roles, and the one route table, from access.md.
+  - PATs and agent tokens (R03).
+  - Kiln's own permission scopes (R04).
+  - Per-repository subject customization (R09; server-wide today).
+  - R11's service and agent subjects (`kiln:<server-id>:service:<name>`, `kiln:agent:<session>`).
+  - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
+    issuer paths, and the Settings → OIDC page (W21).
+  - AC01, AC02, AC04's cloud cases (AWS, Google Cloud, Azure: test tenants, user-assisted).
 
 ### W11 Integrations and the credential broker
 
@@ -2481,7 +2615,10 @@ catalog; this section is the machinery.
 - **W11-AC05 Model providers.** An agent kiln starts calls the Anthropic API with a federated
   token and no stored API key. *E2E, user-assisted.*
 
-**Progress.** Not started.
+**Progress.** Not started. Ownership, agreed 2026-10-18: the Kiln CD lane builds the registry and
+the exchanges (`crates/kiln/src/ci/integrations/`, each kind's `mint()`), on W10's
+`workload_claims` and `ci::oidc::mint`; this lane wires them into jobs (`integrations:`, `kiln
+auth`, W11-R03, R04).
 
 ### W12 Registries
 
@@ -2715,7 +2852,37 @@ enforcement points to W18, agent isolation to W20.
   enabled ends with a runner whose facts and executors are correct, without editing files by hand.
   *E2E, user-assisted for the VM.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.* `crates/kiln/src/runner/docker.rs`, on the host executor through Docker or Podman
+  (R03, R08), as GitHub's self-hosted runner does it:
+  - job containers with GitHub's mounts, steps run through `docker exec` with paths
+    translated;
+  - services on a per-leg network, health checks awaited, ports published, with the
+    `job.services` context;
+  - teardown;
+  - Docker actions (W07-R06);
+  - `CAP_DOCKER` announced when a CLI answers.
+- *Done.* R04's `docker` executor:
+  - a leg runs in a fresh container of its routing rule's image, without the host's Docker
+    socket;
+  - GitHub's Ubuntu labels prefer it where the runner has Docker, and run on the host otherwise;
+  - `kiln/runner-ubuntu-24.04` and `-22.04` are built on the runner the first time a leg needs
+    one, from a Dockerfile kiln carries. Each build is tagged by its Dockerfile's digest, so a
+    changed one is built again;
+  - laid out as GitHub's hosted runners are:
+    - the tool cache at `/opt/hostedtoolcache`, kept per image on the host;
+    - `ImageOS`;
+    - steps run as `runner`, a user with the host's uid and gid and passwordless sudo (root on
+      a rootless engine), so what they write stays the host user's;
+  - container and network names carry the whole leg id and a suffix of their own;
+  - `ubuntu-latest` legs ran `setup-python`, `setup-ruby`, `setup-beam`, `setup-php`,
+    `setup-r`, `flutter-action` and the rest of W22-AC02's second batch in it end to end.
+- *Left.*
+  - R01's probes and R02.
+  - The `firecracker`, `shards` and `k8s` executors (R05 to R07).
+  - Pools, opt-in Docker access and images built in kiln (R09 to R15).
+  - The ACs.
 
 ### W14 Code hosting, stacked diffs, review and landing
 
@@ -2876,11 +3043,24 @@ adapts [review.md](review.md), which it replaces.
   - served at the root of the server's origin (§2.6);
   - open to a leg's token only, and each token reads only its own run's repository.
   - `actions/checkout@v4` with default settings runs unmodified.
-- *REST so far.* `crates/kiln/src/ci/rest.rs`, at `/api/v3`:
+- *REST so far.* `crates/kiln/src/ci/rest/`, at `/api/v3`, each route checking the job token's
+  permissions with GitHub's mapping:
   - the artifact endpoints (`download-artifact` across runs);
-  - 501 "not implemented by kiln" with a warning on the leg for everything else;
+  - the dispatches;
+  - the repository's reads from the mirror: repository, commits (with files), branches, refs,
+    contents, tarballs and zipballs, compare;
+  - commit statuses with the combined status, and check runs;
+  - releases, with assets uploaded to `upload_url` (`/api/uploads/…`) and served by
+    `browser_download_url`;
+  - `/user`, `/rate_limit`;
+  - 501 "not implemented by kiln", with a warning on the leg, for everything else;
   - GraphQL answering the same;
   - GitHub-shaped run links redirected to kiln's pages.
+  - Checked end to end:
+    - `github-script` (statuses, checks, repository, commit, contents);
+    - `docker/metadata-action`;
+    - `softprops/action-gh-release` with an asset;
+    - `actions/checkout` unpacking the tarball where git is missing.
 - *Left.* Everything else: the rest of R11's REST subset and GraphQL, hosting (R01, R02), review,
   landing, the App, the schema, and AC01 to AC07.
 
@@ -3435,7 +3615,20 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
 - **W21-AC04** The runs list with 1,000,000 runs shows its first page in < 100 ms of server time and
   scrolls without blanking. *UI bench.*
 
-**Progress.** Not started.
+**Progress.** In progress: the data comes first.
+
+- *Done.* The API the pages read (§4.1), in `crates/kiln/src/ci/runs_api.rs`:
+  - runs, with filters and cursor paging;
+  - a run with its legs;
+  - the graph, with needs edges and the critical path;
+  - annotations, summaries and artifacts;
+  - cancel, and rerun (mode `all`);
+  - a leg with its steps and annotations, its logs, and routing explain;
+  - caches.
+- Legs of the engine already show on today's run page (steps, logs). Their graph edges come from
+  the needed legs' keys.
+- *Left.* Every page and component of this workstream: runs, the run graph, the leg page, the
+  editor and the rest, with the UI acceptance criteria in Chromium and WebKit.
 
 ### W22 Conformance, end-to-end and performance testing
 
@@ -3495,7 +3688,48 @@ live cluster, fault injection, security, performance, and mixed-version fleets.
   the CI work (no `CAP_CI2`) and runners at the new version: v1 jobs keep running on old runners, v2
   legs wait on old runners with `capability` and run on new ones, nothing fails because of the mix.
 
-**Progress.** Not started.
+**Progress.** In progress: the local harness only.
+
+- *Done.* A throwaway server with the built-in agent (see the W03 to W14 progress notes) runs
+  fixture workflows end to end.
+- *AC02, first batch* (16 actions, 2026-10-18):
+  - Green: `setup-node`, `setup-go`, `setup-java`, `setup-uv`, `pnpm/action-setup`,
+    `setup-bun`, `dtolnay/rust-toolchain`, `setup-terraform`, `docker/metadata-action`,
+    `github-script`, `softprops/action-gh-release`, `actions/cache`, `upload-artifact`,
+    `download-artifact` and `checkout`.
+  - Failed, and why:
+    - `setup-buildx`, `cosign-installer`, `setup-deno` and `setup-zig`: the host's DNS failed
+      during the run. All four passed in the second batch.
+- *AC02, second batch* (2026-10-18): 20 new actions green.
+  - In the `docker` executor: `setup-deno`, `setup-zig`, `cosign-installer`, `setup-dotnet`,
+    `actions-rust-lang/setup-rust-toolchain`, `taiki-e/install-action`, `goreleaser-action`,
+    `setup-beam`, `setup-ruby`, `setup-php`, `setup-gradle` (with `setup-java`),
+    `haskell-actions/setup`, `setup-r`, `setup-julia`, `flutter-action` and `setup-gcloud`.
+  - On the host: `setup-buildx-action`, `login-action`, `metadata-action` and
+    `build-push-action` pushing to a registry service; `golangci-lint-action`.
+- *AC02, third batch* (2026-10-18): `Swatinem/rust-cache` (with its cache), `dorny/paths-filter`
+  on a push, and `hashicorp/vault-action`. vault-action logged in to a local Vault dev server whose
+  JWT auth trusts kiln's issuer by discovery, with a role bound to `repo:acme/e2e:ref:refs/heads/main`,
+  and read a secret. rust-cache's earlier misses were the harness's: no toolchain in the isolated
+  home, then a stray `/tmp/Cargo.toml` above the fixture.
+  - Fixes found on the way:
+    - colliding container names;
+    - root-owned files from container steps;
+    - images that never rebuilt;
+    - the hosted runner's tool cache and `ImageOS`;
+    - problem matchers.
+  - Left of F-21:
+    - `labeler`, `create-pull-request`, `actions-gh-pages` and `upload-sarif`: W14's REST and
+      push;
+    - `attest-build-provenance`: W18;
+    - `setup-qemu-action`: it changes the kernel's binfmt, so it needs a disposable runner;
+    - `codecov`, `configure-aws-credentials`, `amazon-ecr-login`, `google-github-actions/auth`
+      and `azure/login`: accounts (W11-AC03).
+    - `setup-python`: GitHub's `python-versions` manifest has builds for Ubuntu only, and the
+      host is not Ubuntu. *Fixed:* `ubuntu-latest` legs now run in kiln's Ubuntu runner image
+      (W13-R04), where it installs CPython 3.12.
+- *Left.* Everything else: AC01 and AC03 to AC09, `docs/ci-conformance.md`, and the rest of
+  F-21.
 
 ---
 

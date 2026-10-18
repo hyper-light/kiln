@@ -17,6 +17,7 @@ use kiln_ci::expr::{self, Budget, Condition, Contexts, Dialect, ExprError, Statu
 use kiln_ci::runner::commands::{self, Line, Processor};
 use kiln_ci::runner::envfiles::{self, PrependPath};
 use kiln_ci::runner::mask::Masker;
+use kiln_ci::runner::matchers;
 use kiln_ci::wf::ir::{Step, Tpl, YVal};
 use kiln_ci::wf::validate::{Site, options};
 use kiln_ci::wire::{AssignmentV2, Conclusion, JobEventV2};
@@ -41,6 +42,8 @@ pub struct Leg {
 enum Run<'a> {
     Script { script: &'a str, shell: Option<&'a str> },
     Program { prog: String, args: Vec<String> },
+    /// A Docker action's container (W07-R06): `docker run` with GitHub's mounts.
+    Container { cli: super::docker::Cli, image: String, entrypoint: Option<String>, args: Vec<String> },
 }
 
 /// What a process left: how it ended, its outputs and its saved state (`$GITHUB_STATE`).
@@ -82,8 +85,11 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(work: &Path, leg: &str, repo: &str) -> Layout {
+    /// `hosted` is the `docker` executor's image: its tools are kept apart from the host's, as
+    /// they are built for another system.
+    fn new(work: &Path, leg: &str, repo: &str, hosted: Option<&str>) -> Layout {
         let digest = crate::util::sha256_hex(leg.as_bytes());
+        let tools = work.join("_tool");
         let runner_workspace = work.join("w").join(digest.get(..8).unwrap_or("leg"));
         let name = repo.rsplit('/').next().unwrap_or("repo");
         let temp = runner_workspace.join("_temp");
@@ -91,10 +97,28 @@ impl Layout {
             workspace: runner_workspace.join(name),
             commands: temp.join("_runner_file_commands"),
             temp,
-            tool_cache: work.join("_tool"),
+            tool_cache: match hosted {
+                Some(image) => tools.join(image.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' }).collect::<String>()),
+                None => tools,
+            },
             runner_workspace,
         }
     }
+}
+
+/// `p` with `.` and `..` resolved by name, as .NET's `GetFullPath` does.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// How a step ended.
@@ -189,6 +213,23 @@ struct State {
     next_idx: u32,
     /// `GITHUB_SERVER_URL` as the leg reaches it, which [`NOT_GHES`] stands in for.
     server_url: String,
+    /// The leg's containers (W13-R08): its network, services and job container.
+    containers: Option<super::docker::Containers>,
+    /// The problem matchers steps added (W06-R06).
+    matchers: matchers::Job,
+}
+
+/// What reading one process's output keeps.
+struct Reading {
+    proc: Processor,
+    /// The line so far.
+    line: Vec<u8>,
+    /// From the deprecated `set-output` command.
+    set_output: BTreeMap<String, String>,
+    matchers: matchers::Step,
+    /// A command failed (an unreadable matcher file, a disabled command): the step fails, as on
+    /// GitHub.
+    failed: bool,
 }
 
 /// The `GITHUB_SERVER_URL` actions that refuse GitHub Enterprise Server see (docs/ci.md
@@ -222,7 +263,13 @@ impl State {
         values.push(("github", self.github.clone()));
         values.push(("env", str_map(&self.env)));
         values.push(("secrets", str_map(&self.secrets)));
-        values.push(("job", Value::object([("status".to_owned(), Value::str(if self.cancelled { "cancelled" } else if self.failed { "failure" } else { "success" }))])));
+        let mut job = vec![("status".to_owned(), Value::str(if self.cancelled { "cancelled" } else if self.failed { "failure" } else { "success" }))];
+        if let Some(c) = &self.containers {
+            let (container, services) = c.contexts();
+            job.push(("container".to_owned(), Value::from_json(&container)));
+            job.push(("services".to_owned(), Value::from_json(&services)));
+        }
+        values.push(("job", Value::object(job)));
         let steps = Value::object(self.steps.iter().filter_map(|d| {
             let id = d.id.clone()?;
             Some((
@@ -426,7 +473,7 @@ impl Leg {
     async fn run_inner(&self) -> anyhow::Result<Status> {
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
-        let layout = Layout::new(&self.work_dir, &a.job_id, &a.repo);
+        let layout = Layout::new(&self.work_dir, &a.job_id, &a.repo, self.hosted_image());
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         crate::rt::blocking(move || -> std::io::Result<()> {
@@ -493,6 +540,8 @@ impl Leg {
             posts: Vec::new(),
             next_idx: u32::try_from(a.steps.len()).unwrap_or(u32::MAX),
             server_url: a.runtime.facade_url.clone(),
+            containers: None,
+            matchers: matchers::Job::default(),
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -515,6 +564,13 @@ impl Leg {
         st.allow_unsecure = st.env.get("ACTIONS_ALLOW_UNSECURE_COMMANDS").is_some_and(|v| v == "true");
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
         let mut timed_out = false;
+        let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
+        if (a.job_container.is_some() || !a.job_services.is_empty() || executor_container) && !self.init_containers(&mut st).await {
+            if let Some(c) = &st.containers {
+                c.stop().await;
+            }
+            return Ok(Status::Failed);
+        }
         self.pre_steps(&mut st, deadline).await;
         for (idx, step) in a.steps.iter().enumerate() {
             let idx = u32::try_from(idx).unwrap_or(u32::MAX);
@@ -530,6 +586,13 @@ impl Leg {
         }
         self.job_outputs(&st).await;
         self.post_steps(&mut st, deadline).await;
+        if let Some(c) = st.containers.take() {
+            let idx = st.next_idx;
+            st.next_idx += 1;
+            self.start(idx, "Stop containers", "internal", None).await;
+            c.stop().await;
+            self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Success, conclusion: Conclusion::Success, exit_code: None, outputs: BTreeMap::new() }).await;
+        }
         // The leg's processes end with it (GitHub's "Cleaning up orphan processes").
         for g in &st.groups {
             crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={}", a.job_id));
@@ -690,6 +753,113 @@ impl Leg {
         }
     }
 
+    /// Where a Docker action sees the runner's directories (GitHub's mounts).
+    fn action_paths(&self, st: &State) -> super::docker::PathMap {
+        let l = &st.layout;
+        super::docker::PathMap::new(vec![
+            (l.workspace.clone(), "/github/workspace".into()),
+            (l.temp.join("_github_home"), "/github/home".into()),
+            (l.temp.join("_github_workflow"), "/github/workflow".into()),
+            (l.commands.clone(), "/github/file_commands".into()),
+            (l.temp.clone(), "/github/runner_temp".into()),
+        ])
+    }
+
+    /// A container spec from the job's `container` or a `services` entry, its keys evaluated.
+    fn container_spec(&self, st: &State, c: &kiln_ci::wf::ir::Container, image: Option<&String>, service: bool) -> Result<super::docker::Spec, String> {
+        let (site, creds, env_site) = if service { (Site::JobServices, Site::JobServiceCredentials, Site::JobServiceEnv) } else { (Site::JobContainer, Site::JobContainerCredentials, Site::JobContainerEnv) };
+        let image = match image {
+            Some(i) => i.clone(),
+            None => st.render(&c.image, site, "image")?,
+        };
+        let credentials = match &c.credentials {
+            Some((u, p)) => Some((st.render(u, creds, "credentials.username")?, st.render(p, creds, "credentials.password")?)),
+            None => None,
+        };
+        let mut env = Vec::new();
+        for (k, t) in &c.env {
+            env.push((k.clone(), st.render(t, env_site, &format!("env.{k}"))?));
+        }
+        let mut ports = Vec::new();
+        for p in &c.ports {
+            ports.push(st.value(p, site, "ports")?.coerce_string());
+        }
+        let mut volumes = Vec::new();
+        for v in &c.volumes {
+            volumes.push(st.render(v, site, "volumes")?);
+        }
+        let options = match &c.options {
+            Some(o) => Some(st.render(o, site, "options")?),
+            None => None,
+        };
+        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false, user: None })
+    }
+
+    /// "Initialize containers" (W13-R08): the leg's network, services and job container, before
+    /// its first step. Whether they started.
+    async fn init_containers(&self, st: &mut State) -> bool {
+        let idx = st.next_idx;
+        st.next_idx += 1;
+        self.start(idx, "Initialize containers", "internal", None).await;
+        let r = self.try_init_containers(st, idx).await;
+        let ok = r.is_ok();
+        if let Err(e) = r {
+            self.note(idx, &format!("Error: {e:#}")).await;
+            st.failed = true;
+        }
+        let c = if ok { Conclusion::Success } else { Conclusion::Failure };
+        self.event(&JobEventV2::StepFinished { idx, outcome: c, conclusion: c, exit_code: None, outputs: BTreeMap::new() }).await;
+        ok
+    }
+
+    /// The `docker` executor's image, when the leg runs in one rather than in its `container:`.
+    fn hosted_image(&self) -> Option<&str> {
+        let a = &self.a;
+        if a.job_container.is_none() && a.executor.kind == "docker" { a.executor.image.as_deref() } else { None }
+    }
+
+    async fn try_init_containers(&self, st: &mut State, idx: u32) -> anyhow::Result<()> {
+        let a = &self.a;
+        let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("this job uses `container:` or `services:`, and this runner has no working Docker or Podman"))?;
+        let config = st.layout.temp.join("_docker_config");
+        let l = &st.layout;
+        let repo = a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
+        let work = self.work_dir.clone();
+        let dirs = [config.clone(), l.temp.join("_github_home"), l.temp.join("_github_workflow"), work.join("_actions"), l.tool_cache.clone(), work.join("_externals")];
+        crate::rt::blocking(move || dirs.iter().try_for_each(std::fs::create_dir_all)).await??;
+        let map = super::docker::PathMap::new(vec![
+            (l.workspace.clone(), format!("/__w/{repo}/{repo}")),
+            (l.temp.join("_github_home"), "/github/home".into()),
+            (l.temp.join("_github_workflow"), "/github/workflow".into()),
+            (l.temp.clone(), "/__w/_temp".into()),
+            (work.join("_actions"), "/__w/_actions".into()),
+            // The `docker` executor's container is the machine, laid out as GitHub's hosted
+            // runners are (prebuilt tools expect it); a job's `container:` gets `/__t`.
+            (l.tool_cache.clone(), if self.hosted_image().is_some() { "/opt/hostedtoolcache".into() } else { "/__t".into() }),
+            (work.join("_externals"), "/__e".into()),
+        ]);
+        let workdir = map.translate(&l.workspace.to_string_lossy());
+        // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
+        let job = match (&a.job_container, &a.executor.image) {
+            (Some(c), _) => Some(super::docker::Spec { docker_socket: true, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
+            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), ..super::docker::Spec::default() }),
+            _ => None,
+        };
+        let mut services = Vec::new();
+        for (key, c) in &a.job_services {
+            services.push((key.clone(), self.container_spec(st, c, a.services.get(key), true).map_err(anyhow::Error::msg)?));
+        }
+        let said = parking_lot::Mutex::new(Vec::<String>::new());
+        let say = |m: String| said.lock().push(m);
+        let started = super::docker::Containers::start(super::docker::Cli::new(&bin, config), &a.job_id, map, &workdir, job, services, &say).await;
+        let lines = std::mem::take(&mut *said.lock());
+        for line in lines {
+            self.log(idx, format!("{}\r\n", st.masker.mask(&line)).into_bytes()).await;
+        }
+        st.containers = Some(started?);
+        Ok(())
+    }
+
     async fn start(&self, idx: u32, name: &str, kind: &str, action: Option<String>) {
         self.event(&JobEventV2::StepStarted { idx, name: name.to_owned(), kind: kind.to_owned(), action }).await;
     }
@@ -710,12 +880,18 @@ impl Leg {
     /// Runs a script or a program and processes what it prints and writes (W06-R05 to W06-R08).
     async fn exec(&self, st: &mut State, idx: u32, what: Run<'_>, wd: &Path, mut env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
         let id = crate::util::new_id();
+        let in_job = st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some() && !matches!(what, Run::Container { .. });
         let (file, body, shell) = match &what {
             Run::Script { script, shell } => {
-                let (ext, body) = script_file(*shell, script);
-                (Some(st.layout.temp.join(format!("{id}{ext}"))), body, *shell)
+                // In a job container without bash, the default shell is sh (GitHub-exact).
+                let shell = match shell {
+                    None if in_job && st.containers.as_ref().and_then(|c| c.job.as_ref()).is_some_and(|j| !j.has_bash) => Some("sh"),
+                    other => *other,
+                };
+                let (ext, body) = script_file(shell, script);
+                (Some(st.layout.temp.join(format!("{id}{ext}"))), body, shell)
             }
-            Run::Program { .. } => (None, String::new(), None),
+            Run::Program { .. } | Run::Container { .. } => (None, String::new(), None),
         };
         let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV"]
             .iter()
@@ -747,18 +923,46 @@ impl Leg {
         let sep = if cfg!(windows) { ';' } else { ':' };
         let base_path = std::env::var("PATH").unwrap_or_default();
         env.insert("PATH".into(), st.path.apply(env.get("PATH").map_or(base_path.as_str(), String::as_str), sep));
+        let mut container_run: Option<(super::docker::Cli, String, Option<String>, Vec<String>)> = None;
         let (prog, args) = match (what, &file) {
             (Run::Script { .. }, Some(f)) => shell_command(shell, f).map_err(|e| anyhow::anyhow!(e))?,
             (Run::Program { prog, args }, _) => (prog, args),
+            (Run::Container { cli, image, entrypoint, args }, _) => {
+                container_run = Some((cli, image, entrypoint, args));
+                (String::new(), Vec::new())
+            }
             (Run::Script { .. }, None) => anyhow::bail!("no script"),
         };
-        let mut cmd = Command::new(&prog);
-        cmd.args(&args).current_dir(wd).envs(&env);
+        let job_container = if in_job { st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c.cli.clone(), j.clone()))) } else { None };
+        let cmd = if let Some((cli, image, entrypoint, args)) = container_run {
+            // A Docker action: GitHub's mounts, every value by name.
+            let map = self.action_paths(st);
+            let mut inner: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), map.translate(v))).collect();
+            inner.remove("PATH");
+            inner.insert("HOME".into(), "/github/home".into());
+            inner.insert("GITHUB_WORKSPACE".into(), "/github/workspace".into());
+            let network = st.containers.as_ref().map(|c| c.network.clone());
+            let label = format!("kiln.leg={}", self.a.job_id);
+            let name = format!("kiln_{}_{}", self.a.job_id, id.get(id.len().saturating_sub(8)..).unwrap_or(&id));
+            let run_args = super::docker::action_run_args(&name, &label, network.as_deref(), &map.mounts(), &inner, entrypoint.as_deref(), &image, &args);
+            let mut c = Command::new(&cli.bin);
+            c.args(&run_args).envs(&inner);
+            c
+        } else if let Some((cli, j)) = job_container {
+            // A job container's step: `docker exec`, paths translated (W13-R08).
+            let mut inner: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.clone(), j.map.translate(v))).collect();
+            inner.insert("PATH".into(), st.path.apply(&j.path, ':'));
+            inner.insert("HOME".into(), j.home.clone());
+            let args: Vec<String> = args.iter().map(|a| j.map.translate(a)).collect();
+            cli.exec_command(&j.id, j.user.as_deref(), &j.map.translate(&wd.to_string_lossy()), &inner, &j.map.translate(&prog), &args)
+        } else {
+            let mut c = Command::new(&prog);
+            c.args(&args).current_dir(wd).envs(&env);
+            c
+        };
         let mut running = crate::proc::spawn_group(cmd)?;
         st.groups.push(running.pgid);
-        let mut proc = Processor::new(st.allow_unsecure);
-        let mut line: Vec<u8> = Vec::new();
-        let mut set_output: BTreeMap<String, String> = BTreeMap::new();
+        let mut r = Reading { proc: Processor::new(st.allow_unsecure), line: Vec::new(), set_output: BTreeMap::new(), matchers: st.matchers.step(), failed: false };
         let mut flush = Interval::new(Duration::from_millis(100));
         let mut end: Option<End> = None;
         let mut output_done = false;
@@ -769,7 +973,7 @@ impl Leg {
             if end.is_some() {
                 // Daemons keep the pipes open: drain briefly once the step itself exited.
                 match crate::rt::timeout(Duration::from_secs(2), running.output.recv()).await {
-                    Ok(Ok(c)) => self.feed(st, idx, &mut proc, &mut line, &c, &mut set_output).await,
+                    Ok(Ok(c)) => self.feed(st, idx, &mut r, &c).await,
                     Ok(Err(_)) | Err(_) => output_done = true,
                 }
                 continue;
@@ -789,10 +993,10 @@ impl Leg {
                 () = flush.tick().fuse() => Ev::Flush,
             };
             match ev {
-                Ev::Chunk(Some(c)) => self.feed(st, idx, &mut proc, &mut line, &c, &mut set_output).await,
+                Ev::Chunk(Some(c)) => self.feed(st, idx, &mut r, &c).await,
                 Ev::Chunk(None) => output_done = true,
                 Ev::Exit(code) => end = Some(End::Exit(code)),
-                Ev::Flush => self.partial(st, idx, &mut line).await,
+                Ev::Flush => self.partial(st, idx, &mut r).await,
                 Ev::Cancel => {
                     crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await;
                     end = Some(End::Cancelled);
@@ -803,9 +1007,10 @@ impl Leg {
                 }
             }
         }
-        if !line.is_empty() {
-            let rest = std::mem::take(&mut line);
-            self.text(st, idx, &rest).await;
+        // A last line without its newline is a line still.
+        if !r.line.is_empty() {
+            let rest = std::mem::take(&mut r.line);
+            self.whole(st, idx, &mut r, rest).await;
         }
         let tail = st.masker.finish();
         self.log(idx, tail).await;
@@ -815,7 +1020,7 @@ impl Leg {
         let (envf, outf, pathf, statef, sumf, jsonf, runf) = (get("GITHUB_ENV"), get("GITHUB_OUTPUT"), get("GITHUB_PATH"), get("GITHUB_STATE"), get("GITHUB_STEP_SUMMARY"), get("KILN_OUTPUT_JSON"), get("KILN_RUN_ENV"));
         let texts = crate::rt::blocking(move || (read(&envf), read(&outf), read(&pathf), read(&statef), read(&sumf), read(&jsonf), read(&runf))).await?;
         let (env_t, out_t, path_t, state_t, sum_t, _json_t, _run_t) = texts;
-        let mut outputs = set_output;
+        let mut outputs = std::mem::take(&mut r.set_output);
         let mut failed_files = false;
         match envfiles::env(&env_t) {
             Ok(pairs) => {
@@ -849,32 +1054,97 @@ impl Leg {
         }
         let state = envfiles::pairs(&state_t).unwrap_or_default();
         let end = end.unwrap_or(End::Exit(None));
-        let end = if failed_files && end == End::Exit(Some(0)) { End::Exit(Some(1)) } else { end };
+        let end = if (failed_files || r.failed) && end == End::Exit(Some(0)) { End::Exit(Some(1)) } else { end };
         Ok(Ran { end, outputs, state })
     }
 
-    /// Output from the step: whole lines go through the command processor; text is masked and
-    /// logged.
-    async fn feed(&self, st: &mut State, idx: u32, proc: &mut Processor, line: &mut Vec<u8>, chunk: &[u8], set_output: &mut BTreeMap<String, String>) {
+    /// Output from the step, line by line.
+    async fn feed(&self, st: &mut State, idx: u32, r: &mut Reading, chunk: &[u8]) {
         for &b in chunk {
-            line.push(b);
+            r.line.push(b);
             if b == b'\n' {
-                let whole = st.unfake_bytes(std::mem::take(line));
-                let text = String::from_utf8_lossy(&whole).to_string();
-                match proc.line(&text) {
-                    Line::Text | Line::Unknown => self.text(st, idx, &whole).await,
-                    Line::Refused(m) => self.annotate(idx, "error", &m).await,
-                    Line::Command(c) => self.command(st, idx, c, set_output).await,
-                }
+                let whole = std::mem::take(&mut r.line);
+                self.whole(st, idx, r, whole).await;
             }
         }
     }
 
-    /// A line still being written: shown now unless it may be a command.
-    async fn partial(&self, st: &mut State, idx: u32, line: &mut Vec<u8>) {
-        if line.is_empty() {
+    /// A whole line: a command, else an issue a problem matcher makes of it, else text (masked
+    /// and logged).
+    async fn whole(&self, st: &mut State, idx: u32, r: &mut Reading, whole: Vec<u8>) {
+        let whole = st.unfake_bytes(whole);
+        let text = String::from_utf8_lossy(&whole).to_string();
+        match r.proc.line(&text) {
+            Line::Text | Line::Unknown => match r.matchers.line(&text) {
+                Some(issue) => self.issue(st, idx, issue).await,
+                None => self.text(st, idx, &whole).await,
+            },
+            Line::Refused(m) => {
+                self.annotate(idx, "error", &format!("Unable to process command '{}' successfully.", st.masker.mask(text.trim_end()))).await;
+                self.annotate(idx, "error", &m).await;
+                r.failed = true;
+            }
+            Line::Command(c) => self.command(st, idx, c, r).await,
+        }
+    }
+
+    /// A problem matcher's issue, logged and annotated as a workflow command's would be. Its file
+    /// is kept when it is one of the repository's, relative to the workspace.
+    async fn issue(&self, st: &mut State, idx: u32, i: matchers::Issue) {
+        let message = st.masker.mask(&i.message);
+        let color = match i.level {
+            "error" => "31",
+            "warning" => "33",
+            _ => "36",
+        };
+        self.text(st, idx, format!("\x1b[{color}m{}: {message}\x1b[0m\n", i.level).as_bytes()).await;
+        let file = match i.file.as_deref() {
+            Some(f) => self.issue_file(st, f, i.from_path.as_deref()).await,
+            None => None,
+        };
+        self.event(&JobEventV2::Annotation { idx, level: i.level.to_owned(), message, title: None, file, line: i.line, end_line: i.end_line, col: i.col, end_col: i.end_col, log_offset: 0 }).await;
+    }
+
+    /// A matched file as the repository has it: rooted in `from_path`'s directory, else the
+    /// workspace; a job container's path is the host's first.
+    async fn issue_file(&self, st: &State, file: &str, from_path: Option<&str>) -> Option<String> {
+        let mut p = PathBuf::from(file);
+        if p.is_relative()
+            && let Some(dir) = from_path.and_then(|f| Path::new(f).parent()).filter(|d| !d.as_os_str().is_empty())
+        {
+            p = dir.join(p);
+        }
+        let ws = st.layout.workspace.clone();
+        let p = match st.containers.as_ref().and_then(|c| c.job.as_ref()) {
+            _ if p.is_relative() => ws.join(p),
+            Some(j) => j.map.to_host(&p.to_string_lossy())?,
+            None => p,
+        };
+        let p = lexical(&p);
+        let rel = p.strip_prefix(&ws).ok()?.to_string_lossy().replace('\\', "/");
+        crate::rt::blocking(move || p.is_file()).await.ok().filter(|f| *f).map(|_| rel)
+    }
+
+    /// The problem matchers of a matcher file a step names: a job container's path is the
+    /// host's first, and a relative one is the workspace's.
+    async fn load_matchers(&self, st: &State, file: &str) -> Result<Vec<matchers::Config>, String> {
+        let p = match st.containers.as_ref().and_then(|c| c.job.as_ref()) {
+            Some(j) if Path::new(file).is_absolute() => j.map.to_host(file).unwrap_or_else(|| PathBuf::from(file)),
+            _ if Path::new(file).is_relative() => st.layout.workspace.join(file),
+            _ => PathBuf::from(file),
+        };
+        let shown = p.display().to_string();
+        let text = crate::rt::blocking(move || std::fs::read_to_string(&p)).await.map_err(|e| e.to_string())?.map_err(|e| format!("Could not read the matcher file '{shown}': {e}"))?;
+        matchers::parse(&text)
+    }
+
+    /// A line still being written: shown now unless it may be a command, or problem matchers
+    /// need it whole.
+    async fn partial(&self, st: &mut State, idx: u32, r: &mut Reading) {
+        if r.line.is_empty() || (!st.matchers.is_empty() && r.line.len() < 64 << 10) {
             return;
         }
+        let line = &mut r.line;
         let head = String::from_utf8_lossy(line.get(..line.len().min(4)).unwrap_or_default()).to_string();
         let t = head.trim_start();
         if t.starts_with("::") || t.starts_with("##") || t.is_empty() || ":#".starts_with(t) {
@@ -897,7 +1167,7 @@ impl Leg {
         self.log(idx, out).await;
     }
 
-    async fn command(&self, st: &mut State, idx: u32, c: commands::Command, set_output: &mut BTreeMap<String, String>) {
+    async fn command(&self, st: &mut State, idx: u32, c: commands::Command, r: &mut Reading) {
         use kiln_ci::runner::commands::Command as C;
         match c {
             C::AddMask(v) => {
@@ -927,10 +1197,42 @@ impl Leg {
                 self.text(st, idx, format!("\x1b[{color}m{}: {message}\x1b[0m\n", a.level).as_bytes()).await;
                 self.event(&JobEventV2::Annotation { idx, level: a.level, message, title: a.title.map(|t| st.masker.mask(&t)), file: a.file, line: a.line, end_line: a.end_line, col: a.col, end_col: a.end_col, log_offset: 0 }).await;
             }
-            C::StopCommands(_) | C::Echo(_) | C::AddMatcher(_) | C::RemoveMatcher(_) => {}
+            C::StopCommands(_) | C::Echo(_) => {}
+            C::AddMatcher(file) if file.trim().is_empty() => self.annotate(idx, "warning", "File path must be specified.").await,
+            C::AddMatcher(file) => match self.load_matchers(st, file.trim()).await {
+                Ok(configs) => {
+                    let (said, added) = st.matchers.add(configs);
+                    r.matchers.added(&added);
+                    self.text(st, idx, format!("{said}\n").as_bytes()).await;
+                }
+                Err(e) => {
+                    self.annotate(idx, "error", &format!("Unable to process command '::add-matcher::{file}' successfully.")).await;
+                    self.annotate(idx, "error", &e).await;
+                    r.failed = true;
+                }
+            },
+            C::RemoveMatcher { owner, file } => {
+                let owners = match (owner.is_empty(), file.is_empty()) {
+                    (false, false) => return self.annotate(idx, "warning", "Either specify an owner name or a file path in ##[remove-matcher] command. Both values cannot be set.").await,
+                    (true, true) => return self.annotate(idx, "warning", "Either an owner name or a file path must be specified in ##[remove-matcher] command.").await,
+                    (false, true) => vec![owner],
+                    (true, false) => match self.load_matchers(st, &file).await {
+                        Ok(configs) => configs.into_iter().map(|c| c.owner).collect(),
+                        Err(e) => {
+                            self.annotate(idx, "error", &format!("Unable to process command '::remove-matcher::{file}' successfully.")).await;
+                            self.annotate(idx, "error", &e).await;
+                            r.failed = true;
+                            return;
+                        }
+                    },
+                };
+                let (said, gone) = st.matchers.remove(&owners);
+                r.matchers.removed(&gone);
+                self.text(st, idx, format!("{said}\n").as_bytes()).await;
+            }
             C::SetOutput { name, value } => {
                 self.annotate(idx, "warning", "The `set-output` command is deprecated and will be disabled soon. Please upgrade to using Environment Files.").await;
-                set_output.insert(name, value);
+                r.set_output.insert(name, value);
             }
             C::SaveState { .. } => {
                 self.annotate(idx, "warning", "The `save-state` command is deprecated and will be disabled soon. Please upgrade to using Environment Files.").await;
@@ -992,25 +1294,34 @@ impl Leg {
     /// Where an action is: in the workspace (`./`), or fetched at its pinned commit.
     async fn locate(&self, uses: &str) -> anyhow::Result<Located> {
         if let Some(rel) = uses.strip_prefix("./") {
-            let dir = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo).workspace.join(rel);
+            let dir = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo, None).workspace.join(rel);
             return Ok(Located { dir, repo: String::new(), git_ref: String::new() });
         }
         if uses.starts_with("docker://") {
             anyhow::bail!("`{uses}`: Docker actions run with Docker executors (docs/ci.md W13); this runner can't run them yet");
         }
-        if uses.starts_with("$/") {
-            anyhow::bail!("`{uses}`: actions of the running commit (`$/`) arrive with docs/ci.md W07-R01's mirror reads");
-        }
+        // Remote actions, and `$/` ones (this repository at the running commit, W07-R01): as the
+        // run's start resolved them.
         let r = self.a.actions.get(uses).ok_or_else(|| anyhow::anyhow!("`{uses}` was not resolved when the run started"))?;
         let root = self.fetch_action(r).await?;
         let dir = if r.path.is_empty() { root } else { root.join(&r.path) };
+        if uses.starts_with("$/") {
+            return Ok(Located { dir, repo: String::new(), git_ref: String::new() });
+        }
         let git_ref = uses.rsplit_once('@').map(|(_, r)| r.to_owned()).unwrap_or_default();
         Ok(Located { dir, repo: r.repo.clone(), git_ref })
     }
 
     /// An action's code at its commit, kept under `<work>/_actions/<owner>/<repo>/<sha>`.
     async fn fetch_action(&self, r: &kiln_ci::wire::ActionRef) -> anyhow::Result<PathBuf> {
-        let dir = self.work_dir.join("_actions").join(r.repo.replace("..", "_")).join(&r.sha);
+        // A `$/` action's tarball holds its directory only: kept apart by path.
+        let key = if r.url.contains("?path=") {
+            let d = crate::util::sha256_hex(r.path.as_bytes());
+            format!("{}-{}", r.sha, d.get(..12).unwrap_or(&d))
+        } else {
+            r.sha.clone()
+        };
+        let dir = self.work_dir.join("_actions").join(r.repo.replace("..", "_")).join(key);
         let done = dir.join(".kiln-complete");
         if done.exists() {
             return Ok(dir);
@@ -1137,9 +1448,34 @@ impl Leg {
         out
     }
 
-    /// A `uses:` step (W07): JavaScript, composite (Docker with W13).
+    /// The container CLI for Docker actions: the leg's, or this machine's.
+    async fn cli(&self, st: &State) -> anyhow::Result<super::docker::Cli> {
+        if let Some(c) = &st.containers {
+            return Ok(c.cli.clone());
+        }
+        let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("Docker actions need Docker or Podman, and this runner has neither working"))?;
+        let config = st.layout.temp.join("_docker_config");
+        let c = config.clone();
+        crate::rt::blocking(move || std::fs::create_dir_all(c)).await??;
+        Ok(super::docker::Cli::new(&bin, config))
+    }
+
+    /// A `uses:` step (W07): JavaScript, composite, Docker.
     #[allow(clippy::too_many_arguments)]
     async fn action(&self, st: &mut State, idx: u32, step: &Step, uses: &str, with: BTreeMap<String, String>, wd: &Path, env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
+        // `uses: docker://image`: the image itself, with `with.entrypoint` and `with.args`.
+        if uses.starts_with("docker://") {
+            let cli = self.cli(st).await?;
+            let said = parking_lot::Mutex::new(Vec::<String>::new());
+            let image = super::docker::action_image(&cli, Path::new("."), uses, "", &|m: String| said.lock().push(m)).await?;
+            let lines = std::mem::take(&mut *said.lock());
+            for line in lines {
+                self.log(idx, format!("{line}\r\n").into_bytes()).await;
+            }
+            let args = with.get("args").map(|a| super::docker::split_options(a)).unwrap_or_default();
+            let entrypoint = with.get("entrypoint").cloned();
+            return self.exec(st, idx, Run::Container { cli, image, entrypoint, args }, wd, env, deadline).await;
+        }
         let loc = self.locate(uses).await?;
         let dir = loc.dir.clone();
         let action = crate::rt::blocking(move || load_action(&dir)).await??;
@@ -1176,7 +1512,40 @@ impl Leg {
                 Ok(ran)
             }
             "composite" => Box::pin(self.composite(st, idx, &action, &loc, &inputs, aenv, deadline)).await,
-            "docker" => anyhow::bail!("`{uses}` is a Docker action: those run with Docker executors (docs/ci.md W13), which this runner doesn't have yet"),
+            "docker" => {
+                // A Docker action (W07-R06): its image built or pulled, then run with GitHub's mounts.
+                let cli = self.cli(st).await?;
+                let spec_image = action.runs.image.clone().ok_or_else(|| anyhow::anyhow!("`{uses}` has no `runs.image`"))?;
+                let tag = format!("kiln-action/{}:{}", if loc.repo.is_empty() { "local".to_owned() } else { loc.repo.to_ascii_lowercase().replace('/', "-") }, crate::util::sha256_hex(loc.dir.to_string_lossy().as_bytes()).get(..12).unwrap_or("latest"));
+                let said = parking_lot::Mutex::new(Vec::<String>::new());
+                let image = super::docker::action_image(&cli, &loc.dir, &spec_image, &tag, &|m: String| said.lock().push(m)).await;
+                let lines = std::mem::take(&mut *said.lock());
+                for line in lines {
+                    self.log(idx, format!("{line}\r\n").into_bytes()).await;
+                }
+                let image = image?;
+                // `runs.args` see the action's own `inputs`.
+                let saved = st.base.clone();
+                st.base.retain(|(k, _)| *k != "inputs");
+                st.base.push(("inputs", str_map(&inputs)));
+                let args: Result<Vec<String>, String> = action.runs.args.iter().map(|t| st.render(t, Site::StepWith, "runs.args")).collect();
+                st.base = saved;
+                let args = args.map_err(anyhow::Error::msg)?;
+                if let Some(pre) = action.runs.pre_entrypoint.clone().filter(|e| !e.is_empty()) {
+                    let r = self.exec(st, idx, Run::Container { cli: cli.clone(), image: image.clone(), entrypoint: Some(pre), args: Vec::new() }, wd, aenv.clone(), deadline).await?;
+                    if r.end != End::Exit(Some(0)) {
+                        return Ok(r);
+                    }
+                }
+                let ran = self.exec(st, idx, Run::Container { cli: cli.clone(), image: image.clone(), entrypoint: action.runs.entrypoint.clone(), args }, wd, aenv.clone(), deadline).await?;
+                if let Some(post) = action.runs.post_entrypoint.clone().filter(|e| !e.is_empty()) {
+                    let r = self.exec(st, idx, Run::Container { cli, image, entrypoint: Some(post), args: Vec::new() }, wd, aenv, deadline).await?;
+                    if r.end != End::Exit(Some(0)) {
+                        return Ok(r);
+                    }
+                }
+                Ok(ran)
+            }
             other => anyhow::bail!("`runs.using: {other}` is no kind of action this runner knows"),
         }
     }
@@ -1448,6 +1817,53 @@ runs:
         assert!(logs.get(&1).is_some_and(|l| l.contains("hello push, kiln")), "{logs:?}");
         assert_eq!(finished(&events, 1).map(|f| f.2.get("said").cloned()), Some(Some("hello push, kiln".into())));
         assert!(logs.get(&2).is_some_and(|l| l.contains("it said 'hello push, kiln' and GREETED=yes")), "{logs:?}");
+        Ok(())
+    }
+
+    /// W06-R06: problem matchers a step adds apply to the later steps' output: matched lines
+    /// become annotations (with the file when it is the repository's) in place of the line, until
+    /// removed. A matcher file that can't be read, or a disabled command, fails its step, as on
+    /// GitHub.
+    #[cfg(unix)]
+    #[test]
+    fn problem_matchers() -> anyhow::Result<()> {
+        let wf = r###"on: push
+jobs:
+  t:
+    runs-on: x
+    steps:
+      - run: |
+          mkdir -p src && echo 'let x: number = "a";' > src/index.ts
+          cat > tsc.json <<'EOF'
+          { "problemMatcher": [ { "owner": "tsc", "pattern": [ { "regexp": "^([^\\s].*)[\\(:](\\d+)[,:](\\d+)(?:\\):\\s+|\\s+-\\s+)(error|warning|info)\\s+TS(\\d+)\\s*:\\s*(.*)$", "file": 1, "line": 2, "column": 3, "severity": 4, "code": 5, "message": 6 } ] } ] }
+          EOF
+          echo "::add-matcher::tsc.json"
+      - run: |
+          echo "src/index.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'."
+          echo "gone/missing.ts(2,1): warning TS1: no such file"
+      - run: echo "::remove-matcher owner=tsc::"
+      - run: 'echo "src/index.ts(1,5): error TS2322: after removal"'
+      - run: echo "::add-matcher::nope.json"
+      - if: always()
+        run: echo "::set-env name=A::b"
+"###;
+        let (r, logs, events) = run_leg(wf, &[])?;
+        assert_eq!(r.status, Status::Failed, "{logs:?}");
+        let ann = |m: &str| events.iter().find_map(|e| match e {
+            JobEventV2::Annotation { idx, level, message, file, line, col, .. } if message == m => Some((*idx, level.clone(), file.clone(), *line, *col)),
+            _ => None,
+        });
+        assert!(logs.get(&0).is_some_and(|l| l.contains("Added matchers: 'tsc'. Problem matchers scan action output")), "{logs:?}");
+        assert_eq!(ann("Type 'string' is not assignable to type 'number'."), Some((1, "error".into(), Some("src/index.ts".into()), Some(1), Some(5))));
+        assert_eq!(ann("no such file"), Some((1, "warning".into(), None, Some(2), Some(1))), "a file that isn't there is dropped");
+        assert!(logs.get(&1).is_some_and(|l| l.contains("error: Type 'string'") && !l.contains("src/index.ts(1,5)")), "the issue replaces the line: {logs:?}");
+        assert_eq!(finished(&events, 1).map(|f| f.1), Some(Conclusion::Success), "issues alone don't fail a step");
+        assert!(logs.get(&2).is_some_and(|l| l.contains("Removed matchers: 'tsc'")), "{logs:?}");
+        assert!(ann("after removal").is_none() && logs.get(&3).is_some_and(|l| l.contains("src/index.ts(1,5): error TS2322: after removal")), "{logs:?}");
+        assert_eq!(finished(&events, 4).map(|f| f.1), Some(Conclusion::Failure));
+        assert_eq!(ann("Unable to process command '::add-matcher::nope.json' successfully.").map(|a| a.0), Some(4));
+        assert_eq!(finished(&events, 5).map(|f| f.1), Some(Conclusion::Failure), "a disabled command fails its step");
+        assert_eq!(ann("Unable to process command '::set-env name=A::b' successfully.").map(|a| a.0), Some(5));
         Ok(())
     }
 
