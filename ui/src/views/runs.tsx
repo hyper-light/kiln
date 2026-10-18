@@ -38,11 +38,18 @@ export default function Runs() {
         title="Runs"
         lead="Every pipeline run across your repositories, newest first. Filters stay in the URL so you can share a view."
         actions={
-          <Button asChild variant="secondary" size="sm">
-            <Link to="/insights">
-              <ChartLine /> Insights
-            </Link>
-          </Button>
+          <>
+            <Button asChild variant="secondary" size="sm">
+              <Link to="/logs">
+                <Search /> Search logs
+              </Link>
+            </Button>
+            <Button asChild variant="secondary" size="sm">
+              <Link to="/insights">
+                <ChartLine /> Insights
+              </Link>
+            </Button>
+          </>
         }
       />
       <Loadable label="runs" fallback={<RunsHold />}>

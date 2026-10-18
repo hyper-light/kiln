@@ -187,11 +187,11 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
-| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search, microVM and k8s terminals left |
+| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search, audit v2 left |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
-| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; the rest left |
+| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
 
 ---
@@ -3593,8 +3593,10 @@ W06-R13's debug reruns.
     - a cancelled job's post steps run to their end on time of their own (5 minutes, GitHub's
       `cancel-timeout-minutes`), on servers too: the cancel used to cut them short;
     - a signal to `kiln workflow run` cancels its runs before its runner stops.
-- *Left*: R07 (W19), `kiln debug terminal` (an interactive terminal from the CLI), and terminals
-  in microVMs and on k8s (with W13's executors).
+- *R07*: log search across runs and "What changed since the last green run" on a failed leg,
+  from W19-R04 and R03.
+- *Left*: `kiln debug terminal` (an interactive terminal from the CLI), and terminals in microVMs
+  and on k8s (with W13's executors).
 
 ### W18 Supply chain and untrusted code
 
@@ -3733,7 +3735,40 @@ rule-based notifications (G-30, G-31).
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
 **Progress.** In progress: R02 (OpenTelemetry export waits for W11-R09) and R06 (with W11-R06's
-channels). Done: R01, R03, R07, AC01, AC02 and AC03.
+channels). Done: R01, R03, R04, R07, AC01, AC02, AC03 and AC06.
+
+- *R04* (`crates/kiln/src/ci/logsearch.rs`, migration `20261018-2100_w19_log_search.sql`):
+  - **The index.** Finished legs' step logs go into `ci_log_index`, SQLite's FTS5 with the
+    trigram tokenizer: any substring of three characters or more, case-insensitive.
+    - Logs go in as 100-line segments, escape codes stripped, a rewritten line as its last
+      version.
+    - A sweep indexes what isn't in yet, in the order legs finished: every 30 seconds, and as soon
+      as a leg is done. So the index builds incrementally and catches up after a restart.
+    - `ci_log_indexed` keeps each leg's rowid range, so pruned legs leave the index with their
+      logs.
+  - **The API:**
+    - `GET /api/ci/logs/search?q=&repo=&workflow=&branch=&conclusion=&days=&limit=`: matching
+      lines across runs, newest first, each with its run, leg, step, line number and where the
+      match is;
+    - `GET /api/ci/legs/:id/logs/search?q=`: one leg's lines, read from its files, so a running
+      leg's too;
+    - `GET /api/ci/legs/:id/logs/failure`: the failed step's log from just before its first line
+      that reads like an error (else its end), with its exit code;
+    - operations `ci.logs.search`, `ci.legs.search`, `ci.legs.failure_excerpt` and
+      `ci.runs.compare` (W20), which the `kiln-ci-diagnose` skill now uses.
+  - **The page** (`/logs`, from Runs) takes the text, repository, branch, conclusion and window.
+    Each hit opens its leg at its step (`?step=`).
+  - **AC06** (`cargo test -p kiln -- --ignored w19_ac06`): among 10,000 runs, 20,000 legs and
+    60,000 step logs, a string one step printed is found in under a millisecond, against a target
+    of 500 ms.
+  - **Verified end to end** on a local server:
+    - 878 legs (5.8 MB of logs) indexed in two seconds;
+    - a search found its line in 3 ms;
+    - the conclusion filter narrowed it;
+    - two-character queries were refused;
+    - a failed leg's excerpt named its step and exit code;
+    - the page found the lines and opened a hit's leg at its step, in Chromium and WebKit,
+      desktop and phone.
 
 - *R03* (`crates/kiln-ci/src/compare.rs`, `crates/kiln/src/ci/compare.rs`, migration
   `20261018-2000_w19_compare.sql`):
@@ -3871,8 +3906,8 @@ channels). Done: R01, R03, R07, AC01, AC02 and AC03.
     - pointing that subscriber at a working URL sent the rest there;
     - redelivering a failed delivery sent it there with its own delivery id;
     - `run.failed` and `run.succeeded` arrived with their repository.
-- *Left*: R02's OpenTelemetry export, R04, R05; email (SMTP), the inbox and issue trackers as channels; the other
-  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC04 to AC06.
+- *Left*: R02's OpenTelemetry export, R05; email (SMTP), the inbox and issue trackers as channels; the other
+  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC04 and AC05.
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 
@@ -4366,6 +4401,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/legs/:id` | `ci.legs.get` (attempts, steps, outputs, wait reason) | runs.read | W05, W06 |
 | GET | `/api/ci/legs/:id/logs?step=&attempt=&from=` · `/logs/ws` | `ci.legs.logs` (`from`: a byte offset, for followers) | logs.read | W06 |
 | GET | `/api/ci/legs/:id/logs/search?q=` · `/failure` | `ci.legs.search`, `ci.legs.failure_excerpt` | logs.read | W19, W20 |
+| GET | `/api/ci/logs/search?q=&repo=&workflow=&branch=&conclusion=&days=` (built) | `ci.logs.search` | logs.read | W19 |
 | GET | `/api/ci/legs/:id/routing` | `ci.legs.routing` (explain) | runs.read | W05 |
 | GET | `/api/ci/legs/:id/terminal` (WebSocket) | `ci.legs.terminal` | runs.debug | W17 |
 | GET · PUT · DELETE | `/api/ci/oidc/subject?scope=` | `ci.oidc.subject` (`{ use_default, include_claim_keys }`) | runs.read · settings.manage | W10 |
