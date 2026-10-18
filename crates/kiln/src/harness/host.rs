@@ -51,7 +51,15 @@ struct Saved {
     pause_at: Option<u8>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     manual_resume: bool,
+    /// A turn of its was under way, and hadn't ended, when this runner last saved it: a restart
+    /// (an upgrade, the system stopping the runner, a crash) cut it short, and started again it
+    /// is told to go on with it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    cut: bool,
 }
+
+/// What kiln says first to a session whose turn its restart cut short.
+const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it and anything it was running. Pick up where you left off.";
 
 pub struct Host {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -333,19 +341,24 @@ impl Host {
             let id = s.id.clone();
             let seed = store.and_then(|st| kept_seed(st, &id));
             let from_store = seed.is_some();
+            let cut = s.cut;
             match self.open_seeded(Some(s.id), s.spec, seed) {
                 Ok(session) => {
                     let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume;
-                    if !s.queue.is_empty() || paused {
+                    if !s.queue.is_empty() || paused || cut {
                         let mut core = session.core.lock();
                         core.state.queue = s.queue;
                         // A check under way when it stopped is asked again.
                         core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
                         core.state.pause_at = s.pause_at;
                         core.state.manual_resume = s.manual_resume;
+                        // The turn the restart cut short goes on first, in kiln's words.
+                        if cut {
+                            picks_up(&mut core.state.queue);
+                        }
                         core.touch_state();
                     }
-                    tracing::info!(session = %id, from_store, "agent session continued after a restart");
+                    tracing::info!(session = %id, from_store, cut, "agent session continued after a restart");
                 }
                 Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
             }
@@ -378,7 +391,7 @@ impl Host {
                 let spec = s.resume_spec();
                 let core = s.core.lock();
                 let st = &core.state;
-                Saved { id: s.id.clone(), spec, queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume }
+                Saved { id: s.id.clone(), spec, queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume, cut: s.turn_open.load(Ordering::Relaxed) }
             })
             .collect();
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
@@ -388,6 +401,16 @@ impl Host {
             tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions");
         }
     }
+}
+
+/// The turn a restart cut short goes on first: kiln's word (shown as kiln's), ahead of what was
+/// already queued, unless it's waiting there already (a restart before it went out).
+fn picks_up(queue: &mut Vec<QueueItem>) {
+    if queue.first().is_some_and(|q| q.text == CUT_BY_RESTART) {
+        return;
+    }
+    let now = super::core::Core::now();
+    queue.insert(0, QueueItem { id: format!("{}restart-{now}", super::core::KEEP_ID), text: CUT_BY_RESTART.to_owned(), at: now, attachments: Vec::new(), overrides: None });
 }
 
 /// A session's timeline and state as the conversation store kept them, for its restart: None when
@@ -574,6 +597,60 @@ mod tests {
             let core = back.core.lock();
             assert_eq!(core.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1", "n1", "m2"]);
             assert_eq!(core.state.title, "the parser");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_turn_a_restart_cut_short_goes_on_first_thing() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                ..Spec::default()
+            };
+            let cut = |file: &std::path::Path| -> anyhow::Result<Vec<String>> {
+                let saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(file)?)?;
+                Ok(saved.iter().filter(|s| s.get("cut") == Some(&serde_json::json!(true))).filter_map(|s| s.get("id").and_then(serde_json::Value::as_str).map(str::to_owned)).collect())
+            };
+            {
+                let (tx, _rx) = async_channel::unbounded();
+                let host = Host::new(tx, Some(file.clone()), Limits::default());
+                // A turn under way in one, none in the other, as the runner is stopped.
+                host.open(Some("busy".into()), spec.clone())?.turn_open.store(true, Ordering::Relaxed);
+                host.open(Some("idle".into()), spec.clone())?;
+                host.save_now();
+            }
+            assert_eq!(cut(&file)?, ["busy"]);
+            let restore = || -> anyhow::Result<(Arc<Host>, Vec<QueueItem>, Vec<QueueItem>)> {
+                let (tx, _rx) = async_channel::unbounded();
+                let again = Host::new(tx, Some(file.clone()), Limits::default());
+                again.restore();
+                let queue = |id: &str| again.sessions.lock().get(id).map(|s| s.core.lock().state.queue.clone()).unwrap_or_default();
+                let (busy, idle) = (queue("busy"), queue("idle"));
+                Ok((again, busy, idle))
+            };
+            let (again, busy, idle) = restore()?;
+            assert_eq!(busy.len(), 1);
+            assert!(busy.first().is_some_and(|q| q.id.starts_with(super::super::core::KEEP_ID) && q.text.ends_with("Pick up where you left off.")), "{busy:?}");
+            assert!(idle.is_empty());
+            // Restarted again before it went out: it's there once, not twice.
+            if let Some(s) = again.sessions.lock().get("busy") {
+                s.turn_open.store(true, Ordering::Relaxed);
+            }
+            again.save_now();
+            drop(again);
+            let (again, busy, _) = restore()?;
+            assert_eq!(busy.len(), 1, "{busy:?}");
+            // Once its turn has ended, a restart says nothing.
+            if let Some(s) = again.sessions.lock().get("busy") {
+                s.turn_open.store(false, Ordering::Relaxed);
+            }
+            again.save_now();
+            assert!(cut(&file)?.is_empty());
             Ok(())
         })
     }

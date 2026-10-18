@@ -418,6 +418,9 @@ pub struct Session {
     ctl: async_channel::Sender<Ctl>,
     /// The process's pid while it runs.
     pub pid: Mutex<Option<u32>>,
+    /// A turn of its is under way: set as one starts, cleared only as one ends (its harness ending
+    /// leaves it set), so the record a restart reads says which turns it cut short.
+    pub turn_open: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -517,6 +520,16 @@ impl Session {
             s.model = Some(core.state.model.clone());
         }
         s
+    }
+}
+
+/// Whether a turn is under way once a session's status is `status`: one starts it, its end ends it,
+/// and the harness ending or starting again leaves it as it was (a turn cut short stays open).
+pub fn turn_open(status: Status, was: bool) -> bool {
+    match status {
+        Status::Running | Status::Waiting => true,
+        Status::Idle => false,
+        Status::Starting | Status::Exited | Status::Disconnected => was,
     }
 }
 
@@ -631,6 +644,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         info: Mutex::new(info),
         ctl,
         pid: Mutex::new(None),
+        turn_open: std::sync::atomic::AtomicBool::new(false),
     });
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
@@ -1565,6 +1579,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
                             Command::Restart => {}
                             Command::ForceStop => {
+                                // You ended the turn: a restart before it's back doesn't take it up again.
+                                s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
                                 let text = format!("Stopped by force: {} starts again, the conversation going on; what it was running stopped with it", kind.name);
                                 s.core.lock().upsert(&format!("force-stop:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
                                 forcing = true;
@@ -1758,11 +1774,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         ending = true;
                         break;
                     }
-                    let (session, queue, pause) = {
+                    let (session, queue, pause, status) = {
                         let core = s.core.lock();
-                        (core.state.harness_session.clone(), core.state.queue.len(), pause_marks(&core.state))
+                        (core.state.harness_session.clone(), core.state.queue.len(), pause_marks(&core.state), core.state.status)
                     };
-                    if session != last_session || queue != last_queue || pause != last_pause {
+                    let was = s.turn_open.load(std::sync::atomic::Ordering::Relaxed);
+                    let open = turn_open(status, was);
+                    s.turn_open.store(open, std::sync::atomic::Ordering::Relaxed);
+                    if session != last_session || queue != last_queue || pause != last_pause || open != was {
                         last_session = session;
                         last_queue = queue;
                         last_pause = pause;
@@ -1890,6 +1909,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_turn_stays_open_until_it_ends_not_when_its_harness_does() {
+        use super::turn_open;
+        assert!(turn_open(Status::Running, false));
+        assert!(turn_open(Status::Waiting, false));
+        // Its harness ends under it (a restart, a crash) and starts again: still open.
+        assert!(turn_open(Status::Exited, true));
+        assert!(turn_open(Status::Starting, true));
+        assert!(turn_open(Status::Disconnected, true));
+        // It ended: closed, and the harness ending after that doesn't open it.
+        assert!(!turn_open(Status::Idle, true));
+        assert!(!turn_open(Status::Exited, false));
+    }
 
     #[test]
     fn resolve_cwd_expands_home() {
