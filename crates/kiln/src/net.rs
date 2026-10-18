@@ -124,7 +124,8 @@ impl Directory for ServerBook {
     fn identify(&mut self, a: &Authenticated<'_>) -> Option<(PeerId, Role)> {
         let der = a.certificate?;
         let name = cert_name(der)?;
-        if self.revoked.contains(&name) {
+        // A machine named as the server (a certificate from before machines couldn't be) is none.
+        if self.revoked.contains(&name) || crate::pki::reserved(&name) {
             return None;
         }
         let peer = peer_of(der);

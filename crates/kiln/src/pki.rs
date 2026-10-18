@@ -79,6 +79,22 @@ pub fn leaf_name(leaf: &Leaf) -> Option<String> {
     cert_dns_name(&pem_to_der(&leaf.cert_pem).ok()?)
 }
 
+/// `name` is the server's own identity, the name runners check the server by (case and a final
+/// dot aside): no machine's certificate may carry it.
+pub fn reserved(name: &str) -> bool {
+    name.trim_end_matches('.').eq_ignore_ascii_case(SERVER_NAME)
+}
+
+/// A machine's certificate (a runner, a runner process beside it, the server's in-process agent):
+/// it authenticates a client only. Without serverAuth no runner accepts it as the server, whatever
+/// name it carries.
+fn machine_params(name: String, days: i64) -> anyhow::Result<CertificateParams> {
+    anyhow::ensure!(!reserved(&name), "{SERVER_NAME} is the server's own identity; a machine can't be named so");
+    let mut p = leaf_params(vec![name], days)?;
+    p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    Ok(p)
+}
+
 fn leaf_params(names: Vec<String>, days: i64) -> anyhow::Result<CertificateParams> {
     let mut p = CertificateParams::new(names.clone()).context("leaf names")?;
     let now = OffsetDateTime::now_utc();
@@ -311,7 +327,7 @@ impl Pki {
     pub fn sign_csr(&self, csr_pem: &str, name: &str, days: i64) -> anyhow::Result<String> {
         let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse CSR")?;
         let signed = CertificateSigningRequestParams {
-            params: leaf_params(vec![sanitize_name(name)], days)?,
+            params: machine_params(sanitize_name(name), days)?,
             public_key: csr.public_key,
         }
         .signed_by(&self.issuer)
@@ -331,14 +347,14 @@ impl Pki {
         cert.verify_signature(Some(ca.public_key())).map_err(|_| anyhow::anyhow!("that certificate was not issued by this server"))?;
         anyhow::ensure!(cert.validity().is_valid(), "that certificate has expired");
         let name = cert_dns_name(&der).ok_or_else(|| anyhow::anyhow!("that certificate names no machine"))?;
-        anyhow::ensure!(name != SERVER_NAME, "that is the server's certificate");
+        anyhow::ensure!(!reserved(&name), "that is the server's certificate");
         // Parsing checks the CSR's own signature (possession of its private key).
         let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse CSR")?;
         anyhow::ensure!(
             csr.public_key.der_bytes() == cert.public_key().subject_public_key.data.as_ref(),
             "the CSR is for a different key than the certificate"
         );
-        let signed = CertificateSigningRequestParams { params: leaf_params(vec![name.clone()], LEAF_DAYS)?, public_key: csr.public_key }
+        let signed = CertificateSigningRequestParams { params: machine_params(name.clone(), LEAF_DAYS)?, public_key: csr.public_key }
             .signed_by(&self.issuer)
             .context("sign CSR")?;
         Ok((name, signed.pem()))
@@ -353,7 +369,7 @@ impl Pki {
         anyhow::ensure!(!names.is_empty(), "a certificate needs at least one name");
         anyhow::ensure!(names.len() <= 64, "a certificate takes at most 64 names");
         for n in names {
-            anyhow::ensure!(!n.trim_end_matches('.').eq_ignore_ascii_case(SERVER_NAME), "{SERVER_NAME} is the server's own identity");
+            anyhow::ensure!(!reserved(n), "{SERVER_NAME} is the server's own identity");
         }
         // Parsing checks the CSR's own signature (possession of its private key).
         let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse CSR")?;
@@ -388,7 +404,7 @@ impl Pki {
     /// Issue a full leaf (key generated here). Used for the server's own in-process local agent.
     pub fn issue_local(&self, name: &str) -> anyhow::Result<Leaf> {
         let key = KeyPair::generate()?;
-        let cert = leaf_params(vec![sanitize_name(name)], LEAF_DAYS)?.signed_by(&key, &self.issuer)?;
+        let cert = machine_params(sanitize_name(name), LEAF_DAYS)?.signed_by(&key, &self.issuer)?;
         Ok(Leaf { cert_pem: cert.pem(), key_pem: key.serialize_pem() })
     }
 }
@@ -432,6 +448,31 @@ mod tests {
         let again = Pki::open(dir.path())?;
         assert_eq!(again.ca_pem, pki.ca_pem);
         assert_eq!(sanitize_name("Bench Box #1"), "bench-box--1");
+        Ok(())
+    }
+
+    #[test]
+    fn no_machine_is_named_as_the_server_and_none_can_serve_as_it() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pki = Pki::open(dir.path())?;
+        let (csr, _key) = make_csr("kiln-server")?;
+        for name in ["kiln-server", "KILN-SERVER", "Kiln-Server"] {
+            assert!(pki.sign_csr(&csr, name, 30).is_err(), "{name}");
+        }
+        assert!(pki.issue_local("kiln-server").is_err());
+        assert!(reserved("kiln-server.") && reserved("KILN-SERVER") && !reserved("kiln-server-2"));
+        let eku = |pem: &str| -> anyhow::Result<(bool, bool)> {
+            let der = pem_to_der(pem)?;
+            let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let e = cert.extended_key_usage().map_err(|e| anyhow::anyhow!("{e}"))?.ok_or_else(|| anyhow::anyhow!("no extended key usage"))?.value;
+            Ok((e.client_auth, e.server_auth))
+        };
+        // A machine's certificate authenticates a client, never a server: no runner takes it for the server.
+        let (csr, _key) = make_csr("bench")?;
+        assert_eq!(eku(&pki.sign_csr(&csr, "bench", 30)?)?, (true, false));
+        assert_eq!(eku(&pki.issue_local("local")?.cert_pem)?, (true, false));
+        // The server's own still serves.
+        assert!(eku(&pki.server_leaf(&[])?.cert_pem)?.1);
         Ok(())
     }
 
