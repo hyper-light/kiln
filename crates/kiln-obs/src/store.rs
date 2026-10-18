@@ -1123,6 +1123,19 @@ impl Store {
         self.logs.aggregate(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, by, measure)
     }
 
+    /// As [`aggregate_logs`](Self::aggregate_logs), in buckets of `step` ns aligned to it (the
+    /// buckets follow `from` as asked; what the cutoff has dropped is in none).
+    pub fn aggregate_logs_buckets(&self, search: &Search, from: i64, to: i64, step: i64, by: &[crate::logs::store::Facet], measure: &crate::logs::store::Measure) -> Result<crate::logs::store::Bucketed, crate::logs::store::AggregateError> {
+        let buckets = crate::logs::store::Buckets::over(from, to, step)?;
+        self.logs.aggregate_buckets(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, buckets, by, measure)
+    }
+
+    /// Each facet's most common values over the logs a search matches, in one pass
+    /// ([`LogStore::facet_counts`]).
+    pub fn log_facets(&self, search: &Search, from: i64, to: i64, facets: &[crate::logs::store::Facet], top: usize) -> Result<crate::logs::store::FacetCounts, crate::logs::store::AggregateError> {
+        self.logs.facet_counts(search, from.max(self.logs_cutoff.saturating_mul(1_000_000)), to, facets, top)
+    }
+
     /// Bytes of logs on disk.
     pub fn log_bytes(&self) -> u64 {
         self.logs.disk_bytes()

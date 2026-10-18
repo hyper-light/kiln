@@ -148,6 +148,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::api::set_global(obs);
+        crate::observe::api::set_dashboards(std::sync::Arc::new(crate::observe::dashboards::Dashboards::open(&cfg.data("observe"))));
         child!("observe", h => crate::observe::hub::send_loop(h));
         match crate::http::client::Client::public() {
             Ok(http) => {

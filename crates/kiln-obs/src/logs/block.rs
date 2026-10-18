@@ -131,9 +131,15 @@ impl LogBlock {
 
     /// The block's rows' encoding into `out` (reused across blocks).
     pub fn decompress(&self, out: &mut Vec<u8>) -> Result<(), LogBlockError> {
+        self.decompress_text(&self.text, out)
+    }
+
+    /// As [`decompress`](Self::decompress), of this block's text held elsewhere (a file's block,
+    /// read into a buffer: [`super::file::LogFile::read_text`]).
+    pub fn decompress_text(&self, text: &[u8], out: &mut Vec<u8>) -> Result<(), LogBlockError> {
         out.clear();
         match self.codec {
-            Codec::Lz4 => lz4::decompress(&self.text, out, self.raw_len as usize).map_err(|_| LogBlockError::Text)?,
+            Codec::Lz4 => lz4::decompress(text, out, self.raw_len as usize).map_err(|_| LogBlockError::Text)?,
             Codec::Deflate => return Err(LogBlockError::Text),
         }
         if out.len() != self.raw_len as usize {

@@ -189,5 +189,54 @@ fn main() {
         let f = last.unwrap();
         println!("{:<44} {:>8} {:>10} {:>10} {:>9} {:>8.2}ms {:>8.2}ms", q, f.records.len(), f.blocks_total, f.blocks_pruned, f.rows_scanned, ns[ns.len() / 2] as f64 / 1e6, ns[ns.len() - 1] as f64 / 1e6);
     }
+    // Log analytics: every matching record grouped and measured, as the explorer's facets and a log
+    // monitor read them.
+    use kiln_obs::logs::store::{Facet, Measure};
+    let aggregations: [(&str, &str, Vec<Facet>, Measure); 5] = [
+        ("count by {service}", "*", vec![Facet::Service], Measure::Count),
+        ("count by {status}", "*", vec![Facet::Status], Measure::Count),
+        ("count by {service,status}", "*", vec![Facet::Service, Facet::Status], Measure::Count),
+        ("count by {@application}", "*", vec![Facet::Attr("application".into())], Measure::Count),
+        ("cardinality(host) by {service}", "status:error", vec![Facet::Service], Measure::Cardinality(Facet::Host)),
+    ];
+    println!("\n{:<44} {:>8} {:>10} {:>12} {:>10} {:>10}", "aggregate (whole range)", "groups", "rows", "allocs/row", "p50", "p99");
+    for (name, q, by, m) in &aggregations {
+        let s = parse(q).unwrap();
+        let mut ns = Vec::new();
+        let mut last = None;
+        let mut allocs = 0u64;
+        for _ in 0..9 {
+            alloc::begin();
+            let t = Instant::now();
+            let a = store.aggregate_logs(&s, t0, t1, by, m).unwrap();
+            ns.push(t.elapsed().as_nanos() as u64);
+            allocs = alloc::end().calls();
+            last = Some(a);
+        }
+        ns.sort_unstable();
+        let a = last.unwrap();
+        println!("{:<44} {:>8} {:>10} {:>12.4} {:>8.2}ms {:>8.2}ms", name, a.groups.len(), a.rows_scanned, allocs as f64 / a.rows_scanned.max(1) as f64, ns[ns.len() / 2] as f64 / 1e6, ns[ns.len() - 1] as f64 / 1e6);
+    }
+    // The explorer's facet list (four facets, one pass) and its histogram (count by status, 60 buckets).
+    let all = parse("*").unwrap();
+    let four = [Facet::Service, Facet::Host, Facet::Source, Facet::Status];
+    let step = ((t1 - t0) / 60).max(1);
+    for (name, run) in [
+        ("facets: service, host, source, status (1 pass)", Box::new(|| store.log_facets(&all, t0, t1, &four, 10).map(|f| (f.facets.len(), f.rows_scanned))) as Box<dyn Fn() -> Result<(usize, u64), kiln_obs::logs::store::AggregateError>>),
+        ("histogram: count by {status}, 60 buckets", Box::new(|| store.aggregate_logs_buckets(&all, t0, t1, step, &[Facet::Status], &Measure::Count).map(|b| (b.groups.len(), b.rows_scanned)))),
+    ] {
+        let mut ns = Vec::new();
+        let mut allocs = 0u64;
+        let mut last = (0, 0);
+        for _ in 0..9 {
+            alloc::begin();
+            let t = Instant::now();
+            last = run().unwrap();
+            ns.push(t.elapsed().as_nanos() as u64);
+            allocs = alloc::end().calls();
+        }
+        ns.sort_unstable();
+        println!("{:<44} {:>8} {:>10} {:>12.4} {:>8.2}ms {:>8.2}ms", name, last.0, last.1, allocs as f64 / last.1.max(1) as f64, ns[ns.len() / 2] as f64 / 1e6, ns[ns.len() - 1] as f64 / 1e6);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

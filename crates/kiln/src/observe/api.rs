@@ -40,6 +40,17 @@ fn monitors() -> Result<&'static std::sync::Arc<super::monitors::Monitors>, Fail
     MONITORS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "monitors are kept by the server"))
 }
 
+/// The server's dashboards, once it started.
+static DASHBOARDS: OnceLock<std::sync::Arc<super::dashboards::Dashboards>> = OnceLock::new();
+
+pub fn set_dashboards(d: std::sync::Arc<super::dashboards::Dashboards>) {
+    let _ = DASHBOARDS.set(d);
+}
+
+fn dashboards() -> Result<&'static std::sync::Arc<super::dashboards::Dashboards>, Fail> {
+    DASHBOARDS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "dashboards are kept by the server"))
+}
+
 /// A monitor as the API shows it: its definition, its overall state and its groups'.
 fn monitor_json(ms: &super::monitors::Monitors, m: &super::monitors::Monitor) -> Value {
     let mut v = serde_json::to_value(m).unwrap_or(Value::Null);
@@ -140,6 +151,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         }
         (&Method::POST, ["logs", "search"]) => search(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["logs", "aggregate"]) => aggregate(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::POST, ["logs", "facets"]) => facets(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["events"]) => post_event(read_json(req.into_body(), QUERY_BODY).await?),
         (&Method::POST, ["events", "search"]) => {
             let mut b: SearchBody = read_json(req.into_body(), QUERY_BODY).await?;
@@ -239,6 +251,33 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             monitors()?.test(name).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "sent": true })))
         }
+        (&Method::GET, ["dashboards"]) => {
+            // The list without the widgets: what a dashboard is, and how many it holds.
+            let list: Vec<Value> = dashboards()?.list().iter().map(|d| json!({ "id": d.id, "title": d.title, "description": d.description, "builtin": d.builtin, "widgets": d.widgets.len(), "modified": d.modified })).collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "dashboards": list })))
+        }
+        (&Method::POST, ["dashboards"]) => {
+            let mut d: super::dashboards::Dashboard = read_json(req.into_body(), super::dashboards::BYTES).await?;
+            d.id.clear();
+            let d = dashboards()?.put(d).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::CREATED, &d))
+        }
+        (&Method::GET, ["dashboards", id]) => Ok(srv::json(StatusCode::OK, &dashboards()?.get(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such dashboard"))?)),
+        (&Method::PUT, ["dashboards", id]) => {
+            let ds = dashboards()?;
+            let id = (*id).to_owned();
+            if ds.get(&id).is_none() {
+                return Err(fail(StatusCode::NOT_FOUND, "no such dashboard"));
+            }
+            let mut d: super::dashboards::Dashboard = read_json(req.into_body(), super::dashboards::BYTES).await?;
+            d.id = id;
+            let d = ds.put(d).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::OK, &d))
+        }
+        (&Method::DELETE, ["dashboards", id]) => match dashboards()?.delete(id).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
+            true => Ok(srv::status(StatusCode::NO_CONTENT)),
+            false => Err(fail(StatusCode::NOT_FOUND, "no such dashboard")),
+        },
         (&Method::POST, ["series"]) => ingest_series(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::POST, ["logs"]) => ingest_logs(read_json(req.into_body(), INGEST_BODY).await?),
         _ => Err(fail(StatusCode::NOT_FOUND, "no such observe route")),
@@ -354,6 +393,9 @@ struct AggregateBody {
     /// The facet or attribute measured (`@duration`).
     #[serde(default)]
     of: Option<String>,
+    /// Buckets of this many ms (aligned to it): each group's value a bucket, a histogram.
+    #[serde(default)]
+    step: Option<i64>,
 }
 
 /// Log analytics: `count() by {service}` and the like over a search and a range.
@@ -375,10 +417,55 @@ async fn aggregate(body: AggregateBody) -> Result<Response, Fail> {
         let started = std::time::Instant::now();
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
-        let agg = s.aggregate_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let names: Vec<String> = by.iter().map(Facet::name).collect();
-        let groups: Vec<Value> = agg.groups.iter().map(|(vals, v)| json!({ "group": names.iter().zip(vals).map(|(k, x)| (k.clone(), Value::from(x.clone()))).collect::<serde_json::Map<_, _>>(), "value": v })).collect();
+        let group = |vals: &[String]| names.iter().zip(vals).map(|(k, x)| (k.clone(), Value::from(x.clone()))).collect::<serde_json::Map<_, _>>();
+        if let Some(step) = body.step {
+            if step <= 0 {
+                return Err(fail(StatusCode::BAD_REQUEST, "a step: more than 0 ms"));
+            }
+            let b = s.aggregate_logs_buckets(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), ns(step), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            let series: Vec<Value> = b.groups.iter().map(|(vals, v)| json!({ "group": group(vals), "values": v })).collect();
+            return Ok(srv::json(
+                StatusCode::OK,
+                &json!({ "grid": { "from": b.buckets.start / 1_000_000, "step": step, "n": b.buckets.n }, "series": series, "rows_scanned": b.rows_scanned, "blocks_pruned": b.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 }),
+            ));
+        }
+        let agg = s.aggregate_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &by, &measure).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let groups: Vec<Value> = agg.groups.iter().map(|(vals, v)| json!({ "group": group(vals), "value": v })).collect();
         Ok(srv::json(StatusCode::OK, &json!({ "groups": groups, "rows_scanned": agg.rows_scanned, "blocks_pruned": agg.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 })))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+struct FacetsBody {
+    #[serde(default)]
+    query: String,
+    from: i64,
+    to: i64,
+    /// `service`, `host`, `source`, `status`, `@attribute`.
+    facets: Vec<String>,
+    /// Values a facet shows at the most (10).
+    #[serde(default)]
+    top: Option<usize>,
+}
+
+/// The explorer's facet list: each facet's most common values over a search and a range, every
+/// facet in one pass over the records.
+async fn facets(body: FacetsBody) -> Result<Response, Fail> {
+    use kiln_obs::logs::store::Facet;
+    let facets: Vec<Facet> = body.facets.iter().map(|f| Facet::parse(f)).collect();
+    if facets.len() > 32 {
+        return Err(fail(StatusCode::BAD_REQUEST, "at most 32 facets"));
+    }
+    let top = body.top.unwrap_or(10).clamp(1, 1000);
+    reading(move |s| {
+        let started = std::time::Instant::now();
+        let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let ns = |ms: i64| ms.saturating_mul(1_000_000);
+        let fc = s.log_facets(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), &facets, top).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let out: Vec<Value> = facets.iter().zip(&fc.facets).map(|(f, (values, distinct))| json!({ "facet": f.name(), "distinct": distinct, "values": values.iter().map(|(v, n)| json!({ "value": v, "count": n })).collect::<Vec<_>>() })).collect();
+        Ok(srv::json(StatusCode::OK, &json!({ "facets": out, "matched": fc.matched, "rows_scanned": fc.rows_scanned, "blocks_pruned": fc.blocks_pruned, "took_ms": started.elapsed().as_secs_f64() * 1000.0 })))
     })
     .await
 }

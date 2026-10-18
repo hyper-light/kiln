@@ -190,16 +190,24 @@ impl LogFile {
 
     /// Block `i` whole: its summary with its text read and checked.
     pub fn load(&self, i: usize, into: &mut LogBlock) -> Result<(), LogFileError> {
-        let (Some(b), Some(t)) = (self.blocks.get(i), self.texts.get(i)) else { return Err(LogFileError::Damaged(self.path.clone(), "block index")) };
         let mut text = std::mem::take(&mut into.text);
-        text.clear();
-        text.resize(t.len as usize, 0);
-        read_at(&self.file, &mut text, t.off).map_err(io_err(&self.path))?;
-        if crc32c::checksum(&text) != t.crc {
-            return Err(LogFileError::Damaged(self.path.clone(), "a block's text checksum"));
-        }
+        let b = self.read_text(i, &mut text)?;
         *into = LogBlock { text, ..b.clone() };
         Ok(())
+    }
+
+    /// Block `i`'s text into `text` (reused across blocks: a block read allocates nothing),
+    /// checked against its checksum; the block's summary, which says how it decompresses
+    /// ([`LogBlock::decompress_text`]).
+    pub fn read_text(&self, i: usize, text: &mut Vec<u8>) -> Result<&LogBlock, LogFileError> {
+        let (Some(b), Some(t)) = (self.blocks.get(i), self.texts.get(i)) else { return Err(LogFileError::Damaged(self.path.clone(), "block index")) };
+        text.clear();
+        text.resize(t.len as usize, 0);
+        read_at(&self.file, text, t.off).map_err(io_err(&self.path))?;
+        if crc32c::checksum(text) != t.crc {
+            return Err(LogFileError::Damaged(self.path.clone(), "a block's text checksum"));
+        }
+        Ok(b)
     }
 
     pub fn path(&self) -> &Path {
@@ -209,12 +217,11 @@ impl LogFile {
     /// Reads every block's text whole, checked against its checksum and decompressed, and its rows
     /// read: what a file fetched from another replica is put through before it is taken.
     pub fn verify(&self) -> Result<(), LogFileError> {
-        let mut whole = LogBlock::seal_owned(&[]);
-        let mut raw = Vec::new();
+        let (mut text, mut raw) = (Vec::new(), Vec::new());
         for i in 0..self.blocks.len() {
-            self.load(i, &mut whole)?;
-            whole.decompress(&mut raw).map_err(|_| LogFileError::Damaged(self.path.clone(), "a block's text"))?;
-            let mut rows = whole.rows(&raw);
+            let b = self.read_text(i, &mut text)?;
+            b.decompress_text(&text, &mut raw).map_err(|_| LogFileError::Damaged(self.path.clone(), "a block's text"))?;
+            let mut rows = b.rows(&raw);
             while rows.next_row().map_err(|_| LogFileError::Damaged(self.path.clone(), "a block's rows"))?.is_some() {}
         }
         Ok(())

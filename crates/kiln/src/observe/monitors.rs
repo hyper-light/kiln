@@ -181,7 +181,7 @@ impl Monitors {
         let now = crate::util::now_ms();
         let mut defs = lock(&self.defs);
         if m.id.is_empty() {
-            m.id = format!("m{}", crate::util::new_id().get(..12).unwrap_or(""));
+            m.id = super::fresh_id("m", |id| defs.contains_key(id));
             m.created = now;
         } else if let Some(old) = defs.get(&m.id) {
             m.created = old.created;
