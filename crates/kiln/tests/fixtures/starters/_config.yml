@@ -1,0 +1,6 @@
+title: fixture
+# Plain kramdown: the GFM parser is a gem of its own, and the Gemfile here is Ruby's fixture.
+markdown: kramdown
+kramdown:
+  input: kramdown
+exclude: [node_modules, vendor, target, dist, build, obj, bin, deps, _build, src, test, spec, rb, php, ex, ex_test, hs, clj, scala, cmake, autotools, ada, deno, fixture_site, lib, source, project]

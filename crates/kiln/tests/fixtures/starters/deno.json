@@ -1,0 +1,5 @@
+{
+  "lint": { "include": ["deno/"] },
+  "test": { "include": ["deno/"] },
+  "fmt": { "include": ["deno/"] }
+}

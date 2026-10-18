@@ -1,0 +1,6 @@
+{
+  "name": "fixture",
+  "description": "kiln's starter-workflow fixture",
+  "license": "MIT",
+  "targetType": "library"
+}

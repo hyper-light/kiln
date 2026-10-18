@@ -1,0 +1,8 @@
+[tool.pylint."messages control"]
+# The pylint starter installs pylint alone, not the requirements.
+disable = ["import-error"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+norecursedirs = ["node_modules", "dist", "target", "build", "obj", "bin", "_site", "deps", "_build", "vendor"]
