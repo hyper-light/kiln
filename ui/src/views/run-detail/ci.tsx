@@ -45,6 +45,16 @@ export function EditWorkflowLink({ detail }: { detail: CiRunDetail }) {
   );
 }
 
+/** The run's workflow in Insights: its durations, success and where its time goes (W21-R12). */
+export function WorkflowInsightsLink({ detail }: { detail: CiRunDetail }) {
+  const { run } = detail;
+  return (
+    <Link to={`/insights?repo=${encodeURIComponent(run.repo)}&workflow=${encodeURIComponent(run.workflow)}`} className="text-link font-mono text-[11px]">
+      Workflow insights
+    </Link>
+  );
+}
+
 /** Rerun (all, failed, one job; with debug logging) and Cancel, where the run's header is. */
 export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: string[] }) {
   const { run } = detail;

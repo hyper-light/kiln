@@ -84,7 +84,7 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from,
-                        CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END
+                        CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END, waits
                  FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
@@ -97,6 +97,8 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
                     "exit_code": r.get::<_, Option<i64>>(16)?, "reused_from": r.get::<_, Option<String>>(17)?,
                     // A failed leg kept to look into, until when (W17-R02).
                     "kept_until": r.get::<_, Option<i64>>(18)?,
+                    // Seconds queued, by wait reason (W19-R01).
+                    "waits": json_col(19)?,
                 }))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -124,7 +126,13 @@ pub async fn get(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Res
 /// critical path, the chain of jobs that took longest end to end.
 pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     run_json(hub, id).await?;
-    let legs = legs(hub, id, attempt_of(q)).await?;
+    Ok(srv::json(StatusCode::OK, &graph_json(hub, id, attempt_of(q)).await?))
+}
+
+/// A run's graph: its jobs with their legs and spans, the edges between them, and the critical
+/// path.
+pub async fn graph_json(hub: &Hub, id: &str, attempt: Option<i64>) -> Result<Value, Fail> {
+    let legs = legs(hub, id, attempt).await?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
     // Jobs by id, in the order their first leg appeared.
     let mut order: Vec<String> = Vec::new();
@@ -156,15 +164,16 @@ pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<R
         let end = ls.iter().filter_map(|l| l.get("finished_at").and_then(Value::as_i64)).max().unwrap_or(start);
         (start, end)
     };
-    // The critical path: walk back from the job that finished last through the need that
-    // finished last.
-    let mut path: Vec<String> = Vec::new();
-    let mut cur = order.iter().max_by_key(|j| span(j).1).cloned();
-    while let Some(j) = cur {
-        path.push(j.clone());
-        cur = edges.iter().filter(|(_, to)| to == &j).map(|(from, _)| from.clone()).filter(|f| !path.contains(f)).max_by_key(|f| span(f).1);
-    }
-    path.reverse();
+    // The critical path (W19-R01): the longest path through `needs` by the jobs' spans.
+    let jobs: Vec<kiln_ci::insights::Node> = order
+        .iter()
+        .map(|j| {
+            let (start, end) = span(j);
+            let needs = edges.iter().filter(|(_, to)| to == j).map(|(from, _)| from.clone()).collect();
+            kiln_ci::insights::Node { id: j.clone(), needs, duration: if start > 0 { (end - start).max(0) as f64 } else { 0.0 } }
+        })
+        .collect();
+    let path = kiln_ci::insights::critical_path(&jobs);
     let nodes: Vec<Value> = order
         .iter()
         .map(|j| {
@@ -175,7 +184,7 @@ pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<R
         })
         .collect();
     let edges: Vec<Value> = edges.iter().map(|(a, b)| json!({ "from": a, "to": b })).collect();
-    Ok(srv::json(StatusCode::OK, &json!({ "nodes": nodes, "edges": edges, "critical_path": path })))
+    Ok(json!({ "nodes": nodes, "edges": edges, "critical_path": path }))
 }
 
 /// `GET /api/ci/runs/:id/annotations`, `/summary`, `/artifacts`.

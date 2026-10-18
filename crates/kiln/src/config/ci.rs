@@ -45,10 +45,59 @@ pub struct Ci {
     /// throttle = "10m"
     /// ```
     pub notify: Vec<crate::ci::notify::Rule>,
+    pub scheduler: Scheduler,
+    pub fairness: Fairness,
+    pub insights: Insights,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// `[ci.scheduler]`: how waiting legs are ordered (docs/ci.md W05-R09, R10).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scheduler {
+    /// Effective priority a waiting leg gains per minute, so nothing starves.
+    pub aging_per_minute: f64,
+    /// Seconds a leg is expected to take when its job has no history (W19's medians).
+    pub default_cost_seconds: f64,
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        let d = kiln_ci::sched::state::Config::default();
+        Scheduler { aging_per_minute: d.aging_per_minute, default_cost_seconds: d.default_cost }
+    }
+}
+
+/// `[ci.fairness]`: fair share and quotas by repository name (docs/ci.md W05-R10, R11).
+///
+/// ```toml
+/// [ci.fairness]
+/// weights = { "acme/app" = 2 }   # 1 when not named
+/// quotas = { "acme/big" = 10 }   # legs in progress at most
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Fairness {
+    pub weights: std::collections::HashMap<String, f64>,
+    pub quotas: std::collections::HashMap<String, usize>,
+}
+
+/// `[ci.insights]` (docs/ci.md W19-R01): what a runner-minute costs, by pool (a runner's
+/// `pool:<name>` label; `default` for the rest), for the cost columns of Insights.
+///
+/// ```toml
+/// [ci.insights]
+/// cost_per_minute = { default = 0.008, gpu = 0.12 }
+/// currency = "USD"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Insights {
+    pub cost_per_minute: std::collections::HashMap<String, f64>,
+    pub currency: String,
 }
 
 /// `[ci.actions]`: which remote actions runs may use, and what to mirror ahead (docs/ci.md

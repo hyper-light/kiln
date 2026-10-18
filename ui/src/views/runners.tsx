@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
-import { Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
+import { ChartLine, Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Agent, Job, RunnerInstance, RunnerUpdate } from "@/api/types";
@@ -473,6 +473,13 @@ function AgentDetails({
         <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal}>
           <SquareTerminal /> Open terminal
         </Button>
+        {!agent.outpost && (
+          <Button asChild variant="ghost" size="xs">
+            <Link to={`/insights?runner=${encodeURIComponent(agent.name)}`}>
+              <ChartLine /> Insights
+            </Link>
+          </Button>
+        )}
         {!agent.outpost && (
           <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
             {agent.draining ? "Resume scheduling" : "Drain"}

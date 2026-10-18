@@ -139,6 +139,8 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["repos", repo, "tests"]) => super::results::repo(hub, repo, q).await,
         // W19-R06: what notifications went out.
         (&Method::GET, ["notify", "deliveries"]) => super::notify::deliveries(hub, q).await,
+        // W19-R01: insights.
+        (&Method::GET, ["insights", rest @ ..]) => super::insights::route(hub, rest, q).await,
         // W19-R07: outgoing webhooks' deliveries, and sending one again.
         (_, ["webhooks", rest @ ..]) => super::webhooks::route(hub, &method, rest, q).await,
         // W16-R07, R08: benchmark metrics and their trends.

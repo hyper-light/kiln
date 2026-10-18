@@ -258,6 +258,92 @@ export interface CiCatalogEntry {
 }
 
 /** A CI run, or null when the run isn't the engine's (a v1 pipeline's, or gone). */
+/** A rollup as the insights API reads it (W19-R01): counts, rates, percentiles (seconds), resources. */
+export interface CiInsight {
+  count: number;
+  success: number;
+  failure: number;
+  cancelled: number;
+  skipped: number;
+  flaky: number;
+  retried: number;
+  success_rate: number | null;
+  flaky_rate: number | null;
+  p50: number | null;
+  p90: number | null;
+  p99: number | null;
+  mean: number | null;
+  queue_p50: number | null;
+  queue_p90: number | null;
+  queue_seconds: number;
+  run_seconds: number;
+  cpu_seconds: number;
+  peak_rss: number;
+  runner_minutes: number;
+  /** Queue seconds by wait reason (W05-R13). */
+  waits: Record<string, number>;
+  failures: Record<string, number>;
+}
+
+export interface CiInsightPoint extends CiInsight {
+  /** The bucket's start (Unix seconds). */
+  bucket: number;
+}
+
+interface CiInsightsHead {
+  since: number;
+  days: number;
+  grain: "hour" | "day";
+  currency: string;
+}
+
+/** A repository's runs and its share of runner time, against its fair-share weight's (W05-R10). */
+export interface CiRepoShare {
+  id: string;
+  name: string | null;
+  runs: CiInsight;
+  runner_minutes: number;
+  share: number | null;
+  weight: number;
+  weight_share: number | null;
+  cost: number | null;
+}
+
+export interface CiInsightsRepo extends CiInsightsHead {
+  repo: { id: string; name: string };
+  share: CiRepoShare | null;
+  workflows: (CiInsight & { workflow: string; name: string | null; series: CiInsightPoint[] })[];
+}
+
+export interface CiInsightsWorkflow extends CiInsightsHead, CiInsight {
+  repo: { id: string; name: string };
+  workflow: string;
+  name: string | null;
+  series: CiInsightPoint[];
+  jobs: (CiInsight & { job: string; series: CiInsightPoint[] })[];
+  steps: { job: string; step: string; count: number; p50: number | null; p90: number | null; mean: number | null; total: number; success_rate: number | null }[];
+  executors: { executor: string; pool: string; legs: number; runner_minutes: number; cpu_seconds: number; peak_rss: number; cost: number | null }[];
+  cache: { prefix: string; hits: number; misses: number; saves: number; hit_rate: number | null; bytes_restored: number; bytes_saved: number; seconds_saved: number | null }[];
+  critical_path: { run: string; number: number; jobs: string[]; seconds: number } | null;
+}
+
+export interface CiRunnerInsight {
+  runner: string;
+  pool: string;
+  connected_minutes: number;
+  slot_minutes: number;
+  busy_minutes: number;
+  utilization: number | null;
+  legs: CiInsight;
+  runner_minutes: number;
+  cost: number | null;
+}
+
+export interface CiInsightsRunner extends CiInsightsHead, CiRunnerInsight {
+  series: (CiInsightPoint & { connected_minutes: number; slot_minutes: number; busy_minutes: number; utilization: number | null })[];
+  repos: { id: string; name: string | null; legs: number; runner_minutes: number; failure: number }[];
+}
+
 export async function ciRun(id: string, attempt: number | undefined, signal?: AbortSignal): Promise<CiRunDetail | null> {
   try {
     return await request<CiRunDetail>("GET", `/api/ci/runs/${enc(id)}${at(attempt)}`, undefined, { signal });
@@ -297,6 +383,12 @@ export const ci = {
     request<CiWorkflowSource>("GET", `/api/ci/repos/${enc(repo)}/workflows/${path.split("/").map(enc).join("/")}${ref ? `?ref=${enc(ref)}` : ""}`, undefined, { signal }),
   names: (repo: string, path: string, signal?: AbortSignal) => request<{ secrets: string[]; variables: string[] }>("GET", `/api/ci/repos/${enc(repo)}/names?path=${enc(path)}`, undefined, { signal }),
   catalog: (q: string, signal?: AbortSignal) => request<{ actions: CiCatalogEntry[] }>("GET", `/api/ci/actions?q=${enc(q)}`, undefined, { signal }),
+  insightsRepos: (days: number, signal?: AbortSignal) => request<CiInsightsHead & { repos: CiRepoShare[] }>("GET", `/api/ci/insights/repos?days=${days}`, undefined, { signal }),
+  insightsRepo: (repo: string, days: number, signal?: AbortSignal) => request<CiInsightsRepo>("GET", `/api/ci/insights/repos/${enc(repo)}?days=${days}`, undefined, { signal }),
+  insightsWorkflow: (repo: string, workflow: string, days: number, signal?: AbortSignal) =>
+    request<CiInsightsWorkflow>("GET", `/api/ci/insights/workflows/${enc(repo)}?workflow=${enc(workflow)}&days=${days}`, undefined, { signal }),
+  insightsRunners: (days: number, signal?: AbortSignal) => request<CiInsightsHead & { runners: CiRunnerInsight[] }>("GET", `/api/ci/insights/runners?days=${days}`, undefined, { signal }),
+  insightsRunner: (runner: string, days: number, signal?: AbortSignal) => request<CiInsightsRunner>("GET", `/api/ci/insights/runners/${enc(runner)}?days=${days}`, undefined, { signal }),
   preview: (body: { repo: string; ref?: string; sha?: string; path?: string; content?: string; event?: string | { name: string; inputs?: Record<string, string> } }) =>
     request<CiPreview>("POST", `/api/ci/plan-preview`, body),
 };

@@ -189,9 +189,9 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights, compare, log search, audit v2 left |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare, log search, audit v2 left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
-| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; the rest left |
+| W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
 
 ---
@@ -1702,6 +1702,9 @@ W20.
     - `sim`, the simulator.
   - Tests: AC01 to AC06, AC10, S01 to S04, and AC08 at 127,000 assignments per second with a p99
     of 6 µs per input, against a target of 2,000.
+  - `[ci.scheduler]` (`aging_per_minute`, `default_cost_seconds`) and `[ci.fairness]`
+    (`weights`, `quotas`, by repository name) reach the scheduler. A leg's expected cost (R10)
+    is its job's median duration over the last two weeks, from W19's rollups.
   - `crates/kiln/src/ci/dispatch.rs`, the dispatcher, behind `[ci] enabled`:
     - it uses the hub's slot bookkeeping, so v1 and v2 share runners;
     - v1 code reads only v1 rows;
@@ -2333,7 +2336,9 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
     - `cas.rs`: the store, with chunks stored once, ranged reads and collection (R01, AC05 on
       48 MiB);
     - `blob.rs`: signed URLs and the Azure Blob subset (R03, AC04);
-    - `cache_v1.rs`: the cache protocol, with quotas and idle expiry (R06, R07);
+    - `cache_v1.rs`: the cache protocol, with quotas and idle expiry (R06, R07), recording each
+      lookup (hit or miss) and save for R13's insights (hit rates, bytes and time saved by key
+      prefix and workflow, in W19's Insights);
     - `twirp.rs`: `ArtifactService` (R05, R08);
     - hourly upkeep.
   - Leg tokens are JWTs carrying GitHub's `scp` and `ac` claims and `ACTIONS_CACHE_MODE` (R04,
@@ -3727,7 +3732,63 @@ rule-based notifications (G-30, G-31).
   Discord, email and webhook channels deliver (local fakes, then real ones). *Integration test.*
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
-**Progress.** In progress: R06 (with W11-R06's channels). Done: R07.
+**Progress.** In progress: R02 (OpenTelemetry export waits for W11-R09) and R06 (with W11-R06's
+channels). Done: R01, R07, AC01 and AC02.
+
+- *R01, R02* (`crates/kiln-ci/src/insights/`, `crates/kiln/src/ci/insights.rs`, migration
+  `20261018-1900_w19_insights.sql`):
+  - **Rollups.** `kiln_ci::insights::Rollup` keeps one bucket's facts and merges exactly:
+    - counts by conclusion, flaky (passed after a failed attempt) and retried legs;
+    - durations and queue times as a log-bucketed histogram, with quantiles within 1 %;
+    - CPU-seconds, peak memory and runner-seconds (every attempt);
+    - queue seconds by wait reason, and failure classes.
+  - **Rolling up.** Every minute, each hour that has passed is rolled up from the runs, legs and
+    steps that finished in it, one row per repository, workflow, job, step, executor and runner.
+    - A day is its hours merged. Hours are kept 35 days, days for good.
+    - A first start catches up 96 hours a minute.
+    - What finished since the last rolled-up hour is read live, so insights are current.
+  - **What feeds them:**
+    - each leg's queue time by wait reason (`jobs.waits`, closed whenever the reason's kind
+      changes, the leg starts or it ends);
+    - every attempt in `ci_attempts`, with its runner, conclusion and failure class (nothing
+      wrote that table before);
+    - cache lookups and saves (W08-R13);
+    - each runner's connected, slot and busy seconds per hour, sampled every minute.
+  - **The API**, `/api/ci/insights/…`, over `?days=` (30 by default; hours for two days or
+    `?grain=hour`):
+    - `repos`: each repository's runs, runner time, share of all runner time, and its
+      `[ci.fairness]` weight's share;
+    - `repos/:repo`: its workflows, with series;
+    - `workflows/:repo?workflow=`:
+      - its runs and series (p50, p90, p99, success and flaky rates, queue time);
+      - each job's legs with waits by reason, failure classes, CPU, peak memory and runner time;
+      - the 20 slowest steps;
+      - executors and pools (a runner's `pool:` label) with an optional
+        `[ci.insights] cost_per_minute` per pool;
+      - the cache by key prefix;
+      - the latest run's critical path;
+    - `runners` and `runners/:name`: utilization (busy over connected slot-time), legs, failure
+      classes, and whose legs they ran.
+  - **The critical path** is `kiln_ci::insights::critical_path`: the longest path through
+    `needs` by the jobs' spans. The run graph uses it.
+  - **Prometheus** (`/metrics`):
+    - `kiln_ci_cache_total{result}`;
+    - `kiln_ci_attempts_total{conclusion,class}`;
+    - `kiln_ci_wait_seconds_total{reason}`;
+    - `kiln_ci_rollup_lag_seconds`.
+  - **Tests.** AC01 checks hand-computed paths: a diamond, a long job against a chain, ties, a
+    fan-in, unknown needs, a cycle, 200 jobs in a chain. AC02 checks a million synthetic legs,
+    rolled up by the hour, merged into days and then the month, through their stored JSON:
+    - counts, failure classes and peak memory exactly;
+    - sums to rounding;
+    - the 1st to 99.9th percentiles within 1 % of the sorted values.
+  - **Verified end to end** on a local server, with a workflow built to produce each fact:
+    - capacity, concurrency and retry waits, by reason;
+    - the flaky job's two attempts, one failure classed;
+    - a cache miss and save, then a hit, with 5 s saved;
+    - the runner's utilization (0.92);
+    - each repository's share against its weight;
+    - the Insights pages (W21-R12) in Chromium and WebKit, desktop and phone.
 
 - *R06* (`crates/kiln/src/ci/notify.rs`):
   - Rules come from trunk's `.kiln/notify.yaml` and the server's `[[ci.notify]]`, as written
@@ -3777,8 +3838,8 @@ rule-based notifications (G-30, G-31).
     - pointing that subscriber at a working URL sent the rest there;
     - redelivering a failed delivery sent it there with its own delivery id;
     - `run.failed` and `run.succeeded` arrived with their repository.
-- *Left*: R01 to R05; email (SMTP), the inbox and issue trackers as channels; the other
-  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC01 to AC06.
+- *Left*: R02's OpenTelemetry export, R03 to R05; email (SMTP), the inbox and issue trackers as channels; the other
+  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC03 to AC06.
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 
@@ -4062,6 +4123,23 @@ image builder), review, environments, settings, insights (G-06, G-08, G-09, G-11
     leg's wait reason in words, and kept legs marked;
   - job summaries, annotations, artifacts and the pinned actions;
   - "Edit workflow".
+- *Done.* R12, Insights (`ui/src/views/ci/insights.tsx`, `/insights`; from Runs, a run's
+  "Workflow insights" and a runner's details):
+  - the overview: repositories (runs, success, p50 and p90, runner time, share against fair
+    share) and runners (utilization, busy time, legs, failure classes, cost);
+  - a repository's workflows, with each one's median-duration trend;
+  - a workflow:
+    - its numbers, and the latest run's critical path;
+    - duration (p50 and p90), success, and waiting charts;
+    - why legs waited, as bars by reason;
+    - its jobs, slowest steps, executors and pools, and cache;
+  - a runner's utilization, failures by class, and the repositories it served.
+
+  The charts are the metrics pages' (`Chart`), one measure each. The p90 line is the darker
+  step of the p50 hue, an ordinal pair validated against the chart surface. Kiln's pastel series
+  palette fails the categorical checks as a pair, so no chart uses two hues. Every chart spans
+  the window, shows lone points ringed, and has its numbers as a table under "As a table". The
+  pages were checked in Chromium and WebKit, desktop and phone: no overflow, no errors.
 - *Done.* R05's start: a leg's annotations inline, "kept from the last attempt", why a queued
   leg waits with each runner's checks, and its steps in the order they ran.
 - *Done.* R01 and R06's start:
@@ -4281,6 +4359,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | POST | `/api/ci/repos/:repo/quarantine` | `ci.tests.propose_quarantine` (→ diff) | diffs.submit | W16, W20 |
 | GET | `/api/ci/repos/:repo/metrics?name=&branch=` | `ci.metrics.query` | runs.read | W16 |
 | GET | `/api/ci/insights/{workflows,runners,repos}/:id` | `ci.insights.*` | runs.read | W19 |
+| GET | `/api/ci/insights/repos[/:repo]` · `/workflows/:repo?workflow=` · `/runners[/:name]` (built; `?days=&grain=`) | `ci.insights.*` | runs.read (repos, workflows), runners.read (runners) | W19 |
 | GET/PUT | `/api/ci/notifications/rules?scope=` · GET `/api/inbox` | `ci.notifications.*` | settings.manage, — | W19 |
 | GET/POST/DELETE | `/api/webhooks[/:id]` · POST `/:id/redeliver` | `webhooks.*` | settings.manage | W19 |
 | GET · POST | `/api/ci/webhooks/deliveries[/:id]` · `/:id/redeliver` (built: subscriptions are `webhook` integrations with `events`) | `ci.webhooks.*` | integrations.manage | W19 |
