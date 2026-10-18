@@ -899,6 +899,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut harness_wait: Option<Instant> = None;
     // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
     let mut accept_said: Option<bool> = None;
+    // Its battery: when it was last read, and what was last said of it, when.
+    let mut power_read_at: Option<Instant> = None;
+    let mut power_said: Option<(crate::os::battery::Battery, Instant)> = None;
     let mut noticed: Option<String> = None;
     // The harnesses this machine offers, as last reported (rechecked every minute or so).
     let mut harness_kinds_sent: Option<String> = None;
@@ -2242,6 +2245,18 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
+                    // Its battery, once a minute, when it has one: said when it changes, and every
+                    // 10 minutes (a machine on battery sleeps when it runs out).
+                    if !o.ephemeral && !o.outpost && power_read_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        power_read_at = Some(Instant::now());
+                        if let Ok(Some(b)) = crate::rt::blocking(crate::os::battery::read).await
+                            && (power_said.as_ref().is_none_or(|(said, _)| said != &b) || power_said.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(600)))
+                            && let Ok(json) = serde_json::to_string(&b)
+                        {
+                            uplink.msg(AgentMsg::Power { json }).await;
+                            power_said = Some((b, Instant::now()));
+                        }
+                    }
                     if let Some(ai) = &ai {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());
