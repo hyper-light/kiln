@@ -60,8 +60,9 @@ pub struct InstallArgs {
     /// runs in a cluster and is reached through forwarded ports).
     #[arg(long, env = "KILN_QUIC")]
     pub quic: Option<String>,
-    /// Agent: join token (consumed during install; never stored in the boot command).
-    #[arg(long, env = "KILN_JOIN_TOKEN")]
+    /// Agent: join token (consumed during install; never stored in the boot command). It may start
+    /// with `-` (random URL-safe base64): a value all the same.
+    #[arg(long, env = "KILN_JOIN_TOKEN", allow_hyphen_values = true)]
     pub token: Option<String>,
     #[arg(long)]
     pub name: Option<String>,

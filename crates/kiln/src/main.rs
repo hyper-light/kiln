@@ -147,8 +147,9 @@ struct ServerArgs {
     /// The server's URL, e.g. http://localhost:7070.
     #[arg(long, env = "KILN_URL")]
     url: Option<String>,
-    /// The server's admin token.
-    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true)]
+    /// The server's admin token. Tokens are random URL-safe base64: one in 64 starts with `-`, so a
+    /// value starting with one is a value here, not an option.
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
 }
 
@@ -166,7 +167,8 @@ struct AgentArgs {
     /// QUIC address (host:port); defaults to what the server advertised at enrollment.
     #[arg(long, env = "KILN_QUIC")]
     quic: Option<String>,
-    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true)]
+    /// The join token (random URL-safe base64: it may start with `-`, a value all the same).
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true, allow_hyphen_values = true)]
     token: Option<String>,
     #[arg(long, env = "KILN_AGENT_NAME")]
     name: Option<String>,
@@ -590,5 +592,23 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             out(&serde_json::to_string_pretty(&v)?);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tokens are random URL-safe base64, so one in 64 starts with `-`: every command that takes
+    /// one (the join commands kiln shows, the installer's) takes it as a value.
+    #[test]
+    fn a_token_that_starts_with_a_hyphen_is_a_token() -> anyhow::Result<()> {
+        let join = Cli::try_parse_from(["kiln", "agent", "--server", "http://s", "--token", "-7xK_q", "--labels", "baremetal"])?;
+        let Cmd::Agent(a) = join.cmd else { anyhow::bail!("not the agent") };
+        anyhow::ensure!(a.token.as_deref() == Some("-7xK_q") && a.labels == ["baremetal"]);
+        let install = Cli::try_parse_from(["kiln", "install", "--agent", "--token", "--x9", "--labels", "linux"])?;
+        let Cmd::Install(i) = install.cmd else { anyhow::bail!("not install") };
+        anyhow::ensure!(i.token.as_deref() == Some("--x9") && i.labels == ["linux"]);
+        Ok(())
     }
 }

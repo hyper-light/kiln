@@ -156,6 +156,9 @@ struct Admission {
     left_log_bytes: AtomicU64,
     /// Points and records of kiln's own refused at the bound itself.
     refused: AtomicU64,
+    /// The queue has kept too long a wait (`Batcher::congested`): exporters are refused until it
+    /// drains.
+    congested: AtomicBool,
 }
 
 /// Takes room for `n` against `max`, or says there is none. One write bigger than the bound is taken
@@ -253,7 +256,7 @@ impl Observe {
             return true;
         }
         let a = &self.admission;
-        if !reserve(&a.points, &a.left_points, n, max) {
+        if (!count && a.congested.load(Ordering::Acquire)) || !reserve(&a.points, &a.left_points, n, max) {
             if count {
                 a.refused.fetch_add(n, Ordering::Relaxed);
             }
@@ -275,7 +278,7 @@ impl Observe {
             return true;
         }
         let a = &self.admission;
-        if !reserve(&a.points, &a.left_points, n, WAITING_POINTS as u64 / 4 * 3) {
+        if a.congested.load(Ordering::Acquire) || !reserve(&a.points, &a.left_points, n, WAITING_POINTS as u64 / 4 * 3) {
             return false;
         }
         if self.tx.send(Input::Samples(keys, samples)).is_err() {
@@ -302,7 +305,7 @@ impl Observe {
         }
         let n: u64 = records.iter().map(|r| record_bytes(r) as u64).sum();
         let a = &self.admission;
-        if !reserve(&a.log_bytes, &a.left_log_bytes, n, max) {
+        if (!count && a.congested.load(Ordering::Acquire)) || !reserve(&a.log_bytes, &a.left_log_bytes, n, max) {
             if count {
                 a.refused.fetch_add(records.len() as u64, Ordering::Relaxed);
             }
@@ -331,7 +334,7 @@ impl Observe {
     pub fn busy(&self) -> bool {
         let a = &self.admission;
         let inside = |taken: &AtomicU64, left: &AtomicU64| taken.load(Ordering::Acquire).saturating_sub(left.load(Ordering::Acquire));
-        inside(&a.points, &a.left_points) >= WAITING_POINTS as u64 / 4 * 3 || inside(&a.log_bytes, &a.left_log_bytes) >= WAITING_LOG_BYTES as u64 / 4 * 3
+        a.congested.load(Ordering::Acquire) || inside(&a.points, &a.left_points) >= WAITING_POINTS as u64 / 4 * 3 || inside(&a.log_bytes, &a.left_log_bytes) >= WAITING_LOG_BYTES as u64 / 4 * 3
     }
 
     /// The store, for queries, once it is open.
@@ -622,10 +625,12 @@ impl Owner {
             self.writes();
             self.drive();
             self.periodic();
-            // What left the batcher's waiting frees its room for the next requests.
+            // What left the batcher's waiting frees its room for the next requests; a queue that
+            // keeps too long a wait refuses exporters until it drains.
             let (points, log_bytes) = self.batcher.left();
             self.admission.left_points.store(points, Ordering::Release);
             self.admission.left_log_bytes.store(log_bytes, Ordering::Release);
+            self.admission.congested.store(self.batcher.congested(Instant::now()), Ordering::Release);
         }
     }
 

@@ -13,6 +13,12 @@
 //! Gathering follows the OpenTelemetry Collector's batch processor: a write goes once its first
 //! point has waited [`FLUSH`], or once it is full (opentelemetry-collector
 //! `processor/batchprocessor`, `timeout` 200ms; full here is the group's entry, not a count).
+//!
+//! Series go into writes oldest first (the series whose first waiting point came first): when more
+//! waits than a write holds, no series waits behind others for longer than the queue's delay. That
+//! delay is what admission controls, as CoDel controls a queue (Nichols and Jacobson, "Controlling
+//! Queue Delay", 2012; RFC 8289): while the oldest point's wait stays above [`TARGET`] for an
+//! interval, exporters are told to come back (503) rather than queued behind it.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -24,6 +30,13 @@ use super::wire::Outcome;
 
 /// How long the first point of a write waits for more.
 pub const FLUSH: Duration = Duration::from_millis(200);
+/// The wait a queue may keep: five flushes. Under it a point is in a write within a second of
+/// coming; past it for a whole [`INTERVAL`], exporters' points are refused until it drains (they
+/// hold them better: an exporter retries a refused batch after seconds anyway).
+pub const TARGET: Duration = Duration::from_secs(1);
+/// What a queue's wait is judged over: its least within this long (CoDel's interval), so a burst
+/// that drains in time is no reason to refuse.
+pub const INTERVAL: Duration = Duration::from_secs(1);
 /// A write not answered by then is sent again, as it was.
 pub const RESEND: Duration = Duration::from_secs(5);
 /// How long a series counts as defined: past it, the next write of it defines it again.
@@ -65,8 +78,9 @@ pub struct Batcher {
     sender: u64,
     seq: u64,
     builder: Builder,
-    /// The series points wait for, each with how many: by fingerprint, their places here.
-    slots: Vec<(SeriesKey, u32)>,
+    /// The series points wait for, oldest first: each with how many wait, and since when the first
+    /// of them; by fingerprint, their places here.
+    slots: Vec<(SeriesKey, u32, Instant)>,
     by_fp: HashMap<u64, u32>,
     /// Points waiting, each with its series' place, as they came: one buffer, kept.
     points: Vec<(u32, i64, f64)>,
@@ -77,11 +91,14 @@ pub struct Batcher {
     out: Option<Out>,
     /// The last write answered: its buffers, for the next.
     spare: Out,
-    /// Reused to cut a write: the series in the order they go; where each one's points start,
-    /// and next go; the points sorted by series.
-    order: Vec<u32>,
+    /// Reused to cut a write: where each series' points start, and next go; the points sorted by
+    /// series.
     starts: Vec<u32>,
     sorted: Vec<(i64, f64)>,
+    /// The queue's least wait in this interval, and when the interval began; the last interval's.
+    least: Option<Duration>,
+    interval_from: Option<Instant>,
+    judged: Duration,
     /// Series a write of this sender defined, and when it was applied.
     known: HashMap<u64, Instant>,
     pub dropped: u64,
@@ -112,9 +129,11 @@ impl Batcher {
             first_waiting: None,
             out: None,
             spare: Out::default(),
-            order: Vec::new(),
             starts: Vec::new(),
             sorted: Vec::new(),
+            least: None,
+            interval_from: None,
+            judged: Duration::ZERO,
             known: HashMap::new(),
             dropped: 0,
             written: 0,
@@ -127,15 +146,36 @@ impl Batcher {
         self.sender
     }
 
-    /// The place of `key`'s series in `slots`, made if new (the key kept, or dropped as a copy).
-    fn slot(&mut self, key: SeriesKey) -> u32 {
+    /// The place of `key`'s series in `slots`, made (last: the youngest) if new.
+    fn slot(&mut self, key: SeriesKey, now: Instant) -> u32 {
         if let Some(&i) = self.by_fp.get(&key.fp) {
             return i;
         }
         let i = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
         self.by_fp.insert(key.fp, i);
-        self.slots.push((key, 0));
+        self.slots.push((key, 0, now));
         i
+    }
+
+    /// How long the oldest waiting point has waited.
+    pub fn delay(&self, now: Instant) -> Duration {
+        let series = self.slots.first().map(|s| s.2);
+        let logs = if self.logs.is_empty() { None } else { self.first_waiting };
+        series.into_iter().chain(logs).min().map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+    }
+
+    /// Whether the queue has kept more than [`TARGET`] of wait for a whole [`INTERVAL`]: its least
+    /// wait over the last interval, judged as time goes (each call one look).
+    pub fn congested(&mut self, now: Instant) -> bool {
+        let d = self.delay(now);
+        self.least = Some(self.least.map_or(d, |l| l.min(d)));
+        let from = *self.interval_from.get_or_insert(now);
+        if now.saturating_duration_since(from) >= INTERVAL {
+            self.judged = self.least.unwrap_or_default();
+            self.least = None;
+            self.interval_from = Some(now);
+        }
+        self.judged > TARGET
     }
 
     /// Points of series, waiting for the next write.
@@ -149,7 +189,7 @@ impl Batcher {
                 self.left_points += points.len() as u64;
                 continue;
             }
-            let slot = self.slot(key);
+            let slot = self.slot(key, now);
             self.take(slot, points.iter().copied());
             self.first_waiting.get_or_insert(now);
         }
@@ -167,7 +207,7 @@ impl Batcher {
             return;
         }
         // Each key's place here, by its place there.
-        let places: Vec<u32> = keys.into_iter().map(|k| self.slot(k)).collect();
+        let places: Vec<u32> = keys.into_iter().map(|k| self.slot(k, now)).collect();
         for &(i, ts, v) in samples {
             let Some(&slot) = places.get(i as usize) else { continue };
             self.push(slot, ts, v);
@@ -251,20 +291,13 @@ impl Batcher {
         out.series.clear();
         out.points.clear();
         out.defines.clear();
-        // Series in fingerprint order, so a write's bytes do not depend on the order points came.
-        self.order.clear();
-        self.order.extend(self.slots.iter().enumerate().filter(|(_, s)| s.1 > 0).map(|(i, _)| i as u32));
-        let slots = &self.slots;
-        self.order.sort_unstable_by_key(|&i| slots.get(i as usize).map_or(0, |s| s.0.fp));
-        // The points by series, each series' in the order they came: a counting sort.
+        // Series oldest first (their places are in that order), each one's points in the order
+        // they came: a counting sort.
         self.starts.clear();
-        self.starts.resize(self.slots.len(), 0);
         let mut at = 0u32;
-        for &i in &self.order {
-            if let (Some(st), Some(s)) = (self.starts.get_mut(i as usize), self.slots.get(i as usize)) {
-                *st = at;
-                at += s.1;
-            }
+        for s in &self.slots {
+            self.starts.push(at);
+            at += s.1;
         }
         self.sorted.clear();
         self.sorted.resize(self.points.len(), (0, 0.0));
@@ -280,9 +313,11 @@ impl Batcher {
         // takes at most 16 bytes in a run (two 64-bit words, Gorilla's worst).
         let mut start = 0usize;
         let mut taken_to = 0usize;
-        for &i in &self.order {
-            let Some((key, n)) = self.slots.get(i as usize) else { continue };
+        for (key, n, _) in &self.slots {
             let n = *n as usize;
+            if n == 0 {
+                continue;
+            }
             if self.builder.byte_len() >= ENTRY_BUDGET / 2 {
                 break;
             }
@@ -306,14 +341,13 @@ impl Batcher {
         let taken = out.points.len();
         self.waiting_points -= taken;
         self.left_points += taken as u64;
-        // What was not taken waits on, in the order it goes: the rest of a series cut in part,
-        // then every series after it. Places start again with them.
+        // What was not taken waits on, oldest first still: the rest of a series cut in part, then
+        // every series after it, each since when it was. Places start again with them.
         self.points.clear();
-        let mut kept: Vec<(SeriesKey, u32)> = Vec::new();
+        let mut kept: Vec<(SeriesKey, u32, Instant)> = Vec::new();
         if taken_to < self.sorted.len() {
             let mut at = 0usize;
-            for &i in &self.order {
-                let Some((key, n)) = self.slots.get(i as usize) else { continue };
+            for (key, n, since) in &self.slots {
                 let (from, to) = (at, at + *n as usize);
                 at = to;
                 let from = from.max(taken_to);
@@ -321,7 +355,7 @@ impl Batcher {
                     continue;
                 }
                 let place = kept.len() as u32;
-                kept.push((key.clone(), (to - from) as u32));
+                kept.push((key.clone(), (to - from) as u32, *since));
                 for &(ts, v) in self.sorted.get(from..to).unwrap_or_default() {
                     self.points.push((place, ts, v));
                 }
@@ -329,9 +363,9 @@ impl Batcher {
         }
         self.slots.clear();
         self.by_fp.clear();
-        for (key, n) in kept {
+        for (key, n, since) in kept {
             self.by_fp.insert(key.fp, self.slots.len() as u32);
-            self.slots.push((key, n));
+            self.slots.push((key, n, since));
         }
         settle(&mut self.points);
         settle(&mut self.sorted);
@@ -398,7 +432,7 @@ impl Batcher {
                 if outcome.unknown.contains(&key.fp) {
                     let points = out.points.get(range.clone()).unwrap_or_default();
                     back += points.len() as u64;
-                    let slot = self.slot(key.clone());
+                    let slot = self.slot(key.clone(), now);
                     self.take(slot, points.iter().copied());
                     self.first_waiting.get_or_insert(now);
                 }
@@ -507,18 +541,28 @@ mod tests {
         out
     }
 
+    /// What a store holds once it applied `writes`: its digest of every sample.
+    fn applied_all(writes: &[Vec<u8>]) -> anyhow::Result<u64> {
+        let mut store = Store::new(Keyed::new());
+        for (i, w) in writes.iter().enumerate() {
+            applied(&mut store, i as u64 + 1, w)?;
+        }
+        Ok(store.digest(true)?)
+    }
+
     #[test]
-    fn a_write_is_the_same_bytes_whatever_order_its_points_came_in_and_however_they_came() -> anyhow::Result<()> {
+    fn the_same_points_are_stored_alike_whatever_order_they_came_in_and_however_they_came() -> anyhow::Result<()> {
         // 3,000 series of 40 points of values that do not compress: more than one write holds, so
         // series are cut in part too.
         let val = |k: u32, t: i64| (u64::from(k).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (t as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)) as f64;
         let keys: Vec<SeriesKey> = (0..3000).map(|h| key(&format!("h{h}"))).collect::<anyhow::Result<_>>()?;
-        let mut all: Vec<(u32, i64, f64)> = (0..3000u32).flat_map(|k| (0..40i64).map(move |t| (k, t * 10, val(k, t)))).collect();
+        let all: Vec<(u32, i64, f64)> = (0..3000u32).flat_map(|k| (0..40i64).map(move |t| (k, t * 10, val(k, t)))).collect();
         let t0 = Instant::now();
         let mut grouped = Batcher::new(9);
         grouped.series(keys.iter().enumerate().map(|(k, key)| (key.clone(), (0..40i64).map(|t| (t * 10, val(k as u32, t))).collect())).collect(), t0);
-        let want = writes(&mut grouped, t0);
-        anyhow::ensure!(want.len() > 1, "{} writes", want.len());
+        let first = writes(&mut grouped, t0);
+        anyhow::ensure!(first.len() > 1, "{} writes", first.len());
+        let want = applied_all(&first)?;
         // The same points as a request decodes them, in two other orders, each series' own order kept.
         for seed in [1u64, 2] {
             let mut x = seed;
@@ -529,18 +573,74 @@ mod tests {
                 x ^= x << 17;
                 shuffled.swap(i, (x % (i as u64 + 1)) as usize);
             }
-            // Each series' points in their order again, the series interleaved as shuffled.
             let mut next = vec![0i64; 3000];
             for p in &mut shuffled {
-                let n = &mut next[p.0 as usize];
+                let Some(n) = next.get_mut(p.0 as usize) else { continue };
                 *p = (p.0, *n * 10, val(p.0, *n));
                 *n += 1;
             }
             let mut flat = Batcher::new(9);
             flat.samples(keys.clone(), &shuffled, t0);
-            anyhow::ensure!(writes(&mut flat, t0) == want, "the writes of order {seed} differ");
+            anyhow::ensure!(applied_all(&writes(&mut flat, t0))? == want, "order {seed} stored otherwise");
         }
-        all.clear();
+        Ok(())
+    }
+
+    /// More comes each flush than a write holds: every series' points still go within a few
+    /// writes of coming (oldest first), none waiting behind the newer ones for good; and the queue's
+    /// wait, kept past the target for an interval, says it is congested until it drains.
+    #[test]
+    fn under_overload_no_series_waits_behind_newer_ones_and_a_kept_wait_is_congestion() -> anyhow::Result<()> {
+        let val = |k: u64, t: i64| (k.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (t as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)) as f64;
+        let mut b = Batcher::new(3);
+        let t0 = Instant::now();
+        let mut now = t0;
+        // Each step, 4,000 new series of 30 points: some two and a half times what a write holds.
+        let mut first_seen: HashMap<u64, usize> = HashMap::new();
+        let mut written_at: HashMap<u64, usize> = HashMap::new();
+        let mut congested_once = false;
+        for step in 0..30usize {
+            let batch: Vec<(SeriesKey, Vec<(i64, f64)>)> = (0..4000u64)
+                .map(|j| {
+                    let k = key(&format!("s{step}-{j}"))?;
+                    first_seen.insert(k.fp, step);
+                    Ok((k, (0..30i64).map(|t| (t, val(j, t))).collect()))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            b.series(batch, now);
+            now += FLUSH;
+            congested_once |= b.congested(now);
+            if let Some((seq, entry)) = b.poll(now, 0) {
+                let Ok(Command::Write { batch, .. }) = command::decode(&entry) else { anyhow::bail!("not a write") };
+                let mut r = kiln_obs::batch::Reader::new(batch)?;
+                while let Some(item) = r.next_item()? {
+                    if let kiln_obs::batch::Item::Def { fp, .. } = item {
+                        written_at.entry(fp).or_insert(step);
+                    }
+                }
+                b.answered(seq, &Outcome { applied: true, ..Outcome::default() }, now);
+            }
+        }
+        anyhow::ensure!(congested_once, "a queue kept growing for 6 s is congestion: its wait {:?}", b.delay(now));
+        // Oldest first: every series written was written in the order it came, no later than any
+        // series that came after it, and the oldest still waiting came after every one written.
+        let mut order: Vec<(usize, usize)> = written_at.iter().filter_map(|(fp, w)| Some((*first_seen.get(fp)?, *w))).collect();
+        order.sort_unstable();
+        anyhow::ensure!(order.windows(2).all(|w| matches!(w, [a, b] if a.1 <= b.1)), "a series written before an older one");
+        let waits = b.delay(now);
+        anyhow::ensure!(waits > TARGET, "the queue's wait grows: {waits:?}");
+        // Drained, with nothing new: the wait goes, and so does the congestion, an interval on.
+        while b.backlog().0 > 0 {
+            now += FLUSH;
+            if let Some((seq, _)) = b.poll(now, 0) {
+                b.answered(seq, &Outcome { applied: true, ..Outcome::default() }, now);
+            }
+        }
+        b.congested(now);
+        now += INTERVAL;
+        b.congested(now);
+        now += INTERVAL;
+        anyhow::ensure!(!b.congested(now) && b.delay(now).is_zero(), "drained, it is not congested");
         Ok(())
     }
 
