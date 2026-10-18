@@ -20,7 +20,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
-| O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets | done |
+| O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); distributions (§4.4: percentiles merged across hosts and time, heatmaps); next: the heatmap and distribution widgets | in progress |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); next: CloudWatch Metric Streams, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Next: hours-long soaks; a rollup tier for long ranges | continuous |
 
@@ -78,7 +78,7 @@ metric with one tag set. Kinds:
 | gauge | the value | avg | Gauge; Sum with non-monotonic cumulative |
 | count | delta per interval | sum | Sum, delta temporality |
 | counter | cumulative value, resets detected at query time | rate | Sum, monotonic cumulative |
-| distribution | exponential histogram per point (§4.4) | percentiles | ExponentialHistogram; Histogram (explicit buckets, re-binned) |
+| distribution | its exponential buckets, each a count series (§4.4), and its count, sum, least and most | percentiles (`p99:`), avg, sum, count, min, max | ExponentialHistogram; Datadog's distribution points |
 
 **Logs.** `ts`, `severity` (OTel's 1–24), `service`, `host`, `source`, `message`, `attributes` (a
 flat map of `@`-addressable fields), `trace_id`, `span_id`.
@@ -118,11 +118,38 @@ small out-of-order buffer (bounded, sorted on flush) and is merged when the head
 
 ### 4.4 Distributions
 
-A distribution point is a base-2 exponential histogram, OTel's (`scale`, `zero_count`, positive and
-negative bucket arrays). It is DDSketch's logarithmic mapping (Masson, Rim and Lee, VLDB 2019) with
-`γ = 2^(2^-scale)`: relative error `(γ−1)/(γ+1)`, 0.54% at scale 6. Histograms merge exactly by
-downscaling to the coarser scale, so percentiles across hosts and time are mergeable, which averages
-of percentiles are not. Explicit-bucket histograms are re-binned at query time with the stated error.
+A distribution is a base-2 exponential histogram's buckets, OTel's (`kiln_obs::dist`): a value `v`
+falls in bucket `i` at scale `s` when `base^i < |v| ≤ base^(i+1)`, `base = 2^(2^-s)`, negatives in
+mirrored buckets, zero in its own; DDSketch's logarithmic mapping (Masson, Rim and Lee, VLDB 2019).
+A bucket at scale `s` is bucket `i >> k` at scale `s − k`, so histograms of different scales merge
+exactly at the coarser one: percentiles across hosts and time are mergeable, as averages of
+percentiles are not.
+
+Each bucket is a series of its own, `<metric>.dist{…, dist_bucket:<scale>:<bucket>}` (`5:p37`,
+`5:n4`, `5:z`), its value a count of its interval, beside `<metric>.count` and `.sum` (counts of the
+same interval) and `.min` and `.max` (gauges): the store holds nothing it did not hold before, so
+replicas agree as they always have, and a distribution is summed across series and time as any
+count is. Buckets are kept at scale 5 at the finest (32 an octave): a percentile is read at its
+bucket's geometric middle, within `√base − 1` of any value in it, 1.09% (Datadog's distributions
+promise 1%; scale 6 would halve it and double the buckets). OTel SDKs begin at scale 20 and shrink to
+fit 160 buckets, most often to 3 to 5 for a latency's range, so a finer one's buckets are made
+coarser on the way in, exactly.
+
+A percentile (`p99:<metric>{…} by {…}`) merges each group's buckets for each bucket of time at the
+coarsest scale among them and takes the rank `q (n − 1)`'s bucket (DDSketch's). `avg` is the sums
+over the counts, `sum`, `count`, `min` and `max` the distribution's own; a heatmap (§7) its merged
+buckets in each bucket of time. Measured (`a_merged_percentile_is_within_its_relative_error`): over
+log-normal, Pareto and two-sided shapes, 40,000 values merged from parts at scales 5, 7 and 8,
+every percentile from p0 to p100 within the bound.
+
+A cumulative histogram (OTel's default temporality) comes to a receiver as its counts since it
+began; a bucket that holds values for the first time would be a new series whose first point has no
+increase, and the tail's counts would be lost. So a receiver turns them into deltas, as the
+OpenTelemetry Collector's `cumulativetodelta` and the Datadog Agent do: it keeps each series' last
+buckets, count and sum (32 MiB at the most), and gives each point's increase over them; a fall, or a
+new start time, is a reset, all of it anew. A series' first point is all new if it began after the
+receiver did; else what came before it is not known, and it gives nothing (the next does). That
+holds while an exporter's series come to one receiver, as an app's to its machine's runner.
 
 ### 4.5 Head and blocks
 
@@ -338,6 +365,11 @@ a maximum and a percentile take the values as they are. It weighs averages: with
 none. Datadog's own worked example (six pods, two versions) is a test: 36 and 46 plain, 12 and 16
 weighted.
 
+A **distribution** (§4.4) answers its own: `p99:http.server.duration{service:web} by {route}` is the
+99th percentile of every value of the group's series in each bucket of time, its buckets merged;
+`avg` its sums over its counts; `sum`, `count`, `min`, `max` its own. Of any other metric `pNN:` is
+the percentile across the group's series' values.
+
 `outliers(query, 'dbscan'|'mad'|'scaleddbscan'|'scaledmad', tolerance, pct)` (§9.1): which of each
 group's series behave unlike their peers over the range, each series marked (`outlier`), its values
 as they are; tolerance 3 and pct 20 unless said; a group of under three members has none.
@@ -392,10 +424,11 @@ maintainer's). `/api/openapi.json` says each route's. Built:
 
 | | |
 | --- | --- |
-| `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at; a series with a band (`anomalies()`, `forecast()`) has `bounds` (`lower`, `upper`, `score`, `k`, `algorithm`, and a forecast's `forecast_from`, its first bucket forecast; `to` past now draws it) |
+| `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at; a series with a band (`anomalies()`, `forecast()`) has `bounds` (`lower`, `upper`, `score`, `k`, `algorithm`, and a forecast's `forecast_from`, its first bucket forecast; `to` past now draws it). With `heatmap: <rows>`, a heatmap instead: `rows` (each `[lo, hi]`) and `counts` (each bucket of time, each row's): a distribution's merged buckets (made coarser until they fit), or another query's series' values in equal rows |
 | `GET metrics?match=` , `GET tags?key=&match=` | metric names and tag values, sorted (autocomplete) |
 | `POST logs/search` | `{query, from, to, limit}` → records newest first, with the blocks pruned |
 | `POST series` | ingest points as Datadog's v1 series API takes them (`metric`, `type`, `tags`, `points` of `[seconds, value]`) |
+| `POST distribution_points` | ingest a distribution's values as Datadog's v1 API takes them (`metric`, `tags`, `host`, `points` of `[seconds, [values]]`): their buckets, count, sum, least and most (§4.4) |
 | `POST logs` | ingest records as Datadog's log intake takes them (`message`, `timestamp`, `status`, `service`, `hostname`, `ddsource`, `attributes`) |
 | `GET status` | the group: members, leader, term, applied and durable index, series, blocks, bytes on disk (observe's folder, hard-linked snapshot files once), cutoff, this node's writes, each machine's replica, digests (also in hex: a u64 is more than JavaScript's numbers hold) |
 | `POST compact`, `POST verify` | cut and compact the log now; take every replica's full digest (an operator's, or a test's, check that replicas agree) |
@@ -427,7 +460,7 @@ time, sent again until answered; §5), from:
   ingest.token`) or the admin's; every runner takes OTLP on `127.0.0.1:4318` (OTLP/HTTP's port;
   `KILN_OTLP_ADDR`, or `off`) as a local collector would. Metrics map by type (gauges;
   sums by temporality and monotonicity; histograms' count, sum, min, max and buckets;
-  exponential histograms' quantiles too; summaries); logs keep their time, severity, body,
+  exponential histograms as distributions (§4.4), a cumulative one turned to deltas; summaries); logs keep their time, severity, body,
   attributes and trace context, `service` and `host` from the resource.
 - **The node's own host** (`crate::observe::host`, every 15 s, the Datadog Agent's interval), in
   Datadog's names and units: CPU (the split over the interval; Linux), load, memory, swap, every
@@ -1412,6 +1445,13 @@ token. Their figures are functions of the minute, so what is stored is checked m
 - the server's own credentials where it runs: an EC2 instance's (its region too), a Compute Engine
   VM's (its project too), an Azure VM's managed identity.
 2026-10-18: all pass (48 s).
+
+**Distributions** (`observe_live.rs`): three hosts' latencies posted as Datadog's distribution
+points (2,000 each, log-normal), a fourth's as an OTLP exponential histogram (delta, 3,000) and a
+fifth's as a cumulative one exported twice (1,000, then 2,500 since it began): `count` all 11,500
+once; p50, p99 and p99.9 across them within 1.09% of the exact percentiles, each host's p99 within it
+of its own; the average exact; a heatmap of it holding every value once in 40 rows at the most.
+2026-10-18: passes (18 s).
 
 **Prometheus's scrapes** (`observe_clouds.rs`): an exporter served by the test (a counter climbing
 a hundred a second, a gauge), and four targets: one the server reads, one the runner reads, one
