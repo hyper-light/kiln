@@ -1119,7 +1119,8 @@ impl Cd {
                 }
                 Action::Status(s) => {
                     let app = s.app.to_string();
-                    self.statuses.write().insert(app.clone(), s);
+                    let before = self.statuses.write().insert(app.clone(), s.clone());
+                    crate::observe::kiln::cd_status(before.as_ref(), &s);
                     self.dirty.lock().insert(app);
                 }
                 Action::Record(r) => {
@@ -1163,6 +1164,7 @@ impl Cd {
             content,
             artifacts,
         };
+        crate::observe::kiln::deployed(&d);
         let rx = self.store.submit(Command::Deployed { deployment: Box::new(d), limit });
         crate::rt::spawn(async move {
             if let Ok(Err(e)) = rx.await {
