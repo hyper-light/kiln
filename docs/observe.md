@@ -21,7 +21,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets | done |
-| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); Prometheus's scrapes by the server and every runner (§8); next: CloudWatch Metric Streams, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Next: hours-long soaks; a rollup tier for long ranges | continuous |
 
 ## 1. Rules
@@ -386,7 +386,7 @@ same search syntax.
 Under `/api/observe/v1/` (all JSON; the UI uses nothing else), each route under a capability of
 kiln's (docs/access.md): every GET, and every query, search and check asked by POST, needs
 `observe.read` (a viewer's); dashboards, monitors and data posted need `observe.write` (a
-developer's); integrations, clouds and the store's operations need `observe.manage` (a
+developer's); integrations, clouds, scrape targets and the store's operations need `observe.manage` (a
 maintainer's). `/api/openapi.json` says each route's. Built:
 
 | | |
@@ -407,6 +407,7 @@ maintainer's). `/api/openapi.json` says each route's. Built:
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
+| `GET scrapes`, `PUT/DELETE scrapes/{name}`, `POST scrapes/{name}/test` | Prometheus scrape targets (§8), each with how each machine that reads it goes (`up`, its last scrape, samples, error; a runner's as of its last status, every 10 s); a token left out of a `PUT` is the one kept, and never shown; `test` reads a target once from the server and writes nothing, saying what it would get |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
 
@@ -447,6 +448,22 @@ time, sent again until answered; §5), from:
   events`).
 
 - **Clouds**: AWS CloudWatch, Google Cloud Monitoring and Azure Monitor, pulled (§10.1).
+- **Prometheus's scrapes** (`crate::observe::scrape`): an exporter's `/metrics` read as a
+  Prometheus `scrape_config` reads a target. A target is a URL, how often (`every_s`, 15 unless
+  said: the Datadog Agent's check interval) and how long a scrape may take (`timeout_s`, 10:
+  Prometheus's `scrape_timeout`, never past the interval), and the machine that reads it: the
+  server, a runner by name, or every machine its own (`*`, a node exporter on each host). The
+  server keeps the targets (a bearer token sealed under the master key) and tells each runner its
+  own on observe's lane; each machine reads its targets on a schedule of its own, each offset into
+  its interval by a hash of it (Prometheus's), so many targets are not read at once, and kept to it
+  (a slow scrape does not push the next later). A scrape asks for OpenMetrics or the text format
+  as Prometheus's `Accept` does (gzip allowed; 64 MiB at the most), reads what the answer says it
+  is (OpenMetrics' seconds, exemplars and `# EOF`; a counter's `_created` skipped, as Prometheus
+  skips it), tags each sample `job` and `instance` over its own labels of those keys (kept as
+  `exported_job`, ...: Prometheus's `honor_labels: false`), `host` where every machine reads its
+  own, and the target's tags, and writes Prometheus's own series of it: `up`,
+  `scrape_duration_seconds`, `scrape_samples_scraped`. A target that starts failing, or recovers,
+  is an event once (`source:kiln.event @event.type:scrape`).
 - **kiln's own spans** (`crate::observe::spans`): each closed `tracing` span of a target observe
   keeps (`kiln::upgrade`: runners' blue/green upgrades, `upgrade`, `upgrade.start`,
   `upgrade.healthy`, `upgrade.move`, `upgrade.retire`, `upgrade.rollback`) is
@@ -1391,6 +1408,14 @@ token. Their figures are functions of the minute, so what is stored is checked m
 - the server's own credentials where it runs: an EC2 instance's (its region too), a Compute Engine
   VM's (its project too), an Azure VM's managed identity.
 2026-10-18: all pass (48 s).
+
+**Prometheus's scrapes** (`observe_clouds.rs`): an exporter served by the test (a counter climbing
+a hundred a second, a gauge), and four targets: one the server reads, one the runner reads, one
+every machine reads, one that asks for a token. Each is read where it says (the store's `up` by job
+and host; each machine's own report), its samples tagged `job` and `instance` (the sample's own
+`job` kept as `exported_job`) and the target's tags; the counter read as a rate is 90–110 a second;
+the exporter failing makes `up` 0 and is said once, its recovery too; a target deleted is read no
+more, by the runner either; the token is sent and never shown. 2026-10-18: passes (109 s).
 
 **A soak** (`observe_load.rs`, `KOBS_SOAK_SECS`, 300 unless said; hours for a soak worth the
 name): a server and a runner, 200,000 points a second held steady (4 senders paced, OTLP protobuf,
