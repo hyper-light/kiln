@@ -20,13 +20,17 @@ type Agent = Pick<AgentInfo, "id" | "name" | "kind_name" | "target" | "status" |
 
 const askRunners = (signal: AbortSignal): Promise<ReachRunner[]> =>
   api.reachRunners(signal).then(
-    (r) => r.runners.filter((x) => x.connected && x.reach),
+    (r) => r.runners,
     (): ReachRunner[] => [],
   );
 
 function Choices({ agent, value, onPick }: { agent: Agent; value: string; onPick: (v: string) => void }) {
   const runners = useSuspenseResource("harness/reach", askRunners).data;
-  const choices = [{ value: "", label: "Any runner it needs" }, ...reachChoices(runners, agent.target), { value: "off", label: "Only its own machine" }];
+  // A runner without a reach identity runs a kiln from before commands could run elsewhere.
+  const here = runners.find((r) => `agent:${r.name}` === agent.target);
+  if (here && !here.fingerprint) return <p className="mv-none">{here.name} runs an older kiln, without commands on other runners: upgrade it in Settings → Updates.</p>;
+  const others = runners.filter((r) => r.connected && r.reach);
+  const choices = [{ value: "", label: "Any runner it needs" }, ...reachChoices(others, agent.target), { value: "off", label: "Only its own machine" }];
   // The one it has stays a choice, whether or not that runner is around now.
   const now = agent.reach ?? "";
   if (!choices.some((c) => c.value === now)) choices.splice(1, 0, { value: now, label: `Prefer ${now}` });
