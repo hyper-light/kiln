@@ -16,7 +16,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-1 | Engine core: Gorilla chunks, symbols, series index and selection, head with late writes, write batches; measured (§12.1–12.3) | done |
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine; kiln carries Raft between nodes | planned |
-| O-4 | Query language (metrics, logs, events) and the HTTP API | planned |
+| O-4 | Query language: metrics done (parser without recursion, evaluator, §12.5); logs and events with O-6; the HTTP API with O-3 | in progress |
 | O-5 | Ingestion: kiln itself, runners' hosts, OTLP/HTTP (protobuf and JSON), kiln CI and CD | planned |
 | O-6 | Logs: columnar log blocks, search, facets, live tail, patterns | planned |
 | O-7 | Monitors: threshold, change, anomaly, forecast, logs, events, CI/CD, composite; notifications | planned |
@@ -343,6 +343,22 @@ compacted after each cut by the logarithmic method.
 | reopen | 9.6 ms for 5,655 series; 9 page faults |
 | read the last hour of every series, from blocks | 15.3 ns a sample; no allocation a series |
 | read the whole day of every series, from blocks | 7.9 ns a sample; no allocation a series |
+
+### 12.5 Queries
+
+2026-10-18, same machine: `KOBS_CORPUS=<corpus> cargo bench -p kiln-obs --bench query`. Each query
+over the corpus's whole day (a grid of at most 1,200 points a series), fifteen runs.
+
+| query | series | samples | p50 | p99 | ns a sample | allocations |
+| --- | --- | --- | --- | --- | --- | --- |
+| `avg:node_load1{*} by {instance}` | 3 | 8,640 | 0.13 ms | 0.16 ms | 14.5 | 60 |
+| `p99:node_load1{*}` | 1 | 8,640 | 0.14 ms | 0.17 ms | 16.4 | 50 (a bucket's own list at first: 760) |
+| `sum:node_cpu_seconds_total{mode:idle} by {instance}` (a counter's rate) | 1 | 2,880 | 0.05 ms | 0.05 ms | 15.9 | 58 |
+| `sum:apiserver_request_total{*} by {verb}` | 2 | 11,520 | 0.08 ms | 0.09 ms | 7.2 | 54 |
+| `100 * sum:…{code:5*} / sum:…{*}` | 0 | 11,520 | 0.08 ms | 0.10 ms | 7.1 | 59 |
+| `top(avg:container_memory_working_set_bytes{*} by {pod}, 10, 'mean', 'desc')` | 4 | 23,114 | 0.39 ms | 0.43 ms | 16.9 | 87 |
+| `avg:node_*{*} by {instance}` | 7 | 2.93 M | 27.0 ms | 27.3 ms | 9.2 | 95 (a group key a series at first: 1,116) |
+| `sum:*{job:apiserver}` | 1 | 2.18 M | 20.2 ms | 20.9 ms | 9.3 | 48 |
 
 ## 13. Scenarios
 
