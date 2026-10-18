@@ -422,7 +422,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
   );
 
   return (
-    <div ref={panel} className="flex min-h-0 flex-1 flex-col bg-[#08090a]" style={{ height: full ? "100dvh" : "calc(100dvh - var(--header-h) - 1px)" }}>
+    <div ref={panel} className="flex min-h-0 flex-1 flex-col bg-[#08090a]" style={{ height: full ? "var(--window-h, 100dvh)" : "calc(var(--window-h, 100dvh) - var(--header-h) - 1px)" }}>
       {visible && <title>Terminal · kiln</title>}
       {link && <Navigate to="/terminal" replace />}
       {narrow && (

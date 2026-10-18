@@ -660,8 +660,13 @@ fi"#
         r#"{hidden}{job}
 set -u
 fail() {{ echo "{fail} $*"; exit 1; }}
-lp=$("${{SHELL:-/bin/sh}}" -lic env </dev/null 2>/dev/null | sed -n "s/^PATH=//p" | tail -n 1)
+le=$("${{SHELL:-/bin/sh}}" -lic env </dev/null 2>/dev/null)
+lp=$(echo "$le" | sed -n "s/^PATH=//p" | tail -n 1)
 if [ -n "$lp" ]; then PATH="$lp:$PATH"; fi
+for v in RUSTUP_HOME CARGO_HOME; do
+  val=$(echo "$le" | sed -n "s/^$v=//p" | tail -n 1)
+  if [ -n "$val" ]; then export "$v=$val"; fi
+done
 PATH="$PATH:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin"
 export PATH
 repo=""
@@ -699,7 +704,13 @@ npm run --prefix ui build || fail "the UI did not build"
 cargo=cargo
 if command -v rustup >/dev/null 2>&1; then
   echo "bringing the stable Rust toolchain up to date: kiln needs a recent one"
-  if rustup toolchain install stable --profile minimal --no-self-update >/dev/null 2>&1; then cargo="cargo +stable"; else echo "rustup could not update stable: building with the Rust there is"; fi
+  if rustup toolchain install stable --profile minimal --no-self-update >"$dir/rustup.log" 2>&1 || rustup update stable --no-self-update >>"$dir/rustup.log" 2>&1; then
+    cargo="cargo +stable"
+  else
+    echo "rustup could not update stable:"
+    tail -n 6 "$dir/rustup.log"
+    echo "building with the Rust there is"
+  fi
 fi
 echo "building kiln {s} with $($cargo --version 2>/dev/null)"
 MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln || fail "kiln did not build"

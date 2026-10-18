@@ -132,6 +132,47 @@ impl Host {
 
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
+        self.open_seeded(id, spec, None)
+    }
+
+    /// Take over a session another runner handed this one (`super::moving`): its record where its
+    /// harness here looks, then the session, under its own id, its timeline as it was. Blocking
+    /// (writes the record).
+    pub fn adopt(&self, from: &str, data: &[u8]) -> Result<(), String> {
+        let pkg: super::moving::Package = serde_json::from_slice(data).map_err(|e| format!("the session from {from} is unreadable: {e}"))?;
+        if pkg.version != super::moving::VERSION {
+            return Err(format!("a session packed as version {} (this runner takes {})", pkg.version, super::moving::VERSION));
+        }
+        let kind = Kind::get(&pkg.spec.kind).ok_or_else(|| format!("this runner doesn't know {}", pkg.spec.kind))?;
+        if !kind.available() {
+            return Err(format!("{} is not installed on this machine", kind.name));
+        }
+        if self.get(&pkg.id).is_some() {
+            return Err("that session runs here already".into());
+        }
+        let mut pkg = pkg;
+        let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
+        // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home.
+        let mut note = None;
+        if !std::path::Path::new(&cwd).is_dir() {
+            note = Some(format!("{cwd} isn't on this machine, so it works in the home folder"));
+            cwd = session::resolve_cwd(None);
+            pkg.spec.cwd = Some(cwd.clone());
+        }
+        let items = super::moving::install(&pkg, &cwd)?;
+        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, note };
+        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed)).map(|_| ()).map_err(|e| format!("{e:#}"))
+    }
+
+    /// Let go of a session that went on on another machine: it is no longer this machine's, and it
+    /// isn't closed (its viewers follow it there).
+    pub fn release(&self, id: &str) {
+        if self.sessions.lock().remove(id).is_some() {
+            self.mark_dirty();
+        }
+    }
+
+    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>) -> anyhow::Result<Arc<Session>> {
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
@@ -161,6 +202,7 @@ impl Host {
         });
         let me = self.me.clone();
         let me2 = self.me.clone();
+        let me3 = self.me.clone();
         let files = session::Files {
             dir: self.files_dir.join(&id),
             take: Arc::new(move |f: &str| me.upgrade().and_then(|h| h.take_file(f))),
@@ -172,8 +214,13 @@ impl Host {
                     tracing::warn!(error = %format!("{e:#}"), "could not branch an agent session");
                 }
             }),
+            release: Arc::new(move |id: &str| {
+                if let Some(h) = me3.upgrade() {
+                    h.release(id);
+                }
+            }),
         };
-        let s = session::start(id.clone(), spec, self.sink.clone(), on_change, files)?;
+        let s = session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?;
         self.sessions.lock().insert(id, Arc::clone(&s));
         self.mark_dirty();
         Ok(s)

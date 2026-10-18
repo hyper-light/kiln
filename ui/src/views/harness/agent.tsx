@@ -365,6 +365,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
       name: info?.name ?? "this agent",
       status,
       kind: info?.kind ?? "claude",
+      kind_name: info?.kind_name ?? "its harness",
       target: info?.target ?? "local",
       cwd,
       harness_session: state?.harness_session ?? info?.harness_session,

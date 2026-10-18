@@ -32,6 +32,10 @@ pub enum Ask {
     Forget { id: u64 },
     Sync(SyncAsk),
     Ping { at: i64 },
+    /// A piece of something this runner hands the other to take over (an agent session moving
+    /// there: its record, its timeline). `offset` 0 starts it (again); the other side answers with
+    /// [`Say::AdoptGot`] as pieces land and [`Say::Adopted`] once it took it over, or couldn't.
+    Adopt { id: u64, offset: u64, data: Vec<u8>, last: bool },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +60,11 @@ pub enum Say {
     Exit { id: u64, code: Option<i32>, signal: Option<i32>, error: Option<String>, end: u64, lost: u64 },
     Sync(SyncSay),
     Pong { at: i64 },
+    /// Bytes of a hand-over that arrived so far: the asker keeps at most [`WINDOW`] beyond this in
+    /// flight.
+    AdoptGot { id: u64, bytes: u64 },
+    /// The hand-over was taken over (`error` None), or why not.
+    Adopted { id: u64, error: Option<String> },
 }
 
 /// The machine a link reached.

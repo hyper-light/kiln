@@ -26,6 +26,8 @@ enum Ctl {
 struct Lab {
     mac: Handle,
     linux: Handle,
+    /// What linux is handed to take over.
+    adoptions: async_channel::Receiver<node::Adoption>,
     ctl: async_channel::Sender<Ctl>,
     _dirs: Vec<tempfile::TempDir>,
     mirrors: std::path::PathBuf,
@@ -52,9 +54,10 @@ fn info(name: &str, fp: &str) -> RunnerInfo {
 async fn lab() -> anyhow::Result<Lab> {
     let dirs = vec![tempfile::tempdir()?, tempfile::tempdir()?, tempfile::tempdir()?];
     let mirrors = dirs.get(2).map(|d| d.path().to_path_buf()).unwrap_or_default();
-    let cfg = |name: &str, d: &tempfile::TempDir| Config { name: name.into(), dir: d.path().join("reach"), accept: true, mirrors: mirrors.clone() };
-    let (mac, mac_out) = node::start(cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?))?;
-    let (linux, linux_out) = node::start(cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?))?;
+    let (adopt_tx, adoptions) = async_channel::unbounded();
+    let cfg = |name: &str, d: &tempfile::TempDir, adopt: Option<async_channel::Sender<node::Adoption>>| Config { name: name.into(), dir: d.path().join("reach"), accept: true, mirrors: mirrors.clone(), adopt };
+    let (mac, mac_out) = node::start(cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None))?;
+    let (linux, linux_out) = node::start(cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)))?;
     let directory = Arc::new(Mutex::new(vec![info("mac", mac.fingerprint()), info("linux", linux.fingerprint())]));
     // Each runner's current connection, as the server would number them.
     let peers: Arc<Mutex<HashMap<&'static str, u64>>> = Arc::new(Mutex::new(HashMap::from([("mac", 10), ("linux", 20)])));
@@ -115,7 +118,7 @@ async fn lab() -> anyhow::Result<Lab> {
     });
     mac.feed(In::Server(true)).await;
     linux.feed(In::Server(true)).await;
-    Ok(Lab { mac, linux, ctl: ctl_tx, _dirs: dirs, mirrors })
+    Ok(Lab { mac, linux, adoptions, ctl: ctl_tx, _dirs: dirs, mirrors })
 }
 
 async fn deliver(peers: &Mutex<HashMap<&'static str, u64>>, handle_of: &impl Fn(&str) -> Handle, to: u64, sm: ServerMsg) {
@@ -344,4 +347,35 @@ fn the_timeline_shows_a_remote_run_as_a_command_with_where_it_ran() {
     let s = super::shown("mcp__kiln_reach__run", &structured);
     assert!(s.is_some_and(|s| s.output.contains("still running in the background as r2") && s.exit_code.is_none()));
     assert!(super::shown("mcp__kiln-reach__runners", &text).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hand_over_arrives_whole_and_says_how_it_went() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        // linux takes over what it is handed, checking it arrived whole.
+        let taker = lab.adoptions.clone();
+        crate::rt::spawn(async move {
+            if let Ok(a) = taker.recv().await {
+                let ok = a.from == "mac" && a.data.len() == 5_000_000 && a.data.iter().enumerate().all(|(i, b)| *b == (i % 253) as u8);
+                let _ = a.reply.send(if ok { Ok(()) } else { Err(format!("arrived wrong: {} bytes from {}", a.data.len(), a.from)) });
+            }
+        });
+        let data: Vec<u8> = (0..5_000_000usize).map(|i| (i % 253) as u8).collect();
+        lab.mac.adopt("linux", &data).await.map_err(|e| anyhow::anyhow!(e))?;
+        // A refusal comes back as it was said.
+        let taker = lab.adoptions.clone();
+        crate::rt::spawn(async move {
+            if let Ok(a) = taker.recv().await {
+                let _ = a.reply.send(Err("no room for it here".into()));
+            }
+        });
+        let refused = lab.mac.adopt("linux", b"small").await;
+        assert_eq!(refused, Err("no room for it here".to_owned()));
+        // A runner that takes nothing over says so.
+        let nobody = lab.linux.adopt("mac", b"x").await;
+        assert!(nobody.is_err_and(|e| e.contains("doesn't take over")));
+        Ok(())
+    })
 }

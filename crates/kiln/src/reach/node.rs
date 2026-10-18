@@ -57,12 +57,34 @@ pub struct Config {
     pub accept: bool,
     /// Where copies of other runners' trees live (`~/.kiln/reach`).
     pub mirrors: PathBuf,
+    /// Who takes over what another runner hands this one (an agent session moving here); None:
+    /// hand-overs are refused.
+    pub adopt: Option<async_channel::Sender<Adoption>>,
 }
+
+/// Something another runner hands this one to take over, whole: `reply` says whether it was.
+pub struct Adoption {
+    /// The runner it comes from.
+    pub from: String,
+    pub data: Vec<u8>,
+    pub reply: oneshot::Sender<Result<(), String>>,
+}
+
+impl std::fmt::Debug for Adoption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Adoption").field("from", &self.from).field("bytes", &self.data.len()).finish()
+    }
+}
+
+/// The most a hand-over may carry.
+pub const ADOPT_MAX: usize = 512 << 20;
+/// Bytes of a hand-over per message.
+const ADOPT_PIECE: usize = 1 << 20;
 
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach") }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None }
     }
 }
 
@@ -82,6 +104,8 @@ pub enum In {
     Ran { key: (String, String), id: u64, ev: serve::Event },
     /// What a sync this node does for another runner says.
     Synced { key: (String, String), say: SyncSay },
+    /// Whether this runner took over what another handed it.
+    Adopted { key: (String, String), id: u64, error: Option<String> },
     Tick,
 }
 
@@ -102,6 +126,8 @@ pub enum Local {
     Status { reply: oneshot::Sender<Value> },
     /// Forget a runner's pinned key (it was reinstalled).
     Forget { runner: String, reply: oneshot::Sender<bool> },
+    /// Follow a hand-over to `peer` (what it says goes to `says`); answers with its id.
+    AdoptFollow { peer: String, says: Says, reply: oneshot::Sender<u64> },
 }
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
@@ -113,6 +139,18 @@ pub struct Handle {
     tx: async_channel::Sender<In>,
     announce: Announce,
     busy: Arc<AtomicU64>,
+    name: String,
+}
+
+static GLOBAL: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
+
+/// This process's node, for what runs here without a handle passed to it (agent sessions moving).
+pub fn set_global(h: Handle) {
+    let _ = GLOBAL.set(h);
+}
+
+pub fn global() -> Option<&'static Handle> {
+    GLOBAL.get()
 }
 
 impl Handle {
@@ -123,6 +161,11 @@ impl Handle {
 
     pub fn fingerprint(&self) -> &str {
         &self.announce.fingerprint
+    }
+
+    /// This runner's name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Runs under way: those this runner does for others and those it follows elsewhere. A
@@ -177,6 +220,65 @@ impl Handle {
     pub async fn forget(&self, runner: &str) -> anyhow::Result<bool> {
         self.ask(|reply| Local::Forget { runner: runner.to_owned(), reply }).await
     }
+
+    /// Hand `data` to `peer` to take over (an agent session moving there), and wait until it has,
+    /// or says why it can't. A link that drops on the way starts it over (a few times).
+    pub async fn adopt(&self, peer: &str, data: &[u8]) -> Result<(), String> {
+        if data.len() > ADOPT_MAX {
+            return Err(format!("{} MB is more than a hand-over carries", data.len() >> 20));
+        }
+        let mut last_err = String::new();
+        for attempt in 0..3u64 {
+            if attempt > 0 {
+                crate::rt::sleep(Duration::from_millis(500 * attempt)).await;
+            }
+            match self.adopt_once(peer, data).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.starts_with("interrupted") => last_err = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn adopt_once(&self, peer: &str, data: &[u8]) -> Result<(), String> {
+        self.connect(peer).await.map_err(|e| format!("{e:#}"))?;
+        let (tx, rx) = async_channel::unbounded::<Say>();
+        let id = self.ask(|reply| Local::AdoptFollow { peer: peer.to_owned(), says: tx, reply }).await.map_err(|e| format!("{e:#}"))?;
+        let wait = |d: Duration| {
+            let rx = rx.clone();
+            async move {
+                match crate::rt::timeout(d, rx.recv()).await {
+                    Ok(Ok(s)) => Ok(s),
+                    Ok(Err(_)) => Err("interrupted: the link closed".to_owned()),
+                    Err(_) => Err(format!("{peer} did not answer in {}s", d.as_secs())),
+                }
+            }
+        };
+        let pieces: Vec<&[u8]> = if data.is_empty() { vec![&[][..]] } else { data.chunks(ADOPT_PIECE).collect() };
+        let n = pieces.len();
+        let (mut sent, mut got) = (0u64, 0u64);
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let last = i + 1 == n;
+            self.send(peer, Ask::Adopt { id, offset: sent, data: piece.to_vec(), last }).await;
+            sent += piece.len() as u64;
+            while !last && sent.saturating_sub(got) > wire::WINDOW {
+                match wait(Duration::from_secs(60)).await? {
+                    Say::AdoptGot { bytes, .. } => got = bytes,
+                    Say::Adopted { error, .. } => return Err(error.unwrap_or_else(|| "taken over before it all arrived".into())),
+                    _ => {}
+                }
+            }
+        }
+        // Taking it over starts the session over there: give it time.
+        loop {
+            match wait(Duration::from_secs(180)).await? {
+                Say::Adopted { error: None, .. } => return Ok(()),
+                Say::Adopted { error: Some(e), .. } => return Err(e),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Start the node. Returns its handle and what it sends to the server (the agent forwards it on
@@ -198,6 +300,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
             }
         }
     });
+    let node_name = cfg.name.clone();
     let host = Host {
         name: cfg.name.clone(),
         hostname: crate::config::Config::hostname(),
@@ -257,7 +360,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce, busy }, out_rx))
+    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +413,8 @@ struct Peer {
     state: PeerState,
     follows: HashMap<u64, Follow>,
     syncs: HashMap<String, async_channel::Sender<SyncSay>>,
+    /// Hand-overs to this runner being followed, by id.
+    adopts: HashMap<u64, Says>,
     /// Asks waiting for the link.
     queue: VecDeque<Ask>,
     next_id: u64,
@@ -327,6 +432,7 @@ impl Peer {
             state: PeerState::Idle,
             follows: HashMap::new(),
             syncs: HashMap::new(),
+            adopts: HashMap::new(),
             queue: VecDeque::new(),
             next_id: 1,
             host: None,
@@ -337,7 +443,7 @@ impl Peer {
     }
 
     fn busy(&self) -> bool {
-        !self.follows.is_empty() || !self.syncs.is_empty() || !self.queue.is_empty() || !self.waiters.is_empty()
+        !self.follows.is_empty() || !self.syncs.is_empty() || !self.adopts.is_empty() || !self.queue.is_empty() || !self.waiters.is_empty()
     }
 }
 
@@ -370,6 +476,8 @@ struct Session {
     runs: HashMap<u64, Served>,
     /// Syncs, each its own worker (file system work stays off this task).
     syncs: HashMap<String, async_channel::Sender<SyncAsk>>,
+    /// Hand-overs arriving, by id: the bytes so far.
+    adopting: HashMap<u64, Vec<u8>>,
     detached: Option<Instant>,
 }
 
@@ -431,6 +539,11 @@ impl Node {
             In::Local(l) => self.on_local(l).await,
             In::Ran { key, id, ev } => self.on_ran(key, id, ev).await,
             In::Synced { key, say } => self.on_synced(key, say).await,
+            In::Adopted { key, id, error } => {
+                if let Some(link) = self.served.get(&key).and_then(|s| s.link.clone()) {
+                    self.say_on(&link, &Say::Adopted { id, error }).await;
+                }
+            }
             In::Tick => self.tick().await,
         }
     }
@@ -580,6 +693,9 @@ impl Node {
                     // sends only what still differs).
                     for (key, s) in p.syncs.drain() {
                         let _ = s.try_send(SyncSay::Failed { key, error: format!("interrupted: {why}") });
+                    }
+                    for (id, s) in p.adopts.drain() {
+                        let _ = s.try_send(Say::Adopted { id, error: Some(format!("interrupted: {why}")) });
                     }
                 }
             }
@@ -753,6 +869,9 @@ impl Node {
             for (key, s) in p.syncs.drain() {
                 let _ = s.send(SyncSay::Failed { key, error: why.to_owned() }).await;
             }
+            for (id, s) in p.adopts.drain() {
+                let _ = s.send(Say::Adopted { id, error: Some(why.to_owned()) }).await;
+            }
         }
     }
 
@@ -859,6 +978,17 @@ impl Node {
                     }
                 }
             }
+            Say::AdoptGot { id, .. } | Say::Adopted { id, .. } => {
+                let done = matches!(s, Say::Adopted { .. });
+                if let Some(p) = self.peers.get_mut(&name) {
+                    if let Some(tx) = p.adopts.get(&id) {
+                        let _ = tx.send(s).await;
+                    }
+                    if done {
+                        p.adopts.remove(&id);
+                    }
+                }
+            }
             Say::Pong { .. } => {}
         }
     }
@@ -900,7 +1030,7 @@ impl Node {
             if let Some(l) = self.links.get_mut(link) {
                 l.session = Some(session.clone());
             }
-            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), detached: None });
+            let s = self.served.entry(key.clone()).or_insert_with(|| Session { link: None, runs: HashMap::new(), syncs: HashMap::new(), adopting: HashMap::new(), detached: None });
             let old = s.link.replace(link.to_owned());
             s.detached = None;
             let mut resumed = Vec::new();
@@ -979,6 +1109,7 @@ impl Node {
                 }
             }
             Ask::Sync(sa) => self.on_sync_ask(&key, sa).await,
+            Ask::Adopt { id, offset, data, last } => self.on_adopt(&key, id, offset, data, last).await,
             Ask::Ping { at } => {
                 self.say_on(link, &Say::Pong { at }).await;
             }
@@ -1120,6 +1251,60 @@ impl Node {
         }
     }
 
+    /// A piece of a hand-over: kept until the last, then given whole to whoever takes it over here.
+    async fn on_adopt(&mut self, key: &(String, String), id: u64, offset: u64, data: Vec<u8>, last: bool) {
+        let Some(s) = self.served.get_mut(key) else { return };
+        let Some(link) = s.link.clone() else { return };
+        if offset == 0 {
+            s.adopting.insert(id, Vec::new());
+        }
+        let refusal = match s.adopting.get_mut(&id) {
+            None => Some("a hand-over that never began".to_owned()),
+            Some(buf) if buf.len() as u64 != offset => Some(format!("a piece at {offset} where {} was due", buf.len())),
+            Some(buf) if buf.len() + data.len() > ADOPT_MAX => Some("more than a hand-over carries".to_owned()),
+            Some(buf) => {
+                let before = buf.len() >> 20;
+                buf.extend_from_slice(&data);
+                let now = buf.len();
+                if !last && now >> 20 > before {
+                    self.say_on(&link, &Say::AdoptGot { id, bytes: now as u64 }).await;
+                }
+                None
+            }
+        };
+        if let Some(why) = refusal {
+            if let Some(s) = self.served.get_mut(key) {
+                s.adopting.remove(&id);
+            }
+            self.say_on(&link, &Say::Adopted { id, error: Some(why) }).await;
+            return;
+        }
+        if !last {
+            return;
+        }
+        let Some(data) = self.served.get_mut(key).and_then(|s| s.adopting.remove(&id)) else { return };
+        let Some(adopt) = self.cfg.adopt.clone() else {
+            self.say_on(&link, &Say::Adopted { id, error: Some(format!("{} doesn't take over agent sessions", self.cfg.name)) }).await;
+            return;
+        };
+        // Taking it over may take a while (a harness starting): off this task.
+        let (reply, answer) = oneshot::channel();
+        let (tx, key) = (self.tx.clone(), key.clone());
+        let from = key.0.clone();
+        crate::rt::spawn(async move {
+            let error = if adopt.send(Adoption { from, data, reply }).await.is_err() {
+                Some("nothing here takes it over".to_owned())
+            } else {
+                match answer.await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e),
+                    Err(_) => Some("it was dropped before it was taken over".to_owned()),
+                }
+            };
+            let _ = tx.send(In::Adopted { key, id, error }).await;
+        });
+    }
+
     async fn on_sync_ask(&mut self, key: &(String, String), a: SyncAsk) {
         let sync_key = match &a {
             SyncAsk::Plan { key, .. } | SyncAsk::File { key, .. } | SyncAsk::Commit { key } => key.clone(),
@@ -1228,6 +1413,13 @@ impl Node {
             }
             Local::Forget { runner, reply } => {
                 let _ = reply.send(self.pins.forget(&runner));
+            }
+            Local::AdoptFollow { peer, says, reply } => {
+                let p = self.peers.entry(peer).or_insert_with(Peer::new);
+                let id = p.next_id;
+                p.next_id += 1;
+                p.adopts.insert(id, says);
+                let _ = reply.send(id);
             }
         }
     }

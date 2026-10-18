@@ -70,38 +70,42 @@ function closeOnPressAway(close: () => void) {
   };
 }
 
-const NOT_TYPED = new Set(["button", "checkbox", "color", "file", "image", "radio", "range", "reset", "submit"]);
-
-/** A field a phone opens its keyboard for. */
-function typingInto(el: Element | null) {
-  if (el instanceof HTMLInputElement) return !NOT_TYPED.has(el.type);
-  return el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement || (el instanceof HTMLElement && el.isContentEditable);
-}
+/** Shorter than this, the window is a phone's with its keyboard (or a picker) up. */
+const SHORT_PX = 560;
 
 /**
- * A page that fills the window never scrolls, but a phone pans it up to keep a field clear of its
- * keyboard, and iOS can leave it there once the keyboard has gone: the composer stranded mid-screen
- * over an empty band. Once nothing is being typed into (and the page isn't zoomed), it goes back.
+ * A page that fills the window (an agent, the terminal) is the window's visible part, and the page
+ * itself never scrolls: only its panes do. A phone's keyboard (or a picker) takes the bottom of the
+ * window, so the page is that much shorter while it's up, the composer right above it; iOS would
+ * otherwise pan the whole page up to show the field and could leave it there, the UI scrolled out
+ * of view over an empty band. Should the page move all the same, it goes straight back (unless
+ * you've zoomed in). A short window (`data-window="short"`) leaves the conversation more room.
  */
-function settleWhenTyped(el: HTMLElement | null) {
+function fitTheWindow(el: HTMLElement | null) {
   if (!el) return;
+  const root = document.documentElement;
   const view = window.visualViewport;
-  let timer = 0;
-  const settle = () => {
-    window.clearTimeout(timer);
-    timer = window.setTimeout(() => {
-      const zoomed = view ? Math.abs(view.scale - 1) > 0.01 : false;
-      if (window.scrollY !== 0 && !zoomed && !typingInto(document.activeElement)) window.scrollTo({ top: 0, behavior: "instant" });
-    }, 150);
+  root.classList.add("fills-window");
+  const fit = () => {
+    if (view && Math.abs(view.scale - 1) > 0.01) return;
+    const h = Math.round(view?.height ?? window.innerHeight);
+    root.style.setProperty("--window-h", `${h}px`);
+    if (h < SHORT_PX) root.dataset.window = "short";
+    else delete root.dataset.window;
+    // The page, or the window's visible part over it (iOS pans that with its keyboard up), moved.
+    if (window.scrollY !== 0 || window.scrollX !== 0 || (view?.offsetTop ?? 0) > 0) window.scrollTo({ top: 0, left: 0, behavior: "instant" });
   };
-  view?.addEventListener("resize", settle);
-  window.addEventListener("scroll", settle, { passive: true });
-  document.addEventListener("focusout", settle);
+  fit();
+  view?.addEventListener("resize", fit);
+  view?.addEventListener("scroll", fit);
+  window.addEventListener("scroll", fit, { passive: true });
   return () => {
-    window.clearTimeout(timer);
-    view?.removeEventListener("resize", settle);
-    window.removeEventListener("scroll", settle);
-    document.removeEventListener("focusout", settle);
+    view?.removeEventListener("resize", fit);
+    view?.removeEventListener("scroll", fit);
+    window.removeEventListener("scroll", fit);
+    root.classList.remove("fills-window");
+    root.style.removeProperty("--window-h");
+    delete root.dataset.window;
   };
 }
 
@@ -223,7 +227,7 @@ export function AppShell({ me }: { me: Me | null }) {
         <CommandPalette />
       </header>
 
-      <main id="main" ref={fullHeight ? settleWhenTyped : undefined} className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
+      <main id="main" ref={fullHeight ? fitTheWindow : undefined} className={fullHeight ? "relative flex min-h-0 flex-1 flex-col" : "page-main flex-1"}>
         {!onTerminal && (
           <ErrorBoundary resetKey={location.pathname}>
             <React.Suspense fallback={<RouteFallback />}>

@@ -169,10 +169,43 @@ Per agent (New agents → More → Commands; `Spec.reach`): any runner it needs 
 runner or platform it prefers (`run` goes there unless the agent says otherwise), or only its own
 machine (no tools).
 
-## 8. Not yet
+## 8. Moving an agent to another runner
+
+**Move to…** on an agent (or `POST /api/harness/sessions/:id/move {"to": "agent:<runner>"}`) moves
+it, mid-conversation, to another runner that has its harness installed and takes reach links. Nothing
+of it is lost on the way, and nothing waits on a person: what is sent meanwhile waits in kiln's queue
+and is answered over there.
+
+1. **The folder** (`harness/relocate.rs`, on the server). An agent working in a git repository goes
+   on in that repository's copy on the other machine, kept in step by sync (*Repositories on
+   machines*, [sync.md](sync.md)): a copy there already, or one a sync task makes now — the source's
+   working tree, uncommitted work included, then both copies kept in step, so moving back is just as
+   quick. It goes where the repository is under the runner's home (`~/Projects/kiln` stays
+   `~/Projects/kiln`), beside a folder of it already there, never over it. An agent in any other
+   folder moves without its files (the timeline says so); where that folder isn't on the other
+   machine, it works in its home folder.
+2. **The turn** (`harness/session.rs`, on the runner it is on). A move waits for the turn under way
+   to end; kiln's queue holds what is sent meanwhile. Then the harness ends, its record complete.
+3. **The hand-over** (`harness/moving.rs`). The runner packs the session — the harness's own record
+   (Claude Code's transcript as it is; Codex's conversation as a new thread's history, as a switch of
+   harness carries it), kiln's timeline and state with its queue, its settings with the folder it goes
+   on in — and hands it over a reach link: end to end encrypted, in pieces within a window, started
+   over if the link drops (`Ask::Adopt`, `Say::AdoptGot`, `Say::Adopted`).
+4. **The take-over** (the other runner). It puts the record where its harness looks for it, starts the
+   session under the same id with its timeline as it was, and says so; the server follows the session
+   there and viewers stay on it. Only then does the first runner let go of it. A runner that can't take
+   it over says why, and the session goes on where it was.
+
+Measured on one machine with two runners: an idle agent moves in 1.6 s; one moved mid-turn moves as
+the turn ends, and a message sent meanwhile is answered on the new runner with the whole conversation
+in its context.
+
+## 9. Not yet
 
 - A direct runner-to-runner path when two runners can reach each other (the link would move to it
   and keep its session); today every link goes through the server.
 - Pinning fingerprints from the UI (today: `kiln reach status`, `kiln reach forget`).
 - Windows runners as the doing side (the process side is there; the local socket is Unix-only).
 - Changing an agent's Commands setting after it started (it takes effect at its next start).
+- Moving agents of ACP harnesses (Gemini, opencode, goose, amp): their sessions are the harness's own.
+- Moving the tasks an agent left running (shells, monitors): they stay, and stop, where they were.

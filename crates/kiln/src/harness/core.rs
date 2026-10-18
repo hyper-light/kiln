@@ -200,6 +200,42 @@ impl Core {
         }
     }
 
+    /// Take over the timeline and state the session had on another machine (it moved here): its
+    /// events as they were (ids, order, times, who said them), its queue, todos and title. What
+    /// belonged to the process over there (its tasks, a turn's state) stays there.
+    pub fn adopt(&mut self, events: Vec<Event>, state: State) {
+        let first = events.first().map_or(1, |e| e.seq.max(1));
+        // Numbers stay contiguous: an event's place is found from its number.
+        self.events = events
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut e)| {
+                e.seq = first + i as u64;
+                e
+            })
+            .collect();
+        self.index = self.events.iter().map(|e| (e.id.clone(), e.seq)).collect();
+        self.next_seq = self.events.back().map_or(1, |e| e.seq + 1);
+        let cwd = std::mem::take(&mut self.state.cwd);
+        let harness_session = self.state.harness_session.take();
+        self.state = state;
+        self.state.cwd = cwd;
+        self.state.harness_session = harness_session;
+        self.state.status = super::model::Status::Starting;
+        self.state.turn_started = None;
+        self.state.approvals.clear();
+        self.state.tasks.clear();
+        self.state.exit = None;
+        self.state.activity = None;
+        self.state.doing = None;
+        self.state.switching = None;
+        self.changed.clear();
+        self.stream.clear();
+        self.reset = true;
+        self.state_dirty = true;
+        self.meta_dirty = true;
+    }
+
     /// Drop `id` and every event after it (a rewind); viewers get the timeline again.
     pub fn truncate_from(&mut self, id: &str) {
         let Some(seq) = self.index.get(id).copied() else { return };
