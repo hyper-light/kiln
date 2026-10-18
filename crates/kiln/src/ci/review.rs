@@ -233,7 +233,9 @@ pub async fn facts(hub: &Hub, d: &Diff, versions: &[Version]) -> Result<Facts, F
             let mut st = c.prepare("SELECT reviewer, reviewer_kind, version, action FROM reviews WHERE diff_id = ?1 ORDER BY created_at, rowid")?;
             let rows = st.query_map([&id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?, r.get::<_, String>(3)?)))?;
             let reviews: Vec<land::Review> = rows.filter_map(Result::ok).filter_map(|(reviewer, kind, version, action)| Action::parse(&action).map(|action| land::Review { reviewer, agent: kind == "agent", version, action })).collect();
-            let open: i64 = c.query_row("SELECT COUNT(*) FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1)", [&id], |r| r.get(0))?;
+            // Threads on code (as GitHub's conversation resolution counts them; a comment on the
+            // diff as a whole, a bot's report say, doesn't hold a land up).
+            let open: i64 = c.query_row("SELECT COUNT(*) FROM review_threads t WHERE t.diff_id = ?1 AND t.state = 'open' AND t.file IS NOT NULL AND EXISTS (SELECT 1 FROM review_comments c WHERE c.thread_id = t.id AND c.published = 1)", [&id], |r| r.get(0))?;
             let open = usize::try_from(open).unwrap_or(0);
             Ok((reviews, open))
         })

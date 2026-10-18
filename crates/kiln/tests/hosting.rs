@@ -725,8 +725,7 @@ fn w14_r04_change_requests() -> anyhow::Result<()> {
     assert!(st == 422 && r.to_string().contains("doesn't land a change request"), "{st} {r}");
 
     // Each strategy, on its own change request.
-    let mut n = 1;
-    for strategy in ["squash", "merge", "rebase", "ff-only"] {
+    for (n, strategy) in (1..).zip(["squash", "merge", "rebase", "ff-only"]) {
         let before = tip()?;
         if n > 1 {
             g(&["checkout", "-qB", strategy, "origin/main"])?;
@@ -773,7 +772,6 @@ fn w14_r04_change_requests() -> anyhow::Result<()> {
                 assert!(!msg.contains("Change-Request"), "{msg}");
             }
         }
-        n += 1;
     }
 
     // ff-only, once the trunk moved on: refused, saying why.
@@ -803,5 +801,80 @@ fn w14_r04_change_requests() -> anyhow::Result<()> {
     plain("r.txt", "cli: r")?;
     let out = g(&["push"])?;
     assert!(out.contains("CR7 v2 (updated)"), "the branch tracks the server's: {out}");
+    Ok(())
+}
+
+/// W14-R11: a diff is a pull request to a job's GitHub API calls: a `pull_request` workflow reads
+/// it and its files, comments on it as a whole (and edits that comment, as sticky-comment actions
+/// do), comments on a line, and approves; kiln keeps each as its own, the job as
+/// `github-actions[bot]`, an agent whose approval counts only where agents may approve.
+#[test]
+fn w14_r11_pulls() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(
+        work.join(".github/workflows/bot.yml"),
+        r#"on: pull_request
+permissions:
+  pull-requests: write
+  issues: write
+jobs:
+  bot:
+    runs-on: local
+    steps:
+      - env:
+          TOKEN: ${{ github.token }}
+          N: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -e
+          api() { curl -sf -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$@"; }
+          R="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          api "$R/pulls/$N" | grep -q '"title":"one: a"'
+          api "$R/pulls/$N/files" | grep -q '"filename":"a.txt"'
+          id=$(api -X POST "$R/issues/$N/comments" -d '{"body":"coverage: 90%"}' | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+          api -X PATCH "$R/issues/comments/$id" -d '{"body":"coverage: 91%"}' > /dev/null
+          api -X POST "$R/pulls/$N/comments" -d "{\"body\":\"nit\",\"path\":\"a.txt\",\"line\":1,\"side\":\"RIGHT\",\"commit_id\":\"$SHA\"}" > /dev/null
+          api -X POST "$R/pulls/$N/reviews" -d '{"event":"APPROVE","body":"bot says yes"}' | grep -q '"state":"APPROVED"'
+          echo done
+"#,
+    )?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    commit(&home, &work, "a.txt", "one\n", "one: a", "I1111111111111111111111111111111111111111")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+
+    // The bot's run passes, and what it did is kiln's.
+    until(180, "the bot's run", || {
+        let d = api(&s, &dev, "GET", "/api/diffs/D1")?;
+        let done = d.get("runs").and_then(Value::as_array).is_some_and(|r| r.iter().any(|x| text(x, "status") == "succeeded"));
+        let failed = d.get("runs").and_then(Value::as_array).is_some_and(|r| r.iter().any(|x| text(x, "status") == "failed"));
+        anyhow::ensure!(!failed, "the bot's run failed:\n{}", run_logs(&s, "D1"));
+        Ok((!done).then(|| d.to_string()))
+    })?;
+    let threads = api(&s, &dev, "GET", "/api/diffs/D1/comments")?;
+    let list = threads.get("threads").and_then(Value::as_array).cloned().unwrap_or_default();
+    let general = list.iter().find(|t| t.get("file") == Some(&Value::Null)).cloned().unwrap_or_default();
+    let inline = list.iter().find(|t| text(t, "file") == "a.txt").cloned().unwrap_or_default();
+    let first = |t: &Value| t.pointer("/comments/0").cloned().unwrap_or_default();
+    assert_eq!((text(&first(&general), "body"), text(&first(&general), "author")), ("coverage: 91%", text(&first(&general), "author")), "{threads}");
+    assert!(text(&first(&general), "author").starts_with("job:"), "{threads}");
+    assert_eq!((text(&first(&inline), "body"), inline.get("start_line")), ("nit", Some(&json!(1))), "{threads}");
+    // The bot's approval is an agent's: it doesn't count here.
+    let land = api(&s, &dev, "GET", "/api/diffs/D1/land")?;
+    assert!(land.get("blockers").and_then(Value::as_array).is_some_and(|b| b.iter().any(|x| x.as_str().is_some_and(|w| w.starts_with("0 of 1 accepts")))), "{land}");
+    // A comment on the diff as a whole doesn't hold the land up; the line comment does.
+    assert!(land.get("blockers").and_then(Value::as_array).is_some_and(|b| b.iter().any(|x| x.as_str() == Some("1 open thread"))), "{land}");
     Ok(())
 }

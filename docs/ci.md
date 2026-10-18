@@ -3456,6 +3456,13 @@ land queue are built; the review UI, the App and the facade's REST half are left
     and kept for W18), which Gradle's, Maven's and sbt's submission actions send;
   - deployments and their statuses (`/deployments`, `/deployments/{id}/statuses`), and
     `/environments` with GitHub's `protection_rules` (W15);
+  - pull requests over diffs and change requests (`crates/kiln/src/ci/rest/pulls.rs`):
+    `/pulls`, `/pulls/{n}`, `/files`, `/commits`, line comments (`/pulls/{n}/comments`,
+    `/pulls/comments/{id}`), reviews (`APPROVE`, `REQUEST_CHANGES`, `COMMENT`, pending), and
+    the issues API's view (`/issues/{n}`, `/issues/{n}/comments`, `/issues/comments/{id}`, edits
+    and deletes of jobs' own comments). A job writes as `github-actions[bot]`, an agent: its
+    approval counts only where `agents-can-approve`; a comment on the whole pull request doesn't
+    hold a land up. Checked with a real run (`w14_r11_pulls`);
   - `/user`, `/rate_limit`;
   - 501 "not implemented by kiln", with a warning on the leg, for everything else;
   - GraphQL answering the same;

@@ -86,7 +86,7 @@ pub fn author_of(caller_name: &str, kind: Option<crate::authz::gate::Kind>) -> (
     match kind {
         Some(Kind::Agent) => (caller_name.split(' ').next().unwrap_or(caller_name).to_owned(), "agent"),
         Some(Kind::Pat) => (caller_name.rsplit(" of ").next().unwrap_or(caller_name).to_owned(), "human"),
-        None => (caller_name.to_owned(), "agent"),
+        Some(Kind::Job) | None => (caller_name.to_owned(), "agent"),
         _ => (caller_name.to_owned(), "human"),
     }
 }
