@@ -1445,20 +1445,31 @@ mod tests {
         const MAX: u64 = 10_000;
         let (taken, left) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let stop = Arc::new(AtomicBool::new(false));
+        // The race is had, not hoped for: each taker makes 200,000 tries, and goes on past them until
+        // ten bounds' worth was granted and some were refused (the tries alone had none on a
+        // machine busy enough that the freer never ran meanwhile), backing off when refused as a
+        // writer would; a minute at the most.
+        let (granted, refusals) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let takers: Vec<_> = (0..8u64)
             .map(|t| {
-                let (taken, left) = (taken.clone(), left.clone());
+                let (taken, left, granted, refusals) = (taken.clone(), left.clone(), granted.clone(), refusals.clone());
                 std::thread::spawn(move || {
                     let (mut x, mut got, mut refused) = (t.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1, 0u64, 0u64);
-                    for _ in 0..200_000 {
+                    let mut tries = 0u32;
+                    while (tries < 200_000 || !(granted.load(Ordering::Acquire) > MAX * 10 && refusals.load(Ordering::Acquire) > 0)) && std::time::Instant::now() < deadline {
+                        tries += 1;
                         x ^= x << 13;
                         x ^= x >> 7;
                         x ^= x << 17;
                         let n = 1 + x % 500;
                         if reserve(&taken, &left, n, MAX) {
                             got += n;
+                            granted.fetch_add(n, Ordering::AcqRel);
                         } else {
                             refused += 1;
+                            refusals.fetch_add(1, Ordering::AcqRel);
+                            std::thread::yield_now();
                         }
                     }
                     (got, refused)
