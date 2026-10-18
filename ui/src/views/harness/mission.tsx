@@ -6,7 +6,7 @@
 import * as React from "react";
 import "./harness.css";
 import "./mission.css";
-import { Link, useNavigate, useSearchParams } from "react-router";
+import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ArrowUpRight, ChevronRight, Plus, RotateCcw } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";

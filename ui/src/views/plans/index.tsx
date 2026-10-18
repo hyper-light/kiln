@@ -3,7 +3,7 @@
  * agent's plan, changed (each change a version), shared by a link, and run on any agent.
  */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { Plus } from "lucide-react";
 import { planHref, type Plan } from "@/api/plans";
 import { Button } from "@/components/ui/button";

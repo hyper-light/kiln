@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link, NavLink, Outlet, useLocation } from "react-router";
+import { Link, NavLink, Outlet, useLocation } from "@/lib/router";
 import { UpdateNotice } from "./update-notice";
 import { ArrowUpRight, LogOut, Menu, Search, Settings, X } from "lucide-react";
 import { api } from "@/api/client";
@@ -175,8 +175,8 @@ export function AppShell({ me }: { me: Me | null }) {
             </Tip>
             <Button
               variant="ghost"
-              size="icon"
-              className="xl:hidden [&_svg]:size-5"
+              size="icon-lg"
+              className="xl:hidden"
               aria-label={menuOpen ? "Close navigation" : "Open navigation"}
               aria-expanded={menuOpen}
               aria-controls="site-menu"

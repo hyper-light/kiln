@@ -3,7 +3,7 @@
 //! build instead; the commit it is built from (`KILN_COMMIT`), so every other platform's binary
 //! can be built from the same one (`crate::updates::in_step_loop`); and lists the store's migrations (`src/store/migrations/*.sql`, docs/ci.md
 //! §2.4) so that adding one is adding a file, never editing a shared list. Nothing else happens
-//! here: the UI is built separately (`ui/dist`, embedded).
+//! here: the UI is built separately (`ui/dist/client`, embedded).
 
 use std::fmt::Write as _;
 use std::path::PathBuf;

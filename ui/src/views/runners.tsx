@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link, Navigate, useNavigate, useSearchParams } from "react-router";
+import { Link, Navigate, useNavigate, useSearchParams } from "@/lib/router";
 import { Plus, Server, SquareTerminal, Trash2, X } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
@@ -472,7 +472,7 @@ function AgentDetails({
           {agent.draining ? "Resume scheduling" : "Drain"}
         </Button>
         {!forgetting && (
-          <Button variant="ghost" size="xs" className="text-[#d1aaad]" onClick={() => setForgetting(true)}>
+          <Button variant="ghost-danger" size="xs" onClick={() => setForgetting(true)}>
             <Trash2 /> Forget
           </Button>
         )}

@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link, useNavigate, useParams } from "react-router";
+import { Link, useNavigate, useParams } from "@/lib/router";
 import { ChevronRight, GitBranch, RotateCcw, Square, User, Workflow } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";

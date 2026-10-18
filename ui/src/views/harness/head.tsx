@@ -4,7 +4,7 @@
  * as one line of words that opens in place to change them (no popups). Settings live in ⋯.
  */
 import * as React from "react";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate } from "@/lib/router";
 import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
 import type { AgentInfo, Command, Meta, State, Status } from "@/api/harness";
 import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";

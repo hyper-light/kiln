@@ -17,9 +17,14 @@ import { charKey, namedKey, type NamedKey } from "@/components/terminal/keys";
 import { SelectField } from "@/components/ui/misc";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
-import { TerminalSession, type SessionHandle, type SessionState } from "@/views/terminal/session";
+import { Loading } from "@/components/ui/loading";
+import type { SessionHandle, SessionState } from "@/views/terminal/session";
 import { machineName } from "./parts";
 import "./beside.css";
+
+// The terminal itself (xterm, about 500 KB) loads when a terminal beside the agent is first shown,
+// not with the agent's page.
+const TerminalSession = React.lazy(() => import("@/views/terminal/session").then((m) => ({ default: m.TerminalSession })));
 
 /** What was done here to an agent's terminals: opened, closed, the one shown, what went wrong or what it said. */
 interface Here {
@@ -182,21 +187,23 @@ function Terminals({ agent, info, onInsert }: BesideProps) {
             </p>
           )}
           <div className="bt-screen">
-            <TerminalSession
-              key={shown.terminal.id}
-              ref={handle}
-              tabId={shown.terminal.id}
-              sessionId={shown.terminal.id}
-              target={shown.terminal.target}
-              active
-              fontSize={fontSize}
-              copyOnSelect={copyOnSelect}
-              deviceKeyboard
-              onState={onState}
-              onTitle={noop}
-              onSession={noop}
-              onClosed={onClosed}
-            />
+            <React.Suspense fallback={<Loading label="Opening the terminal" block />}>
+              <TerminalSession
+                key={shown.terminal.id}
+                ref={handle}
+                tabId={shown.terminal.id}
+                sessionId={shown.terminal.id}
+                target={shown.terminal.target}
+                active
+                fontSize={fontSize}
+                copyOnSelect={copyOnSelect}
+                deviceKeyboard
+                onState={onState}
+                onTitle={noop}
+                onSession={noop}
+                onClosed={onClosed}
+              />
+            </React.Suspense>
           </div>
           {st?.kind === "reconnecting" && <p className="bt-note">Reconnecting…</p>}
           {st?.kind === "error" && <p className="bt-error">{st.message}</p>}

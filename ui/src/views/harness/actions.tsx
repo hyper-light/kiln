@@ -1,6 +1,6 @@
 /** What you can do to an agent, from its card or its page: open, interrupt, restart, rename, duplicate, end, remove. */
 import * as React from "react";
-import { useNavigate } from "react-router";
+import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
 import { MoreHorizontal } from "lucide-react";
 import { harnessApi, type AgentInfo, type Command } from "@/api/harness";

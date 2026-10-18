@@ -6,7 +6,7 @@
  * deleting happen in place, under what they act on.
  */
 import * as React from "react";
-import { Link, useNavigate, useSearchParams } from "react-router";
+import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { AlertTriangle, ArrowUpRight, FolderSync, GitBranch, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "@/api/client";
 import type { Repo, Run, SyncRepo, SyncView } from "@/api/types";

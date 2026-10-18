@@ -11,7 +11,7 @@
  * the graph on wide screens, under its row everywhere else.
  */
 import * as React from "react";
-import { Link, useNavigate, useParams } from "react-router";
+import { Link, useNavigate, useParams } from "@/lib/router";
 import { RefreshCw, Rocket } from "lucide-react";
 
 import { cdApi } from "@/api/cd";

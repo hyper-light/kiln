@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { ArrowUpRight, Settings } from "lucide-react";
 import { queueHistory } from "@/api/events";
 import type { HostSample } from "@/api/types";

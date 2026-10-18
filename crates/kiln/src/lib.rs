@@ -48,6 +48,7 @@ pub mod terminal;
 pub mod termsess;
 pub mod tunnel;
 pub mod ui;
+pub mod uiserver;
 pub mod updates;
 pub mod upgrade;
 pub mod util;

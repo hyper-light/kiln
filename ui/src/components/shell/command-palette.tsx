@@ -5,7 +5,7 @@
  * arrive (asked for by the action that opens it), so what you type is never lost to a loader.
  */
 import * as React from "react";
-import { useNavigate } from "react-router";
+import { useNavigate } from "@/lib/router";
 import { create } from "zustand";
 import {
   Activity,

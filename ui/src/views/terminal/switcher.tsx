@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { NameField } from "@/components/ui/name-field";
-import { useNavigate } from "react-router";
+import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
 import {
   Bot,

@@ -1,6 +1,9 @@
-//! The web UI, embedded into the binary at build time (`ui/dist`). Hashed assets are served as
-//! immutable; every other path falls back to `index.html` for client-side routing. Compressible
-//! files are gzipped once, on first request, and cached in memory.
+//! The web UI's static files, embedded into the binary at build time (`ui/dist/client`: TanStack
+//! Start's client build). Hashed assets are served as immutable. Pages, server functions and server
+//! components come from the UI server (`crate::uiserver`); without it, every page gets the app's
+//! shell (`_shell.html`) and the app runs in the browser. Compressible files go out brotli-compressed
+//! (or gzipped, to a browser that doesn't take brotli), each compressed once and kept in memory:
+//! the embedded ones in the background as the server starts (`keep_assets`), so no request waits.
 //!
 //! Earlier builds' assets are kept on disk (`keep_assets`), so a page loaded before a deploy can
 //! still load the parts it hasn't yet. An asset no build has is a 404, never `index.html`: a
@@ -19,7 +22,7 @@ use parking_lot::Mutex;
 use crate::http::server::{self as srv, Request, Response};
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "../../ui/dist"]
+#[folder = "../../ui/dist/client"]
 #[allow_missing = true]
 struct Assets;
 
@@ -64,6 +67,7 @@ pub fn keep_assets(data_dir: &Path) {
         }
     }
     let _ = KEPT.set(dir);
+    warm();
 }
 
 /// The file an asset path names (`assets/<name>`): a plain file name, nothing that leaves the
@@ -84,6 +88,49 @@ fn gz_cache() -> &'static Mutex<HashMap<String, Bytes>> {
     C.get_or_init(Default::default)
 }
 
+fn br_cache() -> &'static Mutex<HashMap<String, Bytes>> {
+    static C: OnceLock<Mutex<HashMap<String, Bytes>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// `data` brotli-compressed at the highest quality, once per file.
+fn brotli(name: &str, data: &[u8]) -> Option<Bytes> {
+    if let Some(b) = br_cache().lock().get(name) {
+        return Some(b.clone());
+    }
+    let mut out = Vec::with_capacity(data.len() / 3);
+    {
+        let mut w = brotli::CompressorWriter::new(&mut out, 4096, 11, 22);
+        w.write_all(data).ok()?;
+        w.flush().ok()?;
+    }
+    let out = Bytes::from(out);
+    br_cache().lock().insert(name.to_owned(), out.clone());
+    Some(out)
+}
+
+/// Whether an Accept-Encoding header takes `coding` (and doesn't refuse it with q=0).
+fn accepts(header: Option<&str>, coding: &str) -> bool {
+    header.is_some_and(|v| {
+        v.split(',').any(|part| {
+            let mut it = part.split(';').map(str::trim);
+            it.next().is_some_and(|c| c.eq_ignore_ascii_case(coding)) && !it.any(|p| p.replace(' ', "").eq_ignore_ascii_case("q=0"))
+        })
+    })
+}
+
+/// Compresses every embedded file that's worth it, both ways, so no request has to wait for it.
+fn warm() {
+    for name in Assets::iter() {
+        let Some(f) = Assets::get(&name) else { continue };
+        let mime = mime_guess::from_path(name.as_ref()).first_or_octet_stream();
+        if compressible(mime.as_ref()) && f.data.len() > 1024 {
+            let _ = brotli(&name, &f.data);
+            let _ = gzip(&name, &f.data);
+        }
+    }
+}
+
 fn compressible(mime: &str) -> bool {
     mime.starts_with("text/") || mime.contains("javascript") || mime.contains("json") || mime.contains("svg")
 }
@@ -99,26 +146,46 @@ fn gzip(name: &str, data: &[u8]) -> Option<Bytes> {
     Some(out)
 }
 
-pub fn serve(req: &Request) -> Response {
+/// A static file of the UI, if `req` asks for one: this build's, or an earlier build's asset (a page
+/// loaded before a deploy). An asset no build has is a 404, never a page.
+pub fn static_file(req: &Request) -> Option<Response> {
     let path = req.uri().path().trim_start_matches('/');
-    let (data, name): (Bytes, &str) = match Assets::get(path).filter(|_| !path.is_empty()) {
-        Some(f) => (Bytes::from(f.data.into_owned()), path),
-        // An asset of an earlier build (a page loaded before a deploy), else none: never the page.
+    if path.is_empty() || path.starts_with('_') {
+        return None;
+    }
+    let data = match Assets::get(path) {
+        Some(f) => Bytes::from(f.data.into_owned()),
         None if path.starts_with("assets/") => match kept(path) {
-            Some(b) => (Bytes::from(b), path),
-            None => return srv::response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", srv::full("no such asset in any build kiln keeps\n")),
+            Some(b) => Bytes::from(b),
+            None => return Some(srv::response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", srv::full("no such asset in any build kiln keeps\n"))),
         },
-        None => match Assets::get("index.html") {
-            Some(f) => (Bytes::from(f.data.into_owned()), "index.html"),
-            None => return srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(PLACEHOLDER)),
-        },
+        None => return None,
     };
+    Some(respond(req, path, data))
+}
+
+/// The app's shell (any page, rendered in the browser): for when the UI server isn't there.
+pub fn shell(req: &Request) -> Response {
+    match Assets::get("_shell.html") {
+        Some(f) => respond(req, "_shell.html", Bytes::from(f.data.into_owned())),
+        None => srv::response(StatusCode::OK, "text/html; charset=utf-8", srv::full(PLACEHOLDER)),
+    }
+}
+
+fn respond(req: &Request, name: &str, data: Bytes) -> Response {
     let mime = mime_guess::from_path(name).first_or_octet_stream();
     let cache = if name.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
-    let accepts_gzip = srv::header_str(req, &header::ACCEPT_ENCODING).is_some_and(|v| v.contains("gzip"));
-    let gz = (accepts_gzip && compressible(mime.as_ref()) && data.len() > 1024).then(|| gzip(name, &data)).flatten();
-    let mut r = match gz {
-        Some(b) => srv::with_header(srv::response(StatusCode::OK, mime.as_ref(), srv::full(b)), header::CONTENT_ENCODING, "gzip"),
+    let asked = srv::header_str(req, &header::ACCEPT_ENCODING);
+    let worth = compressible(mime.as_ref()) && data.len() > 1024;
+    let packed = if worth && accepts(asked, "br") {
+        brotli(name, &data).map(|b| (b, "br"))
+    } else if worth && accepts(asked, "gzip") {
+        gzip(name, &data).map(|b| (b, "gzip"))
+    } else {
+        None
+    };
+    let mut r = match packed {
+        Some((b, coding)) => srv::with_header(srv::response(StatusCode::OK, mime.as_ref(), srv::full(b)), header::CONTENT_ENCODING, coding),
         None => srv::response(StatusCode::OK, mime.as_ref(), srv::full(data)),
     };
     r = srv::with_header(r, header::CACHE_CONTROL, cache);
@@ -129,6 +196,24 @@ pub fn serve(req: &Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brotli_and_gzip_are_taken_as_the_browser_says() {
+        assert!(accepts(Some("gzip, deflate, br, zstd"), "br"));
+        assert!(accepts(Some("br;q=1.0, gzip;q=0.8"), "br"));
+        assert!(!accepts(Some("gzip, deflate"), "br"));
+        assert!(!accepts(Some("br;q=0, gzip"), "br"));
+        assert!(!accepts(Some("br; q=0"), "br"));
+        assert!(accepts(Some("gzip"), "gzip"));
+        assert!(!accepts(None, "gzip"));
+        // What comes back decompresses to what went in.
+        let data = "kiln ".repeat(1000);
+        let packed = brotli("test-brotli", data.as_bytes()).unwrap_or_default();
+        let mut back = Vec::new();
+        let _ = brotli::BrotliDecompress(&mut packed.as_ref(), &mut back);
+        assert_eq!(back, data.as_bytes());
+        assert!(packed.len() < data.len() / 10);
+    }
 
     #[test]
     fn only_plain_asset_names_are_looked_up() {

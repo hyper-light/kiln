@@ -1,6 +1,6 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { Link, Navigate, useLocation, useNavigate } from "react-router";
+import { Link, Navigate, useLocation, useNavigate } from "@/lib/router";
 import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Eye, Keyboard, Maximize2, Minimize2, Minus, PencilLine, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import type { AiSession, TerminalSessionInfo } from "@/api/types";
@@ -455,7 +455,7 @@ export default function TerminalWorkspace({ visible }: { visible: boolean }) {
         />
       )}
       {/* tab strip */}
-      <div className={cn("flex h-10 shrink-0 items-stretch border-b border-[#1d1f23]", narrow && "hidden")}>
+      <div className={cn("h-10 shrink-0 items-stretch border-b border-[#1d1f23]", narrow ? "hidden" : "flex")}>
         <div role="tablist" aria-label="Terminal sessions" className="term-tabs flex min-w-0 flex-1 items-stretch overflow-x-auto">
           {tabs.map((t, i) => (
             <div

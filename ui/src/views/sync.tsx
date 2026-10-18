@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { api } from "@/api/client";
 import type { SyncConflict, SyncCopy, SyncKeep, SyncRepo, SyncView } from "@/api/types";
 import { Button } from "@/components/ui/button";
