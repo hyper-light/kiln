@@ -3,10 +3,11 @@
 //!
 //! A session pauses when its harness says its account reached a usage limit (Claude Code's
 //! `rate_limit` error, Codex's `usageLimitExceeded`, an ACP agent's limit error), when another
-//! session on the account did (`Command::LimitHold`, from the server), or between turns once a
-//! limit is as full as `State::pause_at`. While it is paused nothing goes to the harness: kiln's
-//! queue, goals and plan steps wait, and a message sent meanwhile joins the queue. Its folder is
-//! kept as it was in a hidden git ref (`Effect::Checkpoint`).
+//! session on the account did (`Command::LimitHold`, from the server), or once a limit is as full
+//! as `State::pause_at`: between turns, or in the middle of one at its next step (what runs then,
+//! a command or an edit, finishes first; [`stop_mid_turn`]). While it is paused nothing goes to
+//! the harness: kiln's queue, goals and plan steps wait, and a message sent meanwhile joins the
+//! queue. Its folder is kept as it was in a hidden git ref (`Effect::Checkpoint`).
 //!
 //! Once the window starts over (`Pause::until`, plus a margin and a spread across the account's
 //! sessions), kiln asks the harness for its usage. A limit no longer reached ends the pause: the
@@ -15,7 +16,7 @@
 //! the pause at any time, or keep it until they do (`Pause::auto`).
 
 use super::core::{Core, Effect};
-use super::model::{Body, Checkpoint, Command, Cut, Level, Limit, Pause, QueueItem};
+use super::model::{Body, Checkpoint, Command, Cut, Level, Limit, Pause, QueueItem, Status, ToolStatus};
 
 /// A usage limit was reached.
 pub const LIMIT: &str = "limit";
@@ -145,7 +146,7 @@ pub fn hold(core: &mut Core, reason: &str, by: &str, hit: Hit, cut: Option<Cut>)
     }
     let label = hit.window.as_ref().and_then(|w| core.state.limits.iter().find(|l| &l.id == w)).map(|l| l.label.clone());
     let auto = !core.state.manual_resume;
-    let text = pause_words(reason, by, label.as_deref(), &hit.said, auto);
+    let text = pause_words(reason, by, label.as_deref(), &hit.said, auto, cut.is_some());
     let next_check = hit.until.is_none().then(|| now.saturating_add(retry_after(0)));
     core.state.pause = Some(Pause {
         reason: reason.to_owned(),
@@ -168,17 +169,20 @@ pub fn hold(core: &mut Core, reason: &str, by: &str, hit: Hit, cut: Option<Cut>)
     true
 }
 
-/// The timeline's one line about a pause.
-fn pause_words(reason: &str, by: &str, label: Option<&str>, said: &str, auto: bool) -> String {
+/// The timeline's one line about a pause; `cut`: it stopped a turn part-way.
+fn pause_words(reason: &str, by: &str, label: Option<&str>, said: &str, auto: bool, cut: bool) -> String {
     let limit = label.map_or_else(|| "a usage limit".to_owned(), |l| format!("its {l} limit"));
     let what = match (reason, by) {
-        (THRESHOLD, _) => format!("Paused between turns: {limit} is as full as the stop point set for it"),
+        // `said`: "96% used, the stop point is 95%".
+        (THRESHOLD, _) if !said.is_empty() => format!("Paused at the stop point: {limit} is {said}"),
+        (THRESHOLD, _) => format!("Paused at the stop point: {limit} is as full as the stop point set for it"),
         (_, "account") => format!("Paused: another agent on this account reached {}", label.map_or_else(|| "a usage limit".to_owned(), |l| format!("the {l} limit"))),
         _ if !said.trim().is_empty() => format!("Paused: {}", said.trim().trim_end_matches('.')),
         _ => format!("Paused: it reached {limit}"),
     };
     let then = if auto { "it goes on by itself once the limit resets" } else { "it goes on when you resume it" };
-    format!("{what}. Queued messages and goals wait; {then}.")
+    let turn = if reason == THRESHOLD && cut { " The step it was on finished; the turn goes on from there." } else { "" };
+    format!("{what}.{turn} Queued messages and goals wait; {then}.")
 }
 
 /// End the pause: the timeline says why. The pause ended is returned, for the adapter to go on
@@ -300,24 +304,77 @@ fn cap_of(p: &Pause, pause_at: Option<u8>) -> f64 {
     }
 }
 
+/// A window's reset, as different reports give it, drifts a little; one that started over is hours
+/// (or days) later.
+const SAME_RESET_MS: i64 = 10 * 60_000;
+
+/// The windows as full as the stop point (`State::pause_at`) now, but those a person resumed past.
+fn past_stop_point(core: &Core) -> impl Iterator<Item = &Limit> {
+    let at = core.state.pause_at.map(f64::from);
+    let now = Core::now();
+    core.state.limits.iter().filter(move |l| {
+        let waived = core.state.stop_waived.iter().any(|(id, until)| *id == l.id && l.resets_at.is_some_and(|r| r <= until.saturating_add(SAME_RESET_MS)));
+        at.is_some_and(|at| l.used_percent.is_some_and(|u| u >= at)) && l.unit.is_none() && l.resets_at.is_some_and(|r| r > now) && !waived
+    })
+}
+
+/// The limit as full as the stop point (`State::pause_at`), when one is: the one that resets
+/// last, as the pause's hit.
+fn over_stop_point(core: &Core) -> Option<Hit> {
+    let at = core.state.pause_at?;
+    past_stop_point(core)
+        .max_by_key(|l| l.resets_at.unwrap_or(0))
+        .map(|l| Hit { window: Some(l.id.clone()), until: l.resets_at, said: format!("{}% used, the stop point is {at}%", l.used_percent.unwrap_or(0.0).round()) })
+}
+
+/// A person resumed it: the windows now past its stop point are left be until they start over
+/// (they chose to go on regardless); a limit it reaches still pauses it.
+pub fn waive_stop_point(core: &mut Core) {
+    let now = Core::now();
+    let mut waived: Vec<(String, i64)> = core.state.stop_waived.iter().filter(|(_, until)| *until > now).cloned().collect();
+    waived.extend(past_stop_point(core).filter_map(|l| l.resets_at.map(|r| (l.id.clone(), r))).collect::<Vec<_>>());
+    if waived != core.state.stop_waived {
+        core.state.stop_waived = waived;
+        core.touch_state();
+    }
+}
+
 /// Between turns, before kiln's queue (or a goal, or a message) starts another: once a limit is
 /// as full as `State::pause_at`, a pause starts here instead. True when the session is paused.
 pub fn at_threshold(core: &mut Core) -> bool {
     if core.state.pause.is_some() {
         return true;
     }
-    let Some(at) = core.state.pause_at else { return false };
-    let now = Core::now();
-    let full = core
-        .state
-        .limits
-        .iter()
-        .filter(|l| l.unit.is_none() && l.used_percent.is_some_and(|u| u >= f64::from(at)) && l.resets_at.is_some_and(|r| r > now))
-        .max_by_key(|l| l.resets_at.unwrap_or(0))
-        .map(|l| (l.id.clone(), l.resets_at, l.used_percent.unwrap_or(0.0)));
-    let Some((window, until, used)) = full else { return false };
-    let said = format!("{}% used, the stop point is {at}%", used.round());
-    hold(core, THRESHOLD, THRESHOLD, Hit { window: Some(window), until, said }, None)
+    let Some(hit) = over_stop_point(core) else { return false };
+    hold(core, THRESHOLD, THRESHOLD, hit, None)
+}
+
+/// In the middle of a turn, once a limit is as full as `State::pause_at`: the turn stops at its
+/// next step, not at its end (an agent working on its own can go for hours in one turn). What
+/// runs then, a command or an edit, finishes first; then the session pauses, and the turn it cut
+/// off goes on first when the pause ends. True when the turn is to stop now: the caller
+/// interrupts the harness. A turn waiting on a person (an approval) uses nothing meanwhile, and is
+/// left to them.
+pub fn stop_mid_turn(core: &mut Core) -> bool {
+    if core.state.pause.is_some() || core.state.status != Status::Running || core.hold {
+        return false;
+    }
+    let Some(hit) = over_stop_point(core) else { return false };
+    if step_under_way(core) {
+        return false;
+    }
+    let cut = cut_now(core);
+    hold(core, THRESHOLD, THRESHOLD, hit, Some(cut))
+}
+
+/// A tool the turn runs now: a command, an edit, a read (a subagent's own steps count; the call
+/// that started the subagent only waits on them, so it doesn't).
+fn step_under_way(core: &Core) -> bool {
+    let Some(since) = core.state.turn_started else { return false };
+    core.events()
+        .rev()
+        .take_while(|e| e.at >= since)
+        .any(|e| matches!(&e.body, Body::Tool(t) if t.status == ToolStatus::Running && t.task.is_none()))
 }
 
 /// A command on its way to the harness: a message sent while the session is paused (or at its
@@ -434,7 +491,7 @@ pub fn cut_now(core: &Core) -> Cut {
             Body::User { text, client_id, .. } => Some((client_id.clone(), text.clone())),
             _ => None,
         })
-        .last();
+        .next_back();
     let (message, text) = last.unwrap_or_default();
     Cut { message, text: super::model::clip_middle(&text, 300).0, at: Core::now() }
 }
@@ -571,6 +628,100 @@ mod tests {
         }
         core.state.limits = vec![window("five_hour", 2.0, later + 5 * 3_600_000)];
         assert!(checked(&mut core, later).is_some());
+    }
+
+    fn shell(status: ToolStatus) -> Body {
+        use super::super::model::{ToolCall, ToolKind};
+        Body::Tool(Box::new(ToolCall {
+            tool_id: "t".into(),
+            name: "Bash".into(),
+            tool: ToolKind::Shell,
+            title: "cargo build".into(),
+            detail: None,
+            input: serde_json::Value::Null,
+            status,
+            output: None,
+            truncated: false,
+            diffs: Vec::new(),
+            todos: Vec::new(),
+            task: None,
+            exit_code: None,
+            started: 0,
+            ended: None,
+            server: None,
+            tool_short: None,
+            skill: None,
+        }))
+    }
+
+    #[test]
+    fn the_stop_point_stops_a_long_turn_at_its_next_step() {
+        let mut core = Core::new();
+        let later = Core::now() + 3_600_000;
+        core.state.limits = vec![window("five_hour", 96.0, later)];
+        core.state.status = Status::Running;
+        core.state.turn_started = Some(Core::now() - 1_000);
+        core.upsert("u1", None, Body::User { text: "port the parser".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("t1", None, shell(ToolStatus::Running));
+        // No stop point: it works on.
+        assert!(!stop_mid_turn(&mut core));
+        core.state.pause_at = Some(95);
+        // The build under way finishes first.
+        assert!(!stop_mid_turn(&mut core));
+        assert!(core.state.pause.is_none());
+        core.upsert("t1", None, shell(ToolStatus::Done));
+        // Between steps: the turn stops, and goes on from there once the limit resets.
+        assert!(stop_mid_turn(&mut core));
+        let p = core.state.pause.clone().unwrap_or_default();
+        assert_eq!((p.reason.as_str(), p.until), (THRESHOLD, Some(later)));
+        assert_eq!(p.cut.map(|c| c.text), Some("port the parser".to_owned()));
+        let said = core.events().filter_map(|e| if let Body::Notice { text, .. } = &e.body { Some(text.clone()) } else { None }).next_back().unwrap_or_default();
+        assert!(said.starts_with("Paused at the stop point: its Session limit is 96% used, the stop point is 95%. The step it was on finished"), "{said}");
+        // Once paused, it isn't asked to stop again.
+        assert!(!stop_mid_turn(&mut core));
+    }
+
+    #[test]
+    fn resumed_past_the_stop_point_it_goes_on_until_the_window_starts_over() {
+        let mut core = Core::new();
+        let reset = Core::now() + 3_600_000;
+        core.state.pause_at = Some(95);
+        core.state.limits = vec![window("five_hour", 97.0, reset), window("seven_day", 40.0, reset + 86_400_000)];
+        assert!(at_threshold(&mut core));
+        // You resume it: the window past the stop point is left be (it doesn't stop again at once).
+        waive_stop_point(&mut core);
+        assert!(release(&mut core, "Resumed by you.").is_some());
+        assert!(!at_threshold(&mut core));
+        // A report a little off on the reset is the same window.
+        core.state.limits = vec![window("five_hour", 98.0, reset + 60_000), window("seven_day", 40.0, reset + 86_400_000)];
+        assert!(!at_threshold(&mut core));
+        // Another window past it still stops it.
+        core.state.limits = vec![window("five_hour", 98.0, reset), window("seven_day", 96.0, reset + 86_400_000)];
+        assert!(at_threshold(&mut core));
+        assert_eq!(core.state.pause.as_ref().and_then(|p| p.window.clone()).as_deref(), Some("seven_day"));
+        release(&mut core, "Resumed by you.");
+        // Once the window starts over (its reset hours later), the stop point holds for it again.
+        core.state.limits = vec![window("five_hour", 96.0, reset + 5 * 3_600_000)];
+        assert!(at_threshold(&mut core));
+    }
+
+    #[test]
+    fn the_stop_point_leaves_a_turn_waiting_on_a_person_or_under_the_limit() {
+        let mut core = Core::new();
+        core.state.pause_at = Some(95);
+        core.state.turn_started = Some(Core::now() - 1_000);
+        core.state.limits = vec![window("five_hour", 99.0, Core::now() + 3_600_000)];
+        // Waiting on an approval: it uses nothing meanwhile.
+        core.state.status = Status::Waiting;
+        assert!(!stop_mid_turn(&mut core));
+        // Under the stop point: it works on.
+        core.state.status = Status::Running;
+        core.state.limits = vec![window("five_hour", 60.0, Core::now() + 3_600_000)];
+        assert!(!stop_mid_turn(&mut core));
+        // A window already past its reset says nothing about now.
+        core.state.limits = vec![window("five_hour", 99.0, Core::now() - 1)];
+        assert!(!stop_mid_turn(&mut core));
+        assert!(core.state.pause.is_none());
     }
 
     #[test]

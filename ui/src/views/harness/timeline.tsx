@@ -5,7 +5,7 @@
  * the files it read, the subagent it started.
  */
 import * as React from "react";
-import { ArrowDown, ChevronRight, CircleAlert, CornerDownRight, Info, TriangleAlert } from "lucide-react";
+import { ArrowDown, Check, ChevronRight, CircleAlert, Copy, CornerDownRight, Info, TriangleAlert } from "lucide-react";
 import { useSession, type Approval, type Command, type Delivery, type HEvent, type Meta, type SessionStore, type Task } from "@/api/harness";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
@@ -17,6 +17,7 @@ import { TurnMenu } from "./controls";
 import { bringIntoView, elementOf, FindNowContext, mark, useRevealed, type FindNow } from "./find";
 import { Output, Prose, ToolIcon } from "./parts";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
+import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Optic, PrismLabel, ThinkingBody, ThinkingHead, formatThought, type BeamStatus } from "./signals";
 import { usePlaces, type Place } from "./state";
 
@@ -399,6 +400,28 @@ const DELIVERY: Record<Delivery, string> = {
   cancelled: "dropped",
 };
 
+/** Copy what was said (your message, the agent's words), as it was written: a quiet icon that says when it took. */
+function CopyMsg({ text, label, className }: { text: string; label: string; className?: string }) {
+  const [done, setDone] = React.useState(false);
+  return (
+    <button
+      type="button"
+      className={cn("hx-icon hx-msg-copy", className)}
+      aria-label={done ? "Copied" : label}
+      title={done ? "Copied" : label}
+      onClick={() =>
+        void copyText(text).then((ok) => {
+          if (!ok) return;
+          setDone(true);
+          window.setTimeout(() => setDone(false), 1400);
+        })
+      }
+    >
+      {done ? <Check size={13} /> : <Copy size={13} />}
+    </button>
+  );
+}
+
 function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "user" }>; delivery?: Delivery; meta?: Meta | null; onCommand?: (c: Command) => void }) {
   const system = e.origin && e.origin !== "human";
   return (
@@ -416,6 +439,7 @@ function Prompt({ e, delivery, meta, onCommand }: { e: Extract<HEvent, { kind: "
             · {e.images} image{e.images === 1 ? "" : "s"}
           </span>
         ) : null}
+        {e.text && <CopyMsg text={e.text} label={system ? "Copy the message" : "Copy your message"} className="hx-prompt-copy" />}
         {!system && onCommand && <TurnMenu meta={meta ?? null} eventId={e.id} send={onCommand} />}
       </div>
       <div className={cn("hx-prompt-text", system && "hx-dim")}>{e.text}</div>
@@ -434,7 +458,13 @@ function ItemView({ item, cwd, onOpenTask }: { item: Item; cwd: string; onOpenTa
     case "step":
       return item.group === "agent" ? <AgentStep step={item} cwd={cwd} onOpenTask={onOpenTask} /> : <StepRow step={item} cwd={cwd} tasks={NO_TASKS} onOpenTask={onOpenTask} />;
     case "note":
-      return <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} ev={item.event.id} />;
+      // A tap (or a pointer resting on it) shows its copy icon.
+      return (
+        <div className="hx-said" data-ev={item.event.id} tabIndex={-1}>
+          <Prose text={item.event.text} className={cn("hx-note", item.event.streaming && "hx-streaming")} />
+          {!item.event.streaming && item.event.text && <CopyMsg text={item.event.text} label="Copy what it said" className="hx-said-copy" />}
+        </div>
+      );
     case "thought":
       return <Thought e={item.event} more={item.more} />;
     case "notice":
@@ -526,16 +556,15 @@ const TurnView = React.memo(function TurnView({
       {turn.outcome && (
         <div className="hx-outcome" data-ev={turn.outcome.id}>
           <Prose text={turn.outcome.text} />
-          {(edits.length > 0 || turn.ended) && (
-            <div className="hx-outcome-foot">
-              {edits.length > 0 && (
-                <span>
-                  {edits.length} file{edits.length === 1 ? "" : "s"} changed <DiffStat add={add} del={del} />
-                </span>
-              )}
-              {turn.ended && <span className="hx-meta-num">{duration(turn.ended - turn.started)}</span>}
-            </div>
-          )}
+          <div className="hx-outcome-foot">
+            {edits.length > 0 && (
+              <span>
+                {edits.length} file{edits.length === 1 ? "" : "s"} changed <DiffStat add={add} del={del} />
+              </span>
+            )}
+            {turn.ended && <span className="hx-meta-num">{duration(turn.ended - turn.started)}</span>}
+            {turn.outcome.text && <CopyMsg text={turn.outcome.text} label="Copy the answer" className="hx-outcome-copy" />}
+          </div>
         </div>
       )}
     </section>

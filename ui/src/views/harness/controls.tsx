@@ -138,6 +138,43 @@ function ControlRow({ c, state, send, confirm }: { c: Control; state: State | nu
 }
 
 /** Every session-wide control the harness offers, by group. */
+/** kiln's own settings for usage limits, whatever the harness: where it pauses, and whether it goes on elsewhere. */
+function LimitRows({ state, send }: { state: State | null; send: Send }) {
+  const moving = Boolean(state?.move_on_limit);
+  return (
+    <section className="hx-ctl-group">
+      <div className="hx-eyebrow">Usage limits</div>
+      <div className="hx-ctl">
+        <div className="hx-ctl-text">
+          <span className="hx-ctl-label">Pause</span>
+          <span className="hx-dim text-[12px]">At the limit, or once one is this full: the step under way finishes first, and it goes on once the limit resets.</span>
+        </div>
+        <div className="hx-ctl-input">
+          <select className="hx-select" aria-label="Pause" value={state?.pause_at ? String(state.pause_at) : ""} onChange={(e) => send({ type: "pause_at", percent: e.target.value ? Number(e.target.value) : null })}>
+            <option value="">At the limit</option>
+            {[80, 90, 95].map((p) => (
+              <option key={p} value={String(p)}>
+                At {p}% used
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="hx-ctl">
+        <div className="hx-ctl-text">
+          <span className="hx-ctl-label">Go on elsewhere at a limit</span>
+          <span className="hx-dim text-[12px]">It moves to another of your machines whose harness is signed in to an account with room; its conversation and repository go along.</span>
+        </div>
+        <div className="hx-ctl-input">
+          <button type="button" role="switch" aria-checked={moving} aria-label="Go on elsewhere at a limit" className="hx-switch" onClick={() => send({ type: "move_on_limit", on: !moving })}>
+            <span />
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 export function SettingsSheet({ open, onOpenChange, meta, state, send }: { open: boolean; onOpenChange: (o: boolean) => void; meta: Meta | null; state: State | null; send: Send }) {
   const { confirm, dialog } = useConfirm();
   const controls = (meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session");
@@ -155,6 +192,7 @@ export function SettingsSheet({ open, onOpenChange, meta, state, send }: { open:
           description="Everything this harness lets kiln set or do. Changes apply to this agent from its next step."
         >
           <div className="hx-ctls">
+            <LimitRows state={state} send={send} />
             {groups.length === 0 && !meta?.hooks?.length && <div className="hx-dim text-[13px]">This harness reports no further settings.</div>}
             {groups.map(([g, cs]) => (
               <section key={g} className="hx-ctl-group">
