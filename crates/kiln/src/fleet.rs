@@ -9,7 +9,8 @@
 //!    one the release pipeline built, or one another machine of its platform built itself.
 //! 2. Else, on a machine with a checkout of kiln (the sign it builds kiln), it builds the commit
 //!    itself, from the server's archive of it, in a directory of its own
-//!    (`~/.cache/kiln/self-build`; the checkout is never touched), and installs that build. A Mac
+//!    (`~/.cache/kiln/self-build`, a source tree per build beside one cache of compiled crates; the
+//!    checkout is never touched), and installs that build. A Mac
 //!    hands its binary back, so other Macs download it instead of building; a Linux build links
 //!    the machine's own C library, so it is that machine's alone.
 //! 3. Else it waits for a build of the commit, and says what for.
@@ -692,14 +693,21 @@ mkdir -p "$dir" || fail "cannot make $dir"
 base=""
 for b in {bases}; do
   echo "fetching the source of {s} from $b"
-  if curl -fsS -H "Authorization: Bearer {token}" -o "$dir/source.tar" "$b/api/updates/jobs/{job}/source"; then base="$b"; break; fi
+  if curl -fsS -H "Authorization: Bearer {token}" -o "$dir/source-{job}.tar" "$b/api/updates/jobs/{job}/source"; then base="$b"; break; fi
 done
 [ -n "$base" ] || fail "could not fetch the source of {s} from the server"
-rm -rf "$dir/src" && mkdir -p "$dir/src" && tar -xf "$dir/source.tar" -C "$dir/src" || fail "could not unpack the source"
-rm -f "$dir/source.tar"
-cd "$dir/src" || fail "no $dir/src"
-echo "building the UI"
+find "$dir" -maxdepth 1 -name "src*" -mmin +120 -exec rm -rf {{}} + 2>/dev/null
+src="$dir/src-{job}"
+rm -rf "$src" && mkdir -p "$src" && tar -xf "$dir/source-{job}.tar" -C "$src" || fail "could not unpack the source"
+rm -f "$dir/source-{job}.tar"
+cd "$src" || fail "no $src"
+echo "building the UI (node $(node --version 2>/dev/null), npm $(npm --version 2>/dev/null))"
 npm ci --prefix ui --no-audit --no-fund --loglevel=error || fail "npm ci failed"
+if [ ! -x ui/node_modules/.bin/tsc ]; then
+  echo "npm ci left no tsc in ui/node_modules/.bin: installing again"
+  npm ci --prefix ui --no-audit --no-fund --loglevel=error || fail "npm ci failed"
+  [ -x ui/node_modules/.bin/tsc ] || fail "npm ci did not install the UI tools (no tsc in ui/node_modules/.bin)"
+fi
 npm run --prefix ui build || fail "the UI did not build"
 cargo=cargo
 if command -v rustup >/dev/null 2>&1; then
