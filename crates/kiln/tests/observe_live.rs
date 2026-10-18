@@ -540,3 +540,196 @@ fn a_ci_job_that_runs_is_in_the_metrics_and_the_events() -> anyhow::Result<()> {
     anyhow::ensure!(listed("kiln_runs_started_total") && listed("kiln_job_duration_seconds_bucket") && !listed("kiln_agent_cpu_percent"), "the registry's families: {names}");
     Ok(())
 }
+
+/// What a mock service received: each request's path, headers (lowercased names) and body.
+#[derive(Debug, Clone)]
+struct Got {
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Got {
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+}
+
+/// A service for monitors to notify, on a port of its own: it takes every POST, answers 200 (or,
+/// for the first `refuse` requests to a path, 429 with `Retry-After: 1`), and keeps what came.
+struct Mock {
+    port: u16,
+    got: std::sync::Arc<std::sync::Mutex<Vec<Got>>>,
+}
+
+impl Mock {
+    fn start(refuse: &[(&str, usize)]) -> anyhow::Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let got: std::sync::Arc<std::sync::Mutex<Vec<Got>>> = std::sync::Arc::default();
+        let refused: std::sync::Arc<std::sync::Mutex<BTreeMap<String, usize>>> = std::sync::Arc::new(std::sync::Mutex::new(refuse.iter().map(|(p, n)| ((*p).to_owned(), *n)).collect()));
+        let g = got.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let (g, refused) = (g.clone(), refused.clone());
+                std::thread::spawn(move || {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    // Headers, then the body by its length.
+                    let head_end = loop {
+                        let Ok(n) = s.read(&mut chunk) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i;
+                        }
+                    };
+                    let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or(&[])).into_owned();
+                    let mut lines = head.lines();
+                    let path = lines.next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_owned();
+                    let headers: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned())).collect();
+                    let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
+                    let mut body = buf.get(head_end + 4..).unwrap_or(&[]).to_vec();
+                    while body.len() < len {
+                        let Ok(n) = s.read(&mut chunk) else { break };
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+                    }
+                    let refuse = {
+                        let mut r = refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match r.get_mut(&path) {
+                            Some(n) if *n > 0 => {
+                                *n -= 1;
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    g.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Got { path, headers, body });
+                    let answer = if refuse { "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" } else { "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok" };
+                    let _ = s.write_all(answer.as_bytes());
+                });
+            }
+        });
+        Ok(Self { port, got })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    fn at(&self, path: &str) -> Vec<Got> {
+        self.got.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|g| g.path == path).cloned().collect()
+    }
+}
+
+#[test]
+#[ignore = "starts a kiln server as a process, and services for it to notify"]
+fn a_monitor_alerts_every_integration_it_names_recovers_and_keeps_quiet_muted() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    // The webhook refuses its first delivery (429, Retry-After 1): it is tried again.
+    let mock = Mock::start(&[("/hook", 1)])?;
+    for (name, body) in [
+        ("ops", json!({ "kind": "slack", "url": mock.url("/slack") })),
+        ("ops-d", json!({ "kind": "discord", "url": mock.url("/discord") })),
+        ("ops-t", json!({ "kind": "teams", "url": mock.url("/teams") })),
+        ("oncall", json!({ "kind": "pagerduty", "routing_key": "R0UT1NGKEY", "url": mock.url("/pagerduty") })),
+        ("deploys", json!({ "kind": "webhook", "url": mock.url("/hook"), "secret": "s3cret" })),
+    ] {
+        let (code, b) = f.request("PUT", &format!("/api/observe/v1/integrations/{name}"), Some(&body))?;
+        anyhow::ensure!(code == 204, "integration {name}: {code} {}", String::from_utf8_lossy(&b));
+    }
+    let listed = f.call("GET", "/api/observe/v1/integrations", None)?;
+    anyhow::ensure!(!listed.to_string().contains("R0UT1NGKEY") && !listed.to_string().contains("s3cret"), "secrets are never shown: {listed}");
+    let bad = f.call("POST", "/api/observe/v1/monitors/validate", Some(&json!({ "query": "avg(last_5m):avg:x{*}" })))?;
+    anyhow::ensure!(at(&bad, &["ok"]).as_bool() == Some(false), "a query without a comparison: {bad}");
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e temp high",
+            "query": "last(last_1m):max:e2e.temp{*} by {host} > 100",
+            "message": "{{#is_alert}}temp on {{host.name}} is {{value}} @slack-ops @discord-ops-d @teams-ops-t @pagerduty-oncall @webhook-deploys{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @slack-ops @pagerduty-oncall @webhook-deploys{{/is_recovery}}",
+            "options": { "every": 10, "thresholds": { "critical": 100 } },
+            "tags": ["team:e2e"],
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let hot = |f: &Fleet, v: f64| -> anyhow::Result<()> {
+        let now = crate_now();
+        f.write("e2e.temp", &["a"], now - 50_000, 6, |_, _| v)
+    };
+    // Hot: every integration hears of it.
+    hot(&f, 150.0)?;
+    let start = Instant::now();
+    while ["/slack", "/discord", "/teams", "/pagerduty", "/hook"].iter().any(|p| mock.at(p).is_empty()) {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "not every integration heard: {:?}\n{}", mock.got.lock().map(|g| g.iter().map(|x| x.path.clone()).collect::<Vec<_>>()).unwrap_or_default(), f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let slack = mock.at("/slack").first().map(Got::json).unwrap_or_default();
+    anyhow::ensure!(at(&slack, &["text"]).as_str().is_some_and(|t| t.contains("[Triggered] e2e temp high on host:a") && t.contains("150")), "slack: {slack}");
+    let discord = mock.at("/discord").first().map(Got::json).unwrap_or_default();
+    let embed = at(&discord, &["embeds"]).as_array().and_then(|e| e.first()).cloned().unwrap_or_default();
+    anyhow::ensure!(at(&embed, &["color"]).as_u64() == Some(0xE0_1E5A) && at(&embed, &["description"]).as_str().is_some_and(|d| d.contains("temp on a is 150") && !d.contains('@')), "discord: {discord}");
+    let pd = mock.at("/pagerduty").first().map(Got::json).unwrap_or_default();
+    anyhow::ensure!(at(&pd, &["event_action"]) == "trigger" && at(&pd, &["routing_key"]) == "R0UT1NGKEY" && at(&pd, &["payload", "severity"]) == "critical" && at(&pd, &["payload", "source"]) == "a", "pagerduty: {pd}");
+    let dedup = at(&pd, &["dedup_key"]).as_str().unwrap_or("").to_owned();
+    // The webhook: refused once, delivered on the second try, signed.
+    let start = Instant::now();
+    while mock.at("/hook").len() < 2 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(20), "the webhook was not tried again after its 429");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let hook = mock.at("/hook").last().cloned().ok_or_else(|| anyhow::anyhow!("the webhook"))?;
+    let want = format!("sha256={}", hmac_sha256_hex(b"s3cret", &hook.body));
+    anyhow::ensure!(hook.header("x-kiln-signature") == Some(want.as_str()), "the signature: {:?} want {want}", hook.header("x-kiln-signature"));
+    anyhow::ensure!(at(&hook.json(), &["notice", "state"]) == "ALERT");
+    let state = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+    anyhow::ensure!(at(&state, &["state"]) == "ALERT", "the monitor: {state}");
+    // Cool: it recovers, and PagerDuty's incident is resolved by the same key.
+    hot(&f, 50.0)?;
+    let start = Instant::now();
+    while !mock.at("/pagerduty").iter().any(|g| at(&g.json(), &["event_action"]) == "resolve") {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "never recovered\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let resolve = mock.at("/pagerduty").into_iter().map(|g| g.json()).find(|v| at(v, &["event_action"]) == "resolve").unwrap_or_default();
+    anyhow::ensure!(at(&resolve, &["dedup_key"]).as_str() == Some(dedup.as_str()), "resolve: {resolve}");
+    anyhow::ensure!(mock.at("/slack").iter().any(|g| at(&g.json(), &["text"]).as_str().is_some_and(|t| t.contains("[Recovered]"))), "slack hears the recovery");
+    anyhow::ensure!(mock.at("/discord").len() == 1, "discord is not named for recoveries");
+    // Muted: it still changes state (an event), and says nothing.
+    f.call("POST", &format!("/api/observe/v1/monitors/{id}/mute"), Some(&json!({})))?;
+    let before = mock.got.lock().map(|g| g.len()).unwrap_or(0);
+    hot(&f, 200.0)?;
+    f.until(Duration::from_secs(60), "the muted monitor alerting", |_| f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).is_ok_and(|m| at(&m, &["state"]) == "ALERT"))?;
+    std::thread::sleep(Duration::from_secs(3));
+    anyhow::ensure!(mock.got.lock().map(|g| g.len()).unwrap_or(0) == before, "a muted monitor notified");
+    let events = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": format!("source:kiln.event @monitor_id:{id} @event.type:monitor.alert"), "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 10 })))?;
+    let alerts: Vec<Value> = at(&events, &["records"]).as_array().cloned().unwrap_or_default();
+    anyhow::ensure!(alerts.len() == 2 && alerts.iter().any(|e| at(e, &["attributes", "muted"]) == "true"), "two alerts, the second muted: {events}");
+    let delivered = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "source:kiln.event @event.type:monitor.notification @result:delivered", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "limit": 100 })))?;
+    anyhow::ensure!(at(&delivered, &["records"]).as_array().is_some_and(|a| a.len() >= 8), "every delivery recorded: {delivered}");
+    Ok(())
+}
+
+fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    use hmac::{KeyInit as _, Mac as _};
+    match hmac::Hmac::<sha2::Sha256>::new_from_slice(key) {
+        Ok(mut m) => {
+            m.update(msg);
+            hex::encode(m.finalize().into_bytes())
+        }
+        Err(_) => String::new(),
+    }
+}

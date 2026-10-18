@@ -6,6 +6,8 @@ pub mod api;
 pub mod host;
 pub mod hub;
 pub mod kiln;
+pub mod monitors;
+pub mod notify;
 pub mod ingest;
 pub mod otlp;
 pub mod owner;

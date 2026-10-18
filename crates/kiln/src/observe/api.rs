@@ -29,6 +29,27 @@ pub fn get() -> Option<&'static Observe> {
     OBSERVE.get()
 }
 
+/// The server's monitors, once it started.
+static MONITORS: OnceLock<std::sync::Arc<super::monitors::Monitors>> = OnceLock::new();
+
+pub fn set_monitors(m: std::sync::Arc<super::monitors::Monitors>) {
+    let _ = MONITORS.set(m);
+}
+
+fn monitors() -> Result<&'static std::sync::Arc<super::monitors::Monitors>, Fail> {
+    MONITORS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "monitors are kept by the server"))
+}
+
+/// A monitor as the API shows it: its definition, its overall state and its groups'.
+fn monitor_json(ms: &super::monitors::Monitors, m: &super::monitors::Monitor) -> Value {
+    let mut v = serde_json::to_value(m).unwrap_or(Value::Null);
+    if let Value::Object(o) = &mut v {
+        o.insert("state".into(), Value::from(ms.overall(&m.id)));
+        o.insert("groups".into(), serde_json::to_value(ms.groups(&m.id)).unwrap_or(Value::Null));
+    }
+    v
+}
+
 /// The token OTLP exporters send the server (`Authorization: Bearer`), besides the admin's: one
 /// that writes and reads nothing else (`<data>/observe/ingest.token`).
 static INGEST: OnceLock<String> = OnceLock::new();
@@ -126,6 +147,90 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["verify"]) => {
             observe()?.verify();
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "verifying": true })))
+        }
+        (&Method::GET, ["monitors"]) => {
+            let ms = monitors()?;
+            Ok(srv::json(StatusCode::OK, &json!({ "monitors": ms.list().iter().map(|m| monitor_json(ms, m)).collect::<Vec<_>>() })))
+        }
+        (&Method::POST, ["monitors"]) => {
+            let ms = monitors()?;
+            let mut m: super::monitors::Monitor = read_json(req.into_body(), QUERY_BODY).await?;
+            m.id.clear();
+            let m = ms.put(m).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::CREATED, &monitor_json(ms, &m)))
+        }
+        (&Method::POST, ["monitors", "validate"]) => {
+            #[derive(Deserialize)]
+            struct V {
+                query: String,
+            }
+            let v: V = read_json(req.into_body(), QUERY_BODY).await?;
+            Ok(match kiln_obs::monitor::parse(&v.query) {
+                Ok(q) => srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold })),
+                Err(e) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": e.to_string() })),
+            })
+        }
+        (&Method::GET, ["monitors", id]) => {
+            let ms = monitors()?;
+            let m = ms.get(id).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such monitor"))?;
+            Ok(srv::json(StatusCode::OK, &monitor_json(ms, &m)))
+        }
+        (&Method::PUT, ["monitors", id]) => {
+            let ms = monitors()?;
+            let id = (*id).to_owned();
+            if ms.get(&id).is_none() {
+                return Err(fail(StatusCode::NOT_FOUND, "no such monitor"));
+            }
+            let mut m: super::monitors::Monitor = read_json(req.into_body(), QUERY_BODY).await?;
+            m.id = id;
+            let m = ms.put(m).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::json(StatusCode::OK, &monitor_json(ms, &m)))
+        }
+        (&Method::DELETE, ["monitors", id]) => match monitors()?.delete(id).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
+            true => Ok(srv::status(StatusCode::NO_CONTENT)),
+            false => Err(fail(StatusCode::NOT_FOUND, "no such monitor")),
+        },
+        (&Method::POST, ["monitors", id, "mute"]) => {
+            #[derive(Deserialize, Default)]
+            struct Mute {
+                /// Unix ms; none: until unmuted.
+                until: Option<i64>,
+            }
+            let id = (*id).to_owned();
+            let mute: Mute = srv::body_json(req.into_body(), QUERY_BODY).await.unwrap_or_default();
+            let ms = monitors()?;
+            let m = ms.mute(&id, Some(mute.until.unwrap_or(i64::MAX))).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such monitor"))?;
+            Ok(srv::json(StatusCode::OK, &monitor_json(ms, &m)))
+        }
+        (&Method::POST, ["monitors", id, "unmute"]) => {
+            let ms = monitors()?;
+            let m = ms.mute(id, None).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such monitor"))?;
+            Ok(srv::json(StatusCode::OK, &monitor_json(ms, &m)))
+        }
+        (&Method::GET, ["integrations"]) => {
+            let ms = monitors()?;
+            let list: Vec<Value> = ms.integrations.list().iter().map(|(n, i)| {
+                let mut v = i.redacted();
+                if let Value::Object(o) = &mut v {
+                    o.insert("name".into(), Value::from(n.clone()));
+                }
+                v
+            }).collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "integrations": list })))
+        }
+        (&Method::PUT, ["integrations", name]) => {
+            let name = (*name).to_owned();
+            let i: super::notify::Integration = read_json(req.into_body(), QUERY_BODY).await?;
+            monitors()?.integrations.put(&name, i).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::DELETE, ["integrations", name]) => match monitors()?.integrations.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
+            true => Ok(srv::status(StatusCode::NO_CONTENT)),
+            false => Err(fail(StatusCode::NOT_FOUND, "no such integration")),
+        },
+        (&Method::POST, ["integrations", name, "test"]) => {
+            monitors()?.test(name).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+            Ok(srv::json(StatusCode::ACCEPTED, &json!({ "sent": true })))
         }
         (&Method::POST, ["series"]) => ingest_series(read_json(req.into_body(), INGEST_BODY).await?),
         (&Method::POST, ["logs"]) => ingest_logs(read_json(req.into_body(), INGEST_BODY).await?),

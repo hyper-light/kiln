@@ -149,6 +149,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::api::set_global(obs);
         child!("observe", h => crate::observe::hub::send_loop(h));
+        match crate::http::client::Client::public() {
+            Ok(http) => {
+                let ms = crate::observe::monitors::Monitors::open(&cfg.data("observe"), std::sync::Arc::new(http), &cfg.server.public_url);
+                crate::observe::api::set_monitors(ms.clone());
+                // Its loop holds nothing that panics (the crate's lints): run, not supervised.
+                crate::rt::spawn(ms.run(shutdown.clone()));
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "monitors did not start: no HTTPS client"),
+        }
         match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {
             Ok(t) => crate::observe::api::set_ingest_token(t),
             Err(e) => tracing::warn!(error = %e, "observe's ingest token could not be made: OTLP takes the admin token alone"),
