@@ -527,3 +527,119 @@ fn a_runner_whose_clock_is_an_hour_ahead_is_said_so_and_its_figures_from_the_fut
     anyhow::ensure!(messages.iter().any(|m| m.contains("r1's clock agrees with the server's again")), "{messages:?}");
     Ok(())
 }
+
+/// Ten days of a daily cycle every five minutes, two hosts, b's last point a spike: `anomalies()`
+/// bands both from their history, a's points inside, b's spike past; an anomaly monitor (the share
+/// of its window past the band) alerts b's group alone, and says so to a webhook.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn an_anomaly_is_banded_from_its_history_and_its_monitor_alerts_the_group_it_is_in() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/anomalies", Some(&json!({ "kind": "webhook", "url": mock.url("/anomaly") })))?;
+    anyhow::ensure!(code == 204);
+    let end = crate_now().div_euclid(300_000) * 300_000;
+    let n: i64 = 288 * 10;
+    let mut seed = 21u64;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let mut series = Vec::new();
+    for host in ["a", "b"] {
+        let points: Vec<Value> = (0..n)
+            .map(|i| {
+                let t = end - (n - i) * 300_000;
+                let v = 50.0 + 20.0 * (t as f64 / 86_400_000.0 * std::f64::consts::TAU).sin() + noise();
+                json!([t as f64 / 1000.0, if host == "b" && i == n - 1 { v + 60.0 } else { v }])
+            })
+            .collect();
+        series.push(json!({ "metric": "e2e.cycle", "type": "gauge", "tags": [format!("host:{host}")], "points": points }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    let spike = end - 300_000;
+    let band = |k: f64| json!({ "query": format!("anomalies(avg:e2e.cycle{{*}} by {{host}}, 'robust', {k})"), "from": end - 6 * 3_600_000, "to": end, "step": 300_000 });
+    // At 3 deviations, the series' own 1-in-500 error: of 143 ordinary points, a few at the most
+    // past it (on average 0.3).
+    let start = Instant::now();
+    let answer = loop {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&band(3.0)))?;
+        let ready = at(&a, &["series"]).as_array().is_some_and(|s| s.len() == 2 && s.iter().all(|x| at(x, &["values"]).as_array().is_some_and(|v| v.iter().filter(|p| p.is_number()).count() >= 70)));
+        if ready {
+            break a;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the points were not read: {a}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let past = |a: &Value| -> Vec<(String, i64)> {
+        let (from, step) = (at(a, &["grid", "from"]).as_i64().unwrap_or(0), at(a, &["grid", "step"]).as_i64().unwrap_or(300_000));
+        let mut out = Vec::new();
+        for s in at(a, &["series"]).as_array().into_iter().flatten() {
+            let b = at(s, &["bounds"]);
+            for (i, v) in at(s, &["values"]).as_array().into_iter().flatten().enumerate() {
+                let (Some(v), Some(lo), Some(hi)) = (v.as_f64(), at(b, &["lower"]).get(i).and_then(Value::as_f64), at(b, &["upper"]).get(i).and_then(Value::as_f64)) else { continue };
+                if v < lo || v > hi {
+                    out.push((at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned(), from + step * i as i64));
+                }
+            }
+        }
+        out
+    };
+    let at3 = past(&answer);
+    anyhow::ensure!(at3.contains(&("b".to_owned(), spike)) && at3.len() <= 4, "at 3 deviations: the spike, and few others: {at3:?}");
+    // At 5, every ordinary point is inside, and the spike still past.
+    let answer = f.call("POST", "/api/observe/v1/query", Some(&band(5.0)))?;
+    anyhow::ensure!(past(&answer) == vec![("b".to_owned(), spike)], "at 5 deviations, the spike alone: {:?}", past(&answer));
+    let from = at(&answer, &["grid", "from"]).as_i64().unwrap_or(0);
+    let step = at(&answer, &["grid", "step"]).as_i64().unwrap_or(300_000);
+    for s in at(&answer, &["series"]).as_array().into_iter().flatten() {
+        let host = at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned();
+        let b = at(s, &["bounds"]);
+        anyhow::ensure!(at(b, &["algorithm"]) == "robust" && at(b, &["k"]).as_f64() == Some(5.0), "{b}");
+        let values = at(s, &["values"]).as_array().cloned().unwrap_or_default();
+        for (i, v) in values.iter().enumerate() {
+            let Some(v) = v.as_f64() else { continue };
+            let (lo, hi) = (at(b, &["lower"]).get(i).and_then(Value::as_f64), at(b, &["upper"]).get(i).and_then(Value::as_f64));
+            let (Some(lo), Some(hi)) = (lo, hi) else { anyhow::bail!("{host} bucket {i} has no band: {b}") };
+            let t = from + step * i as i64;
+            if host == "b" && t == spike {
+                anyhow::ensure!(v > hi, "b's spike {v} is past {hi}");
+            } else {
+                anyhow::ensure!(lo <= v && v <= hi, "{host} at {t}: {v} in [{lo}, {hi}]");
+            }
+        }
+    }
+    // The monitor: the share of the last 15 minutes past the band, by host.
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e cycle anomalous",
+            "query": "avg(last_15m):anomalies(avg:e2e.cycle{*} by {host}, 'robust', 5) >= 0.3",
+            "message": "{{host.name}} is anomalous @webhook-anomalies",
+            "options": { "every": 10, "thresholds": { "critical": 0.3 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let start = Instant::now();
+    let state = loop {
+        let s = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        if at(&s, &["state"]) == "ALERT" {
+            break s;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the anomaly monitor never alerted: {s}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let groups = at(&state, &["groups"]).as_array().cloned().unwrap_or_default();
+    let alerting: Vec<String> = groups.iter().filter(|g| at(g, &["state"]) == "ALERT").map(|g| g.to_string()).collect();
+    anyhow::ensure!(alerting.len() == 1 && alerting.iter().all(|g| g.contains("host:b") || g.contains("\"b\"")), "b alone alerts: {state}");
+    let start = Instant::now();
+    while mock.at("/anomaly").is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard nothing");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let notice = mock.at("/anomaly").first().map(Got::json).unwrap_or_default();
+    anyhow::ensure!(at(&notice, &["notice", "state"]) == "ALERT" && at(&notice, &["notice", "message"]).as_str().is_some_and(|m| m.contains("b is anomalous")), "{notice}");
+    Ok(())
+}

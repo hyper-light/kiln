@@ -375,7 +375,20 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
             r.max_series = m.clamp(1, eval::DEFAULT_MAX_SERIES);
         }
         let a = eval::eval(s, &r).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
-        let series: Vec<Value> = a.series.iter().map(|x| json!({ "tags": x.tags.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(), "values": x.values })).collect();
+        let series: Vec<Value> = a
+            .series
+            .iter()
+            .map(|x| {
+                let mut o = serde_json::Map::new();
+                o.insert("tags".into(), Value::Object(x.tags.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect()));
+                o.insert("values".into(), json!(x.values));
+                // An `anomalies()` series' band: its bounds and each bucket's score (deviations).
+                if let Some(b) = &x.bounds {
+                    o.insert("bounds".into(), json!({ "lower": b.lower, "upper": b.upper, "score": b.score, "k": b.k, "direction": b.direction.as_str(), "algorithm": b.algorithm.as_str() }));
+                }
+                Value::Object(o)
+            })
+            .collect();
         Ok(srv::json(
             StatusCode::OK,
             &json!({

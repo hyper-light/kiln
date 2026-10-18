@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, Rollup, SpaceAgg, parse};
+use crate::anomaly::{Algorithm, Scorer};
 use crate::batch::Kind;
 use crate::index::Selector;
 use crate::store::{Scratch, Store, StoreError};
@@ -81,11 +82,69 @@ impl Grid {
     }
 }
 
-/// One series of an answer: its group's tags and a value a bucket (NaN where there is none).
+/// History `anomalies()`'s query reads before the range: two weeks, two cycles of a weekly season
+/// (the scorer keeps a period only with two of it to learn from), at most
+/// [`crate::anomaly::HISTORY`] buckets in all.
+const ANOMALY_HISTORY_MS: i64 = 14 * 86_400_000;
+
+/// One series of an answer: its group's tags and a value a bucket (NaN where there is none); an
+/// `anomalies()` series' band besides.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Series {
     pub tags: Vec<(String, String)>,
     pub values: Vec<f64>,
+    pub bounds: Option<Box<Bounds>>,
+}
+
+/// Which side of a band is anomalous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Both,
+    Above,
+    Below,
+}
+
+impl Direction {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().trim_matches(['\'', '"']).to_ascii_lowercase().as_str() {
+            "both" => Some(Self::Both),
+            "above" => Some(Self::Above),
+            "below" => Some(Self::Below),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Above => "above",
+            Self::Below => "below",
+        }
+    }
+}
+
+/// An `anomalies()` series' band: each bucket's bounds, its score (its error in calibrated
+/// deviations, signed), and what made them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bounds {
+    pub lower: Vec<f64>,
+    pub upper: Vec<f64>,
+    pub score: Vec<f64>,
+    pub k: f64,
+    pub direction: Direction,
+    pub algorithm: Algorithm,
+}
+
+impl Bounds {
+    /// Whether bucket `i` is past the band on the side asked.
+    pub fn anomalous(&self, i: usize) -> Option<bool> {
+        let s = self.score.get(i).copied().filter(|s| !s.is_nan())?;
+        Some(match self.direction {
+            Direction::Both => s.abs() > self.k,
+            Direction::Above => s > self.k,
+            Direction::Below => s < -self.k,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +173,9 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
     }
     let grid = grid_for(&ast, req)?;
     let offsets = offsets(&ast)?;
+    let ext = extensions(&ast, grid);
+    // A node's grid: the answer's, begun `ext` buckets earlier beneath `anomalies()`.
+    let at = |e: usize| Grid { from: grid.from - grid.step * e as i64, step: grid.step, n: grid.n + e };
     let mut values: Vec<Option<Value>> = vec![None; ast.nodes.len()];
     let mut scanned = (0u64, 0u64);
     let mut scratch = Scratch::default();
@@ -124,7 +186,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
             Node::Str(s) => Value::Str(s.clone()),
             Node::Metric(q) => {
                 let off = offsets.get(id).copied().unwrap_or(0);
-                Value::Set(metric(store, q, grid, off, req.max_series, &mut scratch, &mut scanned)?)
+                Value::Set(metric(store, q, at(ext.get(id).copied().unwrap_or(0)), off, req.max_series, &mut scratch, &mut scanned)?)
             }
             Node::Neg(x) => match take(&mut values, *x)? {
                 Value::Scalar(a) => Value::Scalar(-a),
@@ -147,7 +209,13 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
                 for &a in args {
                     taken.push(take(&mut values, a)?);
                 }
-                call(*f, taken, grid)?
+                let own = ext.get(id).copied().unwrap_or(0);
+                if *f == Func::Anomalies {
+                    let inner = args.first().and_then(|&a| ext.get(a)).copied().unwrap_or(own);
+                    anomalies(taken, inner.saturating_sub(own), at(own))?
+                } else {
+                    call(*f, taken, at(own))?
+                }
             }
         };
         if let Some(slot) = values.get_mut(id) {
@@ -226,6 +294,98 @@ fn offsets(ast: &Ast) -> Result<Vec<i64>, QueryError> {
     Ok(off)
 }
 
+/// Each node's history in buckets: beneath an `anomalies()`, the buckets of
+/// [`ANOMALY_HISTORY_MS`] its query reads before the range (all the answer's grid allows), as
+/// `offsets` passes a time shift down.
+fn extensions(ast: &Ast, grid: Grid) -> Vec<usize> {
+    let step = grid.step.max(1);
+    let history = usize::try_from(ANOMALY_HISTORY_MS / step).unwrap_or(0).min(crate::anomaly::HISTORY.saturating_sub(grid.n)).min(MAX_POINTS.saturating_sub(grid.n));
+    let mut ext = vec![0usize; ast.nodes.len()];
+    for id in (0..ast.nodes.len()).rev() {
+        let here = ext.get(id).copied().unwrap_or(0);
+        let (children, more): (&[usize], usize) = match ast.nodes.get(id) {
+            Some(Node::Neg(x)) => (std::slice::from_ref(x), 0),
+            Some(Node::Bin(_, l, r)) => {
+                if let Some(e) = ext.get_mut(*l) {
+                    *e = here;
+                }
+                (std::slice::from_ref(r), 0)
+            }
+            Some(Node::Call(Func::Anomalies, args)) => (args.get(..1).unwrap_or(&[]), history),
+            Some(Node::Call(_, args)) => (args.as_slice(), 0),
+            _ => (&[], 0),
+        };
+        for &c in children {
+            if let Some(e) = ext.get_mut(c) {
+                *e = here + more;
+            }
+        }
+    }
+    ext
+}
+
+/// `anomalies(query, algorithm, bounds, direction)`: each series' last `grid.n` buckets, and its band
+/// of `bounds` deviations (2 unless said) about what the algorithm (`basic` unless said) expected of
+/// each before it saw it, learned from the `history` buckets before them; anomalous past the band on
+/// the side asked (`both` unless said).
+fn anomalies(mut args: Vec<Value>, history: usize, grid: Grid) -> Result<Value, QueryError> {
+    let usage = || QueryError::Invalid("anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')".into());
+    if args.is_empty() {
+        return Err(usage());
+    }
+    let set = match args.remove(0) {
+        Value::Set(s) => s,
+        _ => return Err(usage()),
+    };
+    let algorithm = match args.first() {
+        Some(Value::Str(s)) => Algorithm::parse(s).ok_or_else(usage)?,
+        None => Algorithm::Basic,
+        _ => return Err(usage()),
+    };
+    let k = match args.get(1) {
+        Some(Value::Scalar(x)) if *x > 0.0 && x.is_finite() => *x,
+        None => 2.0,
+        _ => return Err(usage()),
+    };
+    let direction = match args.get(2) {
+        Some(Value::Str(s)) => Direction::parse(s).ok_or_else(usage)?,
+        None => Direction::Both,
+        _ => return Err(usage()),
+    };
+    let mut out = Vec::with_capacity(set.len());
+    for s in set {
+        let split = history.min(s.values.len());
+        let (past, now) = s.values.split_at(split);
+        // Learned from the finite points of the history, gaps left out; their spacing their mean gap
+        // (a series sampled every 5 minutes is 5 minutes apart on a grid of 1, or of 2, where its
+        // gaps are 2 and 3 buckets by turns).
+        let at: Vec<usize> = past.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, _)| i).collect();
+        let learn: Vec<f64> = at.iter().filter_map(|&i| past.get(i).copied()).collect();
+        let span = match (at.first(), at.last()) {
+            (Some(&a), Some(&b)) if at.len() > 1 => (b - a) as f64 / (at.len() - 1) as f64,
+            _ => 1.0,
+        };
+        let spacing = span * grid.step as f64 / 1000.0;
+        let mut scorer = Scorer::new(algorithm, &learn, spacing);
+        let n = now.len();
+        let (mut lower, mut upper, mut score) = (vec![f64::NAN; n], vec![f64::NAN; n], vec![f64::NAN; n]);
+        if let Some(sc) = &mut scorer {
+            for (i, &x) in now.iter().enumerate() {
+                let Some((expected, deviation)) = sc.expect() else { continue };
+                if let (Some(l), Some(u)) = (lower.get_mut(i), upper.get_mut(i)) {
+                    *l = expected - k * deviation;
+                    *u = expected + k * deviation;
+                }
+                if let (Some(p), Some(sl)) = (sc.step(x), score.get_mut(i)) {
+                    *sl = p.score;
+                }
+            }
+        }
+        out.push(Series { tags: s.tags, values: now.to_vec(), bounds: Some(Box::new(Bounds { lower, upper, score, k, direction, algorithm })) });
+    }
+    Ok(Value::Set(out))
+}
+
 /// A node's value when it is a constant: a number, or a signed one.
 fn constant(ast: &Ast, id: usize) -> Option<f64> {
     match ast.nodes.get(id)? {
@@ -290,7 +450,7 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, off: i64, max_series: usiz
         if let Some(fill) = q.fill {
             apply_fill(fill, grid, &mut values);
         }
-        out.push(Series { tags, values });
+        out.push(Series { tags, values, bounds: None });
     }
     out.sort_by(|a, b| a.tags.cmp(&b.tags));
     Ok(out)
@@ -708,7 +868,8 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
             });
             set = scored.into_iter().filter(|(s, _)| !s.is_nan()).take(n).map(|(_, s)| s).collect();
         }
-        Func::Timeshift => {}
+        // Evaluated apart (`anomalies`): it reads its query's history.
+        Func::Timeshift | Func::Anomalies => {}
         Func::MovingAvg => {
             let secs = num(args.first(), "the window's seconds")?;
             let k = ((secs * 1000.0 / grid.step as f64).round() as usize).max(1);
@@ -811,6 +972,59 @@ mod tests {
 
     fn by_tag<'a>(a: &'a Answer, k: &str, v: &str) -> &'a Series {
         a.series.iter().find(|s| s.tags.iter().any(|(tk, tv)| tk == k && tv == v)).unwrap()
+    }
+
+    /// Ten days of a daily cycle every five minutes and a spike at its end: `anomalies()` over the
+    /// last six hours learns from the history before them; the band holds every point but the
+    /// spike, whose score is past the bounds; its arguments are checked.
+    #[test]
+    fn anomalies_band_a_series_from_its_history_and_score_the_spike_past_it() {
+        let mut s = Store::new(Keyed::with_keys(3, 4));
+        let mut b = Builder::new();
+        let end: i64 = 1_800_000_000_000;
+        let k = SeriesKey::new("load", [("host", "a")], Kind::Gauge).unwrap();
+        b.define(&k);
+        let mut seed = 9u64;
+        let mut noise = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        let n = 288 * 10;
+        b.run(k.fp, (0..n).map(|i| {
+            let t = end - (n - i) * 300_000;
+            let v = 10.0 + 4.0 * (t as f64 / 86_400_000.0 * std::f64::consts::TAU).sin() + 0.2 * noise();
+            (t, if i == n - 1 { v + 12.0 } else { v })
+        }));
+        s.apply(&b.finish()).unwrap();
+        let mut r = Request::new("anomalies(avg:load{*}, 'robust', 3)", end - 6 * 3_600_000, end);
+        r.step = Some(300_000);
+        let a = eval(&s, &r).unwrap();
+        let [one] = a.series.as_slice() else { panic!("one series: {:?}", a.series.len()) };
+        let bounds = one.bounds.as_ref().unwrap();
+        assert_eq!(one.values.len(), a.grid.n);
+        assert_eq!((bounds.lower.len(), bounds.upper.len(), bounds.score.len()), (a.grid.n, a.grid.n, a.grid.n));
+        let spike = a.grid.n - 1;
+        for i in 0..a.grid.n {
+            let (v, lo, hi) = (one.values[i], bounds.lower[i], bounds.upper[i]);
+            if v.is_nan() {
+                continue;
+            }
+            if i == spike {
+                assert!(v > hi && bounds.anomalous(i) == Some(true), "the spike {v} past {hi}");
+            } else {
+                assert!(lo <= v && v <= hi && bounds.anomalous(i) == Some(false), "bucket {i}: {v} in [{lo}, {hi}]");
+            }
+        }
+        // Above alone: the spike is above. Below alone: it is not below.
+        let mut r = Request::new("anomalies(avg:load{*}, 'robust', 3, 'below')", end - 6 * 3_600_000, end);
+        r.step = Some(300_000);
+        let below = eval(&s, &r).unwrap();
+        assert_eq!(below.series[0].bounds.as_ref().unwrap().anomalous(spike), Some(false));
+        for bad in ["anomalies(avg:load{*}, 'sometimes')", "anomalies(avg:load{*}, 'robust', -1)", "anomalies(avg:load{*}, 'robust', 2, 'sideways')", "anomalies(3)"] {
+            let mut r = Request::new(bad, end - 3_600_000, end);
+            r.step = Some(300_000);
+            assert!(eval(&s, &r).is_err(), "{bad}");
+        }
     }
 
     #[test]

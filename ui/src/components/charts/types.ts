@@ -11,6 +11,17 @@ export interface SeriesSpec {
   value?: (data: ArrayLike<ArrayLike<number | null | undefined>>, v: number | null, seriesIdx: number, idx: number) => string;
 }
 
+/** A band about a series (an anomaly function's): drawn beneath the lines in its series' color, its
+ * points past it marked. */
+export interface Band {
+  /** The series (its place in `series`) it is drawn about. */
+  series: number;
+  lower: (number | null)[];
+  upper: (number | null)[];
+  /** The points past it. */
+  anomalous?: boolean[];
+}
+
 export interface ChartProps {
   /** [xs (unix seconds), ...ys] */
   data: (number | null)[][];
@@ -23,6 +34,7 @@ export interface ChartProps {
   legend?: boolean;
   className?: string;
   ariaLabel?: string;
+  bands?: Band[];
 }
 
 /** Palette for series, harmonised with the prism stops and status pastels. */

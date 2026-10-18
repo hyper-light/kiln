@@ -329,7 +329,16 @@ fn metric_values(store: &Store, query: &str, aggr: TimeAggr, window_ms: i64, to:
         out.push(Value { group: Vec::new(), value: v });
     }
     for s in a.series {
-        if let Some(v) = reduce(aggr, &s.values) {
+        // An `anomalies()` series: the share of its window's buckets past its band, as Datadog's
+        // anomaly monitors compare it (`>= 1`: all of them); buckets it could not score left out.
+        let v = match &s.bounds {
+            Some(b) => {
+                let read: Vec<bool> = (0..s.values.len()).filter_map(|i| b.anomalous(i)).collect();
+                (!read.is_empty()).then(|| read.iter().filter(|&&x| x).count() as f64 / read.len() as f64)
+            }
+            None => reduce(aggr, &s.values),
+        };
+        if let Some(v) = v {
             let mut group = s.tags;
             group.sort();
             out.push(Value { group, value: v });
@@ -596,6 +605,40 @@ mod tests {
         // Unbalanced and deep sections never panic.
         let deep = "{{#is_alert}}".repeat(10_000) + "x" + &"{{/is_alert}}".repeat(9_999) + "{{";
         let _ = render(&deep, Transition { from: State::Ok, to: State::Alert }, &v);
+    }
+
+    /// Ten days of a daily cycle every five minutes, a spike in the last few minutes: the anomaly
+    /// monitor's value is the share of its window past the band, the spike's bucket alone.
+    #[test]
+    fn an_anomaly_monitor_reads_the_share_of_its_window_past_the_band() {
+        let mut s = Store::new(Keyed::new());
+        let mut b = Builder::new();
+        let now: i64 = 1_800_000_000_000;
+        let k = SeriesKey::new("cpu", [("host", "a")], SKind::Gauge).unwrap();
+        b.define(&k);
+        let mut seed = 5u64;
+        let mut noise = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        let n = 288 * 10;
+        let points: Vec<(i64, f64)> = (0..n)
+            .map(|i| {
+                let t = now - (n - i) * 300_000;
+                let v = 50.0 + 20.0 * (t as f64 / 86_400_000.0 * std::f64::consts::TAU).sin() + noise();
+                (t, if i == n - 1 { v + 60.0 } else { v })
+            })
+            .collect();
+        b.run(k.fp, points.iter().copied());
+        s.apply(&b.finish()).unwrap();
+        let q = parse("avg(last_1h):anomalies(avg:cpu{*}, 'robust', 3) >= 0.05").unwrap();
+        let got = evaluate(&s, &q, now, 0).unwrap();
+        // A 1-hour window at 5-minute buckets: twelve, one of them the spike.
+        assert_eq!(got.len(), 1);
+        assert!((got[0].value - 1.0 / 12.0).abs() < 1e-9, "{got:?}");
+        // Without the spike's bucket, nothing past the band.
+        let before = evaluate(&s, &q, now - 300_000, 0).unwrap();
+        assert!(before[0].value.abs() < 1e-9, "{before:?}");
     }
 
     #[test]

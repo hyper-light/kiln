@@ -1,7 +1,7 @@
 import * as React from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
-import type { ChartProps } from "./types";
+import type { Band, ChartProps } from "./types";
 
 const AXIS_FONT = '10px "Geist Mono Variable", ui-monospace, monospace';
 const GRID = "#191c21";
@@ -25,13 +25,73 @@ function timeFmt(kind: ChartProps["timeFormat"]) {
     });
 }
 
-export default function UPlotChart({ data, series, height = 200, yFormat = (v) => String(v), y2Format, yRange, timeFormat = "time", legend = true, className, ariaLabel }: ChartProps) {
+/** Each band beneath the lines: a polygon along its upper bound and back along its lower, broken where
+ * either has no value; clipped to the plot. */
+function drawBands(u: uPlot, bands: Band[], series: ChartProps["series"]) {
+  const xs = u.data[0];
+  const ctx = u.ctx;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+  ctx.clip();
+  for (const b of bands) {
+    ctx.fillStyle = hexA(series[b.series]?.color ?? "#8d9097", 0.14);
+    let run: number[] = [];
+    const flush = () => {
+      if (run.length > 1) {
+        ctx.beginPath();
+        run.forEach((i, j) => {
+          const x = u.valToPos(xs[i]!, "x", true);
+          const y = u.valToPos(b.upper[i]!, "y", true);
+          if (j === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        for (let j = run.length - 1; j >= 0; j--) {
+          const i = run[j]!;
+          ctx.lineTo(u.valToPos(xs[i]!, "x", true), u.valToPos(b.lower[i]!, "y", true));
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
+      run = [];
+    };
+    for (let i = 0; i < xs.length; i++) {
+      if (b.upper[i] != null && b.lower[i] != null) run.push(i);
+      else flush();
+    }
+    flush();
+  }
+  ctx.restore();
+}
+
+/** Each band's points past it, over the lines: a dot in the failure color. */
+function drawPast(u: uPlot, bands: Band[]) {
+  const xs = u.data[0];
+  const ctx = u.ctx;
+  ctx.save();
+  ctx.fillStyle = "#d1aaad";
+  for (const b of bands) {
+    const ys = u.data[b.series + 1];
+    b.anomalous?.forEach((past, i) => {
+      const y = ys?.[i];
+      if (!past || y == null) return;
+      ctx.beginPath();
+      ctx.arc(u.valToPos(xs[i]!, "x", true), u.valToPos(y, "y", true), 3 * devicePixelRatio, 0, 2 * Math.PI);
+      ctx.fill();
+    });
+  }
+  ctx.restore();
+}
+
+export default function UPlotChart({ data, series, height = 200, yFormat = (v) => String(v), y2Format, yRange, timeFormat = "time", legend = true, className, ariaLabel, bands = [] }: ChartProps) {
   const plotRef = React.useRef<uPlot | null>(null);
   const dataRef = React.useRef(data);
   dataRef.current = data;
+  const bandsRef = React.useRef(bands);
+  bandsRef.current = bands;
 
   // A stable key for structural changes (series set, formatters by identity are ignored).
-  const structKey = JSON.stringify([series.map((s) => [s.label, s.color, s.bars, s.scale, s.fill, s.dash]), height, yRange, timeFormat, legend, Boolean(y2Format)]);
+  const structKey = JSON.stringify([series.map((s) => [s.label, s.color, s.bars, s.scale, s.fill, s.dash]), height, yRange, timeFormat, legend, Boolean(y2Format), bands.length > 0]);
 
   // The plot lives as long as its element and its structure: made when they arrive, destroyed with them.
   const mount = React.useCallback(
@@ -52,7 +112,15 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
         legend: { show: legend, live: true },
         scales: {
           x: { time: true },
-          y: yRange ? { range: yRange } : { range: (_u, _min, max) => [0, max > 0 ? max * 1.12 : 1] },
+          // From 0 to the highest line or band.
+          y: yRange
+            ? { range: yRange }
+            : {
+                range: (_u, _min, max) => {
+                  const top = bandsRef.current.reduce((m, b) => b.upper.reduce<number>((n, v) => (v != null && v > n ? v : n), m), max);
+                  return [0, top > 0 ? top * 1.12 : 1];
+                },
+              },
           ...(hasY2 ? { y2: { range: (_u: uPlot, _min: number, max: number) => [0, max > 0 ? max * 1.12 : 1] as uPlot.Range.MinMax } } : {}),
         },
         axes: [
@@ -105,6 +173,10 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
         ],
       };
 
+      opts.hooks = {
+        drawAxes: [(u) => drawBands(u, bandsRef.current, series)],
+        draw: [(u) => drawPast(u, bandsRef.current)],
+      };
       const plot = new uPlot(opts, dataRef.current as uPlot.AlignedData, el);
       plotRef.current = plot;
 

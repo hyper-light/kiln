@@ -148,7 +148,7 @@ function Names({ onPick }: { onPick: (name: string) => void }) {
 function Answer({ query, range }: { query: string; range: Range }) {
   const answers = useRes(queriesRes([query], range)).data;
   const a: QueryAnswer | undefined = answers[0];
-  const { data, labels } = React.useMemo(() => chartData(answers), [answers]);
+  const { data, labels, bands } = React.useMemo(() => chartData(answers), [answers]);
   if (!a) return null;
   if (a.scalar !== null) return <p className="py-10 text-center font-mono text-3xl text-[#e4e5e7]">{formatValue(a.scalar)}</p>;
   const rows = a.series.map((s, i) => ({
@@ -172,6 +172,7 @@ function Answer({ query, range }: { query: string; range: Range }) {
           timeFormat={range === "7d" || range === "30d" ? "day" : "time"}
           yFormat={(v) => formatValue(v)}
           series={rows.map((r) => ({ label: r.label, color: r.color }))}
+          bands={bands}
         />
       )}
       <p className="mt-3 font-mono text-[10px] text-[#7b7e88]">

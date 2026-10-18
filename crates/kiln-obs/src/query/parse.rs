@@ -89,6 +89,9 @@ pub enum Func {
     MovingAvg,
     Ewma,
     Clamp,
+    /// `anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')`: the series
+    /// and its band (`crate::anomaly`).
+    Anomalies,
 }
 
 impl Func {
@@ -111,6 +114,7 @@ impl Func {
             "moving_avg" | "moving_rollup" => Self::MovingAvg,
             "ewma" => Self::Ewma,
             "clamp" => Self::Clamp,
+            "anomalies" => Self::Anomalies,
             _ => return None,
         })
     }
@@ -121,6 +125,7 @@ impl Func {
             Self::Top | Self::Bottom => (1, 4),
             Self::Timeshift | Self::MovingAvg | Self::Ewma => (2, 2),
             Self::Clamp => (3, 3),
+            Self::Anomalies => (1, 4),
             _ => (1, 1),
         }
     }

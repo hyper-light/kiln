@@ -4,9 +4,21 @@
  */
 import * as React from "react";
 import { NavLink, useSearchParams } from "@/lib/router";
-import { observeApi, type Cloud, type Dashboard, type DashboardSummary, type Integration, type LogHistogram, type LogSearch, type Monitor, type ObserveStatus, type QueryAnswer } from "@/api/observe";
+import {
+  observeApi,
+  type Bounds,
+  type Cloud,
+  type Dashboard,
+  type DashboardSummary,
+  type Integration,
+  type LogHistogram,
+  type LogSearch,
+  type Monitor,
+  type ObserveStatus,
+  type QueryAnswer,
+} from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
-import { SERIES } from "@/components/charts/types";
+import { SERIES, type Band } from "@/components/charts/types";
 import { Segmented, tabsTriggerClass } from "@/components/ui/tabs";
 import { useRes, type Res } from "@/lib/data";
 import { formatBytes, formatDuration } from "@/lib/format";
@@ -167,16 +179,26 @@ export function aggregate(values: (number | null)[], how: string = "avg"): numbe
 const timeFormat = (r: Range) => (RANGES[r] > 2 * 86_400_000 ? "day" : "time");
 
 /** Answers drawn as uPlot takes them: the first answer's buckets, and every series on them. */
-export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; labels: string[] } {
+/** Whether an `anomalies()` score is past its band, on the side it watches. */
+function past(score: number | null, k: number, direction: Bounds["direction"]) {
+  if (score == null) return false;
+  return direction === "above" ? score > k : direction === "below" ? score < -k : Math.abs(score) > k;
+}
+
+export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; labels: string[]; bands: Band[] } {
   const first = answers[0];
-  if (!first) return { data: [[]], labels: [] };
+  if (!first) return { data: [[]], labels: [], bands: [] };
   const xs = Array.from({ length: first.grid.n }, (_, i) => (first.grid.from + i * first.grid.step) / 1000);
   const ys: (number | null)[][] = [];
   const labels: string[] = [];
+  const bands: Band[] = [];
   answers.forEach((a, qi) => {
     const same = a.grid.from === first.grid.from && a.grid.step === first.grid.step;
     for (const s of a.series) {
       labels.push(answers.length > 1 ? `${qi + 1}: ${seriesLabel(s.tags)}` : seriesLabel(s.tags));
+      const b = s.bounds;
+      if (b && same)
+        bands.push({ series: ys.length, lower: b.lower.slice(0, xs.length), upper: b.upper.slice(0, xs.length), anomalous: b.score.slice(0, xs.length).map((v) => past(v, b.k, b.direction)) });
       if (same) ys.push(s.values.slice(0, xs.length));
       else {
         // Another grid (its read came a bucket later): each bucket at its time on the first's.
@@ -186,7 +208,7 @@ export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; 
       }
     }
   });
-  return { data: [xs, ...ys], labels };
+  return { data: [xs, ...ys], labels, bands };
 }
 
 /** A level drawn across a chart: a monitor's threshold. */
@@ -215,7 +237,7 @@ export function QueryChart({
   marks?: Mark[];
 }) {
   const answers = useRes(queriesRes(queries, range)).data;
-  const { data, labels } = React.useMemo(() => chartData(answers), [answers]);
+  const { data, labels, bands } = React.useMemo(() => chartData(answers), [answers]);
   if (labels.length === 0)
     return (
       <p className="empty-line flex items-center justify-center" style={{ minHeight: height }}>
@@ -231,6 +253,7 @@ export function QueryChart({
       timeFormat={timeFormat(range)}
       yFormat={(v) => formatValue(v, unit)}
       legend={legend ?? labels.length + marks.length <= 6}
+      bands={bands}
       series={[
         ...labels.map((label, i) => ({ label, color: PALETTE[i % PALETTE.length] ?? SERIES.grey, bars: display === "bars", fill: display === "area" })),
         ...marks.map((m) => ({ label: m.label, color: m.color, dash: [4, 4], width: 1 })),

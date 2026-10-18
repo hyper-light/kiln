@@ -19,7 +19,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); next: live tail, patterns | in progress |
-| O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12); next: `anomalies()` in queries and monitors, forecast, composite | in progress |
+| O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; next: forecast, composite | in progress |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
@@ -253,7 +253,7 @@ filter     := ["!"] key ":" value             // value: exact, wildcard "web-*",
                                               // "quoted" (any characters, exactly; \" and \\ within)
 modifier   := ".rollup(" fn ["," seconds] ")" | ".as_count()" | ".as_rate()" | ".fill(" how ")"
 function   := rate | per_second | per_minute | derivative | diff | abs | log2 | log10 | cumsum
-            | top | bottom | timeshift | moving_avg | ewma | anomalies | forecast | outliers
+            | integral | top | bottom | timeshift | moving_avg | ewma | clamp | anomalies
 ```
 
 Examples:
@@ -263,8 +263,16 @@ avg:system.cpu.user{host:web-*} by {host}
 sum:kiln.ci.job.finished{status:failure}.as_count().rollup(sum, 3600)
 p99:kiln.http.request.duration{route:/api/*} by {route}
 100 * sum:kiln.ci.job.finished{status:failure}.as_count() / sum:kiln.ci.job.finished{*}.as_count()
-anomalies(avg:system.load.1{host:adacachy}, 'seasonal', 3)
+anomalies(avg:system.load.1{host:adacachy}, 'robust', 3)
 ```
+
+`anomalies(query, algorithm, bounds, direction)` (§9.1): each series of the query and its band of
+`bounds` deviations (2 unless said) about what `algorithm` (`basic`, `agile`, `robust`; `basic` unless
+said) expected of each bucket before it saw it; the answer's series carry `bounds` (each bucket's
+`lower`, `upper` and `score`, its error in deviations, signed). The query beneath reads two weeks
+before the range on the range's grid (11,000 buckets in all at the most): the history the season
+and the calibration are learned from, its gaps left out, its points' spacing their mean gap.
+`direction` (`both`, `above`, `below`) says which side of the band is anomalous.
 
 Log search follows Datadog's log syntax: `service:web status:error @http.status_code:>=500
 "connection reset" -host:old-*`, with `AND`, `OR`, `NOT`, parentheses, wildcards and ranges, and
@@ -371,7 +379,9 @@ A monitor is Datadog's (`kiln_obs::monitor`, `crate::observe::monitors`): a quer
 options, so a monitor written for Datadog reads here.
 
 - **Queries**: `avg|sum|min|max|last(last_5m):<metric query> > 90`; change monitors
-  `change(avg(last_5m),last_1h):…` and `pct_change(…)`; log monitors
+  `change(avg(last_5m),last_1h):…` and `pct_change(…)`; anomaly monitors
+  `avg(last_15m):anomalies(<metric query>, 'robust', 3) >= 0.5`, whose value a group is the share of
+  its window's buckets past the band on the side asked (Datadog's: `>= 1`, all of them); log monitors
   `logs("service:web status:error").rollup("count").by("host").last("5m") > 10` (count,
   cardinality, sum, avg, min, max of a facet). A window is whole buckets of a step that divides it,
   aligned to the step.
@@ -389,7 +399,7 @@ options, so a monitor written for Datadog reads here.
   (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
   are saved as they change.
 
-To come: anomaly, forecast, outlier and composite monitors (§9.1).
+To come: forecast, outlier and composite monitors (§9.1).
 
 ### 9.1 Anomalies and forecasts
 
@@ -428,9 +438,9 @@ false positives), 58.3 (rewarding few false negatives); `basic` 50.3, 41.0, 54.8
 41.1. Among NAB's published detectors, `robust` is above Random Cut Forest (51.7), Twitter's ADVec
 (47.1) and the windowed Gaussian (39.6), below Relative Entropy (54.6).
 
-To come: `anomalies()` in queries and anomaly monitors (the fraction of the alert window's points
-past `bounds`); forecasts (Holt-Winters with the fitted smoothing, its intervals from the calibrated
-deviation); outlier and composite monitors.
+Built on it: `anomalies()` in queries (§6), drawn as a band with its anomalies marked (§11), and
+anomaly monitors (§9). To come: forecasts (Holt-Winters with the fitted smoothing, its intervals from
+the calibrated deviation); outlier and composite monitors.
 
 ## 10. Integrations
 
@@ -508,7 +518,8 @@ time range and the search in the address (a page is a link).
   changed.
 - **Metrics explorer**: a query, its series over the range and each one's last, average, least and
   most; with no query, every metric kiln keeps, found by name. A query goes onto a dashboard, or
-  into a monitor, in a step.
+  into a monitor, in a step. An `anomalies()` series is drawn with its band beneath it, in its color,
+  its points past the band marked (every chart: a dashboard's, a monitor's).
 - **Logs explorer and event stream**: a search, a histogram of its records by status (stacked, a
   bucket of a round size, about 60 to the range), each facet's most common values (a click narrows
   the search to one, again widens it), the newest 100 records (and 100 more on asking), each opened
@@ -887,6 +898,13 @@ integrations (services in the test) each in its format, a webhook refused once a
 its second try with its signature checked, a recovery that resolves PagerDuty's incident by the
 same key, and muted, a change of state with nothing said; GitHub's webhooks and posted events,
 searched and counted.
+
+**Anomalies** (`observe_live.rs`): ten days of a daily cycle every five minutes, two hosts, one's
+last point a spike, posted to a server: `anomalies(…, 'robust', 3)` over the last six hours bands
+both from the history before them, the spike past its band and at most a few of 143 ordinary points
+(its 1-in-500 calibration); at 5 deviations the spike alone; an anomaly monitor of the last 15
+minutes alerts the spiking host's group alone, and a webhook hears of it. 2026-10-18: passes, four
+runs of four.
 
 **In a browser** (`ui/e2e/observe.mjs`, Playwright against a live server; how to run it is at
 its top): a query explored and put on a new dashboard, which is then given a note, saved and

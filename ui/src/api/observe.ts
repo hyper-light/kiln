@@ -8,9 +8,19 @@ const BASE = "/api/observe/v1";
 const enc = encodeURIComponent;
 
 /** A query's answer: series on one grid of buckets. */
+/** An `anomalies()` series' band: each bucket's bounds and score (its error in calibrated deviations). */
+export interface Bounds {
+  lower: (number | null)[];
+  upper: (number | null)[];
+  score: (number | null)[];
+  k: number;
+  direction: "both" | "above" | "below";
+  algorithm: "basic" | "agile" | "robust";
+}
+
 export interface QueryAnswer {
   grid: { from: number; step: number; n: number };
-  series: { tags: Record<string, string>; values: (number | null)[] }[];
+  series: { tags: Record<string, string>; values: (number | null)[]; bounds?: Bounds }[];
   scalar: number | null;
   scanned: { series: number; samples: number };
   applied: number;
