@@ -196,9 +196,13 @@ and is answered over there.
    there and viewers stay on it. Only then does the first runner let go of it. A runner that can't take
    it over says why, and the session goes on where it was.
 
-Measured on one machine with two runners: an idle agent moves in 1.6 s; one moved mid-turn moves as
-the turn ends, and a message sent meanwhile is answered on the new runner with the whole conversation
-in its context.
+Measured on one machine with two runners, each with a home of its own: an idle agent moves in 1.6 s;
+one in a git repository in 6.9 s the first time (5.3 s of it copying the repository over, uncommitted
+work and all) and in about a second after that, either way, its copies being in step. One moved
+mid-turn moves as the turn ends, and a message sent meanwhile is answered on the new runner with the
+whole conversation in its context. An agent that comes back to a runner it was on replaces the record
+it left there; one resumed there meanwhile, with turns of its own, is never written over, and the
+agent stays where it is.
 
 ## 9. Not yet
 
