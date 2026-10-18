@@ -543,7 +543,7 @@ mod tests {
         let pb = json_to_pb(METRICS_JSON.as_bytes(), Signal::Metrics)?;
         let d = kiln_obs::otlp::metrics::decode(&pb, 0)?;
         let names: std::collections::BTreeSet<String> = d.series().iter().filter_map(|(k, _)| kiln_obs::batch::parse_key(&k.key).ok().map(|p| p.metric.to_owned())).collect();
-        for want in ["my.counter", "my.gauge", "my.histogram.count", "my.histogram.sum", "my.histogram.bucket", "my.exponential.histogram.count", "my.exponential.histogram.p50"] {
+        for want in ["my.counter", "my.gauge", "my.histogram.count", "my.histogram.sum", "my.histogram.bucket", "my.exponential.histogram.min", "my.exponential.histogram.max"] {
             anyhow::ensure!(names.contains(want), "{want} missing from {names:?}");
         }
         let series = d.series();

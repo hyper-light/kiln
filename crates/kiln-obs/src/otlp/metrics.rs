@@ -129,6 +129,8 @@ struct Cum {
     at_ns: u64,
     scale: i32,
     buckets: Vec<(Bucket, u64)>,
+    count: u64,
+    sum: f64,
 }
 
 /// What the cumulative distributions' state may hold, all shards: past a shard's share it starts
@@ -163,18 +165,21 @@ impl Keys {
         Self { hash: Keyed::new(), shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect(), started_ns, cumulative: (0..SHARDS).map(|_| Mutex::new(CumShard::default())).collect() }
     }
 
-    /// A cumulative distribution's point (`buckets` at `scale`) as the delta since its last:
-    /// into `out`, none when it is the first this receiver has of a series begun before it (what
-    /// came before it is not known) or a point it has had.
-    fn delta(&self, id: u64, start_ns: u64, at_ns: u64, scale: i32, buckets: &[(Bucket, u64)], out: &mut Vec<(Bucket, u64)>) {
+    /// A cumulative distribution's point (`buckets` at `scale`, its `count` and `sum`) as the delta
+    /// since its last: its buckets into `out`, its count and sum returned; none when it is the
+    /// first this receiver has of a series begun before it (what came before is not known) or a
+    /// point it has had. Its count and sum are the same interval's as its buckets, so a
+    /// distribution's average and its percentiles are of the same values.
+    #[allow(clippy::too_many_arguments)]
+    fn delta(&self, id: u64, start_ns: u64, at_ns: u64, scale: i32, buckets: &[(Bucket, u64)], count: u64, sum: f64, out: &mut Vec<(Bucket, u64)>) -> Option<(u64, f64)> {
         out.clear();
-        let Some(shard) = self.cumulative.get((id >> 60) as usize % SHARDS) else { return };
+        let shard = self.cumulative.get((id >> 60) as usize % SHARDS)?;
         let mut guard = shard.lock().unwrap_or_else(PoisonError::into_inner);
         let CumShard { last: kept, bytes: held } = &mut *guard;
-        let entry = |scale: i32| Cum { start_ns, at_ns, scale, buckets: buckets.to_vec() };
+        let entry = |scale: i32| Cum { start_ns, at_ns, scale, buckets: buckets.to_vec(), count, sum };
         let new_bytes = std::mem::size_of_val(buckets) + std::mem::size_of::<Cum>();
         match kept.get_mut(&id) {
-            Some(c) if c.start_ns == start_ns && at_ns <= c.at_ns => {}
+            Some(c) if c.start_ns == start_ns && at_ns <= c.at_ns => None,
             Some(c) if c.start_ns == start_ns && scale <= c.scale => {
                 // The last at this point's scale (an SDK only ever makes a cumulative one coarser),
                 // each bucket's increase; a fall anywhere is a reset: all of it is new.
@@ -208,17 +213,23 @@ impl Keys {
                         out.push((b, n - before));
                     }
                 }
-                if fell || j < last.len() {
+                let reset = fell || j < last.len() || count < c.count;
+                let since = if reset {
                     out.clear();
                     out.extend_from_slice(buckets);
-                }
+                    (count, sum)
+                } else {
+                    (count - c.count, sum - c.sum)
+                };
                 *held = held.saturating_sub(c.buckets.len() * std::mem::size_of::<(Bucket, u64)>()).saturating_add(std::mem::size_of_val(buckets));
                 *c = entry(scale);
+                Some(since)
             }
             _ => {
                 // First seen here, or begun again: what it holds is new if it began after this
                 // receiver did.
-                if start_ns >= self.started_ns {
+                let fresh = start_ns >= self.started_ns;
+                if fresh {
                     out.extend_from_slice(buckets);
                 }
                 if held.saturating_add(new_bytes) > CUMULATIVE_BYTES / SHARDS {
@@ -229,6 +240,7 @@ impl Keys {
                     *held = held.saturating_sub(old.buckets.len() * std::mem::size_of::<(Bucket, u64)>() + std::mem::size_of::<Cum>());
                 }
                 *held += new_bytes;
+                fresh.then_some((count, sum))
             }
         }
     }
@@ -683,12 +695,26 @@ fn exponential_point<'a>(msg: &'a [u8], d: &mut Derived, resource: &[Tag<'a>], c
     }
     sink.merge(resource);
     let ts = time_ms(t, now_ms);
-    let sum_kind = if count_kind == Kind::Counter { Kind::Counter } else { Kind::Count };
-    if let Some(c) = count {
-        sink.point(&d.count, None, count_kind, ts, c as f64);
-    }
-    if let Some(s) = sum {
-        sink.point(&d.sum, None, sum_kind, ts, s);
+    // Its buckets, a distribution's: each a count of its interval, a series of its own, merged with
+    // others' and read as percentiles at query time (`crate::dist`); its count and sum the same
+    // interval's (a cumulative one's turned to deltas with them), its least and most as they came.
+    let mut buckets = std::mem::take(&mut sink.buckets);
+    let at = dist::coarsened(i32::try_from(scale).unwrap_or(0), zero, pos_off, &pos, neg_off, &neg, &mut buckets);
+    let mut delta = std::mem::take(&mut sink.delta);
+    let (counts, since): (&[(Bucket, u64)], Option<(u64, f64)>) = if count_kind == Kind::Counter {
+        let id = sink.identity(&d.dist);
+        let since = sink.keys.delta(id, start, t.max(1), at, &buckets, count.unwrap_or(0), sum.unwrap_or(0.0), &mut delta);
+        (&delta, since)
+    } else {
+        (&buckets, Some((count.unwrap_or(0), sum.unwrap_or(0.0))))
+    };
+    if let Some((c, s)) = since {
+        if count.is_some() {
+            sink.point(&d.count, None, Kind::Count, ts, c as f64);
+        }
+        if sum.is_some() {
+            sink.point(&d.sum, None, Kind::Count, ts, s);
+        }
     }
     if let Some(v) = min {
         sink.point(&d.min, None, Kind::Gauge, ts, v);
@@ -696,18 +722,6 @@ fn exponential_point<'a>(msg: &'a [u8], d: &mut Derived, resource: &[Tag<'a>], c
     if let Some(v) = max {
         sink.point(&d.max, None, Kind::Gauge, ts, v);
     }
-    // Its buckets, a distribution's: each a count of its interval, a series of its own, merged with
-    // others' and read as percentiles at query time (`crate::dist`).
-    let mut buckets = std::mem::take(&mut sink.buckets);
-    let at = dist::coarsened(i32::try_from(scale).unwrap_or(0), zero, pos_off, &pos, neg_off, &neg, &mut buckets);
-    let mut delta = std::mem::take(&mut sink.delta);
-    let counts: &[(Bucket, u64)] = if count_kind == Kind::Counter {
-        let id = sink.identity(&d.dist);
-        sink.keys.delta(id, start, t.max(1), at, &buckets, &mut delta);
-        &delta
-    } else {
-        &buckets
-    };
     for &(b, n) in counts {
         let tag = dist::tag_value(at, b);
         sink.point(&d.dist, Some((dist::BUCKET_TAG, &tag)), Kind::Count, ts, n as f64);
@@ -1241,10 +1255,12 @@ mod tests {
         let start = 5_000_000_000;
         let first = decode(&exponential(true, start, 20_000_000_000, 3, (8, &[2, 5]), (2, &[1])), &keys);
         assert!(dist_buckets(&first).is_empty());
-        assert_eq!(find(&first, "lat.count", None).0.kind, Kind::Counter, "the count, a counter as it was");
-        // The next: each bucket's increase, a bucket new to it whole.
+        assert!(first.series().iter().all(|(k, _)| crate::batch::parse_key(&k.key).unwrap().metric != "lat.count"), "nor its count");
+        // The next: each bucket's increase, a bucket new to it whole; its count the same interval's.
         let second = decode(&exponential(true, start, 30_000_000_000, 3, (8, &[3, 9, 1]), (2, &[4])), &keys);
         assert_eq!(dist_buckets(&second), tagged(&[("3:n2", 3.0), ("3:p8", 1.0), ("3:p9", 4.0), ("3:p10", 1.0)]));
+        let count = find(&second, "lat.count", None);
+        assert_eq!((count.0.kind, count.1[0].1), (Kind::Count, 9.0), "8 values, then 17: 9 in the interval");
         // The same point again (sent twice): nothing.
         assert!(dist_buckets(&decode(&exponential(true, start, 30_000_000_000, 3, (8, &[3, 9, 1]), (2, &[4])), &keys)).is_empty());
         // Coarser (the SDK widened its range): the last made as coarse (p8 and p9 are p4 at scale 2,
