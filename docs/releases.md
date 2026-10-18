@@ -102,6 +102,18 @@ For tracing (OTel), each upgrade is a span under `kiln::upgrade` named `upgrade`
 The machine's local sockets, for `kiln spawn` and `kiln run`, are the same for every runner process
 of a machine. Shells opened before an upgrade keep using them.
 
+**On a Mac, run `kiln signing setup` once.** macOS's local network privacy judges every program
+by its code signature. kiln's builds are ad hoc signed, so to macOS each upgrade is a program it
+has never seen, cut off from the local network, and so from the kiln server, until someone allows
+it again. `kiln signing setup` makes kiln a signing identity on the Mac: a self-signed certificate
+for code signing, in a keychain of kiln's own (`~/Library/Keychains/kiln-signing.keychain-db`).
+macOS asks once to trust it for code signing. Then kiln signs every kiln binary installed there,
+and from then on every binary it installs or downloads, all under one identifier
+(`io.github.hyper-light.kiln`). The runner takes up its signed binary, macOS asks once more
+whether kiln may use the local network, and upgrades keep that permission. `kiln signing` says
+whether a machine is set up. A signed binary keeps the build id it was handed out as
+(`<binary>.kiln-build` beside it), so the server knows it for that build.
+
 Some runners still upgrade as before: those not under a supervisor (`kiln agent` run by hand), and
 Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its
 terminals and agent sessions. Otherwise they upgrade through `kiln install --agent --upgrade`.

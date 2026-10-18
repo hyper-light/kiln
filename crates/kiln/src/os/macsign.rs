@@ -292,7 +292,14 @@ mod imp {
         if let Ok(rd) = std::fs::read_dir(crate::config::default_data_dir().join("launcher")) {
             bins.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.extension().is_none()));
         }
-        if let Ok(exe) = std::env::current_exe() {
+        // The installed kiln (what launchd's jobs run), and this one when it is somewhere else.
+        let installed = crate::install::bin_path(crate::os::is_root());
+        if installed.is_file() {
+            bins.push(installed);
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && !bins.iter().any(|b| b.canonicalize().ok() == exe.canonicalize().ok())
+        {
             bins.push(exe);
         }
         if let Ok(rd) = std::fs::read_dir(crate::config::default_data_dir().join("agent").join("versions")) {

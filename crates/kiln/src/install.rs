@@ -98,7 +98,7 @@ fn quiet(cmd: &mut Command) -> bool {
 }
 
 /// Where the binary is installed.
-fn bin_path(system: bool) -> PathBuf {
+pub(crate) fn bin_path(system: bool) -> PathBuf {
     if system {
         PathBuf::from("/usr/local/bin/kiln")
     } else if cfg!(windows) {
@@ -469,12 +469,13 @@ fn launchd_domains(system: bool) -> Vec<String> {
     }
 }
 
-/// The program a unit's launchd job runs: a copy of kiln that upgrades leave alone. macOS's local
-/// network privacy knows a job by the code it starts, and kiln's builds are ad hoc signed, so to
-/// macOS each one is a new program: a job that ran the `kiln` upgrades replace would be cut off
-/// from the local network (the kiln server) after every upgrade until someone allowed it again.
-/// The launcher stays the program macOS was told about once; it runs the `kiln` upgrades replace
-/// (`supervise --exe <kiln> -- …`), whose network use macOS counts as the launcher's.
+/// The program a unit's launchd job runs: a copy of kiln that upgrades leave alone
+/// (`supervise --exe <kiln> -- …`), so the job itself stays what macOS was told about. That alone
+/// doesn't keep kiln on the local network across upgrades: macOS judges the new build it starts by
+/// its own signature, and an ad hoc signed build is a new program to it (on 2026-10-18 a fresh
+/// build an unchanged launcher started was refused all the same). What does is kiln's signing
+/// identity on the Mac (`crate::os::macsign`, `kiln signing setup`), which every binary installed
+/// here is signed with.
 pub(crate) fn launcher_path(unit: &str) -> PathBuf {
     crate::config::default_data_dir().join("launcher").join(unit)
 }
