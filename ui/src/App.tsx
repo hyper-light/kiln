@@ -8,9 +8,10 @@ import { BrandMark } from "@/components/shell/brand";
 import { ErrorBoundary } from "@/components/ui/error-boundary";
 import { Loading } from "@/components/ui/loading";
 import { Toaster } from "@/components/ui/toast";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import { checkAuth, useAuth } from "@/lib/auth";
-import { Login } from "@/views/login";
+
+/** Sign-in, loaded only when someone isn't signed in. */
+const Login = React.lazy(() => import("@/views/login").then((m) => ({ default: m.Login })));
 
 // Who this is, asked as the app starts (not after its first render).
 if (typeof window !== "undefined") void checkAuth();
@@ -20,20 +21,26 @@ export function SignedIn() {
   const auth = useAuth();
   return (
     <Providers>
-      {auth.kind === "loading" ? <Splash /> : auth.kind === "anon" ? <Login error={auth.error} onRetry={() => void checkAuth()} /> : <AppShell me={auth.me} />}
+      {auth.kind === "loading" ? (
+        <Splash />
+      ) : auth.kind === "anon" ? (
+        <React.Suspense fallback={<Splash />}>
+          <Login error={auth.error} onRetry={() => void checkAuth()} />
+        </React.Suspense>
+      ) : (
+        <AppShell me={auth.me} />
+      )}
     </Providers>
   );
 }
 
-/** What every page has around it: tooltips, toasts, and a last word if it crashes. */
+/** What every page has around it: toasts, and a last word if it crashes. */
 export function Providers({ children }: { children: React.ReactNode }) {
   return (
-    <TooltipProvider>
-      <ErrorBoundary label="kiln crashed">
-        {children}
-        <Toaster />
-      </ErrorBoundary>
-    </TooltipProvider>
+    <ErrorBoundary label="kiln crashed">
+      {children}
+      <Toaster />
+    </ErrorBoundary>
   );
 }
 
