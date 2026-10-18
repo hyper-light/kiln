@@ -105,6 +105,11 @@ impl Api {
         Ok(Api { client: Client::public()?, url: url.trim_end_matches('/').to_owned(), token: token.to_owned() })
     }
 
+    /// The server's URL.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
     /// A CI route (`/api/ci<path>`).
     pub(crate) async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         self.call_api(method, &format!("/api/ci{path}"), body).await
@@ -324,7 +329,7 @@ pub struct Conn {
 }
 
 impl Conn {
-    async fn api(&self, cfg: &Config) -> Result<Api> {
+    pub(crate) async fn api(&self, cfg: &Config) -> Result<Api> {
         Api::connect(cfg, self.url.as_deref(), self.token.as_deref()).await
     }
 }
@@ -1010,3 +1015,81 @@ pub async fn debug(args: DebugArgs, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+
+#[derive(clap::Args)]
+pub struct RepoArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: RepoCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum RepoCmd {
+    /// The repositories kiln follows or hosts.
+    List,
+    /// A repository kiln hosts (docs/ci.md W14-R01), empty: clone and push it at
+    /// `<server>/git/<owner>/<name>.git`.
+    Create {
+        /// `owner/name`.
+        name: String,
+        /// Its trunk.
+        #[arg(long, default_value = "main")]
+        default_branch: String,
+    },
+    /// An upstream repository's history, copied into one kiln hosts: `kiln repo import
+    /// https://github.com/acme/app` (as `acme/app`, or `--name`).
+    Import {
+        url: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
+/// `owner/name` of a clone URL: `https://host/acme/app.git`, `git@host:acme/app.git`.
+fn repo_name_of(url: &str) -> Option<String> {
+    let path = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = path.split_once("://").map_or_else(|| path.split_once(':').map_or(path, |(_, p)| p), |(_, rest)| rest.split_once('/').map_or("", |(_, p)| p));
+    let mut parts = path.rsplit('/');
+    let (name, owner) = (parts.next()?, parts.next()?);
+    (!name.is_empty() && !owner.is_empty()).then(|| format!("{owner}/{name}"))
+}
+
+pub async fn repo(args: RepoArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let created = |v: &Value| {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+        println!("{name}: git clone {}/git/{name}.git", api.url);
+    };
+    match args.cmd {
+        RepoCmd::List => {
+            let v = api.call_api(Method::Get, "/api/repos", None).await?;
+            for r in v.as_array().cloned().unwrap_or_default() {
+                let url = r.get("clone_url").and_then(Value::as_str).unwrap_or_default();
+                let mode = if url.starts_with("file://") { "native" } else { url };
+                println!("{}\t{mode}", r.get("name").and_then(Value::as_str).unwrap_or_default());
+            }
+        }
+        RepoCmd::Create { name, default_branch } => created(&api.call_api(Method::Post, "/api/repos", Some(json!({ "name": name, "mode": "native", "default_branch": default_branch }))).await?),
+        RepoCmd::Import { url, name } => {
+            let name = name.or_else(|| repo_name_of(&url)).ok_or_else(|| anyhow::anyhow!("`{url}`: name it with --name owner/name"))?;
+            let v = api.call_for(Method::Post, "/api/repos", Some(json!({ "name": name, "mode": "native", "import": url })), Duration::from_secs(1800)).await?;
+            created(&v);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod repo_tests {
+    use super::repo_name_of;
+
+    #[test]
+    fn w14_r01_import_names() {
+        assert_eq!(repo_name_of("https://github.com/acme/app.git").as_deref(), Some("acme/app"));
+        assert_eq!(repo_name_of("https://git.example.com/group/sub/app/").as_deref(), Some("sub/app"));
+        assert_eq!(repo_name_of("git@github.com:acme/app.git").as_deref(), Some("acme/app"));
+        assert_eq!(repo_name_of("ssh://git@host:2222/acme/app").as_deref(), Some("acme/app"));
+        assert_eq!(repo_name_of("https://github.com/app"), None);
+    }
+}

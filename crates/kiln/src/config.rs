@@ -93,6 +93,15 @@ pub struct RepoConfig {
     pub clone_url: Option<String>,
     pub branches: Vec<String>,
     pub poll_seconds: Option<u32>,
+    /// `native`: kiln hosts it (docs/ci.md W14-R01), made empty or from `import`; `upstream`
+    /// (the default): kiln follows `clone_url`.
+    pub mode: Option<String>,
+    /// A native repository's history, copied once from this URL.
+    pub import: Option<String>,
+    /// A new, empty native repository's trunk (`main`).
+    pub default_branch: Option<String>,
+    /// A native repository's upstream: its trunk is pushed there after each land.
+    pub mirror: Option<String>,
 }
 
 

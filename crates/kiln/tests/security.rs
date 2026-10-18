@@ -112,6 +112,7 @@ fn w22_ac07_yaml_bombs() {
     refuses(".kiln/routing.yaml", &bomb("rules"), |t| kiln::ci::routing::parse_file(t.as_bytes()));
     refuses(".kiln/notify.yaml", &bomb("rules"), kiln::ci::notify::parse_rules);
     refuses(".kiln/config.yaml", &bomb("actions"), |t| serde_yaml::from_str::<kiln::ci::repo_config::RepoConfig>(t).map_err(|e| e.to_string()));
+    refuses(".kiln/review.yaml", &bomb("trunks"), |t| serde_yaml::from_str::<kiln::ci::hosting::Review>(t).map_err(|e| e.to_string()));
     refuses("pnpm-lock.yaml", &format!("lockfileVersion: '9.0'\n{}", bomb("packages")), |t| kiln_ci::sbom::parse(kiln_ci::sbom::Lock::Pnpm, t));
     refuses("yarn.lock (berry)", &format!("__metadata:\n  version: 6\n{}", bomb("\"x@npm:1\"")), |t| kiln_ci::sbom::parse(kiln_ci::sbom::Lock::Yarn, t));
 }
