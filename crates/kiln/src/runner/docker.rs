@@ -63,7 +63,29 @@ pub struct Spec {
     pub ports: Vec<String>,
     pub volumes: Vec<String>,
     pub options: Option<String>,
+    /// The host's Docker socket inside: GitHub mounts it in job containers. A `docker`
+    /// executor's container doesn't get it (W13-R04: Docker access is opt-in per pool).
+    pub docker_socket: bool,
 }
+
+/// kiln's runner images (W13-R04), built on the runner the first time a leg needs one: what
+/// GitHub's hosted Ubuntu runners have that most workflows count on.
+pub fn runner_dockerfile(image: &str) -> Option<String> {
+    let base = match image.strip_prefix("kiln/runner-")? {
+        "ubuntu-24.04" => "ubuntu:24.04",
+        "ubuntu-22.04" => "ubuntu:22.04",
+        _ => return None,
+    };
+    Some(format!(
+        "FROM {base}\nLABEL kiln.runner-image=1\nENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8\n\
+         RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wget git git-lfs jq unzip zip xz-utils zstd bzip2 gnupg sudo \\\n    \
+         build-essential pkg-config python3 python3-venv python3-pip openssh-client rsync file lsb-release tzdata locales iproute2 netcat-openbsd \\\n    \
+         && rm -rf /var/lib/apt/lists/*\n"
+    ))
+}
+
+/// One runner image build at a time on this machine.
+static IMAGE_BUILD: async_lock::Mutex<()> = async_lock::Mutex::new(());
 
 /// The CLI, with the leg's own credential store.
 #[derive(Debug, Clone)]
@@ -273,7 +295,7 @@ impl Containers {
             say(format!("Starting job container ({})", spec.image));
             c.pull(&spec.image, say).await?;
             let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), format!("{HOST_ALIAS}:host-gateway")];
-            if Path::new("/var/run/docker.sock").exists() {
+            if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
                 args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
             }
             for m in map.mounts() {
@@ -313,6 +335,23 @@ impl Containers {
     }
 
     async fn pull(&self, image: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
+        if let Some(dockerfile) = runner_dockerfile(image) {
+            let _g = IMAGE_BUILD.lock().await;
+            if self.cli.run(&[s("image"), s("inspect"), image.to_owned()], &BTreeMap::new(), QUICK).await.is_ok() {
+                return Ok(());
+            }
+            say(format!("Building kiln's runner image {image} (once per machine)"));
+            let dir = self.cli.config.join(format!("image-{}", crate::util::new_id()));
+            let d = dir.clone();
+            crate::rt::blocking(move || -> std::io::Result<()> {
+                std::fs::create_dir_all(&d)?;
+                std::fs::write(d.join("Dockerfile"), dockerfile)
+            })
+            .await??;
+            let r = self.cli.run(&[s("build"), s("--quiet"), s("-t"), image.to_owned(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
+            let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
+            return r.map(|_| ());
+        }
         say(format!("{} pull {image}", self.cli.bin));
         self.cli.run(&[s("pull"), s("--quiet"), image.to_owned()], &BTreeMap::new(), SLOW).await.map(|_| ())
     }
@@ -440,6 +479,17 @@ pub fn action_run_args(name: &str, label: &str, network: Option<&str>, mounts: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_images_have_a_dockerfile() {
+        let d = runner_dockerfile("kiln/runner-ubuntu-24.04").unwrap_or_default();
+        assert!(d.starts_with("FROM ubuntu:24.04\n"), "{d}");
+        assert!(d.contains("apt-get install -y --no-install-recommends ca-certificates"), "{d}");
+        assert!(d.contains(" \\\n    build-essential"), "line continuations: {d}");
+        assert!(d.trim_end().ends_with("rm -rf /var/lib/apt/lists/*"), "{d}");
+        assert!(runner_dockerfile("ubuntu:24.04").is_none());
+        assert!(runner_dockerfile("kiln/runner-centos").is_none());
+    }
 
     #[test]
     fn options_split_like_a_shell() {

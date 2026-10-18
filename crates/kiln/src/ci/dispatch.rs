@@ -255,7 +255,13 @@ impl Dispatch {
 
     async fn runner_up(&mut self, agent: &str, running: &[String]) {
         let Some(a) = self.hub.agents.lock().get(agent).cloned() else { return };
-        let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), ..kiln_ci::facts::RunnerFacts::default() };
+        // Executors it has: the host always, Docker when it announced it (W13-R01's probes, for now).
+        let mut executors = std::collections::BTreeMap::new();
+        executors.insert("host".to_owned(), kiln_ci::facts::Executor::default());
+        if self.hub.runner_caps(agent) & CAP_DOCKER != 0 {
+            executors.insert("docker".to_owned(), kiln_ci::facts::Executor::default());
+        }
+        let facts = kiln_ci::facts::RunnerFacts { os: a.os.clone(), arch: a.arch.clone(), executors, ..kiln_ci::facts::RunnerFacts::default() };
         let view = RunnerView { name: a.name.clone(), labels: a.labels.clone(), pool: None, facts, caps: u64::from(self.hub.runner_caps(agent)) };
         // Legs this runner was running that it no longer has were lost.
         let gone: Vec<(String, u32)> = self.legs.iter().filter(|(id, l)| l.agent.as_deref() == Some(agent) && !running.contains(id) && !a.running.contains(id)).map(|(id, l)| (id.clone(), l.attempt)).collect();
@@ -536,7 +542,7 @@ impl Dispatch {
                     self.actions(&run, held).await
                 }
                 Command::CancelRun { run, reason } => self.cancel_run(&run, &reason).await,
-                Command::Assign { leg, runner, attempt, executor } => self.assign(&leg, &runner, attempt, executor).await,
+                Command::Assign { leg, runner, attempt, executor, image } => self.assign(&leg, &runner, attempt, executor, image).await,
                 Command::Cancel { leg, reason, .. } => {
                     if let Some(agent) = self.legs.get(&leg).and_then(|l| l.agent.clone()) {
                         self.hub.send_to_agent(&agent, LANE_CONTROL, &ServerMsg::Cancel { job: leg, reason }).await;
@@ -573,7 +579,7 @@ impl Dispatch {
     }
 
     /// Sends a leg to its runner (W05, W06).
-    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, executor: Option<String>) -> anyhow::Result<()> {
+    async fn assign(&mut self, leg: &str, runner: &str, attempt: u32, executor: Option<String>, image: Option<String>) -> anyhow::Result<()> {
         let Some(l) = self.legs.get(leg) else { return Ok(()) };
         let Some(r) = self.runs.get(&l.run) else { return Ok(()) };
         let (cache_mode, cache) = cache_access(&l.spec, r);
@@ -583,7 +589,7 @@ impl Dispatch {
         // (W10-R03, R04).
         let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl).await?;
         let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
-        let a = self.assignment(leg, l, r, attempt, executor.clone(), token, job_token, cache_mode, secrets, vars);
+        let a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
         let json = serde_json::to_string(&a)?;
         if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
             tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
@@ -658,7 +664,7 @@ impl Dispatch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>, token: String, job_token: String, cache_mode: kiln_ci::store::cache::Mode, secrets: Vec<wire::Secret>, vars: serde_json::Value) -> AssignmentV2 {
+    fn assignment(&self, leg: &str, l: &LegSt, r: &RunSt, attempt: u32, executor: Option<String>, image: Option<String>, token: String, job_token: String, cache_mode: kiln_ci::store::cache::Mode, secrets: Vec<wire::Secret>, vars: serde_json::Value) -> AssignmentV2 {
         let spec = &l.spec;
         let wf = &spec.workflow;
         let job = spec.def();
@@ -675,7 +681,7 @@ impl Dispatch {
             git_ref: r.event.git_ref.clone(),
             dialect: if wf.dialect == Some(kiln_ci::expr::Dialect::Kiln) { "kiln".into() } else { "gha".into() },
             leg: wire::LegInfo { job_id: spec.job.clone(), name: spec.name.clone(), matrix: spec.matrix.clone(), index: num("job-index"), total: num("job-total") },
-            executor: wire::ExecutorSpec { kind: executor.unwrap_or_else(|| "host".into()), image: None, options: serde_json::Value::Null },
+            executor: wire::ExecutorSpec { image: if executor.as_deref() == Some("docker") { image } else { None }, kind: executor.unwrap_or_else(|| "host".into()), options: serde_json::Value::Null },
             container: spec.container.clone(),
             services: spec.services.iter().cloned().collect(),
             job_container: job.and_then(|j| j.container.clone()),

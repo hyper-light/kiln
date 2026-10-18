@@ -149,7 +149,8 @@ pub enum WaitReason {
 pub enum Command {
     StartRun { run: String },
     CancelRun { run: String, reason: String },
-    Assign { leg: String, runner: String, attempt: u32, executor: Option<String> },
+    /// `image` is the routing rule's, for container and microVM executors (W13).
+    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String> },
     /// Stop a leg's attempt on its runner.
     Cancel { leg: String, attempt: u32, reason: String },
     /// A failed attempt will be retried at `at` as `attempt`.
@@ -539,6 +540,7 @@ impl Scheduler {
         l.last_runner = Some(runner.to_owned());
         let (attempt, request, exclusive, repo, fair) = (l.attempt, l.input.request, l.input.exclusive, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
         let executors = l.req.executors.clone();
+        let image = l.req.image.clone();
         self.vtime = self.vtime.max(fair as f64 / 1000.0);
         *self.in_progress.entry(repo).or_default() += 1;
         let mut executor = None;
@@ -548,7 +550,7 @@ impl Scheduler {
             r.exclusive = exclusive;
             executor = executors.iter().find(|e| r.input.view.facts.executors.contains_key(e.as_str())).cloned();
         }
-        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor });
+        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image });
     }
 
     fn release(&mut self, id: &str) -> Option<String> {

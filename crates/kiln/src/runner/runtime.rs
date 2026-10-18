@@ -526,7 +526,8 @@ impl Leg {
         st.allow_unsecure = st.env.get("ACTIONS_ALLOW_UNSECURE_COMMANDS").is_some_and(|v| v == "true");
         let deadline = Instant::now() + Duration::from_secs(u64::from(a.timeout_minutes.max(1)) * 60);
         let mut timed_out = false;
-        if (a.job_container.is_some() || !a.job_services.is_empty()) && !self.init_containers(&mut st).await {
+        let executor_container = a.executor.kind == "docker" && a.executor.image.is_some();
+        if (a.job_container.is_some() || !a.job_services.is_empty() || executor_container) && !self.init_containers(&mut st).await {
             if let Some(c) = &st.containers {
                 c.stop().await;
             }
@@ -753,7 +754,7 @@ impl Leg {
             Some(o) => Some(st.render(o, site, "options")?),
             None => None,
         };
-        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options })
+        Ok(super::docker::Spec { image, credentials, env, ports, volumes, options, docker_socket: false })
     }
 
     /// "Initialize containers" (W13-R08): the leg's network, services and job container, before
@@ -792,9 +793,11 @@ impl Leg {
             (work.join("_externals"), "/__e".into()),
         ]);
         let workdir = map.translate(&l.workspace.to_string_lossy());
-        let job = match &a.job_container {
-            Some(c) => Some(self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)?),
-            None => None,
+        // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
+        let job = match (&a.job_container, &a.executor.image) {
+            (Some(c), _) => Some(super::docker::Spec { docker_socket: true, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
+            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), ..super::docker::Spec::default() }),
+            _ => None,
         };
         let mut services = Vec::new();
         for (key, c) in &a.job_services {

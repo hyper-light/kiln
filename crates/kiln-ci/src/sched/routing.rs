@@ -531,9 +531,12 @@ pub struct Rule {
 /// The rules mapping GitHub's hosted labels to requirements (W05-R21). They ship disabled: an
 /// administrator turns them on (`[ci.routing] github_labels = true`).
 pub fn github_label_rules() -> Vec<Rule> {
+    // Ubuntu's labels run in a fresh container of kiln's Ubuntu runner image where the runner has
+    // Docker, the way GitHub gives each job a fresh machine, and on the host otherwise.
     let rule = |labels: &[&str], os: &str, arch: &str, image: &str| Rule {
         matches: RuleMatch { labels: labels.iter().map(|s| (*s).to_owned()).collect(), ..RuleMatch::default() },
         require: vec![format!("os == {os}"), format!("arch == {arch}")],
+        executor: if image.is_empty() { Vec::new() } else { vec!["docker".to_owned(), "host".to_owned()] },
         image: (!image.is_empty()).then(|| image.to_owned()),
         ..Rule::default()
     };
