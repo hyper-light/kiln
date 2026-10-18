@@ -99,7 +99,7 @@ fn quiet(cmd: &mut Command) -> bool {
 }
 
 /// Where the binary is installed.
-fn bin_path(system: bool) -> PathBuf {
+pub(crate) fn bin_path(system: bool) -> PathBuf {
     if system {
         PathBuf::from("/usr/local/bin/kiln")
     } else if cfg!(windows) {
@@ -142,6 +142,7 @@ fn place_binary(dest: &Path) -> anyhow::Result<()> {
     let tmp = dest.with_extension(format!("new.{}", std::process::id()));
     std::fs::copy(&exe, &tmp).with_context(|| format!("copy to {}", tmp.display()))?;
     crate::os::make_executable(&tmp)?;
+    sign_placed(&tmp, dest);
     if let Err(e) = std::fs::rename(&tmp, dest) {
         // Windows cannot replace a running executable, but it can rename it out of the way.
         let aside = dest.with_extension(format!("old-{}", std::process::id()));
@@ -268,6 +269,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         shell: None,
         credentials: None,
         instance: None,
+        config: None,
         reach: Some(true),
         observe: true,
         outpost: false,
@@ -470,12 +472,13 @@ fn launchd_domains(system: bool) -> Vec<String> {
     }
 }
 
-/// The program a unit's launchd job runs: a copy of kiln that upgrades leave alone. macOS's local
-/// network privacy knows a job by the code it starts, and kiln's builds are ad hoc signed, so to
-/// macOS each one is a new program: a job that ran the `kiln` upgrades replace would be cut off
-/// from the local network (the kiln server) after every upgrade until someone allowed it again.
-/// The launcher stays the program macOS was told about once; it runs the `kiln` upgrades replace
-/// (`supervise --exe <kiln> -- …`), whose network use macOS counts as the launcher's.
+/// The program a unit's launchd job runs: a copy of kiln that upgrades leave alone
+/// (`supervise --exe <kiln> -- …`), so the job itself stays what macOS was told about. That alone
+/// doesn't keep kiln on the local network across upgrades: macOS judges the new build it starts by
+/// its own signature, and an ad hoc signed build is a new program to it (on 2026-10-18 a fresh
+/// build an unchanged launcher started was refused all the same). What does is kiln's signing
+/// identity on the Mac (`crate::os::macsign`, `kiln signing setup`), which every binary installed
+/// here is signed with.
 pub(crate) fn launcher_path(unit: &str) -> PathBuf {
     crate::config::default_data_dir().join("launcher").join(unit)
 }
@@ -498,8 +501,17 @@ fn ensure_launcher(unit: &str, bin: &Path) -> anyhow::Result<PathBuf> {
     let tmp = launcher.with_extension(format!("new.{}", std::process::id()));
     std::fs::copy(bin, &tmp).with_context(|| format!("copy {} to {}", bin.display(), tmp.display()))?;
     crate::os::make_executable(&tmp)?;
+    sign_placed(&tmp, &launcher);
     std::fs::rename(&tmp, &launcher).with_context(|| format!("install {}", launcher.display()))?;
     Ok(launcher)
+}
+
+/// On a Mac with kiln's signing identity (`kiln signing setup`), the copy about to become `dest`
+/// signed with it, so macOS knows it as the program it let onto the local network before.
+fn sign_placed(tmp: &Path, dest: &Path) {
+    if let Err(e) = crate::os::macsign::sign_as(tmp, dest, &crate::updates::own_build()) {
+        say(format!("couldn't sign {} as kiln ({e:#}): macOS may ask again before it reaches the server", dest.display()));
+    }
 }
 
 /// A launchd job running `kiln supervise -- …` at load (login, or boot for a daemon), from the
@@ -560,7 +572,7 @@ fn launchd_body(i: &Install<'_>, log: &Path, launcher: Option<&Path>) -> String 
 }
 
 /// Run `launchctl` quietly: `Ok` if it succeeded, else what it said.
-fn launchctl(args: &[&str]) -> Result<(), String> {
+pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
     match Command::new("launchctl").args(args).stdin(Stdio::null()).output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {

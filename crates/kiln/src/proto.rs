@@ -129,6 +129,10 @@ pub enum AgentMsg {
     /// [`crate::convo::feed::Msg`], `data` a batch's bytes (empty for the rest). Only from runners
     /// announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
     Convo { json: String, data: Vec<u8> },
+    /// Whether this machine takes upgrades from its server (its kiln config's `[updates] accept`):
+    /// `false` and the server never upgrades it, whatever its policy there. Sent on every
+    /// (re)connect, and when it changes. Appended last: postcard encodes variants by index.
+    UpdatePrefs { accept: bool },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): `json` a [`crate::observe::wire::Msg`],
     /// `bytes` what it carries (a raft message's, or a write's entry; empty when none). Only from
     /// runners announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard
@@ -165,6 +169,13 @@ pub const CAP_REPOS: u32 = 1 << 18;
 /// to upgrade); the machine's terminals, AI sessions and agents work as a runner's do. It also
 /// carries [`OUTPOST_LABEL`], so it is known as one while it's away too.
 pub const CAP_OUTPOST: u32 = 32;
+/// [`AgentMsg::Build`] capability: it reports whether its machine takes upgrades
+/// ([`AgentMsg::UpdatePrefs`]) and takes the notice of a newer kiln ([`ServerMsg::UpdateAvailable`]).
+pub const CAP_UPDATES: u32 = 256;
+/// [`AgentMsg::Build`] capability: it upgrades blue/green (`crate::bluegreen`): the new build comes
+/// up beside it as another instance, reports in, and takes over. An upgrade of it is done when it
+/// says so ([`AgentMsg::UpgradeDone`]), not when the new build reports in.
+pub const CAP_BLUE_GREEN: u32 = 512;
 /// The label an outpost carries (see [`CAP_OUTPOST`]).
 pub const OUTPOST_LABEL: &str = "outpost";
 
@@ -351,6 +362,11 @@ pub enum ServerMsg {
     /// earlier epoch). Its harness stops; it isn't closed. Only to runners announcing
     /// [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
     HarnessRelease { session: String },
+    /// A newer kiln is available for this machine's runner: `commit` (`build`, its binary for this
+    /// platform, when there is one) and where it comes from. Said whatever its update policy, once a
+    /// commit; only to runners announcing [`CAP_UPDATES`]. Appended last: postcard encodes variants
+    /// by index.
+    UpdateAvailable { commit: String, build: String, from: String },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
     /// announcing [`CAP_OBSERVE`]. Appended last, after main's (deployed first): postcard encodes
     /// variants by index.
@@ -522,18 +538,18 @@ mod tests {
 
     #[test]
     fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
-        // Right after main's last (deployed first): the conversation feed's.
-        let last_server = encode(&ServerMsg::HarnessRelease { session: "s".into() })?;
+        // Right after main's last (deployed first): its updates' own.
+        let last_server = encode(&ServerMsg::UpdateAvailable { commit: "c".into(), build: "b".into(), from: "f".into() })?;
         let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
         let b = encode(&s)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after HarnessRelease");
+        assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1), "ServerMsg::Observe comes right after UpdateAvailable");
         assert_eq!(decode::<ServerMsg>(&b)?, s);
-        let last_agent = encode(&AgentMsg::Convo { json: "{}".into(), data: Vec::new() })?;
+        let last_agent = encode(&AgentMsg::UpdatePrefs { accept: true })?;
         let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
         let b = encode(&a)?;
-        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after Convo");
+        assert_eq!(b.first().copied(), last_agent.first().map(|n| n + 1), "AgentMsg::Observe comes right after UpdatePrefs");
         assert_eq!(decode::<AgentMsg>(&b)?, a);
-        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_OUTPOST, CAP_REPOS, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH, CAP_CONVO];
+        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_OUTPOST, CAP_REPOS, CAP_UPDATES, CAP_BLUE_GREEN, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_DOCKER_ROOTLESS, CAP_REACH, CAP_CONVO];
         assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
         const { assert!(LANE_OBSERVE != LANE_CONVO) };
         Ok(())

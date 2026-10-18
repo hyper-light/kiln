@@ -27,6 +27,9 @@ pub enum Req {
     Signal(Signal),
     /// Forget a runner's pinned key (it was reinstalled).
     Forget { runner: String },
+    /// A question for the kiln server (JSON), from an agent's MCP server: kiln's operations,
+    /// asked for its session (`crate::mcp::runner_ask`). Answered with [`Ev::Answer`].
+    Ask { json: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -70,6 +73,8 @@ pub enum Ev {
     Exit { code: Option<i32>, error: Option<String>, lost: u64 },
     Error(String),
     Forgot(bool),
+    /// The server's answer to [`Req::Ask`] (JSON).
+    Answer(String),
 }
 
 static SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -475,6 +480,13 @@ async fn connection(handle: Handle, me: String, fd: std::sync::Arc<std::os::fd::
         Req::Forget { runner } => {
             let ok = handle.forget(&runner).await.unwrap_or(false);
             let _ = ev_tx.send(Ev::Forgot(ok)).await;
+        }
+        Req::Ask { json } => {
+            let ev = match handle.query(json).await {
+                Ok(a) => Ev::Answer(a),
+                Err(e) => Ev::Error(format!("{e:#}")),
+            };
+            let _ = ev_tx.send(ev).await;
         }
         Req::Run(r) => run(&handle, &me, *r, ev_tx.clone(), req_rx).await,
         Req::Input(_) | Req::InputEnd | Req::Signal(_) => {

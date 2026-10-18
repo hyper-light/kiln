@@ -1093,7 +1093,7 @@ fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> an
         hosts.push((h, values));
     }
     let posted = f.call("POST", "/api/observe/v1/distribution_points", Some(&json!({ "series": series })))?;
-    anyhow::ensure!(posted["values"] == 6000, "{posted}");
+    anyhow::ensure!(at(&posted, &["values"]) == 6000, "{posted}");
     // OTLP: d's delta histogram; e's cumulative, exported twice (the second all the first's and more).
     let histogram = |host: &str, cumulative: bool, start_ns: u64, at_ms: i64, values: &[f64]| -> Value {
         let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
@@ -1131,7 +1131,7 @@ fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> an
     all.sort_by(f64::total_cmp);
     let ask = |q: &str| -> anyhow::Result<Vec<(String, f64)>> {
         let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": end, "step": STEP })))?;
-        Ok(at(&a, &["series"]).as_array().into_iter().flatten().map(|s| (at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned(), s["values"][0].as_f64().unwrap_or(f64::NAN))).collect())
+        Ok(at(&a, &["series"]).as_array().into_iter().flatten().map(|s| (at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned(), s.get("values").and_then(|v| v.get(0)).and_then(Value::as_f64).unwrap_or(f64::NAN))).collect())
     };
     let start = Instant::now();
     loop {
@@ -1142,12 +1142,12 @@ fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> an
         anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{n} of {} values counted\n{}", all.len(), f.logs());
         std::thread::sleep(Duration::from_millis(250));
     }
-    let exact = |v: &[f64], q: f64| v[((v.len() - 1) as f64 * q).floor() as usize];
+    let exact = |v: &[f64], q: f64| v.get((v.len().saturating_sub(1) as f64 * q).floor() as usize).copied().unwrap_or(f64::NAN);
     let bound = ((2f64).powi(-kiln_obs::dist::SCALE) * 0.5).exp2() - 1.0;
     for (q, p) in [("p50", 0.5), ("p99", 0.99), ("p99.9", 0.999)] {
         let got = ask(&format!("{q}:e2e.lat{{*}}"))?;
         let want = exact(&all, p);
-        anyhow::ensure!(got.len() == 1 && ((got[0].1 - want) / want).abs() <= bound, "{q}: {got:?} for {want} (within {bound})");
+        anyhow::ensure!(got.len() == 1 && got.first().is_some_and(|g| ((g.1 - want) / want).abs() <= bound), "{q}: {got:?} for {want} (within {bound})");
     }
     let by_host = ask("p99:e2e.lat{*} by {host}")?;
     for (h, values) in &mut hosts {
@@ -1161,7 +1161,8 @@ fn a_distribution_s_percentiles_merge_across_hosts_from_the_api_and_otlp() -> an
     anyhow::ensure!(((avg - mean) / mean).abs() < 1e-9, "avg {avg} for {mean}");
     // A heatmap of it: every value once, in rows of its buckets.
     let h = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "p50:e2e.lat{*}", "from": from, "to": end, "step": STEP, "heatmap": 40 })))?;
-    let total: f64 = h["heatmap"]["counts"].as_array().into_iter().flatten().flat_map(|row| row.as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_f64()).sum();
-    anyhow::ensure!(h["heatmap"]["distribution"] == true && total == all.len() as f64 && h["heatmap"]["rows"].as_array().is_some_and(|r| r.len() <= 40), "{total} of {} in the heatmap: {}", all.len(), h["heatmap"]["rows"]);
+    let total: f64 = at(&h, &["heatmap", "counts"]).as_array().into_iter().flatten().flat_map(|row| row.as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_f64()).sum();
+    let rows = at(&h, &["heatmap", "rows"]);
+    anyhow::ensure!(at(&h, &["heatmap", "distribution"]) == true && total == all.len() as f64 && rows.as_array().is_some_and(|r| r.len() <= 40), "{total} of {} in the heatmap: {rows}", all.len());
     Ok(())
 }

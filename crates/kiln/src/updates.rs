@@ -90,6 +90,16 @@ pub struct Job {
     pub reached: bool,
     pub log: Vec<String>,
     pub error: Option<String>,
+    /// Its last log line is a progress line (a terminal's carriage return draws it over): the
+    /// next line takes its place.
+    #[serde(skip)]
+    progress: bool,
+    /// The runner upgrades blue/green ([`crate::proto::CAP_BLUE_GREEN`]), and (`handed_over`) it
+    /// said the new build took over.
+    #[serde(skip)]
+    blue_green: bool,
+    #[serde(skip)]
+    handed_over: bool,
 }
 
 /// A binary kiln can hand out for a platform.
@@ -177,12 +187,16 @@ pub fn own_binary() -> Result<(String, u64), String> {
     .clone()
 }
 
-/// This binary's build id ("unknown" if it can't be read).
+/// This binary's build id ("unknown" if it can't be read): the build it was before kiln signed it
+/// on this Mac, when it did (`crate::os::macsign`).
 pub fn own_build() -> String {
-    own_binary().map_or_else(|_| "unknown".to_owned(), |(h, _)| build_id(&h))
+    own_binary().map_or_else(
+        |_| "unknown".to_owned(),
+        |(h, _)| std::env::current_exe().ok().and_then(|p| crate::os::macsign::build_of(&p, &h)).unwrap_or_else(|| build_id(&h)),
+    )
 }
 
-fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
+pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
     use std::io::Read as _;
     let mut f = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
     let mut h = Sha256::new();
@@ -371,6 +385,8 @@ fn in_step_of(others: &[&str], kept: &[Binary], commit: &str) -> InStep {
 struct Starts {
     /// Unix seconds.
     last: Option<i64>,
+    /// Release jobs whose binaries were kept here already (`keep_in_step`).
+    kept: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -447,7 +463,15 @@ async fn keep_in_step(hub: &Hub, commit: &str, starts: &mut Starts) -> anyhow::R
     let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| anyhow::anyhow!("kiln doesn't build {} (no repository of that name)", u.release_repo))?;
     let runs: Vec<crate::store::Run> =
         hub.store.runs(Some(repo.id.clone()), 200, None).await?.into_iter().filter(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit)).collect();
-    if next(&runs, starts, crate::util::now_unix()) != Next::Build {
+    // Built when it was pushed, before this server ran it (nothing then took it): kept now.
+    for run in &runs {
+        for job in hub.store.jobs(run.id.clone(), false).await.unwrap_or_default() {
+            if job.status == crate::store::Status::Succeeded && starts.kept.insert(job.id.clone()) {
+                hub.adopt_release(&job.id, run).await;
+            }
+        }
+    }
+    if in_step(hub, commit).in_step || next(&runs, starts, crate::util::now_unix()) != Next::Build {
         return Ok(());
     }
     match build_commit(hub, &repo, commit).await {
@@ -756,6 +780,27 @@ impl Updates {
         self.jobs.lock().iter().any(|j| j.id == id && j.reached)
     }
 
+    /// A runner that reports the commit job `id` brings it to, on a build other than the one it
+    /// ran before, has arrived as well. Its machine signed the build again (a Mac's `kiln
+    /// signing`), which changes its bytes and so the build it reports.
+    pub(crate) fn reached_commit(&self, hub: &Hub, id: &str, machine: &str) {
+        let Some(j) = self.jobs.lock().iter().find(|j| j.id == id && !j.reached && j.commit.is_some()).cloned() else { return };
+        let build = crate::fleet::newest_build(hub, machine);
+        let commit = build.as_deref().and_then(|b| crate::fleet::runner_commit(hub, machine, Some(b)));
+        if let (true, Some(build), Some(commit)) = (arrived_by_commit(&j, build.as_deref(), commit.as_deref()), build, commit) {
+            self.update(hub, id, |j| {
+                j.reached = true;
+                push_line(j, format!("{machine} is running {} (build {build}, signed again on the machine)", crate::fleet::short(&commit)));
+            });
+        }
+    }
+
+    /// The upgrade is through: the new build reported in and, on a runner that upgrades
+    /// blue/green, the old one said it took over.
+    pub(crate) fn through(&self, id: &str) -> bool {
+        self.jobs.lock().iter().any(|j| j.id == id && j.reached && (!j.blue_green || j.handed_over))
+    }
+
     /// A job already running for `target`.
     pub(crate) fn running_for(&self, kind: &str, target: &str) -> Option<Job> {
         self.jobs.lock().iter().find(|j| j.kind == kind && j.target == target && j.state == JobState::Running).cloned()
@@ -775,6 +820,26 @@ impl Updates {
     pub(crate) fn say(&self, hub: &Hub, id: &str, line: impl Into<String>) {
         let line = line.into();
         self.update(hub, id, |j| push_line(j, line));
+    }
+
+    /// The line a terminal is drawing over (a progress bar): shown last, in place of the one before.
+    pub(crate) fn progress(&self, hub: &Hub, id: &str, line: impl Into<String>) {
+        let line = line.into();
+        self.update(hub, id, |j| {
+            push_line(j, line);
+            j.progress = true;
+        });
+    }
+
+    /// The progress line showing, if any, goes: what was drawn there finished as a hidden line.
+    pub(crate) fn end_progress(&self, hub: &Hub, id: &str) {
+        if self.jobs.lock().iter().any(|j| j.id == id && j.progress) {
+            self.update(hub, id, |j| {
+                if std::mem::take(&mut j.progress) {
+                    j.log.pop();
+                }
+            });
+        }
     }
 
     /// A build job's machine says which build it made: the job is reached when that reports in.
@@ -819,7 +884,10 @@ impl Updates {
     /// in (the job's driver waits for that); a failure completes it now.
     pub fn on_done(&self, hub: &Hub, job: &str, ok: bool, error: Option<String>) {
         if ok {
-            self.say(hub, job, "the runner finished installing");
+            self.update(hub, job, |j| {
+                j.handed_over = j.blue_green;
+                push_line(j, if j.blue_green { "the new build took over" } else { "the runner finished installing" }.to_owned());
+            });
         } else {
             self.finish(hub, job, Err(error.unwrap_or_else(|| "the runner reported a failure".to_owned())));
         }
@@ -843,7 +911,18 @@ impl Updates {
     }
 }
 
+/// Whether a runner whose newest process runs `build`, built from `commit`, is where job `j`
+/// brings it: a build other than the one it ran before, of the job's commit.
+fn arrived_by_commit(j: &Job, build: Option<&str>, commit: Option<&str>) -> bool {
+    let (Some(want), Some(build), Some(commit)) = (j.commit.as_deref(), build, commit) else { return false };
+    !j.reached && j.from_build.as_deref() != Some(build) && commit.eq_ignore_ascii_case(want)
+}
+
 fn push_line(j: &mut Job, line: String) {
+    // A progress line gives way to the next line (the terminal draws it again after).
+    if std::mem::take(&mut j.progress) {
+        j.log.pop();
+    }
     j.log.push(line);
     if j.log.len() > KEEP_LINES {
         let cut = j.log.len() - KEEP_LINES;
@@ -866,6 +945,9 @@ pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, fr
         reached: false,
         log: Vec::new(),
         error: None,
+        progress: false,
+        blue_green: false,
+        handed_over: false,
     }
 }
 
@@ -899,13 +981,95 @@ pub struct RunnerInfo {
     pub next: Option<String>,
     /// How: "download", "build", "wait", "upgrading" (it is), or "left" (left alone).
     pub how: Option<&'static str>,
+    /// The release run it waits for, and how far that is.
+    pub waits_on: Option<crate::fleet::ReleaseRun>,
     /// Its kiln checkout, as it reports it.
     pub checkout: Option<String>,
     /// "native" or "terminal".
     pub method: &'static str,
     /// Terminals are allowed on it (an older runner is upgraded through one).
     pub terminal: bool,
+    /// What it does with a newer kiln, as chosen for it.
+    pub policy: Policy,
+    /// Its machine refuses upgrades (its own kiln config: `[updates] accept = false`): it is never
+    /// upgraded, whatever its policy here.
+    pub locked: bool,
+    /// Where the build it would get comes from ("this server's own build", "built by release run
+    /// #141", "built by adas-macbook", ...), when there is one.
+    pub from: Option<String>,
     pub instances: Vec<crate::instances::InstanceView>,
+}
+
+/// What a runner does with a newer kiln (`crate::fleet`), as chosen for it in Settings → Updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Policy {
+    /// Upgraded as soon as there is a build of the newest kiln for it.
+    Auto,
+    /// Told a newer kiln is available, and where it comes from; upgraded when someone chooses to.
+    #[default]
+    Notify,
+    /// Left alone: never upgraded, on its own or with the others, until its policy changes.
+    Off,
+}
+
+impl Policy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Notify => "notify",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "notify" => Some(Self::Notify),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Where a runner's policy is kept (none: the default).
+fn policy_key(machine: &str) -> String {
+    format!("updates/policy/{machine}")
+}
+
+/// `machine`'s update policy: Notify unless someone chose otherwise.
+pub async fn policy(hub: &Hub, machine: &str) -> Policy {
+    hub.store.kv_get(policy_key(machine)).await.ok().flatten().and_then(|v| Policy::parse(&v)).unwrap_or_default()
+}
+
+/// Set `machine`'s update policy.
+pub async fn set_policy(hub: &Hub, machine: &str, p: Policy) -> anyhow::Result<()> {
+    if p == Policy::default() { hub.store.kv_delete(policy_key(machine)).await } else { hub.store.kv_set(policy_key(machine), p.as_str().to_owned()).await }
+}
+
+/// The runners' gauges (`crate::metrics`): up, behind, update policy and the kiln each runs.
+pub async fn measure(hub: &Arc<Hub>) {
+    let rs = runners(hub).await;
+    let m = crate::metrics::global();
+    m.runner_up.replace(rs.iter().map(|r| (vec![r.name.clone()], i64::from(r.connected))));
+    m.runner_behind.replace(rs.iter().map(|r| (vec![r.name.clone()], i64::from(matches!(r.standing, Some(crate::fleet::Standing::Behind | crate::fleet::Standing::Unknown))))));
+    m.runner_update_policy.replace(rs.iter().map(|r| (vec![r.name.clone(), r.policy.as_str().to_owned()], 1)));
+    m.runner_version_info.replace(rs.iter().map(|r| {
+        let version = r.commit.as_deref().map(|c| short(c).to_owned()).or_else(|| r.build.clone()).unwrap_or_else(|| "unknown".to_owned());
+        (vec![r.name.clone(), version], 1)
+    }));
+}
+
+/// Where a build kiln hands out comes from, said for a person.
+pub fn from_words(b: &Binary) -> String {
+    match b.origin.as_str() {
+        "server" => "this server's own build".to_owned(),
+        "built" => b.run.map_or_else(|| "built by kiln's release pipeline".to_owned(), |n| format!("built by release run #{n}")),
+        "machine" => b.by.as_ref().map_or_else(|| "built by one of its machines".to_owned(), |m| format!("built by {m}")),
+        "upload" => "uploaded here".to_owned(),
+        "release" => "a GitHub release".to_owned(),
+        other => other.to_owned(),
+    }
 }
 
 pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
@@ -926,6 +1090,9 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 up_to_date: build.is_some() && build == target_build,
                 method: if newest.is_some_and(|i| i.can_upgrade) { "native" } else { "terminal" },
                 terminal: a.terminal,
+                policy: Policy::default(),
+                locked: false,
+                from: None,
                 target,
                 target_build,
                 build,
@@ -940,6 +1107,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 standing: None,
                 next: None,
                 how: None,
+                waits_on: None,
                 checkout: None,
             }
         })
@@ -948,16 +1116,23 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
     // Against the newest kiln, when there is one: the commit each runs, and how it gets there.
     let newest = hub.updates.fleet.target();
     for r in &mut out {
+        r.policy = policy(hub, &r.name).await;
+        r.locked = hub.updates.fleet.refuses(&r.name);
         r.commit = crate::fleet::runner_commit(hub, &r.name, r.build.as_deref());
         r.checkout = crate::fleet::reported(hub, &r.name).and_then(|k| k.checkout);
         let Some(t) = &newest else { continue };
-        r.target_build = r.target.as_deref().and_then(|target| crate::fleet::binary_for(hub, target, &t.commit)).map(|b| b.build);
+        let b = r.target.as_deref().and_then(|target| crate::fleet::binary_for(hub, target, &t.commit));
+        r.from = b.as_ref().map(from_words);
+        r.target_build = b.map(|b| b.build);
         let s = crate::fleet::standing(hub, r, t).await;
         r.up_to_date = s == crate::fleet::Standing::Current;
         r.standing = Some(s);
         if r.connected
             && let Some((how, next)) = crate::fleet::next(hub, r, t, s).await
         {
+            if how == "wait" {
+                r.waits_on = crate::fleet::waits_on(hub, r, t).await;
+            }
             r.how = Some(how);
             r.next = Some(next);
         }
@@ -974,6 +1149,8 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job
         return Ok(j);
     }
     let r = runners(hub).await.into_iter().find(|r| r.name == machine).ok_or_else(|| anyhow::anyhow!("there is no runner called {machine}"))?;
+    anyhow::ensure!(r.policy != Policy::Off, "updates are off for {machine}: turn them on to upgrade it");
+    anyhow::ensure!(!r.locked, "{machine} refuses upgrades: its own kiln config says [updates] accept = false");
     anyhow::ensure!(r.connected, "{machine} is not connected");
     if let Some(t) = hub.updates.fleet.target() {
         anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
@@ -1046,14 +1223,21 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
         u.finish(hub, id, Err(format!("{machine} is not connected")));
         return;
     }
-    u.say(hub, id, "asked the runner to upgrade itself");
+    // A runner that upgrades blue/green is through once it says its new build took over.
+    let blue_green = {
+        let inst = hub.instances.lock();
+        inst.newest(machine).and_then(|p| inst.get(p)).is_some_and(|i| i.caps & crate::proto::CAP_BLUE_GREEN != 0)
+    };
+    u.update(hub, id, |j| j.blue_green = blue_green);
+    u.say(hub, id, if blue_green { "asked the runner to upgrade itself: the new build starts beside it and takes over" } else { "asked the runner to upgrade itself" });
     let deadline = Instant::now() + RUNNER_TIMEOUT;
     while Instant::now() < deadline {
         crate::rt::sleep(Duration::from_secs(1)).await;
         if !u.running(id) {
             return;
         }
-        if u.reached(id) {
+        u.reached_commit(hub, id, machine);
+        if u.through(id) {
             u.finish(hub, id, Ok(String::new()));
             return;
         }
@@ -1129,8 +1313,62 @@ fn download_urls(hub: &Hub, target: &str, build: &str) -> Vec<String> {
     server_bases(hub).into_iter().map(|base| format!("{base}/dl/kiln/{target}/{build}")).collect()
 }
 
-/// Terminal output without escape sequences or carriage returns.
-pub(crate) fn plain(s: &str) -> String {
+/// Terminal output line by line, as the terminal shows it: a carriage return starts the line over,
+/// so a progress bar that keeps drawing itself is one line, its latest drawing.
+#[derive(Default)]
+pub(crate) struct Screen {
+    line: String,
+    /// A carriage return came last: what follows draws over the line.
+    back: bool,
+    /// The line under way has been drawn over.
+    redrawn: bool,
+}
+
+/// What [`Screen::feed`] shows.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Shown {
+    /// A line a newline ended.
+    Line(String),
+    /// The line being drawn over (a progress bar), as it is now.
+    Progress(String),
+}
+
+impl Screen {
+    /// The lines `text` ends, then the line under way when it's being drawn over.
+    pub(crate) fn feed(&mut self, text: &str) -> Vec<Shown> {
+        let mut out = Vec::new();
+        for c in strip(text).chars() {
+            match c {
+                '\n' => {
+                    out.push(Shown::Line(std::mem::take(&mut self.line)));
+                    self.back = false;
+                    self.redrawn = false;
+                }
+                '\r' => self.back = true,
+                c => {
+                    if std::mem::take(&mut self.back) {
+                        self.redrawn |= !self.line.trim().is_empty();
+                        self.line.clear();
+                    }
+                    self.line.push(c);
+                }
+            }
+        }
+        if (self.back || self.redrawn) && !self.line.trim().is_empty() {
+            out.push(Shown::Progress(self.line.clone()));
+        }
+        out
+    }
+}
+
+/// A line of an upgrade's script that is kiln's own: never shown as it's being drawn.
+pub(crate) fn marked(line: &str) -> bool {
+    line.starts_with(HIDDEN_MARK) || line.contains(OK_MARK) || line.contains(FAIL_MARK)
+}
+
+/// Terminal output without escape sequences or control characters, but for line ends (`\n`, and
+/// `\r`, for [`Screen`]) and tabs.
+fn strip(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1158,7 +1396,7 @@ pub(crate) fn plain(s: &str) -> String {
                     chars.next();
                 }
             },
-            '\n' | '\t' => out.push(c),
+            '\n' | '\r' | '\t' => out.push(c),
             c if c.is_control() => {}
             c => out.push(c),
         }
@@ -1179,18 +1417,30 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
     let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(format!("sh -c '{script}'")), 200, 50);
     u.say(hub, id, "this runner predates upgrade commands: running the upgrade in a terminal on it (not listed anywhere)");
     let mut att = session.attach();
-    let mut pending = String::new();
+    let mut screen = Screen::default();
     let mut ok_marked = false;
     let mut feed = |text: &str| {
-        pending.push_str(&plain(text));
-        while let Some(i) = pending.find('\n') {
-            let line: String = pending.drain(..=i).collect();
+        for shown in screen.feed(text) {
+            let line = match shown {
+                Shown::Line(line) => line,
+                Shown::Progress(p) => {
+                    if !marked(&p) {
+                        u.progress(hub, id, p.trim());
+                    }
+                    continue;
+                }
+            };
             let line = line.trim_end();
-            if line.is_empty() || line.starts_with(HIDDEN_MARK) {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(HIDDEN_MARK) {
+                u.end_progress(hub, id);
                 continue;
             }
             if line.contains(OK_MARK) {
                 ok_marked = true;
+                u.end_progress(hub, id);
                 continue;
             }
             u.say(hub, id, line.strip_prefix(FAIL_MARK).map_or(line, str::trim));
@@ -1248,7 +1498,8 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &s
 pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     let mut out = Vec::new();
     for r in runners(hub).await {
-        if r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
+        // Runners whose updates are off are left alone, with the others too.
+        if r.policy != Policy::Off && !r.locked && r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
             out.push(upgrade_runner(hub, &r.name).await.map_err(|e| format!("{}: {e:#}", r.name)));
         }
     }
@@ -1508,8 +1759,9 @@ pub async fn run_on_runner(http: &crate::http::client::Client, server_url: &str,
     r
 }
 
-async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, own_dir: &Path, service: &str, up: &crate::exec::Uplink) -> anyhow::Result<()> {
-    use std::io::{Read as _, Seek as _, Write as _};
+/// Download the binary `order` names from the server into `bin`, and check it: Ok with its build.
+async fn download_verified(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, bin: &Path, up: &crate::exec::Uplink) -> anyhow::Result<String> {
+    use std::io::Write as _;
     let say = |line: String| up.msg(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
     let (path, sha256, size) = (order.path, order.sha256, order.size);
     anyhow::ensure!(path.starts_with("/dl/kiln/") && !path.contains(".."), "refusing to fetch {path}");
@@ -1518,15 +1770,14 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
     say(format!("downloading {url}")).await;
     let mut resp = http.get(&url).timeout(Duration::from_secs(600)).send().await?;
     anyhow::ensure!(resp.is_success(), "the server answered {} for {url}", resp.status());
-    let (bin, log_path) = upgrade_files(own_dir);
-    let mut file = std::fs::File::create(&bin).with_context(|| format!("create {}", bin.display()))?;
+    let mut file = std::fs::File::create(bin).with_context(|| format!("create {}", bin.display()))?;
     let mut h = Sha256::new();
     let mut got = 0u64;
     while let Some(chunk) = resp.chunk().await? {
         got += chunk.len() as u64;
         if got > size {
             drop(file);
-            let _ = std::fs::remove_file(&bin);
+            let _ = std::fs::remove_file(bin);
             anyhow::bail!("the download is larger than announced ({size} bytes)");
         }
         h.update(&chunk);
@@ -1536,11 +1787,66 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
     drop(file);
     let hash = hex::encode(h.finalize());
     if hash != sha256 || got != size {
-        let _ = std::fs::remove_file(&bin);
+        let _ = std::fs::remove_file(bin);
         anyhow::bail!("the download does not match: sha256 {hash}, {got} bytes; expected {sha256}, {size} bytes");
     }
-    crate::os::make_executable(&bin)?;
-    say(format!("verified build {} ({got} bytes)", build_id(&hash))).await;
+    crate::os::make_executable(bin)?;
+    let build = build_id(&hash);
+    say(format!("verified build {build} ({got} bytes)")).await;
+    Ok(build)
+}
+
+/// For a blue/green upgrade (`crate::bluegreen`): the binary `order` names, downloaded, checked and
+/// kept under `<state>/versions/<build>/`, where the new build's runner runs from (nothing that
+/// runs is replaced). Its path and build.
+pub async fn fetch_build(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, state_dir: &Path, up: &crate::exec::Uplink) -> anyhow::Result<(PathBuf, String)> {
+    anyhow::ensure!(!UPGRADING.swap(true, Ordering::AcqRel), "an upgrade is already running on this runner");
+    let r = async {
+        let versions = state_dir.join("versions");
+        let mut mk = std::fs::DirBuilder::new();
+        mk.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut mk, 0o700);
+        mk.create(&versions)?;
+        let part = versions.join(format!(".download-{}", std::process::id()));
+        let build = download_verified(http, server_url, order, &part, up).await?;
+        let dir = versions.join(&build);
+        mk.create(&dir)?;
+        let exe = dir.join(if cfg!(windows) { "kiln.exe" } else { "kiln" });
+        // On a Mac, signed as kiln (this machine's identity): macOS knows it as the program it
+        // let onto the local network already.
+        if let Err(e) = crate::os::macsign::sign_as(&part, &exe, &build) {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't sign the new build: macOS may ask again before it reaches the server");
+        }
+        std::fs::rename(&part, &exe).with_context(|| format!("keep {}", exe.display()))?;
+        Ok((exe, build))
+    }
+    .await;
+    UPGRADING.store(false, Ordering::Release);
+    r
+}
+
+/// Every build kept under `<state>/versions/` but `keep`'s (the one running) and the newest few:
+/// removed.
+pub fn prune_versions(state_dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(state_dir.join("versions")) else { return };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n != keep && !n.starts_with('.')))
+        .filter_map(|e| Some((e.metadata().and_then(|m| m.modified()).ok()?, e.path())))
+        .collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
+    // The newest two besides the running one stay: what a rollback goes back to.
+    for (_, d) in dirs.into_iter().skip(2) {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, order: &Order<'_>, own_dir: &Path, service: &str, up: &crate::exec::Uplink) -> anyhow::Result<()> {
+    use std::io::{Read as _, Seek as _};
+    let say = |line: String| up.msg(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
+    let (bin, log_path) = upgrade_files(own_dir);
+    download_verified(http, server_url, order, &bin, up).await?;
     say(format!("kiln install --agent --upgrade --service {service}")).await;
 
     // Its output goes to a file, not a pipe: a runner that takes the binary in place re-executes
@@ -1624,9 +1930,11 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
 /// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
 pub fn runner_build() -> AgentMsg {
     let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
+    // Under a supervisor that can start a new build beside it (`kiln supervise` on Unix).
+    let blue_green = if crate::bluegreen::Supervisor::from_env().is_some() { crate::proto::CAP_BLUE_GREEN } else { 0 };
     // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
     let rootless = if docker != 0 && crate::runner::docker::rootless_engine() { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | rootless }
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | blue_green | rootless }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
@@ -1666,6 +1974,7 @@ pub fn kiln_checkout() -> Option<PathBuf> {
 
 /// Everything this build's runner can do ([`AgentMsg::Build`]).
 pub const RUNNER_CAPS: u32 = CAP_UPGRADE
+    | crate::proto::CAP_UPDATES
     | crate::proto::CAP_FACTS
     | crate::proto::CAP_TAKEOVER
     | crate::proto::CAP_DIRS
@@ -1797,9 +2106,9 @@ mod tests {
         assert_eq!(next(&[run(Failed, Some(now - 3600))], &none, now), Next::Build);
         // A start that failed (the commit wasn't pushed yet) waits 10 minutes, then tries again, for
         // as long as it takes: only builds that ran and failed count.
-        assert_eq!(next(&[], &Starts { last: Some(now - 60) }, now), Next::Wait);
-        assert_eq!(next(&[], &Starts { last: Some(now - 11 * 60) }, now), Next::Build);
-        assert_eq!(next(&[run(Failed, Some(now - 7200))], &Starts { last: Some(now - 11 * 60) }, now), Next::Build);
+        assert_eq!(next(&[], &Starts { last: Some(now - 60), ..Starts::default() }, now), Next::Wait);
+        assert_eq!(next(&[], &Starts { last: Some(now - 11 * 60), ..Starts::default() }, now), Next::Build);
+        assert_eq!(next(&[run(Failed, Some(now - 7200))], &Starts { last: Some(now - 11 * 60), ..Starts::default() }, now), Next::Build);
         let failed3 = [run(Failed, Some(now - 9000)), run(Failed, Some(now - 8000)), run(Failed, Some(now - 7200))];
         assert_eq!(next(&failed3, &none, now), Next::Nothing);
     }
@@ -1946,8 +2255,52 @@ mod tests {
 
     #[test]
     fn terminal_output_becomes_plain_lines() {
-        assert_eq!(plain("\x1b[2mhello\x1b[0m\r\nworld\x1b]0;title\x07!"), "hello\nworld!");
-        assert_eq!(plain("a\x1b]2;t\x1b\\b"), "ab");
+        let mut screen = Screen::default();
+        assert_eq!(screen.feed("\x1b[2mhello\x1b[0m\r\nworld\x1b]0;title\x07!\n"), [Shown::Line("hello".into()), Shown::Line("world!".into())]);
+        assert_eq!(screen.feed("a\x1b]2;t\x1b\\b\n"), [Shown::Line("ab".into())]);
+    }
+
+    #[test]
+    fn a_runner_signed_again_on_its_machine_has_arrived_once_it_reports_the_jobs_commit() {
+        let to = "31c0bbaf734c4b130b43dcfaec93cc647c1ce536";
+        let mut j = new_job("runner", "mac", "native", Some("89cfa54c0577".into()), Some("b8a054982136".into()));
+        j.commit = Some(to.into());
+        // Still the build it ran before: not yet, whatever commit it says.
+        assert!(!arrived_by_commit(&j, Some("89cfa54c0577"), Some(to)));
+        // Another build (its machine signed the new one again) of the job's commit: arrived.
+        assert!(arrived_by_commit(&j, Some("46a3145906a2"), Some(&to.to_ascii_uppercase())));
+        // Another commit, or none known: not.
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), Some("561a240d637481421c8a402205027de71b100b2e")));
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), None));
+        // A job that doesn't know its commit waits for its build to be reported.
+        j.commit = None;
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), Some(to)));
+    }
+
+    #[test]
+    fn a_progress_bar_is_one_line_that_keeps_up() {
+        // cargo's: drawn, then drawn over (a carriage return), lines it finishes printed above it.
+        let mut screen = Screen::default();
+        assert_eq!(screen.feed("   Building [=> ] 1/364: a\r"), [Shown::Progress("   Building [=> ] 1/364: a".into())]);
+        assert_eq!(screen.feed("   Building [==> ] 2/364: b\r"), [Shown::Progress("   Building [==> ] 2/364: b".into())]);
+        assert_eq!(
+            screen.feed("\x1b[K   Compiling kiln\n   Building [===> ] 363/364: kiln\r"),
+            [Shown::Line("   Compiling kiln".into()), Shown::Progress("   Building [===> ] 363/364: kiln".into())]
+        );
+        // A line's CR and LF in two reads: the line, once it ends.
+        let mut screen = Screen::default();
+        assert_eq!(screen.feed("done\r"), [Shown::Progress("done".into())]);
+        assert_eq!(screen.feed("\n"), [Shown::Line("done".into())]);
+        // In the job's log it's the last line, drawn over in place, and gives way to the next line.
+        let mut j = new_job("runner", "m", "build", None, None);
+        push_line(&mut j, "Compiling a".into());
+        for p in ["Building 1/3", "Building 2/3"] {
+            push_line(&mut j, p.into());
+            j.progress = true;
+        }
+        assert_eq!(j.log, ["Compiling a", "Building 2/3"]);
+        push_line(&mut j, "Compiling b".into());
+        assert_eq!(j.log, ["Compiling a", "Compiling b"]);
     }
 
     #[test]

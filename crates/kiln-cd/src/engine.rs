@@ -1151,6 +1151,9 @@ impl Engine {
     fn remove_app(&mut self, id: &str, cascade: Option<Propagation>) {
         let Some(a) = self.app_by_id.remove(id) else { return };
         let Some(app) = self.apps.get_mut(a as usize).and_then(Option::take) else { return };
+        // A read-only app (one shadowed from Argo CD) never writes, also as it goes: what it
+        // compared is someone else's to delete.
+        let cascade = cascade.filter(|_| !app.cfg.read_only);
         self.app_by_tracking.remove(app.cfg.tracked_as());
         self.count_managers(&app.cfg, false);
         let c = app.cluster;
@@ -2554,6 +2557,12 @@ impl Engine {
                     _ => {}
                 },
                 sync::Action::Apply => {
+                    // Sent and not answered yet: the live object is still the one from before, and
+                    // its health says nothing of this apply. Settled by it, the task would end its
+                    // sync while applies wait in the cluster's queue, and they'd be dropped.
+                    if *s == TaskState::Running {
+                        continue;
+                    }
                     if *s == TaskState::Done && !op.multi_step {
                         out.push((i, TaskState::Settled, String::new()));
                         continue;

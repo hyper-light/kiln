@@ -152,6 +152,32 @@ enum Cmd {
     Routing(kiln::ci::cli::RoutingArgs),
     /// CI environments: list, create (with protection), delete, deployments.
     Env(kiln::ci::cli::EnvArgs),
+    /// Repositories: list them; create one kiln hosts, or import one from upstream.
+    Repo(kiln::ci::cli::RepoArgs),
+    /// Clone a repository kiln hosts, with kiln's credentials and the commit-msg hook that gives
+    /// each commit a Change-Id.
+    Clone(kiln::ci::review_cli::CloneArgs),
+    /// Send the commits between the trunk and HEAD for review: each a diff, or a new version of
+    /// its diff (`git push kiln HEAD:refs/for/<trunk>`).
+    Submit(kiln::ci::review_cli::SubmitArgs),
+    /// Fetch the trunk and rebase the stack onto it; landed diffs drop out.
+    Sync(kiln::ci::review_cli::SyncArgs),
+    /// A repository's diffs.
+    Diffs(kiln::ci::review_cli::DiffsArgs),
+    /// Check out a diff's version: `kiln checkout D12` (its latest) or `D12@v2`.
+    Checkout(kiln::ci::review_cli::CheckoutArgs),
+    /// Change requests: `kiln cr open [branch]` reviews a branch against the trunk as a whole.
+    Cr(kiln::ci::review_cli::CrArgs),
+    /// Land diffs (each with those below it) through the land queue: `kiln land D12 --strategy stack`.
+    Land(kiln::ci::review_cli::LandArgs),
+    /// A diff's review: what keeps it from landing and its open threads; or a review of it
+    /// (`--accept`, `--request-changes`, `--comment`, `--resign`).
+    Review(kiln::ci::review_cli::ReviewArgs),
+    /// kiln's commit-msg hook for this repository: install (or print) it.
+    Hook(kiln::ci::review_cli::HookArgs),
+    /// git's credential helper for kiln servers (`kiln clone` sets it up).
+    #[command(hide = true)]
+    GitCredential(kiln::ci::review_cli::GitCredentialArgs),
     /// Approve (or reject) a run's deployments waiting for review.
     Approve(kiln::ci::cli::ApproveArgs),
     /// A kept CI leg: keep it longer, or release it.
@@ -164,6 +190,13 @@ enum Cmd {
     Roles(kiln::authz::cli::RolesArgs),
     /// Personal access tokens and agent tokens: create (shown once), list, revoke, rotate.
     Tokens(kiln::authz::cli::TokensArgs),
+    /// The fleet's kiln versions and update policies: list, policy, upgrade, build.
+    Updates(kiln::updates_cli::UpdatesArgs),
+    /// This machine's kiln config: path, show, get, set, unset (by dotted key).
+    Config(kiln::config_cli::ConfigArgs),
+    /// kiln's own code signature on a Mac: `setup` once, so macOS keeps kiln's local network
+    /// access across upgrades (status by default).
+    Signing(kiln::os::macsign::SigningArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -445,6 +478,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 shell: a.shell,
                 credentials: None,
                 instance: a.instance,
+                config: Some(config_path.clone()),
                 // Commands from other runners are a terminal's worth of access: not without one.
                 reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
                 observe: !a.ephemeral && !a.no_observe,
@@ -489,6 +523,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 shell: a.shell,
                 credentials: None,
                 instance: None,
+                config: None,
                 // It runs no other machine's commands (reach), and for now sends none.
                 reach: None,
                 // Not of the fleet: no replica of the observe group.
@@ -696,12 +731,26 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Cancel(a) => kiln::ci::cli::cancel(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Env(a) => kiln::ci::cli::env(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Repo(a) => kiln::ci::cli::repo(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Clone(a) => kiln::ci::review_cli::clone(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Submit(a) => kiln::ci::review_cli::submit(a),
+        Cmd::Sync(a) => kiln::ci::review_cli::sync(a),
+        Cmd::Diffs(a) => kiln::ci::review_cli::diffs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Checkout(a) => kiln::ci::review_cli::checkout(a),
+        Cmd::Cr(a) => kiln::ci::review_cli::cr(a),
+        Cmd::Land(a) => kiln::ci::review_cli::land(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Review(a) => kiln::ci::review_cli::review(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Hook(a) => kiln::ci::review_cli::hook(a),
+        Cmd::GitCredential(a) => kiln::ci::review_cli::git_credential(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Approve(a) => kiln::ci::cli::approve(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Debug(a) => kiln::ci::cli::debug(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Grants(a) => kiln::authz::cli::grants(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Roles(a) => kiln::authz::cli::roles(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Tokens(a) => kiln::authz::cli::tokens(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Updates(a) => kiln::updates_cli::run(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Config(a) => kiln::config_cli::run(a, &config_path),
+        Cmd::Signing(a) => kiln::os::macsign::run(a),
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;

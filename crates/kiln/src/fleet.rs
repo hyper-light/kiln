@@ -116,6 +116,10 @@ pub struct Fleet {
     no_checkout: Mutex<HashMap<String, Instant>>,
     /// Commits looked up on the release branch.
     on_branch: Mutex<HashMap<String, Branch>>,
+    /// Machines whose own kiln config refuses upgrades (`[updates] accept = false`).
+    refusing: Mutex<std::collections::HashSet<String>>,
+    /// (machine, commit): told a newer kiln is available.
+    told: Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 /// A commit against the release branch, as last looked up.
@@ -133,6 +137,21 @@ impl Fleet {
     /// Look at the fleet again now: a runner reported in, a binary arrived, an upgrade ended.
     pub fn wake(&self) {
         self.wake.notify();
+    }
+
+    /// What `machine`'s own kiln config says of upgrades ([`crate::proto::AgentMsg::UpdatePrefs`]).
+    pub fn set_accept(&self, machine: &str, accept: bool) {
+        let mut g = self.refusing.lock();
+        if accept {
+            g.remove(machine);
+        } else {
+            g.insert(machine.to_owned());
+        }
+    }
+
+    /// `machine`'s own kiln config refuses upgrades.
+    pub fn refuses(&self, machine: &str) -> bool {
+        self.refusing.lock().contains(machine)
     }
 
     /// The newest kiln, as last decided.
@@ -295,7 +314,7 @@ async fn commit_time(hub: &Hub, mirror: &str, commit: &str) -> i64 {
 }
 
 /// The build a machine's newest runner process runs.
-fn newest_build(hub: &Hub, machine: &str) -> Option<String> {
+pub(crate) fn newest_build(hub: &Hub, machine: &str) -> Option<String> {
     hub.runner_processes(machine).into_iter().find(|i| i.newest).and_then(|i| i.build)
 }
 
@@ -423,18 +442,88 @@ pub enum Plan {
     Wait(String),
 }
 
-/// A run of the release pipeline building `commit` right now (a job of it running): its number.
-async fn release_building(hub: &Hub, commit: &str) -> Option<i64> {
+/// A release run building what a runner waits for, and how far it is: what the runner's row says
+/// and links to.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseRun {
+    /// The run's id (its page) and number.
+    pub run: String,
+    pub number: i64,
+    /// Its job's step under way.
+    pub step: Option<String>,
+    /// When that step (else the job) started, in seconds.
+    pub since: Option<i64>,
+    /// The machine its job runs on.
+    pub on: Option<String>,
+}
+
+impl ReleaseRun {
+    /// "run #232: its build step, on adacachy, 11 min in".
+    fn words(&self, now: i64) -> String {
+        let mut w = format!("run #{}", self.number);
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = &self.step {
+            parts.push(format!("its {s} step"));
+        }
+        if let Some(o) = &self.on {
+            parts.push(format!("on {o}"));
+        }
+        if let Some(t) = self.since {
+            parts.push(format!("{} min in", (now - t).max(0) / 60));
+        }
+        if !parts.is_empty() {
+            w.push_str(": ");
+            w.push_str(&parts.join(", "));
+        }
+        w
+    }
+}
+
+/// A run of the release pipeline building `commit` right now (a job of it running), and where it
+/// is. With `target`, only one whose job for that platform is the one running.
+async fn release_building(hub: &Hub, commit: &str, target: Option<&str>) -> Option<ReleaseRun> {
     let u = &hub.cfg.updates;
     let repo = release_repo(hub).await?;
     let runs = hub.store.runs(Some(repo.id.clone()), 50, None).await.ok()?;
     for run in runs.into_iter().filter(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit) && !r.status.is_terminal()) {
         let jobs = hub.store.jobs(run.id.clone(), false).await.unwrap_or_default();
-        if jobs.iter().any(|j| j.status == crate::store::Status::Running) {
-            return Some(run.number);
+        if let Some(j) = jobs.iter().find(|j| j.status == crate::store::Status::Running && target.is_none_or(|t| j.key == platform_job(t))) {
+            let step = j.steps.iter().find(|s| s.status == crate::store::Status::Running);
+            return Some(ReleaseRun {
+                run: run.id.clone(),
+                number: run.number,
+                step: step.map(|s| s.name.clone()),
+                since: step.and_then(|s| s.started_at).or(j.started_at),
+                on: j.agent.clone(),
+            });
         }
     }
     None
+}
+
+/// The release run `r` waits for to reach `t`, when it waits for one (as [`plan`] decides).
+pub async fn waits_on(hub: &Hub, r: &RunnerInfo, t: &Target) -> Option<ReleaseRun> {
+    let target = r.target.as_deref()?;
+    if binary_for(hub, target, &t.commit).is_some() {
+        return None;
+    }
+    match release_building(hub, &t.commit, Some(target)).await {
+        Some(b) => Some(b),
+        None if can_build(hub, r).is_err() => release_building(hub, &t.commit, None).await,
+        None => None,
+    }
+}
+
+/// The release pipeline's job that builds `target`'s binary, on a machine of that platform
+/// (`.kiln/release.yaml`).
+pub fn platform_job(target: &str) -> &'static str {
+    if target.ends_with("-apple-darwin") {
+        "macos"
+    } else if target.contains("-windows-") {
+        "windows"
+    } else {
+        "linux"
+    }
 }
 
 /// Where a machine's kiln checkout may be: its synced copies of kiln, where its agents work (the
@@ -492,12 +581,19 @@ pub async fn plan(hub: &Hub, r: &RunnerInfo, t: &Target) -> Plan {
     if let Some(b) = binary_for(hub, target, &t.commit) {
         return Plan::Download(b);
     }
-    if let Some(n) = release_building(hub, &t.commit).await {
-        return Plan::Wait(format!("waits for the release build of {s} (run #{n})"));
+    let now = crate::util::now_unix();
+    // The release build's job for its platform is under way: that binary comes soon.
+    if let Some(b) = release_building(hub, &t.commit, Some(target)).await {
+        return Plan::Wait(format!("waits for the release build of {s} ({})", b.words(now)));
     }
+    // Otherwise a machine that can build itself does so now, rather than wait on a build of every
+    // platform at once on another machine, which can take hours.
     match can_build(hub, r) {
         Ok(c) => Plan::Build(c),
-        Err(why) => Plan::Wait(format!("waits for a build of {s} for {target}: {why}")),
+        Err(why) => match release_building(hub, &t.commit, None).await {
+            Some(b) => Plan::Wait(format!("waits for the release build of {s} ({})", b.words(now))),
+            None => Plan::Wait(format!("waits for a build of {s} for {target}: {why}")),
+        },
     }
 }
 
@@ -515,12 +611,21 @@ pub async fn next(hub: &Hub, r: &RunnerInfo, t: &Target, standing: Standing) -> 
     if let Some(j) = hub.updates.running_for("runner", &r.name) {
         return Some(("upgrading", if j.method == "build" { format!("is building {s} itself") } else { format!("is upgrading to {s}") }));
     }
-    if let Err(why) = hub.updates.fleet.may_try(&r.name, &t.commit) {
+    let auto = r.policy == crate::updates::Policy::Auto;
+    if r.locked {
+        return Some(("off", format!("{s} is available; its machine refuses upgrades (its kiln config says [updates] accept = false)")));
+    }
+    if r.policy == crate::updates::Policy::Off {
+        return Some(("off", format!("{s} is available; its updates are off, so it stays as it is")));
+    }
+    if auto && let Err(why) = hub.updates.fleet.may_try(&r.name, &t.commit) {
         return Some(("wait", why));
     }
+    // Not upgraded by itself: what its Upgrade does.
+    let when = if auto { "" } else { " when you upgrade it" };
     Some(match plan(hub, r, t).await {
-        Plan::Download(b) => ("download", format!("downloads build {} ({s})", b.build)),
-        Plan::Build(_) => ("build", format!("builds {s} itself")),
+        Plan::Download(b) => ("download", format!("downloads build {} ({s}){when}", b.build)),
+        Plan::Build(_) => ("build", format!("builds {s} itself{when}")),
         Plan::Wait(why) => ("wait", why),
     })
 }
@@ -547,16 +652,39 @@ pub async fn follow_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
                 remember(&hub, &b.build, &b.target, c);
             }
         }
-        let Some(t) = refresh(&hub).await else { continue };
+        let target = refresh(&hub).await;
+        crate::updates::measure(&hub).await;
+        let Some(t) = target else { continue };
+        tell(&hub, &t).await;
         if hub.cfg.updates.follow {
             follow(&hub, &t).await;
         }
     }
 }
 
+/// Tell each runner behind the newest kiln that it is available, and where its build comes from,
+/// once a commit, whatever its policy (only runners that can hear it).
+async fn tell(hub: &Arc<Hub>, t: &Target) {
+    for r in crate::updates::runners(hub).await {
+        if !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) {
+            continue;
+        }
+        let key = (r.name.clone(), t.commit.clone());
+        if hub.updates.fleet.told.lock().contains(&key) {
+            continue;
+        }
+        let Some(peer) = hub.instances.lock().newest_with(&r.name, crate::proto::CAP_UPDATES) else { continue };
+        let from = r.from.clone().unwrap_or_else(|| format!("no build of it for {} yet", r.target.as_deref().unwrap_or("its platform")));
+        let msg = crate::proto::ServerMsg::UpdateAvailable { commit: t.commit.clone(), build: r.target_build.clone().unwrap_or_default(), from };
+        hub.send_peer(peer, &msg).await;
+        hub.updates.fleet.told.lock().insert(key);
+    }
+}
+
 async fn follow(hub: &Arc<Hub>, t: &Target) {
     for r in crate::updates::runners(hub).await {
-        if !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) || hub.updates.running_for("runner", &r.name).is_some() {
+        // Only runners whose policy is Automatic: the rest wait for their Upgrade, or are left alone.
+        if r.policy != crate::updates::Policy::Auto || r.locked || !r.connected || !matches!(r.standing, Some(Standing::Behind | Standing::Unknown)) || hub.updates.running_for("runner", &r.name).is_some() {
             continue;
         }
         if hub.updates.fleet.may_try(&r.name, &t.commit).is_err() {
@@ -762,18 +890,31 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
     let u = &hub.updates;
     let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(format!("sh -c '{script}'")), 200, 50);
     let mut att = session.attach();
-    let mut pending = String::new();
+    let mut screen = crate::updates::Screen::default();
     let (mut ok_marked, mut no_checkout) = (false, false);
     let mut feed = |text: &str| {
-        pending.push_str(&crate::updates::plain(text));
-        while let Some(i) = pending.find('\n') {
-            let line: String = pending.drain(..=i).collect();
+        for shown in screen.feed(text) {
+            let line = match shown {
+                crate::updates::Shown::Line(line) => line,
+                // cargo's progress bar, as it is now (it draws over itself, never ending its line).
+                crate::updates::Shown::Progress(p) => {
+                    if !crate::updates::marked(&p) && !p.starts_with(BUILT_MARK) && !p.starts_with(NO_CHECKOUT_MARK) {
+                        u.progress(hub, id, p.trim());
+                    }
+                    continue;
+                }
+            };
             let line = line.trim_end();
-            if line.is_empty() || line.starts_with(crate::updates::HIDDEN_MARK) {
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with(crate::updates::HIDDEN_MARK) {
+                u.end_progress(hub, id);
                 continue;
             }
             if line.contains(crate::updates::OK_MARK) {
                 ok_marked = true;
+                u.end_progress(hub, id);
                 continue;
             }
             if line.starts_with(NO_CHECKOUT_MARK) {
@@ -781,6 +922,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
             }
             if let Some(sum) = line.strip_prefix(BUILT_MARK) {
                 u.set_to_build(hub, id, &crate::updates::build_id(sum.trim()));
+                u.end_progress(hub, id);
                 continue;
             }
             let line = line.strip_prefix(crate::updates::FAIL_MARK).or_else(|| line.strip_prefix(NO_CHECKOUT_MARK)).map_or(line, str::trim);
@@ -829,6 +971,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
         if !u.running(id) {
             return;
         }
+        u.reached_commit(hub, id, machine);
         if u.reached(id) {
             u.finish(hub, id, Ok(String::new()));
             return;
@@ -841,6 +984,14 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_run_says_how_far_it_is() {
+        let r = ReleaseRun { run: "01a1".into(), number: 232, step: Some("build".into()), since: Some(1_000), on: Some("adacachy".into()) };
+        assert_eq!(r.words(1_000 + 11 * 60 + 5), "run #232: its build step, on adacachy, 11 min in");
+        let bare = ReleaseRun { run: "01a1".into(), number: 7, step: None, since: None, on: None };
+        assert_eq!(bare.words(0), "run #7");
+    }
 
     #[test]
     fn short_and_commits() {

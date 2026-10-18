@@ -250,6 +250,14 @@ pub enum At {
     Job(usize),
     /// The runner at this segment.
     Runner(usize),
+    /// The diff at this segment (`D12`, `12`, or its id): its repository.
+    Diff(usize),
+    /// The stack at this segment: its repository.
+    Stack(usize),
+    /// The review comment at this segment: its diff's repository.
+    Comment(usize),
+    /// The land queue entry at this segment: its repository.
+    Entry(usize),
     /// The `scope` query parameter (`repo:acme/app`, …), else the server.
     ScopeQuery,
     /// The `repo` query parameter, else the server.
@@ -293,6 +301,38 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/repos", "runs.read", At::Anywhere),
     r("POST", "/api/repos/*/trigger", "runs.trigger", At::Repo(2)),
     r("POST", "/api/repos/*/poll", "runs.trigger", At::Repo(2)),
+    // Diffs and stacks (W14).
+    r("GET", "/api/repos/*/diffs", "diffs.read", At::Repo(2)),
+    r("GET", "/api/diffs/*", "diffs.read", At::Diff(2)),
+    r("GET", "/api/diffs/*/**", "diffs.read", At::Diff(2)),
+    r("POST", "/api/diffs/*/ready", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/abandon", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
+    r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
+    r("POST", "/api/diffs/*/comments", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
+    r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
+    r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
+    r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
+    r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
+    r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
+    // Change requests (W14-R04), as diffs.
+    r("GET", "/api/repos/*/change-requests", "diffs.read", At::Repo(2)),
+    r("POST", "/api/repos/*/change-requests", "diffs.submit", At::Repo(2)),
+    r("GET", "/api/change-requests/*", "diffs.read", At::Diff(2)),
+    r("GET", "/api/change-requests/*/**", "diffs.read", At::Diff(2)),
+    r("POST", "/api/change-requests/*/comments", "diffs.review", At::Diff(2)),
+    r("POST", "/api/change-requests/*/review", "diffs.review", At::Diff(2)),
+    r("POST", "/api/change-requests/*/viewed", "diffs.read", At::Diff(2)),
+    r("POST", "/api/change-requests/*/land", "diffs.land", At::Diff(2)),
+    r("POST", "/api/change-requests/*/ready", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/abandon", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/reclaim", "diffs.submit", At::Diff(2)),
+    r("POST", "/api/change-requests/*/commandeer", "diffs.submit", At::Diff(2)),
     r("GET", "/api/runs", "runs.read", At::RepoQuery),
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),

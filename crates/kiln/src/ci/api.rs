@@ -26,6 +26,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
     }
     match seg {
         ["_kiln", "git", rest @ ..] => Some(super::facade::git(hub, rest, req).await),
+        // W14-R01: `/git/<owner>/<repo>.git`, where people clone and push native repositories.
+        ["git", rest @ ..] if git_path(rest) => Some(super::facade::git(hub, rest, req).await),
         // W07: the run's pinned actions, for its legs.
         ["_kiln", "actions", rest @ ..] => Some(super::actions::tarball(hub, rest, &req).await),
         // W08: blobs, the cache (as GHES serves it) and the results service (artifacts).
@@ -63,7 +65,7 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
 
 /// Is this path one of [`open`]'s? (So the caller can hand the request over without cloning it.)
 pub fn is_open(seg: &[&str]) -> bool {
-    git_path(seg) || super::rest::is_web(seg) || super::rest::is_download(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] | ["api", "v3", ..] | ["api", "graphql"] | ["api", "uploads", ..])
+    git_path(seg) || matches!(seg, ["git", rest @ ..] if git_path(rest)) || super::rest::is_web(seg) || super::rest::is_download(seg) || matches!(seg, ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] | ["api", "v3", ..] | ["api", "graphql"] | ["api", "uploads", ..])
 }
 
 /// First segments that are kiln's own, never a repository owner.
@@ -71,10 +73,11 @@ pub fn reserved(owner: &str) -> bool {
     matches!(owner, "api" | "_kiln" | "_apis" | "oidc" | "twirp" | "assets" | "dl" | "runs" | "repos" | "agents" | "runners" | "deployments" | "settings" | "system")
 }
 
-/// git's smart HTTP for a repository: `/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`.
+/// git's smart HTTP for a repository: `/<owner>/<repo>[.git]/info/refs`, `…/git-upload-pack`
+/// and `…/git-receive-pack` (native repositories take pushes, W14-R02).
 fn git_path(seg: &[&str]) -> bool {
     match seg {
-        [owner, _, "info", "refs"] | [owner, _, "git-upload-pack"] => !reserved(owner),
+        [owner, _, "info", "refs"] | [owner, _, "git-upload-pack"] | [owner, _, "git-receive-pack"] => !reserved(owner),
         _ => false,
     }
 }

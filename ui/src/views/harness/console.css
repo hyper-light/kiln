@@ -164,7 +164,16 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 /* The state word keeps the width of its longest ("Needs you"), so "Ready" turning "Working" as a
    turn starts doesn't move the rest of the row. */
 .ag-state > .st-word {
-  min-width: calc(14px + 9ch + 0.2em);
+  min-width: calc(22px + 9ch + 0.2em);
+}
+/* Its dot sits in a column as wide as the turn's mark above it, centred under it, so the two rows'
+   marks and words line up. */
+.ag-state > .st-word > i {
+  margin: 0 4px;
+}
+/* Between turns there's no mark: the words start where the state's do. */
+.ag-turn-row > .ag-turn-idle {
+  padding-left: 22px;
 }
 /* The turn has a row of its own above the state, there between turns too and always as tall, so
    nothing moves as a turn starts or ends; what's in it (a taller word, the offer to force a stop)
@@ -762,6 +771,22 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 .hx-turn .hx-work {
   border-top: 0;
 }
+/* The end of a turn under way while nothing at its end moves: what it's doing, and for how long
+   since its last step. */
+.hx-live-tail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 2px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.hx-live-tail .sg-label {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
 .hx-turn .hx-note,
 .hx-turn .hx-outcome {
   color: #d9dade;
@@ -1106,34 +1131,132 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 }
 
 /* ---------------------------------------------------------------- plan usage: the badge opens it in place */
+/* A row a window (name, bar, how much, when it starts over), then one line of what to do as they fill. */
 .ag-head .hx-usage-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  max-width: 440px;
-  margin-top: 10px;
-  padding-top: 10px;
+  gap: 8px;
+  max-width: 560px;
+  margin-top: 8px;
+  padding-top: 8px;
   border-top: 1px solid #1d1f23;
   animation: ag-usage-in 0.12s ease-out;
 }
-.hx-usage-head {
+.hx-usage-rows {
   display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.hx-usage-row {
+  display: grid;
+  grid-template-columns: 7.5rem minmax(40px, 1fr) 2.75rem 9.5rem;
+  align-items: center;
+  gap: 12px;
+  min-height: 22px;
+}
+.hx-usage-name {
+  overflow: hidden;
+  color: var(--color-foreground);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hx-usage-win {
+  color: var(--color-subtle);
+}
+.hx-usage-bar {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #1a1c21;
+}
+.hx-usage-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #a5c8b3;
+  transition: width 0.4s var(--ease-out-expo);
+}
+.hx-usage-row[data-tone="warn"] .hx-usage-bar > span {
+  background: var(--color-warn);
+}
+.hx-usage-row[data-tone="fail"] .hx-usage-bar > span {
+  background: var(--color-fail);
+}
+.hx-usage-pct {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--color-secondary);
+  text-align: right;
+}
+.hx-usage-row[data-tone="warn"] .hx-usage-pct {
+  color: #ead8bd;
+}
+.hx-usage-row[data-tone="fail"] .hx-usage-pct {
+  color: #ecc9cb;
+}
+.hx-usage-reset {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--color-subtle);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hx-usage-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 18px;
+  color: var(--color-secondary);
+  font-size: 12px;
+}
+.hx-usage-stop {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
 }
-.hx-usage-limits {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.hx-usage-stop .select select {
+  min-height: 28px;
+  padding: 3px 28px 3px 9px;
+  font-size: 12px;
+}
+.hx-usage-stop .select > svg {
+  right: 9px;
+}
+.hx-usage-move {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.hx-usage-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
 }
 .hx-usage-more {
-  align-self: flex-start;
   min-height: 28px;
   color: #a1a4ad;
   font-size: 12px;
   text-decoration: underline;
   text-decoration-color: #a1a4ad55;
   text-underline-offset: 3px;
+}
+/* A phone: when it starts over in the time left only, so each window stays one row. */
+@container (max-width: 520px) {
+  .hx-usage-row {
+    grid-template-columns: 6.25rem minmax(32px, 1fr) 2.5rem 4.5rem;
+    gap: 10px;
+  }
+  .hx-usage-reset > .hx-usage-at {
+    display: none;
+  }
 }
 .hx-usage-more:hover {
   color: var(--color-bright);

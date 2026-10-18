@@ -12,7 +12,7 @@
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
-import { RefreshCw, Rocket } from "lucide-react";
+import { CircleCheck, CircleX, RefreshCw, Rocket } from "lucide-react";
 
 import { cdApi } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
@@ -28,7 +28,7 @@ import { useRes, warm } from "@/lib/data";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
-import { ResourceDetails } from "./details";
+import { ResourceDetails, hasLogs, type Show } from "./details";
 import { RolloutPanel } from "./rollout";
 import { FIXES, age, compareNodes, compareText, facetsOf, fixOf, forest, isFiltered, keep, kindRank, troubled, whatDiffers, type Fix, type GroupItem } from "./model";
 import {
@@ -36,14 +36,13 @@ import {
   KindBadge,
   appKey,
   NodeMarks,
-  StatePair,
+  OpPair,
+  StateGlyph,
   SyncPair,
   TRIGGER_WORD,
   nodeLine,
   objectKey,
   objectLabel,
-  opTone,
-  opWords,
   placeOf,
   running,
   shortRev,
@@ -234,7 +233,7 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
         <AppCrumbs project={project} />
         <h1 className="cd-title">{name}</h1>
         <div className="cd-state">
-          <SyncPair sync={a.sync} />
+          <SyncPair sync={a.sync} op={op} />
           <HealthPair health={a.health} />
           <span className="cd-meta">{[placeOf(a), `${managed.length || a.resources || 0} objects`, childCount ? `${childCount} live children` : ""].filter(Boolean).join(" · ")}</span>
         </div>
@@ -254,6 +253,12 @@ function AppPage({ id, project, name, a }: { id: string; project: string; name: 
           <div className="cd-lines-from">
             <dt>From</dt>
             <dd>{fromLine(a)}</dd>
+          </div>
+          <div className="cd-lines-policy">
+            <dt>Auto-sync</dt>
+            <dd>
+              <SyncPolicy a={a} busy={busy} onSet={(sync, said) => act(said, () => cdApi.put({ ...(a.definition ?? {}), sync }), true)} />
+            </dd>
           </div>
         </dl>
         {a.shadow && <p className="cd-note">Shadowed from Argo CD: kiln compares it and never writes to it. Take it over to deploy it with kiln.</p>}
@@ -521,7 +526,7 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
     const by = op.by;
     return (
       <>
-        <StatePair tone={opTone(op)} word={opWords(op)} />
+        <OpPair op={op} />
         {at ? (
           <span className="cd-dim">
             {running(op) ? "started " : ""}
@@ -541,7 +546,7 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
   if (last) {
     return (
       <>
-        <StatePair tone={last.succeeded ? "succeeded" : "failed"} word={last.succeeded ? "Deployed" : "Failed"} />
+        <StateGlyph icon={last.succeeded ? CircleCheck : CircleX} tone={last.succeeded ? "succeeded" : "failed"} word={last.succeeded ? "Deployed" : "Failed"} />
         <span className="cd-dim">
           <RelTime ts={Math.floor(last.at_ms / 1000)} />
           {last.by ? ` by ${last.by}` : ` · ${(TRIGGER_WORD[last.trigger] ?? last.trigger).toLowerCase()}`}
@@ -558,15 +563,72 @@ function OpLine({ a, last }: { a: CdAppDetail; last: CdDeployment | undefined })
   return <span className="cd-dim">Never synced</span>;
 }
 
-/** Where an app comes from, where it goes, and how it syncs, in one line. */
+/** Where an app comes from and where it goes, in one line. */
 function fromLine(a: CdAppDetail) {
   const src = a.definition?.sources?.[0];
   const where = src ? [src.chart ? `${src.repo} ${src.chart}` : src.repo, src.path].filter(Boolean).join(" · ") : "";
   const at = src?.revision ? ` @ ${src.revision}` : "";
   const more = (a.definition?.sources?.length ?? 0) > 1 ? ` (+${(a.definition?.sources?.length ?? 1) - 1} more)` : "";
+  return where ? `${where}${at}${more} → ${a.cluster} / ${a.namespace || "default"}` : "";
+}
+
+type SyncPolicyValue = NonNullable<CdAppDetail["definition"]>["sync"];
+
+/** A repository as people say it: hyper-light/deploy, not its URL. */
+const repoName = (url: string) => url.replace(/^[a-z+]+:\/\/(www\.)?(github\.com\/)?/i, "").replace(/\.git$/, "");
+
+/**
+ * Whether it syncs by itself, and how: changed here for an app kept in kiln; read from git for one
+ * a deploy file makes (shown where it's set: a change through kiln would be undone at the next
+ * poll); Argo CD's for one it shadows.
+ */
+function SyncPolicy({ a, busy, onSet }: { a: CdAppDetail; busy: boolean; onSet: (sync: SyncPolicyValue, said: string) => void }) {
   const sync = a.definition?.sync;
-  const how = sync?.auto ? ["Auto-sync", sync.prune && "prune", sync.self_heal && "self-heal"].filter(Boolean).join(", ") : "Synced by hand";
-  return [where && `${where}${at}${more} → ${a.cluster} / ${a.namespace || "default"}`, how].filter(Boolean).join(" · ");
+  const words = sync?.auto ? ["On", sync.prune && "prunes what git drops", sync.self_heal && "undoes changes made in the cluster"].filter(Boolean).join(", ") : "Off: it syncs when you say";
+  if (a.shadow || a.origin.kind === "argo") return <span className="cd-dim">Argo CD's: kiln compares this app and leaves syncing it to Argo CD</span>;
+  if (a.origin.kind === "deploy")
+    return (
+      <span>
+        {words}
+        <span className="cd-dim"> · set in {repoName(a.origin.repo)}'s .kiln/deploy.yaml</span>
+      </span>
+    );
+  if (!sync) return <span className="cd-dim">{words}</span>;
+  const set = (patch: Partial<SyncPolicyValue>, said: string) => onSet({ ...sync, ...patch }, said);
+  return (
+    <span className="cd-policy">
+      <label className="cd-opt">
+        <input
+          type="checkbox"
+          className="check"
+          checked={sync.auto}
+          disabled={busy}
+          onChange={(e) => set({ auto: e.target.checked }, e.target.checked ? "Auto-sync on: it syncs when git moves." : "Auto-sync off: it syncs when you say.")}
+        />{" "}
+        Sync when git moves
+      </label>
+      <label className="cd-opt">
+        <input
+          type="checkbox"
+          className="check"
+          checked={sync.prune}
+          disabled={busy || !sync.auto}
+          onChange={(e) => set({ prune: e.target.checked }, e.target.checked ? "It prunes what git drops." : "It leaves what git drops in the cluster.")}
+        />{" "}
+        Prune what git drops
+      </label>
+      <label className="cd-opt">
+        <input
+          type="checkbox"
+          className="check"
+          checked={sync.self_heal}
+          disabled={busy || !sync.auto}
+          onChange={(e) => set({ self_heal: e.target.checked }, e.target.checked ? "It undoes changes made in the cluster." : "Changes made in the cluster stay until the next sync.")}
+        />{" "}
+        Undo changes made in the cluster
+      </label>
+    </span>
+  );
 }
 
 /** Argo CD's sync options a person can set for one sync, each starting as the app sets it. */
@@ -753,9 +815,29 @@ function Resources({
       else next.add(g.id);
       return next;
     });
-  const choose = (n: CdNode) => setSelected(selected === n.id ? null : n.id);
+  // A problem's Logs or Events opens its details there, brought into view.
+  const [tab, setTab] = React.useState<Show | undefined>(undefined);
+  const bring = React.useRef(false);
+  const choose = (n: CdNode) => {
+    setTab(undefined);
+    setSelected(selected === n.id ? null : n.id);
+  };
+  const look = (n: CdNode, at: Show) => {
+    setTab(at);
+    setSelected(n.id);
+    bring.current = true;
+  };
+  const shownDetails = React.useCallback((el: HTMLDivElement | null) => {
+    if (el && bring.current) {
+      bring.current = false;
+      el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, []);
+  const problems = React.useMemo(() => nodes.filter(failing).sort((x, y) => (HEALTH_RANK[x.health ?? ""] ?? 6) - (HEALTH_RANK[y.health ?? ""] ?? 6)), [nodes]);
   const details = sel ? (
-    <ResourceDetails key={sel.id} appId={appId} node={sel} onClose={() => setSelected(null)} onSelect={(id) => setSelected(id)} />
+    <div ref={shownDetails} className="cd-details-at">
+      <ResourceDetails key={`${sel.id}:${tab ?? ""}`} appId={appId} node={sel} initial={tab} onClose={() => setSelected(null)} onSelect={(id) => setSelected(id)} />
+    </div>
   ) : selected ? (
     <p className="cd-empty">
       That object is gone from the cluster.{" "}
@@ -825,6 +907,34 @@ function Resources({
       )}
       {errors.length > 0 && <p className="cd-warn">Not everything could be read: {errors.slice(0, 3).join("; ")}</p>}
       {truncated && <p className="cd-warn">The tree is cut at 5,000 objects.</p>}
+      {problems.length > 0 && (
+        <div className="cd-problems" role="list" aria-label="What's failing">
+          {problems.slice(0, 6).map((n) => {
+            const why = n.message ?? n.why ?? nodeLine(n, "");
+            return (
+              <div key={n.id} role="listitem" className="cd-problem" data-tone={n.health === "Degraded" || n.health === "Missing" ? "fail" : "warn"}>
+                <NodeMarks n={n} words={false} />
+                <KindBadge kind={n.kind} group={n.group} />
+                <span className="cd-problem-name">{n.name}</span>
+                <span className="cd-problem-why" title={why || undefined}>
+                  {why}
+                </span>
+                <span className="cd-problem-acts">
+                  {hasLogs(n) && (
+                    <button type="button" className="cd-link" onClick={() => look(n, "logs")}>
+                      Logs
+                    </button>
+                  )}
+                  <button type="button" className="cd-link" onClick={() => look(n, "events")}>
+                    Events
+                  </button>
+                </span>
+              </div>
+            );
+          })}
+          {problems.length > 6 && <p className="cd-dim cd-problems-more">And {problems.length - 6} more: filter by health to see every one.</p>}
+        </div>
+      )}
 
       <div ref={box} className="cd-view">
         {base.length === 0 ? (
@@ -861,6 +971,9 @@ function Resources({
     </section>
   );
 }
+
+/** What's failing, for its own list: a degraded or missing object, a pod that won't run. */
+const failing = (n: CdNode) => n.health === "Degraded" || n.health === "Missing" || (n.kind === "Pod" && /BackOff|Error|Failed|OOMKilled|Crash|Evicted/i.test(n.status ?? ""));
 
 function sortNodes(list: CdNode[], sort: ListSort): CdNode[] {
   const by: Record<ListSort, (x: CdNode, y: CdNode) => number> = {
@@ -1156,7 +1269,7 @@ function HistoryList({
         const canRollBack = onRollback && h.succeeded && !same(h, current) && h.id > 0;
         return (
           <div key={`${h.at_ms}-${h.op}`} className="cd-history-row" role="listitem">
-            <StatePair tone={h.succeeded ? "succeeded" : "failed"} word={h.succeeded ? "Deployed" : "Failed"} />
+            <StateGlyph icon={h.succeeded ? CircleCheck : CircleX} tone={h.succeeded ? "succeeded" : "failed"} word={h.succeeded ? "Deployed" : "Failed"} />
             <span className="cd-mono">
               #{h.id} · {shortRev(h.revision) || "no revision"}
             </span>

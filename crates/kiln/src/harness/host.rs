@@ -37,9 +37,10 @@ pub struct Inventory {
     pub kinds: Vec<KindInfo>,
 }
 
-/// A session as kept on disk.
+/// A session as kept on disk, and as it goes to another runner process of this machine when its
+/// harness process can't (a blue/green upgrade, `crate::bluegreen`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Saved {
+pub struct Saved {
     id: String,
     spec: Spec,
     #[serde(default)]
@@ -51,6 +52,8 @@ struct Saved {
     pause_at: Option<u8>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     manual_resume: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    move_on_limit: bool,
     /// A turn of its was under way, and hadn't ended, when this runner last saved it: a restart
     /// (an upgrade, the system stopping the runner, a crash) cut it short, and started again it
     /// is told to go on with it.
@@ -63,6 +66,34 @@ struct Saved {
     harness: Option<super::survivors::Ran>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ran: Vec<super::survivors::Ran>,
+}
+
+impl Saved {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// `s` as it is kept: its spec to resume it by, its queue and pause, and whether a turn of its is
+/// under way. Takes the session's locks itself: never with one held.
+fn record(s: &Session) -> Saved {
+    // resume_spec takes the session's lock itself: before this one, never inside it.
+    let spec = s.resume_spec();
+    let ran = s.ran.lock().clone();
+    let core = s.core.lock();
+    let st = &core.state;
+    Saved {
+        id: s.id.clone(),
+        spec,
+        queue: st.queue.clone(),
+        pause: st.pause.clone(),
+        pause_at: st.pause_at,
+        manual_resume: st.manual_resume,
+        move_on_limit: st.move_on_limit,
+        cut: s.turn_open.load(Ordering::Relaxed),
+        harness: ran.0,
+        ran: ran.1,
+    }
 }
 
 /// What kiln says first to a session whose turn its restart cut short.
@@ -203,7 +234,7 @@ impl Host {
 
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
-        self.open_seeded(id, spec, None)
+        self.open_seeded(id, spec, None, None)
     }
 
     /// Take over a session another runner handed this one (`super::moving`): its record where its
@@ -211,8 +242,8 @@ impl Host {
     /// (writes the record).
     pub fn adopt(&self, from: &str, data: &[u8]) -> Result<(), String> {
         let pkg: super::moving::Package = serde_json::from_slice(data).map_err(|e| format!("the session from {from} is unreadable: {e}"))?;
-        if pkg.version != super::moving::VERSION {
-            return Err(format!("a session packed as version {} (this runner takes {})", pkg.version, super::moving::VERSION));
+        if !super::moving::takes(pkg.version) {
+            return Err(format!("a session packed as version {} (this runner takes up to {})", pkg.version, super::moving::VERSION));
         }
         let kind = Kind::get(&pkg.spec.kind).ok_or_else(|| format!("this runner doesn't know {}", pkg.spec.kind))?;
         if !kind.available() {
@@ -232,7 +263,7 @@ impl Host {
         }
         let items = super::moving::install(&pkg, &cwd)?;
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false };
-        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed)).map(|_| ()).map_err(|e| format!("{e:#}"))
+        self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None).map(|_| ()).map_err(|e| format!("{e:#}"))
     }
 
     /// Let go of a session that went on on another machine: it is no longer this machine's, and it
@@ -243,7 +274,7 @@ impl Host {
         }
     }
 
-    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>) -> anyhow::Result<Arc<Session>> {
+    fn open_seeded(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>) -> anyhow::Result<Arc<Session>> {
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
@@ -291,7 +322,10 @@ impl Host {
                 }
             }),
         };
-        let s = session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?;
+        let s = match handed {
+            Some(h) => session::start_handed(id.clone(), spec, self.sink.clone(), on_change, files, h)?,
+            None => session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?,
+        };
         self.sessions.lock().insert(id, Arc::clone(&s));
         self.mark_dirty();
         self.watch();
@@ -317,41 +351,157 @@ impl Host {
         found
     }
 
-    /// Stop every harness process now (this process is about to re-execute itself; the sessions
-    /// continue in the new image from the record saved here). Blocks up to a few seconds.
+    /// Stop every harness process now (this process is about to end, and a fresh one continues
+    /// the sessions from the record saved here: an upgrade by a successor on macOS). Blocks up to
+    /// a few seconds.
     pub fn stop_all(&self) {
         self.save_now();
         let pids: Vec<u32> = self.sessions.lock().values().filter_map(|s| *s.pid.lock()).collect();
         for pid in pids {
             stop_process(pid);
-            // This image re-executes next and the new one won't wait for it: reaped now.
+            // The process that continues them won't wait for it: reaped now.
             #[cfg(unix)]
             let _ = crate::os::try_reap(pid);
         }
     }
 
-    /// Continue the sessions recorded before a restart.
+    /// Hand every session's harness process, still running, to this process's next image (it
+    /// re-executes itself next: an in-place upgrade), where each goes on as it was, mid-turn
+    /// included ([`Host::restore`]). One that can't be handed over is stopped, and starts again
+    /// there from its record (its conversation goes on). Returns how many were handed over.
+    pub async fn hand_over_all(&self) -> usize {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;
+        let mut out: HashMap<String, Box<session::Handed>> = HashMap::new();
+        for (s, h) in handed {
+            match h {
+                Some(h) => {
+                    out.insert(s.id.clone(), h);
+                }
+                None => {
+                    if let Some(pid) = s.pid.lock().take() {
+                        stop_process(pid);
+                        #[cfg(unix)]
+                        let _ = crate::os::try_reap(pid);
+                    }
+                }
+            }
+        }
+        self.save_now();
+        let n = out.len();
+        if let Some(path) = self.handover_path() {
+            let wrote = serde_json::to_vec(&out).map_err(std::io::Error::other).and_then(|json| crate::util::write_secret(&path, &json, 0o600));
+            if let Err(e) = wrote {
+                // The next image can't take them: stopped, and they start again from their records.
+                tracing::warn!(error = %e, file = %path.display(), "couldn't write the agent sessions' handover: they start again after the upgrade");
+                for h in out.values() {
+                    stop_process(h.process.pid);
+                    #[cfg(unix)]
+                    let _ = crate::os::try_reap(h.process.pid);
+                }
+                return 0;
+            }
+        }
+        n
+    }
+
+    /// Every session, handed to another runner process of this machine (a blue/green upgrade,
+    /// `crate::bluegreen`): each with its spec and, still running, its harness process (`None`:
+    /// it couldn't be handed over, was stopped, and starts again there from its spec). They are no
+    /// longer this runner's.
+    pub async fn move_out(&self) -> Vec<(Saved, Option<Box<session::Handed>>)> {
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        let handed = futures::future::join_all(sessions.iter().map(|s| async move { (Arc::clone(s), crate::rt::timeout(Duration::from_secs(15), s.hand_over()).await.ok().flatten()) })).await;
+        let mut out = Vec::new();
+        for (s, h) in handed {
+            if h.is_none()
+                && let Some(pid) = s.pid.lock().take()
+            {
+                stop_process(pid);
+                #[cfg(unix)]
+                let _ = crate::os::try_reap(pid);
+            }
+            let rec = record(&s);
+            self.sessions.lock().remove(&s.id);
+            out.push((rec, h));
+        }
+        self.mark_dirty();
+        out
+    }
+
+    /// Take over a session another runner process of this machine handed over (blue/green): with
+    /// its process (its descriptors are this process's now), or started again from its record (a
+    /// turn its stop cut short is picked up first).
+    pub fn move_in(&self, rec: Saved, handed: Option<Box<session::Handed>>) -> anyhow::Result<()> {
+        match handed {
+            Some(h) => {
+                let (harness, ran) = (rec.harness.clone(), rec.ran.clone());
+                let session = self.open_seeded(Some(rec.id), rec.spec, None, Some(h))?;
+                // What its harness runs stays under it; the watch finds the rest again.
+                *session.ran.lock() = (harness, ran);
+                Ok(())
+            }
+            None => {
+                let outlived = super::survivors::alive(&rec.harness.iter().cloned().collect::<Vec<_>>());
+                if !outlived.is_empty() {
+                    super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
+                }
+                let found = super::survivors::scan(&[(rec.id.clone(), None)]);
+                let apart = found.get(&rec.id).map(|f| f.apart.clone()).unwrap_or_default();
+                let now_s = u64::try_from(crate::util::now_unix()).unwrap_or(0);
+                self.open_record(rec, None, apart, now_s).map(|_| ())
+            }
+        }
+    }
+
+    /// The image the sessions were handed to never came (the exec failed): this one goes on with
+    /// them, their processes included.
+    pub fn take_back(&self) {
+        self.sessions.lock().clear();
+        self.restore();
+    }
+
+    /// Where the sessions handed to the next image are written: beside their record.
+    fn handover_path(&self) -> Option<PathBuf> {
+        self.file.as_ref().map(|f| f.with_file_name("agent-handover.json"))
+    }
+
+    /// The sessions the previous image of this process handed over ([`Host::hand_over_all`]),
+    /// once: the file goes as it's read.
+    fn take_handover(&self) -> HashMap<String, Box<session::Handed>> {
+        let Some(path) = self.handover_path() else { return HashMap::new() };
+        let Ok(raw) = std::fs::read(&path) else { return HashMap::new() };
+        let _ = std::fs::remove_file(&path);
+        serde_json::from_slice(&raw).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, file = %path.display(), "unreadable agent session handover: they start again");
+            HashMap::new()
+        })
+    }
+
+    /// Continue the sessions recorded before a restart (`restore_from`, without the conversation
+    /// store).
     pub fn restore(&self) {
         self.restore_from(None);
     }
 
-    /// Continue the sessions recorded before a restart, each with its timeline and state as the
-    /// conversation store kept them (`crate::convo`), when it kept any; otherwise as before (a
-    /// Claude Code session's history from its transcript).
+    /// Continue the sessions recorded before a restart. Those the previous image of this process
+    /// handed over go on with their processes, still running. The rest start again, each with its
+    /// timeline and state as the conversation store kept them (`crate::convo`), when it kept any;
+    /// otherwise as before (a Claude Code session's history from its transcript).
     pub fn restore_from(&self, store: Option<&crate::convo::store::Store>) {
-        let Some(file) = &self.file else { return };
-        let Ok(raw) = std::fs::read(file) else { return };
-        let saved: Vec<Saved> = match serde_json::from_slice(&raw) {
-            Ok(s) => s,
-            Err(e) => {
+        let mut handed = self.take_handover();
+        let saved: Vec<Saved> = match self.file.as_ref().map(|f| (f, std::fs::read(f))) {
+            Some((file, Ok(raw))) => serde_json::from_slice(&raw).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, file = %file.display(), "unreadable agent session record; starting without it");
-                return;
-            }
+                Vec::new()
+            }),
+            _ => Vec::new(),
         };
         // A harness that outlived the runner it ran under (a crash, the system stopping only the
         // runner) is stopped first, so no second one resumes its conversation beside it; what it
         // started is kept, and taken back over with the rest.
-        let outlived: Vec<super::survivors::Ran> = super::survivors::alive(&saved.iter().filter_map(|s| s.harness.clone()).collect::<Vec<_>>());
+        let outlived: Vec<super::survivors::Ran> =
+            super::survivors::alive(&saved.iter().filter(|s| !handed.contains_key(&s.id)).filter_map(|s| s.harness.clone()).collect::<Vec<_>>());
         if !outlived.is_empty() {
             tracing::info!(processes = ?outlived.iter().map(|r| r.pid).collect::<Vec<_>>(), "agent harnesses outlived their runner: stopped before their sessions resume");
             super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
@@ -361,49 +511,78 @@ impl Host {
         let found = super::survivors::scan(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>());
         for s in saved {
             let id = s.id.clone();
+            if let Some(h) = handed.remove(&id) {
+                let pid = h.process.pid;
+                match self.open_seeded(Some(s.id.clone()), s.spec.clone(), None, Some(h)) {
+                    Ok(session) => {
+                        // What its harness runs stays under it; the watch finds the rest again.
+                        *session.ran.lock() = (s.harness.clone(), s.ran.clone());
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(session = %id, error = %format!("{e:#}"), "could not go on with an agent session's process: it starts again");
+                        stop_process(pid);
+                    }
+                }
+            }
             let seed = store.and_then(|st| kept_seed(st, &id));
             let from_store = seed.is_some();
             let cut = s.cut;
-            // What it started that still runs, taken back over (its stopped harness not among it).
-            let mut alive = found.get(&id).map(|f| f.apart.clone()).unwrap_or_default();
-            for r in super::survivors::alive(&s.ran) {
-                if !alive.iter().any(|a| a.pid == r.pid) {
-                    alive.push(r);
-                }
-            }
-            if let Some(h) = &s.harness {
-                alive.retain(|r| r.pid != h.pid);
-            }
-            let trees = super::survivors::trees(&alive);
-            match self.open_seeded(Some(s.id), s.spec, seed) {
-                Ok(session) => {
-                    let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume;
-                    if !trees.is_empty() {
-                        session.ran.lock().1.clone_from(&alive);
-                        *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
-                        let mut core = session.core.lock();
-                        core.state.tasks.extend(trees.iter().map(|(root, _)| super::survivors::task(root)));
-                        core.touch_state();
-                    }
-                    if !s.queue.is_empty() || paused || cut {
-                        let mut core = session.core.lock();
-                        core.state.queue = s.queue;
-                        // A check under way when it stopped is asked again.
-                        core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
-                        core.state.pause_at = s.pause_at;
-                        core.state.manual_resume = s.manual_resume;
-                        // The turn the restart cut short goes on first, in kiln's words, with what
-                        // it started that still runs.
-                        if cut {
-                            picks_up(&mut core.state.queue, &super::survivors::said(&trees, now_s));
-                        }
-                        core.touch_state();
-                    }
-                    tracing::info!(session = %id, from_store, cut, left_running = trees.len(), "agent session continued after a restart");
-                }
+            let apart = found.get(&id).map(|f| f.apart.clone()).unwrap_or_default();
+            match self.open_record(s, seed, apart, now_s) {
+                Ok(left) => tracing::info!(session = %id, from_store, cut, left_running = left, "agent session continued after a restart"),
                 Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
             }
         }
+        // Handed over without a record to go on from: nothing goes on with them.
+        for h in handed.into_values() {
+            stop_process(h.process.pid);
+        }
+    }
+
+    /// Start a session again from its record: its queue and pause as they were and, when a turn of
+    /// its was cut short, that turn picked up first.
+    /// `apart`: what it started that still runs on its own, found by its mark (`survivors::scan`).
+    /// What it started that still runs (that, and what its record says) is taken back over as
+    /// left running. How many such were found.
+    fn open_record(&self, s: Saved, seed: Option<session::Seed>, apart: Vec<super::survivors::Ran>, now_s: u64) -> anyhow::Result<usize> {
+        let cut = s.cut;
+        // What it started that still runs, taken back over (its stopped harness not among it).
+        let mut alive = apart;
+        for r in super::survivors::alive(&s.ran) {
+            if !alive.iter().any(|a| a.pid == r.pid) {
+                alive.push(r);
+            }
+        }
+        if let Some(h) = &s.harness {
+            alive.retain(|r| r.pid != h.pid);
+        }
+        let trees = super::survivors::trees(&alive);
+        let session = self.open_seeded(Some(s.id), s.spec, seed, None)?;
+        let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
+        if !trees.is_empty() {
+            session.ran.lock().1.clone_from(&alive);
+            *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
+            let mut core = session.core.lock();
+            core.state.tasks.extend(trees.iter().map(|(root, _)| super::survivors::task(root)));
+            core.touch_state();
+        }
+        if !s.queue.is_empty() || paused || cut {
+            let mut core = session.core.lock();
+            core.state.queue = s.queue;
+            // A check under way when it stopped is asked again.
+            core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
+            core.state.pause_at = s.pause_at;
+            core.state.manual_resume = s.manual_resume;
+            core.state.move_on_limit = s.move_on_limit;
+            // The turn the restart cut short goes on first, in kiln's words, with what it started
+            // that still runs.
+            if cut {
+                picks_up(&mut core.state.queue, &super::survivors::said(&trees, now_s));
+            }
+            core.touch_state();
+        }
+        Ok(trees.len())
     }
 
     /// Every few seconds, what each session's harness runs: noted (and kept in the record when it
@@ -502,19 +681,8 @@ impl Host {
 
     fn save_now(&self) {
         let Some(file) = &self.file else { return };
-        let saved: Vec<Saved> = self
-            .sessions
-            .lock()
-            .values()
-            .map(|s| {
-                // resume_spec takes the session's lock itself: before this one, never inside it.
-                let spec = s.resume_spec();
-                let ran = s.ran.lock().clone();
-                let core = s.core.lock();
-                let st = &core.state;
-                Saved { id: s.id.clone(), spec, queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume, cut: s.turn_open.load(Ordering::Relaxed), harness: ran.0, ran: ran.1 }
-            })
-            .collect();
+        let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
+        let saved: Vec<Saved> = sessions.iter().map(|s| record(s)).collect();
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
         let tmp = file.with_extension("tmp");
         let wrote = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| crate::util::write_secret(&tmp, &json, 0o600)).and_then(|()| std::fs::rename(&tmp, file));
@@ -559,7 +727,7 @@ fn kept_seed(store: &crate::convo::store::Store, id: &str) -> Option<session::Se
 
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
 #[cfg(unix)]
-fn stop_process(pid: u32) {
+pub(crate) fn stop_process(pid: u32) {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
     let Ok(p) = i32::try_from(pid) else { return };
@@ -577,7 +745,7 @@ fn stop_process(pid: u32) {
 }
 
 #[cfg(windows)]
-fn stop_process(pid: u32) {
+pub(crate) fn stop_process(pid: u32) {
     crate::os::proc::taskkill_tree(pid);
 }
 
@@ -652,6 +820,8 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         pause: None,
         last_turn: None,
         keep_off: false,
+        move_on_limit: false,
+        pause_at: None,
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]

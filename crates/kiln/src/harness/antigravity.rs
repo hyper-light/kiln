@@ -92,6 +92,9 @@ fn extras() -> Vec<SlashCommand> {
 /// What it can't do from kiln.
 const UNSUPPORTED: &str = "Antigravity's headless mode has no way to manage its MCP servers or skills from kiln.";
 
+/// Plain data, written out whole when its runner hands it to its next image or another runner
+/// process of the machine (an upgrade: `crate::harness::kinds::Frozen`).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Agy {
     /// The conversation it was started on (`--conversation`), to tell when that one was gone.
     resumed: Option<String>,
@@ -118,6 +121,10 @@ pub struct Agy {
     /// Its process is being ended to start again: what is sent waits for the new one.
     restarting: bool,
     seq: u64,
+    /// The conversation so far, in words, given with the first message it sends (a session that
+    /// went on here from another machine, `super::moving`).
+    #[serde(default)]
+    context: Option<String>,
 }
 
 impl Agy {
@@ -136,6 +143,7 @@ impl Agy {
             allow_bypass: spec.allow_bypass,
             restarting: false,
             seq: 0,
+            context: None,
         }
     }
 
@@ -259,7 +267,7 @@ impl Agy {
             Command::Control { .. } => {}
             Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
-            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::LimitHold { .. } => {}
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } => {}
             // Its own commands and skills run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {
                 let name = name.trim().trim_start_matches('/').to_owned();
@@ -383,10 +391,19 @@ impl Agy {
         self.prompt(core, m);
     }
 
+    /// The conversation so far, in words, to give with the first message it sends.
+    pub fn offer_context(&mut self, text: Option<String>) {
+        self.context = text.filter(|t| !t.is_empty());
+    }
+
     fn prompt(&mut self, core: &mut Core, m: QueueItem) {
         self.close_text(core);
-        // It takes text only: files go as their paths on this machine, which it reads itself.
-        let mut text = m.text.clone();
+        // It takes text only: files go as their paths on this machine, which it reads itself. The
+        // conversation so far comes first, once, when it went on here from another machine.
+        let mut text = match self.context.take() {
+            Some(c) => format!("{c}\n\n{}", m.text),
+            None => m.text.clone(),
+        };
         for a in &m.attachments {
             if let Some(p) = &a.path {
                 if !text.is_empty() {
@@ -687,7 +704,7 @@ fn parse_models(output: &str) -> Vec<ModelOption> {
         .filter_map(|l| {
             let (id, label) = l.split_once('\t')?;
             let id = id.trim();
-            (!id.is_empty() && !id.contains(' ')).then(|| ModelOption { id: id.to_owned(), label: label.trim().to_owned(), description: String::new(), efforts: Vec::new() })
+            (!id.is_empty() && !id.contains(' ')).then(|| ModelOption { id: id.to_owned(), label: label.trim().to_owned(), ..ModelOption::default() })
         })
         .collect()
 }

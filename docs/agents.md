@@ -231,7 +231,8 @@ console picks) and are answered with a `reply` update to that client.
 | `skills_reload` | | `state.skills` |
 | `resume` | | ends a pause now (`state.pause`): the turn it cut off goes on, then the queue |
 | `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
-| `pause_at` | `percent` (null: off) | stop between turns once a limit is this full (`state.pause_at`) |
+| `pause_at` | `percent` (null: off) | pause once a limit is this full, between turns or at the next step of one under way (`state.pause_at`) |
+| `move_on_limit` | `on` | at a limit, go on on another machine with room (`state.move_on_limit`) |
 | `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too |
 
 ### Questions
@@ -349,9 +350,11 @@ Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`,
   the limit; "account": another session on its account did; "threshold"), `cut?` (`{message?,
   text, at}`: the turn the limit cut off), `checkpoint?` (`{git_ref, commit, at}`), `tries`,
   `checking?`, `next_check?`. `pause_at?` — its stop point (percent). `manual_resume` — pauses end
-  only when a person resumes them.
+  only when a person resumes them. `move_on_limit` — at a limit it goes on on another machine with
+  room.
 
-`Info` (the lists) carries `limits`, `account`, `plan`, `left_behind` and `pause` too.
+`Info` (the lists) carries `limits`, `account`, `plan`, `left_behind`, `pause`, `pause_at` and
+`move_on_limit` too.
 
 ## Usage limits: pause and resume
 
@@ -382,14 +385,60 @@ turn (`harness/pause.rs`):
 - **Your call.** `resume` ends it now (after a plan upgrade, say). Turn off "Resume by itself at the
   reset" (`auto_resume`) to keep it paused until you do. Picking another harness's model
   (`set_model` with `kind`) ends it too: the conversation goes on there, the cut-off turn first.
-- **Stop point.** `pause_at` (the head's usage badge → Stop between turns: 80, 90 or 95 %) pauses
-  the agent between turns once a limit is that full, before the limit cuts a turn off. Off by
-  default.
-- **Restarts.** A pause, its timer and its stop point are kept with the session on its machine
-  (the runner's `harness.json`, the server's `local.json`) and go on after a restart.
+- **Stop point.** `pause_at` (the head's usage badge → Pause at, or the agent's Settings → Usage
+  limits: 80, 90 or 95 % used) pauses the agent once a limit is that full, before the limit cuts a
+  turn off. Between turns, or in the middle of one (an agent working on its own can go for hours
+  in one turn): at its next step, the command or edit under way finishing first. The turn it
+  stopped goes on from there, first, once the limit resets. A turn waiting on you (an approval)
+  is left to you. Off by default.
+- **Go on elsewhere.** With `move_on_limit` on (the usage badge, the agent's Settings, or the
+  paused line above the composer; off by default, a conversation at a time), a pause sends the
+  agent to another of your machines instead of waiting (`harness/elsewhere.rs`): one that is
+  connected, takes sessions over (reach), and has the same harness signed in to another account,
+  one kiln doesn't know to be as full. A machine with a copy of its repository comes first, then
+  the emptiest account; else its repository is copied there and kept in step. It moves as a move
+  you ask for does (`docs/reach.md` §8), and there its harness, signed in as someone else, ends
+  the pause and goes on with the cut-off turn. With nowhere to go its timeline says why, and kiln
+  looks again every few minutes.
+- **Restarts.** A pause, its timer, its stop point and going on elsewhere are kept with the session
+  on its machine (the runner's `harness.json`, the server's `local.json`) and go on after a restart.
+- **Queued meanwhile.** While it is paused the composer queues (its words and button say so), and
+  what is queued waits for the reset; nothing queued can jump the pause (no steer, no send now).
 
 Repeated identical notices in a turn (such as a limit said over and over by a build before this)
 show once in the timeline, with a count.
+
+### Runner upgrades: agents keep their processes
+
+A runner under `kiln supervise` (how `kiln install --agent` runs one on Linux and macOS) upgrades
+blue/green (docs/releases.md): the new build starts beside it, and once it's connected, every
+agent session is handed to it over a local socket, its harness process still running. Its pipes are
+passed across, not reopened. A runner upgraded in place (a new kiln binary where its own is, run
+without a supervisor) re-executes itself instead, same pid, and hands every agent session to its
+new image the same way. Either way nothing the agent is doing stops:
+- a turn mid-reply goes on;
+- a permission prompt waiting stays waiting, and is answered as before;
+- the commands it left running in the background keep running;
+- its timeline, queue and pause are where they were.
+
+The upgrade doesn't wait for turns to end. If a blue/green upgrade's new build doesn't come up, the
+sessions never leave the runner.
+
+How: each session stops reading its harness's output at a line boundary. What was read is taken
+in; the rest waits in the pipe. It writes out its whole state: the timeline, and the adapter's
+(requests in flight, prompts waiting, streaming state). Then it keeps its pipes open, across the
+exec or passed to the new build (`SCM_RIGHTS`), and the new process takes the harness over by its
+pipes and its pid, and reads on. Some sessions can't be handed over: a switch, move or setting
+waiting for its turn to end, or on Windows, which has neither upgrade. Those are stopped and start
+again from their record, continuing the conversation, as every session did before.
+
+### Messages while its machine is away
+
+When an agent's machine is offline (or the connection to the server drops), the composer keeps
+working: what you send is kept in your browser ("Kept here", editable and removable, across
+reloads) and goes to the agent in order once it can take it, ahead of anything sent after.
+Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
+page until it reloads.
 
 ### Tasks: shells, monitors and other work an agent leaves running
 
@@ -463,6 +512,7 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | start | ✓ | ✓ | ✓ | ? |
 | resume, with the history | ✓ | ✓ (latest 100 turns, paged) | unit (when the agent loads sessions) | ? |
 | survives server and runner restarts | ✓ | ? | ? | ? |
+| a runner upgrade keeps its process (mid-turn, background commands) | ✓ | unit | unit | ? |
 | send, queue | ✓ | ✓ | ✓ | ? |
 | steer into a running turn | ✓ | ✓ | — (waits for the turn) | — |
 | a queued message steered in (`queue_steer`) | ✓ | ✓ | — | — |

@@ -591,6 +591,28 @@ fn objects_argo_cd_deployed_are_found_by_its_tracking_name() {
     assert_eq!(s.map(|s| (s.sync, s.resources, s.out_of_sync)), Some((Sync::Synced, 1, 0)), "{s:?}");
 }
 
+/// A shadow compares what Argo CD deployed: removing it, even "with its objects", deletes none.
+#[test]
+fn removing_a_shadow_deletes_nothing_it_compared() {
+    let (mut h, git) = harness(fast());
+    let cm = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cfg", "namespace": "web",
+        "annotations": {"argocd.argoproj.io/tracking-id": "web:/ConfigMap:web/cfg"}}, "data": {"v": "1"}});
+    if let Some(c) = h.clusters.get_mut("dev") {
+        let _ = c.apply(0, cm, "argocd-controller", false);
+    }
+    let mut a = AppConfig::new("default/web", "dev", "web");
+    a.tracking = crate::model::Tracking::ArgoAnnotation;
+    a.tracking_name = Some("web".into());
+    a.read_only = true;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "default/web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    h.run_for(5_000);
+    assert_eq!(status(&h, "default/web").map(|s| s.sync), Some(Sync::Synced), "its tracking names it: the object is its own");
+    h.input(Input::RemoveApp { id: "default/web".into(), cascade: Some(crate::model::Propagation::Foreground) });
+    h.run_for(10_000);
+    assert!(present(&h, "cfg"), "a shadow never writes, also as it goes");
+}
+
 #[test]
 fn crds_deployed_by_argo_cd_carry_no_tracking_and_still_compare_synced() {
     let (mut h, git) = harness(fast());
@@ -878,4 +900,33 @@ fn objects_without_tracking_differ_only_by_kilns_marks() {
     assert_eq!(s, Some((2, 1, 0, 1)), "y missing, x only unmarked");
     let x = h.engine.resources("one").into_iter().find(|r| &*r.key.name == "x");
     assert!(x.is_some_and(|r| r.marks_only && r.tracked_by.is_none()));
+}
+
+
+/// A sync of objects already there and healthy applies every one of them, however many wait in
+/// the cluster's queue: a task waits for its own answer, not for the live object it is about to
+/// change (which is the one from before, and healthy).
+#[test]
+fn a_sync_of_objects_already_there_applies_every_one() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertCluster { name: "dev".into(), qps: None, inflight: Some(2) });
+    let cms: Vec<Value> = (0..12).map(|i| config_map(&format!("cfg{i}"), "1", json!({}))).collect();
+    for i in 0..12 {
+        let cm = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": format!("cfg{i}"), "namespace": "web"}, "data": {"v": "1"}});
+        if let Some(c) = h.clusters.get_mut("dev") {
+            let _ = c.apply(0, cm, "someone", false);
+        }
+    }
+    h.input(Input::UpsertApp(AppConfig::new("web", "dev", "web")));
+    deploy(&mut h, &git, "web", "r1", cms);
+    h.run_for(5_000);
+    let n = h.records.len();
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let marked = (0..12)
+        .filter(|i| h.clusters.get("dev").and_then(|c| c.get(&ResKey::new("", "ConfigMap", "web", &format!("cfg{i}")))).is_some_and(|v| obj::annotation(&v, crate::engine::TRACKING).is_some()))
+        .count();
+    assert_eq!(marked, 12, "every object applied");
+    let applied = h.records.iter().skip(n).find_map(|r| if let Record::Finished { applied, .. } = r { Some(*applied) } else { None });
+    assert_eq!(applied, Some(12));
 }

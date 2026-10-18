@@ -1000,6 +1000,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             shell: None,
             credentials: None,
             instance: None,
+            config: None,
             reach: Some(true),
             observe: true,
             outpost: false,

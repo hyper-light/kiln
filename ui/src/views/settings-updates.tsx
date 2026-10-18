@@ -11,14 +11,14 @@ import { create } from "zustand";
 import { ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import type { FleetTarget, KilnBinary, ReleaseBuild, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatesOverview } from "@/api/types";
+import type { FleetTarget, KilnBinary, ReleaseBuild, ReleaseWait, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm, Facts, Panel, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { fuller, mergeJobs, updatesRes, useRes, useUpdateJobs } from "@/lib/data";
-import { formatBytes, relativeTime, shortSha } from "@/lib/format";
+import { formatBytes, formatDuration, relativeTime, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -128,6 +128,16 @@ export function UpdatesPanel() {
   const data = useRes(updatesRes).data;
   const live = useUpdateJobs();
   const [confirm, setConfirm] = React.useState<Confirming | null>(null);
+  // Runners chosen for one update policy at once, and that policy.
+  const [selected, setSelected] = React.useState<Set<string>>(() => new Set());
+  const [bulk, setBulk] = React.useState<UpdatePolicy>("notify");
+  const select = (name: string, on: boolean) =>
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (on) next.add(name);
+      else next.delete(name);
+      return next;
+    });
   const [checking, setChecking] = React.useState(false);
   const pending = usePending((s) => s.pending);
   const fileRef = React.useRef<HTMLInputElement>(null);
@@ -166,6 +176,17 @@ export function UpdatesPanel() {
       toast.error(`Couldn't upgrade ${r.name}`, errorMessage(e));
     }
     readAgainSoon();
+  };
+
+  const setPolicy = async (names: string[] | "all", policy: UpdatePolicy) => {
+    try {
+      const [one] = names === "all" ? [] : names;
+      if (names !== "all" && names.length === 1 && one) await api.setRunnerPolicy(one, policy);
+      else await api.setPolicies(policy, names);
+    } catch (e) {
+      toast.error("Couldn't change the update policy", errorMessage(e));
+    }
+    invalidate("updates");
   };
 
   const startAll = async () => {
@@ -215,7 +236,8 @@ export function UpdatesPanel() {
   };
 
   // Runners on a branch or a local build run it on purpose: "Upgrade all" leaves them be.
-  const outdated = data.runners.filter((r) => r.connected && !r.up_to_date && r.how !== "left" && r.how !== "wait");
+  const outdated = data.runners.filter((r) => r.connected && !r.up_to_date && r.how !== "left" && r.how !== "wait" && r.policy !== "off" && !r.locked);
+  const byPolicy = (p: UpdatePolicy) => data.runners.filter((r) => r.policy === p).length;
   const newest = data.newest ?? null;
   const current = data.runners.filter((r) => r.up_to_date).length;
   const runningRunners = new Set(jobs.filter((j) => j.kind === "runner" && j.state === "running").map((j) => j.target));
@@ -269,7 +291,7 @@ export function UpdatesPanel() {
                 {data.runners.length === 0
                   ? "No machines have joined yet."
                   : newest
-                    ? `${current} of ${data.runners.length} on the newest kiln, ${shortSha(newest.commit)}${newest.from === "server" ? ", the server's" : `, from ${newest.from}`} · ${data.follow ? "every runner follows it on its own" : "runners are upgraded when you say"}`
+                    ? `${current} of ${data.runners.length} on the newest kiln, ${shortSha(newest.commit)}${newest.from === "server" ? ", the server's" : `, from ${newest.from}`} · ${data.follow ? `${byPolicy("auto")} upgrade automatically, ${byPolicy("notify")} wait for you, ${byPolicy("off")} have updates off` : "automatic upgrades are off for every runner ([updates] follow)"}`
                     : `${current} of ${data.runners.length} on the server's build · runners are brought to the build this server runs`}
               </p>
             </div>
@@ -292,6 +314,32 @@ export function UpdatesPanel() {
             </Button>
           </div>
           {confirm?.scope === "all" && <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} />}
+          {data.runners.length > 0 && (
+            <div className="upd-bulk">
+              <label className="inline-flex min-h-8 cursor-pointer items-center gap-2">
+                <input
+                  type="checkbox"
+                  className="check"
+                  checked={selected.size > 0 && selected.size === data.runners.length}
+                  onChange={(e) => setSelected(e.target.checked ? new Set(data.runners.map((r) => r.name)) : new Set())}
+                  aria-label="Select every runner"
+                />
+                <span className="upd-sub">{selected.size ? `${plural(selected.size, "runner")} selected` : "Select runners"}</span>
+              </label>
+              <SelectField label="Updates for the selected runners" hideLabel value={bulk} onChange={(v) => setBulk(v as UpdatePolicy)} options={POLICIES} className="upd-select upd-policy" />
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={selected.size === 0}
+                onClick={() => {
+                  void setPolicy(selected.size === data.runners.length ? "all" : [...selected], bulk);
+                  setSelected(new Set());
+                }}
+              >
+                {selected.size === 0 ? "Set" : `Set for ${selected.size === data.runners.length ? "all" : plural(selected.size, "runner")}`}
+              </Button>
+            </div>
+          )}
           <ul className="upd-runners">
             {data.runners.map((r) => (
               <RunnerRow
@@ -301,6 +349,9 @@ export function UpdatesPanel() {
                 job={latest("runner", r.name)}
                 uploading={uploading}
                 onUpload={() => r.target && pickUpload(r.target)}
+                selected={selected.has(r.name)}
+                onSelect={(on) => select(r.name, on)}
+                onPolicy={(p) => void setPolicy([r.name], p)}
                 plan={confirm?.scope === `runner:${r.name}` ? <InlinePlan confirm={confirm} onClose={() => setConfirm(null)} /> : null}
                 onUpgrade={() =>
                   setConfirm({
@@ -463,11 +514,19 @@ function ServerPlan({ s, action }: { s: ServerUpdate; action: "restart" | "repla
 
 /* ---------------------------- runners ---------------------------- */
 
+/** What a runner does with a newer kiln. */
+const POLICIES: { value: UpdatePolicy; label: string }[] = [
+  { value: "auto", label: "Updates: automatic" },
+  { value: "notify", label: "Updates: notify me" },
+  { value: "off", label: "Updates: off" },
+];
+
 function runnerState(r: RunnerUpdate, job: UpdateJob | undefined): { tone: string; text: string } {
   if (job?.state === "running") return { tone: "running", text: job.method === "build" ? "building itself" : "upgrading" };
   if (!r.connected) return { tone: "cancelled", text: "offline" };
   if (r.up_to_date) return { tone: "succeeded", text: "up to date" };
   if (r.how === "left") return { tone: "timed_out", text: r.standing === "local" ? "local build" : "branch build" };
+  if (r.how === "off") return { tone: "timed_out", text: "updates off" };
   if (r.how === "wait") return { tone: "queued", text: "waiting" };
   if (r.standing) return { tone: "queued", text: "behind" };
   return { tone: "queued", text: r.build ? "upgrade available" : "older runner" };
@@ -478,6 +537,19 @@ function sentence(s: string) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+/** "Waits for the release build of 31c0bba: run #232, its build step, on adacachy, 11m 04s in",
+ * the run a link and its time ticking. */
+function ReleaseWaitWords({ w, newest }: { w: ReleaseWait; newest: FleetTarget | null }) {
+  const nowS = useNow() / 1000;
+  const parts = [w.step ? `its ${w.step} step` : null, w.on ? `on ${w.on}` : null, w.since ? `${formatDuration(nowS - w.since)} in` : null].filter(Boolean);
+  return (
+    <>
+      Waits for the release build{newest ? ` of ${shortSha(newest.commit)}` : ""}: <Link to={`/runs/${w.run}`}>run #{w.number}</Link>
+      {parts.length > 0 ? `, ${parts.join(", ")}` : ""}
+    </>
+  );
+}
+
 function RunnerRow({
   r,
   newest,
@@ -486,6 +558,9 @@ function RunnerRow({
   plan,
   onUpgrade,
   onUpload,
+  selected,
+  onSelect,
+  onPolicy,
 }: {
   r: RunnerUpdate;
   /** The newest kiln, when kiln knows it. */
@@ -496,12 +571,16 @@ function RunnerRow({
   plan: React.ReactNode;
   onUpgrade: () => void;
   onUpload: () => void;
+  selected: boolean;
+  onSelect: (on: boolean) => void;
+  onPolicy: (p: UpdatePolicy) => void;
 }) {
   const st = runnerState(r, job);
   const missing = Boolean(r.connected && !r.up_to_date && !r.target_build && r.target);
   return (
     <li className="upd-runner">
       <div className="upd-runner-top">
+        <input type="checkbox" className="check" checked={selected} onChange={(e) => onSelect(e.target.checked)} aria-label={`Select ${r.name}`} />
         <StatusDot status={st.tone} title={st.text} />
         <div className="min-w-0 flex-1">
           <div className="upd-name">{r.name}</div>
@@ -525,16 +604,32 @@ function RunnerRow({
         </span>
         {r.connected && !r.up_to_date && (
           <span className="upd-sub">
-            {r.next ? sentence(r.next) : r.method === "native" ? "upgrades itself" : r.terminal ? "upgraded through a terminal on it" : "terminals are off: upgrade it on the machine"}
+            {r.waits_on ? (
+              <ReleaseWaitWords w={r.waits_on} newest={newest} />
+            ) : r.next ? (
+              sentence(r.next)
+            ) : r.method === "native" ? (
+              "upgrades itself"
+            ) : r.terminal ? (
+              "upgraded through a terminal on it"
+            ) : (
+              "terminals are off: upgrade it on the machine"
+            )}
+            {r.from && r.how !== "off" ? ` · ${r.from}` : ""}
           </span>
         )}
         <div className="upd-actions">
+          {r.locked ? (
+            <span className="upd-sub">Updates off on the machine</span>
+          ) : (
+            <SelectField label={`Updates for ${r.name}`} hideLabel value={r.policy} onChange={(v) => onPolicy(v as UpdatePolicy)} options={POLICIES} className="upd-select upd-policy" />
+          )}
           {missing && (
             <Button size="xs" variant="ghost" disabled={uploading !== null} onClick={onUpload}>
               <Upload /> {uploading === r.target ? "Uploading…" : `Upload ${r.target}`}
             </Button>
           )}
-          {r.connected && !r.up_to_date && !plan && r.how !== "wait" && r.how !== "upgrading" && (
+          {r.connected && !r.up_to_date && !plan && r.how !== "wait" && r.how !== "upgrading" && r.policy !== "off" && !r.locked && (
             <Button size="xs" variant="secondary" disabled={job?.state === "running" || ((r.method === "terminal" || r.how === "build") && !r.terminal)} onClick={onUpgrade}>
               {r.how === "build" ? "Build and upgrade" : "Upgrade"}
             </Button>

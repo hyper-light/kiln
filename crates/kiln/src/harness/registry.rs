@@ -524,6 +524,11 @@ impl Registry {
         self.mirrors.lock().get(id).is_none_or(|m| matches!(&m.location, Location::Machine(at) if at == machine))
     }
 
+    /// Session `id` is one kiln knows, and it runs on `machine`.
+    pub fn located_on(&self, id: &str, machine: &str) -> bool {
+        self.mirrors.lock().get(id).is_some_and(|m| matches!(&m.location, Location::Machine(at) if at == machine))
+    }
+
     /// A copy of session `id` at `epoch` is from before it went on elsewhere: its machine lets go
     /// of it.
     pub fn stale(&self, id: &str, epoch: u64) -> bool {
@@ -886,6 +891,8 @@ impl Registry {
                         pause: None,
                         last_turn: None,
                         keep_off: false,
+                        move_on_limit: false,
+                        pause_at: None,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);
@@ -971,6 +978,16 @@ impl Registry {
             out.push(a);
         }
         Ok(Command::Send { id: mid, text, mode, attachments: out, overrides })
+    }
+
+    /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is
+    /// told, to take up the account (Claude Code starts again with it once its turn ends; Codex reads
+    /// it again).
+    pub async fn signed_in(&self, hub: &Hub, target: &str, kind: &str) {
+        let ids: Vec<String> = self.list().into_iter().filter(|i| i.target == target && i.kind == kind).map(|i| i.id).collect();
+        for id in ids {
+            let _ = self.command(hub, &id, Command::Control { id: "account".into(), value: None }).await;
+        }
     }
 
     /// A command for a session, from any device.

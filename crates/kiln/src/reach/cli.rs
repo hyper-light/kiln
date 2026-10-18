@@ -207,7 +207,7 @@ pub async fn run(a: RunArgs, shutdown: crate::rt::Shutdown) -> anyhow::Result<()
                     };
                 }
                 Ev::Error(e) => anyhow::bail!("{e}"),
-                Ev::Status(_) | Ev::Runners(_) | Ev::Forgot(_) => {}
+                Ev::Status(_) | Ev::Runners(_) | Ev::Forgot(_) | Ev::Answer(_) => {}
             }
         }
         use futures::FutureExt as _;

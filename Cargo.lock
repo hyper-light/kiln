@@ -2043,6 +2043,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "tungstenite",
@@ -3775,6 +3776,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

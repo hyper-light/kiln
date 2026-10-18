@@ -61,12 +61,13 @@ const ENDED: Record<string, string> = {
 function LastTurn({ state, status }: { state: State | null; status: Status }) {
   const now = useNow();
   const t = state?.last_turn;
-  if (status === "starting") return <span className="ag-turn-meta">Starting…</span>;
+  // An existing conversation resumes; only a new one starts.
+  if (status === "starting") return <span className="ag-turn ag-turn-idle ag-turn-meta">{state?.harness_session ? "Resuming…" : "Starting…"}</span>;
   if (!t) return null;
   const ago = relativeTime(t.at / 1000, now);
   const how = ENDED[t.how];
   return (
-    <span className="ag-turn">
+    <span className="ag-turn ag-turn-idle">
       <span className="ag-turn-meta ag-turn-effort">
         Last turn ended {ago === "now" ? "just now" : ago}
         {how && `, ${how}`}
@@ -116,7 +117,6 @@ export function AgentHeader({
 }) {
   const navigate = useNavigate();
   const features = meta?.features ?? [];
-  const sessionControls = (meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session").length;
   const running = status === "running" || status === "waiting";
   const activity = state?.activity ?? info?.activity;
   const cost = state?.usage?.cost_usd ?? info?.cost_usd ?? 0;
@@ -124,7 +124,8 @@ export function AgentHeader({
   const approvals = state?.approvals ?? [];
   const left = state?.left_behind ?? info?.left_behind ?? 0;
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
-  const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), ...(sessionControls > 0 ? [{ label: "Settings…", onSelect: onSettings }] : [])];
+  // Settings always: kiln's own (usage limits) are there whatever the harness offers.
+  const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), { label: "Settings…", onSelect: onSettings }];
   // Codex takes a new permission mode, model or effort from its next turn.
   const nextTurn = info?.kind === "codex" ? { mode: true, model: true, effort: true } : undefined;
   // How it runs, as one line; with the other harnesses' models on its machine where it can go on in them.
@@ -233,7 +234,7 @@ export function AgentHeader({
       </div>
       <div className="ag-turn-row">{running ? <TurnLine state={state} activity={activity} stopAt={stopAt} onForce={features.includes("interrupt") ? onForceStop : undefined} /> : <LastTurn state={state} status={status} />}</div>
       <div className="ag-state">
-        <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause }} />
+        <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause, harness_session: state?.harness_session ?? info?.harness_session }} />
         <span className="ag-cwd ag-wide-only" title={cwd}>
           {tildify(cwd)}
         </span>
@@ -257,6 +258,8 @@ export function AgentHeader({
           plan={plan}
           stopAt={state?.pause_at ?? null}
           onStopAt={(percent) => send({ type: "pause_at", percent })}
+          moveOn={state?.move_on_limit ?? false}
+          onMoveOn={(on) => send({ type: "move_on_limit", on })}
           onMore={() => {
             setUsage(false);
             onUsage();

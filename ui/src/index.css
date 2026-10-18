@@ -3007,6 +3007,17 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   align-items: center;
   gap: 8px;
 }
+.upd-bulk {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-bottom: 10px;
+}
+.upd-policy {
+  flex: 0 1 190px;
+  min-width: 0;
+}
 .upd-upload > .upd-select {
   flex: 0 1 260px;
   min-width: 0;

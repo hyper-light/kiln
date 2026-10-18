@@ -13,9 +13,11 @@ import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
 import type { AiSession } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Loadable, Loading } from "@/components/ui/loading";
-import { PageIntro } from "@/components/ui/misc";
+import { PageIntro, SelectField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
-import { errorMessage, useLocalStorage } from "@/lib/hooks";
+import { useAgentsLive } from "@/lib/data";
+import { relativeTime } from "@/lib/format";
+import { errorMessage, useLocalStorage, useNow } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { agentLabel, hasOwnName, plain } from "./derive";
 import { pauseLine } from "./pause";
@@ -70,7 +72,7 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return a.pause ? pauseLine(a.pause, Date.now()) : "Paused";
     case "working": {
       const plan = (a.todos_total ?? 0) > 0 ? `plan ${a.todos_done ?? 0}/${a.todos_total}` : "";
-      return [a.status === "starting" ? "Starting" : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
+      return [a.status === "starting" ? (a.harness_session ? "Resuming" : "Starting") : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
     }
     case "finished":
       return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
@@ -312,6 +314,82 @@ function Found({ all }: { all: { a: AgentInfo }[] }) {
   return <FoundSessions sessions={elsewhere} quiet={quiet} />;
 }
 
+/** A machine offline this long, with agents on it, may be gone: they can go on elsewhere. */
+const GONE_AFTER_S = 120;
+
+/**
+ * Machines that have been offline a while with agents on them: if one is gone, its agents go on
+ * elsewhere from kiln's copy of their conversations, each on the machine that suits it, or all on
+ * one. A machine only restarting doesn't show here.
+ */
+function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
+  const runners = useAgentsLive().data;
+  const nowS = useNow() / 1000;
+  const offline = new Map<string, number>();
+  for (const { a, stand } of rows) {
+    if (stand !== "offline" || a.target === "local") continue;
+    const m = machineName(a.target);
+    offline.set(m, (offline.get(m) ?? 0) + 1);
+  }
+  const gone = [...offline].flatMap(([machine, count]) => {
+    const r = runners.find((x) => x.name === machine);
+    return r && !r.connected && nowS - r.last_seen > GONE_AFTER_S ? [{ machine, count, since: r.last_seen }] : [];
+  });
+  if (gone.length === 0) return null;
+  const others = runners.filter((r) => r.connected && !r.ephemeral && !r.outpost).map((r) => r.name);
+  return (
+    <>
+      {gone.map((g) => (
+        <RecoverMachine key={g.machine} {...g} others={others} />
+      ))}
+    </>
+  );
+}
+
+function RecoverMachine({ machine, count, since, others }: { machine: string; count: number; since: number; others: string[] }) {
+  const [to, setTo] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const go = async () => {
+    setBusy(true);
+    try {
+      const { moved } = await harnessApi.recover(machine, to || undefined);
+      const failed = moved.filter((m) => m.error);
+      const n = moved.length - failed.length;
+      if (n > 0) toast({ title: `${n} agent${n === 1 ? "" : "s"} of ${machine} going on elsewhere`, description: failed.length > 0 ? `${failed.length} couldn't: ${failed[0]?.error ?? ""}` : undefined, tone: "running" });
+      else toast.error(`${machine}'s agents couldn't go on elsewhere`, failed[0]?.error ?? "");
+      invalidate("harness/agents");
+    } catch (e) {
+      toast.error(`${machine}'s agents couldn't go on elsewhere`, errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="ms-recover" role="status">
+      <span>
+        {machine} has been offline since {relativeTime(since)}. If it&rsquo;s gone, its {count} agent{count === 1 ? "" : "s"} can go on elsewhere from kiln&rsquo;s copy of
+        {count === 1 ? " its conversation" : " their conversations"}.
+      </span>
+      {others.length > 0 ? (
+        <span className="ms-recover-go">
+          <SelectField
+            label={`Where ${machine}'s agents go on`}
+            hideLabel
+            value={to}
+            onChange={setTo}
+            options={[{ value: "", label: "Each where it suits best" }, ...others.map((m) => ({ value: m, label: `All on ${m}` }))]}
+          />
+          <Button size="xs" variant="secondary" disabled={busy} onClick={() => void go()}>
+            {busy ? "Moving…" : "Move them on"}
+          </Button>
+        </span>
+      ) : (
+        <span className="ms-recover-none">No other machine is connected to take them.</span>
+      )}
+    </div>
+  );
+}
+
 function Agents({ onSpawn }: { onSpawn: () => void }) {
   const { list, reload } = useAgents();
   const seen = useSeen();
@@ -363,6 +441,9 @@ function Agents({ onSpawn }: { onSpawn: () => void }) {
         <>
           <ListBar rows={all} q={q} onQuery={setQ} view={view} onView={setView} />
           <MessageBar agents={targets} reach={reach} onEnded={() => setSelected(new Set())} />
+          <React.Suspense fallback={null}>
+            <Recover rows={all} />
+          </React.Suspense>
         </>
       )}
 

@@ -176,15 +176,15 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
-| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
+| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); tiers, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); change requests; review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); review UI, App, REST rest left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
@@ -192,7 +192,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal) |
 
 ---
 
@@ -606,7 +606,7 @@ wait reason says so (W05).
 | `/_kiln/proxy/<ecosystem>/…` | Package registry proxies (W12) | job token or PAT |
 | `/<owner>/<repo>[.git]/info/refs` and `…/git-upload-pack`, `/api/v3/…`, `/api/graphql` | The facade: GitHub-compatible git and REST for jobs (W14) | job token as `GITHUB_TOKEN` |
 | `/<owner>/<repo>/actions/runs/<id>…` | GitHub-shaped page links that actions print, redirected to kiln's pages (W14) | open (the pages ask for a session) |
-| `/git/<owner>/<repo>.git` | Native git hosting (W14) | PAT, agent token |
+| `/git/<owner>/<repo>.git` | Native git hosting (W14): clone, fetch and push | PAT, agent token, job token |
 
 The facade lives at the **root** of the server's origin, because `actions/checkout` builds its
 URLs from the origin of `GITHUB_SERVER_URL` and drops any path. Its paths can't collide with
@@ -1970,9 +1970,10 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     JavaScript action on the current `@actions/core`, `@actions/exec` and `@actions/io`, with a
     post step, calls every API (inputs of each kind, outputs, `exportVariable`, `addPath`,
     `setSecret`, state, `debug`, groups, annotations with properties, summaries, `exec`,
-    `getExecOutput`, `mkdirP`, `which`, `isDebug`). `runtime::tests::toolkit_conformance`
+    `getExecOutput`, `mkdirP`, `which`, `isDebug`, `getIDToken`). `runtime::tests::toolkit_conformance`
     checks each effect on the host executor: in the step's log, in a later step, in the post
-    step and in the leg's events.
+    step and in the leg's events. `getIDToken` asks the leg's ID token endpoint for its
+    audience with the request token, and the token is masked from the moment it arrives.
   - R01's workspaces (`crates/kiln/src/runner/workspaces.rs`): a leg's `<work>/w/<8 hex>` is
     removed when the leg ends; until then they were kept forever, 12 GB of them on one runner.
     A failed leg with `keep_on_failure_minutes` (W17-R02) keeps its own until that runs out.
@@ -2358,8 +2359,29 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
       key, and a refused read-only save;
     - `upload-artifact@v4` and `@v7` (zipped and `archive: false`);
     - `download-artifact@v4` and `@v8`: by name, by pattern, raw, and across runs with `run-id`.
+- *Job-result reuse (R10, AC06).* A job with `reuse: true` or `reuse: { paths, env, max-age }`
+  (kiln) gets an input hash before its leg is queued (`kiln_ci::plan::reuse`). It covers:
+  - the leg as planned, with its job and the workflow's `env` and defaults;
+  - its actions' pins and its images' digests;
+  - runs-on and requirements;
+  - the listed variables;
+  - its trust;
+  - the git objects of the listed paths (globs, files or directories) at the commit, or the
+    whole tree when none are listed.
+
+  A leg that succeeded is kept under its hash (`ci_reuse`). A later leg with the same hash,
+  within `max-age`, whose source's artifacts are all still there, takes that result over: its
+  outputs (which the plan and `needs` see as a success), steps, logs and artifacts, and it
+  names its source ("Reused from run #N", linked). Untrusted legs hash differently, so neither
+  side takes the other's. `kiln rerun --no-reuse` (and `no_reuse` on the API) runs every leg.
+  A leg whose inputs can't all be known (an image's digest, the mirror) runs, and says why in
+  the server's log. AC06:
+  - a table of edits changes the hash, one input at a time;
+  - E2E on a local server: a README-only push reused the build, a change under its `paths` ran
+    it, and "run anyway" ran it.
 - *Left.*
-  - R02 (S3), R09 (tiers), R10 (reuse), R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
+  - R02 (S3), R09 (tiers), R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
+  - A diff that only rebases reusing what it didn't touch (W14).
   - R14's cap for called workflows.
   - v1's `artifacts:` as an artifact.
   - AC01 (the toolkit harness: 1,000 files, 2 GiB), AC03, AC06, AC09.
@@ -3094,6 +3116,17 @@ enforcement points to W18, agent isolation to W20.
   `docker version`. Exactly the declared fact and the answering probe appear.
 
   Firecracker and shards are reported as tools until the runner can run legs on them.
+- **Executor parity (AC02), on the executors this fleet has.** A workflow on a local server runs
+  F-20 from the repository on the host and in the `docker` executor (`ubuntu-latest`, kiln's
+  runner image). Every effect is the same in both:
+  - inputs of each kind; outputs, `exportVariable` and `addPath` in a later step;
+  - the secret masked;
+  - `exec` and `io`;
+  - annotations with their properties, and the summary;
+  - the post step's state;
+  - `getIDToken` from kiln's own issuer, for its audience and the repository's subject, masked.
+
+  Firecracker, shards and `k8s` follow when their executors do.
 
 - *Done.* `crates/kiln/src/runner/docker.rs`, on the host executor through Docker or Podman
   (R03, R08), as GitHub's self-hosted runner does it:
@@ -3298,8 +3331,127 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** In progress: the facade's git half, and the start of its REST half.
+**Progress.** In progress: native hosting, stacked diffs, change requests, review, policy and the
+land queue are built; the review UI, the App and the facade's REST half are left.
 
+- *Done.* R01 and R02's hosting, in `crates/kiln/src/ci/hosting.rs`:
+  - native repositories: bare repositories in `<data_dir>/hosted/<owner>/<name>.git` (apart
+    from the mirrors), made empty (`POST /api/repos` with `mode: native`, `kiln repo create`,
+    `[[repos]] mode = "native"`) or copied from upstream (`import`, `kiln repo import <url>`,
+    from network URLs only); `repos` gains `mode` and `default_branch` (R13's first part);
+  - clone and push over HTTPS at `/git/<owner>/<repo>.git` (and at the root, for legs), with a
+    PAT or an agent token as git's password, or a leg's `GITHUB_TOKEN`;
+  - fetches need `diffs.read` (a leg: `contents: read`, its own repository only);
+  - a push's ref updates are read before git sees the pack, and the push is refused whole, in
+    git's own report and as `remote: kiln: …` lines, when one of them breaks policy:
+    - only the owner, or a principal `.kiln/review.yaml` `direct-push` names (read from trunk),
+      writes a trunk;
+    - a trunk is never deleted, nor written in another case;
+    - an empty repository takes its first trunk from anyone who may push;
+    - other branches need `diffs.submit`, tags `diffs.land`; a leg needs `contents: write`;
+    - `refs/kiln/*` and `refs/pull/*` are kiln's;
+  - every push is audited (`repo.push`), and wakes the poller, so its workflows start at once.
+  - Checked end to end with real git (`crates/kiln/tests/hosting.rs`): clone and push by
+    developer, viewer, owner and powerless tokens, trunk refusals, whole-push refusal, and the
+    push's run.
+- *Done.* R03's stacked diffs, in `crates/kiln/src/ci/diffs.rs` (pure part:
+  `crates/kiln-ci/src/review.rs`):
+  - a push to `refs/for/<trunk>` (`diffs.submit`) makes each commit between the trunk and the
+    one pushed a diff (`D12`), or a new version of the diff with its `Change-Id`;
+  - git stores the push, kiln makes the diffs, git's report gives each a link (`remote: kiln:
+    D12 v3 (updated)`) or the whole push's refusal: no Change-Id, a merge, a landed or an
+    abandoned diff, not a trunk;
+  - only the diffs that changed get versions. A diff restacked on an amended one keeps its
+    version; one whose patch only moved to a new trunk base gets a rebase-only version, marked;
+    a reorder is seen and marked;
+  - every version is kept at `refs/kiln/diffs/D12/v3`; the push's `refs/for/*` ref is never kept;
+  - push options `draft`, `ready`, `reviewer=`, `message=`, `topic=` (and Gerrit's `%…`
+    suffix);
+  - each new version starts the `pull_request` (`opened`, then `synchronize`) and `diff`
+    workflows on its commit, with the diff in `github.event.kiln.diff`;
+  - the API: `/api/repos/:repo/diffs`, `/api/diffs/:id` (versions, reviewers, runs),
+    `/versions/:v/files`, `/interdiff?from=&to=` (`git range-diff`), `/api/stacks/:id`, and
+    `ready`, `abandon`, `reclaim`, `commandeer`, scoped to the diff's repository in the route
+    table;
+  - the CLI (`crates/kiln/src/ci/review_cli.rs`):
+    - `kiln clone` (kiln's git credential helper, and the commit-msg hook that adds Change-Ids);
+    - `kiln submit` (adds the Change-Ids commits lack, then pushes);
+    - `kiln sync`, `kiln diffs`, `kiln checkout D12[@v2]`, `kiln hook install`;
+  - tables `diffs`, `diff_versions`, `stacks`, `diff_reviewers`.
+  - Checked end to end with real git: W14-AC01 (`w14_ac01_stacks`: three commits as a stack,
+    D2 amended, the stack rebased and reordered, an interdiff, the refusals, the options, the
+    author's actions, the runs), and the CLI (`w14_r03_cli`).
+- *Done.* The rest of R01 and R02, and of R05 and R07:
+  - `native + mirror`: a repository's `mirror` (API, `[[repos]] mirror =`) gets its trunk after
+    each land and each direct push of it;
+  - branch protection: `.kiln/review.yaml` `protected: [globs]`: those branches aren't deleted
+    or rewritten (git refuses their non-fast-forwards once it has the commits), and only those who
+    may land push them;
+  - a suggestion applied as an amend (`POST /api/comments/:id/apply`): a diff's new version (its
+    parent, message and author kept), a change request's commit on its branch; the thread is
+    resolved, saying which version;
+  - landed commits signed when `[ci] land_signing = { key, format }` says so (an SSH key by
+    default);
+  - a patch series without git (`POST /api/repos/:repo/submit`): `git format-patch` output or
+    `{ message, diff }` patches, applied onto the trunk in a temporary index, given Change-Ids,
+    and submitted as a push is.
+  - Checked end to end (`w14_r05_suggestions_mirror_signing`).
+- *Done.* R04's change requests, in `crates/kiln/src/ci/cr.rs`: a branch reviewed against a
+  trunk as a whole (`CR4`, numbered with the diffs):
+  - opened by pushing `refs/for/<trunk>/branch/<name>` (`kiln cr open [branch]`, `-o title=`)
+    or `POST /api/repos/:repo/change-requests` for a branch already pushed;
+  - each later push of the branch is a version (rebase-only when its combined patch is the same
+    on a new base), said in git's report;
+  - the same review, threads, checks (`pull_request`), API (`/api/change-requests/:id/…`) and
+    queue as diffs; the commits it brings are listed;
+  - it lands by `squash` (the default: one commit), `merge` (a merge commit), `rebase` (each
+    commit replayed) or `ff-only`, each with a `Change-Request:` trailer where it writes a
+    commit;
+  - checked end to end (`w14_r04_change_requests`): every strategy's history, and ff-only refused
+    once the trunk moved on.
+- *Done.* R05's review, in `crates/kiln/src/ci/review.rs`:
+  - threads anchored to a version, file, side and lines, that follow the code to the latest
+    version (`git diff -U0` hunks) or show as outdated;
+  - comments drafted privately and published together by a review (`accept`,
+    `request_changes`, `comment`, `resign`); the author doesn't accept their own;
+  - each reviewer's state; the diff's review state from its reviews;
+  - threads resolved and reopened (`PATCH /api/comments/:id`);
+  - files marked viewed until they change;
+  - the inbox (`/api/review/inbox`): threads waiting for you (on your diffs, ones you joined, ones
+    that mention you), threads where you wait, review requests, your open diffs.
+- *Done.* R09's policy from the trunk (`crates/kiln-ci/src/land.rs`): `.kiln/review.yaml` and
+  `.kiln/owners.yaml` read from the trunk when they apply:
+  - approvals from people other than the author, agents' only with `agents-can-approve`;
+  - sticky approvals across rebase-only versions;
+  - owners (the last matching rule, optional rules aside);
+  - `land.checks` on the version (a skipped or neutral check passes, as on GitHub);
+  - open threads; `land.strategies` and `land.default`;
+  - what still blocks a diff is listed at `/api/diffs/:id/land`.
+- *Done.* R07 and R08, the land queue, in `crates/kiln/src/ci/land.rs`:
+  - `POST /api/diffs/:id/land` (`diffs.land`) lands the diff and those below it, by the strategy
+    asked for, within `land.strategies`: `stack` (one commit each, with `Differential-Revision:`
+    and `Reviewed-by:` trailers), `stack-squash`, or `ff-only` (the commits as they are, refused
+    when diverged);
+  - per trunk, the next batch (up to `queue.batch`, halved after each failure until the culprit
+    is alone) is applied onto the trunk's tip without a working tree (`git merge-tree`; a
+    temporary worktree where git is older than 2.40), kept at `refs/kiln/land/<trunk>/<batch>`,
+    and tested by its `merge_group` and `land` workflows;
+  - a required check that none of them runs ejects the batch;
+  - when they pass, the trunk moves in one compare-and-swap update (a moved trunk means a new
+    candidate);
+  - a failure ejects a lone entry with its reason, or splits the batch; a conflict ejects the
+    entry as "needs rebase";
+  - landed diffs get `pull_request` `closed` events; the open diffs above them are restacked onto
+    the new trunk as rebase-only versions;
+  - `GET /api/repos/:repo/queue`, `DELETE /api/queue/:entry` (`queue.manage`);
+  - `kiln land D12 [--strategy S]` and `kiln review D12 [--accept | --request-changes | --comment
+    | --resign]`.
+  - Checked end to end:
+    - W14-AC02 and AC04 (`w14_ac02_strategies`): a review lets a stack land; each strategy's
+      history; the restack; a policy-loosening diff judged by the trunk's policy;
+    - W14-AC03 (`w14_ac03_queue`): a batch of four with one culprit bisected, the culprit
+      ejected with its reason and three landed, and a conflict ejected; the checks run on a real
+      runner that fetches through kiln's git with the leg's token.
 - *Done.* R11's git half, in `crates/kiln/src/ci/facade.rs`:
   - smart HTTP over the server's mirror, served by `git http-backend` (protocols v0 to v2,
     gzipped requests, fetches by SHA, filters);
@@ -3319,6 +3471,13 @@ adapts [review.md](review.md), which it replaces.
     and kept for W18), which Gradle's, Maven's and sbt's submission actions send;
   - deployments and their statuses (`/deployments`, `/deployments/{id}/statuses`), and
     `/environments` with GitHub's `protection_rules` (W15);
+  - pull requests over diffs and change requests (`crates/kiln/src/ci/rest/pulls.rs`):
+    `/pulls`, `/pulls/{n}`, `/files`, `/commits`, line comments (`/pulls/{n}/comments`,
+    `/pulls/comments/{id}`), reviews (`APPROVE`, `REQUEST_CHANGES`, `COMMENT`, pending), and
+    the issues API's view (`/issues/{n}`, `/issues/{n}/comments`, `/issues/comments/{id}`, edits
+    and deletes of jobs' own comments). A job writes as `github-actions[bot]`, an agent: its
+    approval counts only where `agents-can-approve`; a comment on the whole pull request doesn't
+    hold a land up. Checked with a real run (`w14_r11_pulls`);
   - `/user`, `/rate_limit`;
   - 501 "not implemented by kiln", with a warning on the leg, for everything else;
   - GraphQL answering the same;
@@ -3328,8 +3487,13 @@ adapts [review.md](review.md), which it replaces.
     - `docker/metadata-action`;
     - `softprops/action-gh-release` with an asset;
     - `actions/checkout` unpacking the tarball where git is missing.
-- *Left.* Everything else: the rest of R11's REST subset and GraphQL, hosting (R01, R02), review,
-  landing, the App, the schema, and AC01 to AC07.
+- *Left.* Everything else:
+  - R03's `kiln absorb`;
+  - the rest of R11's REST subset and GraphQL;
+  - replies by email or chat (R05, with W11-R06);
+  - R06's diffs UI and the review pages (with W21);
+  - the App (R10);
+  - AC05 to AC07.
 
 ### W15 Environments and deployments
 
@@ -4571,9 +4735,35 @@ and AC02.
     - `setup-python`: GitHub's `python-versions` manifest has builds for Ubuntu only, and the
       host is not Ubuntu. *Fixed:* `ubuntu-latest` legs now run in kiln's Ubuntu runner image
       (W13-R04), where it installs CPython 3.12.
+- *AC07* (`crates/kiln/tests/security.rs`, against a server of its own):
+  - **Token scope.** Every route of the route table refuses a token that may do nothing. That is an
+    agent's for a user without a grant: 403 for it, and 401 without a token, on 128 routes.
+    Tokens are each caller's own: someone else's is never listed, and is out of reach.
+  - **Secrets.** A run uses a secret in its command, environment, annotations, a title, its
+    summary, its outputs and `$GITHUB_ENV`. The logs show it masked. It is in no API answer (the
+    run, its legs, annotations, summaries and graph), not in the events stream, and in no file
+    under the data directory, the database's write-ahead log included.
+  - **YAML bombs.** A billion laughs is refused, in well under a second, by everything kiln reads
+    from a repository: workflows of both dialects, overlays, actions, `routing.yaml`,
+    `notify.yaml`, `config.yaml`, `pnpm-lock.yaml` and `yarn.lock`.
+  - **SSRF guards.** A request to an address someone gave kiln never reaches this machine, a
+    private network or a link-local address (a cloud's metadata service), unless
+    `[ci] allow_private_targets` names that host, address or network. This covers webhook
+    subscriptions, channels' webhook URLs and OCI registries' Verify. The name is resolved where
+    the request is made and the connection goes to the address checked, so DNS rebinding can't
+    get around it.
+  - **Archive traversal.** The runner unpacks a commit's tarball with nothing outside the
+    workspace (`w22_ac07_tarball_stays_in_the_workspace`):
+    - entries with `..` are skipped;
+    - a link earlier in the archive can't lead a later entry, or the directories made for it,
+      elsewhere;
+    - a link where a file goes is replaced, never written through.
+
+    Actions' tarballs unpack through `tar`'s own checks, and local runs arrive as git packs.
+  - Fork isolation is W18-AC03, and signed URL tampering W08-AC04.
 - *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03 to AC09; the rest of F-21; an authenticated way for legs
-  to read github.com's API (W18's egress proxy).
+  with test tenants (W11-AC03); AC03 to AC06, AC08 and AC09; the rest of F-21; an authenticated
+  way for legs to read github.com's API (W18's egress proxy).
 
 ---
 

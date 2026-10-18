@@ -3,8 +3,8 @@
  * they reset, and the harness's own status (version, account, model, sandbox, MCP servers …).
  */
 import * as React from "react";
+import { ChevronDown } from "lucide-react";
 import type { AgentInfo, Limit, StatusItem } from "@/api/harness";
-import { SelectField } from "@/components/ui/misc";
 import { cn } from "@/lib/utils";
 import { useClock } from "./dom";
 import { HarnessMark } from "./parts";
@@ -82,9 +82,51 @@ export function LimitMeter({ limit, compact }: { limit: Limit; compact?: boolean
   );
 }
 
+/** When a window starts over, shortly: "1:40 PM", "Sat 2:00 AM". */
+function resetShort(at: number, now: number): string {
+  const d = new Date(at);
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return new Date(at).toDateString() === new Date(now).toDateString() ? time : `${d.toLocaleDateString([], { weekday: "short" })} ${time}`;
+}
+
+/** One window, one row: its name, how full, how much, and when it starts over. */
+function UsageRow({ limit, now }: { limit: Limit; now: number }) {
+  const pct = limit.used_percent;
+  const reached = limit.status === "rejected";
+  // "5h": the session window, which its label ("Session") doesn't say the length of.
+  const hours = /^(\d+)h$/.exec(limit.window ?? "")?.[1];
+  const at = limit.resets_at;
+  const left = at && at > now ? leftWords(at - now) : null;
+  const title = [`${limit.label}: ${amount(limit)}`, reached ? "reached" : limit.status === "warning" ? "close to the limit" : "", ...resetsIn(at, now)].filter(Boolean).join(" · ");
+  return (
+    <li className="hx-usage-row" data-tone={reached ? "fail" : tone(pct)} title={title}>
+      <span className="hx-usage-name">
+        {limit.label}
+        {hours && <span className="hx-usage-win"> {hours}h</span>}
+      </span>
+      <span className="hx-usage-bar" role="meter" aria-label={limit.label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct ?? undefined}>
+        <span style={{ width: `${Math.min(100, Math.max(0, pct ?? 0))}%` }} />
+      </span>
+      <span className="hx-usage-pct">{reached ? "100%" : pct !== null ? `${Math.round(pct)}%` : "—"}</span>
+      <span className="hx-usage-reset">
+        {at && left ? (
+          <>
+            <span className="hx-usage-at">{resetShort(at, now)} · </span>
+            {left}
+          </>
+        ) : at ? (
+          "now"
+        ) : null}
+      </span>
+    </li>
+  );
+}
+
+const STOP_POINTS = [80, 90, 95];
+
 /**
- * The plan's limits in full, opened in place from the head's usage badge (no popup): how much of
- * each window is used, and when it starts over, in local time.
+ * The plan's limits, opened in place from the head's usage badge (no popup): a row a window, and
+ * what the agent does as they fill (where it pauses, and whether it goes on on another machine).
  */
 export function UsagePanel({
   id,
@@ -93,40 +135,60 @@ export function UsagePanel({
   onMore,
   stopAt,
   onStopAt,
+  moveOn,
+  onMoveOn,
 }: {
   id: string;
   limits: Limit[];
   plan?: string;
   onMore?: () => void;
-  /** The agent stops between turns once a limit is this full (null: only when one is reached). */
+  /** The agent pauses once a limit is this full (null: only when one is reached). */
   stopAt?: number | null;
   onStopAt?: (percent: number | null) => void;
+  /** At a limit it goes on on another machine with room (opt in). */
+  moveOn?: boolean;
+  onMoveOn?: (on: boolean) => void;
 }) {
+  const now = useClock(30_000);
   return (
     <section id={id} className="hx-usage-panel" aria-label="Plan usage">
-      <div className="hx-usage-head">
-        <span className="hx-eyebrow">Plan usage</span>
-        {plan && <span className="hx-tag">{plan}</span>}
-      </div>
-      <div className="hx-usage-limits">
+      <ul className="hx-usage-rows">
         {limits.map((l) => (
-          <LimitMeter key={l.id} limit={l} />
+          <UsageRow key={l.id} limit={l} now={now} />
         ))}
+      </ul>
+      <div className="hx-usage-foot">
+        {onStopAt && (
+          <label className="hx-usage-stop">
+            <span>Pause at</span>
+            <span className="select">
+              <select value={stopAt ? String(stopAt) : ""} onChange={(e) => onStopAt(e.target.value ? Number(e.target.value) : null)}>
+                <option value="">the limit</option>
+                {STOP_POINTS.map((p) => (
+                  <option key={p} value={String(p)}>
+                    {p}% used
+                  </option>
+                ))}
+              </select>
+              <ChevronDown size={12} aria-hidden="true" />
+            </span>
+          </label>
+        )}
+        {onMoveOn && (
+          <label className="hx-usage-move" title="At a limit, it goes on on another of your machines whose harness is signed in to an account with room: its conversation and repository go along">
+            <input type="checkbox" className="check" checked={Boolean(moveOn)} onChange={(e) => onMoveOn(e.target.checked)} />
+            Go on elsewhere at a limit
+          </label>
+        )}
+        <span className="hx-usage-end">
+          {plan && <span className="hx-tag">{plan}</span>}
+          {onMore && (
+            <button type="button" className="hx-usage-more" onClick={onMore}>
+              Cost and status
+            </button>
+          )}
+        </span>
       </div>
-      {onStopAt && (
-        <SelectField
-          className="hx-usage-stop"
-          label="Stop between turns"
-          value={stopAt ? String(stopAt) : ""}
-          onChange={(v) => onStopAt(v ? Number(v) : null)}
-          options={[{ value: "", label: "Only when a limit is reached" }, ...[80, 90, 95].map((p) => ({ value: String(p), label: `Once a limit is ${p}% used` }))]}
-        />
-      )}
-      {onMore && (
-        <button type="button" className="hx-usage-more" onClick={onMore}>
-          This session&apos;s cost, context and status
-        </button>
-      )}
     </section>
   );
 }

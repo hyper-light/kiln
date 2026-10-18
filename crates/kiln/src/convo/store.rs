@@ -28,6 +28,10 @@ pub const COMMIT_ROWS: usize = 2048;
 pub const QUEUE: usize = 65_536;
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
+/// While the writer has nothing else to do, record lines kept before lines were compressed are
+/// compressed this many at a time, this often.
+const SQUEEZE_BATCH: usize = 2000;
+const SQUEEZE_EVERY: Duration = Duration::from_millis(200);
 
 /// What the store keeps of one session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -143,6 +147,9 @@ pub trait Engine: Send + 'static {
     fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
     /// The sessions not ended, heard of since `since` (unix ms), oldest first.
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>>;
+    /// Compress the next `limit` record lines kept before lines were compressed, if any are left:
+    /// whether more are.
+    fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool>;
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -324,6 +331,8 @@ impl SendWait for mpsc::SyncSender<Msg> {
 fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers) {
     let mut pending: Vec<Row> = Vec::new();
     let mut since: Option<Instant> = None;
+    // Lines kept before lines were compressed may be left: compressed while nothing else waits.
+    let mut squeezing = true;
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
         if pending.is_empty() {
             return;
@@ -335,7 +344,8 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         }
     };
     loop {
-        let wait = since.map_or(Duration::from_secs(3600), |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
+        let idle = if squeezing { SQUEEZE_EVERY } else { Duration::from_secs(3600) };
+        let wait = since.map_or(idle, |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
         match rx.recv_timeout(wait) {
             Ok(Msg::Rows(rows)) => {
                 pending.extend(rows);
@@ -351,8 +361,19 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 f(engine.as_mut());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                let had = !pending.is_empty();
                 commit(&mut engine, &mut pending);
                 since = None;
+                if squeezing && !had {
+                    match engine.squeeze_some(SQUEEZE_BATCH) {
+                        Ok(true) => {}
+                        Ok(false) => squeezing = false,
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "conversation store: older record lines couldn't be compressed");
+                            squeezing = false;
+                        }
+                    }
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 commit(&mut engine, &mut pending);

@@ -312,6 +312,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "observe", "v1", rest @ ..]) => crate::observe::api::route(rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        // W14: diffs and stacks.
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
+            let segs: Vec<&str> = s.iter().skip(1).copied().collect();
+            let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
+            crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body).await.map_err(|(c, m)| err(c, m))
+        }
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
         (&Method::GET, ["api", "audit"]) => audit(&hub, &q).await,
@@ -320,6 +326,8 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         (&Method::POST, ["api", "updates", "runners"]) => Ok(upgrade_all_runners(&hub).await),
         (&Method::POST, ["api", "updates", "build"]) => build_every_platform(&hub).await,
         (&Method::POST, ["api", "updates", "runners", name]) => upgrade_runner(&hub, name).await,
+        (&Method::PUT, ["api", "updates", "runners", name]) => set_runner_policy(&hub, name, req).await,
+        (&Method::PUT, ["api", "updates", "policy"]) => set_policies(&hub, req).await,
         (&Method::POST, ["api", "updates", "server"]) => upgrade_server(&hub, req).await,
         (&Method::POST, ["api", "updates", "binaries"]) => upload_binary(&hub, &q, req).await,
         (&Method::DELETE, ["api", "updates", "binaries", target]) => delete_binary(&hub, target).await,
@@ -484,6 +492,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (&Method::POST, ["api", "harness", "broadcast"]) => harness_broadcast(&hub, req).await,
         (&Method::POST, ["api", "harness", "broadcast", "preview"]) => harness_broadcast_preview(&hub, req).await,
+        (&Method::POST, ["api", "harness", "machines", machine, "recover"]) => harness_recover(&hub, machine, req).await,
         (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
             let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
@@ -1329,6 +1338,14 @@ struct NewRepo {
     #[serde(default)]
     branches: Vec<String>,
     poll_seconds: Option<u32>,
+    /// `native`: kiln hosts it (W14-R01); `upstream` (the default): kiln follows `clone_url`.
+    mode: Option<String>,
+    /// A native repository's history, copied from this URL (`kiln repo import`).
+    import: Option<String>,
+    /// A new, empty native repository's trunk (`main`).
+    default_branch: Option<String>,
+    /// A native repository's upstream, its trunk pushed there after each land (W14-R01).
+    mirror: Option<String>,
 }
 
 async fn add_repo(hub: &Hub, req: Request) -> R {
@@ -1337,11 +1354,33 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
     if name.split('/').count() != 2 || name.contains(char::is_whitespace) {
         return Err(err(StatusCode::BAD_REQUEST, "name must be owner/repo"));
     }
+    let native = match r.mode.as_deref() {
+        None => r.import.is_some(),
+        Some("native") => true,
+        Some("upstream") => false,
+        Some(m) => return Err(err(StatusCode::BAD_REQUEST, format!("mode `{m}`: `native` or `upstream`"))),
+    };
+    let default_branch = r.default_branch.clone().filter(|_| native).or_else(|| native.then(|| "main".to_owned()));
+    if let Some(m) = r.mirror.as_deref() {
+        if !native {
+            return Err(err(StatusCode::BAD_REQUEST, "a mirror is a native repository's upstream"));
+        }
+        crate::ci::hosting::importable(m).map_err(|e| err(StatusCode::BAD_REQUEST, e.replace("an import copies", "a mirror is")))?;
+    }
+    let clone_url = if native {
+        if let Some(url) = &r.import {
+            crate::ci::hosting::importable(url).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+        }
+        let path = crate::ci::hosting::create(hub, &name, default_branch.as_deref().unwrap_or("main"), r.import.as_deref()).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        crate::ci::hosting::clone_url(&path)
+    } else {
+        r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git"))
+    };
     let repo = hub
         .store
         .upsert_repo(Repo {
             id: crate::util::new_id(),
-            clone_url: r.clone_url.unwrap_or_else(|| format!("https://github.com/{name}.git")),
+            clone_url,
             name: name.clone(),
             branches: r.branches,
             poll_seconds: r.poll_seconds.unwrap_or(hub.cfg.gitops.poll_seconds),
@@ -1349,6 +1388,9 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
             created_at: crate::util::now_unix(),
             last_polled_at: None,
             last_error: None,
+            mode: if native { "native" } else { "upstream" }.into(),
+            default_branch,
+            mirror: r.mirror.clone(),
         })
         .await?;
     hub.store.audit("admin".into(), "repo.add".into(), name).await;
@@ -2234,6 +2276,50 @@ async fn upgrade_runner(hub: &Arc<Hub>, name: &str) -> R {
     }
 }
 
+#[derive(Deserialize)]
+struct RunnerPolicy {
+    policy: crate::updates::Policy,
+}
+
+/// `PUT /api/updates/runners/{name}` `{"policy": "auto" | "notify" | "off"}`: what that machine's
+/// runner does with a newer kiln (Notify unless chosen otherwise).
+async fn set_runner_policy(hub: &Arc<Hub>, name: &str, req: Request) -> R {
+    let b: RunnerPolicy = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    apply_policy(hub, &[name.to_owned()], b.policy).await
+}
+
+#[derive(Deserialize)]
+struct Policies {
+    policy: crate::updates::Policy,
+    /// These runners; or every one, with `all`.
+    #[serde(default)]
+    runners: Vec<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// `PUT /api/updates/policy` `{"policy": "off", "runners": ["a", "b"]}` (or `"all": true`): the same
+/// update policy for any number of runners at once.
+async fn set_policies(hub: &Arc<Hub>, req: Request) -> R {
+    let b: Policies = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let names = if b.all { crate::updates::runners(hub).await.into_iter().map(|r| r.name).collect() } else { b.runners };
+    if names.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "name the runners, or say all"));
+    }
+    apply_policy(hub, &names, b.policy).await
+}
+
+async fn apply_policy(hub: &Arc<Hub>, names: &[String], policy: crate::updates::Policy) -> R {
+    for name in names {
+        crate::updates::set_policy(hub, name, policy).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    }
+    hub.store.audit("admin".into(), "upgrade.policy".into(), format!("updates {} for {}", policy.as_str(), names.join(", "))).await;
+    hub.emit(&json!({ "type": "updates" }));
+    // Its gauges at once, and an automatic one brought up to date.
+    hub.updates.fleet.wake();
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 /// `POST /api/updates/runners`: upgrade every connected runner that isn't up to date.
 async fn upgrade_all_runners(hub: &Arc<Hub>) -> Response {
     let mut jobs = Vec::new();
@@ -2761,6 +2847,7 @@ struct HarnessOpen {
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
+    let opener = caller_of(hub, req.headers()).await.and_then(|c| c.opener());
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
@@ -2777,7 +2864,28 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`).
+    if let Some(o) = &opener {
+        for i in &infos {
+            let _ = hub.store.kv_set(crate::mcp::opener_key(&i.id), o.clone()).await;
+        }
+    }
     Ok(srv::json(StatusCode::OK, &infos))
+}
+
+/// Every agent of a machine that's gone goes on elsewhere, from the server's copy of its
+/// conversation (`harness::relocate::recover`): `{"to"?}` puts them all on one machine.
+async fn harness_recover(hub: &Arc<Hub>, machine: &str, req: Request) -> R {
+    #[derive(serde::Deserialize, Default)]
+    struct Body {
+        #[serde(default)]
+        to: Option<String>,
+    }
+    let b: Body = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    let moved = crate::harness::relocate::recover(hub, machine, b.to.as_deref()).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let ok = moved.iter().filter(|m| m.get("error").is_none()).count();
+    hub.store.audit("admin".into(), "agent.recover".into(), format!("{ok} of {} agents of {machine} go on elsewhere", moved.len())).await;
+    Ok(srv::json(StatusCode::OK, &serde_json::json!({ "moved": moved })))
 }
 
 /// One thing to many agents at once: a prompt or slash command, a command, or answers to every

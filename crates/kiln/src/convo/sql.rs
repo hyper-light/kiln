@@ -129,6 +129,11 @@ pub const RECORD_SOURCES: &str = "SELECT source, MAX(n) FROM records WHERE sessi
 pub const RECORD_LINE: &str = "SELECT line_end, line FROM records WHERE session = ?1 AND source = ?2 AND n = ?3";
 /// `?4` lines of a session's record from `source`, from line `?3` on, in order.
 pub const RECORD_LINES: &str = "SELECT n, line FROM records WHERE session = ?1 AND source = ?2 AND n >= ?3 ORDER BY n LIMIT ?4";
+/// `?2` record lines written before number `?1`, newest first: what compressing the lines kept
+/// before lines were compressed walks through, down the numbers.
+pub const RECORDS_BELOW: &str = "SELECT session, source, n, line, rev FROM records WHERE rev < ?1 ORDER BY rev DESC LIMIT ?2";
+/// A line, compressed: the same line, so its number for a feed stays as it was.
+pub const RECORD_SQUEEZE: &str = "UPDATE records SET line = ?4 WHERE session = ?1 AND source = ?2 AND n = ?3";
 
 /// What was dropped, numbered as the writes are (each one kept: a feed sends them in order).
 pub const DROP_ADD: &str = "INSERT INTO drops (rev, session, what, source, n, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
