@@ -661,3 +661,94 @@ fn an_anomaly_is_banded_from_its_history_and_its_monitor_alerts_the_group_it_is_
     anyhow::ensure!(at(&notice, &["notice", "state"]) == "ALERT" && at(&notice, &["notice", "message"]).as_str().is_some_and(|m| m.contains("b is anomalous")), "{notice}");
     Ok(())
 }
+
+/// Two monitors grouped by host, one alerting on web01–05 and the other on web04–09, and a
+/// composite of both (`a && b`, Datadog's): it alerts the hosts both alert on, web04 and web05, and
+/// no other, and a webhook hears of those two alone; web04 recovering in one of them recovers it in
+/// the composite, and is said; a monitor the composite reads is not deleted while it does, and a
+/// composite of a composite, or of a monitor that isn't there, is refused.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn a_composite_alerts_the_groups_its_monitors_share_and_keeps_what_it_reads() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/both", Some(&json!({ "kind": "webhook", "url": mock.url("/both") })))?;
+    anyhow::ensure!(code == 204);
+    let monitor = |name: &str, metric: &str| -> anyhow::Result<String> {
+        let m = f.call("POST", "/api/observe/v1/monitors", Some(&json!({ "name": name, "query": format!("max(last_1m):max:{metric}{{*}} by {{host}} > 10"), "options": { "every": 10, "thresholds": { "critical": 10 } } })))?;
+        Ok(at(&m, &["id"]).as_str().unwrap_or("").to_owned())
+    };
+    let a = monitor("e2e a", "e2e.ca")?;
+    let b = monitor("e2e b", "e2e.cb")?;
+    let (code, _) = f.request("POST", "/api/observe/v1/monitors", Some(&json!({ "name": "nowhere", "type": "composite", "query": format!("{a} && mnosuch") })))?;
+    anyhow::ensure!(code == 400, "a composite of a monitor that isn't there: {code}");
+    let c = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e both",
+            "type": "composite",
+            "query": format!("{a} && {b}"),
+            "message": "{{#is_alert}}both on {{host.name}} @webhook-both{{/is_alert}}{{#is_recovery}}{{host.name}} recovered @webhook-both{{/is_recovery}}",
+            "options": { "every": 10 },
+        })),
+    )?;
+    let cid = at(&c, &["id"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(at(&c, &["composite", "expression"]) == "a && b" && at(&c, &["composite", "named"]) == "e2e a && e2e b", "{c}");
+    let (code, _) = f.request("POST", "/api/observe/v1/monitors", Some(&json!({ "name": "nested", "type": "composite", "query": format!("{cid} || {a}") })))?;
+    anyhow::ensure!(code == 400, "a composite of a composite: {code}");
+    let hosts = |r: std::ops::RangeInclusive<u32>| r.map(|i| format!("web{i:02}")).collect::<Vec<_>>();
+    let write = |metric: &str, hs: &[String], v: f64| -> anyhow::Result<()> {
+        let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
+        f.write(metric, &refs, crate_now() - 30_000, 4, |_, _| v)
+    };
+    write("e2e.ca", &hosts(1..=5), 20.0)?;
+    write("e2e.cb", &hosts(4..=9), 20.0)?;
+    // A group's first tag's value (a group is a list of [key, value]).
+    let host = |group: &Value| group.as_array().and_then(|g| g.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).unwrap_or("").to_owned();
+    let groups = |id: &str| -> BTreeMap<String, String> {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None).unwrap_or_default();
+        at(&m, &["groups"]).as_array().into_iter().flatten().map(|g| (host(at(g, &["group"])), at(g, &["state"]).as_str().unwrap_or("").to_owned())).collect()
+    };
+    let both: BTreeMap<String, String> = [("web04", "ALERT"), ("web05", "ALERT")].iter().map(|(h, s)| ((*h).to_owned(), (*s).to_owned())).collect();
+    let start = Instant::now();
+    while groups(&cid) != both {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the composite's groups: {:?} (a: {:?}, b: {:?})\n{}", groups(&cid), groups(&a), groups(&b), f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let said = |mock: &Mock| -> Vec<(String, String)> {
+        mock.at("/both")
+            .iter()
+            .map(|g| {
+                let v = g.json();
+                (at(&v, &["notice", "state"]).as_str().unwrap_or("").to_owned(), host(at(&v, &["notice", "group"])))
+            })
+            .collect()
+    };
+    let start = Instant::now();
+    while said(&mock).len() < 2 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard {:?}", said(&mock));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let mut heard = said(&mock);
+    heard.sort();
+    anyhow::ensure!(heard == [("ALERT".to_owned(), "web04".to_owned()), ("ALERT".to_owned(), "web05".to_owned())], "the webhook heard {heard:?}");
+    // web04 recovers in b: the composite's web04 recovers, and is said.
+    write("e2e.cb", &hosts(4..=4), 0.0)?;
+    let start = Instant::now();
+    while groups(&cid).get("web04").map(String::as_str) != Some("OK") || said(&mock).len() < 3 {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "web04 never recovered: {:?}, heard {:?}", groups(&cid), said(&mock));
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(said(&mock).last() == Some(&("OK".to_owned(), "web04".to_owned())) && groups(&cid).get("web05").map(String::as_str) == Some("ALERT"), "heard {:?}, groups {:?}", said(&mock), groups(&cid));
+    // A monitor the composite reads is kept; once the composite goes, it may go.
+    let (code, body) = f.request("DELETE", &format!("/api/observe/v1/monitors/{a}"), None)?;
+    anyhow::ensure!(code == 409 && String::from_utf8_lossy(&body).contains("e2e both"), "deleting what a composite reads: {code} {}", String::from_utf8_lossy(&body));
+    let (code, _) = f.request("DELETE", &format!("/api/observe/v1/monitors/{cid}"), None)?;
+    anyhow::ensure!(code == 204);
+    let (code, _) = f.request("DELETE", &format!("/api/observe/v1/monitors/{a}"), None)?;
+    anyhow::ensure!(code == 204);
+    Ok(())
+}

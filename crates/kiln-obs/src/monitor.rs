@@ -20,6 +20,8 @@
 //! set), so a value that hovers at a threshold does not flap; warnings the same below it. A group
 //! with no data keeps its state, or goes to NO DATA when the monitor asks to be told.
 
+pub mod composite;
+
 use crate::logs::search::Search;
 use crate::logs::store::{Facet, Measure};
 use crate::query::eval::{self, Request};

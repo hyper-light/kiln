@@ -88,8 +88,28 @@ fn monitor_json(ms: &super::monitors::Monitors, m: &super::monitors::Monitor) ->
     if let Value::Object(o) = &mut v {
         o.insert("state".into(), Value::from(ms.overall(&m.id)));
         o.insert("groups".into(), serde_json::to_value(ms.groups(&m.id)).unwrap_or(Value::Null));
+        if let Ok(super::monitors::Compiled::Composite(c)) = m.compiled() {
+            o.insert("composite".into(), composite_json(ms, &c));
+        }
     }
     v
+}
+
+/// What a composite reads: each monitor with its letter (Datadog's UI's `a`, `b`, ...), name and
+/// state, and the expression with their names.
+fn composite_json(ms: &super::monitors::Monitors, c: &kiln_obs::monitor::composite::Composite) -> Value {
+    let name = |id: &str| ms.get(id).map(|m| m.name);
+    let monitors: Vec<Value> = c
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let letter = char::from(b'a' + u8::try_from(i).unwrap_or(0));
+            json!({ "letter": letter.to_string(), "id": id, "name": name(id), "state": ms.get(id).map(|_| ms.overall(id)) })
+        })
+        .collect();
+    let lettered = c.show(|id| c.ids.iter().position(|x| x == id).map(|i| char::from(b'a' + u8::try_from(i).unwrap_or(0)).to_string()));
+    json!({ "monitors": monitors, "expression": lettered, "named": c.show(|id| name(id)) })
 }
 
 /// The token OTLP exporters send the server (`Authorization: Bearer`), besides the admin's: one
@@ -217,8 +237,20 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             #[derive(Deserialize)]
             struct V {
                 query: String,
+                #[serde(rename = "type", default)]
+                kind: Option<String>,
             }
             let v: V = read_json(req.into_body(), QUERY_BODY).await?;
+            if v.kind.as_deref() == Some(super::monitors::COMPOSITE) {
+                let ms = monitors()?;
+                return Ok(match kiln_obs::monitor::composite::parse(&v.query) {
+                    Ok(c) => match c.ids.iter().find(|id| ms.get(id).is_none_or(|m| m.is_composite())) {
+                        Some(bad) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": format!("{bad}: no monitor, or a composite") })),
+                        None => srv::json(StatusCode::OK, &json!({ "ok": true, "kind": "composite", "composite": composite_json(ms, &c) })),
+                    },
+                    Err(e) => srv::json(StatusCode::OK, &json!({ "ok": false, "error": e.to_string() })),
+                });
+            }
             // What it watches besides, to draw: the metric query, or the log search, and its window.
             Ok(match kiln_obs::monitor::parse(&v.query) {
                 Ok(q) => {
@@ -248,9 +280,11 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
             let m = ms.put(m).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
             Ok(srv::json(StatusCode::OK, &monitor_json(ms, &m)))
         }
-        (&Method::DELETE, ["monitors", id]) => match monitors()?.delete(id).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))? {
-            true => Ok(srv::status(StatusCode::NO_CONTENT)),
-            false => Err(fail(StatusCode::NOT_FOUND, "no such monitor")),
+        (&Method::DELETE, ["monitors", id]) => match monitors()?.delete(id) {
+            Ok(true) => Ok(srv::status(StatusCode::NO_CONTENT)),
+            Ok(false) => Err(fail(StatusCode::NOT_FOUND, "no such monitor")),
+            Err(super::monitors::Refused::Read(by)) => Err(fail(StatusCode::CONFLICT, format!("composite monitors read it: {}; change or delete them first", by.join(", ")))),
+            Err(super::monitors::Refused::Io(e)) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, e)),
         },
         (&Method::POST, ["monitors", id, "mute"]) => {
             #[derive(Deserialize, Default)]

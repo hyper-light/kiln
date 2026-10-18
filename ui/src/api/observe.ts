@@ -146,9 +146,20 @@ export interface MonitorGroup {
   notified: number;
 }
 
+/** What a composite monitor reads: its monitors, each with its letter, and its condition. */
+export interface CompositeOf {
+  monitors: { letter: string; id: string; name: string | null; state: MonitorState | null }[];
+  /** The condition in letters (`a && b`). */
+  expression: string;
+  /** The condition with the monitors' names. */
+  named: string;
+}
+
 export interface Monitor {
   id: string;
   name: string;
+  /** `composite` for a composite (its query an expression of monitors' ids); none for the rest. */
+  type?: string | null;
   query: string;
   message: string;
   tags: string[];
@@ -159,6 +170,7 @@ export interface Monitor {
   modified: number;
   state: MonitorState;
   groups: MonitorGroup[];
+  composite?: CompositeOf;
 }
 
 /** A monitor's query checked: its condition, and what it watches (to draw), or why it is not one. */
@@ -166,14 +178,15 @@ export interface MonitorCheck {
   ok: boolean;
   op?: string;
   threshold?: number;
-  kind?: "metric" | "change" | "logs";
+  kind?: "metric" | "change" | "logs" | "composite";
   watched?: { query?: string; search?: string };
+  composite?: CompositeOf;
   window_ms?: number;
   error?: string;
 }
 
 /** What a monitor is made of, as it is sent. */
-export type MonitorIn = Pick<Monitor, "name" | "query" | "message" | "tags" | "priority" | "options">;
+export type MonitorIn = Pick<Monitor, "name" | "query" | "message" | "tags" | "priority" | "options"> & { type?: string };
 
 export type IntegrationKind = "slack" | "discord" | "teams" | "pagerduty" | "webhook";
 
@@ -325,7 +338,7 @@ export const observeApi = {
   createMonitor: (m: MonitorIn) => request<Monitor>("POST", `${BASE}/monitors`, m),
   updateMonitor: (id: string, m: MonitorIn) => request<Monitor>("PUT", `${BASE}/monitors/${enc(id)}`, m),
   deleteMonitor: (id: string) => request<void>("DELETE", `${BASE}/monitors/${enc(id)}`),
-  validateMonitor: (query: string, signal?: AbortSignal) => request<MonitorCheck>("POST", `${BASE}/monitors/validate`, { query }, { signal }),
+  validateMonitor: (query: string, signal?: AbortSignal, type?: string) => request<MonitorCheck>("POST", `${BASE}/monitors/validate`, { query, type }, { signal }),
   mute: (id: string, until?: number) => request<Monitor>("POST", `${BASE}/monitors/${enc(id)}/mute`, until ? { until } : {}),
   unmute: (id: string) => request<Monitor>("POST", `${BASE}/monitors/${enc(id)}/unmute`, {}),
   integrations: (signal?: AbortSignal) => request<{ integrations: Integration[] }>("GET", `${BASE}/integrations`, undefined, { signal }).then((r) => r.integrations),

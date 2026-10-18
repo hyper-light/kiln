@@ -19,8 +19,8 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
-| O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; next: forecast, composite | in progress |
-| O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
+| O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); next: forecast | in progress |
+| O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
 
@@ -323,7 +323,7 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 | `GET logs/tail?query=&rate=` | live tail (§6), a WebSocket: each 200 ms, `{type: "records", records, read, matched, missed, ms}`, the tick's records (all the search matched, or a uniform sample past `rate` a second: 50 unless said, 1 to 1,000) and how many rows it read, matched and missed (missed: it fell more than the feed's bound behind); idle, one a second, its counts 0. `{type: "error", message}`, then closed, for a search that does not parse, a rate out of bounds, or a node that 16 tails follow already |
 | `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, read-only) and yours, kept in `<observe>/dashboards.json` |
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
-| `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups'; validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated |
+| `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups', a composite (`type: "composite"`) with what it reads (each monitor's letter, name and state, its condition in letters and in names); validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated, or, given `type`, whether a composite's monitors are there to read; a monitor a composite reads is not deleted (409) |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
@@ -422,8 +422,22 @@ options, so a monitor written for Datadog reads here.
 - The server, the leader, evaluates each on the blocking pool; each group's change is an event
   (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
   are saved as they change.
+- **Composites** (`type: "composite"`, `kiln_obs::monitor::composite`): Datadog's, a condition over
+  up to ten other monitors, none of them a composite, by id in the API (`m1 && (m2 || !m3)`) and by
+  letter in the form (`a && (b || !c)`). States are weighed by severity, ALERT over WARN over NO
+  DATA over OK, the first three alert-worthy: `a && b` is the less severe of the two (OK unless both
+  are alert-worthy), `a || b` the more severe, `!a` OK where `a` is alert-worthy, ALERT where it is
+  OK and NO DATA where it is NO DATA; a result of NO DATA keeps the last state unless the composite
+  asks to be told. All of it is Datadog's page's, and its table of two monitors is a test row for
+  row; Datadog states no precedence, so `!` binds tightest, then `&&`, then `||`. Grouped, a
+  composite looks only at what its monitors share, a group known by its tags' values (`host:web04`
+  is `service:web04`'s): its groups are those of its most finely grouped monitor that each other
+  grouped one holds a group of (`device,host` holds `host`; `host,url` and `device,host` share
+  nothing); a monitor not grouped stands for every group. It is evaluated right after any monitor it
+  reads, and at its own interval besides; a monitor a composite reads is not deleted while it does
+  (409, naming the composites), nor made a composite itself.
 
-To come: forecast, outlier and composite monitors (§9.1).
+To come: forecast and outlier monitors (§9.1).
 
 ### 9.1 Anomalies and forecasts
 
@@ -558,7 +572,8 @@ time range and the search in the address (a page is a link).
   to its fields and attributes, any one a filter a click away.
 - **Monitors**: their states, in trouble first; each one's groups, what it watches drawn over the
   range with its thresholds, what it said (its events), mute and unmute; made and edited in a form
-  that checks its query.
+  that checks its query. A composite (the form's other kind) is its monitors chosen by letter and a
+  condition over the letters; its page lists what it reads, each one's state a link away.
 - **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
   each one's mention to copy.
 - **Live**: the hosts' samples of the last hour at 5 s, streamed (what the Metrics page was); before
@@ -1062,8 +1077,10 @@ search's patterns, one of them clicked, the search it narrows to finding its rec
 through the API); a search followed live: what is posted after comes, the newest on top, another
 service's never; paused, what comes waits (said how many) and resuming shows it; opening a record
 pauses; a
-monitor made from the form, muted, unmuted and deleted; a signed webhook added, tested (the
-receiver checks the signature) and removed. Each makes its own records and checks through the API,
+monitor made from the form, muted, unmuted and deleted; a composite made from the form of two
+monitors grouped by host (web01–03 and web02–04), alerting web02 and web03 alone, listing what it
+reads, and one of them refused deletion from its page while the composite reads it; a signed webhook
+added, tested (the receiver checks the signature) and removed. Each makes its own records and checks through the API,
 not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
 and every Observe page loads in both with no error, failed request or sideways overflow, against a
 server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a
@@ -1071,6 +1088,12 @@ webhook and to Slack. Run again and again, two flakes showed and are gone: WebKi
 page makes a field, can drop text typed into it with no input event at all (every field is now
 checked to hold what was typed, and typed again if not); and a button found by part of its name
 also found kiln's own metrics named `…_running` (every button is found by its whole name).
+
+**Composites** (`observe_live.rs`): two monitors grouped by host, one alerting web01–05 and the
+other web04–09, and their composite `a && b`: it alerts web04 and web05 and no other host, a webhook
+hears of those two alone; web04 recovering in one recovers it in the composite, and is said; a
+monitor it reads is refused deletion (409, naming it) until it goes; a composite of a composite or of
+a monitor that isn't there is refused. 2026-10-18: passes (53 s).
 
 **Under load** (`crates/kiln/tests/observe_load.rs`): the flood of §12.11, every point taken
 stored exactly once, the replicas alike; and a runner flooded while its server is killed (SIGKILL)

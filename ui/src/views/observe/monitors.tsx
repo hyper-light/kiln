@@ -107,7 +107,7 @@ function List() {
                     <Link to={`/observe/monitors/${encodeURIComponent(m.id)}`} className="text-[13px] text-[#e4e5e7] hover:text-white">
                       {m.name}
                     </Link>
-                    <p className="truncate font-mono text-[10.5px] text-[#8c8f98]">{m.query}</p>
+                    <p className="truncate font-mono text-[10.5px] text-[#8c8f98]">{m.composite?.named ?? m.query}</p>
                   </td>
                   <td className="num cell-mono">{m.groups.length ? `${trouble ? `${trouble} of ` : ""}${m.groups.length}` : "—"}</td>
                   <td>

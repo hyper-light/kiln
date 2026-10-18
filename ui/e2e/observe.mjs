@@ -176,6 +176,75 @@ const scenarios = {
     );
   },
 
+  /** A composite made from the form of two monitors grouped by host: it alerts the hosts both alert
+   * on and no other, lists what it reads, and a monitor it reads is not deleted while it does. */
+  async "a composite is made of two monitors, alerts what they share, and keeps what it reads"() {
+    const made = [];
+    try {
+      for (const [x, hosts] of [
+        ["a", ["web01", "web02", "web03"]],
+        ["b", ["web02", "web03", "web04"]],
+      ]) {
+        const m = await api("POST", "/api/observe/v1/monitors", {
+          name: `E2E ${x} ${run}`,
+          query: `max(last_1m):max:e2e.composite.${x}.${run}{*} by {host} > 10`,
+          options: { every: 10, thresholds: { critical: 10 } },
+        });
+        expect(m.status === 201, `monitor ${x}: ${JSON.stringify(m.body)}`);
+        made.push(m.body.id);
+        const now = Date.now();
+        const series = hosts.map((h) => ({ metric: `e2e.composite.${x}.${run}`, type: "gauge", tags: [`host:${h}`], points: [0, 1, 2, 3].map((i) => [(now - 30_000 + i * 10_000) / 1000, 20]) }));
+        expect((await api("POST", "/api/observe/v1/series", { series })).status === 202, "writing its points");
+      }
+      await page.goto(`${BASE}/observe/monitors/new`);
+      await fillIn(page.getByLabel("Name", { exact: true }), `E2E both ${run}`);
+      await page.getByRole("group", { name: "Kind", exact: true }).getByRole("button", { name: "Composite", exact: true }).click();
+      await page.getByLabel("Monitor a", { exact: true }).selectOption({ label: `E2E a ${run}` });
+      await page.getByLabel("Monitor b", { exact: true }).selectOption({ label: `E2E b ${run}` });
+      await fillIn(page.getByLabel("Alerts when", { exact: true }), "a && b");
+      await page.getByRole("button", { name: "Create", exact: true }).click();
+      await page.waitForURL(/\/observe\/monitors\/m[0-9a-f]+$/);
+      const id = page.url().split("/").pop();
+      made.unshift(id);
+      const reads = page.getByRole("region", { name: "What it reads" });
+      await reads.getByText(`E2E a ${run}`).waitFor();
+      await reads.getByText(`E2E b ${run}`).waitFor();
+      const c = await api("GET", `/api/observe/v1/monitors/${id}`);
+      expect(
+        c.body.type === "composite" && c.body.composite.expression === "a && b" && c.body.query === `${made[1]} && ${made[2]}`,
+        `the composite kept as made: ${JSON.stringify(c.body).slice(0, 300)}`,
+      );
+      // Its groups: the hosts both alert on.
+      const host = (g) => g.group[0]?.[1];
+      await until(
+        "the composite alerting web02 and web03 alone",
+        async () => {
+          const m = (await api("GET", `/api/observe/v1/monitors/${id}`)).body;
+          const alerting = m.groups
+            .filter((g) => g.state === "ALERT")
+            .map(host)
+            .sort();
+          return m.groups.length === 2 && JSON.stringify(alerting) === JSON.stringify(["web02", "web03"]);
+        },
+        60_000,
+      );
+      await page.reload();
+      await page.getByRole("region", { name: "Groups" }).getByText("host:web02").waitFor();
+      // A monitor it reads is not deleted: the page says why, and it stays.
+      await page.goto(`${BASE}/observe/monitors/${made[1]}`);
+      await page.getByRole("button", { name: "Delete the monitor", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+      await page
+        .getByText(/composite monitors read it/)
+        .first()
+        .waitFor();
+      problems.length = 0; // The refusal's 409 is the point.
+      expect((await api("GET", `/api/observe/v1/monitors/${made[1]}`)).status === 200, "the monitor it reads is still there");
+    } finally {
+      for (const id of made) await api("DELETE", `/api/observe/v1/monitors/${id}`);
+    }
+  },
+
   /** A monitor made from the form, muted, unmuted and deleted. */
   async "a monitor is made, muted, unmuted and deleted"() {
     await page.goto(`${BASE}/observe/monitors/new?query=${encodeURIComponent("avg(last_5m):avg:app.latency.p95{*} by {service} > 1000000")}`);

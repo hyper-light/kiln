@@ -9,14 +9,19 @@
 //! the monitor is muted, its message to every integration it mentions; a group that stays in
 //! trouble is told again each renotification interval.
 //!
+//! A composite (`type: "composite"`, Datadog's) reads other monitors' states, its query an
+//! expression of their ids (`kiln_obs::monitor::composite`): evaluated right after any monitor it
+//! reads, and at its own interval besides. A monitor a composite reads is not deleted while it does.
+//!
 //! Definitions are `<observe>/monitors.json`, states `<observe>/monitor-states.json` (saved as they
 //! change, so a restart neither forgets an alert nor says it again).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use kiln_obs::monitor::composite::{self, Composite, Group};
 use kiln_obs::monitor::{self, State, Thresholds, Transition, Vars};
 use serde::{Deserialize, Serialize};
 
@@ -59,11 +64,19 @@ pub struct Options {
     pub every: Option<u32>,
 }
 
+/// Datadog's type for a composite monitor.
+pub const COMPOSITE: &str = "composite";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Monitor {
     #[serde(default)]
     pub id: String,
     pub name: String,
+    /// Datadog's monitor type: [`COMPOSITE`] for a composite, its query an expression of other
+    /// monitors' ids; none (or `metric alert`, `query alert`, `log alert`) for the rest, whose kind
+    /// their query says.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub query: String,
     #[serde(default)]
     pub message: String,
@@ -82,10 +95,31 @@ pub struct Monitor {
     pub modified: i64,
 }
 
+/// A monitor, compiled: a query of the store and its thresholds, or a composite of other monitors.
+#[derive(Debug, Clone)]
+pub enum Compiled {
+    Query(monitor::Query, Thresholds),
+    Composite(Composite),
+}
+
 impl Monitor {
+    pub fn is_composite(&self) -> bool {
+        self.kind.as_deref() == Some(COMPOSITE)
+    }
+
     /// Its query parsed and its thresholds, the query's critical one and the options' others (the
-    /// options' critical must be the query's, as Datadog requires).
-    pub fn compiled(&self) -> Result<(monitor::Query, Thresholds), String> {
+    /// options' critical must be the query's, as Datadog requires); a composite's expression.
+    pub fn compiled(&self) -> Result<Compiled, String> {
+        if let Some(e) = self.options.every
+            && e < EVERY_MIN_S
+        {
+            return Err(format!("evaluated every {e} s: at most every {EVERY_MIN_S}"));
+        }
+        match self.kind.as_deref() {
+            Some(COMPOSITE) => return composite::parse(&self.query).map(Compiled::Composite).map_err(|e| e.to_string()),
+            None | Some("metric alert" | "query alert" | "log alert") => {}
+            Some(other) => return Err(format!("a monitor's type: {other} ({COMPOSITE}, or none: the query says)")),
+        }
         let q = monitor::parse(&self.query).map_err(|e| e.to_string())?;
         let t = &self.options.thresholds;
         if let Some(c) = t.critical
@@ -93,12 +127,16 @@ impl Monitor {
         {
             return Err(format!("the critical threshold {c} is not the query's {}", q.threshold));
         }
-        if let Some(e) = self.options.every
-            && e < EVERY_MIN_S
-        {
-            return Err(format!("evaluated every {e} s: at most every {EVERY_MIN_S}"));
+        let t = Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery };
+        Ok(Compiled::Query(q, t))
+    }
+
+    /// The monitors a composite reads (none for the rest).
+    pub fn reads(&self) -> Vec<String> {
+        if !self.is_composite() {
+            return Vec::new();
         }
-        Ok((q.clone(), Thresholds { critical: q.threshold, warning: t.warning, critical_recovery: t.critical_recovery, warning_recovery: t.warning_recovery }))
+        composite::parse(&self.query).map(|c| c.ids).unwrap_or_default()
     }
 
     fn window_ms(q: &monitor::Query) -> i64 {
@@ -122,6 +160,21 @@ pub struct GroupState {
     pub since: i64,
     pub last_data: i64,
     pub notified: i64,
+}
+
+/// What a monitor's messages say of its thresholds (a composite has none: NaN, null in a notice).
+#[derive(Debug, Clone, Copy)]
+struct Said {
+    threshold: f64,
+    warning: Option<f64>,
+}
+
+/// Why a monitor was not deleted.
+#[derive(Debug)]
+pub enum Refused {
+    /// Composites read it (their names).
+    Read(Vec<String>),
+    Io(String),
 }
 
 #[derive(Default)]
@@ -172,14 +225,32 @@ impl Monitors {
         lock(&self.defs).get(id).cloned()
     }
 
-    /// Creates or replaces a monitor; its query and options checked first.
+    /// Creates or replaces a monitor; its query and options checked first, and a composite's
+    /// monitors (each there, none a composite, not itself).
     pub fn put(&self, mut m: Monitor) -> Result<Monitor, String> {
-        m.compiled()?;
+        let compiled = m.compiled()?;
         if m.name.trim().is_empty() {
             return Err("a monitor's name".into());
         }
         let now = crate::util::now_ms();
         let mut defs = lock(&self.defs);
+        if let Compiled::Composite(c) = &compiled {
+            for id in &c.ids {
+                match defs.get(id) {
+                    _ if *id == m.id => return Err("a composite does not read itself".into()),
+                    None => return Err(format!("no monitor {id}")),
+                    Some(o) if o.is_composite() => return Err(format!("{} is a composite: a composite reads other kinds of monitor", o.name)),
+                    Some(_) => {}
+                }
+            }
+        }
+        // A monitor composites read cannot become one: they read other kinds.
+        if m.is_composite() && !m.id.is_empty() {
+            let readers: Vec<&str> = defs.values().filter(|c| c.reads().contains(&m.id)).map(|c| c.name.as_str()).collect();
+            if !readers.is_empty() {
+                return Err(format!("composites read it ({}): it cannot be one", readers.join(", ")));
+            }
+        }
         if m.id.is_empty() {
             m.id = super::fresh_id("m", |id| defs.contains_key(id));
             m.created = now;
@@ -200,10 +271,17 @@ impl Monitors {
         Ok(m)
     }
 
-    pub fn delete(&self, id: &str) -> Result<bool, String> {
-        let had = lock(&self.defs).remove(id).is_some();
+    /// Deletes a monitor, unless a composite reads it (then `Refused::Read`, naming them).
+    pub fn delete(&self, id: &str) -> Result<bool, Refused> {
+        let mut defs = lock(&self.defs);
+        let readers: Vec<String> = defs.values().filter(|c| c.reads().iter().any(|r| r == id)).map(|c| c.name.clone()).collect();
+        if !readers.is_empty() {
+            return Err(Refused::Read(readers));
+        }
+        let had = defs.remove(id).is_some();
+        drop(defs);
         lock(&self.states).remove(id);
-        self.save().map_err(|e| format!("{e:#}"))?;
+        self.save().map_err(|e| Refused::Io(format!("{e:#}")))?;
         self.save_states();
         Ok(had)
     }
@@ -249,8 +327,18 @@ impl Monitors {
                 .collect()
         };
         let mut changed = false;
-        for m in due {
-            changed |= self.evaluate(store, &m, now);
+        // Queries first: composites read what they found.
+        let mut evaluated: HashSet<&str> = HashSet::new();
+        for m in due.iter().filter(|m| !m.is_composite()) {
+            changed |= self.evaluate(store, m, now);
+            evaluated.insert(m.id.as_str());
+        }
+        let composites: Vec<Monitor> = lock(&self.defs).values().filter(|m| m.is_composite()).cloned().collect();
+        for c in composites {
+            let Ok(Compiled::Composite(x)) = c.compiled() else { continue };
+            if due.iter().any(|d| d.id == c.id) || x.ids.iter().any(|id| evaluated.contains(id.as_str())) {
+                changed |= self.evaluate_composite(&c, &x, now);
+            }
         }
         if changed {
             self.save_states();
@@ -260,7 +348,7 @@ impl Monitors {
     /// One monitor's evaluation: each group's next state, events and notifications for changes.
     /// Whether any state changed.
     fn evaluate(&self, store: &kiln_obs::store::Store, m: &Monitor, now: i64) -> bool {
-        let Ok((q, t)) = m.compiled() else { return false };
+        let Ok(Compiled::Query(q, t)) = m.compiled() else { return false };
         let delay = i64::from(m.options.evaluation_delay.unwrap_or(0)) * 1000;
         let values = match monitor::evaluate(store, &q, now, delay) {
             Ok(v) => v,
@@ -270,6 +358,32 @@ impl Monitors {
             }
         };
         let no_data_ms = m.options.no_data_timeframe.map_or(2 * Monitor::window_ms(&q), |mins| i64::from(mins) * 60_000);
+        let found: Vec<(Group, Option<f64>, State)> = values.into_iter().map(|v| (v.group, Some(v.value), State::Ok)).collect();
+        let said = Said { threshold: q.threshold, warning: t.warning };
+        self.apply(m, now, no_data_ms, found, |prev, value, _| monitor::next(prev, value, q.op, &t, m.options.notify_no_data), said)
+    }
+
+    /// A composite's evaluation: its groups' states from the states of the monitors it reads, as
+    /// they last found them. A group that comes out NO DATA keeps its last state, unless the
+    /// composite asks to be told (Datadog's "last known state").
+    fn evaluate_composite(&self, m: &Monitor, c: &Composite, now: i64) -> bool {
+        let inputs: Vec<Vec<(Group, State)>> = {
+            let all = lock(&self.states);
+            c.ids.iter().map(|id| all.get(id).map(|gs| gs.values().map(|g| (g.group.clone(), State::parse(&g.state).unwrap_or(State::Ok))).collect()).unwrap_or_default()).collect()
+        };
+        let Some(results) = composite::evaluate(c, &inputs) else { return false };
+        let every_ms = i64::from(m.options.every.unwrap_or(EVERY_S).max(EVERY_MIN_S)) * 1000;
+        let no_data_ms = m.options.no_data_timeframe.map_or(2 * every_ms, |mins| i64::from(mins) * 60_000);
+        let notify = m.options.notify_no_data;
+        let found: Vec<(Group, Option<f64>, State)> = results.into_iter().map(|(g, s)| (g, None, s)).collect();
+        self.apply(m, now, no_data_ms, found, |prev, _, s| if s == State::NoData && !notify { prev } else { s }, Said { threshold: f64::NAN, warning: None })
+    }
+
+    /// What an evaluation found, applied: each group found moves from its last state to what
+    /// `next(last, its value, what the evaluation made of it)` says; groups not found go to NO DATA
+    /// after `no_data_ms` when the monitor asks to be told, and are forgotten after a day. Changes
+    /// are said, and groups in trouble said again when due. Whether any state changed.
+    fn apply(&self, m: &Monitor, now: i64, no_data_ms: i64, found: Vec<(Group, Option<f64>, State)>, next: impl Fn(State, Option<f64>, State) -> State, said: Said) -> bool {
         let renotify_ms = m.options.renotify_interval.map(|mins| i64::from(mins) * 60_000).filter(|&r| r > 0);
         let mut transitions: Vec<(GroupState, State)> = Vec::new();
         let mut renotify: Vec<GroupState> = Vec::new();
@@ -277,38 +391,38 @@ impl Monitors {
         {
             let mut all = lock(&self.states);
             let groups = all.entry(m.id.clone()).or_default();
-            let mut seen: Vec<String> = Vec::with_capacity(values.len());
-            for v in &values {
-                let key = group_key(&v.group);
-                seen.push(key.clone());
+            let mut seen: HashSet<String> = HashSet::with_capacity(found.len());
+            for (group, value, made) in found {
+                let key = group_key(&group);
                 if !groups.contains_key(&key) && groups.len() >= GROUPS {
                     continue;
                 }
-                let g = groups.entry(key).or_insert_with(|| GroupState { group: v.group.clone(), state: State::Ok.as_str().into(), value: None, since: now, last_data: now, notified: 0 });
+                seen.insert(key.clone());
+                let g = groups.entry(key).or_insert_with(|| GroupState { group, state: State::Ok.as_str().into(), value: None, since: now, last_data: now, notified: 0 });
                 let prev = State::parse(&g.state).unwrap_or(State::Ok);
-                let next = monitor::next(prev, Some(v.value), q.op, &t, m.options.notify_no_data);
-                g.value = Some(v.value);
+                let to = next(prev, value, made);
+                g.value = value;
                 g.last_data = now;
-                if next != prev {
+                if to != prev {
                     transitions.push((g.clone(), prev));
-                    g.state = next.as_str().into();
+                    g.state = to.as_str().into();
                     g.since = now;
                     changed = true;
-                } else if next != State::Ok && renotify_ms.is_some_and(|r| now - g.notified >= r) {
+                } else if to != State::Ok && renotify_ms.is_some_and(|r| now - g.notified >= r) {
                     renotify.push(g.clone());
                 }
             }
-            // Groups without data now: NO DATA after the timeframe, when asked; forgotten after a day.
+            // Groups not found now: NO DATA after the timeframe, when asked; forgotten after a day.
             groups.retain(|key, g| seen.contains(key) || now - g.last_data < FORGET_MS);
             for (key, g) in groups.iter_mut() {
                 if seen.contains(key) || now - g.last_data < no_data_ms {
                     continue;
                 }
                 let prev = State::parse(&g.state).unwrap_or(State::Ok);
-                let next = monitor::next(prev, None, q.op, &t, m.options.notify_no_data);
-                if next != prev {
+                let to = if m.options.notify_no_data { State::NoData } else { prev };
+                if to != prev {
                     transitions.push((g.clone(), prev));
-                    g.state = next.as_str().into();
+                    g.state = to.as_str().into();
                     g.since = now;
                     g.value = None;
                     changed = true;
@@ -318,23 +432,22 @@ impl Monitors {
         for (g, prev) in transitions {
             // The group as it is now (its new state and value).
             let now_g = lock(&self.states).get(&m.id).and_then(|gs| gs.get(&group_key(&g.group)).cloned()).unwrap_or(g);
-            let next = State::parse(&now_g.state).unwrap_or(State::Ok);
-            self.say(m, &q, &t, &now_g, prev, next, now);
+            let to = State::parse(&now_g.state).unwrap_or(State::Ok);
+            self.say(m, said, &now_g, prev, to, now);
         }
         for g in renotify {
             let s = State::parse(&g.state).unwrap_or(State::Ok);
-            self.say(m, &q, &t, &g, s, s, now);
+            self.say(m, said, &g, s, s, now);
         }
         changed
     }
 
     /// A group's change of state (or its renotification): its event, and, unless the monitor is
     /// muted, its message to every integration the message mentions.
-    #[allow(clippy::too_many_arguments)]
-    fn say(&self, m: &Monitor, q: &monitor::Query, t: &Thresholds, g: &GroupState, from: State, to: State, now: i64) {
+    fn say(&self, m: &Monitor, said: Said, g: &GroupState, from: State, to: State, now: i64) {
         let link = format!("{}/observe/monitors/{}", self.link_base, m.id);
         let tr = Transition { from, to };
-        let vars = Vars { monitor: &m.name, value: g.value, threshold: q.threshold, warn_threshold: t.warning, group: &g.group, link: &link };
+        let vars = Vars { monitor: &m.name, value: g.value, threshold: said.threshold, warn_threshold: said.warning, group: &g.group, link: &link };
         let message = monitor::render(&m.message, tr, &vars);
         let muted = m.muted(now);
         if let Some(o) = super::api::get() {
@@ -366,7 +479,7 @@ impl Monitors {
         if muted {
             return;
         }
-        let notice = Notice { monitor_id: m.id.clone(), monitor: m.name.clone(), state: to.as_str(), previous: from.as_str(), group: g.group.clone(), value: g.value, threshold: q.threshold, message: message.clone(), link, at: now, priority: m.priority, tags: m.tags.clone() };
+        let notice = Notice { monitor_id: m.id.clone(), monitor: m.name.clone(), state: to.as_str(), previous: from.as_str(), group: g.group.clone(), value: g.value, threshold: said.threshold, message: message.clone(), link, at: now, priority: m.priority, tags: m.tags.clone() };
         for mention in monitor::mentions(&message) {
             match self.integrations.mentioned(&mention) {
                 Some((name, i)) => self.notifier.send(&name, i, notice.clone()),
