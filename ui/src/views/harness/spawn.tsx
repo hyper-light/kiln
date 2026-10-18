@@ -272,7 +272,7 @@ interface Kept {
 }
 
 /** Where an agent's commands can run, besides its own machine: each other runner that takes them, and each platform they make up. */
-function reachChoices(runners: ReachRunner[], target: string): { value: string; label: string }[] {
+export function reachChoices(runners: ReachRunner[], target: string): { value: string; label: string }[] {
   const others = runners.filter((r) => `agent:${r.name}` !== target);
   const platforms = [...new Set(others.map((r) => `${r.os}/${r.arch}`))].sort();
   return [...platforms.map((p) => ({ value: p, label: `Prefer any ${p}` })), ...others.map((r) => ({ value: r.name, label: `Prefer ${r.name} (${r.os}/${r.arch})` }))];

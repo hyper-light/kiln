@@ -34,11 +34,11 @@ export interface Turn {
   ended: number | null;
   /** The harness that answered (a conversation switched between harnesses keeps who said what). */
   by?: string;
-  /** Not a turn: the line where the conversation went on in another harness. */
+  /** Not a turn: the line where the conversation went on in another harness, on another machine, or with another setting its harness starts with. */
   divider?: Extract<HEvent, { kind: "notice" }>;
 }
 
-/** The notice kiln puts where a conversation went on in another harness (`harness-switch:` ids). */
+/** The notice kiln puts where a conversation went on in another harness, on another machine, or with another setting its harness starts with (`harness-switch:` ids). */
 const switchOf = (e: HEvent): Extract<HEvent, { kind: "notice" }> | null => (e.kind === "notice" && e.id.startsWith("harness-switch:") ? e : null);
 
 const GROUP: Record<ToolKind, StepGroup> = {

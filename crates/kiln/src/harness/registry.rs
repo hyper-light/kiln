@@ -627,6 +627,7 @@ impl Registry {
                         account: None,
                         plan: None,
                         left_behind: 0,
+                        reach: spec.reach.clone(),
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);

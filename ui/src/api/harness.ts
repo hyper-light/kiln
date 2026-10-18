@@ -292,6 +292,8 @@ export interface State {
   account?: string;
   /** Shells, monitors and other tasks still running while the agent is idle or ended. */
   left_behind?: number;
+  /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
+  reach?: string | null;
   /** Which of those lists the harness has reported yet (servers that predate it omit this). */
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
   /** A switch to another harness's model, waiting for the turn under way to end. */
@@ -499,6 +501,8 @@ export interface AgentInfo {
   tasks_running: number;
   /** Shells, monitors and other tasks still running while the agent is idle or ended. */
   left_behind?: number;
+  /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
+  reach?: string | null;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -673,7 +677,8 @@ export const harnessApi = {
   start: (target: string, spec: Spec, count = 1) => call<AgentInfo[]>("POST", "/api/harness/sessions", { target, spec, count }),
   stop: (id: string) => call<void>("DELETE", `/api/harness/sessions/${encodeURIComponent(id)}`),
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
-  move: (id: string, to: string) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to }),
+  /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
+  move: (id: string, to: string, now = false) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now }),
   /** A command without opening the session's socket (inbox answers). */
   command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
   /** Upload a file for a later message (the agent's socket caps a message at 16 MB). */

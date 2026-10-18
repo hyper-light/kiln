@@ -919,6 +919,10 @@ pub struct State {
     /// The harness's own session id (what `--resume` takes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session: Option<String>,
+    /// Where its commands may run besides its machine (`Spec::reach`): None anywhere it needs,
+    /// `"off"` only its own machine, else a runner or platform it prefers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
     #[serde(default)]
     pub cwd: String,
     #[serde(default)]
@@ -1156,6 +1160,9 @@ pub enum Command {
         /// What came along of the folder, said in the timeline ("its repository, kept in step").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Not waiting for the turn under way: it is interrupted, and picked up over there.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {

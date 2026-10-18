@@ -36,8 +36,9 @@ fn join(path: &str, rel: &str) -> String {
 }
 
 /// Start moving session `id` to runner `to`: Ok once it is under way (what it does next shows in
-/// its timeline), or why it can't.
-pub async fn start(hub: &Arc<Hub>, id: &str, to: &str) -> Result<serde_json::Value, String> {
+/// its timeline), or why it can't. `now`: the turn under way doesn't finish here; it is
+/// interrupted once the other runner is ready, and picked up there.
+pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool) -> Result<serde_json::Value, String> {
     let to = to.strip_prefix("agent:").unwrap_or(to).to_owned();
     let info = hub.harness.list().into_iter().find(|i| i.id == id).ok_or_else(|| "no such agent".to_owned())?;
     let from = match hub.harness.location(id) {
@@ -63,7 +64,7 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str) -> Result<serde_json::Val
     let (hub, id) = (Arc::clone(hub), id.to_owned());
     let to2 = to.clone();
     crate::rt::spawn(async move {
-        if let Err(e) = prepare_and_go(&hub, &id, &from, &to2, &info.cwd).await {
+        if let Err(e) = prepare_and_go(&hub, &id, &from, &to2, &info.cwd, now).await {
             say(&hub, &id, &format!("Couldn't move to {to2}: {e}")).await;
         }
     });
@@ -74,9 +75,9 @@ async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
     let _ = hub.harness.command(hub, id, Command::Moving { text: text.to_owned() }).await;
 }
 
-async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str) -> Result<(), String> {
+async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool) -> Result<(), String> {
     let (there, note) = folder(hub, id, from, to, cwd).await?;
-    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note }).await {
+    match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now }).await {
         Sent::Ok => Ok(()),
         _ => Err(format!("{from} is not connected")),
     }

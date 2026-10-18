@@ -50,6 +50,9 @@ pub struct Package {
     pub events: Vec<Event>,
     pub state: State,
     pub created_at: i64,
+    /// Its turn was interrupted to move: it picks the turn up there.
+    #[serde(default)]
+    pub picks_up: bool,
 }
 
 /// Variables of one machine's environment that mean nothing on another (its paths, its terminal,
@@ -96,7 +99,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         Carry::ClaudeLines { session, .. } => spec.resume = Some(session.clone()),
         Carry::Seed { .. } | Carry::Nothing => spec.resume = None,
     }
-    Package { version: VERSION, id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms() }
+    Package { version: VERSION, id: id.to_owned(), spec, from: from.to_owned(), from_cwd: from_cwd.to_owned(), carry, events, state, created_at: crate::util::now_ms(), picks_up: false }
 }
 
 /// Every message of transcript `had` is among `lines`: `had` is an earlier copy of the same
@@ -170,6 +173,10 @@ mod tests {
         assert!(p.spec.shell.is_none() && p.spec.program.is_none());
         let again: Package = serde_json::from_slice(&serde_json::to_vec(&p)?)?;
         assert_eq!(again.carry, p.carry);
+        // A package from a runner that never interrupts a turn to move picks nothing up.
+        let mut older = serde_json::to_value(&p)?;
+        older.as_object_mut().map(|o| o.remove("picks_up"));
+        assert!(!serde_json::from_value::<Package>(older)?.picks_up);
         Ok(())
     }
 

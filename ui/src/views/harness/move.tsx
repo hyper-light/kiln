@@ -1,11 +1,13 @@
 /**
  * Move an agent to another machine: the runners that have its harness and take reach links, one
- * to pick, and what goes along. It moves once its turn is over; how it goes shows in its timeline.
+ * to pick, and what goes along. It moves once its turn is over, or now (the turn stops here and is
+ * picked up there); how it goes shows in its timeline.
  */
 import * as React from "react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type KindInfo } from "@/api/harness";
 import type { ReachRunner } from "@/api/types";
+import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
 import { Loadable } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
@@ -71,19 +73,19 @@ function Choices({ agent, picked, onPick }: { agent: Agent; picked: string; onPi
 
 export function MoveDialog({ agent, onClose }: { agent: Agent; onClose: () => void }) {
   const [picked, setPicked] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  const [busy, setBusy] = React.useState<"" | "now" | "after">("");
   const running = agent.status === "running" || agent.status === "waiting";
-  const go = async () => {
+  const go = async (now: boolean) => {
     if (!picked) return;
-    setBusy(true);
+    setBusy(now ? "now" : "after");
     try {
-      await harnessApi.move(agent.id, picked);
-      toast.success(`Moving ${agent.name}`, running ? "It goes on there once this turn is over." : "It goes on there in a moment.");
+      await harnessApi.move(agent.id, picked, now);
+      toast.success(`Moving ${agent.name}`, !running ? "It goes on there in a moment." : now ? "This turn stops here and goes on there." : "It goes on there once this turn is over.");
       onClose();
     } catch (e) {
       toast.error("Couldn't move it", errorMessage(e));
     } finally {
-      setBusy(false);
+      setBusy("");
     }
   };
   return (
@@ -95,17 +97,19 @@ export function MoveDialog({ agent, onClose }: { agent: Agent; onClose: () => vo
         <Loadable label="Loading your machines" fallback={<p className="mv-none">Looking at your machines…</p>}>
           <Choices agent={agent} picked={picked} onPick={setPicked} />
         </Loadable>
-        <div className="mt-5 flex flex-wrap justify-end gap-2">
+        {/* On a phone, stacked: the move first, then the other way to move, then Cancel. */}
+        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:flex-wrap sm:justify-end">
           <DialogClose asChild>
-            <button className="inline-flex min-h-11 items-center rounded-full px-5 text-sm text-[#b4b5ba] hover:bg-white/[0.06] hover:text-white">Cancel</button>
+            <Button variant="ghost">Cancel</Button>
           </DialogClose>
-          <button
-            disabled={busy || !picked}
-            onClick={() => void go()}
-            className="inline-flex min-h-11 items-center rounded-full border border-[#e4e5e7] bg-[#e4e5e7] px-5 text-sm font-medium text-[#111214] transition-colors hover:bg-white disabled:opacity-40"
-          >
-            {busy ? "Moving…" : running ? "Move after this turn" : "Move"}
-          </button>
+          {running && (
+            <Button variant="secondary" disabled={busy !== "" || !picked} onClick={() => void go(true)}>
+              {busy === "now" ? "Moving…" : "Move now"}
+            </Button>
+          )}
+          <Button disabled={busy !== "" || !picked} onClick={() => void go(false)}>
+            {busy === "after" ? "Moving…" : running ? "Move after this turn" : "Move"}
+          </Button>
         </div>
       </DialogContent>
     </Dialog>

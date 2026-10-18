@@ -187,6 +187,9 @@ pub struct Info {
     /// Tasks it left running with no turn under way (as `State::left_behind`).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub left_behind: u32,
+    /// Where its commands may run besides its machine (as `State::reach`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -236,6 +239,7 @@ impl Info {
         self.account.clone_from(&s.account);
         self.plan.clone_from(&s.plan);
         self.left_behind = s.count_left_behind();
+        self.reach.clone_from(&s.reach);
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -269,6 +273,8 @@ pub struct Seed {
     /// Where it came from: the runner and its folder there.
     pub from: String,
     pub from_cwd: String,
+    /// Its turn was interrupted to move: it picks the turn up here.
+    pub picks_up: bool,
     /// Said with the move (its folder isn't here, so it works in home).
     pub note: Option<String>,
 }
@@ -329,6 +335,34 @@ fn name_session(s: &Session, value: Option<&serde_json::Value>) -> Option<Comman
     core.touch_state();
     let harness_names = core.meta.controls.iter().any(|c| c.id == "rename");
     (harness_names && !name.is_empty()).then(|| Command::Control { id: "rename".into(), value: Some(serde_json::Value::String(name)) })
+}
+
+/// Where its commands may run besides its machine (the "reach" control, as `Spec::reach`): ""
+/// anywhere it needs, "off" only its own machine, else a runner or platform it prefers. Kept in
+/// its spec (its harness takes it when it next starts) and shown in its state. Whether it changed.
+fn set_reach(s: &Session, value: Option<&serde_json::Value>) -> bool {
+    let v = value.and_then(serde_json::Value::as_str).map(str::trim).unwrap_or("");
+    let reach = (!v.is_empty()).then(|| v.chars().take(MAX_NAME).collect::<String>());
+    {
+        let mut spec = s.spec.lock();
+        if spec.reach == reach {
+            return false;
+        }
+        spec.reach.clone_from(&reach);
+    }
+    let mut core = s.core.lock();
+    core.state.reach = reach;
+    core.touch_state();
+    true
+}
+
+/// The "reach" setting in words, for the timeline.
+fn reach_words(reach: Option<&str>) -> String {
+    match reach {
+        None => "Its commands can run on any runner it needs".to_owned(),
+        Some("off") => "Its commands run only on its own machine".to_owned(),
+        Some(r) => format!("Its commands can run on other runners, {r} first"),
+    }
 }
 
 /// A command as the adapter should see it (attachments stored first).
@@ -474,6 +508,12 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.harness = Some(kind.name.to_owned());
         let folder = if core.state.cwd == sd.from_cwd { String::new() } else { format!(" (it works in {} here; it was in {})", core.state.cwd, sd.from_cwd) };
         let mut text = format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from);
+        // Interrupted to move: the turn goes on here, first thing.
+        if sd.picks_up {
+            text.push_str(", and the turn it was in the middle of goes on here");
+            let ask = format!("This conversation just moved here from {}, which interrupted your last turn. Pick up where you left off.", sd.from);
+            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None });
+        }
         if let Some(n) = &sd.note {
             text.push_str(". ");
             text.push_str(n);
@@ -481,6 +521,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.upsert(&format!("harness-switch:moved-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
         items = sd.items;
     }
+    core.state.reach.clone_from(&spec.reach);
     let info = Info {
         id: id.clone(),
         kind: kind.id.to_owned(),
@@ -517,6 +558,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         account: None,
         plan: None,
         left_behind: 0,
+        reach: spec.reach.clone(),
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -965,7 +1007,10 @@ struct Switch {
 
 /// Nothing is under way: no turn, nothing waiting for a person.
 fn settled(s: &Session) -> bool {
-    let core = s.core.lock();
+    settled_core(&s.core.lock())
+}
+
+fn settled_core(core: &Core) -> bool {
     core.state.status == Status::Idle && core.state.approvals.is_empty() && core.state.turn_started.is_none()
 }
 
@@ -1157,17 +1202,27 @@ struct Move {
     to: String,
     cwd: String,
     note: Option<String>,
+    /// The turn under way was interrupted to move now: it is picked up over there.
+    picks_up: bool,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>) -> Move {
+/// `now`: the turn under way isn't waited for (the caller interrupts it).
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool) -> Move {
     let mut core = s.core.lock();
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
-    let text = if busy { format!("Moving to {to} when this turn ends") } else { format!("Moving to {to}…") };
+    let picks_up = now && busy;
+    let text = if picks_up {
+        format!("Moving to {to} now: this turn stops here and goes on there")
+    } else if busy {
+        format!("Moving to {to} when this turn ends")
+    } else {
+        format!("Moving to {to}…")
+    };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note }
+    Move { to, cwd, note, picks_up }
 }
 
 /// How a move is getting on before it starts (its repository being copied there).
@@ -1201,7 +1256,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
     }
     let env = spec.env.clone();
     let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &note)).await.map_err(|e| format!("{e:#}"))??;
-    let pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    pkg.picks_up = mv.picks_up;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
     reach.adopt(&mv.to, &bytes).await
@@ -1254,6 +1310,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut seed: Option<Vec<serde_json::Value>> = carried;
     // A move to another runner, waiting for the turn under way to end.
     let mut moving: Option<Move> = None;
+    // A setting its harness takes when it starts (where its commands run) changed: it starts
+    // again once nothing is under way.
+    let mut reloading = false;
     // Tasks the harness left running that a switch stopped.
     let mut left = 0usize;
     // The models it last listed (the machine keeps the list for its "new agent" and switches).
@@ -1275,6 +1334,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     on_change();
                 }
             }
+            first = false;
+        }
+        // Started again for a setting (where its commands run): what waited in kiln's queue goes
+        // to the new process.
+        if std::mem::take(&mut reloading) {
+            s.core.lock().hold = false;
             first = false;
         }
         if let Some(sw) = switching.take() {
@@ -1408,12 +1473,33 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 }
                                 on_change();
                             }
+                            // Where its commands run: its harness takes that when it starts, so it
+                            // starts again (the conversation goes on) once nothing is under way.
+                            Command::Control { id, value } if id == "reach" => {
+                                if set_reach(&s, value.as_ref()) {
+                                    let mut core = s.core.lock();
+                                    let when = if settled_core(&core) { "now" } else { "once this turn ends" };
+                                    let text = format!("{} — {} starts again with that {when}; the conversation goes on", reach_words(core.state.reach.as_deref()), kind.name);
+                                    core.upsert(&format!("harness-switch:reach-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                                    core.hold = true;
+                                    drop(core);
+                                    reloading = true;
+                                }
+                                on_change();
+                            }
                             Command::SetModel { model, kind: Some(to) } if to != kind.id => {
                                 if let Some(sw) = wanted(&s, kind, &to, model) {
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note } => moving = Some(move_wanted(&s, to, cwd, note)),
+                            Command::MoveTo { to, cwd, note, now } => {
+                                let mv = move_wanted(&s, to, cwd, note, now);
+                                // Not waiting for the turn: it stops here, and goes on there.
+                                if mv.picks_up {
+                                    adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                }
+                                moving = Some(mv);
+                            }
                             Command::Moving { text } => moving_note(&s, &text),
                             c => {
                                 // A model of its own harness: no switch after all.
@@ -1506,7 +1592,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     // A switch, now that nothing is under way: the harness ends by itself once its
                     // input closes (its record of the conversation complete), else it is stopped.
-                    if (switching.is_some() || moving.is_some()) && settled(&s) {
+                    if (switching.is_some() || moving.is_some() || reloading) && settled(&s) {
                         left = s.core.lock().state.tasks.iter().filter(|t| t.left_running()).count();
                         p.stdin.close();
                         if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
@@ -1558,8 +1644,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         if adapter.seeded() {
             seed = None;
         }
-        // A switch or a move waiting for the turn: the turn is over (it ended with the harness).
-        if switching.is_some() || moving.is_some() {
+        // A switch, a move or a setting waiting for the turn: the turn is over (it ended with the
+        // harness).
+        if switching.is_some() || moving.is_some() || reloading {
             continue;
         }
         // A crash after a good run comes back by itself (a few times); a harness that will not
@@ -1595,14 +1682,23 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note } => {
-                        moving = Some(move_wanted(&s, to, cwd, note));
+                    Command::MoveTo { to, cwd, note, now } => {
+                        moving = Some(move_wanted(&s, to, cwd, note, now));
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
                         carry.push(prepare(&files, c).await);
                         break;
+                    }
+                    // Where its commands run, while it isn't running: from its next start.
+                    Command::Control { id, value } if id == "reach" => {
+                        if set_reach(&s, value.as_ref()) {
+                            let mut core = s.core.lock();
+                            let text = format!("{} from its next start", reach_words(core.state.reach.as_deref()));
+                            core.upsert(&format!("harness-switch:reach-{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                        }
+                        on_change();
                     }
                     // Named while it isn't running: kiln's name now, the harness's when it next runs.
                     Command::Control { id, value } if id == "rename" => {
@@ -1682,6 +1778,7 @@ mod tests {
             account: None,
             plan: None,
             left_behind: 0,
+            reach: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };
@@ -1700,6 +1797,15 @@ mod tests {
         assert!(i.differs(&named));
         i.apply(&State::default());
         assert_eq!(i.name, "Docs fixer");
+
+        // Where its commands run reaches lists through its state too, and reads as said.
+        i.apply(&State { reach: Some("off".into()), ..State::default() });
+        assert_eq!(i.reach.as_deref(), Some("off"));
+        i.apply(&State::default());
+        assert_eq!(i.reach, None, "absent: anywhere it needs");
+        assert_eq!(reach_words(None), "Its commands can run on any runner it needs");
+        assert_eq!(reach_words(Some("off")), "Its commands run only on its own machine");
+        assert_eq!(reach_words(Some("linux/amd64")), "Its commands can run on other runners, linux/amd64 first");
     }
 
     #[test]
