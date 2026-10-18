@@ -104,7 +104,11 @@ async fn lookup(hub: &Arc<Hub>, claims: &Claims, req: &Request) -> Result<Respon
         return Ok(msg(StatusCode::FORBIDDEN, &format!("cache read denied: this job's cache-mode is `{}`", claims.cm)));
     }
     let all = entries(hub, &claims.repo).await.map_err(internal)?;
-    let Some(hit) = cache::lookup(&all, &keys, &version, &scopes) else { return Ok(srv::status(StatusCode::NO_CONTENT)) };
+    let Some(hit) = cache::lookup(&all, &keys, &version, &scopes) else {
+        crate::ci::insights::cache_event(hub, claims, keys.first().map_or("", String::as_str), "miss", None);
+        return Ok(srv::status(StatusCode::NO_CONTENT));
+    };
+    crate::ci::insights::cache_event(hub, claims, &hit.key, "hit", Some(hit.size));
     let id = hit.id;
     hub.store.call(move |c| Ok(c.execute("UPDATE ci_caches SET last_used_at = ?2 WHERE id = ?1", params![id, crate::util::now_unix()])?)).await.map_err(internal)?;
     let location = blob::url(hub, &blob::origin(req), Target::Cache(id), "r", DOWNLOAD_TTL);
@@ -275,10 +279,15 @@ async fn commit(hub: &Arc<Hub>, claims: &Claims, id: &str, req: Request) -> Resu
     }
     let obj = cas::put_file(hub, &path).await.map_err(internal)?;
     let (digest, size) = (obj.digest, i64::try_from(obj.size).unwrap_or(i64::MAX));
-    hub.store
-        .call(move |c| Ok(c.execute("UPDATE ci_caches SET object = ?2, size = ?3, last_used_at = ?4 WHERE id = ?1 AND object IS NULL", params![id, digest, size, crate::util::now_unix()])?))
+    let key: Option<String> = hub
+        .store
+        .call(move |c| {
+            c.execute("UPDATE ci_caches SET object = ?2, size = ?3, last_used_at = ?4 WHERE id = ?1 AND object IS NULL", params![id, digest, size, crate::util::now_unix()])?;
+            Ok(c.query_row("SELECT key FROM ci_caches WHERE id = ?1", [id], |r| r.get(0)).optional()?)
+        })
         .await
         .map_err(internal)?;
+    crate::ci::insights::cache_event(hub, claims, key.as_deref().unwrap_or(""), "save", Some(obj.size));
     if let Some(dir) = path.parent().map(std::path::Path::to_path_buf) {
         let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
     }

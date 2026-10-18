@@ -11,6 +11,7 @@
 //! - [`oidc`]: the OIDC issuer's key rotation, claims and subjects (W10).
 //! - [`sched`]: queues, concurrency, priorities, fairness, routing, retries (W05).
 //! - [`results`]: test reports and flaky classification (W16).
+//! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
 //! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
 //! - [`store`]: chunking and GitHub's cache rules for the runtime store (W08).
 //! - [`secrets`]: secret scopes, and which secrets a leg reads (W09).
@@ -21,6 +22,7 @@
 pub mod env;
 pub mod expr;
 pub mod facts;
+pub mod insights;
 pub mod oidc;
 pub mod plan;
 pub mod policy;

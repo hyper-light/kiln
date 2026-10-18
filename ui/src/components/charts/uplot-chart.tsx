@@ -31,7 +31,7 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
   dataRef.current = data;
 
   // A stable key for structural changes (series set, formatters by identity are ignored).
-  const structKey = JSON.stringify([series.map((s) => [s.label, s.color, s.bars, s.scale, s.fill, s.dash]), height, yRange, timeFormat, legend, Boolean(y2Format)]);
+  const structKey = JSON.stringify([series.map((s) => [s.label, s.color, s.bars, s.scale, s.fill, s.dash, s.points]), height, yRange, timeFormat, legend, Boolean(y2Format)]);
 
   // The plot lives as long as its element and its structure: made when they arrive, destroyed with them.
   const mount = React.useCallback(
@@ -98,7 +98,8 @@ export default function UPlotChart({ data, series, height = 200, yFormat = (v) =
             dash: s.dash,
             fill: s.bars ? hexA(s.color, 0.78) : s.fill ? (typeof s.fill === "string" ? s.fill : hexA(s.color, 0.08)) : undefined,
             paths: s.bars ? barsPaths : undefined,
-            points: { show: false },
+            // uPlot shows them where there's room between them.
+            points: s.points ? { size: 8, width: 2, stroke: "#08090a", fill: s.color } : { show: false },
             spanGaps: false,
             value: s.value ? (u, v, si, i) => s.value!(u.data, v, si, i ?? 0) : (_u, v) => (v == null ? "—" : s.scale === "y2" && y2Format ? y2Format(v) : yFormat(v)),
           })),
