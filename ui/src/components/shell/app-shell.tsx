@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link, NavLink, Outlet, useLocation } from "react-router";
+import { Link, NavLink, Outlet, useLocation } from "@/lib/router";
 import { UpdateNotice } from "./update-notice";
 import { ArrowUpRight, LogOut, Menu, Search, Settings, X } from "lucide-react";
 import { api } from "@/api/client";

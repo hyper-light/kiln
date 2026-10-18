@@ -6,7 +6,7 @@
  * other platforms come from kiln's own release pipeline (Build every platform) or an upload.
  */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { create } from "zustand";
 import { ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";

@@ -1,4 +1,4 @@
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Optic } from "@/components/ui/misc";

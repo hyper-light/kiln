@@ -5,7 +5,7 @@
  * Kept plans are the same ones Agents › Plans lists; everything stays in the page's flow.
  */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { planHref, plansApi, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";

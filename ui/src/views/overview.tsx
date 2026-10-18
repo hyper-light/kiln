@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link, useNavigate } from "react-router";
+import { Link, useNavigate } from "@/lib/router";
 import { ArrowUpRight, Server } from "lucide-react";
 import type { Overview as OverviewData } from "@/api/types";
 import { Chart } from "@/components/charts/chart";

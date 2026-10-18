@@ -10,7 +10,7 @@
 import * as React from "react";
 import "./harness.css";
 import "./console.css";
-import { Link, useNavigate, useParams } from "react-router";
+import { Link, useNavigate, useParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
 import { harnessApi, sessionStore, useSession, useSessionReady, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
 import { Button } from "@/components/ui/button";

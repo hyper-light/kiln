@@ -7,7 +7,7 @@
  * a selection, or everything a filter shows, syncs or refreshes at once.
  */
 import * as React from "react";
-import { Link, useSearchParams } from "react-router";
+import { Link, useSearchParams } from "@/lib/router";
 import { Rocket } from "lucide-react";
 
 import { appHref, cdApi, plansHref, type CdFilters, type CdSort } from "@/api/cd";

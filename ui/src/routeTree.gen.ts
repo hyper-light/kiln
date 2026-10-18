@@ -9,50 +9,520 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as SplatRouteImport } from './routes/$'
+import { Route as AppRouteImport } from './routes/_app'
+import { Route as AppIndexRouteImport } from './routes/_app.index'
+import { Route as AppSplatRouteImport } from './routes/_app.$'
+import { Route as AppReposRouteImport } from './routes/_app.repos'
+import { Route as AppSettingsRouteImport } from './routes/_app.settings'
+import { Route as AppSyncRouteImport } from './routes/_app.sync'
+import { Route as AppSystemRouteImport } from './routes/_app.system'
+import { Route as AppTelemetryRouteImport } from './routes/_app.telemetry'
+import { Route as AppTerminalRouteImport } from './routes/_app.terminal'
+import { Route as AppAgentsIndexRouteImport } from './routes/_app.agents.index'
+import { Route as AppAgentsIdRouteImport } from './routes/_app.agents.$id'
+import { Route as AppAgentsSessionsRouteImport } from './routes/_app.agents.sessions'
+import { Route as AppDeploymentsIndexRouteImport } from './routes/_app.deployments.index'
+import { Route as AppDeploymentsPlansRouteImport } from './routes/_app.deployments.plans'
+import { Route as AppRunnersIndexRouteImport } from './routes/_app.runners.index'
+import { Route as AppRunnersAddRouteImport } from './routes/_app.runners.add'
+import { Route as AppRunsIndexRouteImport } from './routes/_app.runs.index'
+import { Route as SharedPlansTokenRouteImport } from './routes/shared.plans.$token'
+import { Route as AppAgentsPlansIndexRouteImport } from './routes/_app.agents.plans.index'
+import { Route as AppAgentsPlansIdRouteImport } from './routes/_app.agents.plans.$id'
+import { Route as AppRunsIdIndexRouteImport } from './routes/_app.runs.$id.index'
+import { Route as AppDeploymentsAppsProjectNameRouteImport } from './routes/_app.deployments.apps.$project.$name'
+import { Route as AppRunsIdJobsJobIdRouteImport } from './routes/_app.runs.$id.jobs.$jobId'
 
-const SplatRoute = SplatRouteImport.update({
+const AppRoute = AppRouteImport.update({
+  id: '/_app',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AppIndexRoute = AppIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSplatRoute = AppSplatRouteImport.update({
   id: '/$',
   path: '/$',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppReposRoute = AppReposRouteImport.update({
+  id: '/repos',
+  path: '/repos',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSettingsRoute = AppSettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSyncRoute = AppSyncRouteImport.update({
+  id: '/sync',
+  path: '/sync',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppSystemRoute = AppSystemRouteImport.update({
+  id: '/system',
+  path: '/system',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppTelemetryRoute = AppTelemetryRouteImport.update({
+  id: '/telemetry',
+  path: '/telemetry',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppTerminalRoute = AppTerminalRouteImport.update({
+  id: '/terminal',
+  path: '/terminal',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAgentsIndexRoute = AppAgentsIndexRouteImport.update({
+  id: '/agents/',
+  path: '/agents/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAgentsIdRoute = AppAgentsIdRouteImport.update({
+  id: '/agents/$id',
+  path: '/agents/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAgentsSessionsRoute = AppAgentsSessionsRouteImport.update({
+  id: '/agents/sessions',
+  path: '/agents/sessions',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDeploymentsIndexRoute = AppDeploymentsIndexRouteImport.update({
+  id: '/deployments/',
+  path: '/deployments/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDeploymentsPlansRoute = AppDeploymentsPlansRouteImport.update({
+  id: '/deployments/plans',
+  path: '/deployments/plans',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppRunnersIndexRoute = AppRunnersIndexRouteImport.update({
+  id: '/runners/',
+  path: '/runners/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppRunnersAddRoute = AppRunnersAddRouteImport.update({
+  id: '/runners/add',
+  path: '/runners/add',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppRunsIndexRoute = AppRunsIndexRouteImport.update({
+  id: '/runs/',
+  path: '/runs/',
+  getParentRoute: () => AppRoute,
+} as any)
+const SharedPlansTokenRoute = SharedPlansTokenRouteImport.update({
+  id: '/shared/plans/$token',
+  path: '/shared/plans/$token',
   getParentRoute: () => rootRouteImport,
+} as any)
+const AppAgentsPlansIndexRoute = AppAgentsPlansIndexRouteImport.update({
+  id: '/agents/plans/',
+  path: '/agents/plans/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAgentsPlansIdRoute = AppAgentsPlansIdRouteImport.update({
+  id: '/agents/plans/$id',
+  path: '/agents/plans/$id',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppRunsIdIndexRoute = AppRunsIdIndexRouteImport.update({
+  id: '/runs/$id/',
+  path: '/runs/$id/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDeploymentsAppsProjectNameRoute =
+  AppDeploymentsAppsProjectNameRouteImport.update({
+    id: '/deployments/apps/$project/$name',
+    path: '/deployments/apps/$project/$name',
+    getParentRoute: () => AppRoute,
+  } as any)
+const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
+  id: '/runs/$id/jobs/$jobId',
+  path: '/runs/$id/jobs/$jobId',
+  getParentRoute: () => AppRoute,
 } as any)
 
 export interface FileRoutesByFullPath {
-  '/$': typeof SplatRoute
+  '/': typeof AppIndexRoute
+  '/$': typeof AppSplatRoute
+  '/repos': typeof AppReposRoute
+  '/settings': typeof AppSettingsRoute
+  '/sync': typeof AppSyncRoute
+  '/system': typeof AppSystemRoute
+  '/telemetry': typeof AppTelemetryRoute
+  '/terminal': typeof AppTerminalRoute
+  '/agents/$id': typeof AppAgentsIdRoute
+  '/agents/sessions': typeof AppAgentsSessionsRoute
+  '/deployments/plans': typeof AppDeploymentsPlansRoute
+  '/runners/add': typeof AppRunnersAddRoute
+  '/shared/plans/$token': typeof SharedPlansTokenRoute
+  '/agents/': typeof AppAgentsIndexRoute
+  '/deployments/': typeof AppDeploymentsIndexRoute
+  '/runners/': typeof AppRunnersIndexRoute
+  '/runs/': typeof AppRunsIndexRoute
+  '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/runs/$id/': typeof AppRunsIdIndexRoute
+  '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
+  '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
 export interface FileRoutesByTo {
-  '/$': typeof SplatRoute
+  '/$': typeof AppSplatRoute
+  '/repos': typeof AppReposRoute
+  '/settings': typeof AppSettingsRoute
+  '/sync': typeof AppSyncRoute
+  '/system': typeof AppSystemRoute
+  '/telemetry': typeof AppTelemetryRoute
+  '/terminal': typeof AppTerminalRoute
+  '/': typeof AppIndexRoute
+  '/agents/$id': typeof AppAgentsIdRoute
+  '/agents/sessions': typeof AppAgentsSessionsRoute
+  '/deployments/plans': typeof AppDeploymentsPlansRoute
+  '/runners/add': typeof AppRunnersAddRoute
+  '/shared/plans/$token': typeof SharedPlansTokenRoute
+  '/agents': typeof AppAgentsIndexRoute
+  '/deployments': typeof AppDeploymentsIndexRoute
+  '/runners': typeof AppRunnersIndexRoute
+  '/runs': typeof AppRunsIndexRoute
+  '/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/agents/plans': typeof AppAgentsPlansIndexRoute
+  '/runs/$id': typeof AppRunsIdIndexRoute
+  '/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
+  '/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
-  '/$': typeof SplatRoute
+  '/_app': typeof AppRouteWithChildren
+  '/_app/$': typeof AppSplatRoute
+  '/_app/repos': typeof AppReposRoute
+  '/_app/settings': typeof AppSettingsRoute
+  '/_app/sync': typeof AppSyncRoute
+  '/_app/system': typeof AppSystemRoute
+  '/_app/telemetry': typeof AppTelemetryRoute
+  '/_app/terminal': typeof AppTerminalRoute
+  '/_app/': typeof AppIndexRoute
+  '/_app/agents/$id': typeof AppAgentsIdRoute
+  '/_app/agents/sessions': typeof AppAgentsSessionsRoute
+  '/_app/deployments/plans': typeof AppDeploymentsPlansRoute
+  '/_app/runners/add': typeof AppRunnersAddRoute
+  '/shared/plans/$token': typeof SharedPlansTokenRoute
+  '/_app/agents/': typeof AppAgentsIndexRoute
+  '/_app/deployments/': typeof AppDeploymentsIndexRoute
+  '/_app/runners/': typeof AppRunnersIndexRoute
+  '/_app/runs/': typeof AppRunsIndexRoute
+  '/_app/agents/plans/$id': typeof AppAgentsPlansIdRoute
+  '/_app/agents/plans/': typeof AppAgentsPlansIndexRoute
+  '/_app/runs/$id/': typeof AppRunsIdIndexRoute
+  '/_app/deployments/apps/$project/$name': typeof AppDeploymentsAppsProjectNameRoute
+  '/_app/runs/$id/jobs/$jobId': typeof AppRunsIdJobsJobIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/$'
+  fullPaths:
+    | '/'
+    | '/$'
+    | '/repos'
+    | '/settings'
+    | '/sync'
+    | '/system'
+    | '/telemetry'
+    | '/terminal'
+    | '/agents/$id'
+    | '/agents/sessions'
+    | '/deployments/plans'
+    | '/runners/add'
+    | '/shared/plans/$token'
+    | '/agents/'
+    | '/deployments/'
+    | '/runners/'
+    | '/runs/'
+    | '/agents/plans/$id'
+    | '/agents/plans/'
+    | '/runs/$id/'
+    | '/deployments/apps/$project/$name'
+    | '/runs/$id/jobs/$jobId'
   fileRoutesByTo: FileRoutesByTo
-  to: '/$'
-  id: '__root__' | '/$'
+  to:
+    | '/$'
+    | '/repos'
+    | '/settings'
+    | '/sync'
+    | '/system'
+    | '/telemetry'
+    | '/terminal'
+    | '/'
+    | '/agents/$id'
+    | '/agents/sessions'
+    | '/deployments/plans'
+    | '/runners/add'
+    | '/shared/plans/$token'
+    | '/agents'
+    | '/deployments'
+    | '/runners'
+    | '/runs'
+    | '/agents/plans/$id'
+    | '/agents/plans'
+    | '/runs/$id'
+    | '/deployments/apps/$project/$name'
+    | '/runs/$id/jobs/$jobId'
+  id:
+    | '__root__'
+    | '/_app'
+    | '/_app/$'
+    | '/_app/repos'
+    | '/_app/settings'
+    | '/_app/sync'
+    | '/_app/system'
+    | '/_app/telemetry'
+    | '/_app/terminal'
+    | '/_app/'
+    | '/_app/agents/$id'
+    | '/_app/agents/sessions'
+    | '/_app/deployments/plans'
+    | '/_app/runners/add'
+    | '/shared/plans/$token'
+    | '/_app/agents/'
+    | '/_app/deployments/'
+    | '/_app/runners/'
+    | '/_app/runs/'
+    | '/_app/agents/plans/$id'
+    | '/_app/agents/plans/'
+    | '/_app/runs/$id/'
+    | '/_app/deployments/apps/$project/$name'
+    | '/_app/runs/$id/jobs/$jobId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  SplatRoute: typeof SplatRoute
+  AppRoute: typeof AppRouteWithChildren
+  SharedPlansTokenRoute: typeof SharedPlansTokenRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/$': {
-      id: '/$'
+    '/_app': {
+      id: '/_app'
+      path: ''
+      fullPath: '/'
+      preLoaderRoute: typeof AppRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_app/': {
+      id: '/_app/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof AppIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/$': {
+      id: '/_app/$'
       path: '/$'
       fullPath: '/$'
-      preLoaderRoute: typeof SplatRouteImport
+      preLoaderRoute: typeof AppSplatRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/repos': {
+      id: '/_app/repos'
+      path: '/repos'
+      fullPath: '/repos'
+      preLoaderRoute: typeof AppReposRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/settings': {
+      id: '/_app/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof AppSettingsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/sync': {
+      id: '/_app/sync'
+      path: '/sync'
+      fullPath: '/sync'
+      preLoaderRoute: typeof AppSyncRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/system': {
+      id: '/_app/system'
+      path: '/system'
+      fullPath: '/system'
+      preLoaderRoute: typeof AppSystemRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/telemetry': {
+      id: '/_app/telemetry'
+      path: '/telemetry'
+      fullPath: '/telemetry'
+      preLoaderRoute: typeof AppTelemetryRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/terminal': {
+      id: '/_app/terminal'
+      path: '/terminal'
+      fullPath: '/terminal'
+      preLoaderRoute: typeof AppTerminalRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/agents/': {
+      id: '/_app/agents/'
+      path: '/agents'
+      fullPath: '/agents/'
+      preLoaderRoute: typeof AppAgentsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/agents/$id': {
+      id: '/_app/agents/$id'
+      path: '/agents/$id'
+      fullPath: '/agents/$id'
+      preLoaderRoute: typeof AppAgentsIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/agents/sessions': {
+      id: '/_app/agents/sessions'
+      path: '/agents/sessions'
+      fullPath: '/agents/sessions'
+      preLoaderRoute: typeof AppAgentsSessionsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/': {
+      id: '/_app/deployments/'
+      path: '/deployments'
+      fullPath: '/deployments/'
+      preLoaderRoute: typeof AppDeploymentsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/plans': {
+      id: '/_app/deployments/plans'
+      path: '/deployments/plans'
+      fullPath: '/deployments/plans'
+      preLoaderRoute: typeof AppDeploymentsPlansRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/runners/': {
+      id: '/_app/runners/'
+      path: '/runners'
+      fullPath: '/runners/'
+      preLoaderRoute: typeof AppRunnersIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/runners/add': {
+      id: '/_app/runners/add'
+      path: '/runners/add'
+      fullPath: '/runners/add'
+      preLoaderRoute: typeof AppRunnersAddRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/runs/': {
+      id: '/_app/runs/'
+      path: '/runs'
+      fullPath: '/runs/'
+      preLoaderRoute: typeof AppRunsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/shared/plans/$token': {
+      id: '/shared/plans/$token'
+      path: '/shared/plans/$token'
+      fullPath: '/shared/plans/$token'
+      preLoaderRoute: typeof SharedPlansTokenRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/_app/agents/plans/': {
+      id: '/_app/agents/plans/'
+      path: '/agents/plans'
+      fullPath: '/agents/plans/'
+      preLoaderRoute: typeof AppAgentsPlansIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/agents/plans/$id': {
+      id: '/_app/agents/plans/$id'
+      path: '/agents/plans/$id'
+      fullPath: '/agents/plans/$id'
+      preLoaderRoute: typeof AppAgentsPlansIdRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/runs/$id/': {
+      id: '/_app/runs/$id/'
+      path: '/runs/$id'
+      fullPath: '/runs/$id/'
+      preLoaderRoute: typeof AppRunsIdIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/apps/$project/$name': {
+      id: '/_app/deployments/apps/$project/$name'
+      path: '/deployments/apps/$project/$name'
+      fullPath: '/deployments/apps/$project/$name'
+      preLoaderRoute: typeof AppDeploymentsAppsProjectNameRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/runs/$id/jobs/$jobId': {
+      id: '/_app/runs/$id/jobs/$jobId'
+      path: '/runs/$id/jobs/$jobId'
+      fullPath: '/runs/$id/jobs/$jobId'
+      preLoaderRoute: typeof AppRunsIdJobsJobIdRouteImport
+      parentRoute: typeof AppRoute
     }
   }
 }
 
+interface AppRouteChildren {
+  AppSplatRoute: typeof AppSplatRoute
+  AppReposRoute: typeof AppReposRoute
+  AppSettingsRoute: typeof AppSettingsRoute
+  AppSyncRoute: typeof AppSyncRoute
+  AppSystemRoute: typeof AppSystemRoute
+  AppTelemetryRoute: typeof AppTelemetryRoute
+  AppTerminalRoute: typeof AppTerminalRoute
+  AppIndexRoute: typeof AppIndexRoute
+  AppAgentsIdRoute: typeof AppAgentsIdRoute
+  AppAgentsSessionsRoute: typeof AppAgentsSessionsRoute
+  AppDeploymentsPlansRoute: typeof AppDeploymentsPlansRoute
+  AppRunnersAddRoute: typeof AppRunnersAddRoute
+  AppAgentsIndexRoute: typeof AppAgentsIndexRoute
+  AppDeploymentsIndexRoute: typeof AppDeploymentsIndexRoute
+  AppRunnersIndexRoute: typeof AppRunnersIndexRoute
+  AppRunsIndexRoute: typeof AppRunsIndexRoute
+  AppAgentsPlansIdRoute: typeof AppAgentsPlansIdRoute
+  AppAgentsPlansIndexRoute: typeof AppAgentsPlansIndexRoute
+  AppRunsIdIndexRoute: typeof AppRunsIdIndexRoute
+  AppDeploymentsAppsProjectNameRoute: typeof AppDeploymentsAppsProjectNameRoute
+  AppRunsIdJobsJobIdRoute: typeof AppRunsIdJobsJobIdRoute
+}
+
+const AppRouteChildren: AppRouteChildren = {
+  AppSplatRoute: AppSplatRoute,
+  AppReposRoute: AppReposRoute,
+  AppSettingsRoute: AppSettingsRoute,
+  AppSyncRoute: AppSyncRoute,
+  AppSystemRoute: AppSystemRoute,
+  AppTelemetryRoute: AppTelemetryRoute,
+  AppTerminalRoute: AppTerminalRoute,
+  AppIndexRoute: AppIndexRoute,
+  AppAgentsIdRoute: AppAgentsIdRoute,
+  AppAgentsSessionsRoute: AppAgentsSessionsRoute,
+  AppDeploymentsPlansRoute: AppDeploymentsPlansRoute,
+  AppRunnersAddRoute: AppRunnersAddRoute,
+  AppAgentsIndexRoute: AppAgentsIndexRoute,
+  AppDeploymentsIndexRoute: AppDeploymentsIndexRoute,
+  AppRunnersIndexRoute: AppRunnersIndexRoute,
+  AppRunsIndexRoute: AppRunsIndexRoute,
+  AppAgentsPlansIdRoute: AppAgentsPlansIdRoute,
+  AppAgentsPlansIndexRoute: AppAgentsPlansIndexRoute,
+  AppRunsIdIndexRoute: AppRunsIdIndexRoute,
+  AppDeploymentsAppsProjectNameRoute: AppDeploymentsAppsProjectNameRoute,
+  AppRunsIdJobsJobIdRoute: AppRunsIdJobsJobIdRoute,
+}
+
+const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
-  SplatRoute: SplatRoute,
+  AppRoute: AppRouteWithChildren,
+  SharedPlansTokenRoute: SharedPlansTokenRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

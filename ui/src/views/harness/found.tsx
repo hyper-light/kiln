@@ -6,7 +6,7 @@
  * transcript, to read in place.
  */
 import * as React from "react";
-import { Link, Navigate, useLocation, useNavigate, useSearchParams } from "react-router";
+import { Link, Navigate, useLocation, useNavigate, useSearchParams } from "@/lib/router";
 import { ChevronRight, SquareTerminal } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi } from "@/api/harness";

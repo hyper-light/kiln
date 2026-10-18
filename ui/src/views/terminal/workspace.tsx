@@ -1,6 +1,6 @@
 import * as React from "react";
 import { DropdownMenu } from "radix-ui";
-import { Link, Navigate, useLocation, useNavigate } from "react-router";
+import { Link, Navigate, useLocation, useNavigate } from "@/lib/router";
 import { ChevronDown, ClipboardCopy, ClipboardPaste, Copy, Eraser, Eye, Keyboard, Maximize2, Minimize2, Minus, PencilLine, Plus, RotateCcw, Server, SquareTerminal, X } from "lucide-react";
 import { api } from "@/api/client";
 import type { AiSession, TerminalSessionInfo } from "@/api/types";

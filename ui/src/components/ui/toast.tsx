@@ -1,7 +1,7 @@
 import * as React from "react";
 import { Toast as T } from "radix-ui";
 import { X } from "lucide-react";
-import { useNavigate } from "react-router";
+import { useNavigate } from "@/lib/router";
 import { StatusDot } from "./status";
 
 export interface ToastItem {

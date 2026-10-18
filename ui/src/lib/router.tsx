@@ -22,7 +22,15 @@ const AnyNavigate = TanNavigate as unknown as React.ComponentType<Record<string,
 
 type AnchorProps = Omit<React.AnchorHTMLAttributes<HTMLAnchorElement>, "href" | "className">;
 
-export const Link = React.forwardRef<HTMLAnchorElement, AnchorProps & { to: string; replace?: boolean; className?: string }>(function Link({ to, replace, ...rest }, ref) {
+type LinkProps = AnchorProps & {
+  to: string;
+  replace?: boolean;
+  className?: string;
+  /** When it counts as the current page (TanStack's own: it then sets `aria-current="page"`). */
+  activeOptions?: { exact?: boolean; includeSearch?: boolean };
+};
+
+export const Link = React.forwardRef<HTMLAnchorElement, LinkProps>(function Link({ to, replace, ...rest }, ref) {
   const p = split(to);
   return <AnyLink ref={ref} to={p.pathname} search={p.search} hash={p.hash || undefined} replace={replace} {...rest} />;
 });
@@ -42,9 +50,11 @@ export function NavLink({
 }) {
   const { pathname } = useTanLocation();
   const target = split(to).pathname;
-  const isActive = end || target === "/" ? pathname === target : pathname === target || pathname.startsWith(`${target.replace(/\/$/, "")}/`);
+  const exact = Boolean(end) || target === "/";
+  // The same rule TanStack's Link applies to set aria-current (below the path, or exactly).
+  const isActive = exact ? pathname === target : pathname === target || pathname.startsWith(`${target.replace(/\/$/, "")}/`);
   return (
-    <Link to={to} className={typeof className === "function" ? className({ isActive }) : className} aria-current={isActive ? "page" : undefined} {...rest}>
+    <Link to={to} activeOptions={{ exact, includeSearch: false }} className={typeof className === "function" ? className({ isActive }) : className} {...rest}>
       {typeof children === "function" ? children({ isActive }) : children}
     </Link>
   );
@@ -78,10 +88,12 @@ export function useParams(): Record<string, string | undefined> {
   return params as Record<string, string | undefined>;
 }
 
-export function useLocation(): { pathname: string; search: string; hash: string; state: unknown } {
+/** Where the page is. `key` is new for every navigation (as React Router's was), from the history entry. */
+export function useLocation(): { pathname: string; search: string; hash: string; state: unknown; key: string } {
   const l = useTanLocation();
   const search = l.searchStr && !l.searchStr.startsWith("?") ? `?${l.searchStr}` : (l.searchStr ?? "");
-  return { pathname: l.pathname, search, hash: l.hash ? `#${l.hash}` : "", state: l.state };
+  const state = l.state as { __TSR_key?: string; key?: string } | undefined;
+  return { pathname: l.pathname, search, hash: l.hash ? `#${l.hash}` : "", state: l.state, key: state?.__TSR_key ?? state?.key ?? "default" };
 }
 
 type SetSearch = (next: URLSearchParams | Record<string, string> | ((prev: URLSearchParams) => URLSearchParams | Record<string, string>), opts?: { replace?: boolean }) => void;

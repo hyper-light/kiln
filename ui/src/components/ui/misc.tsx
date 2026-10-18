@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { AlertTriangle, ChevronDown, RotateCcw, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "./button";

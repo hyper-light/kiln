@@ -4,7 +4,7 @@
  * exported, its versions and runs. Everything in the page's flow.
  */
 import * as React from "react";
-import { Link, useNavigate, useParams } from "react-router";
+import { Link, useNavigate, useParams } from "@/lib/router";
 import { harnessApi, type KindInfo } from "@/api/harness";
 import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";

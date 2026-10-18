@@ -1,4 +1,4 @@
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { Clock, GitCommitHorizontal, GitPullRequest, Hand, Tag } from "lucide-react";
 import type { Agent, Child, HostSample, Run } from "@/api/types";
 import { StatusDot, Chips } from "@/components/ui/status";

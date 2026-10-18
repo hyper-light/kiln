@@ -1,6 +1,6 @@
 /** Keeping a plan an agent made: "Save plan" wherever a plan shows in a conversation. */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { planHref, plansApi, type PlanSource } from "@/api/plans";
 import { errorMessage } from "@/lib/hooks";
 import { cn } from "@/lib/utils";

@@ -1,6 +1,6 @@
 /** "Start agents here": from a terminal tab, start agents of any harness inside that shell. */
 import * as React from "react";
-import { useNavigate } from "react-router";
+import { useNavigate } from "@/lib/router";
 import { Bot } from "lucide-react";
 import { Tip } from "@/components/ui/tooltip";
 import { SpawnDialog } from "./spawn";

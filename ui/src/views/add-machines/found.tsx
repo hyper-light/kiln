@@ -4,7 +4,7 @@
  * happen in place above the list. Waiting to join: requests from machines discovery doesn't hear.
  */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { ArrowDown, ArrowRight, ArrowUpRight, Check, Pencil, Plus, Radar, Send, X } from "lucide-react";
 import { api, discoveryApi } from "@/api/client";
 import type { DiscoveredInstance, DiscoveryInfo, JoinRequest, ScanState } from "@/api/types";

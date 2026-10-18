@@ -1,6 +1,6 @@
 /** Add a machine: the one-liner for its system, what it does, and a live line that says when the machine is here. */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronRight, Copy, RotateCcw } from "lucide-react";
 import type { InstallOs, JoinInfo, JoinRequest } from "@/api/types";
 import { Button } from "@/components/ui/button";

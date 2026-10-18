@@ -7,7 +7,7 @@
  * passed on as a link.
  */
 import * as React from "react";
-import { Link, useSearchParams } from "react-router";
+import { Link, useSearchParams } from "@/lib/router";
 import { GitBranch } from "lucide-react";
 
 import { appHref, cdApi } from "@/api/cd";

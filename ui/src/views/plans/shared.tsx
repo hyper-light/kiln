@@ -1,5 +1,5 @@
 /** A shared plan, for anyone with its link: its words only, read-only, no sign-in. */
-import { useParams } from "react-router";
+import { useParams } from "@/lib/router";
 import { plansApi } from "@/api/plans";
 import { BrandMark } from "@/components/shell/brand";
 import { Loadable } from "@/components/ui/loading";
