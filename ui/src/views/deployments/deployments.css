@@ -115,8 +115,100 @@
 .cd-item[data-tone="fail"] {
   box-shadow: inset 2px 0 0 #d1aaad;
 }
+/* Syncing: its edge runs with the prism while the sync is under way. */
 .cd-item[data-live] {
-  box-shadow: inset 2px 0 0 #bab0e3;
+  position: relative;
+  box-shadow: none;
+}
+.cd-item[data-live]::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--prism);
+  background-size: 100% 300%;
+  animation: cd-edge 1.6s ease-in-out infinite alternate;
+  pointer-events: none;
+}
+@keyframes cd-edge {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 100%;
+  }
+}
+/* A state's sign and word: Argo CD's signs, in kiln's tones. A change plays in; what's under way turns. */
+.cd-glyph-in {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  animation: cd-glyph-in 0.32s var(--ease) both;
+}
+.cd-glyph-i {
+  flex: none;
+  color: #8c8f98;
+}
+.cd-glyph-i[data-status="succeeded"] {
+  color: #a5c8b3;
+}
+.cd-glyph-i[data-status="failed"] {
+  color: #d1aaad;
+}
+.cd-glyph-i[data-status="timed_out"] {
+  color: #cbb69a;
+}
+.cd-glyph-i[data-status="running"] {
+  color: #c9c1ec;
+}
+.cd-spin {
+  animation: cd-spin 1.2s linear infinite;
+}
+@keyframes cd-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes cd-glyph-in {
+  from {
+    opacity: 0;
+    transform: scale(0.72);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* What a sync under way is doing, in words that shimmer as it goes. */
+.cd-live-text {
+  background: linear-gradient(100deg, #c9c1ec 0%, #e8e3ff 22%, #c9c1ec 44%, #c9c1ec 100%);
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: cd-shimmer 2.2s linear infinite;
+}
+@keyframes cd-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -150% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cd-spin,
+  .cd-glyph-in,
+  .cd-live-text,
+  .cd-item[data-live]::before {
+    animation: none;
+  }
+  .cd-live-text {
+    color: #c9c1ec;
+  }
 }
 .cd-row {
   display: grid;
@@ -438,6 +530,15 @@
   }
   .cd-lines-rev .cd-line-by {
     flex-basis: 100%;
+  }
+  /* How it syncs wraps instead: every switch, and where it's set, stays in sight. */
+  .cd-lines-policy dd {
+    overflow: visible;
+    white-space: normal;
+  }
+  .cd-lines-policy dd > * {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 }
 
@@ -1962,4 +2063,83 @@ button.cd-gnode:hover {
 }
 .cd-rollout-log li {
   overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------------ what's failing, and how it syncs */
+/* What's failing in the app, first: why, and its logs or events a tap away. */
+.cd-problems {
+  display: flex;
+  flex-direction: column;
+  margin: 4px 0 14px;
+  border-top: 1px solid #25272c;
+}
+.cd-problem {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 0.6fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0 12px;
+  min-height: 40px;
+  padding: 6px 4px 6px 10px;
+  border-bottom: 1px solid #25272c;
+  box-shadow: inset 2px 0 0 #c6b08e;
+  font-size: 12.5px;
+}
+.cd-problem[data-tone="fail"] {
+  box-shadow: inset 2px 0 0 #d1aaad;
+}
+.cd-problem-name {
+  overflow: hidden;
+  color: #e1e5e9;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-problem-why {
+  overflow: hidden;
+  color: #d8b9bb;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cd-problem[data-tone="warn"] .cd-problem-why {
+  color: #cbb69a;
+}
+.cd-problem-acts {
+  display: flex;
+  gap: 12px;
+  white-space: nowrap;
+}
+.cd-problems-more {
+  margin: 8px 0 0 10px;
+  font-size: 12px;
+}
+@container (max-width: 640px) {
+  .cd-problem {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    grid-template-areas: "marks kind name acts" "why why why why";
+    row-gap: 4px;
+  }
+  .cd-problem > .cd-marks {
+    grid-area: marks;
+  }
+  .cd-problem > .cd-kind {
+    grid-area: kind;
+  }
+  .cd-problem-name {
+    grid-area: name;
+  }
+  .cd-problem-why {
+    grid-area: why;
+    white-space: normal;
+  }
+  .cd-problem-acts {
+    grid-area: acts;
+  }
+}
+/* How it syncs, changed in place for an app kept in kiln. */
+.cd-policy {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+.cd-details-at {
+  scroll-margin: 12px;
 }

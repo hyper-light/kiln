@@ -104,6 +104,8 @@ export const cdApi = {
   /** Syncs every app the filters show. */
   syncMany: (f: CdFilters) => request<{ started: number }>("POST", "/api/cd/ops/cd.apps.sync_many", { ...selector(f), max: 100_000 }),
   refresh: (id: string, hard: boolean) => request<unknown>("POST", `${appPath(id)}/refresh${qs({ hard })}`, {}),
+  /** Create or replace an app kept in kiln, from its whole definition (as `get` gives it). */
+  put: (definition: Record<string, unknown>) => request<{ app: string }>("POST", "/api/cd/apps", definition),
   /** Compares again every app the filters show. */
   refreshMany: (f: CdFilters) => request<{ refreshing: number }>("POST", "/api/cd/ops/cd.apps.refresh_many", selector(f)),
   terminate: (id: string) => request<unknown>("POST", `${appPath(id)}/terminate`, {}),
