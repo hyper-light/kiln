@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod agent;
 pub mod aisessions;
 pub mod api;
+pub mod authz;
 pub mod autodetect;
 pub mod cd;
 pub mod ci;

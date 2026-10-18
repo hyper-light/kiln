@@ -104,11 +104,23 @@ fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
 
 /// The cookie a sign-in sets; `Secure` when the browser reached kiln over HTTPS.
 fn session_cookie(hub: &Hub, secure: bool) -> String {
+    cookie_for(&signed_expiring(hub, "session", SESSION_TTL), secure)
+}
+
+/// The session cookie carrying `value` (the owner's, or a user's: `crate::authz::gate`).
+fn cookie_for(value: &str, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!(
-        "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}",
-        signed_expiring(hub, "session", SESSION_TTL)
-    )
+    format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}")
+}
+
+/// Who a request is: the owner (the admin token, the owner's session), else a token or a user's
+/// session (docs/ci.md W10-R01).
+async fn caller_of(hub: &Hub, headers: &HeaderMap) -> Option<crate::authz::Caller> {
+    if authed(hub, headers) {
+        return Some(crate::authz::Caller::owner());
+    }
+    let session = cookie(headers, SESSION_COOKIE);
+    crate::authz::gate::caller(hub, bearer(headers), session.as_deref()).await
 }
 
 /// A `Host` header without its port (IPv6 literals keep their brackets).
@@ -166,11 +178,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             };
         }
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
-        (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req)),
+        (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req).await),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
         (&Method::POST, ["api", "auth", "password"]) => return login_password(&hub, req).await,
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
-        (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
+        (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers()).await),
         (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
         (&Method::POST, ["api", "agents", "instance"]) => return enroll_instance(&hub, req).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
@@ -236,11 +248,28 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     if !is_api {
         return Ok(crate::uiserver::serve(req).await);
     }
-    if !authed(&hub, req.headers()) {
+    let Some(caller) = caller_of(&hub, req.headers()).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
-    }
+    };
     let q = srv::query(&req);
+    // Everyone but the owner is held to the route table (W10-R05), and what they change is
+    // audited under their own name.
+    if !caller.is_owner() {
+        crate::authz::gate::check(&hub, &caller, &method, &s, &q).await.map_err(|(c, m)| err(c, m))?;
+        if method != Method::GET && method != Method::HEAD {
+            hub.store.audit(caller.name.clone(), format!("api.{}", method.as_str().to_ascii_lowercase()), path.clone()).await;
+        }
+    }
+    let mut req = req;
+    req.extensions_mut().insert(caller.clone());
+    if matches!(s.get(1), Some(&("users" | "grants" | "roles" | "tokens"))) {
+        return match crate::authz::api::route(&hub, &caller, &method, &s, &q, req).await {
+            Some(r) => r.map_err(|(c, m)| err(c, m)),
+            None => Err(err(StatusCode::NOT_FOUND, "not found")),
+        };
+    }
     match (&method, s.as_slice()) {
+        (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION")))),
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
@@ -259,7 +288,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             None => Err(err(StatusCode::NOT_FOUND, "no such upgrade")),
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
-        (&Method::GET, ["api", "repos"]) => Ok(srv::json(StatusCode::OK, &hub.store.repos().await?)),
+        (&Method::GET, ["api", "repos"]) => {
+            let mut repos = hub.store.repos().await?;
+            repos.retain(|r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }));
+            Ok(srv::json(StatusCode::OK, &repos))
+        }
         (&Method::POST, ["api", "repos"]) => add_repo(&hub, req).await,
         (&Method::DELETE, ["api", "repos", id]) => delete_repo(&hub, id).await,
         (&Method::POST, ["api", "repos", id, "poll"]) => poll_repo(&hub, id).await,
@@ -1024,9 +1057,20 @@ async fn login(hub: &Hub, req: Request) -> R {
     }
 }
 
-fn otp(hub: &Hub, req: &Request) -> Response {
+async fn otp(hub: &Hub, req: &Request) -> Response {
     let q = srv::query(req);
     let code = q.get("code").map(String::as_str).unwrap_or("");
+    // A user's link (`u.<id>.<secret>`): theirs, once.
+    if code.starts_with("u.") {
+        return match crate::authz::gate::redeem_link(hub, code).await {
+            Some((session, name)) => {
+                hub.store.audit(format!("user:{name}"), "login".into(), "sign-in link".into()).await;
+                let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/");
+                srv::with_header(r, header::SET_COOKIE, &cookie_for(&session, is_secure(hub, req)))
+            }
+            None => srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/?signin=expired"),
+        };
+    }
     if verify_expiring(hub, "otp", code) {
         let hub_store = hub.store.clone();
         crate::rt::spawn(async move {
@@ -1129,7 +1173,8 @@ fn logout() -> Response {
     srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &format!("{SESSION_COOKIE}=; Path=/; Max-Age=0"))
 }
 
-fn me(hub: &Hub, headers: &HeaderMap) -> Response {
+async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
+    let caller = caller_of(hub, headers).await;
     // What discovery announces anyway (when it does), so a probe can tell which instance answers.
     let d = &hub.discovery;
     let announced = d.announcing().then(|| {
@@ -1142,7 +1187,12 @@ fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     srv::json(
         StatusCode::OK,
         &json!({
-            "authenticated": authed(hub, headers),
+            "authenticated": caller.is_some(),
+            // Who (W10-R01): `admin` for the owner, `user:<name>`, a token, a job; and what they
+            // hold, when that isn't everything.
+            "principal": caller.as_ref().map(|c| c.name.clone()),
+            "kind": caller.as_ref().map(|c| c.kind),
+            "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
             "public_url": hub.cfg.server.public_url,
             // Where else browsers find this server: its runners' front doors (HTTPS).
             "origins": hub.front_doors.origins(),

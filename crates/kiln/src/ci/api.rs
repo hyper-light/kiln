@@ -72,7 +72,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W02: workflows.
         (&Method::POST, ["validate"]) => workflows::validate(req.into_body()).await,
         // W04-R29: a plan without a run.
-        (&Method::POST, ["plan-preview"]) => super::preview::route(hub, req.into_body()).await,
+        (&Method::POST, ["plan-preview"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            super::preview::route(hub, caller.as_ref(), req.into_body()).await
+        }
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
         (&Method::GET, ["repos", repo, "workflows"]) => workflows::list(hub, repo, q).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => workflows::get(hub, repo, &path.join("/"), q).await,

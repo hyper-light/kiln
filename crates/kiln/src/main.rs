@@ -128,6 +128,14 @@ enum Cmd {
     Cancel(kiln::ci::cli::CancelArgs),
     /// Where CI legs go, and why they wait.
     Routing(kiln::ci::cli::RoutingArgs),
+    /// People who sign in: add (with a sign-in link), list, link, sign out, remove.
+    Users(kiln::authz::cli::UsersArgs),
+    /// What users may do: roles and capabilities in scopes (`developer@org:acme`).
+    Grants(kiln::authz::cli::GrantsArgs),
+    /// The built-in roles and custom ones.
+    Roles(kiln::authz::cli::RolesArgs),
+    /// Personal access tokens and agent tokens: create (shown once), list, revoke, rotate.
+    Tokens(kiln::authz::cli::TokensArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -558,6 +566,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Rerun(a) => kiln::ci::cli::rerun(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Cancel(a) => kiln::ci::cli::cancel(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Grants(a) => kiln::authz::cli::grants(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Roles(a) => kiln::authz::cli::roles(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Tokens(a) => kiln::authz::cli::tokens(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;

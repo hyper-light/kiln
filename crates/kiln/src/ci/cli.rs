@@ -83,20 +83,27 @@ enum VarsCmd {
     },
 }
 
-struct Api {
+/// A kiln server's API, as its admin (or a personal access token).
+pub(crate) struct Api {
     client: Client,
     url: String,
     token: String,
 }
 
 impl Api {
-    async fn connect(cfg: &Config, url: Option<&str>, token: Option<&str>) -> Result<Api> {
+    pub(crate) async fn connect(cfg: &Config, url: Option<&str>, token: Option<&str>) -> Result<Api> {
         let t = crate::access::resolve(cfg, url, token).await?;
         Ok(Api { client: Client::public()?, url: t.url, token: t.token })
     }
 
+    /// A CI route (`/api/ci<path>`).
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut req = self.client.request(method, &format!("{}/api/ci{path}", self.url)).bearer(&self.token).timeout(Duration::from_secs(60));
+        self.call_api(method, &format!("/api/ci{path}"), body).await
+    }
+
+    /// Any route of the API (`path` from `/api`).
+    pub(crate) async fn call_api(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        let mut req = self.client.request(method, &format!("{}{path}", self.url)).bearer(&self.token).timeout(Duration::from_secs(60));
         if let Some(b) = body {
             req = req.json(&b);
         }
@@ -521,11 +528,11 @@ pub async fn routing(args: RoutingArgs, cfg: &Config) -> Result<()> {
 }
 
 /// Percent-encodes a query value.
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-fn when(t: Option<i64>) -> String {
+pub(crate) fn when(t: Option<i64>) -> String {
     t.and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()).and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".into())
 }
 

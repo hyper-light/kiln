@@ -180,7 +180,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
-| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing); principals and roles left |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; per-repository subjects and service subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD, branch cd-design) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope, the `oci` kind (any OCI registry, Docker Hub first); cloud `mint()` (AWS, Google Cloud, Azure) next |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images; probes, pools, microVMs, k8s left |
@@ -188,7 +188,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W15 | Environments and deployments | W04, W09 | blocked (W04) | |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
 | W17 | Debugging | W06, W13 | blocked (W06) | |
-| W18 | Supply chain, untrusted code | W10, W13 | blocked (W10) | |
+| W18 | Supply chain, untrusted code | W10, W13 | not started | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; the rest left |
@@ -2557,10 +2557,57 @@ elsewhere (G-24, G-33).
     - AC04's Vault case: unmodified `hashicorp/vault-action` logged in to a Vault dev server whose
       JWT auth trusts kiln's issuer by discovery, and read a secret (a role bound to the
       branch's subject).
+  - Principals, roles and the one route table (R01, R02, R05; `crates/kiln/src/authz/`):
+    - the owner keeps every way in (the admin token, the password, one-time links, MCP tokens)
+      and is never held to the table;
+    - users (`users`) sign in with a one-time link of their own (`kiln users add | link`,
+      `POST /api/users/:id/link`: only the newest link works, once, for a day); a session
+      carries the user's epoch, so `kiln users sign-out` and disabling a user end them all;
+    - grants (`grants`): a built-in role (`viewer`, `developer`, `maintainer`, `admin`,
+      `owner`), a custom role (`roles`, `kiln roles set`) or a capability, in a scope (`server`,
+      `org:`, `repo:`, `workflow:`, `environment:`, `runner:`, `pool:`), written
+      `developer@org:acme`; a grant reaches what its scope contains, and a deny (`!…`) wins;
+    - the route table (`authz::ROUTES`) gives each route its capability and where its scope comes
+      from: a path segment's repository, run, job or runner, `?repo=`, or `?scope=`. A route it
+      doesn't name needs `settings.manage`. `GET /api/openapi.json` is generated from it. The
+      repository list shows what the caller reads, and a plan preview checks the repository its
+      body names;
+    - every change a non-owner makes is audited under its name (`user:<name>`, `pat:<id> of
+      user:<name>`, `agent:<label> for user:<name>`, `job:<leg>`).
+  - Personal access and agent tokens (R03): `kiln_pat_<id>_<secret>` (1 to 366 days) and
+    `kiln_agt_<id>_<secret>` (an hour; `POST /api/tokens/:id/rotate` gives the next secret and
+    the old one stops at once). Each carries its own grant, so it does at most what both it and
+    its user allow. Tokens are minted from a session (or with `tokens.manage`), never by a token
+    for itself: `kiln tokens create | list | revoke | rotate`. Disabling a user revokes theirs.
+    The runner's masker masks all three prefixes by their shape, across chunk boundaries.
+  - Job tokens on the API (R04): a job token reaches the API for what its job's permissions
+    give. `actions: read` reads its repository's runs, logs and artifacts; `actions: write` also
+    triggers, cancels and reruns there; `contents: write` triggers; `environments: deploy`
+    deploys; `binaries: publish` publishes binaries, so a release workflow needs no admin token.
+    kiln's scopes take their verbs (`publish`, `deploy`, `push`) as `write`.
+  - AC02 as a unit test generated from the table: every route, for each built-in role on the
+    server and on one repository, for an agent acting for a maintainer whose token is reduced to
+    `viewer@repo:…`, and under a deny.
+  - Checked end to end on a local server (AC01, AC02), 45 checks:
+    - a link signs a user in once;
+    - a developer on one repository reads its runs there, and gets 403 for every repository's
+      runs, secrets, runners and a route the table doesn't name;
+    - another organization's viewer sees an empty repository list and can't preview;
+    - a PAT reduced to `viewer` reads but can't cancel, and is refused 3 ms after it is revoked;
+    - an agent token rotates and its old secret is refused;
+    - a deny wins over a role;
+    - disabling the user ends their session and revokes their agent's token;
+    - the audit names the user, and the admin token still does everything.
+
+    A job token with `actions: read` read its repository's runs (200), not every run nor the
+    runners (403), couldn't cancel (403), got past the check to publish binaries, and was masked
+    in its own log.
 - *Left.*
-  - R01, R02 and R05: principals, capabilities, roles, and the one route table, from access.md.
-  - PATs and agent tokens (R03).
-  - Kiln's own permission scopes (R04).
+  - Passwords and passkeys per user (users sign in with links), and the Settings pages for
+    people and tokens (W21).
+  - Lists narrowed row by row for repository-scoped callers: `/api/runs` and `/api/ci/runs` ask
+    them for `?repo=`, and the event stream and overview need the server scope.
+  - `secrets.use:<name>`; the MCP tools from the route table (W20-R01).
   - Per-repository subject customization (R09; server-wide today).
   - R11's service and agent subjects (`kiln:<server-id>:service:<name>`, `kiln:agent:<session>`).
   - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
@@ -3838,7 +3885,11 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET/POST/DELETE | `/api/webhooks[/:id]` · POST `/:id/redeliver` | `webhooks.*` | settings.manage | W19 |
 | POST | `/api/ci/hooks/:id` | inbound webhook (HMAC) | open, signed | W03 |
 | GET | `/api/audit?principal=&action=&target=&since=` | `audit.list` | audit.read | W19 |
-| GET/POST/PATCH/DELETE | `/api/tokens[/:id]` | `tokens.*` | tokens.manage | W10 |
+| GET/POST · DELETE · POST | `/api/tokens` · `/:id` · `/:id/rotate` | `tokens.*` (shown once; agent tokens rotate) | your own; anyone's with tokens.manage | W10 |
+| GET/POST · DELETE · POST | `/api/users` · `/:id` · `/:id/{link,sign-out}` | `users.*` (a one-time sign-in link) | users.manage | W10 |
+| GET/POST · DELETE | `/api/grants?user=` · `/:id` | `grants.*` (`developer@org:acme`, `!runs.cancel@repo:…`) | users.manage | W10 |
+| GET · PUT/DELETE | `/api/roles` · `/:name` | `roles.*` (built-in and custom) | signed in · users.manage | W10 |
+| GET | `/api/openapi.json` | the route table as OpenAPI 3.1 (`x-kiln-capability`) | signed in | W10 |
 | * | `/git/<owner>/<repo>.git/...` | git smart HTTP | diffs.submit (push), diffs.read | W14 |
 | GET | `/api/repos/:repo/diffs?state=&author=&reviewer=` | `diffs.list` | diffs.read | W14 |
 | GET | `/api/diffs/:id` · `/versions/:v/files` · `/interdiff?from=&to=` | `diffs.get`, `.files`, `.interdiff` | diffs.read | W14 |
