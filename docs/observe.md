@@ -731,7 +731,10 @@ time range and the search in the address (a page is a link).
   that checks its query. A composite (the form's other kind) is its monitors chosen by letter and a
   condition over the letters; its page lists what it reads, each one's state a link away.
 - **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
-  each one's mention to copy.
+  each one's mention to copy. The clouds kiln reads, and the Prometheus endpoints it scrapes: each
+  target's state over the machines that read it (up, down, starting) and its error, its endpoint,
+  who reads it and how often, its last scrape; added and edited in a form that tests the endpoint
+  once from the server (what it reads, in which format) before it is kept, its token kept unshown.
 - **Live**: the hosts' samples of the last hour at 5 s, streamed (what the Metrics page was); before
   that, the Hosts dashboard.
 

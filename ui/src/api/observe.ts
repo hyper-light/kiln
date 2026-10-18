@@ -271,6 +271,55 @@ export type CloudIn = (
 /** A cloud integration as the API shows it: its secrets "…", its status. */
 export type Cloud = CloudIn & { name: string; status: CloudStatus };
 
+/** How a machine's scrapes of a target go (`up`: none before its first). */
+export interface ScrapeState {
+  up: boolean | null;
+  last_ms: number | null;
+  took_ms: number;
+  samples: number;
+  skipped: number;
+  deferred: number;
+  error: string | null;
+  scrapes: number;
+  failures: number;
+}
+
+/** A Prometheus scrape target as it is given: `on` is `server`, a runner's name, or `*` (every machine, each its own). */
+export interface ScrapeIn {
+  url: string;
+  every_s?: number;
+  timeout_s?: number;
+  on?: string;
+  tags?: string[];
+  /** Left out: the one kept. */
+  bearer?: string;
+}
+
+/** A scrape target as the API shows it: whether it has a token, and how each machine that reads it goes. */
+export interface Scrape {
+  name: string;
+  url: string;
+  every_s: number;
+  timeout_s: number;
+  on: string;
+  tags: string[];
+  bearer: boolean;
+  machines: { machine: string; state: ScrapeState }[];
+}
+
+/** What a target would give, read once from the server and nothing written. */
+export interface ScrapeTest {
+  ok: boolean;
+  error?: string;
+  format?: "openmetrics" | "text";
+  samples?: number;
+  skipped?: number;
+  series?: number;
+  metrics?: number;
+  sample?: string[];
+  took_ms?: number;
+}
+
 /** What a configuration would read, pulled once and nothing written. */
 export interface CloudTest {
   ok: boolean;
@@ -355,6 +404,10 @@ export const observeApi = {
   deleteCloud: (name: string) => request<void>("DELETE", `${BASE}/clouds/${enc(name)}`),
   pullCloud: (name: string) => request<unknown>("POST", `${BASE}/clouds/${enc(name)}/pull`, {}),
   testCloud: (name: string, c: CloudIn) => request<CloudTest>("POST", `${BASE}/clouds/${enc(name)}/test`, c),
+  scrapes: (signal?: AbortSignal) => request<{ scrapes: Scrape[] }>("GET", `${BASE}/scrapes`, undefined, { signal }).then((r) => r.scrapes),
+  putScrape: (name: string, t: ScrapeIn) => request<void>("PUT", `${BASE}/scrapes/${enc(name)}`, t),
+  deleteScrape: (name: string) => request<void>("DELETE", `${BASE}/scrapes/${enc(name)}`),
+  testScrape: (name: string, t: ScrapeIn) => request<ScrapeTest>("POST", `${BASE}/scrapes/${enc(name)}/test`, t),
   dashboards: (signal?: AbortSignal) => request<{ dashboards: DashboardSummary[] }>("GET", `${BASE}/dashboards`, undefined, { signal }).then((r) => r.dashboards),
   dashboard: (id: string, signal?: AbortSignal) => request<Dashboard>("GET", `${BASE}/dashboards/${enc(id)}`, undefined, { signal }),
   createDashboard: (d: Omit<Dashboard, "id" | "builtin" | "created" | "modified">) => request<Dashboard>("POST", `${BASE}/dashboards`, d),

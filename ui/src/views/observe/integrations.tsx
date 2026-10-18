@@ -1,7 +1,8 @@
 /**
  * Integrations: where monitors' messages go (Slack, Discord, Microsoft Teams, PagerDuty, or any
- * webhook, signed), each named, each mentioned in a message as `@<kind>-<name>`; and the clouds
- * whose metrics kiln reads (`./clouds`). Secrets are kept by the server and never shown again; a
+ * webhook, signed), each named, each mentioned in a message as `@<kind>-<name>`; the clouds whose
+ * metrics kiln reads (`./clouds`), and the Prometheus endpoints it scrapes (`./scrapes`). Secrets
+ * are kept by the server and never shown again; a
  * test sends a message at once.
  */
 import * as React from "react";
@@ -17,6 +18,7 @@ import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { Clouds } from "./clouds";
+import { Scrapes } from "./scrapes";
 import { ObserveNav, integrationsRes } from "./parts";
 
 const KINDS: { value: IntegrationKind; label: string; url: string }[] = [
@@ -37,7 +39,7 @@ export default function Integrations() {
         index={8}
         label="Observe"
         title="Integrations"
-        lead="Where monitors' messages go, and the clouds whose metrics kiln reads. Mention one in a monitor's message as @kind-name: it is told when a group alerts, warns, stops having data, and recovers."
+        lead="Where monitors' messages go, and the clouds and Prometheus endpoints whose metrics kiln reads. Mention one in a monitor's message as @kind-name: it is told when a group alerts, warns, stops having data, and recovers."
         actions={
           <Button onClick={() => setAdding(true)}>
             <Plus /> Add integration
@@ -51,6 +53,7 @@ export default function Integrations() {
       </Loadable>
       {adding && <AddDialog onClose={() => setAdding(false)} />}
       <Clouds />
+      <Scrapes />
     </div>
   );
 }

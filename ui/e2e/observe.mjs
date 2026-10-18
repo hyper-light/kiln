@@ -371,6 +371,37 @@ const scenarios = {
     await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
     await until("the integration gone", async () => !(await api("GET", "/api/observe/v1/integrations")).body.integrations.some((i) => i.name === name));
   },
+  /** A Prometheus endpoint (the server's own /metrics) added from the form, tested, scraped, and removed. */
+  async "a scrape target is tested, added, read, and removed"() {
+    const name = `e2e-s-${run}`;
+    await page.goto(`${BASE}/observe/integrations`);
+    await page.getByRole("button", { name: "Add target", exact: true }).click();
+    const dialog = page.getByRole("dialog");
+    await fillIn(dialog.getByLabel("Name"), name);
+    await fillIn(dialog.getByLabel("Endpoint"), `${BASE}/metrics`);
+    await fillIn(dialog.getByLabel("Every (seconds)"), "2");
+    await fillIn(dialog.getByLabel("Timeout (seconds)"), "1");
+    await dialog.getByRole("button", { name: "Test", exact: true }).click();
+    const said = await dialog.getByRole("status").textContent({ timeout: 15_000 });
+    expect(/^Reads [1-9][\d,]* samples of [1-9][\d,]* metrics \(Prometheus text\)/.test(said ?? ""), `the test reads the server's own: ${said}`);
+    await dialog.getByRole("button", { name: "Add", exact: true }).click();
+    // Read by the server, up, as the API says and the page shows.
+    await until(
+      "the target up",
+      async () => (await api("GET", "/api/observe/v1/scrapes")).body.scrapes.find((t) => t.name === name)?.machines?.some((m) => m.machine === "server" && m.state.up === true),
+      30_000,
+    );
+    const row = page.locator("tr", { hasText: name });
+    await until("the row says Up", async () => (await row.textContent())?.includes("Up"), 30_000);
+    const up = await api("POST", "/api/observe/v1/query", { query: `max:up{job:${name}}`, from: Date.now() - 60_000, to: Date.now() + 1000, step: 1000 });
+    expect(
+      up.body.series?.[0]?.values?.some((v) => v === 1),
+      `up 1 for job:${name}`,
+    );
+    await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
+    await until("the target gone", async () => !(await api("GET", "/api/observe/v1/scrapes")).body.scrapes.some((t) => t.name === name));
+  },
   /** A search's patterns: the seed's message shapes grouped, and a pattern a click from its records. */
   async "a search's records group into patterns, and a pattern narrows the search to its own"() {
     // Records of its own, of three shapes.
