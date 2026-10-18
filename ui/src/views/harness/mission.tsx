@@ -292,7 +292,9 @@ const FOUND = { on: ["ai_sessions"], pollMs: 20_000 } as const;
  * told when they change, and read again now and then for their state and last activity.
  */
 function Found({ all }: { all: { a: AgentInfo }[] }) {
-  const [found, quiet] = useSuspenseResource("ai-sessions", readAll, FOUND).data;
+  // Its own key: "ai-sessions" is the list alone (`aiSessionsRes`), and whichever read it first
+  // would hand the other the wrong shape.
+  const [found, quiet] = useSuspenseResource("ai-sessions-found", readAll, FOUND).data;
   const elsewhere = found.filter((s) => !s.managed_by && !all.some((r) => r.a.harness_session && r.a.harness_session === s.id));
   return <FoundSessions sessions={elsewhere} quiet={quiet} />;
 }
