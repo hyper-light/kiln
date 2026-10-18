@@ -142,10 +142,17 @@ too.
   answers from its store. Words match anywhere, in any case, all of them.
 - `GET /api/harness/sessions/:id/events?before=&limit=` returns a session's history beyond what the
   timeline keeps in memory (`MAX_EVENTS`), page by page, from the store.
-- **In the console (C4, to come):**
-  - Mission control's filter box will also search conversations, and its results will open the
-    agent at that event.
-  - An agent's find bar will search its whole history, not only what is loaded.
+- **In the console:**
+  - **Mission Control's filter box** also searches conversations, from three characters typed. Under
+    the agents, *In conversations* lists the matching events, newest first: which agent, which
+    machine, who said it, when, and the words around the match, marked. A match opens its agent
+    with the find bar already looking for the same words. An agent that ended and is forgotten has
+    its matches listed, but not as links.
+  - **An agent's find bar** finds what its timeline holds. When the timeline holds only the latest
+    events (`MAX_EVENTS`), the matches before them, from its history, are listed under the bar
+    (*N earlier, in its history*) to read in place.
+  - The UI mock answers the search too: `MOCK_DROPPED=n` gives its long conversation an earlier
+    history.
 
 ## Settings
 
@@ -159,7 +166,7 @@ the store off). Replication to the server needs no setting: a runner with a stor
 | C1 | Turso embedded; each machine's store (a runner keeps its own sessions; the server keeps every session as its updates come in); the writer (per event, batched); restore from the store; `events?before=` paging | a session restarted keeps its whole timeline; 10k events written and read back in tests; musl, macOS and Windows builds |
 | C2 | Replication: the feed, the lane, epochs; the harness's record followed and replicated | killing a runner loses nothing; a server killed mid-turn catches up; a runner offline catches up; checked with a real Claude Code |
 | C3 | Resuming on another machine from the server's store; the copy left behind lets go | a session whose machine is gone goes on elsewhere, its conversation and harness record intact, also after a server restart; checked in the lab with a real Claude Code |
-| C4 | Search in the console: the filter box and the find bar | search across agents, newest first, by words, tool, status, machine and time |
+| C4 | Search in the console: the filter box and the find bar | search across agents, newest first, by words; a match opens its agent where the words are |
 | C5 | Mirrors: other runners keep a copy of the server's store | the server's store lost and a runner gone too: nothing lost |
 
 ## Risks
@@ -181,5 +188,5 @@ the store off). Replication to the server needs no setting: a runner with a stor
 | C1 store | live (1a59fad, 2026-10-18): the Turso engine, each runner's store of its sessions, the server's store of every session, the writer, restore from the store, search and paging API |
 | C2 replication | built: revisions, the feed on its lane, the harness's record followed, epochs, resets that keep history. Lab with a real Claude Code: the server's store matches the runner's and the transcript line for line; a server killed mid-turn catches up; a runner killed comes back and goes on |
 | C3 resume elsewhere | built: Move falls back to the server's store when the machine is away; the transcript lands where Claude Code looks; the copy left behind lets go; away agents listed after a server restart. Lab with two runners and a real Claude Code: the conversation goes on with its context |
-| C4 search UI | not yet (the API is built) |
+| C4 search UI | built: Mission Control's filter box finds what was said across every agent; an agent's find bar lists the matches in its earlier history. Checked on desktop and phone-sized Chromium against the UI mock |
 | C5 mirrors | not yet |

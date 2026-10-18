@@ -10,7 +10,7 @@
 import * as React from "react";
 import "./harness.css";
 import "./console.css";
-import { Link, useNavigate, useParams } from "@/lib/router";
+import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
 import { harnessApi, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
@@ -25,6 +25,7 @@ import { SettingsSheet, useAttachments, type Attachments } from "./controls";
 import { agentLabel, changesetOf, editsOf, useSameList } from "./derive";
 import { useListener } from "./dom";
 import { FindBar, findIn, type FindNow } from "./find";
+import { EarlierMatches } from "./said";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { StateWord } from "./parts";
@@ -98,9 +99,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   );
   // /login and /logout open the account in the conversation, below what was said: brought into view once.
   const showAccount = React.useCallback((el: HTMLDivElement | null) => el?.scrollIntoView({ block: "nearest", behavior: "smooth" }), []);
-  // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown.
-  const [findOpen, setFindOpen] = React.useState(false);
-  const [findQ, setFindQ] = React.useState("");
+  // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown. A
+  // match found from Mission Control (`?find=`) opens it already looking.
+  const [params] = useSearchParams();
+  const [findOpen, setFindOpen] = React.useState(() => Boolean(params.get("find")));
+  const [findQ, setFindQ] = React.useState(() => params.get("find") ?? "");
   const [findAt, setFindAt] = React.useState<FindNow | null>(null);
   const findInput = React.useRef<HTMLInputElement>(null);
   const openFind = React.useCallback(() => {
@@ -240,6 +243,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           inputRef={findInput}
         />
       )}
+      {findOpen && dropped > 0 && <EarlierMatches agent={id} q={findQ} before={findEvents[0]?.at} />}
       {task && (
         <div className="hx-crumbs">
           <button type="button" className="hx-link" onClick={() => setTask(null)}>

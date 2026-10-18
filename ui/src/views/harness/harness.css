@@ -616,6 +616,64 @@ textarea.hx-input {
     display: none;
   }
 }
+/* The matches before what the timeline holds, from its history: under the find bar, to read. */
+.hx-earlier {
+  border-bottom: 1px solid #1d1f23;
+  background: #0b0c0e;
+}
+.hx-earlier-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.hx-earlier-btn:hover {
+  color: #ededee;
+}
+.hx-earlier-chev {
+  transition: transform 0.2s;
+}
+.hx-earlier-btn[aria-expanded="true"] .hx-earlier-chev {
+  transform: rotate(90deg);
+}
+.hx-earlier-list {
+  max-height: min(30vh, 260px);
+  margin: 0;
+  padding: 0 0 6px;
+  overflow-y: auto;
+  list-style: none;
+}
+.hx-earlier-hit {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 14px;
+  color: inherit;
+  text-align: left;
+}
+.hx-earlier-hit:hover {
+  background: #111215;
+}
+.hx-earlier-meta {
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.hx-earlier-text {
+  color: #b4b6bd;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.hx-earlier-text mark {
+  border-radius: 2px;
+  background: rgb(198 176 142 / 26%);
+  color: inherit;
+}
 ::highlight(kiln-find) {
   background-color: rgb(198 176 142 / 26%);
   color: inherit;

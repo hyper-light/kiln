@@ -21,7 +21,7 @@ import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, 
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongSession, setLongEmit } from "./conversation.ts";
+import { handleLongSession, searchSaid, setLongEmit } from "./conversation.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -1392,6 +1392,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- agents ----
+    if (p === "/api/conversations/search" && m === "GET") {
+      const q = url.searchParams;
+      return json(res, 200, { hits: searchSaid(q.get("q") ?? "", q.get("agent"), q.has("until") ? Number(q.get("until")) : null, Number(q.get("limit") ?? 100)) });
+    }
     if (p === "/api/agents" && m === "GET") return json(res, 200, [...agents.values()]);
     if (p === "/api/agents/join" && m === "GET") {
       planAutojoin();

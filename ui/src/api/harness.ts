@@ -71,6 +71,14 @@ export type Body =
 /** `by`: the harness that was running when it appeared (a conversation switched between harnesses keeps who said what). */
 export type HEvent = { id: string; seq: number; at: number; parent?: string; by?: string } & Body;
 
+/** An event found in a conversation: its agent, the name and machine the server knows it by (none: it ended and is forgotten), the event. */
+export interface SaidHit {
+  agent: string;
+  name: string | null;
+  machine: string | null;
+  event: HEvent;
+}
+
 export interface AlwaysOption {
   label: string;
   scope: string;
@@ -751,6 +759,14 @@ export const harnessApi = {
   move: (id: string, to: string, now = false) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now }),
   /** A command without opening the session's socket (inbox answers). */
   command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
+  /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
+  said: (p: { q: string; agent?: string; until?: number; limit?: number }) => {
+    const qs = new URLSearchParams({ q: p.q });
+    if (p.agent) qs.set("agent", p.agent);
+    if (p.until !== undefined) qs.set("until", String(p.until));
+    if (p.limit !== undefined) qs.set("limit", String(p.limit));
+    return call<{ hits: SaidHit[] }>("GET", `/api/conversations/search?${qs}`);
+  },
   /** Upload a file for a later message (the agent's socket caps a message at 16 MB). */
   upload: async (blob: Blob, name: string, mime: string): Promise<string> => {
     const res = await fetch(`/api/harness/files?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(mime)}`, {
