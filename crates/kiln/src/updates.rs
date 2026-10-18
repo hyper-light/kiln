@@ -187,12 +187,16 @@ pub fn own_binary() -> Result<(String, u64), String> {
     .clone()
 }
 
-/// This binary's build id ("unknown" if it can't be read).
+/// This binary's build id ("unknown" if it can't be read): the build it was before kiln signed it
+/// on this Mac, when it did (`crate::os::macsign`).
 pub fn own_build() -> String {
-    own_binary().map_or_else(|_| "unknown".to_owned(), |(h, _)| build_id(&h))
+    own_binary().map_or_else(
+        |_| "unknown".to_owned(),
+        |(h, _)| std::env::current_exe().ok().and_then(|p| crate::os::macsign::build_of(&p, &h)).unwrap_or_else(|| build_id(&h)),
+    )
 }
 
-fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
+pub(crate) fn hash_file(p: &Path) -> anyhow::Result<(String, u64)> {
     use std::io::Read as _;
     let mut f = std::fs::File::open(p).with_context(|| format!("open {}", p.display()))?;
     let mut h = Sha256::new();
@@ -1780,6 +1784,11 @@ pub async fn fetch_build(http: &crate::http::client::Client, server_url: &str, o
         let dir = versions.join(&build);
         mk.create(&dir)?;
         let exe = dir.join(if cfg!(windows) { "kiln.exe" } else { "kiln" });
+        // On a Mac, signed as kiln (this machine's identity): macOS knows it as the program it
+        // let onto the local network already.
+        if let Err(e) = crate::os::macsign::sign_as(&part, &exe, &build) {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't sign the new build: macOS may ask again before it reaches the server");
+        }
         std::fs::rename(&part, &exe).with_context(|| format!("keep {}", exe.display()))?;
         Ok((exe, build))
     }

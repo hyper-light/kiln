@@ -141,6 +141,7 @@ fn place_binary(dest: &Path) -> anyhow::Result<()> {
     let tmp = dest.with_extension(format!("new.{}", std::process::id()));
     std::fs::copy(&exe, &tmp).with_context(|| format!("copy to {}", tmp.display()))?;
     crate::os::make_executable(&tmp)?;
+    sign_placed(&tmp, dest);
     if let Err(e) = std::fs::rename(&tmp, dest) {
         // Windows cannot replace a running executable, but it can rename it out of the way.
         let aside = dest.with_extension(format!("old-{}", std::process::id()));
@@ -496,8 +497,17 @@ fn ensure_launcher(unit: &str, bin: &Path) -> anyhow::Result<PathBuf> {
     let tmp = launcher.with_extension(format!("new.{}", std::process::id()));
     std::fs::copy(bin, &tmp).with_context(|| format!("copy {} to {}", bin.display(), tmp.display()))?;
     crate::os::make_executable(&tmp)?;
+    sign_placed(&tmp, &launcher);
     std::fs::rename(&tmp, &launcher).with_context(|| format!("install {}", launcher.display()))?;
     Ok(launcher)
+}
+
+/// On a Mac with kiln's signing identity (`kiln signing setup`), the copy about to become `dest`
+/// signed with it, so macOS knows it as the program it let onto the local network before.
+fn sign_placed(tmp: &Path, dest: &Path) {
+    if let Err(e) = crate::os::macsign::sign_as(tmp, dest, &crate::updates::own_build()) {
+        say(format!("couldn't sign {} as kiln ({e:#}): macOS may ask again before it reaches the server", dest.display()));
+    }
 }
 
 /// A launchd job running `kiln supervise -- …` at load (login, or boot for a daemon), from the

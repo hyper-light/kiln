@@ -163,6 +163,9 @@ enum Cmd {
     Updates(kiln::updates_cli::UpdatesArgs),
     /// This machine's kiln config: path, show, get, set, unset (by dotted key).
     Config(kiln::config_cli::ConfigArgs),
+    /// kiln's own code signature on a Mac: `setup` once, so macOS keeps kiln's local network
+    /// access across upgrades (status by default).
+    Signing(kiln::os::macsign::SigningArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -684,6 +687,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Tokens(a) => kiln::authz::cli::tokens(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Updates(a) => kiln::updates_cli::run(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Config(a) => kiln::config_cli::run(a, &config_path),
+        Cmd::Signing(a) => kiln::os::macsign::run(a),
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;
