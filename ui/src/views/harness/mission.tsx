@@ -18,6 +18,7 @@ import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage } from "@/lib/hooks";
 import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { agentLabel, hasOwnName, plain } from "./derive";
+import { pauseLine } from "./pause";
 import { NameField, useAgentActions } from "./actions";
 import { MessageBar } from "./broadcast";
 import { DEFAULT_VIEW, isFiltered, ListBar, useShownList, type ListView } from "./list-tools";
@@ -28,11 +29,13 @@ import { SpawnDialog } from "./spawn";
 import { useAgentList, useAgents } from "./use-agents";
 
 /** Where an agent stands. */
-type Stand = "needs" | "crashed" | "working" | "finished" | "ready" | "offline" | "ended";
+type Stand = "needs" | "crashed" | "paused" | "working" | "finished" | "ready" | "offline" | "ended";
 
 function standOf(a: AgentInfo, seen: number | undefined): Stand {
   if (a.approvals.length > 0 || a.status === "waiting") return "needs";
   if (a.status === "exited" && a.exit?.error) return "crashed";
+  // Waiting for a usage limit to reset (its current turn, if any, finishes first).
+  if (a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected") return "paused";
   if (a.status === "running" || a.status === "starting") return "working";
   if (a.status === "idle") return a.last_activity > (seen ?? 0) + 1500 ? "finished" : "ready";
   // Its machine is reconnecting (a runner or server restart): it stays where it is.
@@ -43,6 +46,7 @@ function standOf(a: AgentInfo, seen: number | undefined): Stand {
 const WORD: Record<Stand, string> = {
   needs: "Needs you",
   crashed: "Stopped",
+  paused: "Paused",
   working: "Working",
   finished: "Finished",
   ready: "Ready",
@@ -61,6 +65,8 @@ function lineOf(a: AgentInfo, stand: Stand): string {
     }
     case "crashed":
       return a.exit?.error ?? "Stopped unexpectedly";
+    case "paused":
+      return a.pause ? pauseLine(a.pause, Date.now()) : "Paused";
     case "working": {
       const plan = (a.todos_total ?? 0) > 0 ? `plan ${a.todos_done ?? 0}/${a.todos_total}` : "";
       return [a.status === "starting" ? "Starting" : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
@@ -161,6 +167,11 @@ const Row = React.memo(function Row({ a, stand, selected, onSelect }: { a: Agent
         {/* What to answer; on a phone it takes the meta line's place, so the row's corner keeps one width. */}
         <span className="ms-decide">
           {stand === "needs" && ap && <Decide a={a} ap={ap} />}
+          {stand === "paused" && (
+            <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "resume" }).catch((e: unknown) => toast.error("Couldn't resume", errorMessage(e)))}>
+              Resume
+            </Button>
+          )}
           {stand === "crashed" && (
             <Button size="xs" variant="secondary" onClick={() => void harnessApi.command(a.id, { type: "restart" }).catch((e: unknown) => toast.error("Couldn't restart", errorMessage(e)))}>
               Restart
@@ -197,6 +208,7 @@ function Lead() {
   const status = [
     n("needs") && `${n("needs")} need${n("needs") === 1 ? "s" : ""} you`,
     n("crashed") && `${n("crashed")} stopped`,
+    n("paused") && `${n("paused")} paused for a usage limit`,
     n("working") && `${n("working")} working`,
     n("finished") && `${n("finished")} finished`,
   ]

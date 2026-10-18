@@ -28,6 +28,7 @@ import { FindBar, findIn, type FindNow } from "./find";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { StateWord } from "./parts";
+import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
 import { Timeline } from "./timeline";
@@ -452,6 +453,7 @@ function Dock({
           )}
         </div>
       ) : null}
+      <PausedLine store={store} send={send} />
       <Composer store={store} agent={id} attachments={attachments} toMain={toMain} onView={onView} onTerminal={onTerminal} />
     </div>
   );

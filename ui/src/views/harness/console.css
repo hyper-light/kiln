@@ -47,6 +47,12 @@
 .st-word[data-state="disconnected"] > i {
   background: #d1aaad;
 }
+.st-word[data-state="paused"] {
+  color: #b8c2d3;
+}
+.st-word[data-state="paused"] > i {
+  background: #a6b2c6;
+}
 
 
 /* ---------------------------------------------------------------- agent page head */

@@ -298,6 +298,41 @@ export interface State {
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
   /** A switch to another harness's model, waiting for the turn under way to end. */
   switching?: { kind: string; model: string };
+  /** Nothing more goes to the harness until this ends: its account reached a usage limit. Queued messages, goals and plan steps wait. */
+  pause?: Pause;
+  /** It stops between turns once a limit is this full (percent); absent: only when one is reached. */
+  pause_at?: number;
+  /** A pause ends only when a person resumes it. */
+  manual_resume?: boolean;
+}
+
+/** Why a session waits for a usage limit, and until when (`State.pause`). */
+export interface Pause {
+  /** "limit" (a limit was reached) or "threshold" (a limit got as full as `pause_at`). */
+  reason: string;
+  /** The window, as a `Limit.id`, when known. */
+  window?: string;
+  label?: string;
+  /** What the harness said, as it said it. */
+  said?: string;
+  /** Unix ms the window starts over, when known. */
+  until?: number;
+  /** Unix ms it paused. */
+  since: number;
+  /** It goes on by itself once the limit resets. */
+  auto: boolean;
+  /** "harness" (it reached the limit), "account" (another agent on its account did) or "threshold". */
+  by: string;
+  /** The turn the limit cut off: it goes on first. */
+  cut?: { message?: string; text?: string; at: number };
+  /** Its folder as it was when it paused, kept in a hidden git ref. */
+  checkpoint?: { git_ref: string; commit: string; at: number };
+  /** Checks at the reset that found the limit still reached. */
+  tries?: number;
+  /** Unix ms a check started (waiting for the harness's answer). */
+  checking?: number;
+  /** Unix ms of the next check, when the reset time isn't known. */
+  next_check?: number;
 }
 
 /** loading: not reported yet; ready: reported (an empty list means none); unsupported: the harness can't say. */
@@ -507,6 +542,8 @@ export interface AgentInfo {
   left_behind?: number;
   /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
   reach?: string | null;
+  /** It waits for a usage limit to reset (as `State.pause`). */
+  pause?: Pause;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -611,7 +648,13 @@ export type Command =
   | { type: "queue_steer"; id: string }
   | { type: "restart" }
   | { type: "suggest"; client: string; query: string }
-  | { type: "snapshot" };
+  | { type: "snapshot" }
+  /** End a pause now: the turn it cut off goes on, then the queue. */
+  | { type: "resume" }
+  /** Whether a pause ends by itself once its limit resets. */
+  | { type: "auto_resume"; on: boolean }
+  /** Stop between turns once a limit is this full (null: only when one is reached). */
+  | { type: "pause_at"; percent: number | null };
 
 export type Update =
   | { t: "open"; info: AgentInfo }

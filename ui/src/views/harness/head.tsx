@@ -202,7 +202,7 @@ export function AgentHeader({
         </div>
       </div>
       <div className="ag-state">
-        <StateWord a={{ status, approvals }} />
+        <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause }} />
         {running && <TurnLine state={state} activity={activity} stopAt={stopAt} onForce={features.includes("interrupt") ? onForceStop : undefined} />}
         <span className="ag-cwd ag-wide-only" title={cwd}>
           {tildify(cwd)}
@@ -225,6 +225,8 @@ export function AgentHeader({
           id={usageId}
           limits={limits}
           plan={plan}
+          stopAt={state?.pause_at ?? null}
+          onStopAt={(percent) => send({ type: "pause_at", percent })}
           onMore={() => {
             setUsage(false);
             onUsage();

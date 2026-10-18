@@ -4,6 +4,7 @@
  */
 import * as React from "react";
 import type { AgentInfo, Limit, StatusItem } from "@/api/harness";
+import { SelectField } from "@/components/ui/misc";
 import { cn } from "@/lib/utils";
 import { useClock } from "./dom";
 import { HarnessMark } from "./parts";
@@ -85,7 +86,22 @@ export function LimitMeter({ limit, compact }: { limit: Limit; compact?: boolean
  * The plan's limits in full, opened in place from the head's usage badge (no popup): how much of
  * each window is used, and when it starts over, in local time.
  */
-export function UsagePanel({ id, limits, plan, onMore }: { id: string; limits: Limit[]; plan?: string; onMore?: () => void }) {
+export function UsagePanel({
+  id,
+  limits,
+  plan,
+  onMore,
+  stopAt,
+  onStopAt,
+}: {
+  id: string;
+  limits: Limit[];
+  plan?: string;
+  onMore?: () => void;
+  /** The agent stops between turns once a limit is this full (null: only when one is reached). */
+  stopAt?: number | null;
+  onStopAt?: (percent: number | null) => void;
+}) {
   return (
     <section id={id} className="hx-usage-panel" aria-label="Plan usage">
       <div className="hx-usage-head">
@@ -97,6 +113,15 @@ export function UsagePanel({ id, limits, plan, onMore }: { id: string; limits: L
           <LimitMeter key={l.id} limit={l} />
         ))}
       </div>
+      {onStopAt && (
+        <SelectField
+          className="hx-usage-stop"
+          label="Stop between turns"
+          value={stopAt ? String(stopAt) : ""}
+          onChange={(v) => onStopAt(v ? Number(v) : null)}
+          options={[{ value: "", label: "Only when a limit is reached" }, ...[80, 90, 95].map((p) => ({ value: String(p), label: `Once a limit is ${p}% used` }))]}
+        />
+      )}
       {onMore && (
         <button type="button" className="hx-usage-more" onClick={onMore}>
           This session&apos;s cost, context and status

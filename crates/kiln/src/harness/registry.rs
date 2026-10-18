@@ -358,6 +358,9 @@ impl Registry {
         let mut changed: Option<Info> = None;
         let mut gone = false;
         let mut save_names = false;
+        // The account's other sessions, which pause too (`hold_account`).
+        let mut hold: Option<(Command, Vec<(String, Location)>)> = None;
+        let mut hold_for: Option<String> = None;
         // Where it runs, and the name given here, are the server's to say: to the mirror and to
         // viewers alike (a session announced again — a switch of harness, a reconnect — keeps its
         // machine and its name). The machine's own name is kept aside: it counts once it changes it.
@@ -430,6 +433,15 @@ impl Registry {
                     if m.info.differs(&before) {
                         changed = Some(m.info.clone());
                     }
+                    if before.pause.is_none()
+                        && let Some(p) = m.info.pause.as_ref().filter(|p| p.reason == super::pause::LIMIT && p.by == "harness")
+                        && let Some(account) = m.info.account.clone()
+                    {
+                        let c = Command::LimitHold { window: p.window.clone(), label: p.label.clone(), until: p.until, said: p.said.clone() };
+                        hold = Some((c, Vec::new()));
+                        // Collected below, once this mirror is let go.
+                        hold_for = Some(account);
+                    }
                 }
                 Update::Meta { meta } => m.meta = serde_json::to_value(meta).unwrap_or(Value::Null),
                 Update::Changes { files } => m.changes = serde_json::to_value(files).unwrap_or(Value::Null),
@@ -454,6 +466,16 @@ impl Registry {
                 g.remove(id);
                 save_names = self.names.lock().remove(id).is_some() || save_names;
             }
+            if let (Some(account), Some((_, targets))) = (hold_for.as_ref(), hold.as_mut()) {
+                *targets = g
+                    .iter()
+                    .filter(|(other, o)| other.as_str() != id && o.info.account.as_deref() == Some(account.as_str()) && o.info.pause.is_none() && o.info.status != Status::Exited)
+                    .map(|(other, o)| (other.clone(), o.location.clone()))
+                    .collect();
+            }
+        }
+        if let Some((c, targets)) = hold {
+            self.hold_account(hub, &c, targets);
         }
         if save_names {
             self.save_names();
@@ -462,6 +484,29 @@ impl Registry {
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         } else if let Some(info) = changed {
             hub.emit(&json!({"type": "harness", "info": info}));
+        }
+    }
+
+    /// A session reached its account's usage limit: the account's other sessions, on every machine,
+    /// pause until it resets too, rather than each finding out by failing.
+    fn hold_account(&self, hub: &Hub, c: &Command, targets: Vec<(String, Location)>) {
+        let Ok(json) = serde_json::to_string(c) else { return };
+        for (id, loc) in targets {
+            match loc {
+                Location::Local => {
+                    self.local.command(&id, c.clone());
+                }
+                Location::Machine(machine) => {
+                    let msg = ServerMsg::HarnessCmd { session: id, json: json.clone() };
+                    let net = hub.net.clone();
+                    let peer = hub.agents.lock().get(&machine).and_then(|a| a.peer);
+                    if let (Some(peer), Ok(b)) = (peer, crate::proto::encode(&msg)) {
+                        crate::rt::spawn(async move {
+                            net.send(peer, LANE_TERM, crate::net::Kind::Term, b).await;
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -628,6 +673,7 @@ impl Registry {
                         plan: None,
                         left_behind: 0,
                         reach: spec.reach.clone(),
+                        pause: None,
                     };
                     self.mirrors.lock().entry(id).or_insert_with(|| Mirror::new(info.clone(), loc.clone()));
                     out.push(info);

@@ -1016,6 +1016,81 @@ pub struct State {
     /// A switch to another harness's model, waiting for the turn under way to end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switching: Option<Switching>,
+    /// Nothing more goes to the harness until this ends: its account reached a usage limit
+    /// (`harness::pause`). The queue, goals and plan steps wait; a message sent meanwhile joins
+    /// the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<Pause>,
+    /// Stop between turns once any of the account's limits is this full (percent), before the
+    /// limit cuts a turn off. None: only when a limit is reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_at: Option<u8>,
+    /// A pause ends only when a person resumes it, not by itself at the reset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual_resume: bool,
+}
+
+/// Why a session waits, and until when (`State::pause`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Pause {
+    /// "limit" (a usage limit was reached) or "threshold" (a limit got as full as `pause_at`).
+    pub reason: String,
+    /// The window, as `Limit::id` ("five_hour", "seven_day", "codex.primary", ...), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// That window's label ("Session", "Weekly").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// What the harness said, as it said it ("You've hit your session limit · resets 10:30pm").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub said: String,
+    /// Unix ms the window starts over, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<i64>,
+    /// Unix ms it paused.
+    pub since: i64,
+    /// It goes on by itself once the window starts over (else when a person resumes it).
+    pub auto: bool,
+    /// "harness" (it reached the limit itself), "account" (another session on its account did)
+    /// or "threshold".
+    pub by: String,
+    /// The turn the limit cut off: it goes on first when the pause ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<Cut>,
+    /// Its folder as it was when it paused, kept in a hidden git ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<Checkpoint>,
+    /// Checks at the reset that found the limit still reached.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tries: u32,
+    /// Unix ms a check started, while it waits for the harness's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checking: Option<i64>,
+    /// Unix ms of the next check, when the reset time isn't known (or a check found the limit
+    /// still reached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check: Option<i64>,
+}
+
+/// A turn a limit cut off (`Pause::cut`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Cut {
+    /// The client id of the message that started it, when kiln sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// What that message said, shortened.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    pub at: i64,
+}
+
+/// A folder kept as it was (`Pause::checkpoint`): a commit outside every branch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Checkpoint {
+    /// "refs/kiln/checkpoints/<session>/<unix ms>".
+    pub git_ref: String,
+    pub commit: String,
+    pub at: i64,
 }
 
 /// A switch the session will make (`State::switching`).
@@ -1256,6 +1331,30 @@ pub enum Command {
     SkillsReload,
     /// Stop every task still running (shells, monitors, background agents).
     StopTasks,
+    /// End a pause now (`State::pause`): the turn it cut off goes on, then the queue.
+    Resume,
+    /// Whether a pause ends by itself once its limit resets.
+    AutoResume {
+        on: bool,
+    },
+    /// Stop between turns once a limit is this full (`State::pause_at`); None: only when one is
+    /// reached.
+    PauseAt {
+        #[serde(default)]
+        percent: Option<u8>,
+    },
+    /// Another session on the same account reached a usage limit: wait for its reset too (the
+    /// server sends it).
+    LimitHold {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        said: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
