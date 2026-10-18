@@ -146,6 +146,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             max_series: cfg.observe.max_series,
         });
         crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
+        crate::observe::kiln::start_registry(obs.clone(), crate::os::hostname(), std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
         crate::observe::api::set_global(obs);
         child!("observe", h => crate::observe::hub::send_loop(h));
         match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {

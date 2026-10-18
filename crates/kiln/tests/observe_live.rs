@@ -66,6 +66,11 @@ struct Fleet {
 
 impl Fleet {
     fn new() -> anyhow::Result<Self> {
+        Self::with(|_| String::new())
+    }
+
+    /// A fleet whose server's configuration has `extra(root)` too.
+    fn with(extra: impl Fn(&Path) -> String) -> anyhow::Result<Self> {
         let root = tempfile::tempdir()?;
         let (http, quic) = (free_port()?, free_port()?);
         let data = root.path().join("server");
@@ -102,8 +107,11 @@ enabled = true
 # Each node looks at its host once, as it starts, and then not for an hour: the test's writes are the
 # writes.
 host_seconds = 3600
+
+{extra}
 "#,
-            data = data.display()
+            data = data.display(),
+            extra = extra(root.path())
         );
         std::fs::write(root.path().join("kiln.toml"), cfg)?;
         let mut f = Self { root, http, admin: String::new(), server: None, runners: BTreeMap::new(), otlp: BTreeMap::new() };
@@ -147,7 +155,7 @@ host_seconds = 3600
         let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
         let child = self
             .command(&dir.join("home"))?
-            .args(["agent", "--server", &format!("http://127.0.0.1:{}", self.http), "--token", &join, "--name", name, "--slots", "1", "--no-terminal", "--no-reach"])
+            .args(["agent", "--server", &format!("http://127.0.0.1:{}", self.http), "--token", &join, "--name", name, "--slots", "1", "--labels", "baremetal", "--no-terminal", "--no-reach"])
             .env("KILN_OTLP_ADDR", format!("127.0.0.1:{otlp}"))
             .env("KILN_OBSERVE_HOST_SECONDS", "3600")
             .arg("--state-dir")
@@ -466,4 +474,69 @@ fn the_group_answers_alike_on_every_replica_through_kills_and_an_image() -> anyh
 
 fn crate_now() -> i64 {
     i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)).unwrap_or(0)
+}
+
+fn git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let out = Command::new("git").arg("-C").arg(dir).args(["-c", "user.name=kiln", "-c", "user.email=kiln@example.invalid", "-c", "commit.gpgsign=false"]).args(args).output()?;
+    anyhow::ensure!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(())
+}
+
+#[test]
+#[ignore = "starts a kiln server and a runner as processes, and runs a CI job"]
+fn a_ci_job_that_runs_is_in_the_metrics_and_the_events() -> anyhow::Result<()> {
+    // A repository on disk, with a pipeline of one job, run by hand.
+    let repo_dir = tempfile::tempdir()?;
+    std::fs::create_dir_all(repo_dir.path().join(".kiln"))?;
+    std::fs::write(repo_dir.path().join(".kiln/ci.yaml"), "name: ci\non:\n  manual: true\njobs:\n  hello:\n    runs-on: [baremetal]\n    steps:\n      - name: say\n        run: echo hello from e2e\n")?;
+    git(repo_dir.path(), &["init", "-q", "-b", "main"])?;
+    git(repo_dir.path(), &["add", "."])?;
+    git(repo_dir.path(), &["commit", "-q", "-m", "a pipeline"])?;
+    let url = format!("file://{}", repo_dir.path().display());
+    let mut f = Fleet::with(|_| format!("[[repos]]\nname = \"e2e\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 2\n"))?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(60), "r1 caught up", |s| caught_up(s, &["r1"]))?;
+    let start = Instant::now();
+    let id = loop {
+        let repos = f.call("GET", "/api/repos", None)?;
+        if let Some(id) = repos.as_array().into_iter().flatten().find(|r| at(r, &["name"]) == "e2e").and_then(|r| at(r, &["id"]).as_str().map(str::to_owned)) {
+            break id;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the repository never appeared: {repos}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let start = Instant::now();
+    loop {
+        // The first poll records the branch; the trigger takes it after.
+        if f.call("POST", &format!("/api/repos/{id}/trigger"), Some(&json!({ "branch": "main", "pipeline": "ci" }))).is_ok() {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the pipeline never triggered\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // The job runs on r1; its end is a point of each metric and an event.
+    let start = Instant::now();
+    loop {
+        let now = crate_now();
+        let jobs = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:kiln.ci.jobs.finished{repo:e2e} by {job,status,runner}.as_count()", "from": now - 600_000, "to": now + 60_000, "step": 60_000 })))?;
+        let events = f.call("POST", "/api/observe/v1/logs/search", Some(&json!({ "query": "source:kiln.event @event.type:ci.job.finished @repo:e2e", "from": now - 600_000, "to": now + 60_000, "limit": 5 })))?;
+        let series = at(&jobs, &["series"]).as_array().cloned().unwrap_or_default();
+        let one = series.iter().any(|s| at(s, &["tags", "job"]) == "hello" && at(s, &["tags", "runner"]) == "r1" && at(s, &["tags", "status"]) == "succeeded" && at(s, &["values"]).as_array().is_some_and(|v| v.iter().filter_map(Value::as_f64).sum::<f64>() == 1.0));
+        let event = at(&events, &["records"]).as_array().and_then(|a| a.first()).cloned();
+        if one && let Some(e) = event {
+            anyhow::ensure!(at(&e, &["service"]) == "kiln.ci" && at(&e, &["host"]) == "r1" && at(&e, &["attributes", "job"]) == "hello", "the event: {e}");
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(120), "the job's metrics and event never came: {jobs} {events}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let d = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": "max:kiln.ci.job.duration{repo:e2e,job:hello}", "from": crate_now() - 600_000, "to": crate_now() + 60_000, "step": 60_000 })))?;
+    anyhow::ensure!(at(&d, &["series"]).as_array().is_some_and(|s| !s.is_empty()), "the job's duration: {d}");
+    // kiln's registry, as Prometheus scraped it (once, as the server started: the families it had
+    // then), with the families observe reports itself left out.
+    let names = f.call("GET", "/api/observe/v1/metrics?match=kiln_*", None)?;
+    let listed = |n: &str| at(&names, &["metrics"]).as_array().is_some_and(|a| a.iter().any(|x| x == n));
+    anyhow::ensure!(listed("kiln_runs_started_total") && listed("kiln_job_duration_seconds_bucket") && !listed("kiln_agent_cpu_percent"), "the registry's families: {names}");
+    Ok(())
 }

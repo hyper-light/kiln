@@ -1296,6 +1296,13 @@ impl Hub {
             #[allow(clippy::cast_precision_loss)]
             m.job_duration.observe((crate::util::now_unix() - started) as f64);
         }
+        if let Some(j) = &job {
+            let mut j = j.clone();
+            j.peak_rss = r.peak_rss.or(j.peak_rss);
+            j.cpu_seconds = r.cpu_seconds.or(j.cpu_seconds);
+            j.error = r.error.clone().or(j.error);
+            crate::observe::kiln::job_finished(&j, run.as_ref(), r.status, crate::util::now_unix());
+        }
         tracing::info!(job = %r.job, agent, status = r.status.as_str(), "job finished");
         let snapshot = self.agents.lock().get(agent).cloned();
         if let Some(a) = snapshot {
@@ -1312,6 +1319,7 @@ impl Hub {
             self.adopt_release(&r.job, run).await;
         }
         if let (Some(status), Some(run)) = (settled, run) {
+            crate::observe::kiln::run_finished(&run, status, crate::util::now_unix());
             crate::gitops::report_status(self, &run, status).await;
         }
         self.update_slot_gauges();

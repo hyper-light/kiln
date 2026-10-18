@@ -22,6 +22,7 @@ pub mod lz4;
 pub mod machine;
 pub mod manifest;
 pub mod otlp;
+pub mod prom;
 pub mod query;
 pub mod store;
 pub mod symbols;
