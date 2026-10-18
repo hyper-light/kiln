@@ -1,16 +1,18 @@
 /**
  * One plan: written or changed in place (each saved change a version), its steps as they will run,
- * run on an agent (one that runs, or a new one; as one message or step by step), shared by a link,
- * exported, its versions and runs. Everything in the page's flow.
+ * run on an agent (one that runs, or a new one; as one message, step by step, or as goals), shared
+ * by a link, exported, its versions and runs. Everything in the page's flow. A plan that isn't
+ * there (deleted, or a wrong link) says so.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "@/lib/router";
+import { ApiError } from "@/api/client";
 import { harnessApi, type KindInfo } from "@/api/harness";
 import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { Confirm, CopyButton, Crumbs, SelectField, TextField } from "@/components/ui/misc";
+import { Confirm, CopyButton, Crumbs, EmptyState, SelectField, TextField } from "@/components/ui/misc";
 import { useAuth } from "@/lib/auth";
 import { harnessSessionsRes, useRes, warm, type Res } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
@@ -30,17 +32,48 @@ const tagList = (s: string) =>
 /** The harnesses each machine offers. */
 const kindsRes: Res<Record<string, KindInfo[]>> = { key: "harness/kinds", fetch: () => harnessApi.kindsAll(), opts: { pollMs: 60_000 } };
 
-/** A plan, or none for a new one. */
-const planRes = (id: string): Res<Plan | null> => ({ key: `plans/${id}`, fetch: (s) => (id === "new" ? Promise.resolve(null) : plansApi.get(id, s)) });
+/** "gone" for a plan that isn't there: trying again won't bring it. */
+const unlessGone = (e: unknown): "gone" => {
+  if (e instanceof ApiError && e.status === 404) return "gone";
+  throw e;
+};
+
+/** A plan; none for a new one; "gone" for one that isn't there (deleted, or a wrong link). */
+const planRes = (id: string): Res<Plan | null | "gone"> => ({ key: `plans/${id}`, fetch: (s) => (id === "new" ? Promise.resolve(null) : plansApi.get(id, s).catch(unlessGone)) });
 
 export default function PlanPage() {
   const { id = "new" } = useParams();
   return (
     <div className="container-console page plan-page">
       <Loadable label="the plan" fallback={<PlanHold />}>
-        <PlanEditor key={id} id={id} />
+        <PlanOrNone key={id} id={id} />
       </Loadable>
     </div>
+  );
+}
+
+/** The plan, or word that there's none here. */
+function PlanOrNone({ id }: { id: string }) {
+  if (useRes(planRes(id)).data === "gone") return <NoPlan />;
+  return <PlanEditor id={id} />;
+}
+
+function NoPlan() {
+  return (
+    <>
+      <title>No plan · kiln</title>
+      <PlanCrumbs />
+      <EmptyState
+        title="No plan here"
+        action={
+          <Button asChild size="sm" variant="secondary">
+            <Link to="/agents/plans">All plans</Link>
+          </Button>
+        }
+      >
+        It was deleted, or the link is wrong.
+      </EmptyState>
+    </>
   );
 }
 
@@ -82,7 +115,7 @@ function PlanEditor({ id }: { id: string }) {
   const isNew = id === "new";
   const navigate = useNavigate();
   const res = useRes(planRes(id));
-  const plan = res.data;
+  const plan = res.data === "gone" ? null : res.data;
   if (plan) warm(harnessSessionsRes, kindsRes);
 
   const [base, setBase] = React.useState<Base | null>(() => (plan ? baseOf(plan) : null));
@@ -145,7 +178,7 @@ function PlanEditor({ id }: { id: string }) {
           {plan.source?.agent ? ` · from ${plan.source.agent}${plan.source.machine ? ` on ${plan.source.machine}` : ""}` : ""}
         </p>
       )}
-      <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder={isNew ? "From the first heading when left empty" : ""} />
+      <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="From its text, or its first step, when left empty" />
       <div className="plan-edit" data-preview={preview}>
         <div className="plan-text">
           <label htmlFor="plan-body" className="field-label">
@@ -450,7 +483,7 @@ function Runs({ plan }: { plan: Plan }) {
         {runs.map((r) => (
           <li key={r.id} className="plan-row-line">
             <Link to={`/agents/${encodeURIComponent(r.session)}`} className="plan-row-main">
-              {r.mode === "steps" ? "Step by step" : "One message"} · v{r.version} · on {nameOf(r.session)}
+              {r.mode === "steps" ? "Step by step" : r.mode === "goals" ? "As goals" : "One message"} · v{r.version} · on {nameOf(r.session)}
             </Link>
             <span className="plan-dim">
               {relativeTime(r.at)} · {r.by}
