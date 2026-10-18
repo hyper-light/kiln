@@ -522,6 +522,20 @@ fn script_file(shell: Option<&str>, body: &str) -> (&'static str, String) {
     }
 }
 
+/// What decides whether two benchmark runs compare (W16-R07): this machine's OS and architecture,
+/// CPU model and kernel, and the executor.
+fn fingerprint(executor: &str) -> String {
+    static MACHINE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let cpu = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("model name").and_then(|r| r.split_once(':')).map(|(_, m)| m.trim().to_owned())))
+            .unwrap_or_default();
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").map(|k| k.trim().to_owned()).unwrap_or_default();
+        [format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH), cpu, kernel].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
+    });
+    format!("{} · {}", *MACHINE, if executor.is_empty() { "host" } else { executor })
+}
+
 /// Kept legs' runtimes and states, by leg: what rerunning one of their steps needs (W17-R04).
 static PARKED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, (Leg, State)>>> = std::sync::LazyLock::new(Default::default);
 
@@ -1518,7 +1532,7 @@ impl Leg {
             }
             Run::Program { .. } | Run::Container { .. } => (None, String::new(), None),
         };
-        let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV"]
+        let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV", "KILN_METRICS"]
             .iter()
             .map(|k| (*k, st.layout.commands.join(format!("{}_{id}", k.to_ascii_lowercase()))))
             .collect();
@@ -1718,6 +1732,22 @@ impl Leg {
             match envfiles::summary(&sum_t) {
                 Ok(md) => self.event(&JobEventV2::Summary { idx, markdown: st.masker.mask(&st.unfake(md)) }).await,
                 Err(e) => self.annotate(idx, "warning", &e).await,
+            }
+        }
+        // Benchmark metrics (W16-R07): `{ name, value, unit, better, tags }` per line.
+        let metf = get("KILN_METRICS");
+        let met_t = crate::rt::blocking(move || read(&metf)).await.unwrap_or_default();
+        if !met_t.trim().is_empty() {
+            let (points, bad) = kiln_ci::results::metrics::parse_lines(&met_t);
+            for b in bad.iter().take(5) {
+                self.annotate(idx, "warning", &format!("$KILN_METRICS {b}")).await;
+            }
+            if !points.is_empty() {
+                let points = points.into_iter().map(|mut p| {
+                    p.name = st.masker.mask(&p.name);
+                    serde_json::to_value(p).unwrap_or_default()
+                }).collect();
+                self.event(&JobEventV2::Metrics { idx, points, fingerprint: fingerprint(&self.a.executor.kind) }).await;
             }
         }
         if let Some(f) = file {

@@ -120,6 +120,9 @@ enum Cmd {
     Oidc(kiln::ci::cli::OidcArgs),
     /// CI actions: the mirrored catalog, prefetching, the action policy.
     Actions(kiln::ci::cli::ActionsArgs),
+    /// A benchmark tool's output as CI metrics, added to the step's `$KILN_METRICS`
+    /// (criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest, k6).
+    Metrics(kiln::ci::cli::MetricsArgs),
     /// Workflows of this working tree: `kiln workflow run [WORKFLOW]` runs them here, or on a
     /// server's runners (`--server`), before you push.
     Workflow(kiln::ci::local::WorkflowArgs),
@@ -627,6 +630,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             kiln::ci::cli::actions(a, &cfg).await
         }
         Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();

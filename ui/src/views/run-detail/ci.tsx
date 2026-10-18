@@ -2,7 +2,7 @@
  * leaves behind (summaries, annotations, artifacts, the actions it pinned). */
 import * as React from "react";
 import { RotateCcw, Square } from "lucide-react";
-import { ci, reviewOf, waitSentence, type CiAnnotation, type CiRunDetail, type CiTest, type RerunMode } from "@/api/ci";
+import { ci, reviewOf, waitSentence, type CiAnnotation, type CiMetric, type CiRunDetail, type CiTest, type RerunMode } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
@@ -173,9 +173,11 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
   const annotations = useSuspenseResource(`ci-run/${id}/annotations/${attempt ?? ""}`, (s) => ci.annotations(id, attempt, s)).data.annotations;
   const artifacts = useSuspenseResource(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s)).data.artifacts;
   const tests = useSuspenseResource(`ci-run/${id}/tests/${attempt ?? ""}`, (s) => ci.tests(id, attempt, s)).data;
+  const metrics = useSuspenseResource(`ci-run/${id}/metrics`, (s) => ci.metrics(id, s)).data.metrics;
   return (
     <div className="mt-6 flex flex-col gap-4">
       {tests.tests.length > 0 && <Tests list={tests.tests} counts={tests.counts} />}
+      {metrics.length > 0 && <Metrics list={metrics} />}
       {summaries.length > 0 && (
         <Panel eyebrow={`Summaries · ${summaries.length}`} title="Job summaries">
           <div className="flex flex-col gap-6">
@@ -230,6 +232,55 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
 }
 
 const OUTCOME_DOT: Record<CiTest["outcome"], string> = { failed: "failed", error: "failed", passed: "succeeded", skipped: "skipped" };
+
+const VERDICT_RANK: Record<string, number> = { regressed: 0, improved: 1, no_clear_difference: 2 };
+
+/** A metric's value, short. */
+function metricValue(v: number, unit: string): string {
+  const n = Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(2) : v.toPrecision(3);
+  return unit ? `${n} ${unit}` : n;
+}
+
+const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+
+/** The run's benchmark metrics (W16-R07, R08): clear changes first, each with its interval
+ * against the baseline (the default branch's last runs on the same kind of runner). */
+function Metrics({ list }: { list: CiMetric[] }) {
+  const sorted = [...list].sort((a, b) => (VERDICT_RANK[a.comparison?.verdict ?? ""] ?? 3) - (VERDICT_RANK[b.comparison?.verdict ?? ""] ?? 3) || a.name.localeCompare(b.name));
+  const regressed = list.filter((m) => m.comparison?.verdict === "regressed").length;
+  const improved = list.filter((m) => m.comparison?.verdict === "improved").length;
+  const eyebrow = [`${list.length} metric${list.length === 1 ? "" : "s"}`, regressed ? `${regressed} regressed` : "", improved ? `${improved} improved` : ""].filter(Boolean).join(" · ");
+  return (
+    <Panel eyebrow={eyebrow} title="Benchmarks" bodyClassName="px-0 pb-1">
+      <ul className="row-list">
+        {sorted.map((m, i) => {
+          const c = m.comparison;
+          const status = c?.verdict === "regressed" ? "failed" : c?.verdict === "improved" ? "succeeded" : "pending";
+          return (
+            <li key={i} className="flex flex-col gap-1 px-5 py-2.5">
+              <span className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
+                <i className="dot" data-status={status} aria-hidden="true" />
+                <span className="min-w-0 font-mono text-[12px] [overflow-wrap:anywhere] text-[#d4dde8]">{m.name}</span>
+                <span className="font-mono text-[12px] text-[#a6b2c6] tabular-nums">{metricValue(m.value, m.unit)}</span>
+                <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a]">{m.leg_key}</span>
+              </span>
+              <span className="text-[12px] text-[#c5cdd8]">
+                {c == null
+                  ? "No baseline yet: three runs of the default branch on this kind of runner make one."
+                  : c.verdict === "regressed"
+                    ? `${pct(c.change)} worse than the baseline (95% interval ${pct(c.low)} to ${pct(c.high)}, ${c.runs} runs)`
+                    : c.verdict === "improved"
+                      ? `${pct(-c.change)} better than the baseline (95% interval ${pct(-c.high)} to ${pct(-c.low)}, ${c.runs} runs)`
+                      : `No clear difference from the baseline (${pct(c.low)} to ${pct(c.high)}, ${c.runs} runs)`}
+              </span>
+              <span className="font-mono text-[10.5px] [overflow-wrap:anywhere] text-[#7f8a9a]">{m.fingerprint}</span>
+            </li>
+          );
+        })}
+      </ul>
+    </Panel>
+  );
+}
 
 /** A test's time, short. */
 function testTime(ms: number | null): string {

@@ -135,6 +135,9 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["runs", id, "tests"]) => super::results::of(hub, Some(id), None, q).await,
         (&Method::GET, ["legs", id, "tests"]) => super::results::of(hub, None, Some(id), q).await,
         (&Method::GET, ["repos", repo, "tests"]) => super::results::repo(hub, repo, q).await,
+        // W16-R07, R08: benchmark metrics and their trends.
+        (&Method::GET, ["runs", id, "metrics"]) => super::results::run_metrics(hub, id).await,
+        (&Method::GET, ["repos", repo, "metrics"]) => super::results::repo_metrics(hub, repo, q).await,
         (&Method::GET, ["runs", id, which @ ("annotations" | "summary" | "artifacts")]) => super::runs_api::part(hub, id, which, q).await,
         (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
         (&Method::POST, ["runs", id, "rerun"]) => {

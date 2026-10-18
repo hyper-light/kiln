@@ -444,6 +444,62 @@ pub async fn logs(args: LogsArgs, cfg: &Config) -> Result<()> {
     }
 }
 
+/// `kiln metrics <tool> <path>` (docs/ci.md W16-R07): a benchmark tool's output as metrics, added
+/// to the step's `$KILN_METRICS` (printed when there is none).
+#[derive(clap::Args)]
+pub struct MetricsArgs {
+    /// criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest or k6.
+    tool: String,
+    /// Its output: a file (`-` for standard input), or criterion's directory (`target/criterion`).
+    path: std::path::PathBuf,
+    /// `KEY=VALUE` tags on every metric (repeatable).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+}
+
+pub fn metrics(args: MetricsArgs) -> Result<()> {
+    use kiln_ci::results::metrics::{Tool, convert};
+    use std::io::Write as _;
+    let Some(tool) = Tool::parse(&args.tool) else { bail!("`{}` isn't a tool kiln reads: criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest or k6", args.tool) };
+    let mut files: Vec<(String, String)> = Vec::new();
+    if args.path.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        files.push(("-".into(), s));
+    } else if args.path.is_dir() {
+        // criterion: every `…/new/estimates.json` and `sample.json` below.
+        let mut stack = vec![args.path.clone()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir)?.filter_map(std::result::Result::ok) {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "new") && p.file_name().is_some_and(|n| n == "estimates.json" || n == "sample.json") {
+                    files.push((p.to_string_lossy().replace('\\', "/"), std::fs::read_to_string(&p)?));
+                }
+            }
+        }
+    } else {
+        files.push((args.path.to_string_lossy().into_owned(), std::fs::read_to_string(&args.path)?));
+    }
+    let mut points = convert(tool, &files).map_err(|e| anyhow::anyhow!("{}: {e}", args.path.display()))?;
+    for t in &args.tags {
+        let Some((k, v)) = t.split_once('=') else { bail!("--tag takes KEY=VALUE, not `{t}`") };
+        for p in &mut points {
+            p.tags.insert(k.to_owned(), v.to_owned());
+        }
+    }
+    let lines: String = points.iter().filter_map(|p| serde_json::to_string(p).ok()).map(|l| l + "\n").collect();
+    match std::env::var_os("KILN_METRICS").filter(|v| !v.is_empty()) {
+        Some(file) => {
+            std::fs::OpenOptions::new().create(true).append(true).open(&file)?.write_all(lines.as_bytes())?;
+            eprintln!("{} metrics added to $KILN_METRICS", points.len());
+        }
+        None => print!("{lines}"),
+    }
+    Ok(())
+}
+
 /// `kiln dispatch`: a `workflow_dispatch` run.
 #[derive(clap::Args)]
 pub struct DispatchArgs {

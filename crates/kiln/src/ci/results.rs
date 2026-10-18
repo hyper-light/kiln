@@ -399,6 +399,212 @@ pub async fn repo(hub: &Hub, repo: &str, q: &HashMap<String, String>) -> Result<
     Ok(srv::json(StatusCode::OK, &json!({ "repo": r.name, "branch": branch, "days": days, "sort": sort, "tests": tests })))
 }
 
+/// How many default-branch runs a metric's baseline takes (W16-R08).
+const BASELINE_RUNS: usize = 10;
+/// A change smaller than this, across the whole interval, isn't reported.
+const REPORT_THRESHOLD: f64 = 0.05;
+/// Bootstrap resamples per comparison.
+const ROUNDS: usize = 2000;
+
+/// The baseline of metric `name` (W16-R08): its values in the last default-branch runs, on
+/// runners with this `fingerprint` unless `any_runner`, other than `run`.
+async fn baseline(hub: &Hub, repo: &str, branch: &str, name: &str, fingerprint: Option<&str>, run: &str) -> anyhow::Result<Vec<f64>> {
+    let (repo, branch, name, fp, run) = (repo.to_owned(), branch.to_owned(), name.to_owned(), fingerprint.map(str::to_owned), run.to_owned());
+    hub.store
+        .call(move |c| {
+            // One value a run: its latest.
+            let mut st = c.prepare(
+                "SELECT value FROM metrics WHERE id IN (SELECT MAX(id) FROM metrics WHERE repo_id = ?1 AND branch = ?2 AND name = ?3 AND (?4 IS NULL OR fingerprint = ?4) AND run_id != ?5 GROUP BY run_id)
+                 ORDER BY ts DESC LIMIT ?6",
+            )?;
+            Ok(st.query_map(params![repo, branch, name, fp, run, i64::try_from(BASELINE_RUNS).unwrap_or(10)], |r| r.get::<_, f64>(0))?.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+}
+
+/// A comparison as stored and shown.
+fn comparison(v: kiln_ci::stats::Verdict, i: kiln_ci::stats::Interval, runs: usize, better: kiln_ci::stats::Better) -> Value {
+    use kiln_ci::stats::{Better, Verdict};
+    // As a change for the worse: `+0.10` is 10 % worse, whichever way is better.
+    let worse = |ratio: f64| if better == Better::Lower { ratio - 1.0 } else { 1.0 - ratio };
+    let (lo, hi) = (worse(i.low).min(worse(i.high)), worse(i.low).max(worse(i.high)));
+    let verdict = match v {
+        Verdict::Regressed { .. } => "regressed",
+        Verdict::Improved { .. } => "improved",
+        Verdict::NoClearDifference => "no_clear_difference",
+    };
+    json!({ "verdict": verdict, "change": worse(i.mid), "low": lo, "high": hi, "runs": runs })
+}
+
+/// What a step wrote to `$KILN_METRICS` (W16-R07): kept, each compared with its baseline (R08),
+/// and a clear change annotated on the step.
+pub async fn metrics(hub: &Hub, leg: &str, idx: u32, points: &[Value], fingerprint: &str) -> anyhow::Result<()> {
+    use kiln_ci::results::metrics::Point;
+    let Some(of) = leg_of(hub, leg).await? else { return Ok(()) };
+    let repo = hub.store.repos().await?.into_iter().find(|r| r.id == of.repo);
+    let trunk = match &repo {
+        Some(r) => super::events::facts(hub, r).await.default_branch,
+        None => "main".into(),
+    };
+    let now = crate::util::now_unix();
+    let mut rows = Vec::new();
+    for v in points {
+        let Ok(p) = serde_json::from_value::<Point>(v.clone()) else { continue };
+        let base = baseline(hub, &of.repo, &trunk, &p.name, Some(fingerprint), &of.run).await.unwrap_or_default();
+        let current = if p.samples.is_empty() { vec![p.value] } else { p.samples.clone() };
+        let cmp = (base.len() >= 3).then(|| kiln_ci::stats::ratio_interval(&base, &current, ROUNDS, seed(&format!("{}{}", of.run, p.name)))).flatten().map(|i| comparison(kiln_ci::stats::judge(i, REPORT_THRESHOLD, p.better), i, base.len(), p.better));
+        rows.push((p, cmp));
+    }
+    let leg_s = leg.to_owned();
+    let fp = fingerprint.to_owned();
+    let annotate: Vec<(String, String)> = rows
+        .iter()
+        .filter_map(|(p, c)| {
+            let c = c.as_ref()?;
+            let pct = |x: f64| format!("{:.1}%", x * 100.0);
+            let n = c.get("runs").and_then(Value::as_u64).unwrap_or(0);
+            let (lo, hi, ch) = (c.get("low").and_then(Value::as_f64)?, c.get("high").and_then(Value::as_f64)?, c.get("change").and_then(Value::as_f64)?);
+            match c.get("verdict").and_then(Value::as_str)? {
+                "regressed" => Some(("warning".into(), format!("{}: {} worse than {trunk} (95% interval {} to {}, against {n} runs on this kind of runner)", p.name, pct(ch), pct(lo), pct(hi)))),
+                "improved" => Some(("notice".into(), format!("{}: {} better than {trunk} (95% interval {} to {}, against {n} runs)", p.name, pct(-ch), pct(-hi), pct(-lo)))),
+                _ => None,
+            }
+        })
+        .collect();
+    hub.store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            for (p, cmp) in &rows {
+                tx.execute(
+                    "INSERT INTO metrics (repo_id, run_id, leg, leg_key, attempt, branch, sha, step_idx, name, value, unit, better, tags, samples, fingerprint, comparison, ts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    params![
+                        of.repo, of.run, leg_s, of.key, of.attempt, of.branch, of.sha, idx, p.name, p.value, p.unit,
+                        if p.better == kiln_ci::stats::Better::Higher { "higher" } else { "lower" },
+                        serde_json::to_string(&p.tags).ok(), (!p.samples.is_empty()).then(|| serde_json::to_string(&p.samples).unwrap_or_default()), fp,
+                        cmp.as_ref().map(Value::to_string), now
+                    ],
+                )?;
+            }
+            for (level, message) in annotate.iter().take(MAX_ANNOTATIONS) {
+                tx.execute("INSERT INTO ci_annotations (leg_id, step_idx, level, title, message) VALUES (?1, ?2, ?3, 'Benchmark', ?4)", params![leg_s, idx, level, message])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// A seed from text (the run and the metric), so a comparison is the same each time it's made.
+fn seed(s: &str) -> u64 {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(s.as_bytes()).iter().take(8).fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+}
+
+/// An annotation on a leg (`level`: error, warning, notice).
+pub async fn annotate(hub: &Hub, leg: &str, level: &str, title: &str, message: &str) {
+    let (l, lv, t, m) = (leg.to_owned(), level.to_owned(), title.to_owned(), message.to_owned());
+    if let Err(e) = hub.store.call(move |c| Ok(c.execute("INSERT INTO ci_annotations (leg_id, level, title, message) VALUES (?1, ?2, ?3, ?4)", params![l, lv, t, m]).map(|_| ())?)).await {
+        tracing::warn!(leg, error = %format!("{e:#}"), "an annotation could not be kept");
+    }
+}
+
+/// A job's `bench-gate` on a leg that passed (W16-R09): the metrics it covers that got worse by
+/// more than it allows, judged against their baselines. `Some((fail, why))` when one did.
+pub async fn gate(hub: &Hub, leg: &str, g: &kiln_ci::results::metrics::Gate) -> anyhow::Result<Option<(bool, String)>> {
+    use kiln_ci::stats::{Better, Verdict};
+    let Some(of) = leg_of(hub, leg).await? else { return Ok(None) };
+    let repo = hub.store.repos().await?.into_iter().find(|r| r.id == of.repo);
+    let trunk = match &repo {
+        Some(r) => super::events::facts(hub, r).await.default_branch,
+        None => "main".into(),
+    };
+    let l = leg.to_owned();
+    let points: Vec<(String, f64, String, Option<String>, String)> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT name, value, better, samples, fingerprint FROM metrics WHERE leg = ?1 ORDER BY id")?;
+            Ok(st.query_map([&l], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await?;
+    let mut worse = Vec::new();
+    for (name, value, better, samples, fp) in points.into_iter().filter(|p| g.covers(&p.0)) {
+        let base = baseline(hub, &of.repo, &trunk, &name, g.same_fingerprint.then_some(fp.as_str()), &of.run).await?;
+        if base.len() < 3 {
+            continue;
+        }
+        let current: Vec<f64> = samples.and_then(|s| serde_json::from_str(&s).ok()).filter(|v: &Vec<f64>| !v.is_empty()).unwrap_or_else(|| vec![value]);
+        let better = if better == "higher" { Better::Higher } else { Better::Lower };
+        if let Some(i) = kiln_ci::stats::ratio_interval(&base, &current, ROUNDS, seed(&format!("{}{name}", of.run)))
+            && let Verdict::Regressed { change } = kiln_ci::stats::judge(i, g.max_regression, better)
+        {
+            worse.push(format!("{name} is {:.1}% worse than {trunk}", change * 100.0));
+        }
+    }
+    if worse.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((g.fail, format!("bench-gate: {} (more than the {:.0}% it allows)", worse.join("; "), g.max_regression * 100.0))))
+}
+
+/// `GET /api/ci/runs/:id/metrics`: the run's metrics, each with its comparison.
+pub async fn run_metrics(hub: &Hub, run: &str) -> Result<Response, Fail> {
+    let r = run.to_owned();
+    let rows: Vec<Value> = hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT leg, leg_key, step_idx, name, value, unit, better, tags, fingerprint, comparison FROM metrics WHERE run_id = ?1 AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY id")?;
+            let rows = st.query_map([&r], |x| {
+                let parse = |s: Option<String>| s.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
+                Ok(json!({
+                    "leg": x.get::<_, String>(0)?, "leg_key": x.get::<_, String>(1)?, "step": x.get::<_, Option<i64>>(2)?, "name": x.get::<_, String>(3)?,
+                    "value": x.get::<_, f64>(4)?, "unit": x.get::<_, String>(5)?, "better": x.get::<_, String>(6)?, "tags": parse(x.get(7)?),
+                    "fingerprint": x.get::<_, String>(8)?, "comparison": parse(x.get(9)?),
+                }))
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(srv::json(StatusCode::OK, &json!({ "metrics": rows })))
+}
+
+/// `GET /api/ci/repos/:repo/metrics?name=&branch=&days=`: a metric's values over time on a
+/// branch, by fingerprint (W16-AC05's trends); without `name`, the metrics there are.
+pub async fn repo_metrics(hub: &Hub, repo: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
+    let r = hub.store.repos().await.map_err(|e| internal(&e))?.into_iter().find(|x| x.id == repo || x.name == repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{repo}`")))?;
+    let branch = match q.get("branch").filter(|b| !b.is_empty()) {
+        Some(b) => b.clone(),
+        None => super::events::facts(hub, &r).await.default_branch,
+    };
+    let days: i64 = q.get("days").and_then(|d| d.parse().ok()).unwrap_or(30).clamp(1, 365);
+    let since = crate::util::now_unix() - days * 86_400;
+    let (repo_id, b, name) = (r.id.clone(), branch.clone(), q.get("name").cloned());
+    let out: Value = hub
+        .store
+        .call(move |c| {
+            Ok(match name {
+                None => {
+                    let mut st = c.prepare("SELECT name, unit, better, COUNT(*), MAX(ts) FROM metrics WHERE repo_id = ?1 AND branch = ?2 AND ts >= ?3 GROUP BY name ORDER BY name")?;
+                    let rows = st.query_map(params![repo_id, b, since], |x| Ok(json!({ "name": x.get::<_, String>(0)?, "unit": x.get::<_, String>(1)?, "better": x.get::<_, String>(2)?, "points": x.get::<_, i64>(3)?, "last": x.get::<_, i64>(4)? })))?;
+                    json!({ "metrics": rows.collect::<Result<Vec<_>, _>>()? })
+                }
+                Some(n) => {
+                    let mut st = c.prepare("SELECT fingerprint, sha, run_id, value, unit, ts FROM metrics WHERE repo_id = ?1 AND branch = ?2 AND name = ?3 AND ts >= ?4 ORDER BY ts")?;
+                    let mut by: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+                    for x in st.query_map(params![repo_id, b, n, since], |x| Ok((x.get::<_, String>(0)?, json!({ "sha": x.get::<_, String>(1)?, "run": x.get::<_, String>(2)?, "value": x.get::<_, f64>(3)?, "unit": x.get::<_, String>(4)?, "ts": x.get::<_, i64>(5)? }))))? {
+                        let (fp, v) = x?;
+                        by.entry(fp).or_default().push(v);
+                    }
+                    json!({ "name": n, "series": by.into_iter().map(|(fp, points)| json!({ "fingerprint": fp, "points": points })).collect::<Vec<_>>() })
+                }
+            })
+        })
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(srv::json(StatusCode::OK, &json!({ "repo": r.name, "branch": branch, "days": days, "data": out })))
+}
+
 /// The most items a run's timing table keeps.
 const MAX_TIMING: usize = 5000;
 

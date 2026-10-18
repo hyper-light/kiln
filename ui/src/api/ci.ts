@@ -88,6 +88,20 @@ export interface CiAnnotation {
   end_col: number | null;
 }
 
+/** A benchmark metric of a run, compared with its baseline (W16-R07, R08). */
+export interface CiMetric {
+  leg: string;
+  leg_key: string;
+  step: number | null;
+  name: string;
+  value: number;
+  unit: string;
+  better: "lower" | "higher";
+  fingerprint: string;
+  /** `change` is how much worse (+) or better (−) than the baseline, a fraction; `low`/`high` its 95% interval. */
+  comparison: { verdict: "regressed" | "improved" | "no_clear_difference"; change: number; low: number; high: number; runs: number } | null;
+}
+
 /** A test's result in a run (W16-R03). */
 export interface CiTest {
   id: string;
@@ -259,6 +273,8 @@ export const ci = {
     request<{ annotations: CiAnnotation[] }>("GET", `/api/ci/runs/${enc(id)}/annotations${at(attempt)}`, undefined, { signal }),
   summaries: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<{ summaries: CiSummary[] }>("GET", `/api/ci/runs/${enc(id)}/summary${at(attempt)}`, undefined, { signal }),
   artifacts: (id: string, signal?: AbortSignal) => request<{ artifacts: CiArtifact[] }>("GET", `/api/ci/runs/${enc(id)}/artifacts`, undefined, { signal }),
+  /** The run's benchmark metrics (W16-R07). */
+  metrics: (id: string, signal?: AbortSignal) => request<{ metrics: CiMetric[] }>("GET", `/api/ci/runs/${enc(id)}/metrics`, undefined, { signal }),
   /** The run's tests, failures first (W16-R03). */
   tests: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
     request<{ counts: Record<string, number>; tests: CiTest[] }>("GET", `/api/ci/runs/${enc(id)}/tests${at(attempt)}`, undefined, { signal }),

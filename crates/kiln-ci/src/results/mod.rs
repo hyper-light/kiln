@@ -6,9 +6,11 @@
 //!   tells them apart when the format isn't given. Malformed reports are errors, never panics.
 //! - [`flaky`] classifies a test from its results (W16-R04).
 //! - [`quarantine`] reads `.kiln/quarantine.yaml` and judges a step's failures (W16-R05).
+//! - [`metrics`]: benchmark metrics from `$KILN_METRICS` and the common tools (W16-R07).
 
 mod junit;
 mod lines;
+pub mod metrics;
 mod objects;
 pub mod quarantine;
 pub mod xml;

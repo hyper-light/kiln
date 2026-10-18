@@ -186,7 +186,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
-| W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, the run page's Tests panel, flaky and probably flaky, quarantine with `enforce`, timing for shards; metrics, regressions, gates and the tests page left |
+| W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server; MCP, log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
@@ -3377,7 +3377,7 @@ opt-in quarantine, timing data for shards, regression tracking and opt-in gates 
   metrics and shows trends per fingerprint. *E2E.*
 
 **Progress.** In progress: R01 (formats and `test-results:`), R02, R03 (the run page and
-annotations), R04, R05 and R06; AC01 to AC03.
+annotations), R04 to R09; AC01 to AC04.
 
 - *R01* (`kiln_ci::results`): the formats are told apart by their first bytes, and read by a
   small XML reader of kiln's own (no dependency):
@@ -3414,14 +3414,37 @@ annotations), R04, R05 and R06; AC01 to AC03.
 - *R06*: each run gets a timing table, which feeds `balance: timing`. It holds test files' and
   tests' median durations over two weeks, cached for ten minutes, and is saved with the run so a
   replay shards alike.
+- *R07* (`kiln_ci::results::metrics`):
+  - Steps write `{ name, value, unit, better, tags, samples? }` lines to `$KILN_METRICS`.
+  - `kiln metrics <tool> <path>` converts criterion (its directory, with `sample.json`'s
+    per-iteration times), hyperfine, `go test -bench` (each measure, `-count` runs as samples),
+    pytest-benchmark, Google Benchmark, libtest's bench output and k6's summary.
+  - The runner sends the points with its fingerprint: OS and architecture, CPU model, kernel and
+    executor. They are kept per leg (`metrics`).
+- *R08* (`kiln_ci::stats`): each point is compared with its baseline, the default branch's last
+  ten runs on runners of the same fingerprint (three at least).
+  - The comparison is a seeded bootstrap 95 % interval of the medians' ratio.
+  - A change is reported, as an annotation, only when the whole interval clears 5 %; otherwise
+    there is "no clear difference".
+- *R09*: `bench-gate: { metric, max-regression, same-fingerprint, action }` fails (or warns
+  about) a leg whose gated metrics got worse by more than it allows, with the reason.
+  - `GET /api/ci/runs/:id/metrics` and `/api/ci/repos/:repo/metrics?name=` (a metric's values
+    by fingerprint over time).
+  - The run page has a Benchmarks panel.
 - *Verified end to end*:
+  - three runs at 1,000 ns made a baseline; a fourth at 1,100 ns was "9.7% worse (95% interval
+    9.0% to 9.9%)" and its `bench-gate` at 5 % failed the leg; an unchanged metric showed no
+    clear difference;
   - a step that exited 1 with one quarantined failure passed, with the run, and showed the test
     at `src/calc.rs:12`;
   - its rerun (the test passing on attempt 2) marked it flaky;
   - one more failure than quarantine covers failed the step, and an expired entry was flagged;
-  - the Tests panel in Chromium and WebKit, at desktop and phone widths.
-- *Left*: R07 to R09 (metrics, regressions, gates), the repository's tests page,
-  `kiln/test-results@v1` and discovery of the usual paths (with W07's built-ins), AC04 and AC05.
+  - the Tests and Benchmarks panels in Chromium and WebKit, at desktop and phone widths.
+- *Left*:
+  - the repository's tests page and metric trend charts;
+  - the gate's result on diffs and the land queue (W14);
+  - `kiln/test-results@v1` and discovery of the usual paths (with W07's built-ins);
+  - AC05, kiln's own `bench.yaml` on an exclusive runner.
 
 ### W17 Debugging
 

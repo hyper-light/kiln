@@ -266,7 +266,14 @@ pub enum JobEventV2 {
         environment_url: Option<String>,
     },
     TestReport { idx: u32, format: String, object: String },
-    Metrics { idx: u32, points: Vec<serde_json::Value> },
+    /// W16-R07: what the step wrote to `$KILN_METRICS`, and the runner's fingerprint (its OS and
+    /// architecture, CPU model, kernel and executor), which baselines are kept by.
+    Metrics {
+        idx: u32,
+        points: Vec<serde_json::Value>,
+        #[serde(default)]
+        fingerprint: String,
+    },
     /// Why the attempt failed (W05-R15): `runner-lost`, `infra`, `image-pull`, `oom`, `disk-full`,
     /// `timeout`, `failure`.
     FailureClass { class: String },

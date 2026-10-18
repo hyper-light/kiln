@@ -1216,7 +1216,13 @@ impl Dispatch {
                     l.class = FailureClass::parse(&class);
                 }
             }
-            JobEventV2::Group { .. } | JobEventV2::Mask { .. } | JobEventV2::TestReport { .. } | JobEventV2::Metrics { .. } => {}
+            // W16-R07, R08: benchmark metrics, each compared with its baseline.
+            JobEventV2::Metrics { idx, points, fingerprint } => {
+                if let Err(e) = super::results::metrics(&self.hub, leg, idx, &points, &fingerprint).await {
+                    tracing::warn!(leg, error = %format!("{e:#}"), "metrics could not be kept");
+                }
+            }
+            JobEventV2::Group { .. } | JobEventV2::Mask { .. } | JobEventV2::TestReport { .. } => {}
         }
         Ok(())
     }
@@ -1231,12 +1237,28 @@ impl Dispatch {
         }
         let Some(l) = self.legs.get(&r.job) else { return Ok(()) };
         let attempt = l.attempt;
-        let outcome = match r.status {
+        let gate = l.spec.def().and_then(|j| j.kiln.bench_gate.clone());
+        let mut outcome = match r.status {
             Status::Succeeded | Status::Skipped => Outcome::Success,
             Status::Cancelled => Outcome::Cancelled,
             Status::TimedOut => Outcome::Failed(Failed { class: FailureClass::Timeout, exit_code: r.exit_code, log_hits: Vec::new() }),
             _ => Outcome::Failed(Failed { class: l.class.unwrap_or(FailureClass::Failure), exit_code: r.exit_code, log_hits: Vec::new() }),
         };
+        // W16-R09: a job's bench-gate fails (or warns about) a leg whose metrics got worse.
+        if let (Outcome::Success, Some(g)) = (&outcome, gate) {
+            match kiln_ci::results::metrics::Gate::from_yval(&g) {
+                Ok(g) => match super::results::gate(&self.hub, &r.job, &g).await {
+                    Ok(Some((true, why))) => {
+                        super::results::annotate(&self.hub, &r.job, "error", "bench-gate", &why).await;
+                        outcome = Outcome::Failed(Failed { class: FailureClass::Failure, exit_code: None, log_hits: Vec::new() });
+                    }
+                    Ok(Some((false, why))) => super::results::annotate(&self.hub, &r.job, "warning", "bench-gate", &why).await,
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(leg = %r.job, error = %format!("{e:#}"), "the bench-gate could not be judged"),
+                },
+                Err(e) => super::results::annotate(&self.hub, &r.job, "warning", "bench-gate", &e).await,
+            }
+        }
         if let Some(l) = self.legs.get_mut(&r.job) {
             l.agent = None;
             if let Some(e) = &r.error {
