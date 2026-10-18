@@ -1652,6 +1652,7 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_DIRS
     | crate::proto::CAP_TAKEOVER_STOP
     | crate::proto::CAP_SYNC
+    | crate::proto::CAP_REPOS
     | crate::proto::CAP_FRONT_DOOR
     | crate::proto::CAP_CI2
     | crate::proto::CAP_ACTIONS

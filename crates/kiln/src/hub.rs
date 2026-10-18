@@ -150,6 +150,10 @@ pub struct Hub {
     pub sync: crate::sync::server::Sync,
     /// Reach: the links between runners this server relays, and their identities (`crate::reach`).
     pub reach: Mutex<crate::reach::relay::Relay>,
+    /// The git repositories each machine holds, as it last said (`crate::sync::places`).
+    pub places: crate::sync::places::Places,
+    /// Clones, syncs and moves of repositories between machines (`crate::sync::tasks`).
+    pub tasks: crate::sync::tasks::Tasks,
 }
 
 impl Hub {
@@ -169,6 +173,8 @@ impl Hub {
         let discovery = Arc::new(crate::discovery::Discovery::for_server(&cfg, &pki.ca_der));
         let harness_dir = cfg.data("harness");
         let sync = crate::sync::server::Sync::start(cfg.data("sync"), admin_token.clone());
+        let places = crate::sync::places::Places::open(cfg.data("sync").join("places.json"));
+        let tasks = crate::sync::tasks::Tasks::open(&cfg.data("sync"));
         Arc::new(Self {
             cfg,
             store,
@@ -209,6 +215,8 @@ impl Hub {
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),
             sync,
             reach: Mutex::new(crate::reach::relay::Relay::default()),
+            places,
+            tasks,
         })
     }
 
@@ -251,6 +259,21 @@ impl Hub {
             }
         }
         Ok(())
+    }
+
+    /// What a machine's runner said on the sync lane: of its copies (to the groups), of the git
+    /// repositories it holds, or of its part of a task.
+    fn sync_heard(&self, machine: &str, json: &str, raft: Vec<u8>) {
+        match crate::sync::wire::decode(json) {
+            Some(crate::sync::wire::Msg::Repos(r)) => {
+                if self.places.heard(machine, r) {
+                    self.emit(&serde_json::json!({ "type": "places" }));
+                }
+            }
+            Some(crate::sync::wire::Msg::Task(news)) => self.tasks.heard(machine, news),
+            Some(msg) => self.sync.from_runner(machine, msg, raft),
+            None => {}
+        }
     }
 
     /// A runner process of `machine` that syncs said so: the newest such process syncs, and every
@@ -523,6 +546,7 @@ impl Hub {
         metrics::agent_samples().write().remove(agent);
         self.store.delete_agent(agent.to_owned()).await?;
         self.front_doors.forget(&self.store, agent).await;
+        self.places.forget(agent);
         self.tailnet.wake.notify();
         self.update_slot_gauges();
         Ok(())
@@ -831,7 +855,7 @@ impl Hub {
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
             }
-            AgentMsg::Sync { json, raft } => self.sync.from_runner(&agent, &json, raft),
+            AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::FrontDoorStatus { json } => crate::frontdoor::control::on_status(self, peer, &agent, &json).await,
             // CI (docs/ci.md §2.5): the dispatcher's; facts are W13's.
             AgentMsg::JobEvent { job, json } => {

@@ -1,0 +1,455 @@
+//! A runner's git repositories (`docs/sync.md`, "Repositories on machines"): it says what this
+//! machine holds when it connects, when that changes and every few minutes ([`Msg::Repos`]), and
+//! does its part of the server's tasks: bundling a repository for clones elsewhere, cloning one,
+//! deleting the folder of one moved away. Each says how it goes as it goes ([`Msg::Task`]), again
+//! every few seconds while it works and again after a reconnect, so the server knows it is alive.
+//!
+//! Bundles travel over HTTP to and from the server (`/api/sync/bundles/:batch`), with the token the
+//! server gives this machine with its copies: the same links, the same ports.
+
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+use sha2::{Digest as _, Sha256};
+
+use super::git::{self, Kept, Registry};
+use super::wire::{self, CloneOrder, Msg, Repos, TaskNews};
+use crate::http::client::Client;
+use crate::proto::AgentMsg;
+
+/// How often this machine looks at its repositories when nothing asks it to, and says so even if
+/// nothing changed.
+const LOOK_EVERY: Duration = Duration::from_secs(300);
+const SAY_EVERY: Duration = Duration::from_secs(1800);
+/// News of a task at work is said again this often; news of one over is kept this long, to say
+/// again after a reconnect.
+const AGAIN: Duration = Duration::from_secs(15);
+const KEEP_NEWS: Duration = Duration::from_secs(900);
+/// Progress while bytes move is said at most this often.
+const PROGRESS: Duration = Duration::from_secs(3);
+/// The largest bundle this machine fetches.
+const BUNDLE_MAX: u64 = 64 << 30;
+
+/// What the runner's sync hands the worker.
+pub enum Job {
+    /// What the server said: `Look`, `Bundle`, `Clone`, `Delete` or `Forget`.
+    Order(Msg),
+    /// The token blob and bundle requests carry.
+    Token(String),
+    /// The folders of this machine's synced copies (looked at wherever they are).
+    Paths(Vec<String>),
+    Connected(bool),
+}
+
+/// What the worker and the tasks it runs share.
+struct Shared {
+    dir: PathBuf,
+    me: String,
+    home: PathBuf,
+    http: Arc<Client>,
+    server: String,
+    say: async_channel::Sender<AgentMsg>,
+    connected: AtomicBool,
+    token: Mutex<String>,
+    news: Mutex<HashMap<String, (TaskNews, Instant)>>,
+    registry: Mutex<Registry>,
+    /// The worker's own queue, to look again once a task is done.
+    kick: async_channel::Sender<Job>,
+    /// Folders a task is cloning into or deleting now: never two at once.
+    busy: Mutex<BTreeSet<String>>,
+}
+
+impl Shared {
+    fn send(&self, msg: &Msg) {
+        if self.connected.load(Ordering::SeqCst) {
+            let _ = self.say.try_send(AgentMsg::Sync { json: wire::encode(msg), raft: Vec::new() });
+        }
+    }
+
+    /// Says how a task goes, and keeps it to say again.
+    fn tell(&self, news: TaskNews) {
+        self.news.lock().insert(news.task.clone(), (news.clone(), Instant::now()));
+        self.send(&Msg::Task(news));
+    }
+
+    fn token(&self) -> String {
+        self.token.lock().clone()
+    }
+
+    fn registry_file(&self) -> PathBuf {
+        self.dir.join("clones.json")
+    }
+
+    fn bundle_file(&self, name: &str) -> PathBuf {
+        let safe: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        self.dir.join("bundles").join(format!("{safe}.bundle"))
+    }
+
+    fn url(&self, batch: &str) -> String {
+        let enc = |s: &str| -> String { s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { char::from(b).to_string() } else { format!("%{b:02X}") }).collect() };
+        format!("{}/api/sync/bundles/{}?machine={}", self.server.trim_end_matches('/'), enc(batch), enc(&self.me))
+    }
+}
+
+/// Starts this machine's worker (its state in `dir`, `<state>/sync`); what it says goes out through
+/// `say`. Hand it [`Job`]s.
+pub fn start(dir: PathBuf, me: String, http: Arc<Client>, server: String, say: async_channel::Sender<AgentMsg>) -> async_channel::Sender<Job> {
+    let (tx, rx) = async_channel::unbounded();
+    let registry = Registry::load(&dir.join("clones.json"));
+    let shared = Arc::new(Shared {
+        dir,
+        me,
+        home: crate::os::home_dir(),
+        http,
+        server,
+        say,
+        connected: AtomicBool::new(false),
+        token: Mutex::new(String::new()),
+        news: Mutex::new(HashMap::new()),
+        registry: Mutex::new(registry),
+        kick: tx.clone(),
+        busy: Mutex::new(BTreeSet::new()),
+    });
+    crate::rt::spawn(async move { Worker { s: shared, paths: Vec::new(), told: None, told_at: None, looked: None, soon: true }.run(rx).await });
+    tx
+}
+
+struct Worker {
+    s: Arc<Shared>,
+    paths: Vec<String>,
+    /// What it last said it holds, and when.
+    told: Option<Repos>,
+    told_at: Option<Instant>,
+    looked: Option<Instant>,
+    /// Look at the next chance.
+    soon: bool,
+}
+
+impl Worker {
+    async fn run(mut self, rx: async_channel::Receiver<Job>) {
+        loop {
+            match crate::rt::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(job)) => self.job(job),
+                Ok(Err(_)) => return,
+                Err(_) => {}
+            }
+            while let Ok(job) = rx.try_recv() {
+                self.job(job);
+            }
+            self.again();
+            let due = self.looked.is_none_or(|t| t.elapsed() >= LOOK_EVERY);
+            if self.s.connected.load(Ordering::SeqCst) && (self.soon || due) {
+                self.soon = false;
+                self.look().await;
+            }
+        }
+    }
+
+    fn job(&mut self, job: Job) {
+        match job {
+            Job::Token(t) => *self.s.token.lock() = t,
+            Job::Paths(p) => {
+                if p != self.paths {
+                    self.paths = p;
+                    self.soon = true;
+                }
+            }
+            Job::Connected(up) => {
+                self.s.connected.store(up, Ordering::SeqCst);
+                if up {
+                    // All of it again: the server may have restarted.
+                    self.told = None;
+                    self.soon = true;
+                    let all: Vec<TaskNews> = self.s.news.lock().values().map(|(n, _)| n.clone()).collect();
+                    for n in all {
+                        self.s.send(&Msg::Task(n));
+                    }
+                }
+            }
+            Job::Order(Msg::Look) => self.soon = true,
+            Job::Order(Msg::Forget { path }) => {
+                let changed = self.s.registry.lock().clones.remove(&path).is_some();
+                if changed {
+                    let r = self.s.registry.lock().clone();
+                    if let Err(e) = r.save(&self.s.registry_file()) {
+                        tracing::warn!(error = %format!("{e:#}"), "the clones kiln made here could not be saved");
+                    }
+                    self.soon = true;
+                }
+            }
+            Job::Order(Msg::Bundle { task, path }) => {
+                let s = self.s.clone();
+                crate::rt::spawn(async move { bundle(&s, &task, &path).await });
+            }
+            Job::Order(Msg::Clone(order)) => {
+                let s = self.s.clone();
+                crate::rt::spawn(async move { clone(&s, order).await });
+            }
+            Job::Order(Msg::Delete { task, path, origin }) => {
+                if self.paths.contains(&path) {
+                    self.s.tell(TaskNews::failed(&task, format!("{path} is still synced here")));
+                    return;
+                }
+                let s = self.s.clone();
+                crate::rt::spawn(async move { delete(&s, &task, &path, origin.as_deref()).await });
+            }
+            // The rest are the copies' (`crate::sync::runner`).
+            Job::Order(_) => {}
+        }
+    }
+
+    /// Says again what tasks at work are doing; forgets news of tasks over long ago.
+    fn again(&self) {
+        let mut out = Vec::new();
+        {
+            let mut news = self.s.news.lock();
+            news.retain(|_, (n, at)| !n.over() || at.elapsed() < KEEP_NEWS);
+            for (n, at) in news.values_mut() {
+                if !n.over() && at.elapsed() >= AGAIN {
+                    *at = Instant::now();
+                    out.push(n.clone());
+                }
+            }
+        }
+        for n in out {
+            self.s.send(&Msg::Task(n));
+        }
+    }
+
+    /// Looks at this machine's repositories, and says what it found if that changed (or it is time).
+    async fn look(&mut self) {
+        let (extra, kiln) = {
+            let r = self.s.registry.lock();
+            let kiln: BTreeSet<String> = r.clones.keys().cloned().collect();
+            let mut extra: Vec<PathBuf> = r.paths().collect();
+            extra.extend(self.paths.iter().map(|p| git::expand(p, &self.s.home)));
+            (extra, kiln)
+        };
+        let looked = git::look(self.s.home.clone(), extra, kiln).await;
+        self.looked = Some(Instant::now());
+        let report = Repos { home: self.s.home.to_string_lossy().into_owned(), repos: looked.repos, error: looked.error, at: crate::util::now_unix() };
+        let same = self.told.as_ref().is_some_and(|t| Repos { at: report.at, ..t.clone() } == report);
+        let stale = self.told_at.is_none_or(|t| t.elapsed() >= SAY_EVERY);
+        if !same || stale {
+            self.s.send(&Msg::Repos(report.clone()));
+            self.told = Some(report);
+            self.told_at = Some(Instant::now());
+        }
+    }
+}
+
+/// A size as people read it.
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if n < 1024 {
+        return format!("{n} bytes");
+    }
+    let mut v = n as f64 / 1024.0;
+    let mut unit = "KB";
+    for u in UNITS.iter().skip(1) {
+        if v < 1024.0 {
+            break;
+        }
+        v /= 1024.0;
+        unit = u;
+    }
+    format!("{v:.1} {unit}")
+}
+
+/// Takes a folder for one task at a time; none: another task has it.
+struct Busy<'a> {
+    s: &'a Shared,
+    path: String,
+}
+
+impl<'a> Busy<'a> {
+    fn take(s: &'a Shared, path: &str) -> Option<Self> {
+        s.busy.lock().insert(path.to_owned()).then(|| Self { s, path: path.to_owned() })
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.s.busy.lock().remove(&self.path);
+    }
+}
+
+/// Bundles the repository at `path` and sends it to the server for batch `task`.
+async fn bundle(s: &Arc<Shared>, task: &str, path: &str) {
+    s.tell(TaskNews::new(task, "bundling", format!("bundling the commits in {path}")));
+    let file = s.bundle_file(task);
+    let out = async {
+        if let Some(dir) = file.parent() {
+            let d = dir.to_path_buf();
+            crate::rt::blocking(move || std::fs::create_dir_all(d)).await??;
+        }
+        let _ = std::fs::remove_file(&file);
+        git::bundle(&git::expand(path, &s.home), &file).await?;
+        let size = std::fs::metadata(&file)?.len();
+        s.tell(TaskNews::new(task, "sending", format!("sending the bundle ({})", bytes(size))));
+        send_bundle(s, task, &file, size).await
+    }
+    .await;
+    let _ = std::fs::remove_file(&file);
+    match out {
+        Ok((hash, size)) => s.tell(TaskNews { hash: Some(hash), size: Some(size), ..TaskNews::new(task, "done", format!("sent the bundle ({})", bytes(size))) }),
+        Err(e) => s.tell(TaskNews::failed(task, format!("{e:#}"))),
+    }
+}
+
+async fn send_bundle(s: &Arc<Shared>, task: &str, file: &Path, size: u64) -> anyhow::Result<(String, u64)> {
+    let src = crate::rt::file_source(file.to_path_buf())?;
+    let (tx, rx) = async_channel::bounded(8);
+    let (s2, t2) = (s.clone(), task.to_owned());
+    crate::rt::spawn(async move {
+        let (mut sent, mut said) = (0u64, Instant::now());
+        while let Ok(chunk) = src.recv().await {
+            sent = sent.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            if said.elapsed() >= PROGRESS {
+                said = Instant::now();
+                s2.tell(TaskNews::new(&t2, "sending", format!("sent {} of {}", bytes(sent), bytes(size))));
+            }
+            if tx.send(chunk).await.is_err() {
+                break;
+            }
+        }
+    });
+    let resp = s.http.put(&s.url(task)).bearer(&s.token()).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(4 * 3600)).send().await?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.bytes(64 << 10).await.unwrap_or_default();
+        anyhow::bail!("the server took no bundle ({status}): {}", String::from_utf8_lossy(&body).trim());
+    }
+    #[derive(serde::Deserialize)]
+    struct Got {
+        hash: String,
+        size: u64,
+    }
+    let got: Got = resp.json(64 << 10).await?;
+    Ok((got.hash, got.size))
+}
+
+/// Fetches a batch's bundle into `file`, checking it is the one named.
+async fn fetch_bundle(s: &Arc<Shared>, task: &str, batch: &str, hash: &str, size: u64, file: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(size <= BUNDLE_MAX, "the bundle is {}: more than this machine fetches", bytes(size));
+    let mut resp = s.http.get(&s.url(batch)).bearer(&s.token()).timeout(Duration::from_secs(900)).send().await?;
+    anyhow::ensure!(resp.is_success(), "the server gave no bundle ({})", resp.status());
+    let (sink, done) = crate::rt::file_sink(file.to_path_buf(), BUNDLE_MAX)?;
+    let mut h = Sha256::new();
+    let (mut got, mut said) = (0u64, Instant::now());
+    let mut whole = true;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                h.update(&chunk);
+                got = got.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                if said.elapsed() >= PROGRESS {
+                    said = Instant::now();
+                    s.tell(TaskNews::new(task, "fetching", format!("fetched {} of {}", bytes(got), bytes(size))));
+                }
+                if sink.send(chunk).await.is_err() {
+                    whole = false;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => anyhow::bail!("the bundle stopped coming: {e:#}"),
+        }
+    }
+    drop(sink);
+    done.await?;
+    anyhow::ensure!(whole, "the bundle could not be written");
+    anyhow::ensure!(hex::encode(h.finalize()) == hash, "the bundle that came is not the one sent");
+    Ok(())
+}
+
+/// Clones what `order` says, and keeps the clone as kiln's.
+async fn clone(s: &Arc<Shared>, order: CloneOrder) {
+    let task = order.task.clone();
+    let path = git::expand(&order.path, &s.home).to_string_lossy().into_owned();
+    let Some(_busy) = Busy::take(s, &path) else {
+        s.tell(TaskNews::failed(&task, format!("another task is at {path} now")));
+        return;
+    };
+    let bundle = s.bundle_file(&task);
+    let out = async {
+        let source: OsString = match (&order.bundle, &order.hash, &order.url) {
+            (Some(batch), Some(hash), _) => {
+                s.tell(TaskNews::new(&task, "fetching", format!("fetching the bundle ({})", bytes(order.size))));
+                fetch_bundle(s, &task, batch, hash, order.size, &bundle).await?;
+                bundle.clone().into_os_string()
+            }
+            (_, _, Some(url)) => url.into(),
+            _ => anyhow::bail!("nothing to clone from"),
+        };
+        s.tell(TaskNews::new(&task, "cloning", format!("cloning into {path}")));
+        git::clone_into(&order, &source, &s.home).await
+    }
+    .await;
+    let _ = std::fs::remove_file(&bundle);
+    match out {
+        Ok((branch, head)) => {
+            let saved = {
+                let mut r = s.registry.lock();
+                r.clones.insert(path.clone(), Kept { key: order.key.clone(), task: task.clone(), at: crate::util::now_unix() });
+                r.clone()
+            };
+            if let Err(e) = saved.save(&s.registry_file()) {
+                tracing::warn!(error = %format!("{e:#}"), "the clones kiln made here could not be saved");
+            }
+            let what = match &branch {
+                Some(b) => format!("cloned {b} into {path}"),
+                None => format!("cloned into {path}"),
+            };
+            s.tell(TaskNews { branch, head, ..TaskNews::new(&task, "done", what) });
+            let _ = s.kick.try_send(Job::Order(Msg::Look));
+        }
+        Err(e) => s.tell(TaskNews::failed(&task, format!("{e:#}"))),
+    }
+}
+
+/// Deletes the folder of a repository moved away (or given up), if it is safe to.
+async fn delete(s: &Arc<Shared>, task: &str, path: &str, origin: Option<&str>) {
+    let Some(_busy) = Busy::take(s, path) else {
+        s.tell(TaskNews::failed(task, format!("another task is at {path} now")));
+        return;
+    };
+    s.tell(TaskNews::new(task, "deleting", format!("deleting {path}")));
+    // Never kiln's own folders: its state, and where its binary is.
+    let mut keep: Vec<PathBuf> = s.dir.parent().map(Path::to_path_buf).into_iter().collect();
+    keep.extend(std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)));
+    match git::delete(&git::expand(path, &s.home), origin, &s.home, &keep).await {
+        Ok(()) => {
+            let saved = {
+                let mut r = s.registry.lock();
+                r.clones.remove(path).map(|_| r.clone())
+            };
+            if let Some(r) = saved
+                && let Err(e) = r.save(&s.registry_file())
+            {
+                tracing::warn!(error = %format!("{e:#}"), "the clones kiln made here could not be saved");
+            }
+            s.tell(TaskNews::new(task, "done", format!("deleted {path}")));
+            let _ = s.kick.try_send(Job::Order(Msg::Look));
+        }
+        Err(e) => s.tell(TaskNews::failed(task, format!("{e:#}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_read_as_people_say_them() {
+        assert_eq!(bytes(512), "512 bytes");
+        assert_eq!(bytes(2048), "2.0 KB");
+        assert_eq!(bytes(5 << 20), "5.0 MB");
+        assert_eq!(bytes(3 << 30), "3.0 GB");
+    }
+}

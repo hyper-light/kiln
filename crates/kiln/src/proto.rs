@@ -138,6 +138,10 @@ pub const CAP_SYNC: u32 = 64;
 /// a domain, HTTPS in front of the server, a `.local` name) and reports it with
 /// [`AgentMsg::FrontDoorStatus`].
 pub const CAP_FRONT_DOOR: u32 = 16;
+/// [`AgentMsg::Build`] capability: the runner says which git repositories its machine holds and
+/// clones, bundles and deletes them for the server's tasks (`crate::sync::repos`), inside
+/// [`AgentMsg::Sync`] / [`ServerMsg::Sync`]. Clear of CI's bits and of `CAP_REACH` (1 << 17).
+pub const CAP_REPOS: u32 = 1 << 18;
 
 // CI's capability bits (docs/ci.md §2.5) start at 1 << 10, clear of the rest of kiln's.
 /// The runner takes [`ServerMsg::AssignV2`], sends [`AgentMsg::JobEvent`], runs the GitHub-exact
@@ -440,7 +444,8 @@ mod tests {
             assert_eq!(decode::<AgentMsg>(&b)?, m);
         }
         let ci = [CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY];
-        let others = CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP | CAP_SYNC | CAP_FRONT_DOOR;
+        let others = CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP | CAP_SYNC | CAP_FRONT_DOOR | CAP_REPOS;
+        assert!(CAP_REPOS.is_power_of_two() && CAP_REPOS & (CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP | CAP_SYNC | CAP_FRONT_DOOR) == 0);
         let mut seen = 0u32;
         for c in ci {
             assert!(c.is_power_of_two() && c & others == 0 && c & seen == 0, "{c} is a bit of its own");
