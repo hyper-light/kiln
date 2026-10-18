@@ -50,6 +50,8 @@ The file is SQLite's format, so `sqlite3` reads it.
 
 ## Replication
 
+**A first replica, from C1.** The server already receives every session's updates, from every machine, to show them. It keeps them in its own store as they come in, so it holds every conversation. A runner that was away re-announces its sessions in full when it reconnects, and the server's copy catches up. What C2 adds is guaranteed delivery, the harness's record, extra replicas and fencing.
+
 Each session's conversation is one **Raft group**: hyper-raft's core in hyper-durable's shell, its
 log on hyper-log. The machinery is repo sync's (`sync::group`), with its own log file on each
 machine (`<state>/convo.log`, laid out for `GROUPS` groups).
@@ -103,7 +105,7 @@ keep_closed_days = 30
 
 | | What | Done when |
 |---|---|---|
-| C1 | Turso embedded; each machine's store; the writer (per event, batched); restore from the store; `events?before=` paging | a session restarted keeps its whole timeline; 10k events written and read back in tests; musl, macOS and Windows builds |
+| C1 | Turso embedded; each machine's store (a runner keeps its own sessions; the server keeps every session as its updates come in, so it is a first replica of all of them); the writer (per event, batched); restore from the store; `events?before=` paging | a session restarted keeps its whole timeline; 10k events written and read back in tests; musl, macOS and Windows builds |
 | C2 | Replication: the per-session group, the lane, epochs, the server's store of every conversation; the harness's record replicated | killing a runner loses nothing the server acknowledged; a runner offline catches up; tests with two members over the real group code |
 | C3 | Resuming on another machine from the server's store | a session whose machine is gone goes on elsewhere, its conversation and harness record intact; checked in the lab with a real Claude Code |
 | C4 | Search: the API and the console's filter box and find bar | search across agents, newest first, by words, tool, status, machine and time |

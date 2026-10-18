@@ -18,6 +18,11 @@ use crate::harness::session::Sink;
 pub const COMMIT_MS: u64 = 50;
 /// Rows that make a commit at once, however soon.
 pub const COMMIT_ROWS: usize = 2048;
+/// Updates waiting for the writer, at most: one that can't keep up (a stuck disk) drops what
+/// comes, saying so, rather than holding sessions back or growing without bound.
+pub const QUEUE: usize = 65_536;
+/// Longest a read waits for the writer.
+pub const READ_WAIT: Duration = Duration::from_secs(10);
 
 /// What the store keeps of one session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -79,41 +84,47 @@ enum Msg {
 /// A handle to a machine's store: cheap to clone, usable from any thread.
 #[derive(Clone)]
 pub struct Store {
-    tx: mpsc::Sender<Msg>,
+    tx: mpsc::SyncSender<Msg>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Store {
     /// The store, its writer thread started on `engine`.
     pub fn start(engine: Box<dyn Engine>) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::channel::<Msg>();
+        let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
         std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx))?;
-        Ok(Self { tx })
+        Ok(Self { tx, dropped: Default::default() })
     }
 
     /// What `update` of `session` makes, to be committed with the next batch.
     pub fn send(&self, session: &str, update: &Update) {
-        let rows = rows::of(session, update, crate::util::now_ms());
-        if !rows.is_empty() {
-            let _ = self.tx.send(Msg::Rows(rows));
-        }
+        self.put(rows::of(session, update, crate::util::now_ms()));
     }
 
-    /// Rows made elsewhere (a replica's entries), to be committed with the next batch.
+    /// Rows made elsewhere (a replica's entries), to be committed with the next batch. Never
+    /// blocks: when the writer can't keep up, they're dropped and counted.
     pub fn put(&self, rows: Vec<Row>) {
-        if !rows.is_empty() {
-            let _ = self.tx.send(Msg::Rows(rows));
+        if rows.is_empty() {
+            return;
+        }
+        if let Err(mpsc::TrySendError::Full(_)) = self.tx.try_send(Msg::Rows(rows)) {
+            let n = self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n.is_power_of_two() {
+                tracing::warn!(dropped = n + 1, "conversation store: the writer can't keep up; updates were dropped");
+            }
         }
     }
 
-    /// Run `f` on the engine once what was sent before is committed. Blocking.
+    /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at
+    /// most.
     fn read<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
         let (rtx, rrx) = mpsc::channel();
         self.tx
-            .send(Msg::Read(Box::new(move |e| {
+            .send_timeout_compat(Msg::Read(Box::new(move |e| {
                 let _ = rtx.send(f(e));
             })))
-            .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        rrx.recv().map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?
+            .map_err(|_| anyhow::anyhow!("the conversation store has stopped, or is full"))?;
+        rrx.recv_timeout(READ_WAIT).map_err(|_| anyhow::anyhow!("the conversation store didn't answer in time"))?
     }
 
     /// What is kept of `session`, with at most its last `last` events. Blocking.
@@ -136,6 +147,30 @@ impl Store {
     /// Wait until everything sent so far is committed. Blocking.
     pub fn sync(&self) -> anyhow::Result<()> {
         self.read(|_| Ok(()))
+    }
+}
+
+/// Sending a read: room is waited for, up to `READ_WAIT` (a full queue means a writer behind).
+trait SendWait {
+    fn send_timeout_compat(&self, m: Msg) -> Result<(), ()>;
+}
+
+impl SendWait for mpsc::SyncSender<Msg> {
+    fn send_timeout_compat(&self, mut m: Msg) -> Result<(), ()> {
+        let until = Instant::now() + READ_WAIT;
+        loop {
+            match self.try_send(m) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Disconnected(_)) => return Err(()),
+                Err(mpsc::TrySendError::Full(back)) => {
+                    if Instant::now() >= until {
+                        return Err(());
+                    }
+                    m = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
     }
 }
 

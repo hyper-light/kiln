@@ -155,6 +155,8 @@ pub struct Registry {
     kinds: Mutex<HashMap<String, Vec<KindInfo>>>,
     /// The server's own sessions.
     pub local: Arc<Host>,
+    /// The server's conversation store (docs/conversations.md), when it's on.
+    pub convo: Option<crate::convo::store::Store>,
     local_rx: async_channel::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
@@ -199,12 +201,16 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
 impl Registry {
     pub fn new(dir: std::path::PathBuf) -> Self {
         let (tx, rx) = async_channel::bounded(8192);
+        // Every session's conversation, on every machine, kept on disk as it comes in
+        // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
+        let convo = crate::convo::open(&dir);
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         Self {
             mirrors: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
             kinds: Mutex::new(HashMap::new()),
             local,
+            convo,
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
@@ -283,7 +289,7 @@ impl Registry {
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
         RESTORED.call_once(|| {
-            hub.harness.local.restore();
+            hub.harness.local.restore_from(hub.harness.convo.as_ref());
             match super::socket::serve(&hub.harness.local, super::socket::path("server", &hub.harness.dir)) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
@@ -376,6 +382,9 @@ impl Registry {
             }
             other => other,
         };
+        if let Some(store) = &self.convo {
+            store.send(id, &u);
+        }
         {
             let mut g = self.mirrors.lock();
             if let Update::Open { info } = &u {

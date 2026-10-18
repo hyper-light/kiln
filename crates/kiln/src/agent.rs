@@ -349,8 +349,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // this process's restarts: each continues its harness session.
     let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        let h = crate::harness::host::Host::new(harness_tx.clone(), Some(own_dir.join("harness.json")), Default::default());
-        h.restore();
+        // Conversations kept on disk as they happen (docs/conversations.md).
+        let convo = crate::convo::open(&own_dir);
+        let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
+        let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
+        h.restore_from(convo.as_ref());
         h
     });
     // What `kiln spawn` in this machine's terminals talks to.

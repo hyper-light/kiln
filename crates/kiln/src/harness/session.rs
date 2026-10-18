@@ -281,6 +281,9 @@ pub struct Seed {
     pub picks_up: bool,
     /// Said with the move (its folder isn't here, so it works in home).
     pub note: Option<String>,
+    /// Not a move: the session is started again here after a restart, its timeline and state
+    /// taken from the conversation store (`crate::convo`).
+    pub restored: bool,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -505,7 +508,14 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     core.state.harness_session.clone_from(&spec.resume);
     // Moved here: its timeline as it was, then the line saying so.
     let mut items = None;
-    if let Some(sd) = seed {
+    let restored = seed.as_ref().is_some_and(|sd| sd.restored);
+    if let Some(sd) = seed.as_ref().filter(|_| restored) {
+        // Restarted here: its timeline and state as the store kept them, and nothing said of it.
+        core.adopt(sd.events.clone(), sd.state.clone());
+        core.state.model = spec.model.clone().unwrap_or_default();
+        core.state.mode = spec.mode.clone().unwrap_or_default();
+        core.harness = Some(kind.name.to_owned());
+    } else if let Some(sd) = seed {
         core.adopt(sd.events, sd.state);
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
