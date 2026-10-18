@@ -569,7 +569,7 @@ fn launchd_body(i: &Install<'_>, log: &Path, launcher: Option<&Path>) -> String 
 }
 
 /// Run `launchctl` quietly: `Ok` if it succeeded, else what it said.
-fn launchctl(args: &[&str]) -> Result<(), String> {
+pub(crate) fn launchctl(args: &[&str]) -> Result<(), String> {
     match Command::new("launchctl").args(args).stdin(Stdio::null()).output() {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => {

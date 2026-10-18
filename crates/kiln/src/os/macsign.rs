@@ -316,7 +316,71 @@ mod imp {
                 signed.push(b);
             }
         }
+        watch().context("have launchd sign kiln again whenever it's replaced")?;
         Ok(signed)
+    }
+
+    const WATCHER: &str = "io.github.hyper-light.kiln-sign";
+
+    /// A launchd job that signs the installed kiln and its launchers again whenever they're
+    /// replaced, by anything: an upgrade by a kiln from before this signs nothing itself, nor does
+    /// a build or install by hand. It uses only macOS's own tools, so it works whatever kiln put
+    /// the binary there; one signed with kiln's identity already is left as it is.
+    fn watch() -> anyhow::Result<()> {
+        use std::fmt::Write as _;
+        let d = dir();
+        let bin_dir = crate::install::bin_path(false).parent().map(Path::to_path_buf).unwrap_or_default();
+        let launchers = crate::config::default_data_dir().join("launcher");
+        let script = d.join("resign");
+        let body = format!(
+            r#"#!/bin/sh
+# kiln signing (`kiln signing setup`): a kiln binary replaced here is signed again with this Mac's
+# kiln identity, so macOS knows it as the program it let onto the local network already.
+kc="{kc}"
+pw=$(cat "{pass}" 2>/dev/null) || exit 0
+/usr/bin/security unlock-keychain -p "$pw" "$kc" 2>/dev/null || exit 0
+id=$(/usr/bin/security find-identity -v -p codesigning "$kc" 2>/dev/null | /usr/bin/awk '/{name}/ {{print $2; exit}}')
+[ -n "$id" ] || exit 0
+for f in "{bin}" "{launchers}"/*; do
+  [ -f "$f" ] && [ -x "$f" ] || continue
+  case "$f" in *.new.*|*.signing.*|*.kiln-build) continue ;; esac
+  /usr/bin/codesign -dvv "$f" 2>&1 | /usr/bin/grep -q "^Authority={name}" && continue
+  tmp="$f.signing.$$"
+  /bin/cp -p "$f" "$tmp" && /usr/bin/codesign --force --sign "$id" --keychain "$kc" --identifier {ident} --timestamp=none "$tmp" && /bin/mv -f "$tmp" "$f" && echo "$(/bin/date) signed $f"
+  /bin/rm -f "$tmp"
+done
+"#,
+            kc = keychain().display(),
+            pass = d.join("keychain.pass").display(),
+            name = NAME,
+            bin = crate::install::bin_path(false).display(),
+            launchers = launchers.display(),
+            ident = IDENTIFIER,
+        );
+        crate::util::write_secret(&script, body.as_bytes(), 0o700)?;
+        let log = d.join("resign.log");
+        let mut plist = String::new();
+        let _ = write!(
+            plist,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict><key>Label</key><string>{WATCHER}</string>\
+             <key>ProgramArguments</key><array><string>/bin/sh</string><string>{}</string></array>\
+             <key>WatchPaths</key><array><string>{}</string><string>{}</string></array>\
+             <key>RunAtLoad</key><true/><key>StandardOutPath</key><string>{}</string><key>StandardErrorPath</key><string>{}</string></dict></plist>\n",
+            script.display(),
+            bin_dir.display(),
+            launchers.display(),
+            log.display(),
+            log.display(),
+        );
+        let agents = crate::os::home_dir().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents)?;
+        let path = agents.join(format!("{WATCHER}.plist"));
+        std::fs::write(&path, plist)?;
+        let domain = format!("gui/{}", crate::os::uid());
+        let _ = crate::install::launchctl(&["bootout", &format!("{domain}/{WATCHER}")]);
+        crate::install::launchctl(&["bootstrap", &domain, &path.to_string_lossy()]).map_err(anyhow::Error::msg)?;
+        Ok(())
     }
 }
 
