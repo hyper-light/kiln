@@ -234,10 +234,11 @@ function Watched({ m, range }: { m: Monitor; range: Range }) {
   const t = m.options.thresholds;
   // A change monitor's thresholds are of the change, not of the series drawn.
   const marks: Mark[] =
-    check.kind === "metric"
+    check.kind === "metric" || check.kind === "forecast"
       ? [{ label: "Critical", value: check.threshold ?? 0, color: SERIES.fail }, ...(t.warning !== null && t.warning !== undefined ? [{ label: "Warning", value: t.warning, color: SERIES.warn }] : [])]
       : [];
-  return <QueryChart queries={[check.watched?.query ?? ""]} range={range} height={220} marks={marks} />;
+  // A forecast monitor's chart reaches as far ahead as it looks.
+  return <QueryChart queries={[check.watched?.query ?? ""]} range={range} height={220} marks={marks} ahead={check.kind === "forecast" ? check.window_ms : undefined} />;
 }
 
 function LogsWatched({ search, range }: { search: string; range: Range }) {
@@ -418,7 +419,8 @@ function MonitorForm({ initial, onDone }: { initial: Monitor; onDone?: (after: M
                 {check ? (
                   check.ok ? (
                     <span>
-                      Alerts when {check.kind === "logs" ? "the count" : check.kind === "change" ? "the change" : "the value"} is {check.op} {check.threshold}.
+                      Alerts when {check.kind === "logs" ? "the count" : check.kind === "change" ? "the change" : check.kind === "forecast" ? "the forecast's edge" : "the value"} is {check.op}{" "}
+                      {check.threshold}.
                     </span>
                   ) : (
                     <span className="text-[#e2c4c6]">{check.error}</span>

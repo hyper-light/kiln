@@ -17,7 +17,7 @@ import { toast } from "@/components/ui/toast";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, formatValue, queriesRes, useParam, useRange, type Range } from "./parts";
+import { ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, dataOf, formatValue, queriesRes, useParam, useRange, type Range } from "./parts";
 
 const namesRes: Res<string[]> = { key: "observe/metric-names", fetch: (s) => observeApi.metrics(undefined, s).then((r) => r.metrics), opts: { pollMs: 300_000 } };
 
@@ -148,16 +148,17 @@ function Names({ onPick }: { onPick: (name: string) => void }) {
 function Answer({ query, range }: { query: string; range: Range }) {
   const answers = useRes(queriesRes([query], range)).data;
   const a: QueryAnswer | undefined = answers[0];
-  const { data, labels, bands } = React.useMemo(() => chartData(answers), [answers]);
+  const { data, bands, drawn } = React.useMemo(() => chartData(answers), [answers]);
   if (!a) return null;
   if (a.scalar !== null) return <p className="py-10 text-center font-mono text-3xl text-[#e4e5e7]">{formatValue(a.scalar)}</p>;
+  // Each series' figures are of its data: a forecast's values are not its last, nor its most.
   const rows = a.series.map((s, i) => ({
-    label: labels[i] ?? "",
+    label: drawn.find((d) => d.source === i && !d.forecast)?.label ?? "",
     color: PALETTE[i % PALETTE.length] ?? SERIES.grey,
-    last: aggregate(s.values, "last"),
-    avg: aggregate(s.values, "avg"),
-    min: aggregate(s.values, "min"),
-    max: aggregate(s.values, "max"),
+    last: aggregate(dataOf(s), "last"),
+    avg: aggregate(dataOf(s), "avg"),
+    min: aggregate(dataOf(s), "min"),
+    max: aggregate(dataOf(s), "max"),
   }));
   return (
     <>
@@ -171,7 +172,7 @@ function Answer({ query, range }: { query: string; range: Range }) {
           legend={false}
           timeFormat={range === "7d" || range === "30d" ? "day" : "time"}
           yFormat={(v) => formatValue(v)}
-          series={rows.map((r) => ({ label: r.label, color: r.color }))}
+          series={drawn.map((d) => ({ label: d.label, color: PALETTE[d.source % PALETTE.length] ?? SERIES.grey, ...(d.forecast ? { dash: [6, 4] } : {}) }))}
           bands={bands}
         />
       )}

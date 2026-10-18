@@ -92,6 +92,10 @@ pub enum Func {
     /// `anomalies(query, 'basic'|'agile'|'robust', bounds, 'both'|'above'|'below')`: the series
     /// and its band (`crate::anomaly`).
     Anomalies,
+    /// `forecast(query, 'linear'|'seasonal', deviations, model=, seasonality=, history=,
+    /// interval=)`: the series, and past its last point what it will do and its bounds
+    /// (`crate::forecast`).
+    Forecast,
 }
 
 impl Func {
@@ -115,6 +119,7 @@ impl Func {
             "ewma" => Self::Ewma,
             "clamp" => Self::Clamp,
             "anomalies" => Self::Anomalies,
+            "forecast" => Self::Forecast,
             _ => return None,
         })
     }
@@ -126,6 +131,8 @@ impl Func {
             Self::Timeshift | Self::MovingAvg | Self::Ewma => (2, 2),
             Self::Clamp => (3, 3),
             Self::Anomalies => (1, 4),
+            // The query and its algorithm; deviations; then named arguments.
+            Self::Forecast => (2, 8),
             _ => (1, 1),
         }
     }
@@ -139,6 +146,9 @@ pub enum Node {
     Neg(NodeId),
     Bin(BinOp, NodeId, NodeId),
     Call(Func, Vec<NodeId>),
+    /// A named argument, `model='reactive'`, its value as written (a string's, a number's or a
+    /// name's): a function's argument, nothing else.
+    Named(String, String),
 }
 
 /// A parsed query: its nodes, children before their parents, and the root.
@@ -241,6 +251,28 @@ pub fn parse(q: &str) -> Result<Ast, ParseError> {
                 Tok::LParen => {
                     ops.push(Op::Group(at));
                     i += 1;
+                }
+                // A named argument: `key='value'` (the lexer reads `key=` as a name), `key=value` (one
+                // name), or `key = value`.
+                Tok::Name(name) if matches!(ops.last(), Some(Op::Call(..))) && (name.find('=').is_some_and(|p| p > 0) || matches!(toks.get(i + 1), Some((_, Tok::Name("="))))) => {
+                    let (key, inline, at_value) = match name.split_once('=') {
+                        Some((k, v)) if !v.is_empty() => (k, Some(v), i),
+                        Some((k, _)) => (k, None, i + 1),
+                        None => (*name, None, i + 2),
+                    };
+                    let value = match (inline, toks.get(at_value)) {
+                        (Some(v), _) => v.to_owned(),
+                        (None, Some((_, Tok::Str(v)))) => v.clone(),
+                        (None, Some((_, Tok::Number(x)))) => x.to_string(),
+                        (None, Some((_, Tok::Name(v)))) => (*v).to_owned(),
+                        _ => return Err(syntax(at, format!("{key}= needs a value"))),
+                    };
+                    if key.is_empty() || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                        return Err(syntax(at, format!("a named argument's name: {key}")));
+                    }
+                    b.push(Node::Named(key.to_ascii_lowercase(), value));
+                    expect_operand = false;
+                    i = at_value + 1;
                 }
                 Tok::Name(name) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) && Func::by_name(&name.to_ascii_lowercase()).is_some() => {
                     let f = Func::by_name(&name.to_ascii_lowercase()).ok_or_else(|| syntax(at, "a function"))?;

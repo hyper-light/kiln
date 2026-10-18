@@ -9,13 +9,16 @@ const enc = encodeURIComponent;
 
 /** A query's answer: series on one grid of buckets. */
 /** An `anomalies()` series' band: each bucket's bounds and score (its error in calibrated deviations). */
+/** A series' band: an `anomalies()` one's (each bucket's score) or a `forecast()` one's (from
+ * `forecast_from` on, the values are forecast, not data). */
 export interface Bounds {
   lower: (number | null)[];
   upper: (number | null)[];
   score: (number | null)[];
   k: number;
   direction: "both" | "above" | "below";
-  algorithm: "basic" | "agile" | "robust";
+  algorithm: "basic" | "agile" | "robust" | "linear" | "seasonal";
+  forecast_from?: number | null;
 }
 
 export interface QueryAnswer {
@@ -178,7 +181,7 @@ export interface MonitorCheck {
   ok: boolean;
   op?: string;
   threshold?: number;
-  kind?: "metric" | "change" | "logs" | "composite";
+  kind?: "metric" | "change" | "logs" | "composite" | "forecast";
   watched?: { query?: string; search?: string };
   composite?: CompositeOf;
   window_ms?: number;

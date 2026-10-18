@@ -37,10 +37,12 @@ on a repository covers its pipelines and environments.
 | Machines | `machines.read`, `machines.manage`, `machines.terminal`, `binaries.publish` |
 | Agents | `agents.run`, `agents.attach`, `agents.stop`, `experiments.run` |
 | Secrets | `secrets.use:<name>`, `secrets.manage` |
+| Observe | `observe.read` (queries, searches, live tails, dashboards, monitors, integrations listed without their secrets), `observe.write` (dashboards, monitors, series, logs and events posted), `observe.manage` (integrations and clouds, which hold secrets; the store's compaction and checks) |
 | Server | `settings.manage`, `tokens.manage`, `users.manage`, `audit.read` |
 
-**Roles** are named sets of capabilities: `viewer`, `developer` (trigger, rerun, submit, review),
-`maintainer` (plus land, attach agents, manage the queue), `admin` (everything but ownership) and
+**Roles** are named sets of capabilities: `viewer` (reads, observe's too), `developer` (trigger,
+rerun, submit, review; observe's dashboards and monitors), `maintainer` (plus land, attach agents,
+manage the queue; observe's integrations and clouds), `admin` (everything but ownership) and
 `owner`. Custom roles are allowed. A user holds roles per scope. Grants add up across scopes, and
 an explicit deny wins.
 

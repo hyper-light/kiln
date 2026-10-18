@@ -61,6 +61,11 @@ pub const CAPABILITIES: &[&str] = &[
     "users.manage",
     "audit.read",
     "binaries.publish",
+    // Observe (docs/observe.md §7): reading it, writing to it (dashboards, monitors, data posted),
+    // managing it (its integrations and clouds, which hold secrets; its store).
+    "observe.read",
+    "observe.write",
+    "observe.manage",
 ];
 
 /// What a route needs when any signed-in principal may call it (who you are, the schemas).
@@ -70,8 +75,8 @@ pub const SIGNED_IN: &str = "signed-in";
 /// submits and reviews; `maintainer` also lands, attaches agents, debugs, approves, deploys and
 /// manages the queue, secrets and variables; `admin` and `owner` have every capability.
 pub fn role(name: &str) -> Option<Vec<&'static str>> {
-    const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read"];
-    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run"];
+    const VIEWER: &[&str] = &["runs.read", "logs.read", "artifacts.read", "runners.read", "diffs.read", "observe.read"];
+    const DEVELOPER: &[&str] = &["runs.trigger", "runs.rerun", "runs.cancel", "artifacts.write", "caches.write", "workflows.edit", "diffs.submit", "diffs.review", "agents.run", "observe.write"];
     const MAINTAINER: &[&str] = &[
         "runs.debug",
         "runs.approve",
@@ -83,6 +88,7 @@ pub fn role(name: &str) -> Option<Vec<&'static str>> {
         "variables.manage",
         "secrets.manage",
         "images.build",
+        "observe.manage",
     ];
     Some(match name {
         "viewer" => VIEWER.to_vec(),
@@ -348,6 +354,23 @@ pub static ROUTES: &[Rule] = &[
     // Deployments (docs/cd.md).
     r("GET", "/api/cd/**", "runs.read", At::Server),
     any("/api/cd/**", "environments.deploy", At::Server),
+    // Observe (docs/observe.md §7): every GET and every query, search and check asked by POST
+    // reads; integrations, clouds and the store's operations manage; the rest writes (dashboards,
+    // monitors, series, logs and events posted). Snapshot files and OTLP are answered before this,
+    // on tokens of their own.
+    r("GET", "/api/observe/v1/**", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/query", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/search", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/aggregate", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/facets", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/logs/patterns", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/events/search", "observe.read", At::Server),
+    r("POST", "/api/observe/v1/monitors/validate", "observe.read", At::Server),
+    any("/api/observe/v1/integrations/**", "observe.manage", At::Server),
+    any("/api/observe/v1/clouds/**", "observe.manage", At::Server),
+    r("POST", "/api/observe/v1/compact", "observe.manage", At::Server),
+    r("POST", "/api/observe/v1/verify", "observe.manage", At::Server),
+    any("/api/observe/v1/**", "observe.write", At::Server),
     // Runners and machines.
     r("GET", "/api/agents", "runners.read", At::Server),
     r("GET", "/api/reach/runners", "runners.read", At::Server),

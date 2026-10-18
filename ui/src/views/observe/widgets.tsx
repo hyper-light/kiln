@@ -8,7 +8,24 @@ import { Link } from "@/lib/router";
 import type { Widget } from "@/api/observe";
 import { SERIES } from "@/components/charts/types";
 import { useRes } from "@/lib/data";
-import { PALETTE, QueryChart, STATUS_COLOR, StateBadge, aggregate, firstLine, formatValue, logsOnly, monitorsRes, queriesRes, recordsRes, seriesLabel, when, within, type Range } from "./parts";
+import {
+  PALETTE,
+  QueryChart,
+  STATUS_COLOR,
+  StateBadge,
+  aggregate,
+  dataOf,
+  firstLine,
+  formatValue,
+  logsOnly,
+  monitorsRes,
+  queriesRes,
+  recordsRes,
+  seriesLabel,
+  when,
+  within,
+  type Range,
+} from "./parts";
 
 // Markdown's renderer is big: only a dashboard with a note loads it.
 const MarkdownBody = React.lazy(() => import("@/lib/markdown").then((m) => ({ default: m.MarkdownBody })));
@@ -72,7 +89,7 @@ function Empty({ height, what }: { height: number; what: string }) {
 function QueryValue({ queries, range, height, unit, how }: { queries: string[]; range: Range; height: number; unit?: string; how: string }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const a = answers[0];
-  const values = (a?.series ?? []).map((s) => aggregate(s.values, how)).filter((v): v is number => v !== null);
+  const values = (a?.series ?? []).map((s) => aggregate(dataOf(s), how)).filter((v): v is number => v !== null);
   const v =
     a?.scalar ??
     (values.length
@@ -95,7 +112,7 @@ function QueryValue({ queries, range, height, unit, how }: { queries: string[]; 
 function TopList({ queries, range, height, unit, how }: { queries: string[]; range: Range; height: number; unit?: string; how: string }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const rows = answers
-    .flatMap((a) => a.series.map((s) => ({ label: seriesLabel(s.tags), v: aggregate(s.values, how) })))
+    .flatMap((a) => a.series.map((s) => ({ label: seriesLabel(s.tags), v: aggregate(dataOf(s), how) })))
     .filter((r): r is { label: string; v: number } => r.v !== null)
     .sort((a, b) => b.v - a.v)
     .slice(0, 25);
@@ -118,7 +135,7 @@ function TopList({ queries, range, height, unit, how }: { queries: string[]; ran
 function SeriesTable({ queries, range, height, unit }: { queries: string[]; range: Range; height: number; unit?: string }) {
   const answers = useRes(queriesRes(queries, range)).data;
   const rows = answers.flatMap((a) =>
-    a.series.map((s) => ({ label: seriesLabel(s.tags), last: aggregate(s.values, "last"), avg: aggregate(s.values, "avg"), min: aggregate(s.values, "min"), max: aggregate(s.values, "max") })),
+    a.series.map((s) => ({ label: seriesLabel(s.tags), last: aggregate(dataOf(s), "last"), avg: aggregate(dataOf(s), "avg"), min: aggregate(dataOf(s), "min"), max: aggregate(dataOf(s), "max") })),
   );
   if (rows.length === 0) return <Empty height={height} what="data in this range" />;
   return (

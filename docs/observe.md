@@ -19,7 +19,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
-| O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); next: forecast | in progress |
+| O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
@@ -281,6 +281,15 @@ before the range on the range's grid (11,000 buckets in all at the most): the hi
 and the calibration are learned from, its gaps left out, its points' spacing their mean gap.
 `direction` (`both`, `above`, `below`) says which side of the band is anomalous.
 
+`forecast(query, 'linear'|'seasonal', deviations, model='default'|'simple'|'reactive',
+seasonality='hourly'|'daily'|'weekly', history='1w', interval=seconds)` forecasts each series past
+its last point to the range's end (Datadog's arguments, named as Datadog names them; `interval` the
+step, `history` how far back a linear one learns, `timezone` only UTC's): up to it the series, from
+it the forecast, its band `deviations` either side (§9.1). The query beneath reads ten seasons before
+the range (seasonal; a daily season unless said) or the history asked (linear: 30 times the buckets
+ahead unless said), at most the 11,000 buckets a query reads. A season under two buckets at the step
+is refused.
+
 A search's records group into **patterns** (`kiln_obs::logs::patterns`): Drain (He et al., ICWS
 2017) over their messages, a number (its sign with it), `0x` hex and long hex ids masked where they
 stand apart, one setting for every system (depth 5, similarity 0.7, a masked variable alike where
@@ -306,11 +315,15 @@ same search syntax.
 
 ## 7. API
 
-Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
+Under `/api/observe/v1/` (all JSON; the UI uses nothing else), each route under a capability of
+kiln's (docs/access.md): every GET, and every query, search and check asked by POST, needs
+`observe.read` (a viewer's); dashboards, monitors and data posted need `observe.write` (a
+developer's); integrations, clouds and the store's operations need `observe.manage` (a
+maintainer's). `/api/openapi.json` says each route's. Built:
 
 | | |
 | --- | --- |
-| `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at |
+| `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at; a series with a band (`anomalies()`, `forecast()`) has `bounds` (`lower`, `upper`, `score`, `k`, `algorithm`, and a forecast's `forecast_from`, its first bucket forecast; `to` past now draws it) |
 | `GET metrics?match=` , `GET tags?key=&match=` | metric names and tag values, sorted (autocomplete) |
 | `POST logs/search` | `{query, from, to, limit}` → records newest first, with the blocks pruned |
 | `POST series` | ingest points as Datadog's v1 series API takes them (`metric`, `type`, `tags`, `points` of `[seconds, value]`) |
@@ -422,6 +435,12 @@ options, so a monitor written for Datadog reads here.
 - The server, the leader, evaluates each on the blocking pool; each group's change is an event
   (`source:kiln.event @event.type:monitor.alert`, …) and, unless muted, its notifications; states
   are saved as they change.
+- **Forecasts**: Datadog's `max(next_1w):forecast(<metric query>, 'linear', 2, ...) >= 90`: a group's
+  value is its forecast's highest upper bound over the next window (`max`, alerting above), or its
+  lowest lower bound (`min`, with `<=`, below): "the edge of the forecast confidence bounds goes above
+  or below the threshold within the next" window, as Datadog says; an hour to three months ahead,
+  read in 96 buckets (or the forecast's `interval`). A group whose forecast cannot be made (too
+  little history) has no value.
 - **Composites** (`type: "composite"`, `kiln_obs::monitor::composite`): Datadog's, a condition over
   up to ten other monitors, none of them a composite, by id in the API (`m1 && (m2 || !m3)`) and by
   letter in the form (`a && (b || !c)`). States are weighed by severity, ALERT over WARN over NO
@@ -437,7 +456,7 @@ options, so a monitor written for Datadog reads here.
   reads, and at its own interval besides; a monitor a composite reads is not deleted while it does
   (409, naming the composites), nor made a composite itself.
 
-To come: forecast and outlier monitors (§9.1).
+To come: outlier monitors.
 
 ### 9.1 Anomalies and forecasts
 
@@ -477,8 +496,36 @@ false positives), 58.3 (rewarding few false negatives); `basic` 50.3, 41.0, 54.8
 (47.1) and the windowed Gaussian (39.6), below Relative Entropy (54.6).
 
 Built on it: `anomalies()` in queries (§6), drawn as a band with its anomalies marked (§11), and
-anomaly monitors (§9). To come: forecasts (Holt-Winters with the fitted smoothing, its intervals from
-the calibrated deviation); outlier and composite monitors.
+anomaly monitors (§9).
+
+**Forecasts** (`kiln_obs::forecast`): Datadog's `forecast()` says what its algorithms are for, not
+how they work, so kiln's were chosen on the M4 competition's data, scored as M4 scores them, the
+scoring checked by remaking M4's own benchmarks to their published figures (§12.15):
+
+- `seasonal`: additive Holt-Winters with a damped trend (Gardner and McKenzie 1985), its smoothing
+  the grid's that errs least over the whole horizon from every season's start (one step ahead errs
+  0.83 OWA, the horizon 0.63), learned from the last ten seasons (of 6, 8, 10, 12, 15, 20 and all);
+  and the seasonal naive (the last season again).
+- `linear`: `default`, Holt's linear method, damped or not as it errs least one step ahead, and the
+  last value, from the last 30 horizons of points (of 10, 15, 20, 30, 40); `reactive`, Holt's
+  undamped from the last 4, alone; `simple`, Theil and Sen's line through the history (the median of
+  every pair's slope, robust to 29% of the points being wild; Sen 1968), at most 512 of its points.
+- Each forecast is one of three, chosen per series on its own history: the smoothing, the naive,
+  or the two averaged (M4's lesson: a combination beats its parts). Each is made from every origin
+  of the history as it will be from the last, and the average is kept unless another erred less by
+  a fifth: a steady trend (a disk filling) erred far less carried on than averaged with its last
+  value, which lags it by half, so it is carried on; a random walk keeps the average.
+- The bounds are the chosen way's own errors at each step ahead from those origins, their root mean
+  square, never narrower than the step before: `deviations` of it either side (2 unless said).
+
+On M4: hourly series (seasonal), OWA 0.556 against the seasonal naive's 0.628 and M4's Naive2's 1,
+95% bounds (1.96 deviations) holding 94.3% of outcomes, MSIS 7.30 (M4's ETS 17.49, ARIMA 7.54);
+daily series (linear, default), OWA 0.976 (M4's best entry 0.977, its combination of exponential
+smoothings 0.978), 93.3% held, MSIS 28.9 (ETS 29.7, Naive 32.6). A series forecasts in 0.8 ms
+(hourly) or 0.2 ms (daily) with ten allocations.
+
+Built on it: `forecast()` in queries (§6), drawn past now with its band (§11), and forecast monitors
+(§9). To come: outlier monitors.
 
 ## 10. Integrations
 
@@ -557,7 +604,10 @@ time range and the search in the address (a page is a link).
 - **Metrics explorer**: a query, its series over the range and each one's last, average, least and
   most; with no query, every metric kiln keeps, found by name. A query goes onto a dashboard, or
   into a monitor, in a step. An `anomalies()` series is drawn with its band beneath it, in its color,
-  its points past the band marked (every chart: a dashboard's, a monitor's).
+  its points past the band marked (every chart: a dashboard's, a monitor's). A chart of a
+  `forecast()` reaches half its range past now (a forecast monitor's, its horizon): each series
+  solid to its last point, then dashed in its color with its band; its figures (last, average, least,
+  most; a widget's value) are its data's alone.
 - **Patterns** (the logs explorer's and the event stream's other view, `?view=patterns`): the
   search's records grouped by their template (Drain), the most common first, each its count, its
   worst status, its template (variables a quiet `*`) and when last seen; a click narrows the search
@@ -1013,6 +1063,51 @@ Live, a debug build (§13): a record posted comes on the tail within 0.41 s at t
 flood at 50 asked the tail shows 51 a second (10 a tick, 20 after a tick that read nothing), every
 one of 18,700 posted counted and none missed.
 
+### 12.15 Forecasts on M4
+
+`M4=<M4's Dataset folder> cargo bench -p kiln-obs --bench m4`: the M4 competition's hourly series
+(414, 48 points ahead, a season of 24) and daily ones (4,227, 14 ahead), their test periods held out,
+scored as M4 scores them (its `Benchmarks and Evaluation.R`): sMAPE, MASE (scaled by the in-sample
+seasonal naive's errors), OWA against Naive2's, and 95% intervals by MSIS (Gneiting and Raftery's
+interval score at α 0.05, scaled as MASE) and coverage.
+
+**The scoring checked**: M4's own benchmarks made again (Naive, seasonal naive, Naive2 with M4's
+90% seasonality test and classical multiplicative decomposition, Naive's random-walk intervals)
+score what M4 published for them (`Evaluation and Ranks.xlsx`) to the third decimal: hourly Naive
+43.003 / 11.608 / 3.593, seasonal naive 13.912 / 1.193, Naive2 18.383 / 2.395, Naive's intervals'
+MSIS 71.245 and its coverage's distance from 95%, 0.011; daily 3.045 / 3.278 and 32.552, 0.021.
+
+| hourly | sMAPE | MASE | OWA | MSIS | held |
+| --- | --- | --- | --- | --- | --- |
+| seasonal naive | 13.912 | 1.193 | 0.628 | 9.111 (its own errors' bounds) | 0.963 |
+| Holt-Winters, fitted one step ahead | 18.633 | 1.536 | 0.827 | 11.894 | 0.965 |
+| Holt-Winters, fitted to the horizon | 15.187 | 1.018 | 0.626 | 7.806 | 0.960 |
+| … averaged with the seasonal naive | 13.778 | 1.006 | 0.585 | 7.880 | 0.962 |
+| … from the last 10 seasons (the last 6: 0.624) | 13.569 | 1.020 | 0.582 | 7.642 | 0.952 |
+| **kiln `seasonal`** (each series choosing, by a fifth) | 13.216 | 0.942 | **0.556** | **7.301** | 0.943 |
+| M4: ETS / ARIMA intervals; its best entry | | | 0.440 | 17.487 / 7.538 | |
+
+| daily | sMAPE | MASE | OWA | MSIS | held |
+| --- | --- | --- | --- | --- | --- |
+| Naive (M4's) | 3.045 | 3.278 | 1.000 | 32.552 | 0.929 |
+| Holt, one step, last 20 horizons | 3.045 | 3.237 | 0.994 | 28.724 | 0.928 |
+| … averaged with the last value | 2.974 | 3.232 | 0.981 | 28.491 | 0.930 |
+| Theil-Sen over the last 2 horizons | 4.315 | 4.657 | 1.419 | 38.910 | 0.909 |
+| **kiln `linear`, default** (each series choosing) | 2.955 | 3.220 | **0.976** | 28.903 | 0.933 |
+| kiln `linear`, reactive | 3.285 | 3.490 | 1.072 | 29.126 | 0.894 |
+| M4: Comb (SES, Holt, damped); best entry; ETS intervals | 2.980 | 3.203 | 0.978; 0.977 | 29.7 | |
+
+Every choice was made on all the series and held on their halves (odd and even places): the
+seasons (10 best on both hourly halves), the horizons (30 on both daily halves), the margin a way
+must win by to be chosen over the average (0.2: best or tied on three of the four halves, 0.006
+behind 0.1 on the fourth). Daily outcomes fall inside 1.96 deviations 93.3% of the time, not 95%:
+errors at in-sample origins understate those to come a little; the figure is reported, not tuned.
+`simple` over a daily series' whole history (up to 27 years) is 6.99: a line through a random walk
+is the wrong model, as Datadog says (`linear` "for metrics that have steady trends"); on a steady
+trend it is near exact (a filling disk, §13). A series costs 0.8 ms (hourly) and 0.2 ms (daily) and
+ten allocations: the model's buffers kept across the 800 smoothings it tries (160 without a
+season), each stopped once it errs more than the best (11 times faster).
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -1088,6 +1183,20 @@ webhook and to Slack. Run again and again, two flakes showed and are gone: WebKi
 page makes a field, can drop text typed into it with no input event at all (every field is now
 checked to hold what was typed, and typed again if not); and a button found by part of its name
 also found kiln's own metrics named `…_running` (every button is found by its whole name).
+
+**Forecasts** (`observe_live.rs`): two disks, one filling a percent an hour from 62 and one steady
+at 40, two days of a point every ten minutes: the query API forecasts both past now, the filling one
+74 twelve hours on within its band and the steady one 40; `max(next_2d):forecast(..., 'linear', 2)
+>= 95` alerts the filling disk alone, and a webhook hears it once. 2026-10-18: passes (23 s). In a
+browser, the explorer draws a filling disk's forecast and its table says the data's last (62), not
+the forecast's; in Chromium and WebKit as a phone.
+
+**Roles** (`observe_live.rs`): tokens of a viewer, a developer and a maintainer against a
+server: the viewer reads (status, a query, a search, dashboards, monitors, integrations,
+a check) and is refused (403) a monitor, a dashboard, data posted, an integration and a compaction;
+the developer makes a monitor and a dashboard and posts data, and is refused an integration, a
+cloud and a check of the replicas; the maintainer adds an integration and removes it; the OpenAPI
+document says what each route needs. 2026-10-18: passes (18 s).
 
 **Composites** (`observe_live.rs`): two monitors grouped by host, one alerting web01–05 and the
 other web04–09, and their composite `a && b`: it alerts web04 and web05 and no other host, a webhook

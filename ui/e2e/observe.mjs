@@ -108,6 +108,33 @@ const scenarios = {
     expect((await api("GET", `/api/observe/v1/dashboards/${id}`)).status === 404, "the dashboard gone");
   },
 
+  /** A forecast in the explorer: a disk filling a percent an hour drawn past now (the API's answer
+   * forecasting it carried on), and the table's figures the data's, its last the last point's. */
+  async "a forecast is drawn past now, and the explorer's figures are the data's"() {
+    const metric = `e2e.forecast.disk.${run}`;
+    const now = Math.floor(Date.now() / 600_000) * 600_000;
+    const points = Array.from({ length: 6 * 24 + 1 }, (_, i) => {
+      const t = now - (6 * 24 - i) * 600_000;
+      return [t / 1000, 62 + (t - now) / 3_600_000];
+    });
+    expect((await api("POST", "/api/observe/v1/series", { series: [{ metric, type: "gauge", tags: ["host:db-1"], points }] })).status === 202, "writing the disk's points");
+    const query = `forecast(avg:${metric}{*} by {host}, 'linear', 2)`;
+    await until("the points stored", async () => (await api("POST", "/api/observe/v1/query", { query: `avg:${metric}{*}`, from: now - 3_600_000, to: now + 600_000 })).body?.series?.length === 1);
+    await page.goto(`${BASE}/observe/metrics?range=1d&q=${encodeURIComponent(query)}`);
+    const row = page.locator("table.data-table tbody tr").first();
+    await row.waitFor({ timeout: 20_000 });
+    // The data's last, 62, not the forecast's (some 74 twelve hours on).
+    const last = Number((await row.locator("td").nth(1).innerText()).replace(/,/g, ""));
+    expect(Math.abs(last - 62) < 0.5, `the table's last is the data's: ${last}`);
+    await page.locator("canvas").first().waitFor();
+    const a = await api("POST", "/api/observe/v1/query", { query, from: now - 86_400_000, to: now + 12 * 3_600_000, points: 240 });
+    const s = a.body.series[0];
+    const from = s.bounds?.forecast_from;
+    expect(a.status === 200 && Number.isInteger(from) && from < s.values.length, `a forecast past now: ${JSON.stringify(s.bounds ?? null).slice(0, 120)}`);
+    const end = s.values.at(-1);
+    expect(Math.abs(end - 74) < 2 && s.bounds.lower.at(-1) < end && end < s.bounds.upper.at(-1), `carried on to ${end} in its band`);
+  },
+
   /** kiln's own dashboard narrowed to one host by its template variable. */
   async "a template variable narrows every widget to its value"() {
     const hosts = (await api("GET", "/api/observe/v1/tags?key=host")).body.values;

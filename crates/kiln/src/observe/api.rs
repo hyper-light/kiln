@@ -258,6 +258,8 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
                         kiln_obs::monitor::Kind::Metric { query, window_ms, .. } => ("metric", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Change { query, window_ms, .. } => ("change", json!({ "query": query }), window_ms),
                         kiln_obs::monitor::Kind::Logs { search, window_ms, .. } => ("logs", json!({ "search": search }), window_ms),
+                        // A forecast's window is ahead: `window_ms` its horizon.
+                        kiln_obs::monitor::Kind::Forecast { query, ahead_ms, .. } => ("forecast", json!({ "query": query }), ahead_ms),
                     };
                     srv::json(StatusCode::OK, &json!({ "ok": true, "op": q.op.as_str(), "threshold": q.threshold, "kind": kind, "watched": watched, "window_ms": window_ms }))
                 }
@@ -405,6 +407,8 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
     reading(move |s| {
         let started = std::time::Instant::now();
         let mut r = QueryRequest::new(&body.query, body.from, body.to);
+        // A forecast() forecasts past its series' last point, to the range's end.
+        r.now = Some(crate::util::now_ms());
         r.step = body.step;
         if let Some(p) = body.points {
             r.points = p.clamp(1, eval::MAX_POINTS);
@@ -422,7 +426,7 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
                 o.insert("values".into(), json!(x.values));
                 // An `anomalies()` series' band: its bounds and each bucket's score (deviations).
                 if let Some(b) = &x.bounds {
-                    o.insert("bounds".into(), json!({ "lower": b.lower, "upper": b.upper, "score": b.score, "k": b.k, "direction": b.direction.as_str(), "algorithm": b.algorithm.as_str() }));
+                    o.insert("bounds".into(), json!({ "lower": b.lower, "upper": b.upper, "score": b.score, "k": b.k, "direction": b.direction.as_str(), "algorithm": b.algorithm, "forecast_from": b.forecast_from }));
                 }
                 Value::Object(o)
             })

@@ -142,6 +142,8 @@ impl Monitor {
     fn window_ms(q: &monitor::Query) -> i64 {
         match &q.kind {
             monitor::Kind::Metric { window_ms, .. } | monitor::Kind::Change { window_ms, .. } | monitor::Kind::Logs { window_ms, .. } => *window_ms,
+            // Ahead, not behind: an hour without a forecast is two "windows" without data.
+            monitor::Kind::Forecast { .. } => 3_600_000,
         }
     }
 

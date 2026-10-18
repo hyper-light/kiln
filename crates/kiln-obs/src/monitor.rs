@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! metric := time_aggr "(" window ")" ":" query op threshold
+//! forecast := ("max" | "min") "(" "next_" n unit ")" ":" "forecast(" query "," algorithm ["," deviations] ["," name "=" value]* ")" op threshold
 //! change := ("change" | "pct_change") "(" time_aggr "(" window ")" "," shift ")" ":" query op threshold
 //! logs   := "logs(" '"' search '"' ")" [".index(" '"' * '"' ")"] ".rollup(" '"' measure '"' ["," '"' facet '"'] ")"
 //!           [".by(" '"' facets '"' ")"] ".last(" '"' window '"' ")" op threshold
@@ -30,6 +31,12 @@ use crate::store::Store;
 /// The longest a monitor's window may be: a week (Datadog's longest, `last_1w`), so that one
 /// evaluation reads a bounded range.
 pub const MAX_WINDOW_MS: i64 = 7 * 86_400_000;
+/// The furthest a forecast monitor looks ahead: three months (Datadog's "between 12 hours and 3
+/// months"; shorter here too, an hour at the least).
+pub const MAX_AHEAD_MS: i64 = 92 * 86_400_000;
+/// Buckets a forecast monitor reads its horizon in, unless its forecast names an `interval`: a
+/// day's season at a quarter hour, a week's horizon at two hours.
+pub const FORECAST_POINTS: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeAggr {
@@ -81,6 +88,9 @@ pub enum Kind {
     /// The value now against the value `shift_ms` before (`pct`: as a percent of it).
     Change { aggr: TimeAggr, window_ms: i64, shift_ms: i64, pct: bool, query: String },
     Logs { search: String, measure: Measure, by: Vec<Facet>, window_ms: i64 },
+    /// Datadog's forecast monitor: the edge of a forecast's bounds over the next `ahead_ms`, its
+    /// highest upper bound (`max`, alerting above) or its lowest lower one (`min`, below).
+    Forecast { highest: bool, ahead_ms: i64, query: String },
 }
 
 /// A monitor's query, parsed.
@@ -120,6 +130,21 @@ fn window(s: &str) -> Result<i64, MonitorError> {
     };
     let w = n.checked_mul(ms).filter(|&w| w > 0 && w <= MAX_WINDOW_MS).ok_or_else(|| syntax(format!("a window of {s}: at most a week")))?;
     Ok(w)
+}
+
+/// A forecast monitor's horizon (`1w`, `24h`, `3d`, ...): an hour to three months.
+fn ahead(s: &str) -> Result<i64, MonitorError> {
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).ok_or_else(|| syntax(format!("a horizon without a unit: {s}")))?);
+    let n: i64 = n.parse().map_err(|_| syntax(format!("a horizon: {s}")))?;
+    let per = match unit {
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 7 * 86_400_000,
+        "mo" => 30 * 86_400_000,
+        _ => return Err(syntax(format!("a horizon's unit: {unit}"))),
+    };
+    n.checked_mul(per).filter(|&ms| (3_600_000..=MAX_AHEAD_MS).contains(&ms)).ok_or_else(|| syntax(format!("a horizon of {s}: an hour to three months")))
 }
 
 fn aggr(s: &str) -> Result<TimeAggr, MonitorError> {
@@ -208,7 +233,20 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     if query.is_empty() {
         return Err(syntax("a metric query after the colon"));
     }
-    let kind = if let Some(inner) = head.strip_prefix("change(").or_else(|| head.strip_prefix("pct_change(")) {
+    let kind = if let Some((a, rest)) = head.split_once('(').filter(|(_, r)| r.trim_start().starts_with("next_")) {
+        // max(next_1w):forecast(...)
+        let highest = match a.trim() {
+            "max" => true,
+            "min" => false,
+            other => return Err(syntax(format!("a forecast monitor's aggregation: {other} (max, alerting above; min, below)"))),
+        };
+        let w = rest.trim().trim_end_matches(')').trim().trim_start_matches("next_");
+        let ahead_ms = ahead(w)?;
+        if !query.trim_start().starts_with("forecast(") {
+            return Err(syntax("next_…: a forecast(...) after the colon"));
+        }
+        Kind::Forecast { highest, ahead_ms, query }
+    } else if let Some(inner) = head.strip_prefix("change(").or_else(|| head.strip_prefix("pct_change(")) {
         // change(avg(last_5m),last_1h)
         let pct = head.starts_with("pct_change(");
         let inner = inner.strip_suffix(')').ok_or_else(|| syntax("change(...)'s closing parenthesis"))?;
@@ -222,7 +260,7 @@ pub fn parse(q: &str) -> Result<Query, MonitorError> {
     };
     // The metric query must parse as one.
     crate::query::parse::parse(match &kind {
-        Kind::Metric { query, .. } | Kind::Change { query, .. } => query,
+        Kind::Metric { query, .. } | Kind::Change { query, .. } | Kind::Forecast { query, .. } => query,
         Kind::Logs { .. } => "",
     })
     .map_err(|e| syntax(e.to_string()))?;
@@ -334,11 +372,11 @@ fn metric_values(store: &Store, query: &str, aggr: TimeAggr, window_ms: i64, to:
         // An `anomalies()` series: the share of its window's buckets past its band, as Datadog's
         // anomaly monitors compare it (`>= 1`: all of them); buckets it could not score left out.
         let v = match &s.bounds {
-            Some(b) => {
+            Some(b) if b.forecast_from.is_none() => {
                 let read: Vec<bool> = (0..s.values.len()).filter_map(|i| b.anomalous(i)).collect();
                 (!read.is_empty()).then(|| read.iter().filter(|&&x| x).count() as f64 / read.len() as f64)
             }
-            None => reduce(aggr, &s.values),
+            _ => reduce(aggr, &s.values),
         };
         if let Some(v) = v {
             let mut group = s.tags;
@@ -368,6 +406,7 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
                 })
                 .collect())
         }
+        Kind::Forecast { highest, ahead_ms, query } => forecast_values(store, query, *highest, *ahead_ms, to),
         Kind::Logs { search, measure, by, window_ms } => {
             let parsed: Search = crate::logs::search::parse(&logs_only(search)).map_err(|e| MonitorError::Eval(e.to_string()))?;
             let ns = |ms: i64| ms.saturating_mul(1_000_000);
@@ -381,6 +420,29 @@ pub fn evaluate(store: &Store, q: &Query, now: i64, delay_ms: i64) -> Result<Vec
             Ok(out)
         }
     }
+}
+
+/// A forecast monitor's values: over the next `ahead_ms` (in [`FORECAST_POINTS`] buckets, or its
+/// `interval`'s), each group's forecast's highest upper bound or lowest lower one. A group whose
+/// forecast could not be made (too little history) has none.
+fn forecast_values(store: &Store, query: &str, highest: bool, ahead_ms: i64, now: i64) -> Result<Vec<Value>, MonitorError> {
+    let mut req = Request::new(query, now, now + ahead_ms);
+    req.points = FORECAST_POINTS;
+    req.now = Some(now);
+    let a = eval::eval(store, &req).map_err(|e| MonitorError::Eval(e.to_string()))?;
+    let mut out = Vec::new();
+    for s in a.series {
+        let Some(b) = &s.bounds else { continue };
+        let from = b.forecast_from.unwrap_or(s.values.len());
+        let edge = if highest { b.upper.get(from..) } else { b.lower.get(from..) };
+        let v = edge.into_iter().flatten().copied().filter(|v| v.is_finite()).reduce(if highest { f64::max } else { f64::min });
+        if let Some(v) = v {
+            let mut group = s.tags;
+            group.sort();
+            out.push(Value { group, value: v });
+        }
+    }
+    Ok(out)
 }
 
 /// A monitor's thresholds (Datadog's `options.thresholds`): the critical one the query states,
@@ -682,6 +744,49 @@ mod tests {
         for w in [60_000, 300_000, 420_000, 900_000, 3_600_000, 86_400_000, 7 * 86_400_000] {
             let st = step_for(w);
             assert!(w % st == 0 && w / st >= (w / 10_000).min(10), "{w}: {st}");
+        }
+    }
+
+    /// Datadog's forecast monitor: two hosts' disks, one filling a percent an hour from 80 and one
+    /// steady at 50; `max(next_1d):forecast(..., 'linear', 2) >= 95` alerts the filling one alone,
+    /// its value the forecast's highest upper bound over the next day.
+    #[test]
+    fn a_forecast_monitor_alerts_what_will_cross_its_threshold_within_its_horizon() {
+        let mut s = Store::new(Keyed::new());
+        let mut b = Builder::new();
+        let now: i64 = 1_800_000_000_000;
+        let mut seed = 2u64;
+        let mut noise = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        for (host, rate) in [("filling", 1.0), ("steady", 0.0)] {
+            let k = SeriesKey::new("disk", [("host", host)], SKind::Gauge).unwrap();
+            b.define(&k);
+            let n = 24 * 6 * 4;
+            let points: Vec<(i64, f64)> = (0..n)
+                .map(|i| {
+                    let t = now - (n - 1 - i) * 600_000;
+                    let base = if rate > 0.0 { 80.0 } else { 50.0 };
+                    (t, base + rate * (t - now) as f64 / 3_600_000.0 + 0.2 * noise())
+                })
+                .collect();
+            b.run(k.fp, points.iter().copied());
+        }
+        s.apply(&b.finish()).unwrap();
+        let q = parse("max(next_1d):forecast(avg:disk{*} by {host}, 'linear', 2) >= 95").unwrap();
+        assert!(matches!(q.kind, Kind::Forecast { highest: true, ahead_ms: 86_400_000, .. }));
+        let got = evaluate(&s, &q, now, 0).unwrap();
+        let value = |h: &str| got.iter().find(|v| v.group.iter().any(|(_, x)| x == h)).map(|v| v.value);
+        let (filling, steady) = (value("filling").unwrap(), value("steady").unwrap());
+        assert!(filling >= 95.0, "the filling disk's forecast reaches {filling}");
+        assert!(steady < 60.0, "the steady disk's stays {steady}");
+        // Below: min with <=, the lowest lower bound.
+        let low = parse("min(next_12h):forecast(avg:disk{*} by {host}, 'linear', 2) <= 40").unwrap();
+        let got = evaluate(&s, &low, now, 0).unwrap();
+        assert!(got.iter().all(|v| v.value > 40.0), "{got:?}");
+        for bad in ["max(next_10m):forecast(avg:disk{*}, 'linear', 2) >= 95", "max(next_1y):forecast(avg:disk{*}, 'linear', 2) >= 95", "avg(next_1d):forecast(avg:disk{*}, 'linear', 2) >= 95", "max(next_1d):avg:disk{*} >= 95"] {
+            assert!(parse(bad).is_err(), "{bad} parsed");
         }
     }
 }

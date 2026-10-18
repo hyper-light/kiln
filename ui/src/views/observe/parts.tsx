@@ -103,24 +103,38 @@ export function RangePicker({ value, onChange }: { value: Range; onChange: (r: R
 export const pollFor = (r: Range) => Math.max(15_000, Math.min(300_000, RANGES[r] / 120));
 
 /** What `query` answers over the last `range`, read again as the range moves on. */
+/** How far past now a chart of these queries reaches: half its range when one forecasts (a day's
+ * chart its next twelve hours), unless asked; none else. */
+export function aheadOf(queries: string[], range: Range, ask?: number): number {
+  if (!queries.some((q) => /\bforecast\s*\(/i.test(q))) return 0;
+  return ask ?? RANGES[range] / 2;
+}
+
 export const queryRes = (query: string, range: Range, points = 240): Res<QueryAnswer> => ({
   key: `observe/query/${range}/${points}/${query}`,
   fetch: (signal) => {
-    const to = Date.now();
-    return observeApi.query({ query, from: to - RANGES[range], to, points }, signal);
+    const now = Date.now();
+    return observeApi.query({ query, from: now - RANGES[range], to: now + aheadOf([query], range), points }, signal);
   },
   opts: { pollMs: pollFor(range) },
 });
 
 /** What several queries answer over one range, read together (a widget's, the explorer's). */
-export const queriesRes = (queries: string[], range: Range, points = 240): Res<QueryAnswer[]> => ({
-  key: `observe/queries/${range}/${points}/${queries.join("\n")}`,
+export const queriesRes = (queries: string[], range: Range, points = 240, ahead?: number): Res<QueryAnswer[]> => ({
+  key: `observe/queries/${range}/${points}/${ahead ?? ""}/${queries.join("\n")}`,
   fetch: (signal) => {
-    const to = Date.now();
-    return Promise.all(queries.map((query) => observeApi.query({ query, from: to - RANGES[range], to, points }, signal)));
+    const now = Date.now();
+    const to = now + aheadOf(queries, range, ahead);
+    return Promise.all(queries.map((query) => observeApi.query({ query, from: now - RANGES[range], to, points }, signal)));
   },
   opts: { pollMs: pollFor(range) },
 });
+
+/** A series' data: its values up to where a forecast starts (all of them, without one). */
+export function dataOf(s: QueryAnswer["series"][number]): (number | null)[] {
+  const f = s.bounds?.forecast_from;
+  return f === null || f === undefined ? s.values : s.values.slice(0, f);
+}
 
 /** A log search's records over the range, by status, in about 60 buckets of a round size. */
 export const histogramRes = (query: string, range: Range): Res<LogHistogram> => ({
@@ -205,30 +219,58 @@ function past(score: number | null, k: number, direction: Bounds["direction"]) {
   return direction === "above" ? score > k : direction === "below" ? score < -k : Math.abs(score) > k;
 }
 
-export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; labels: string[]; bands: Band[] } {
+/** A drawn series: its label, its source series' place (its color), and whether it is a forecast. */
+export interface Drawn {
+  label: string;
+  source: number;
+  forecast: boolean;
+}
+
+/** Answers as a chart's columns: each series as a line; a `forecast()` series as two, its data
+ * and, from its last point on, its forecast (drawn dashed, its band about it). */
+export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; labels: string[]; bands: Band[]; drawn: Drawn[] } {
   const first = answers[0];
-  if (!first) return { data: [[]], labels: [], bands: [] };
+  if (!first) return { data: [[]], labels: [], bands: [], drawn: [] };
   const xs = Array.from({ length: first.grid.n }, (_, i) => (first.grid.from + i * first.grid.step) / 1000);
   const ys: (number | null)[][] = [];
   const labels: string[] = [];
   const bands: Band[] = [];
+  const drawn: Drawn[] = [];
+  let source = 0;
   answers.forEach((a, qi) => {
     const same = a.grid.from === first.grid.from && a.grid.step === first.grid.step;
     for (const s of a.series) {
-      labels.push(answers.length > 1 ? `${qi + 1}: ${seriesLabel(s.tags)}` : seriesLabel(s.tags));
+      const label = answers.length > 1 ? `${qi + 1}: ${seriesLabel(s.tags)}` : seriesLabel(s.tags);
       const b = s.bounds;
-      if (b && same)
-        bands.push({ series: ys.length, lower: b.lower.slice(0, xs.length), upper: b.upper.slice(0, xs.length), anomalous: b.score.slice(0, xs.length).map((v) => past(v, b.k, b.direction)) });
-      if (same) ys.push(s.values.slice(0, xs.length));
+      let values: (number | null)[];
+      if (same) values = s.values.slice(0, xs.length);
       else {
         // Another grid (its read came a bucket later): each bucket at its time on the first's.
         const at = new Map<number, number | null>();
         s.values.forEach((v, i) => at.set((a.grid.from + i * a.grid.step) / 1000, v));
-        ys.push(xs.map((x) => at.get(x) ?? null));
+        values = xs.map((x) => at.get(x) ?? null);
       }
+      const from = b?.forecast_from;
+      if (b && same && from !== null && from !== undefined) {
+        ys.push(values.map((v, i) => (i < from ? v : null)));
+        labels.push(label);
+        drawn.push({ label, source, forecast: false });
+        // From the last data point, so the two lines meet.
+        bands.push({ series: ys.length, lower: b.lower.slice(0, xs.length), upper: b.upper.slice(0, xs.length) });
+        ys.push(values.map((v, i) => (i >= from - 1 ? v : null)));
+        labels.push(`${label} · forecast`);
+        drawn.push({ label: `${label} · forecast`, source, forecast: true });
+      } else {
+        if (b && same)
+          bands.push({ series: ys.length, lower: b.lower.slice(0, xs.length), upper: b.upper.slice(0, xs.length), anomalous: b.score.slice(0, xs.length).map((v) => past(v, b.k, b.direction)) });
+        ys.push(values);
+        labels.push(label);
+        drawn.push({ label, source, forecast: false });
+      }
+      source += 1;
     }
   });
-  return { data: [xs, ...ys], labels, bands };
+  return { data: [xs, ...ys], labels, bands, drawn };
 }
 
 /** A level drawn across a chart: a monitor's threshold. */
@@ -247,6 +289,7 @@ export function QueryChart({
   display = "line",
   legend,
   marks = [],
+  ahead,
 }: {
   queries: string[];
   range: Range;
@@ -255,9 +298,11 @@ export function QueryChart({
   display?: "line" | "bars" | "area";
   legend?: boolean;
   marks?: Mark[];
+  /** How far past now to draw a forecast (ms): half the range unless said. */
+  ahead?: number;
 }) {
-  const answers = useRes(queriesRes(queries, range)).data;
-  const { data, labels, bands } = React.useMemo(() => chartData(answers), [answers]);
+  const answers = useRes(queriesRes(queries, range, 240, ahead)).data;
+  const { data, labels, bands, drawn } = React.useMemo(() => chartData(answers), [answers]);
   if (labels.length === 0)
     return (
       <p className="empty-line flex items-center justify-center" style={{ minHeight: height }}>
@@ -275,7 +320,13 @@ export function QueryChart({
       legend={legend ?? labels.length + marks.length <= 6}
       bands={bands}
       series={[
-        ...labels.map((label, i) => ({ label, color: PALETTE[i % PALETTE.length] ?? SERIES.grey, bars: display === "bars", fill: display === "area" })),
+        ...drawn.map((d) => ({
+          label: d.label,
+          color: PALETTE[d.source % PALETTE.length] ?? SERIES.grey,
+          bars: display === "bars" && !d.forecast,
+          fill: display === "area" && !d.forecast,
+          ...(d.forecast ? { dash: [6, 4] } : {}),
+        })),
         ...marks.map((m) => ({ label: m.label, color: m.color, dash: [4, 4], width: 1 })),
       ]}
     />

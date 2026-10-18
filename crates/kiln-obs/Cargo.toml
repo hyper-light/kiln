@@ -70,5 +70,9 @@ harness = false
 name = "tail"
 harness = false
 
+[[bench]]
+name = "m4"
+harness = false
+
 [lints]
 workspace = true

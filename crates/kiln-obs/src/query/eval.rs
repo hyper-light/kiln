@@ -60,11 +60,14 @@ pub struct Request<'a> {
     pub step: Option<i64>,
     pub points: usize,
     pub max_series: usize,
+    /// The present (ms): a `forecast()` forecasts the buckets after its series' last point, and
+    /// reads history for those after this. None: the range's end (nothing ahead).
+    pub now: Option<i64>,
 }
 
 impl<'a> Request<'a> {
     pub fn new(query: &'a str, from: i64, to: i64) -> Self {
-        Self { query, from, to, step: None, points: DEFAULT_POINTS, max_series: DEFAULT_MAX_SERIES }
+        Self { query, from, to, step: None, points: DEFAULT_POINTS, max_series: DEFAULT_MAX_SERIES, now: None }
     }
 }
 
@@ -129,10 +132,14 @@ impl Direction {
 pub struct Bounds {
     pub lower: Vec<f64>,
     pub upper: Vec<f64>,
+    /// An `anomalies()` band's: each bucket's error in deviations (NaN for a forecast's).
     pub score: Vec<f64>,
     pub k: f64,
     pub direction: Direction,
-    pub algorithm: Algorithm,
+    /// What drew it: `basic`, `agile`, `robust` (anomalies) or `linear`, `seasonal` (a forecast).
+    pub algorithm: &'static str,
+    /// A forecast's first bucket: the values from it on are forecast, not data.
+    pub forecast_from: Option<usize>,
 }
 
 impl Bounds {
@@ -163,6 +170,8 @@ enum Value {
     Scalar(f64),
     Str(String),
     Set(Vec<Series>),
+    /// A named argument (`forecast()`'s).
+    Named(String, String),
 }
 
 /// Evaluates a query.
@@ -173,7 +182,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
     }
     let grid = grid_for(&ast, req)?;
     let offsets = offsets(&ast)?;
-    let ext = extensions(&ast, grid);
+    let ext = extensions(&ast, grid, req.now);
     // A node's grid: the answer's, begun `ext` buckets earlier beneath `anomalies()`.
     let at = |e: usize| Grid { from: grid.from - grid.step * e as i64, step: grid.step, n: grid.n + e };
     let mut values: Vec<Option<Value>> = vec![None; ast.nodes.len()];
@@ -184,6 +193,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
         let v = match node {
             Node::Num(n) => Value::Scalar(*n),
             Node::Str(s) => Value::Str(s.clone()),
+            Node::Named(k, v) => Value::Named(k.clone(), v.clone()),
             Node::Metric(q) => {
                 let off = offsets.get(id).copied().unwrap_or(0);
                 Value::Set(metric(store, q, at(ext.get(id).copied().unwrap_or(0)), off, req.max_series, &mut scratch, &mut scanned)?)
@@ -198,7 +208,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
                     }
                     Value::Set(s)
                 }
-                Value::Str(_) => return Err(QueryError::Invalid("a string has no sign".into())),
+                Value::Str(_) | Value::Named(..) => return Err(QueryError::Invalid("a string has no sign".into())),
             },
             Node::Bin(op, l, r) => {
                 let (a, b) = (take(&mut values, *l)?, take(&mut values, *r)?);
@@ -213,7 +223,12 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
                 if *f == Func::Anomalies {
                     let inner = args.first().and_then(|&a| ext.get(a)).copied().unwrap_or(own);
                     anomalies(taken, inner.saturating_sub(own), at(own))?
+                } else if *f == Func::Forecast {
+                    forecast(taken, at(own))?
                 } else {
+                    if taken.iter().any(|v| matches!(v, Value::Named(..))) {
+                        return Err(QueryError::Invalid(format!("{f:?} takes no named arguments (forecast() does)")));
+                    }
                     call(*f, taken, at(own))?
                 }
             }
@@ -226,7 +241,7 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
     let (series, scalar) = match root {
         Value::Set(s) => (s, None),
         Value::Scalar(x) => (Vec::new(), Some(x)),
-        Value::Str(_) => return Err(QueryError::Invalid("a query's result is a string".into())),
+        Value::Str(_) | Value::Named(..) => return Err(QueryError::Invalid("a query's result is a string".into())),
     };
     if series.len() > req.max_series {
         return Err(QueryError::TooManySeries(series.len(), req.max_series));
@@ -243,6 +258,8 @@ fn grid_for(ast: &Ast, req: &Request<'_>) -> Result<Grid, QueryError> {
         .iter()
         .filter_map(|n| match n {
             Node::Metric(m) => m.rollup.and_then(|r| r.1).map(|s| s.saturating_mul(1000)),
+            // A forecast's `interval=` (seconds): Datadog's rollup of its points.
+            Node::Named(k, v) if k == "interval" => v.parse::<f64>().ok().filter(|s| *s >= 1.0).map(|s| (s * 1000.0) as i64),
             _ => None,
         })
         .max()
@@ -297,7 +314,7 @@ fn offsets(ast: &Ast) -> Result<Vec<i64>, QueryError> {
 /// Each node's history in buckets: beneath an `anomalies()`, the buckets of
 /// [`ANOMALY_HISTORY_MS`] its query reads before the range (all the answer's grid allows), as
 /// `offsets` passes a time shift down.
-fn extensions(ast: &Ast, grid: Grid) -> Vec<usize> {
+fn extensions(ast: &Ast, grid: Grid, now: Option<i64>) -> Vec<usize> {
     let step = grid.step.max(1);
     let history = usize::try_from(ANOMALY_HISTORY_MS / step).unwrap_or(0).min(crate::anomaly::HISTORY.saturating_sub(grid.n)).min(MAX_POINTS.saturating_sub(grid.n));
     let mut ext = vec![0usize; ast.nodes.len()];
@@ -312,6 +329,7 @@ fn extensions(ast: &Ast, grid: Grid) -> Vec<usize> {
                 (std::slice::from_ref(r), 0)
             }
             Some(Node::Call(Func::Anomalies, args)) => (args.get(..1).unwrap_or(&[]), history),
+            Some(Node::Call(Func::Forecast, args)) => (args.get(..1).unwrap_or(&[]), forecast_history(ast, args, grid, now).min(MAX_POINTS.saturating_sub(grid.n))),
             Some(Node::Call(_, args)) => (args.as_slice(), 0),
             _ => (&[], 0),
         };
@@ -381,7 +399,176 @@ fn anomalies(mut args: Vec<Value>, history: usize, grid: Grid) -> Result<Value, 
                 }
             }
         }
-        out.push(Series { tags: s.tags, values: now.to_vec(), bounds: Some(Box::new(Bounds { lower, upper, score, k, direction, algorithm })) });
+        out.push(Series { tags: s.tags, values: now.to_vec(), bounds: Some(Box::new(Bounds { lower, upper, score, k, direction, algorithm: algorithm.as_str(), forecast_from: None })) });
+    }
+    Ok(Value::Set(out))
+}
+
+/// A forecast's settings, read from its arguments (`forecast(query, algorithm, deviations, name=...)`).
+struct ForecastArgs {
+    linear: bool,
+    model: crate::forecast::Model,
+    /// The season, in ms (seasonal).
+    season_ms: i64,
+    /// History asked (linear), in ms.
+    history_ms: Option<i64>,
+    deviations: f64,
+}
+
+/// `1w`, `3d`, `12h`, `30m`, `90s` in ms.
+fn duration_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = n.parse().ok()?;
+    let per = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 7 * 86_400_000,
+        _ => return None,
+    };
+    n.checked_mul(per).filter(|&ms| ms > 0)
+}
+
+fn forecast_args<'a>(positional: impl Iterator<Item = Option<&'a str>>, deviations: Option<f64>, named: impl Iterator<Item = (&'a str, &'a str)>) -> Result<ForecastArgs, QueryError> {
+    let usage = |why: &str| QueryError::Invalid(format!("forecast(query, 'linear'|'seasonal', deviations, model='default'|'simple'|'reactive', seasonality='hourly'|'daily'|'weekly', history='1w', interval=seconds): {why}"));
+    let mut positional = positional;
+    let linear = match positional.next().flatten() {
+        Some("linear") => true,
+        Some("seasonal") => false,
+        Some(other) => return Err(usage(&format!("the algorithm {other}"))),
+        None => return Err(usage("the algorithm")),
+    };
+    let deviations = deviations.unwrap_or(2.0);
+    if !(deviations.is_finite() && deviations > 0.0) {
+        return Err(usage("deviations: a number above 0"));
+    }
+    let mut a = ForecastArgs { linear, model: crate::forecast::Model::Default, season_ms: 86_400_000, history_ms: None, deviations };
+    for (k, v) in named {
+        match k {
+            "model" => a.model = crate::forecast::Model::parse(v).ok_or_else(|| usage(&format!("the model {v}")))?,
+            "seasonality" => {
+                a.season_ms = match v {
+                    "hourly" => 3_600_000,
+                    "daily" => 86_400_000,
+                    "weekly" => 7 * 86_400_000,
+                    _ => return Err(usage(&format!("the seasonality {v}"))),
+                }
+            }
+            "history" => a.history_ms = Some(duration_ms(v).ok_or_else(|| usage(&format!("the history {v}")))?),
+            "interval" => {}
+            // kiln's seasons are UTC's.
+            "timezone" if v.eq_ignore_ascii_case("utc") => {}
+            other => return Err(usage(&format!("a named argument {other}"))),
+        }
+    }
+    Ok(a)
+}
+
+/// The history a forecast reads before the range, in buckets: a seasonal one's [`SEASONS`]
+/// seasons; a linear one's `history`, or [`LINEAR_HORIZONS`] times the buckets it forecasts (those
+/// after `now`).
+///
+/// [`SEASONS`]: crate::forecast::SEASONS
+/// [`LINEAR_HORIZONS`]: crate::forecast::LINEAR_HORIZONS
+fn forecast_history(ast: &Ast, args: &[usize], grid: Grid, now: Option<i64>) -> usize {
+    let step = grid.step.max(1);
+    let positional = args.iter().skip(1).filter_map(|&a| match ast.nodes.get(a) {
+        Some(Node::Str(s)) => Some(Some(s.as_str())),
+        _ => None,
+    });
+    let deviations = args.get(2).and_then(|&a| constant(ast, a));
+    let named = args.iter().filter_map(|&a| match ast.nodes.get(a) {
+        Some(Node::Named(k, v)) => Some((k.as_str(), v.as_str())),
+        _ => None,
+    });
+    let Ok(a) = forecast_args(positional, deviations, named) else { return 0 };
+    let ahead = now.map_or(1, |now| {
+        let end = grid.from + grid.step * grid.n as i64;
+        usize::try_from((end - now).max(0) / step).unwrap_or(0).max(1)
+    });
+    let buckets = if a.linear {
+        match a.history_ms {
+            Some(ms) => usize::try_from(ms / step).unwrap_or(0),
+            None => crate::forecast::LINEAR_HORIZONS.saturating_mul(ahead),
+        }
+    } else {
+        crate::forecast::SEASONS.saturating_mul(usize::try_from(a.season_ms / step).unwrap_or(0))
+    };
+    buckets.min(crate::forecast::MAX_AHEAD * crate::forecast::LINEAR_HORIZONS)
+}
+
+/// `forecast(query, algorithm, deviations, ...)`: each series as it is up to its last point, and past
+/// it, to the range's end, what `crate::forecast` expects and its bounds at `deviations` (2 unless
+/// said), learned from the `history` buckets before the range and the range's own up to that point.
+fn forecast(mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> {
+    let usage = || QueryError::Invalid("forecast(query, 'linear'|'seasonal', deviations, ...): a query first".into());
+    if args.is_empty() {
+        return Err(usage());
+    }
+    let set = match args.remove(0) {
+        Value::Set(s) => s,
+        _ => return Err(usage()),
+    };
+    if args.iter().any(|v| matches!(v, Value::Set(_))) {
+        return Err(QueryError::Invalid("forecast(query, ...): one query, then its algorithm, deviations and named arguments".into()));
+    }
+    let positional: Vec<Option<&str>> = args.iter().filter_map(|v| match v {
+        Value::Str(s) => Some(Some(s.as_str())),
+        _ => None,
+    }).collect();
+    let deviations = args.iter().find_map(|v| match v {
+        Value::Scalar(x) => Some(*x),
+        _ => None,
+    });
+    let named: Vec<(&str, &str)> = args.iter().filter_map(|v| match v {
+        Value::Named(k, v) => Some((k.as_str(), v.as_str())),
+        _ => None,
+    }).collect();
+    let a = forecast_args(positional.into_iter(), deviations, named.into_iter())?;
+    let algo = if a.linear {
+        crate::forecast::Algorithm::Linear(a.model)
+    } else {
+        let period = usize::try_from(a.season_ms / grid.step.max(1)).unwrap_or(0);
+        if period < 2 {
+            return Err(QueryError::Invalid(format!("a season of {} s at a step of {} s: under two points a season; a finer step", a.season_ms / 1000, grid.step / 1000)));
+        }
+        crate::forecast::Algorithm::Seasonal { period }
+    };
+    let algorithm = if a.linear { "linear" } else { "seasonal" };
+    let mut out = Vec::with_capacity(set.len());
+    for s in set {
+        let total = s.values.len();
+        let start = total.saturating_sub(grid.n);
+        let Some(last) = s.values.iter().rposition(|v| v.is_finite()) else {
+            out.push(Series { tags: s.tags, values: s.values.get(start..).unwrap_or(&[]).to_vec(), bounds: None });
+            continue;
+        };
+        let ahead = total - 1 - last;
+        let fc = if ahead > 0 { s.values.get(..=last).and_then(|h| crate::forecast::forecast(h, algo, ahead)) } else { None };
+        let mut values: Vec<f64> = s.values.get(start..).unwrap_or(&[]).to_vec();
+        let Some(fc) = fc else {
+            out.push(Series { tags: s.tags, values, bounds: None });
+            continue;
+        };
+        let (mut lower, mut upper) = (vec![f64::NAN; values.len()], vec![f64::NAN; values.len()]);
+        for (i, v) in values.iter_mut().enumerate() {
+            let abs = start + i;
+            if abs <= last {
+                continue;
+            }
+            let k = abs - last - 1;
+            if let (Some(&e), Some((lo, hi))) = (fc.expected.get(k), fc.bounds(k, a.deviations)) {
+                *v = e;
+                if let (Some(l), Some(u)) = (lower.get_mut(i), upper.get_mut(i)) {
+                    (*l, *u) = (lo, hi);
+                }
+            }
+        }
+        let forecast_from = Some((last + 1).saturating_sub(start).min(values.len()));
+        let score = vec![f64::NAN; values.len()];
+        out.push(Series { tags: s.tags, values, bounds: Some(Box::new(Bounds { lower, upper, score, k: a.deviations, direction: Direction::Both, algorithm, forecast_from })) });
     }
     Ok(Value::Set(out))
 }
@@ -869,7 +1056,7 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
             set = scored.into_iter().filter(|(s, _)| !s.is_nan()).take(n).map(|(_, s)| s).collect();
         }
         // Evaluated apart (`anomalies`): it reads its query's history.
-        Func::Timeshift | Func::Anomalies => {}
+        Func::Timeshift | Func::Anomalies | Func::Forecast => {}
         Func::MovingAvg => {
             let secs = num(args.first(), "the window's seconds")?;
             let k = ((secs * 1000.0 / grid.step as f64).round() as usize).max(1);
@@ -1159,5 +1346,88 @@ mod tests {
         assert_eq!(percentile(&mut v, 0.0), 1.0);
         assert_eq!(percentile(&mut v, 100.0), 4.0);
         assert!(percentile(&mut [], 50.0).is_nan());
+    }
+
+    /// Ten days of a daily cycle every half hour, then a forecast over a range a day past now: up to
+    /// now the series itself, past it the cycle forecast (within a few percent of what the cycle
+    /// will do), its band about it; a ramp's linear forecast carries the ramp on.
+    #[test]
+    fn a_forecast_carries_a_season_and_a_trend_past_now() {
+        let mut s = Store::new(Keyed::with_keys(5, 6));
+        let mut b = Builder::new();
+        let now: i64 = 1_800_000_000_000 / 1_800_000 * 1_800_000;
+        let cycle = |t: i64| 50.0 + 20.0 * (t as f64 / 86_400_000.0 * std::f64::consts::TAU).sin();
+        let ramp = |t: i64| 10.0 + (t - now) as f64 / 3_600_000.0;
+        let (load, disk) = (SeriesKey::new("load", [("host", "a")], Kind::Gauge).unwrap(), SeriesKey::new("disk", [("host", "a")], Kind::Gauge).unwrap());
+        b.define(&load);
+        b.define(&disk);
+        let n = 48 * 10;
+        b.run(load.fp, (0..n).map(|i| {
+            let t = now - (n - 1 - i) * 1_800_000;
+            (t, cycle(t))
+        }));
+        b.run(disk.fp, (0..n).map(|i| {
+            let t = now - (n - 1 - i) * 1_800_000;
+            (t, ramp(t))
+        }));
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str| {
+            let mut r = Request::new(q, now - 86_400_000, now + 86_400_000);
+            r.step = Some(1_800_000);
+            r.now = Some(now);
+            eval(&s, &r).unwrap()
+        };
+        let a = ask("forecast(avg:load{*}, 'seasonal', 2, seasonality='daily')");
+        let [one] = a.series.as_slice() else { panic!("one series") };
+        let b = one.bounds.as_ref().expect("a forecast's band");
+        let from = b.forecast_from.expect("where the forecast starts");
+        assert_eq!(a.grid.time(from - 1), now, "data to now, forecast after");
+        assert_eq!(b.algorithm, "seasonal");
+        for i in 0..a.grid.n {
+            let t = a.grid.time(i);
+            let (v, lo, hi) = (one.values[i], b.lower[i], b.upper[i]);
+            if i < from {
+                assert!((v - cycle(t)).abs() < 1e-9 && lo.is_nan(), "data at {i}");
+            } else {
+                assert!((v - cycle(t)).abs() < 2.0, "the forecast at {i}: {v} for {}", cycle(t));
+                assert!(lo <= v && v <= hi, "its band at {i}");
+            }
+        }
+        let d = ask("forecast(avg:disk{*}, 'linear', 2, model='default')");
+        let [one] = d.series.as_slice() else { panic!("one series") };
+        let last = one.values[d.grid.n - 1];
+        // The ramp a day on: 34; half the last value (Naive) and half Holt's, the default's.
+        assert!(last > 20.0 && last <= ramp(d.grid.time(d.grid.n - 1)) + 1.0, "{last}");
+        let r = ask("forecast(avg:disk{*}, 'linear', 2, model='reactive', history='2d')");
+        let last = r.series[0].values[r.grid.n - 1];
+        assert!((last - ramp(r.grid.time(r.grid.n - 1))).abs() < 1.0, "the reactive model carries the ramp on: {last}");
+    }
+
+    #[test]
+    fn named_arguments_are_forecast_s_and_its_own_are_checked() {
+        let s = store();
+        let r = |q: &str| {
+            let mut r = Request::new(q, 0, 600_000);
+            r.now = Some(600_000);
+            eval(&s, &r)
+        };
+        assert!(r("forecast(cpu{*}, 'linear', 1, model='reactive', history='1h')").is_ok());
+        assert!(r("forecast(cpu{*}, 'linear', 1, model = 'simple')").is_ok());
+        for bad in [
+            "top(cpu{*} by {host}, 2, 'mean', model='reactive')",
+            "forecast(cpu{*}, 'linear', 1, model='psychic')",
+            "forecast(cpu{*}, 'quadratic', 1)",
+            "forecast(cpu{*}, 'linear', 0)",
+            "forecast(cpu{*}, 'linear', 1, history='forever')",
+            "forecast(cpu{*}, 'linear', 1, seasonality='yearly')",
+            "forecast(cpu{*}, 'linear', 1, timezone='America/New_York')",
+            "forecast(cpu{*}, 'linear', 1, mystery=1)",
+            // A day's season at a 10-minute range's step is fine; an hour's at a day's step is not.
+        ] {
+            assert!(r(bad).is_err(), "{bad} was taken");
+        }
+        let mut coarse = Request::new("forecast(cpu{*}, 'seasonal', 2, seasonality='hourly')", 0, 86_400_000 * 2);
+        coarse.step = Some(3_600_000);
+        assert!(eval(&s, &coarse).is_err(), "an hourly season at an hour's step");
     }
 }

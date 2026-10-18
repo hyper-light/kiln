@@ -752,3 +752,164 @@ fn a_composite_alerts_the_groups_its_monitors_share_and_keeps_what_it_reads() ->
     anyhow::ensure!(code == 204);
     Ok(())
 }
+
+/// Two disks, one filling a percent an hour from 62 and one steady at 40, two days of a point every
+/// ten minutes: the query API forecasts both past now (the filling one carried on, its band about
+/// it), and Datadog's forecast monitor, `max(next_2d):forecast(..., 'linear', 2) >= 95`, alerts the
+/// filling one alone, which a webhook hears of.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn a_forecast_monitor_alerts_the_disk_that_will_fill_and_says_so() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/disks", Some(&json!({ "kind": "webhook", "url": mock.url("/disks") })))?;
+    anyhow::ensure!(code == 204);
+    let now = crate_now() / 600_000 * 600_000;
+    let n: i64 = 6 * 48;
+    let mut seed = 31u64;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let mut series = Vec::new();
+    for (host, start, rate) in [("filling", 62.0, 1.0), ("steady", 40.0, 0.0)] {
+        let points: Vec<Value> = (0..=n)
+            .map(|i| {
+                let t = now - (n - i) * 600_000;
+                json!([t as f64 / 1000.0, start + rate * (t - now) as f64 / 3_600_000.0 + 0.3 * noise()])
+            })
+            .collect();
+        series.push(json!({ "metric": "e2e.disk", "type": "gauge", "tags": [format!("host:{host}")], "points": points }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    // The query API: up to now the disks themselves, past it their forecasts.
+    let q = json!({ "query": "forecast(avg:e2e.disk{*} by {host}, 'linear', 2)", "from": now - 86_400_000, "to": now + 12 * 3_600_000, "step": 600_000 });
+    let start = Instant::now();
+    let answer = loop {
+        let a = f.call("POST", "/api/observe/v1/query", Some(&q))?;
+        if at(&a, &["series"]).as_array().is_some_and(|s| s.len() == 2 && s.iter().all(|x| at(x, &["bounds", "forecast_from"]).as_u64().is_some())) {
+            break a;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "no forecast: {a}");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    for s in at(&answer, &["series"]).as_array().into_iter().flatten() {
+        let host = at(s, &["tags", "host"]).as_str().unwrap_or("").to_owned();
+        let values: Vec<f64> = at(s, &["values"]).as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(f64::NAN)).collect();
+        let from = at(s, &["bounds", "forecast_from"]).as_u64().unwrap_or(0) as usize;
+        let (last, end) = (values.get(from - 1).copied().unwrap_or(f64::NAN), values.last().copied().unwrap_or(f64::NAN));
+        let upper = at(s, &["bounds", "upper"]).as_array().and_then(|u| u.last()).and_then(Value::as_f64).unwrap_or(f64::NAN);
+        let lower = at(s, &["bounds", "lower"]).as_array().and_then(|u| u.last()).and_then(Value::as_f64).unwrap_or(f64::NAN);
+        anyhow::ensure!(from > 0 && from < values.len(), "{host}: the forecast starts at {from} of {}", values.len());
+        match host.as_str() {
+            // Twelve hours on: 74, as the disk will be.
+            "filling" => anyhow::ensure!((end - 74.0).abs() < 2.0 && lower < end && end < upper && (last - 62.0).abs() < 1.5, "filling: {last} now, {end} in [{lower}, {upper}] in 12 h"),
+            _ => anyhow::ensure!((end - 40.0).abs() < 1.0 && lower < 40.0 && 40.0 < upper, "steady: {end} in [{lower}, {upper}]"),
+        }
+    }
+    // The monitor: the filling disk alone.
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e disk fills",
+            "query": "max(next_2d):forecast(avg:e2e.disk{*} by {host}, 'linear', 2) >= 95",
+            "message": "{{#is_alert}}{{host.name}} will be full within two days @webhook-disks{{/is_alert}}",
+            "options": { "every": 10, "thresholds": { "critical": 95 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let check = f.call("POST", "/api/observe/v1/monitors/validate", Some(&json!({ "query": "max(next_2d):forecast(avg:e2e.disk{*} by {host}, 'linear', 2) >= 95" })))?;
+    anyhow::ensure!(at(&check, &["kind"]) == "forecast" && at(&check, &["window_ms"]).as_i64() == Some(2 * 86_400_000), "{check}");
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        let groups: Vec<(String, String)> = at(&m, &["groups"]).as_array().into_iter().flatten().map(|g| {
+            let host = at(g, &["group"]).as_array().and_then(|kv| kv.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).unwrap_or("").to_owned();
+            (host, at(g, &["state"]).as_str().unwrap_or("").to_owned())
+        }).collect();
+        if groups.len() == 2 && groups.iter().any(|g| g == &("filling".to_owned(), "ALERT".to_owned())) && groups.iter().any(|g| g == &("steady".to_owned(), "OK".to_owned())) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the monitor's groups: {groups:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let start = Instant::now();
+    while mock.at("/disks").is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard nothing");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let heard: Vec<Value> = mock.at("/disks").iter().map(Got::json).collect();
+    let [one] = heard.as_slice() else { anyhow::bail!("the webhook heard {} notices: {heard:?}", heard.len()) };
+    anyhow::ensure!(at(one, &["notice", "state"]) == "ALERT" && at(one, &["notice", "message"]).as_str().is_some_and(|m| m.contains("filling will be full")), "{one}");
+    Ok(())
+}
+
+/// Who may do what with observe, as kiln's roles say: a viewer's token reads (a query, a search,
+/// dashboards, monitors, the integrations' list with their secrets left out) and is refused (403)
+/// writing anything; a developer's makes monitors and dashboards and posts data, and is refused
+/// integrations, clouds and the store's operations; a maintainer's manages integrations. The OpenAPI
+/// document says what each of observe's routes needs.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn observe_s_routes_are_each_role_s_as_its_capabilities_say() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mint = |grant: &str| -> anyhow::Result<String> {
+        let t = f.call("POST", "/api/tokens", Some(&json!({ "grants": [grant], "user": "owner", "note": format!("e2e {grant}") })))?;
+        at(&t, &["token"]).as_str().map(str::to_owned).ok_or_else(|| anyhow::anyhow!("no token: {t}"))
+    };
+    let (viewer, developer, maintainer) = (mint("viewer")?, mint("developer")?, mint("maintainer")?);
+    let ask = |token: &str, method: &str, path: &str, body: Option<Value>| -> anyhow::Result<u16> {
+        let b = body.map(|b| serde_json::to_vec(&b)).transpose()?.unwrap_or_default();
+        Ok(raw(f.http, method, path, &format!("Authorization: Bearer {token}\r\nContent-Type: application/json\r\n"), &b)?.0)
+    };
+    let now = crate_now();
+    let query = json!({ "query": "avg:kiln.process.cpu_seconds{*}", "from": now - 600_000, "to": now });
+    let search = json!({ "query": "*", "from": now - 600_000, "to": now });
+    let monitor = json!({ "name": "e2e roles", "query": "avg(last_5m):avg:e2e.roles{*} > 10", "options": { "thresholds": { "critical": 10 } } });
+    let hook = json!({ "kind": "webhook", "url": "http://127.0.0.1:9/hook" });
+    let series = json!({ "series": [{ "metric": "e2e.roles", "type": "gauge", "points": [[(now / 1000) as f64, 1.0]] }] });
+    let reads: [(&str, &str, Option<Value>); 7] = [
+        ("GET", "/api/observe/v1/status", None),
+        ("POST", "/api/observe/v1/query", Some(query.clone())),
+        ("POST", "/api/observe/v1/logs/search", Some(search.clone())),
+        ("GET", "/api/observe/v1/dashboards", None),
+        ("GET", "/api/observe/v1/monitors", None),
+        ("GET", "/api/observe/v1/integrations", None),
+        ("POST", "/api/observe/v1/monitors/validate", Some(json!({ "query": "avg(last_5m):avg:x{*} > 1" }))),
+    ];
+    for (method, path, body) in reads {
+        let code = ask(&viewer, method, path, body)?;
+        anyhow::ensure!(code == 200, "a viewer reading {method} {path}: {code}");
+    }
+    for (method, path, body) in [
+        ("POST", "/api/observe/v1/monitors", Some(monitor.clone())),
+        ("POST", "/api/observe/v1/dashboards", Some(json!({ "title": "e2e", "widgets": [] }))),
+        ("POST", "/api/observe/v1/series", Some(series.clone())),
+        ("PUT", "/api/observe/v1/integrations/e2e", Some(hook.clone())),
+        ("POST", "/api/observe/v1/compact", Some(json!({}))),
+    ] {
+        let code = ask(&viewer, method, path, body)?;
+        anyhow::ensure!(code == 403, "a viewer writing {method} {path}: {code}");
+    }
+    for (method, path, body, want) in [
+        ("POST", "/api/observe/v1/monitors", Some(monitor.clone()), 201),
+        ("POST", "/api/observe/v1/dashboards", Some(json!({ "title": "e2e", "widgets": [] })), 201),
+        ("POST", "/api/observe/v1/series", Some(series.clone()), 202),
+        ("PUT", "/api/observe/v1/integrations/e2e", Some(hook.clone()), 403),
+        ("PUT", "/api/observe/v1/clouds/e2e", Some(json!({ "kind": "aws", "region": "us-east-1" })), 403),
+        ("POST", "/api/observe/v1/verify", Some(json!({})), 403),
+    ] {
+        let code = ask(&developer, method, path, body)?;
+        anyhow::ensure!(code == want, "a developer's {method} {path}: {code}, not {want}");
+    }
+    anyhow::ensure!(ask(&maintainer, "PUT", "/api/observe/v1/integrations/e2e", Some(hook))? == 204, "a maintainer adds an integration");
+    anyhow::ensure!(ask(&maintainer, "DELETE", "/api/observe/v1/integrations/e2e", None)? == 204, "and removes it");
+    let doc = f.call("GET", "/api/openapi.json", None)?;
+    let needs = |path: &str, method: &str| at(&doc, &["paths", path, method, "x-kiln-capability"]).as_str().unwrap_or("").to_owned();
+    anyhow::ensure!(needs("/api/observe/v1/query", "post") == "observe.read" && needs("/api/observe/v1/compact", "post") == "observe.manage", "the OpenAPI document: {}", at(&doc, &["paths"]).as_object().map(|p| p.keys().filter(|k| k.contains("observe")).cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
+    Ok(())
+}
