@@ -306,17 +306,22 @@ impl Hub {
     /// mirrors are picked again from them, and fed (`crate::convo::mirror`).
     fn mirrors_seen(&self) {
         let Some(m) = &self.harness.copies else { return };
+        // One lock at a time: the machines first, then their runner processes.
+        let machines: Vec<(String, u64)> = self
+            .agents
+            .lock()
+            .values()
+            .filter(|a| a.connected && !a.ephemeral && !a.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
+            .map(|a| (a.name.clone(), a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used))))
+            .collect();
         let candidates: Vec<crate::convo::mirror::Candidate> = {
-            let agents = self.agents.lock();
             let inst = self.instances.lock();
-            agents
-                .values()
-                .filter(|a| a.connected && !a.ephemeral && !a.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
-                .filter_map(|a| {
-                    let peer = inst.newest_with(&a.name, proto::CAP_CONVO)?;
+            machines
+                .into_iter()
+                .filter_map(|(machine, disk_free)| {
+                    let peer = inst.newest_with(&machine, proto::CAP_CONVO)?;
                     let connected_at = inst.get(peer).map_or(0, |i| i.connected_at);
-                    let disk_free = a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used));
-                    Some(crate::convo::mirror::Candidate { machine: a.name.clone(), peer, connected_at, disk_free })
+                    Some(crate::convo::mirror::Candidate { machine, peer, connected_at, disk_free })
                 })
                 .collect()
         };
