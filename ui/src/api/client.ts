@@ -117,6 +117,43 @@ const enc = encodeURIComponent;
 
 /* ---------------------------- endpoints ---------------------------- */
 
+/** Where a published image lives: the local Docker that builds it, or a registry repository. */
+export type ImageHome = { kind: "local" } | { kind: "registry"; repository: string; integration?: string };
+
+export interface CdImages {
+  images: Record<string, ImageHome>;
+  /** The images apps publish, with the apps that do. */
+  used: Record<string, string[]>;
+}
+
+export interface IntegrationKind {
+  kind: string;
+  title: string;
+  category: string;
+  mode: "oidc" | "token" | "optional";
+  fields: { name: string; required: boolean; help: string }[];
+  secret: string | null;
+  built: boolean;
+}
+
+export interface Integration {
+  id: string;
+  kind: string;
+  name: string;
+  config: Record<string, unknown>;
+  has_secret: boolean;
+  scope: string;
+  created_at: number;
+  verified_at: number | null;
+  last_error: string | null;
+  last_used_at: number | null;
+}
+
+export interface Integrations {
+  kinds: IntegrationKind[];
+  integrations: Integration[];
+}
+
 export const api = {
   login: async (token: string) => {
     await post<void>("/api/auth/login", { token });
@@ -144,6 +181,14 @@ export const api = {
   },
 
   overview: (signal?: AbortSignal) => get<Overview>("/api/overview", signal),
+  /** Where each image kiln publishes lives, and the apps that publish it (docs/cd-targets.md §7.1). */
+  cdImages: (signal?: AbortSignal) => get<CdImages>("/api/cd/images", signal),
+  setCdImage: (name: string, home: ImageHome) => request<CdImages>("PUT", `/api/cd/images/${encodeURIComponent(name)}`, home),
+  /** Integrations (docs/ci.md W11): the catalog of kinds and the ones set up. */
+  integrations: (signal?: AbortSignal) => get<Integrations>("/api/ci/integrations", signal),
+  createIntegration: (body: { kind: string; name: string; config: Record<string, string>; secret?: string }) => post<Integration>("/api/ci/integrations", body),
+  verifyIntegration: (name: string) => post<{ ok: boolean; message?: string; error?: string }>(`/api/ci/integrations/${encodeURIComponent(name)}/verify`),
+  deleteIntegration: (name: string) => del<void>(`/api/ci/integrations/${encodeURIComponent(name)}`),
 
   repos: (signal?: AbortSignal) => get<Repo[]>("/api/repos", signal),
   sync: (signal?: AbortSignal) => get<SyncView>("/api/sync", signal),

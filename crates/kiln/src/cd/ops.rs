@@ -1172,7 +1172,21 @@ async fn remove_cluster(cx: Cx, v: Value) -> Out {
 }
 
 async fn images_list(cx: Cx, _: Value) -> Out {
-    Ok(json!({ "images": super::images::json(&cx.cd.image_homes()) }))
+    Ok(images_view(&cx.cd))
+}
+
+/// Every image people set, and the images apps publish with the apps that do (so an image not
+/// set yet, living in the local Docker, still shows).
+fn images_view(cd: &Cd) -> Value {
+    let mut used: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (id, e) in cd.apps.read().iter() {
+        for a in e.def.artifacts.values() {
+            if let Some(p) = &a.published {
+                used.entry(p.clone()).or_default().push(id.clone());
+            }
+        }
+    }
+    json!({ "images": super::images::json(&cd.image_homes()), "used": used })
 }
 
 async fn images_set(cx: Cx, v: Value) -> Out {
@@ -1190,7 +1204,9 @@ async fn images_set(cx: Cx, v: Value) -> Out {
     };
     cx.cd.set_image_home(&name, home).await.map_err(bad)?;
     audit(&cx, "cd.images.set", name.clone()).await;
-    Ok(json!({ "images": super::images::json(&cx.cd.image_homes()) }))
+    // Apps that publish it resolve again now, from where it lives.
+    cx.cd.kick();
+    Ok(images_view(&cx.cd))
 }
 
 async fn repos(cx: Cx, _: Value) -> Out {
