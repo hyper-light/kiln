@@ -135,6 +135,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         child!("gitops-discover", h => crate::gitops::discover_loop(h));
         child!("gitops-poll", h => crate::gitops::poll_loop(h));
         child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
+        child!("land-queue", h => crate::ci::land::run_loop(h));
         if cfg.cd.enabled {
             child!("cd", h => crate::cd::run(h));
         }

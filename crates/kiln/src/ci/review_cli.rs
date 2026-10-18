@@ -384,6 +384,106 @@ pub fn checkout(args: CheckoutArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(clap::Args)]
+pub struct LandArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// The diffs to land (each with those below it): `D12`.
+    #[arg(required = true)]
+    diffs: Vec<String>,
+    /// `stack`, `stack-squash`, `ff-only` (default: the trunk's `land.default`).
+    #[arg(long)]
+    strategy: Option<String>,
+}
+
+/// `kiln land D12 [--strategy S]`: into the land queue, with the diffs below it.
+pub async fn land(args: LandArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    for d in &args.diffs {
+        let body = match &args.strategy {
+            Some(s) => serde_json::json!({ "strategy": s }),
+            None => serde_json::json!({}),
+        };
+        let v = api.call_api(Method::Post, &format!("/api/diffs/{}/land", super::cli::enc(d)), Some(body)).await?;
+        let names: Vec<&str> = v.get("diffs").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        println!("{} queued to land on {} ({}): entry {}", names.join(" "), v.get("trunk").and_then(Value::as_str).unwrap_or_default(), v.get("strategy").and_then(Value::as_str).unwrap_or_default(), v.get("entry").and_then(Value::as_str).unwrap_or_default());
+    }
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct ReviewArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// `D12`.
+    diff: String,
+    #[arg(long, conflicts_with_all = ["request_changes", "comment", "resign"])]
+    accept: bool,
+    #[arg(long, conflicts_with_all = ["comment", "resign"])]
+    request_changes: bool,
+    #[arg(long, conflicts_with = "resign")]
+    comment: bool,
+    #[arg(long)]
+    resign: bool,
+    /// What the review says.
+    #[arg(short, long)]
+    message: Option<String>,
+}
+
+/// `kiln review D12`: the diff, what keeps it from landing, and its open threads; with
+/// `--accept`, `--request-changes`, `--comment` or `--resign`, a review (publishing your drafts).
+pub async fn review(args: ReviewArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let id = super::cli::enc(&args.diff);
+    let action = if args.accept {
+        Some("accept")
+    } else if args.request_changes {
+        Some("request_changes")
+    } else if args.comment || args.message.is_some() {
+        Some("comment")
+    } else if args.resign {
+        Some("resign")
+    } else {
+        None
+    };
+    if let Some(a) = action {
+        let v = api.call_api(Method::Post, &format!("/api/diffs/{id}/review"), Some(serde_json::json!({ "action": a, "body": args.message.clone().unwrap_or_default() }))).await?;
+        println!("{} v{}: {} ({} draft comment{} published); it is {}", args.diff, v.get("version").and_then(Value::as_u64).unwrap_or(0), a, v.get("published").and_then(Value::as_u64).unwrap_or(0), if v.get("published").and_then(Value::as_u64) == Some(1) { "" } else { "s" }, v.get("state").and_then(Value::as_str).unwrap_or_default());
+        return Ok(());
+    }
+    let d = api.call_api(Method::Get, &format!("/api/diffs/{id}"), None).await?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    let versions = d.get("versions").and_then(Value::as_array).map_or(0, Vec::len);
+    println!("{} {} ({}, v{versions}, by {})", s(&d, "name"), s(&d, "title"), s(&d, "state"), s(&d, "author"));
+    if !s(&d, "summary").is_empty() {
+        println!("\n{}\n", s(&d, "summary"));
+    }
+    let land = api.call_api(Method::Get, &format!("/api/diffs/{id}/land"), None).await?;
+    let blockers: Vec<&str> = land.get("blockers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+    if blockers.is_empty() {
+        println!("ready to land: `kiln land {}`", s(&d, "name"));
+    } else {
+        println!("not ready to land:");
+        for b in blockers {
+            println!("  - {b}");
+        }
+    }
+    let threads = api.call_api(Method::Get, &format!("/api/diffs/{id}/comments"), None).await?;
+    for t in threads.get("threads").and_then(Value::as_array).into_iter().flatten().filter(|t| s(t, "state") == "open") {
+        let at = match (t.get("file").and_then(Value::as_str), t.pointer("/now/start_line").and_then(Value::as_u64)) {
+            (Some(f), Some(l)) => format!("{f}:{l}"),
+            (Some(f), None) => format!("{f} (outdated)"),
+            _ => "the diff".to_owned(),
+        };
+        println!("\nthread on {at}:");
+        for c in t.get("comments").and_then(Value::as_array).into_iter().flatten() {
+            let draft = if c.get("draft") == Some(&Value::Bool(true)) { " (draft)" } else { "" };
+            println!("  {}{draft}: {}", s(c, "author"), s(c, "body"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

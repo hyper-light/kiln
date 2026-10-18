@@ -301,9 +301,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         // W14: diffs and stacks.
-        (_, ["api", "diffs" | "stacks", ..]) | (&Method::GET, ["api", "repos", _, "diffs"]) => {
+        (_, ["api", "diffs" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
-            crate::ci::diffs::route(&hub, &method, &segs, &q, &caller).await.map_err(|(c, m)| err(c, m))
+            let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
+            crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body).await.map_err(|(c, m)| err(c, m))
         }
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),

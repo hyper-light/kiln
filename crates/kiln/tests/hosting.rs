@@ -354,6 +354,10 @@ fn w14_r03_cli() -> anyhow::Result<()> {
     assert!(g(&["log", "-1", "--format=%B"])?.contains("Change-Id: I"), "HEAD moved to the rewritten commit");
     assert_eq!(g(&["status", "--porcelain"])?, "", "the working tree is as it was");
 
+    let out = must(kiln(&home, &work, &s, &dev, &["review", "D2"]), "kiln review")?;
+    assert!(out.contains("D2 two: b (draft, v1") && out.contains("not ready to land") && out.contains("it's a draft"), "{out}");
+    let (ok, out) = kiln(&home, &work, &s, &dev, &["land", "D2"])?;
+    assert!(!ok && out.contains("diffs.land"), "a developer doesn't land: {out}");
     let out = must(kiln(&home, &work, &s, &dev, &["diffs"]), "kiln diffs")?;
     assert!(out.contains("D1") && out.contains("D2") && out.contains("draft") && out.contains("(on D1)"), "{out}");
     let top = g(&["rev-parse", "HEAD"])?.trim().to_owned();
@@ -386,4 +390,278 @@ fn kiln_git(home: &Path, dir: &Path, s: &Server, token: &str, args: &[&str]) -> 
         .env_remove("KILN_CONFIG")
         .output()?;
     Ok((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
+}
+
+fn post(s: &Server, token: &str, path: &str, body: &Value) -> anyhow::Result<(u16, Value)> {
+    let (st, text) = http(s.port, "POST", path, token, Some(body))?;
+    Ok((st, serde_json::from_str(&text).unwrap_or(Value::String(text))))
+}
+
+/// Polls `f` until it says yes, for up to `secs` seconds.
+fn until(secs: u64, what: &str, mut f: impl FnMut() -> anyhow::Result<Option<String>>) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match f()? {
+            None => return Ok(()),
+            Some(last) => anyhow::ensure!(Instant::now() < deadline, "{what}: {last}"),
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// W14-AC02 and AC04, with W14-R05: a review (draft comments published together, a thread
+/// answered and resolved, accepts from someone other than the author) lets a stack land; each
+/// strategy gives the trunk the history it should (`stack`: one commit each with its trailers,
+/// `stack-squash`: one, `ff-only`: the commits as they are, refused when diverged); a diff
+/// standing on a landed one is restacked as a rebase-only version; and a diff that loosens the
+/// policy is judged by the trunk's.
+#[test]
+fn w14_ac02_strategies() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options::default())?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    let trunk0 = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+
+    // D1 and D2, a stack.
+    commit(&home, &work, "a.txt", "one\n", "one: a", "I1111111111111111111111111111111111111111")?;
+    commit(&home, &work, "b.txt", "two\nmore\n", "two: b", "I2222222222222222222222222222222222222222")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    let (st, why) = post(&s, &lead, "/api/diffs/D2/land", &json!({}))?;
+    assert!(st == 409 && why.to_string().contains("0 of 1 accepts"), "{st} {why}");
+
+    // A review: a draft only its author sees, published with the review; a thread that blocks
+    // until it's answered and resolved.
+    let (st, c) = post(&s, &rev, "/api/diffs/D2/comments", &json!({ "file": "b.txt", "start_line": 2, "body": "why more?" }))?;
+    anyhow::ensure!(st == 200, "comment: {c}");
+    let threads = |token: &str| -> anyhow::Result<Vec<Value>> { Ok(api(&s, token, "GET", "/api/diffs/D2/comments")?.get("threads").and_then(Value::as_array).cloned().unwrap_or_default()) };
+    assert!(threads(&dev)?.is_empty(), "a draft is its author's alone");
+    assert_eq!(threads(&rev)?.len(), 1);
+    let (st, r) = post(&s, &rev, "/api/diffs/D2/review", &json!({ "action": "comment", "body": "a question" }))?;
+    assert!(st == 200 && r.get("published") == Some(&json!(1)), "{r}");
+    let t = threads(&dev)?;
+    let thread = t.first().map(|x| text(x, "id").to_owned()).unwrap_or_default();
+    assert_eq!(t.first().and_then(|x| x.pointer("/now/start_line")), Some(&json!(2)), "{t:?}");
+    let inbox = api(&s, &dev, "GET", "/api/review/inbox")?;
+    assert!(inbox.get("waiting_for_you").and_then(Value::as_array).is_some_and(|w| w.iter().any(|x| text(x, "thread") == thread)), "{inbox}");
+    let (st, r) = post(&s, &dev, "/api/diffs/D2/comments", &json!({ "thread": thread, "body": "for the test", "publish": true }))?;
+    anyhow::ensure!(st == 200, "reply: {r}");
+    let inbox = api(&s, &dev, "GET", "/api/review/inbox")?;
+    assert!(inbox.get("waiting_for_others").and_then(Value::as_array).is_some_and(|w| w.iter().any(|x| text(x, "thread") == thread)), "{inbox}");
+    let (st, r) = post(&s, &dev, "/api/diffs/D2/review", &json!({ "action": "accept" }))?;
+    assert_eq!(st, 403, "the author doesn't accept their own: {r}");
+    let (_, r) = post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    assert_eq!(text(&r, "state"), "accepted", "{r}");
+    let (_, r) = post(&s, &rev, "/api/diffs/D2/review", &json!({ "action": "accept" }))?;
+    assert_eq!(text(&r, "state"), "accepted", "{r}");
+    let land = api(&s, &dev, "GET", "/api/diffs/D2/land")?;
+    assert_eq!(land.get("blockers"), Some(&json!(["1 open thread"])), "{land}");
+    let (st, _) = http(s.port, "PATCH", &format!("/api/comments/{}", text(&c, "id")), &rev, Some(&json!({ "state": "resolved" })))?;
+    assert_eq!(st, 200);
+    // A developer doesn't land; a maintainer lands D2, and D1 with it, one commit each.
+    let (st, _) = post(&s, &dev, "/api/diffs/D2/land", &json!({}))?;
+    assert_eq!(st, 403);
+    let (st, e) = post(&s, &lead, "/api/diffs/D2/land", &json!({ "strategy": "stack" }))?;
+    assert!(st == 200 && e.get("diffs") == Some(&json!(["D1", "D2"])), "{st} {e}");
+    until(30, "D2 lands", || Ok((text(&api(&s, &dev, "GET", "/api/diffs/D2")?, "state") != "landed").then(|| "not yet".to_owned())))?;
+    must(git(&home, &work, &["fetch", "-q", "origin"]), "fetch")?;
+    let log = must(git(&home, &work, &["log", "--format=%H %P%n%B%x1e", &format!("{trunk0}..origin/main")]), "log")?;
+    let commits: Vec<&str> = log.split('\x1e').map(str::trim).filter(|c| !c.is_empty()).collect();
+    assert_eq!(commits.len(), 2, "{log}");
+    assert!(commits.iter().any(|c| c.contains("Differential-Revision: D1")) && commits.iter().any(|c| c.contains("Differential-Revision: D2") && c.contains("Reviewed-by: user:rev")), "{log}");
+    let d1 = api(&s, &dev, "GET", "/api/diffs/D1")?;
+    assert_eq!(text(&d1, "state"), "landed");
+
+    // AC04: a diff loosening the policy is judged by the trunk's.
+    must(git(&home, &work, &["checkout", "-q", "-B", "loosen", "origin/main"]), "checkout")?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 0\n")?;
+    must(git(&home, &work, &["commit", "-qam", &format!("loosen\n\nChange-Id: {}", "I3333333333333333333333333333333333333333")]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    let (st, why) = post(&s, &lead, "/api/diffs/D3/land", &json!({}))?;
+    assert!(st == 409 && why.to_string().contains("0 of 1 accepts"), "{st} {why}");
+
+    // stack-squash: D4 and D5 as one commit; D6 above them, not landed, is restacked onto it.
+    must(git(&home, &work, &["checkout", "-q", "-B", "s2", "origin/main"]), "checkout")?;
+    commit(&home, &work, "c.txt", "c\n", "four: c", "I4444444444444444444444444444444444444444")?;
+    commit(&home, &work, "d.txt", "d\n", "five: d", "I5555555555555555555555555555555555555555")?;
+    commit(&home, &work, "e.txt", "e\n", "six: e", "I6666666666666666666666666666666666666666")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    for d in ["D4", "D5", "D6"] {
+        post(&s, &rev, &format!("/api/diffs/{d}/review"), &json!({ "action": "accept" }))?;
+    }
+    let before = must(git(&home, &work, &["rev-parse", "origin/main"]), "rev-parse")?.trim().to_owned();
+    let (st, e) = post(&s, &lead, "/api/diffs/D5/land", &json!({ "strategy": "stack-squash" }))?;
+    assert!(st == 200 && e.get("diffs") == Some(&json!(["D4", "D5"])), "{st} {e}");
+    until(30, "D5 lands", || Ok((text(&api(&s, &dev, "GET", "/api/diffs/D5")?, "state") != "landed").then(|| "not yet".to_owned())))?;
+    must(git(&home, &work, &["fetch", "-q", "origin"]), "fetch")?;
+    let log = must(git(&home, &work, &["log", "--format=%B%x1e", &format!("{before}..origin/main")]), "log")?;
+    let one: Vec<&str> = log.split('\x1e').map(str::trim).filter(|c| !c.is_empty()).collect();
+    assert!(one.len() == 1 && one.first().is_some_and(|c| c.contains("Differential-Revision: D4") && c.contains("Differential-Revision: D5")), "{log}");
+    let tip = must(git(&home, &work, &["rev-parse", "origin/main"]), "rev-parse")?.trim().to_owned();
+    until(30, "D6 restacked", || {
+        let d6 = api(&s, &dev, "GET", "/api/diffs/D6")?;
+        let last = d6.get("versions").and_then(Value::as_array).and_then(|v| v.last()).cloned().unwrap_or_default();
+        Ok((!(last.get("rebase_only") == Some(&json!(true)) && text(&last, "parent") == tip && d6.get("parent") == Some(&Value::Null))).then(|| d6.to_string()))
+    })?;
+
+    // ff-only: the trunk moves to the commit as it is; a diverged one is refused.
+    must(git(&home, &work, &["fetch", "-q", "origin"]), "fetch")?;
+    must(git(&home, &work, &["checkout", "-q", "-B", "ff", "origin/main"]), "checkout")?;
+    let c7 = commit(&home, &work, "f.txt", "f\n", "seven: f", "I7777777777777777777777777777777777777777")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    post(&s, &rev, "/api/diffs/D7/review", &json!({ "action": "accept" }))?;
+    let (st, e) = post(&s, &lead, "/api/diffs/D7/land", &json!({ "strategy": "ff-only" }))?;
+    anyhow::ensure!(st == 200, "ff-only: {e}");
+    until(30, "D7 lands", || Ok((text(&api(&s, &dev, "GET", "/api/diffs/D7")?, "state") != "landed").then(|| "not yet".to_owned())))?;
+    let refs = must(git(&home, &work, &["ls-remote", &url(&dev), "refs/heads/main"]), "ls-remote")?;
+    assert!(refs.starts_with(&c7), "the trunk is the commit itself: {refs} vs {c7}");
+    // D8 on an old trunk: ff-only can't.
+    must(git(&home, &work, &["checkout", "-q", "-B", "old", &trunk0]), "checkout")?;
+    commit(&home, &work, "g.txt", "g\n", "eight: g", "I8888888888888888888888888888888888888888")?;
+    must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    post(&s, &rev, "/api/diffs/D8/review", &json!({ "action": "accept" }))?;
+    let (st, e) = post(&s, &lead, "/api/diffs/D8/land", &json!({ "strategy": "ff-only" }))?;
+    anyhow::ensure!(st == 200, "queued: {e}");
+    let entry = text(&e, "entry").to_owned();
+    until(30, "D8's entry is ejected", || {
+        let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
+        let mine = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| text(x, "id") == entry).cloned()).unwrap_or_default();
+        Ok((!(text(&mine, "state") == "ejected" && text(&mine, "reason").contains("ff-only"))).then(|| mine.to_string()))
+    })?;
+    assert_eq!(text(&api(&s, &dev, "GET", "/api/diffs/D8")?, "state"), "accepted", "back to its review state");
+    Ok(())
+}
+
+/// W14-AC03: four entries tested as one batch whose candidate fails (one of them brings `BAD`,
+/// which only the `merge_group` run rejects): the queue bisects, ejects the culprit with its
+/// reason and lands the other three; and an entry that conflicts with the trunk is ejected as
+/// "needs rebase". The checks run for real on the server's own runner, which fetches each commit
+/// through kiln's git with the leg's token.
+#[test]
+fn w14_ac03_queue() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = start(dir.path(), &Options { agent: true, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/app.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::create_dir_all(work.join(".github/workflows"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\n  checks: [gate]\nqueue:\n  batch: 4\n")?;
+    std::fs::write(
+        work.join(".github/workflows/gate.yml"),
+        r#"name: gate
+on: [pull_request, merge_group]
+jobs:
+  gate:
+    runs-on: local
+    steps:
+      - env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git -c http.extraHeader="Authorization: Bearer $TOKEN" fetch -q --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+      - if: github.event_name == 'merge_group'
+        run: test ! -f BAD
+"#,
+    )?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    must(git(&home, &work, &["add", "."]), "add")?;
+    must(git(&home, &work, &["commit", "-qm", "first"]), "commit")?;
+    must(git(&home, &work, &["push", "-q", "origin", "main"]), "the first trunk")?;
+    let trunk0 = must(git(&home, &work, &["rev-parse", "HEAD"]), "rev-parse")?.trim().to_owned();
+
+    // Four diffs, each on the trunk: one brings BAD. Two more change the same line.
+    let files = [("a.txt", "a: one"), ("BAD", "b: the culprit"), ("c.txt", "c: three"), ("d.txt", "d: four")];
+    for (i, (file, title)) in files.iter().enumerate() {
+        must(git(&home, &work, &["checkout", "-q", "-B", &format!("s{i}"), &trunk0]), "checkout")?;
+        commit(&home, &work, file, "x\n", title, &format!("I{}", format!("{i}").repeat(40)))?;
+        must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    }
+    for (i, line) in ["app, said one way\n", "app, said another\n"].iter().enumerate() {
+        must(git(&home, &work, &["checkout", "-q", "-B", &format!("r{i}"), &trunk0]), "checkout")?;
+        commit(&home, &work, "README.md", line, &format!("readme {i}"), &format!("I{}", format!("{}", 5 + i).repeat(40)))?;
+        must(git(&home, &work, &["push", "-q", "origin", "HEAD:refs/for/main"]), "submit")?;
+    }
+    for d in ["D1", "D2", "D3", "D4", "D5", "D6"] {
+        let (st, r) = post(&s, &rev, &format!("/api/diffs/{d}/review"), &json!({ "action": "accept" }))?;
+        anyhow::ensure!(st == 200, "{d}: {r}");
+    }
+    // Each version's gate passes (the merge_group step is skipped on pull requests).
+    for d in ["D1", "D2", "D3", "D4", "D5", "D6"] {
+        until(180, &format!("{d}'s gate"), || {
+            let l = api(&s, &dev, "GET", &format!("/api/diffs/{d}/land"))?;
+            Ok((l.get("blockers") != Some(&json!([]))).then(|| format!("{l}\n{}", run_logs(&s, d))))
+        })?;
+    }
+
+    // Four entries at once: one batch, which fails; bisected, the culprit goes, three land.
+    for d in ["D1", "D2", "D3", "D4"] {
+        let (st, e) = post(&s, &lead, &format!("/api/diffs/{d}/land"), &json!({}))?;
+        anyhow::ensure!(st == 200, "{d}: {e}");
+    }
+    let state = |d: &str| -> anyhow::Result<String> { Ok(text(&api(&s, &dev, "GET", &format!("/api/diffs/{d}"))?, "state").to_owned()) };
+    until(400, "the queue settles", || {
+        let states: Vec<String> = ["D1", "D2", "D3", "D4"].iter().map(|d| state(d)).collect::<anyhow::Result<_>>()?;
+        Ok((states != ["landed", "accepted", "landed", "landed"]).then(|| format!("{states:?}\n{}", api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue").map(|q| q.to_string()).unwrap_or_default())))
+    })?;
+    let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
+    let culprit = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D2"])))).cloned().unwrap_or_default();
+    assert!(text(&culprit, "state") == "ejected" && text(&culprit, "reason").contains("`gate` failure"), "{culprit}");
+    must(git(&home, &work, &["fetch", "-q", "origin"]), "fetch")?;
+    let landed = must(git(&home, &work, &["log", "--format=%s", &format!("{trunk0}..origin/main")]), "log")?;
+    assert_eq!(landed.lines().count(), 3, "{landed}");
+    assert!(!landed.contains("culprit"), "{landed}");
+
+    // The two README changes: the first lands, the second needs a rebase.
+    for d in ["D5", "D6"] {
+        let (st, e) = post(&s, &lead, &format!("/api/diffs/{d}/land"), &json!({}))?;
+        anyhow::ensure!(st == 200, "{d}: {e}");
+    }
+    until(300, "D5 lands and D6 is ejected", || {
+        let (a, b) = (state("D5")?, state("D6")?);
+        Ok(!(a == "landed" && b == "accepted")).map(|w| w.then(|| format!("{a} {b}")))
+    })?;
+    let q = api(&s, &dev, "GET", "/api/repos/acme%2Fapp/queue")?;
+    let d6 = q.get("entries").and_then(Value::as_array).and_then(|l| l.iter().find(|x| x.get("diffs") == Some(&json!(["D6"])))).cloned().unwrap_or_default();
+    assert!(text(&d6, "reason").contains("needs rebase") && text(&d6, "reason").contains("README.md"), "{d6}");
+    Ok(())
+}
+
+/// The logs of the runs on a diff's latest version, for a failure's message.
+fn run_logs(s: &Server, diff: &str) -> String {
+    let mut out = String::new();
+    let Ok(d) = api(s, &s.admin, "GET", &format!("/api/diffs/{diff}")) else { return out };
+    for r in d.get("runs").and_then(Value::as_array).into_iter().flatten() {
+        let Ok(run) = api(s, &s.admin, "GET", &format!("/api/runs/{}", text(r, "id"))) else { continue };
+        for j in run.get("jobs").and_then(Value::as_array).into_iter().flatten() {
+            if let Ok((_, logs)) = http(s.port, "GET", &format!("/api/jobs/{}/logs", text(j, "id")), &s.admin, None) {
+                out.push_str(&format!("--- {} {}\n{}\n", text(r, "event"), text(j, "display"), logs.chars().rev().take(3000).collect::<String>().chars().rev().collect::<String>()));
+            }
+        }
+    }
+    out
 }

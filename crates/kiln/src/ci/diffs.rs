@@ -29,15 +29,27 @@ fn fail(e: anyhow::Error) -> Fail {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
 }
 
-/// git with `input` on its stdin: what it prints.
-pub(crate) async fn git_with_input(hub: &Hub, args: &[&str], input: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+/// What a git run said: whether it succeeded, its stdout and its stderr.
+pub(crate) struct Ran {
+    pub ok: bool,
+    pub out: Vec<u8>,
+    pub err: Vec<u8>,
+}
+
+/// git with `env` set and `input` on its stdin, however it ends.
+pub(crate) async fn git_run(hub: &Hub, args: &[&str], env: &[(&str, &str)], input: Vec<u8>) -> anyhow::Result<Ran> {
     let mut cmd = gitops::git(hub);
     cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let d = crate::proc::spawn_duplex(cmd)?;
     let stdin = d.stdin.clone();
     drop(d.stdin);
     crate::rt::spawn(async move {
-        let _ = stdin.send(input).await;
+        if !input.is_empty() {
+            let _ = stdin.send(input).await;
+        }
     });
     let (stdout, stderr, exit) = (d.stdout, d.stderr, d.exit);
     let read = async move {
@@ -54,10 +66,17 @@ pub(crate) async fn git_with_input(hub: &Hub, args: &[&str], input: Vec<u8>) -> 
         }
         (out, err.await.unwrap_or_default(), exit.await.ok().flatten())
     };
-    let what = args.first().copied().unwrap_or_default();
+    let what = args.iter().find(|a| !a.starts_with('-') && !a.contains('/')).copied().unwrap_or_default();
     let (out, err, code) = crate::rt::timeout(Duration::from_secs(300), read).await.map_err(|_| anyhow::anyhow!("git {what} took too long"))?;
-    anyhow::ensure!(code == Some(0), "git {what}: {}", crate::util::truncate(String::from_utf8_lossy(&err).trim(), 600));
-    Ok(out)
+    Ok(Ran { ok: code == Some(0), out, err })
+}
+
+/// git with `input` on its stdin: what it prints.
+pub(crate) async fn git_with_input(hub: &Hub, args: &[&str], input: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    let r = git_run(hub, args, &[], input).await?;
+    let what = args.iter().find(|a| !a.starts_with('-') && !a.contains('/')).copied().unwrap_or_default();
+    anyhow::ensure!(r.ok, "git {what}: {}", crate::util::truncate(String::from_utf8_lossy(&r.err).trim(), 600));
+    Ok(r.out)
 }
 
 /// Who a diff is by, as its rows name them: `user:ada` (a person, through any of their tokens),
@@ -346,6 +365,74 @@ async fn checks(hub: &Hub, repo: &Repo, trunk: &str, base_sha: &str, author: &(S
     Ok(())
 }
 
+/// A new version of `d` that kiln made (a restack onto a moved trunk, W14-R08): kept at its ref,
+/// its checks started. Its number.
+pub(crate) async fn add_version(hub: &Arc<Hub>, repo: &Repo, path: &str, d: &Diff, v: NewVersion) -> anyhow::Result<u32> {
+    let (id, nv) = (d.id.clone(), v.clone());
+    let n: u32 = hub
+        .store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let n: u32 = tx.query_row("SELECT COALESCE(MAX(n), 0) + 1 FROM diff_versions WHERE diff_id = ?1", [&id], |r| r.get(0))?;
+            let now = crate::util::now_unix();
+            tx.execute(
+                "INSERT INTO diff_versions (diff_id, n, commit_sha, parent, base, patch_id, message, note, rebase_only, pushed_by, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![id, n, nv.commit, nv.parent, nv.base, nv.patch_id, nv.message, nv.note, nv.rebase_only, nv.pushed_by, now],
+            )?;
+            tx.execute("UPDATE diffs SET parent_diff = ?2, updated_at = ?3 WHERE id = ?1", params![id, nv.parent_diff, now])?;
+            tx.commit()?;
+            Ok(n)
+        })
+        .await?;
+    gitops::run_git(hub, &["-C", path, "update-ref", &format!("refs/kiln/diffs/{}/v{n}", d.name), &v.commit], LS_REMOTE_TIMEOUT).await?;
+    let (title, summary) = review::title_and_summary(&v.message);
+    let f = Fresh { number: d.number, n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: v.message.clone(), draft: d.state == "draft", rebase_only: v.rebase_only };
+    let (hub2, repo2, trunk, author, base) = (hub.clone(), repo.clone(), d.trunk.clone(), (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" }), v.base.clone());
+    crate::rt::spawn(async move {
+        if let Err(e) = checks(&hub2, &repo2, &trunk, &base, &author, &f).await {
+            tracing::warn!(diff = f.number, version = f.n, error = %format!("{e:#}"), "a diff's workflows didn't start");
+        }
+    });
+    Ok(n)
+}
+
+/// A version kiln makes.
+#[derive(Debug, Clone)]
+pub(crate) struct NewVersion {
+    pub commit: String,
+    pub parent: String,
+    pub base: String,
+    pub patch_id: String,
+    pub message: String,
+    pub note: Option<String>,
+    pub rebase_only: bool,
+    pub pushed_by: String,
+    pub parent_diff: Option<String>,
+}
+
+/// `pull_request` `closed` for a diff that landed (`merged`) or was abandoned (W03-R09's table).
+pub(crate) async fn closed(hub: &Hub, repo: &Repo, d: &Diff, merged: bool) -> anyhow::Result<()> {
+    if !hub.ci.enabled() {
+        return Ok(());
+    }
+    let Some(v) = versions(hub, d).await?.pop() else { return Ok(()) };
+    let ctx = super::events::facts(hub, repo).await.repo;
+    let (title, summary) = (d.title.clone(), d.summary.clone());
+    let f = Fresh { number: d.number, n: v.n, sha: v.commit.clone(), parent: v.parent.clone(), title, summary, message: String::new(), draft: false, rebase_only: v.rebase_only };
+    let author = (d.author.clone(), if d.author_kind == "agent" { "agent" } else { "human" });
+    let (mut e, _) = events_of(repo, &ctx, &d.trunk, &v.base, &author, &f, None);
+    e.action = "closed".into();
+    if let Some(p) = e.payload.pointer_mut("/pull_request").and_then(Value::as_object_mut) {
+        p.insert("state".into(), json!("closed"));
+        p.insert("merged".into(), json!(merged));
+    }
+    let commit = super::load::load(hub, repo, &v.commit).await?;
+    for l in commit.workflows.iter().filter(|l| l.runs && (l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows)) {
+        super::events::start(hub, repo, &e, l, &d.title, &d.author, Value::Null).await?;
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ reads
 
 /// A diff as the API shows it.
@@ -427,7 +514,7 @@ pub async fn find(hub: &Hub, key: &str) -> anyhow::Result<Option<Diff>> {
         .await
 }
 
-async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>> {
+pub(crate) async fn versions(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Version>> {
     let (id, name) = (d.id.clone(), d.name.clone());
     hub.store
         .call(move |c| {
@@ -453,7 +540,7 @@ async fn reviewers(hub: &Hub, d: &Diff) -> anyhow::Result<Vec<Value>> {
 }
 
 /// The native repository a diff lives in, and its bare repository.
-async fn home(hub: &Hub, d: &Diff) -> Result<(Repo, String), Fail> {
+pub(crate) async fn home(hub: &Hub, d: &Diff) -> Result<(Repo, String), Fail> {
     let repos = hub.store.repos().await.map_err(fail)?;
     let repo = repos.into_iter().find(|r| r.name == d.repo).ok_or((StatusCode::NOT_FOUND, "the diff's repository is gone".to_owned()))?;
     let path = super::hosting::native_path(hub, &repo).ok_or((StatusCode::CONFLICT, "the diff's repository isn't hosted here any more".to_owned()))?;
@@ -465,17 +552,23 @@ fn version_of(list: &[Version], n: &str) -> Result<Version, Fail> {
     list.iter().find(|v| v.n == n).cloned().ok_or((StatusCode::NOT_FOUND, format!("no version {n}")))
 }
 
-/// The files a version changes (renames found), with the patch.
-async fn files(hub: &Hub, d: &Diff, v: &Version) -> Result<Value, Fail> {
+/// The files a version changes (renames found), with the patch, and which of them `viewer`
+/// marked viewed (and that haven't changed since).
+async fn files(hub: &Hub, d: &Diff, v: &Version, viewer: &str, latest: &Version) -> Result<Value, Fail> {
     let (_, path) = home(hub, d).await?;
     let stat = gitops::run_git(hub, &["-C", &path, "diff", "--numstat", "-z", "-M", &v.parent, &v.commit], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
     let status = gitops::run_git(hub, &["-C", &path, "diff", "--name-status", "-z", "-M", &v.parent, &v.commit], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
     let patch = gitops::run_git(hub, &["-C", &path, "diff", "--no-color", "-M", &v.parent, &v.commit], LS_REMOTE_TIMEOUT).await.map_err(fail)?;
     let mut list = numstat(&String::from_utf8_lossy(&stat));
     let statuses = name_status(&String::from_utf8_lossy(&status));
+    let seen = if v.n == latest.n { super::review::viewed_files(hub, d, viewer, latest).await } else { HashMap::new() };
     for f in &mut list {
-        if let Some(s) = f.get("path").and_then(Value::as_str).and_then(|p| statuses.get(p)) {
-            f["status"] = json!(s);
+        let path = f.get("path").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if let Some(o) = f.as_object_mut() {
+            if let Some(s) = statuses.get(&path) {
+                o.insert("status".into(), json!(s));
+            }
+            o.insert("viewed".into(), json!(seen.contains_key(&path)));
         }
     }
     const MAX: usize = 8 << 20;
@@ -636,11 +729,15 @@ async fn act(hub: &Hub, d: &Diff, action: &str, caller: &Caller) -> Result<Value
 
 /// `/api/diffs/<id>[/…]`, `/api/repos/<repo>/diffs` and `/api/stacks/<id>`; the route table
 /// (W10-R05) has let the caller through for the diff's repository.
-pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<String, String>, caller: &Caller) -> Result<Response, Fail> {
+pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<String, String>, caller: &Caller, body: &Value) -> Result<Response, Fail> {
     let ok = |v: Value| Ok(srv::json(StatusCode::OK, &v));
     match (method, segs) {
         (&Method::GET, ["repos", repo, "diffs"]) => ok(list(hub, repo, q).await?),
+        (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
+        (&Method::GET, ["review", "inbox"]) => ok(super::review::inbox(hub, caller).await?),
+        (&Method::PATCH, ["comments", id]) => ok(super::review::edit(hub, id, caller, body).await?),
+        (&Method::DELETE, ["queue", id]) => ok(super::land::cancel(hub, id, caller).await?),
         (_, ["diffs", key, rest @ ..]) => {
             let d = find(hub, key).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, format!("no diff {key}")))?;
             // A caller sees a diff where they may read diffs (the route table checked it there).
@@ -652,7 +749,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                 (&Method::GET, ["versions"]) => ok(json!({ "versions": versions(hub, &d).await.map_err(fail)? })),
                 (&Method::GET, ["versions", n, "files"]) => {
                     let vs = versions(hub, &d).await.map_err(fail)?;
-                    ok(files(hub, &d, &version_of(&vs, n)?).await?)
+                    let latest = vs.last().cloned().ok_or((StatusCode::NOT_FOUND, "no versions".to_owned()))?;
+                    ok(files(hub, &d, &version_of(&vs, n)?, &super::review::who(caller).0, &latest).await?)
                 }
                 (&Method::GET, ["interdiff"]) => {
                     let vs = versions(hub, &d).await.map_err(fail)?;
@@ -660,6 +758,17 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
                     let from = version_of(&vs, q.get("from").map_or("1", String::as_str))?;
                     let to = version_of(&vs, q.get("to").map_or(last.as_str(), String::as_str))?;
                     ok(interdiff(hub, &d, &from, &to).await?)
+                }
+                (&Method::GET, ["comments"]) => ok(json!({ "threads": super::review::threads(hub, &d, &super::review::who(caller).0).await? })),
+                (&Method::POST, ["comments"]) => ok(super::review::comment(hub, &d, caller, body).await?),
+                (&Method::POST, ["review"]) => ok(super::review::review(hub, &d, caller, body).await?),
+                (&Method::POST, ["viewed"]) => ok(super::review::viewed(hub, &d, caller, body).await?),
+                (&Method::GET, ["land"]) => ok(super::review::readiness(hub, &d).await?),
+                (&Method::POST, ["land"]) => {
+                    if !caller.can("diffs.land", &Scope::Repo { repo: d.repo.clone() }) {
+                        return Err((StatusCode::FORBIDDEN, "landing needs `diffs.land`".into()));
+                    }
+                    ok(super::land::enqueue(hub, &d, caller, body).await?)
                 }
                 (&Method::POST, [action @ ("ready" | "abandon" | "reclaim" | "commandeer")]) => {
                     if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {

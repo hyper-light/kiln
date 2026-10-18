@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use http::StatusCode;
-use serde::Deserialize;
 
 use super::Fail;
 use crate::authz::{Caller, Scope};
@@ -273,12 +272,7 @@ pub fn for_ref(name: &str) -> Option<(&str, Vec<String>)> {
 }
 
 /// `.kiln/review.yaml` as a push reads it (W14-R09): the trunks, and who may push to them.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct Review {
-    pub trunks: Vec<String>,
-    pub direct_push: Vec<String>,
-}
+pub use kiln_ci::land::Policy as Review;
 
 /// Who is pushing or fetching.
 pub enum Pusher {
@@ -378,7 +372,7 @@ async fn trunks(hub: &Hub, path: &str) -> (Vec<String>, Review) {
     let review: Review = crate::gitops::run_git(hub, &["-C", path, "show", &format!("refs/heads/{head}:.kiln/review.yaml")], crate::gitops::LS_REMOTE_TIMEOUT)
         .await
         .ok()
-        .and_then(|b| serde_yaml::from_slice(&b).ok())
+        .and_then(|b| Review::parse(&String::from_utf8_lossy(&b)).ok())
         .unwrap_or_default();
     let mut list = review.trunks.clone();
     if !list.contains(&head) {

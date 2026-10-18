@@ -248,6 +248,10 @@ pub enum At {
     Diff(usize),
     /// The stack at this segment: its repository.
     Stack(usize),
+    /// The review comment at this segment: its diff's repository.
+    Comment(usize),
+    /// The land queue entry at this segment: its repository.
+    Entry(usize),
     /// The `scope` query parameter (`repo:acme/app`, …), else the server.
     ScopeQuery,
     /// The `repo` query parameter, else the server.
@@ -300,6 +304,14 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/reclaim", "diffs.submit", At::Diff(2)),
     r("POST", "/api/diffs/*/commandeer", "diffs.submit", At::Diff(2)),
     r("GET", "/api/stacks/*", "diffs.read", At::Stack(2)),
+    r("POST", "/api/diffs/*/comments", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/review", "diffs.review", At::Diff(2)),
+    r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
+    r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
+    r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
+    r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
+    r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),
     r("GET", "/api/runs", "runs.read", At::RepoQuery),
     r("GET", "/api/runs/*", "runs.read", At::Run(2)),
     r("POST", "/api/runs/*/cancel", "runs.cancel", At::Run(2)),

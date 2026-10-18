@@ -184,7 +184,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; facts (built-in probes on connect, every 10 minutes and on request; declared facts and probes; routing decides over them; on the runner's page; AC01); pools, microVMs, k8s left |
-| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); diffs, review, landing left |
+| W14 | Code hosting, stacks, review, landing | W03 | in progress | native hosting (clone and push at /git/, push policy, import); stacked diffs (refs/for, versions, stacks, interdiffs, kiln submit/sync/checkout; AC01); review, policy from trunk, strategies and the land queue with bisection (AC02–AC04); the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); change requests, review UI, App left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
@@ -3331,8 +3331,8 @@ adapts [review.md](review.md), which it replaces.
 - **W14-AC07 GitHub App.** Statuses and checks on GitHub for kiln runs; a stacked pull request
   landed bottom-up with retargeting. *E2E against a test repository, user-assisted.*
 
-**Progress.** In progress: native hosting, stacked diffs, the facade's git half, and the start
-of its REST half.
+**Progress.** In progress: native hosting, stacked diffs, review, policy and the land queue are
+built; change requests, the review UI, the App and the facade's REST half are left.
 
 - *Done.* R01 and R02's hosting, in `crates/kiln/src/ci/hosting.rs`:
   - native repositories: bare repositories in `<data_dir>/hosted/<owner>/<name>.git` (apart
@@ -3381,6 +3381,49 @@ of its REST half.
   - Checked end to end with real git: W14-AC01 (`w14_ac01_stacks`: three commits as a stack,
     D2 amended, the stack rebased and reordered, an interdiff, the refusals, the options, the
     author's actions, the runs), and the CLI (`w14_r03_cli`).
+- *Done.* R05's review, in `crates/kiln/src/ci/review.rs`:
+  - threads anchored to a version, file, side and lines, that follow the code to the latest
+    version (`git diff -U0` hunks) or show as outdated;
+  - comments drafted privately and published together by a review (`accept`,
+    `request_changes`, `comment`, `resign`); the author doesn't accept their own;
+  - each reviewer's state; the diff's review state from its reviews;
+  - threads resolved and reopened (`PATCH /api/comments/:id`);
+  - files marked viewed until they change;
+  - the inbox (`/api/review/inbox`): threads waiting for you (on your diffs, ones you joined, ones
+    that mention you), threads where you wait, review requests, your open diffs.
+- *Done.* R09's policy from the trunk (`crates/kiln-ci/src/land.rs`): `.kiln/review.yaml` and
+  `.kiln/owners.yaml` read from the trunk when they apply:
+  - approvals from people other than the author, agents' only with `agents-can-approve`;
+  - sticky approvals across rebase-only versions;
+  - owners (the last matching rule, optional rules aside);
+  - `land.checks` on the version (a skipped or neutral check passes, as on GitHub);
+  - open threads; `land.strategies` and `land.default`;
+  - what still blocks a diff is listed at `/api/diffs/:id/land`.
+- *Done.* R07 and R08, the land queue, in `crates/kiln/src/ci/land.rs`:
+  - `POST /api/diffs/:id/land` (`diffs.land`) lands the diff and those below it, by the strategy
+    asked for, within `land.strategies`: `stack` (one commit each, with `Differential-Revision:`
+    and `Reviewed-by:` trailers), `stack-squash`, or `ff-only` (the commits as they are, refused
+    when diverged);
+  - per trunk, the next batch (up to `queue.batch`, halved after each failure until the culprit
+    is alone) is applied onto the trunk's tip without a working tree (`git merge-tree`; a
+    temporary worktree where git is older than 2.40), kept at `refs/kiln/land/<trunk>/<batch>`,
+    and tested by its `merge_group` and `land` workflows;
+  - a required check that none of them runs ejects the batch;
+  - when they pass, the trunk moves in one compare-and-swap update (a moved trunk means a new
+    candidate);
+  - a failure ejects a lone entry with its reason, or splits the batch; a conflict ejects the
+    entry as "needs rebase";
+  - landed diffs get `pull_request` `closed` events; the open diffs above them are restacked onto
+    the new trunk as rebase-only versions;
+  - `GET /api/repos/:repo/queue`, `DELETE /api/queue/:entry` (`queue.manage`);
+  - `kiln land D12 [--strategy S]` and `kiln review D12 [--accept | --request-changes | --comment
+    | --resign]`.
+  - Checked end to end:
+    - W14-AC02 and AC04 (`w14_ac02_strategies`): a review lets a stack land; each strategy's
+      history; the restack; a policy-loosening diff judged by the trunk's policy;
+    - W14-AC03 (`w14_ac03_queue`): a batch of four with one culprit bisected, the culprit
+      ejected with its reason and three landed, and a conflict ejected; the checks run on a real
+      runner that fetches through kiln's git with the leg's token.
 - *Done.* R11's git half, in `crates/kiln/src/ci/facade.rs`:
   - smart HTTP over the server's mirror, served by `git http-backend` (protocols v0 to v2,
     gzipped requests, fetches by SHA, filters);
@@ -3414,8 +3457,12 @@ of its REST half.
   - branch protection rules (R02, with R09);
   - R03's `kiln absorb`;
   - the rest of R11's REST subset and GraphQL;
-  - change requests, review, landing, the App, the rest of the schema (R04 to R10, R13);
-  - AC02 to AC07.
+  - change requests (R04) and the strategies only they use (`squash`, `rebase`, `merge`);
+  - suggestions applied as amends, replies by email or chat (R05);
+  - R06's diffs UI and the review pages (with W21);
+  - commit signing of landed commits (R07);
+  - the App (R10);
+  - AC05 to AC07.
 
 ### W15 Environments and deployments
 

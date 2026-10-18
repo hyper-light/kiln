@@ -252,6 +252,62 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
     Ok(out)
 }
 
+/// A hunk of `git diff -U0`: `@@ -old_start,old_len +new_start,new_len @@`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hunk {
+    pub old_start: u32,
+    pub old_len: u32,
+    pub new_start: u32,
+    pub new_len: u32,
+}
+
+/// The hunks of a `git diff -U0` of one file.
+pub fn hunks(diff: &str) -> Vec<Hunk> {
+    let range = |r: &str| -> Option<(u32, u32)> {
+        let (a, b) = r.split_once(',').unwrap_or((r, "1"));
+        Some((a.parse().ok()?, b.parse().ok()?))
+    };
+    diff.lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("@@ -")?;
+            let (old, rest) = rest.split_once(" +")?;
+            let new = rest.split_once(" @@").map_or(rest, |(n, _)| n);
+            let ((old_start, old_len), (new_start, new_len)) = (range(old)?, range(new)?);
+            Some(Hunk { old_start, old_len, new_start, new_len })
+        })
+        .collect()
+}
+
+/// Where lines `start..=end` of a file are after the changes `hunks` make to it: moved by the
+/// hunks before them; `None` when a hunk touches them (a comment there is outdated).
+pub fn follow(hunks: &[Hunk], start: u32, end: u32) -> Option<(u32, u32)> {
+    let (s, e) = (i64::from(start), i64::from(end.max(start)));
+    let mut delta: i64 = 0;
+    for h in hunks {
+        let (a, b, d) = (i64::from(h.old_start), i64::from(h.old_len), i64::from(h.new_len));
+        if b > 0 {
+            if a + b - 1 < s {
+                delta += d - b;
+                continue;
+            }
+            if a > e {
+                break;
+            }
+            return None;
+        }
+        // Lines inserted after old line `a`.
+        if a < s {
+            delta += d;
+            continue;
+        }
+        if a >= e {
+            break;
+        }
+        return None;
+    }
+    Some((u32::try_from(s + delta).ok()?, u32::try_from(e + delta).ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +328,20 @@ mod tests {
         assert_eq!(with_change_id("fix: x\n", A), format!("fix: x\n\nChange-Id: {A}\n"));
         assert_eq!(with_change_id("fix: x\n\nbody\n\nSigned-off-by: Ada <a@x>\n", A), format!("fix: x\n\nbody\n\nSigned-off-by: Ada <a@x>\nChange-Id: {A}\n"));
         assert_eq!(with_change_id(&m, B), m, "one is enough");
+    }
+
+    #[test]
+    fn w14_r05_follow() {
+        let h = hunks("diff --git a/f b/f\n@@ -2 +2,3 @@\n-x\n+a\n+b\n+c\n@@ -10,2 +12,0 @@\n-y\n-z\n@@ -20,0 +21 @@\n+w\n");
+        assert_eq!(h, [Hunk { old_start: 2, old_len: 1, new_start: 2, new_len: 3 }, Hunk { old_start: 10, old_len: 2, new_start: 12, new_len: 0 }, Hunk { old_start: 20, old_len: 0, new_start: 21, new_len: 1 }]);
+        assert_eq!(follow(&h, 1, 1), Some((1, 1)), "before every change");
+        assert_eq!(follow(&h, 5, 7), Some((7, 9)), "after line 2 grew by two");
+        assert_eq!(follow(&h, 2, 2), None, "its line changed");
+        assert_eq!(follow(&h, 9, 11), None, "its lines were removed");
+        assert_eq!(follow(&h, 15, 16), Some((15, 16)), "+2 then -2");
+        assert_eq!(follow(&h, 19, 21), None, "a line inserted inside it");
+        assert_eq!(follow(&h, 21, 22), Some((22, 23)), "a line inserted before it");
+        assert_eq!(follow(&[], 3, 4), Some((3, 4)));
     }
 
     #[test]

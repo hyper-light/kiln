@@ -317,6 +317,8 @@ async fn target(hub: &Hub, at: At, segs: &[&str], q: &HashMap<String, String>) -
             repo_of(name)
         }
         At::Stack(i) => repo_of(one("SELECT p.name FROM stacks s JOIN repos p ON p.id = s.repo_id WHERE s.id = ?1", seg(i)).await),
+        At::Comment(i) => repo_of(one("SELECT p.name FROM review_comments c JOIN review_threads t ON t.id = c.thread_id JOIN diffs d ON d.id = t.diff_id JOIN repos p ON p.id = d.repo_id WHERE c.id = ?1", seg(i)).await),
+        At::Entry(i) => repo_of(one("SELECT p.name FROM land_queue q JOIN repos p ON p.id = q.repo_id WHERE q.id = ?1", seg(i)).await),
         At::ScopeQuery => match q.get("scope").map(|s| Scope::parse(s)) {
             Some(Ok(s)) => match s.repo().map(str::to_owned) {
                 Some(r) => {
