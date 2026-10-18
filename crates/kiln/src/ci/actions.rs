@@ -52,7 +52,7 @@ impl Remote {
     }
 }
 
-fn mirror(hub: &Hub, owner: &str, repo: &str) -> PathBuf {
+pub(crate) fn mirror(hub: &Hub, owner: &str, repo: &str) -> PathBuf {
     hub.cfg.data("actions").join(format!("{owner}__{repo}.git"))
 }
 
@@ -112,7 +112,7 @@ pub async fn resolve(hub: &Hub, wf: &Workflow) -> Result<BTreeMap<String, Action
 
 /// The commit `ref` names now, fetched into the mirror (W07-R02, W07-R03): a tag (peeled), a
 /// branch, or a full SHA. When the source can't be reached, a ref the mirror knows still works.
-async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
+pub(crate) async fn pin(hub: &Hub, r: &Remote) -> anyhow::Result<String> {
     let dir = mirror(hub, &r.owner, &r.repo);
     let d = dir.to_string_lossy().to_string();
     let url = format!("https://github.com/{}/{}.git", r.owner, r.repo);

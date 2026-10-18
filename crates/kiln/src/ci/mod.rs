@@ -12,6 +12,7 @@ pub mod hooks;
 pub mod load;
 pub mod oidc;
 pub mod rest;
+pub mod reusable;
 pub mod runs;
 pub mod runs_api;
 pub mod schedule;
