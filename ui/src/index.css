@@ -384,7 +384,15 @@
     overflow-y: auto;
     padding: 4px 0 8px;
   }
-  /* A page fills the window at least, so the footer sits below the fold and never jumps in view
+  /* A page that fills the window (an agent, the terminal: app-shell's fitTheWindow) never scrolls
+   itself, only its panes: no rubber band, nothing to drag the UI out of view with. */
+html.fills-window,
+html.fills-window body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+/* A page fills the window at least, so the footer sits below the fold and never jumps in view
    while the page loads. */
 .page-main {
   min-height: calc(100dvh - var(--header-h));

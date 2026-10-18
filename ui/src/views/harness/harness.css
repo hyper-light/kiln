@@ -448,7 +448,8 @@ textarea.hx-input {
   position: relative;
   display: flex;
   flex-direction: column;
-  height: calc(100dvh - var(--header-h) - 1px);
+  /* The window's visible part (a phone's keyboard takes the rest: app-shell's fitTheWindow). */
+  height: calc(var(--window-h, 100dvh) - var(--header-h) - 1px);
   min-height: 0;
   background: var(--color-background);
 }
@@ -639,6 +640,11 @@ textarea.hx-input {
   /* The conversation keeps your place itself (timeline.tsx), the same in every browser. */
   overflow-anchor: none;
   padding: 22px max(16px, calc((100% - 860px) / 2)) 28px;
+}
+/* Always a pixel to scroll: iOS keeps a drag in a pane that can scroll, and one that fits (a short
+   conversation, an agent at rest) would hand it to the page and drag the whole UI up. */
+.hx-timeline > .hx-flow {
+  min-height: calc(100% + 1px);
 }
 /* Placeholder words that hold a line's height while the page loads. */
 .hx-ghost {
