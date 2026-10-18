@@ -293,6 +293,8 @@ export interface State {
   left_behind?: number;
   /** Which of those lists the harness has reported yet (servers that predate it omit this). */
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
+  /** A switch to another harness's model, waiting for the turn under way to end. */
+  switching?: { kind: string; model: string };
 }
 
 /** loading: not reported yet; ready: reported (an empty list means none); unsupported: the harness can't say. */
@@ -309,6 +311,8 @@ export interface ModelOption {
   id: string;
   label: string;
   description?: string;
+  /** The effort levels it takes, lowest first (when the harness says). */
+  efforts?: string[];
 }
 
 export interface SlashCommand {
@@ -461,7 +465,7 @@ export interface Meta {
   models: ModelOption[];
   commands: SlashCommand[];
   agents: string[];
-  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume" */
+  /** "steer", "send_now", "queue_cancel", "interrupt", "set_mode", "set_model", "stop_task", "file_suggestions", "resume", "switch_harness" */
   features: string[];
 }
 
@@ -524,6 +528,10 @@ export interface KindInfo {
   default_mode?: string;
   /** Effort levels a new agent can start at, lowest first (older runners don't say). */
   efforts?: ControlOption[];
+  /** The models it offers on that machine (older runners don't say). */
+  models?: ModelOption[];
+  /** An agent in another harness can go on in this one, its conversation carried over. */
+  switch?: boolean;
 }
 
 /** What to start. */
@@ -584,7 +592,8 @@ export type Command =
     }
   | { type: "interrupt" }
   | { type: "set_mode"; mode: string }
-  | { type: "set_model"; model: string }
+  /** `kind`: the model is another harness's; the agent goes on in it (feature "switch_harness"). */
+  | { type: "set_model"; model: string; kind?: string }
   | { type: "stop_task"; task: string }
   | { type: "stop_tasks" }
   /** Take a queued message out of the queue and steer it into the running turn (no interrupt). */

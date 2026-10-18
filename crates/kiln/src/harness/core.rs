@@ -160,6 +160,9 @@ pub struct Core {
     pub task_output: HashMap<String, TaskOutput>,
     /// The timeline was cut (a rewind): viewers start over from a snapshot.
     reset: bool,
+    /// kiln's queue waits: the session goes on in another harness once the turn under way ends,
+    /// and what is queued goes to that one.
+    pub hold: bool,
 }
 
 impl Default for Core {
@@ -190,6 +193,7 @@ impl Core {
             effects: Vec::new(),
             task_output: HashMap::new(),
             reset: false,
+            hold: false,
         }
     }
 

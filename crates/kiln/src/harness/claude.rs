@@ -529,7 +529,7 @@ impl Claude {
         if core.meta.commands.is_empty() {
             core.meta.commands = sort_catalog(claude_catalog());
         }
-        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images"]
+        core.meta.features = ["steer", "send_now", "queue", "queue_steer", "interrupt", "set_mode", "set_model", "set_effort", "stop_task", "file_suggestions", "resume", "attachments", "images", "switch_harness"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
@@ -619,7 +619,7 @@ impl Claude {
                     self.request(core, Pending::SetMode(mode.clone()), json!({"subtype": "set_permission_mode", "mode": mode}));
                 }
             }
-            Command::SetModel { model } => {
+            Command::SetModel { model, .. } => {
                 self.request(core, Pending::SetModel(model.clone()), json!({"subtype": "set_model", "model": model}));
             }
             Command::StopTask { task } => {
@@ -1272,7 +1272,7 @@ impl Claude {
 
     /// The turn is over: the next message waiting in kiln's queue goes out.
     fn drain_queue(&mut self, core: &mut Core) {
-        if self.busy(core) || core.state.queue.is_empty() || core.state.status == Status::Exited {
+        if core.hold || self.busy(core) || core.state.queue.is_empty() || core.state.status == Status::Exited {
             return;
         }
         let item = core.state.queue.remove(0);
@@ -1437,6 +1437,7 @@ impl Claude {
                                 id: str_of(m, "value")?.to_owned(),
                                 label: str_of(m, "displayName").unwrap_or("").to_owned(),
                                 description: str_of(m, "description").unwrap_or("").to_owned(),
+                                efforts: m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
                             })
                         })
                         .collect();
@@ -4389,7 +4390,7 @@ mod tests {
         c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s", "model": "sonnet[1m]", "permissionMode": "default"}).to_string());
         assert_eq!(ids(&core), ["low", "medium", "high"]);
         let _ = requests(&mut core);
-        c.command(&mut core, Command::SetModel { model: "claude-haiku-5-5".into() });
+        c.command(&mut core, Command::SetModel { model: "claude-haiku-5-5".into(), kind: None });
         let reqs = requests(&mut core);
         reply_to(&mut c, &mut core, &reqs, "set_model", json!({}));
         assert!(core.meta.efforts.is_empty());

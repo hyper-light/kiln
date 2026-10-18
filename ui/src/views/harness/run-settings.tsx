@@ -7,6 +7,8 @@
  *   each is one track: tap a stop or slide to it. A mode that turns checks off waits for an
  *   explicit "Turn them off".
  * - The model is a family (Opus, Fable, Sonnet, Haiku); its other versions are one tap further.
+ *   The other harnesses' models on the agent's machine follow, by harness: choosing one goes on
+ *   there (at the end of the turn under way), the conversation carried over.
  *
  * A choice applies at once, "· UNDO" waits on the line for a few seconds, and the setting folds
  * away shortly after. Nothing pops up or covers the conversation.
@@ -32,6 +34,8 @@ interface Word {
   hint?: string;
   /** Turns checks off, so it takes an explicit confirmation. */
   dangerous?: boolean;
+  /** A model of another harness than the agent's (its id): choosing it switches there. */
+  kind?: string;
 }
 
 const KEY: Record<Kind, string> = { mode: "Permissions", model: "Model", effort: "Effort" };
@@ -396,6 +400,13 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
 
 /* ------------------------------------------------------------------ the line */
 
+/** Another harness on the agent's machine, and its models. */
+export interface Elsewhere {
+  kind: string;
+  name: string;
+  models: ModelOption[];
+}
+
 export interface RunSettingsProps {
   modes: ModeOption[];
   mode: string;
@@ -403,7 +414,11 @@ export interface RunSettingsProps {
   onMode?: (id: string) => void;
   models: ModelOption[];
   model: string;
-  onModel?: (id: string) => void;
+  /** With the harness the model is in: the agent's own (`harness`) or one of `elsewhere`. */
+  onModel?: (id: string, kind?: string) => void;
+  /** The harness the agent runs in, and the others whose models it can go on with (its conversation carried over). */
+  harness?: string;
+  elsewhere?: Elsewhere[];
   /** How a model id reads ("claude-opus-5-5" → "Opus 5.5"). */
   modelLabel?: (id: string) => string;
   efforts: ControlOption[];
@@ -423,6 +438,9 @@ interface Change {
   /** What Undo puts back. */
   prev: string;
   to: string;
+  /** For a model: the harnesses of `prev` and `to`. */
+  prevKind?: string;
+  toKind?: string;
   /** Offers Undo (an undo itself doesn't). */
   undoable: boolean;
 }
@@ -438,6 +456,8 @@ export function RunSettings({
   models,
   model,
   onModel,
+  harness,
+  elsewhere = [],
   modelLabel = same,
   efforts,
   effort,
@@ -462,11 +482,17 @@ export function RunSettings({
 
   const actual: Record<Kind, string> = { mode, model, effort };
   const shown = (k: Kind) => (change?.kind === k && actual[k] === change.base ? change.to : actual[k]);
+  // The other harnesses' models, by harness (they switch the agent there).
+  const groups = onModel ? elsewhere.filter((h) => h.models.length > 0).map((h) => ({ ...h, words: h.models.map((m) => ({ ...modelWord(m, modelLabel), kind: h.kind })) })) : [];
+  const others = groups.flatMap((g) => g.words);
+  // The agent's own models (its current one among them, unless that is another harness's: a switch waiting).
+  const own = modelWords(models, others.some((w) => w.id === shown("model")) ? "" : shown("model"), modelLabel);
   const sets: Record<Kind, { words: Word[]; count: number; pick?: (id: string) => void }> = {
     mode: { words: modeWords(modes, shown("mode")), count: modes.length, pick: onMode },
-    model: { words: modelWords(models, shown("model"), modelLabel), count: models.length, pick: onModel },
+    model: { words: [...own, ...others], count: models.length + others.length, pick: onModel },
     effort: { words: effortWords(efforts, shown("effort")), count: efforts.length, pick: onEffort },
   };
+  const kindOf = (id: string) => others.find((w) => w.id === id)?.kind ?? harness;
   const nameOf = (k: Kind, id: string) => sets[k].words.find((w) => w.id === id)?.full ?? id;
   const editable = (k: Kind) => Boolean(sets[k].pick && sets[k].count > 0);
   const nextTurn = (k: Kind) => Boolean(running && appliesNextTurn?.[k]);
@@ -513,11 +539,14 @@ export function RunSettings({
     const pick = sets[k].pick;
     const prev = shown(k);
     if (!pick || to === prev) return;
-    pick(to);
-    setChange({ kind: k, base: actual[k], prev, to, undoable: Boolean(prev) });
+    const [prevKind, toKind] = k === "model" ? [kindOf(prev), kindOf(to)] : [undefined, undefined];
+    if (k === "model" && onModel) onModel(to, toKind);
+    else pick(to);
+    setChange({ kind: k, base: actual[k], prev, to, undoable: Boolean(prev), prevKind, toKind });
     setArmed(null);
     setTick((t) => t + 1);
-    setSaid(`${KEY[k]}: ${nameOf(k, to)}${nextTurn(k) ? ", from the next turn" : ""}`);
+    const there = groups.find((g) => g.kind === toKind)?.name;
+    setSaid(`${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : ""}`);
   };
 
   const choose = (k: Kind, w: Word) => {
@@ -535,9 +564,11 @@ export function RunSettings({
 
   const undo = () => {
     if (!change?.undoable) return;
-    const { kind: k, prev, to } = change;
-    sets[k].pick?.(prev);
-    setChange({ kind: k, base: actual[k], prev: to, to: prev, undoable: false });
+    const { kind: k, prev, to, prevKind, toKind } = change;
+    // A switch undone goes back to the harness the agent was in (or doesn't happen).
+    if (k === "model" && onModel) onModel(prev, prevKind);
+    else sets[k].pick?.(prev);
+    setChange({ kind: k, base: actual[k], prev: to, to: prev, undoable: false, prevKind: toKind, toKind: prevKind });
     setArmed(null);
     setTick((t) => t + 1);
     setSaid(`${KEY[k]}: back to ${nameOf(k, prev)}`);
@@ -565,8 +596,18 @@ export function RunSettings({
     if (k === "model") {
       return (
         <>
-          <ModelChoice words={s.words} value={shown(k)} onPick={pick} />
+          <ModelChoice words={own} value={shown(k)} onPick={pick} />
           {after}
+          {groups.map((g) => (
+            <div key={g.kind} className="rs-elsewhere" role="group" aria-label={`${g.name} models`}>
+              <p className="rs-elsewhere-name">{g.name}</p>
+              <ModelChoice words={g.words} value={shown(k)} onPick={pick} />
+              <p className="rs-desc">
+                Switches to {g.name}
+                {running ? " at the end of this turn" : ""} — the conversation carries over
+              </p>
+            </div>
+          ))}
         </>
       );
     }

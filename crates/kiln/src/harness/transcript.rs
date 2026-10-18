@@ -42,7 +42,7 @@ pub fn tail(config: &Path, session: &str, bytes: u64) -> Option<Vec<String>> {
 }
 
 /// The last `bytes` of a file as whole lines.
-fn tail_lines(path: &Path, bytes: u64) -> Option<Vec<String>> {
+pub(super) fn tail_lines(path: &Path, bytes: u64) -> Option<Vec<String>> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let start = len.saturating_sub(bytes);
@@ -59,7 +59,7 @@ fn tail_lines(path: &Path, bytes: u64) -> Option<Vec<String>> {
 
 /// The conversation's records, oldest first: the parent chain back from the newest message
 /// (across compactions), so records other processes interleaved are left out.
-fn branch(records: Vec<Value>, started: Option<i64>, upto: Option<&str>) -> Vec<Value> {
+pub(super) fn branch(records: Vec<Value>, started: Option<i64>, upto: Option<&str>) -> Vec<Value> {
     let keep: HashSet<String> = {
         let msgs: Vec<&Value> = records.iter().filter(|r| r.get("uuid").and_then(Value::as_str).is_some()).collect();
         let by_id: HashMap<&str, &Value> = msgs.iter().filter_map(|r| Some((r.get("uuid")?.as_str()?, *r))).collect();

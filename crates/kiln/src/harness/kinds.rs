@@ -258,6 +258,22 @@ impl Adapter {
             Self::Acp(_) => {}
         }
     }
+
+    /// Start with a conversation carried over from another harness, in the harness's own form
+    /// (Codex: Responses items for its new thread; Claude Code reads its own from a transcript).
+    pub fn seed(&mut self, items: Vec<serde_json::Value>) {
+        if let Self::Codex(a) = self {
+            a.seed(items);
+        }
+    }
+
+    /// That conversation is in (or there was none).
+    pub fn seeded(&self) -> bool {
+        match self {
+            Self::Codex(a) => a.seeded(),
+            Self::Claude(_) | Self::Acp(_) => true,
+        }
+    }
 }
 
 /// What a machine offers, for the "new agent" dialog.
@@ -284,6 +300,14 @@ pub struct KindInfo {
     /// The executable (what a terminal runs for one that is not structured).
     #[serde(default)]
     pub program: String,
+    /// The models it offers: as its sessions on this machine last listed them, else the ones it
+    /// is known to have (empty: not known).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<super::model::ModelOption>,
+    /// A session of another harness can go on in this one, its conversation carried over
+    /// (`Command::SetModel::kind`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub switch: bool,
 }
 
 fn yes() -> bool {
@@ -311,6 +335,12 @@ impl Kind {
             Protocol::CodexAppServer => (super::codex::modes(true), "auto"),
             Protocol::Acp(_) | Protocol::Terminal => (Vec::new(), ""),
         }
+    }
+
+    /// A conversation can be carried into it from another harness (and out of it): kiln reads
+    /// and writes its own record of one.
+    pub fn switchable(&self) -> bool {
+        matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer)
     }
 
     /// The effort levels a new session can start at, before the harness says which its model has.
@@ -342,7 +372,72 @@ pub fn offered() -> Vec<KindInfo> {
                 efforts: k.efforts(),
                 structured: k.structured(),
                 program: k.program.to_owned(),
+                models: models_of(k.id),
+                switch: k.switchable(),
             }
         })
+        .collect()
+}
+
+/// The models each harness's sessions on this machine last listed, by harness, and the file
+/// they are kept in (so they are known before any session runs, after a restart too).
+struct Seen {
+    file: Option<std::path::PathBuf>,
+    models: std::collections::HashMap<String, Vec<super::model::ModelOption>>,
+}
+
+static SEEN: std::sync::LazyLock<parking_lot::Mutex<Seen>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(Seen { file: None, models: std::collections::HashMap::new() }));
+
+/// Keep the models seen in `file` (and know the ones kept there). Blocking (reads it).
+pub fn keep_models_in(file: std::path::PathBuf) {
+    let kept: std::collections::HashMap<String, Vec<super::model::ModelOption>> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut g = SEEN.lock();
+    for (k, v) in kept {
+        g.models.entry(k).or_insert(v);
+    }
+    g.file = Some(file);
+}
+
+/// A session of harness `kind` listed these models: the machine's list for it from now on
+/// (written to the file off the caller's thread).
+pub fn note_models(kind: &str, models: &[super::model::ModelOption]) {
+    if models.is_empty() {
+        return;
+    }
+    let (file, all) = {
+        let mut g = SEEN.lock();
+        if g.models.get(kind).is_some_and(|m| m.as_slice() == models) {
+            return;
+        }
+        g.models.insert(kind.to_owned(), models.to_vec());
+        (g.file.clone(), g.models.clone())
+    };
+    if let (Some(file), Ok(json)) = (file, serde_json::to_vec_pretty(&all)) {
+        crate::rt::spawn(async move {
+            let _ = crate::rt::blocking(move || crate::util::write_secret(&file, &json, 0o600)).await;
+        });
+    }
+}
+
+/// The models harness `kind` offers on this machine: as its sessions last listed them, else the
+/// ones it is known to have.
+pub fn models_of(kind: &str) -> Vec<super::model::ModelOption> {
+    if let Some(m) = SEEN.lock().models.get(kind).filter(|m| !m.is_empty()) {
+        return m.clone();
+    }
+    let known: &[(&str, &str, &[&str])] = match kind {
+        // Claude Code's aliases: each the newest of its family.
+        "claude" => &[("opus", "Opus", super::claude::EFFORTS), ("sonnet", "Sonnet", super::claude::EFFORTS), ("haiku", "Haiku", &[])],
+        "codex" => &[
+            ("gpt-6.1-sol", "GPT-6.1-Sol", &["low", "medium", "high", "xhigh", "max", "ultra"]),
+            ("gpt-6-sol", "GPT-6-Sol", &["low", "medium", "high", "xhigh", "max", "ultra"]),
+            ("gpt-6-astra", "GPT-6-Astra", &["low", "medium", "high", "xhigh", "max", "ultra"]),
+            ("gpt-6-luna", "GPT-6-Luna", &["low", "medium", "high", "xhigh", "max"]),
+        ],
+        _ => &[],
+    };
+    known
+        .iter()
+        .map(|(id, label, efforts)| super::model::ModelOption { id: (*id).to_owned(), label: (*label).to_owned(), description: String::new(), efforts: efforts.iter().map(|e| (*e).to_owned()).collect() })
         .collect()
 }
