@@ -1007,7 +1007,11 @@ impl Dispatch {
         // GITHUB_TOKEN: a job token with the job's permissions, revoked when the attempt ends
         // (W10-R03, R04).
         let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl).await?;
-        let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
+        let (secrets, used_ids, vars, unmade) = self.leg_secrets(l, r, &job_token).await;
+        // Brokered secrets that couldn't be made (W09-R08): the leg goes on without them, told why.
+        for why in &unmade {
+            runs::annotation(&self.hub, leg, None, "warning", Some("secrets".into()), why, None, None, None, None, None).await?;
+        }
         let secret_env = secret_outputs_for(&self.hub, l, r).await;
         let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
         // Its integrations (W11-R03); one it may not use fails it before it starts.
@@ -1086,7 +1090,8 @@ impl Dispatch {
     /// and followed through the calls that brought it, plus `GITHUB_TOKEN`. Untrusted runs get
     /// only the token. Also returns the secrets' rows (for their uses) and the leg's `vars`
     /// (its environment's included).
-    async fn leg_secrets(&self, l: &LegSt, r: &RunSt, token: &str) -> (Vec<wire::Secret>, Vec<String>, serde_json::Value) {
+    async fn leg_secrets(&self, l: &LegSt, r: &RunSt, token: &str) -> (Vec<wire::Secret>, Vec<String>, serde_json::Value, Vec<String>) {
+        let mut unmade = Vec::new();
         let spec = &l.spec;
         let env = spec.environment.as_ref().map(|e| e.name.clone());
         let vars = match &env {
@@ -1101,7 +1106,7 @@ impl Dispatch {
         };
         let token_secret = wire::Secret { name: "GITHUB_TOKEN".into(), value: token.to_owned() };
         if !r.trusted && r.given.secrets.is_empty() {
-            return (vec![token_secret], Vec::new(), vars);
+            return (vec![token_secret], Vec::new(), vars, unmade);
         }
         let used = spec.def().map(kiln_ci::secrets::used).unwrap_or_default();
         let needed = kiln_ci::secrets::needed(&spec.secrets, &used);
@@ -1109,8 +1114,16 @@ impl Dispatch {
         let resolved = if !r.trusted {
             Default::default()
         } else {
-            match super::secrets::for_leg(&self.hub, &r.repo, &r.path, env.as_deref(), &needed).await {
-                Ok(x) => x,
+            let text = |k: &str| r.github.get(k).and_then(serde_json::Value::as_str);
+            let w = kiln_ci::oidc::Workload { repository: &r.repo.name, environment: env.as_deref(), git_ref: text("ref"), sha: Some(&r.event.sha), actor: text("actor").unwrap_or("kiln"), source: "job", app: None, deployment: None, trigger: Some(&l.run) };
+            match super::secrets::for_leg(&self.hub, &r.repo, &r.path, env.as_deref(), &needed, &w).await {
+                Ok((x, failed)) => {
+                    for (name, why) in failed {
+                        tracing::warn!(leg = %spec.key, secret = %name, error = %why, "a brokered secret couldn't be made; the leg goes without it");
+                        unmade.push(format!("secret {name} couldn't be made {why}"));
+                    }
+                    x
+                }
                 Err(e) => {
                     tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "secrets could not be read; the leg gets none");
                     Default::default()
@@ -1124,7 +1137,7 @@ impl Dispatch {
         let ids: Vec<String> = resolved.values().filter_map(|v| v.id.clone()).collect();
         let mut out: Vec<wire::Secret> = given.into_iter().filter(|(k, _)| k != "GITHUB_TOKEN").map(|(name, value)| wire::Secret { name, value }).collect();
         out.push(token_secret);
-        (out, ids, vars)
+        (out, ids, vars, unmade)
     }
 
     /// The integrations a leg authenticates to (W11-R03): its job's `integrations:`, its steps',
