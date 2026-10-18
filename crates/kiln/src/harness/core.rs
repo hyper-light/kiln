@@ -87,6 +87,10 @@ pub enum Effect {
     /// running): the newest process under the harness whose command line runs `command`, with
     /// everything it started. The outcome comes back as a run's end (`run_done`, code 0: stopped).
     Kill { job: String, command: String },
+    /// Keep the session's folder as it is now in a hidden git ref (the pause that started at `at`
+    /// gets it as `Pause::checkpoint`), when the folder is a repository. Nothing in the folder,
+    /// its index or its branches changes.
+    Checkpoint { at: i64 },
 }
 
 /// The output of a task kiln keeps itself (a harness that streams it rather than writing a

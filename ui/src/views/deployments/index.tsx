@@ -10,7 +10,7 @@ import * as React from "react";
 import { Link, useSearchParams } from "@/lib/router";
 import { Rocket } from "lucide-react";
 
-import { appHref, cdApi, plansHref, type CdFilters, type CdSort } from "@/api/cd";
+import { appHref, cdApi, newAppHref, plansHref, type CdFilters, type CdSort } from "@/api/cd";
 import { useServerEvents } from "@/api/events";
 import type { CdApp, CdFacets, CdSummary } from "@/api/types";
 import { Button } from "@/components/ui/button";
@@ -143,9 +143,14 @@ export default function Deployments() {
         title="Deployments."
         lead="What git says, and what runs: every app's sync and health, live."
         actions={
-          <Button asChild size="sm" variant="secondary">
-            <Link to={plansHref}>Plan a deploy</Link>
-          </Button>
+          <>
+            <Button asChild size="sm" variant="secondary">
+              <Link to={plansHref}>Plan a deploy</Link>
+            </Button>
+            <Button asChild size="sm">
+              <Link to={newAppHref}>New app</Link>
+            </Button>
+          </>
         }
       />
       <Loadable label="the apps" fallback={<DeploymentsHold />}>
@@ -401,7 +406,7 @@ function DeploymentsBody() {
             "Clear the filters to see every app."
           ) : (
             <>
-              Add one with <code>kiln cd import app.yaml</code> (Argo CD Applications), the API, or an agent through kiln's MCP server.
+              <Link to={newAppHref}>Build one</Link>, write it in a repository's <code>.kiln/deploy.yaml</code>, or import Argo CD Applications with <code>kiln cd import app.yaml</code>.
             </>
           )}
         </EmptyState>

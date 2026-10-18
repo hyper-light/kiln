@@ -181,7 +181,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; per-repository subjects and service subjects left |
-| W11 | Integrations and credential broker | W10 | in progress (CD, branch cd-design) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope, the `oci` kind (any OCI registry, Docker Hub first); cloud `mint()` (AWS, Google Cloud, Azure) next |
+| W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; next: the job side (`kiln/auth@v1`, secrets `from: integration:…`) on CI's board |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches); hosting, review left |
@@ -3865,9 +3865,11 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET/DELETE | `/api/ci/repos/:repo/caches[/:id]` | `ci.caches.list`, `.delete` | runs.read, caches.write | W08 |
 | GET/PUT/DELETE | `/api/ci/secrets?scope=` · `/:name` | `ci.secrets.list`, `.set`, `.delete` (values write-only) | secrets.manage | W09 |
 | GET/PUT/DELETE | `/api/ci/variables?scope=` · `/:name` | `ci.variables.*` | variables.manage | W09 |
-| GET | `/api/ci/integrations/kinds` | `ci.integrations.kinds` | runs.read | W11 |
-| GET/POST/PATCH/DELETE | `/api/ci/integrations[/:id]` | `ci.integrations.*` | integrations.manage | W11 |
-| POST | `/api/ci/integrations/:id/verify` | `ci.integrations.verify` | integrations.manage | W11 |
+| GET | `/api/ci/integrations/kinds` | `ci.integrations.kinds` (the catalog: fields, how each authenticates, what's built) | runs.read | W11 |
+| GET | `/api/ci/integrations` | `ci.integrations.list` (every integration, never its secret, with the kinds) | integrations.manage | W11 |
+| POST | `/api/ci/integrations` | `ci.integrations.create` (`{ kind, name, config, secret?, scope? }`; the secret write-only) | integrations.manage | W11 |
+| GET/PATCH/DELETE | `/api/ci/integrations/:name` | `ci.integrations.get`, `.update` (`{ config?, secret? }`), `.delete` | integrations.manage | W11 |
+| POST | `/api/ci/integrations/:name/verify` | `ci.integrations.verify` (a real exchange: `{ ok, message \| error }`) | integrations.manage | W11 |
 | GET | `/api/ci/oidc` · POST `/rotate` · POST `/publish` · GET `/jwks-export` | `ci.oidc.*` | settings.manage | W10 |
 | GET | `/api/ci/actions?q=` · `/kiln` · POST `/sync` | `ci.actions.*` | runs.read, settings.manage | W07 |
 | GET | `/api/ci/runners` · `/:name` · POST `/:name/probe` | `ci.runners.*` | runners.read, runners.manage | W13 |

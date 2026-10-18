@@ -42,6 +42,14 @@ fn issuer_path(hub: &Hub) -> String {
     after_scheme.find('/').and_then(|p| after_scheme.get(p..)).unwrap_or("/oidc").trim_end_matches('/').to_owned()
 }
 
+/// Whether the issuer's documents are served: while the CI engine runs (its jobs' tokens), or
+/// while an account federates kiln's identity (an `aws`, `gcp` or `azure` integration, whose CD
+/// syncs mint tokens). Only reads: fetching the keys makes the first one, so with neither,
+/// nothing is served and no key is made.
+pub async fn active(hub: &Hub) -> bool {
+    hub.ci.enabled() || crate::ci::integrations::federates(hub).await
+}
+
 /// Whether `seg` is one of the issuer's documents here.
 pub fn is_issuer(hub: &Hub, seg: &[&str]) -> Option<&'static str> {
     let path = format!("/{}", seg.join("/"));
@@ -264,7 +272,7 @@ pub async fn admin(hub: &Hub, method: &http::Method, rest: &[&str], body: Value)
                 .iter()
                 .map(|k| json!({ "kid": k.times.kid, "created_at": k.times.created_at, "sign_from": k.times.sign_from, "signing": plan.sign.as_deref() == Some(k.times.kid.as_str()), "published": plan.publish.contains(&k.times.kid) }))
                 .collect();
-            Ok(srv::json(StatusCode::OK, &json!({ "issuer": i, "discovery": format!("{i}/.well-known/openid-configuration"), "jwks_uri": format!("{i}/jwks"), "serving": hub.ci.enabled(), "keys": list, "subject_claims": hub.cfg.ci.oidc.subject_claims })))
+            Ok(srv::json(StatusCode::OK, &json!({ "issuer": i, "discovery": format!("{i}/.well-known/openid-configuration"), "jwks_uri": format!("{i}/jwks"), "serving": active(hub).await, "keys": list, "subject_claims": hub.cfg.ci.oidc.subject_claims })))
         }
         (&http::Method::GET, ["jwks-export"]) => {
             let set = jwks(hub).await.map_err(fail)?;

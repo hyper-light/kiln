@@ -9,6 +9,7 @@ import type {
   JoinInfo,
   JoinRequest,
   KilnBinary,
+  OutpostInvite,
   Me,
   MetricsHistory,
   NewRepo,
@@ -149,6 +150,14 @@ export interface Integrations {
   integrations: Integration[];
 }
 
+export interface OidcIssuer {
+  issuer: string;
+  discovery: string;
+  jwks_uri: string;
+  /** Whether this server serves the issuer's documents now. */
+  serving: boolean;
+}
+
 export const api = {
   login: async (token: string) => {
     await post<void>("/api/auth/login", { token });
@@ -182,7 +191,11 @@ export const api = {
   /** Integrations (docs/ci.md W11): the catalog of kinds and the ones set up. */
   integrations: (signal?: AbortSignal) => get<Integrations>("/api/ci/integrations", signal),
   createIntegration: (body: { kind: string; name: string; config: Record<string, string>; secret?: string }) => post<Integration>("/api/ci/integrations", body),
-  verifyIntegration: (name: string) => post<{ ok: boolean; message?: string; error?: string }>(`/api/ci/integrations/${encodeURIComponent(name)}/verify`),
+  /** A real exchange with the integration; a federated one as `repository`'s `environment` (docs/cd-targets.md §6). */
+  verifyIntegration: (name: string, as?: { repository?: string; environment?: string }) =>
+    post<{ ok: boolean; message?: string; error?: string }>(`/api/ci/integrations/${encodeURIComponent(name)}/verify`, as ?? {}),
+  /** kiln's OIDC issuer (docs/ci.md W10): its URL, whether its documents are served, its keys. */
+  oidc: (signal?: AbortSignal) => get<OidcIssuer>("/api/ci/oidc", signal),
   deleteIntegration: (name: string) => del<void>(`/api/ci/integrations/${encodeURIComponent(name)}`),
 
   repos: (signal?: AbortSignal) => get<Repo[]>("/api/repos", signal),
@@ -220,6 +233,8 @@ export const api = {
   drainAgent: (name: string, draining: boolean) => post<void>(`/api/agents/${enc(name)}/drain`, { draining }),
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),
   joinRequests: (signal?: AbortSignal) => get<JoinRequest[]>("/api/join-requests", signal),
+  /** A one-time invite for an outpost: kiln run on a machine without installing it there. */
+  outpostInvite: () => post<OutpostInvite>("/api/outposts/invite"),
   approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) => post<{ id: string; status: string; name: string; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
   denyJoin: (id: string) => post<{ id: string; status: string; name: string }>(`/api/join-requests/${enc(id)}/deny`),
   discovery: (signal?: AbortSignal) => get<DiscoveryInfo>("/api/discovery", signal),

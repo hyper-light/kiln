@@ -44,6 +44,13 @@ struct Saved {
     spec: Spec,
     #[serde(default)]
     queue: Vec<QueueItem>,
+    /// A pause for a usage limit, which goes on (with its timer) after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause: Option<super::model::Pause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause_at: Option<u8>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    manual_resume: bool,
 }
 
 pub struct Host {
@@ -273,9 +280,14 @@ impl Host {
             let id = s.id.clone();
             match self.open(Some(s.id), s.spec) {
                 Ok(session) => {
-                    if !s.queue.is_empty() {
+                    let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume;
+                    if !s.queue.is_empty() || paused {
                         let mut core = session.core.lock();
                         core.state.queue = s.queue;
+                        // A check under way when it stopped is asked again.
+                        core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
+                        core.state.pause_at = s.pause_at;
+                        core.state.manual_resume = s.manual_resume;
                         core.touch_state();
                     }
                     tracing::info!(session = %id, "agent session continued after a restart");
@@ -306,7 +318,11 @@ impl Host {
             .sessions
             .lock()
             .values()
-            .map(|s| Saved { id: s.id.clone(), spec: s.resume_spec(), queue: s.core.lock().state.queue.clone() })
+            .map(|s| {
+                let core = s.core.lock();
+                let st = &core.state;
+                Saved { id: s.id.clone(), spec: s.resume_spec(), queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume }
+            })
             .collect();
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
         let tmp = file.with_extension("tmp");
@@ -408,6 +424,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         plan: None,
         left_behind: 0,
         reach: spec.reach.clone(),
+        pause: None,
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]

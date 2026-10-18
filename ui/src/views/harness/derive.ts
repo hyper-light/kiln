@@ -21,7 +21,8 @@ export type Item =
   | Step
   | { type: "note"; key: string; event: Extract<HEvent, { kind: "assistant" }> }
   | { type: "thought"; key: string; event: Extract<HEvent, { kind: "thinking" }>; more?: Extract<HEvent, { kind: "thinking" }>[] }
-  | { type: "notice"; key: string; event: Extract<HEvent, { kind: "notice" }> };
+  /** `repeats`: the same notice said again right after itself, shown once with a count. */
+  | { type: "notice"; key: string; event: Extract<HEvent, { kind: "notice" }>; repeats?: number };
 
 export interface Turn {
   key: string;
@@ -102,7 +103,9 @@ export function turnsOf(events: HEvent[], parent?: string, openLast = false): Tu
       if (last && last.type === "thought" && !last.event.streaming && !e.redacted) last.more = [...(last.more ?? []), e];
       else t.items.push({ type: "thought", key: e.id, event: e });
     } else {
-      t.items.push({ type: "notice", key: e.id, event: e });
+      const last = t.items.at(-1);
+      if (last && last.type === "notice" && last.event.level === e.level && last.event.text === e.text) last.repeats = (last.repeats ?? 1) + 1;
+      else t.items.push({ type: "notice", key: e.id, event: e });
     }
   }
   // The last assistant note of a finished turn, if nothing but thoughts follow it, is its answer.
@@ -129,6 +132,7 @@ function sameItem(a: Item, b: Item): boolean {
   if (a.type !== b.type || a.key !== b.key) return false;
   if (a.type === "step") return b.type === "step" && a.group === b.group && sameList(a.calls, b.calls);
   if (a.type === "thought") return b.type === "thought" && a.event === b.event && sameList(a.more, b.more);
+  if (a.type === "notice") return b.type === "notice" && a.event === b.event && (a.repeats ?? 1) === (b.repeats ?? 1);
   return "event" in b && a.event === b.event;
 }
 

@@ -1540,6 +1540,7 @@ dependencies = [
  "serde_yaml",
  "tar",
  "tempfile",
+ "toml",
  "tracing",
  "xxhash-rust",
 ]

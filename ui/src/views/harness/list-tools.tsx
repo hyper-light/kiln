@@ -36,6 +36,7 @@ const SORTS: { value: SortId; label: string }[] = [
 export const STANDS = [
   { id: "needs", label: "Needs you" },
   { id: "crashed", label: "Stopped" },
+  { id: "paused", label: "Paused" },
   { id: "working", label: "Working" },
   { id: "finished", label: "Finished" },
   { id: "ready", label: "Ready" },

@@ -38,7 +38,7 @@ export function PrismLabel({ live = false, className, children }: { live?: boole
 }
 
 /** "<1s", "12s", "1m 05s", "1h 02m". */
-function formatThought(seconds: number) {
+export function formatThought(seconds: number) {
   if (!Number.isFinite(seconds) || seconds < 1) return "<1s";
   const s = Math.floor(seconds);
   if (s < 60) return `${s}s`;

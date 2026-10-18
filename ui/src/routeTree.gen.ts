@@ -23,6 +23,7 @@ import { Route as AppAgentsIndexRouteImport } from './routes/_app.agents.index'
 import { Route as AppAgentsIdRouteImport } from './routes/_app.agents.$id'
 import { Route as AppAgentsSessionsRouteImport } from './routes/_app.agents.sessions'
 import { Route as AppDeploymentsIndexRouteImport } from './routes/_app.deployments.index'
+import { Route as AppDeploymentsNewRouteImport } from './routes/_app.deployments.new'
 import { Route as AppDeploymentsPlansRouteImport } from './routes/_app.deployments.plans'
 import { Route as AppRunnersIndexRouteImport } from './routes/_app.runners.index'
 import { Route as AppRunnersAddRouteImport } from './routes/_app.runners.add'
@@ -103,6 +104,11 @@ const AppDeploymentsIndexRoute = AppDeploymentsIndexRouteImport.update({
   path: '/deployments/',
   getParentRoute: () => AppRoute,
 } as any)
+const AppDeploymentsNewRoute = AppDeploymentsNewRouteImport.update({
+  id: '/deployments/new',
+  path: '/deployments/new',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppDeploymentsPlansRoute = AppDeploymentsPlansRouteImport.update({
   id: '/deployments/plans',
   path: '/deployments/plans',
@@ -167,6 +173,7 @@ export interface FileRoutesByFullPath {
   '/workflows': typeof AppWorkflowsRoute
   '/agents/$id': typeof AppAgentsIdRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
+  '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
   '/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
@@ -192,6 +199,7 @@ export interface FileRoutesByTo {
   '/': typeof AppIndexRoute
   '/agents/$id': typeof AppAgentsIdRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
+  '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
   '/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
@@ -219,6 +227,7 @@ export interface FileRoutesById {
   '/_app/': typeof AppIndexRoute
   '/_app/agents/$id': typeof AppAgentsIdRoute
   '/_app/agents/sessions': typeof AppAgentsSessionsRoute
+  '/_app/deployments/new': typeof AppDeploymentsNewRoute
   '/_app/deployments/plans': typeof AppDeploymentsPlansRoute
   '/_app/runners/add': typeof AppRunnersAddRoute
   '/shared/plans/$token': typeof SharedPlansTokenRoute
@@ -246,6 +255,7 @@ export interface FileRouteTypes {
     | '/workflows'
     | '/agents/$id'
     | '/agents/sessions'
+    | '/deployments/new'
     | '/deployments/plans'
     | '/runners/add'
     | '/shared/plans/$token'
@@ -271,6 +281,7 @@ export interface FileRouteTypes {
     | '/'
     | '/agents/$id'
     | '/agents/sessions'
+    | '/deployments/new'
     | '/deployments/plans'
     | '/runners/add'
     | '/shared/plans/$token'
@@ -297,6 +308,7 @@ export interface FileRouteTypes {
     | '/_app/'
     | '/_app/agents/$id'
     | '/_app/agents/sessions'
+    | '/_app/deployments/new'
     | '/_app/deployments/plans'
     | '/_app/runners/add'
     | '/shared/plans/$token'
@@ -416,6 +428,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppDeploymentsIndexRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/deployments/new': {
+      id: '/_app/deployments/new'
+      path: '/deployments/new'
+      fullPath: '/deployments/new'
+      preLoaderRoute: typeof AppDeploymentsNewRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/deployments/plans': {
       id: '/_app/deployments/plans'
       path: '/deployments/plans'
@@ -501,6 +520,7 @@ interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
   AppAgentsIdRoute: typeof AppAgentsIdRoute
   AppAgentsSessionsRoute: typeof AppAgentsSessionsRoute
+  AppDeploymentsNewRoute: typeof AppDeploymentsNewRoute
   AppDeploymentsPlansRoute: typeof AppDeploymentsPlansRoute
   AppRunnersAddRoute: typeof AppRunnersAddRoute
   AppAgentsIndexRoute: typeof AppAgentsIndexRoute
@@ -526,6 +546,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
   AppAgentsIdRoute: AppAgentsIdRoute,
   AppAgentsSessionsRoute: AppAgentsSessionsRoute,
+  AppDeploymentsNewRoute: AppDeploymentsNewRoute,
   AppDeploymentsPlansRoute: AppDeploymentsPlansRoute,
   AppRunnersAddRoute: AppRunnersAddRoute,
   AppAgentsIndexRoute: AppAgentsIndexRoute,

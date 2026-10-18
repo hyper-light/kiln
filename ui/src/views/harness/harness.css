@@ -913,6 +913,17 @@ textarea.hx-input {
 .hx-notice[data-level="warn"] {
   color: var(--color-warn);
 }
+.hx-notice-n {
+  margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid #2a2c33;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 16px;
+  color: #a1a4ad;
+  white-space: nowrap;
+}
 .hx-notice[data-level="error"] {
   color: var(--color-fail);
 }
@@ -2475,6 +2486,57 @@ textarea.hx-input {
 .hx-startfail b {
   font-weight: 500;
   color: #f4e0e1;
+}
+
+/* Paused for a usage limit (pause.tsx): one calm block above the composer, what it waits for and
+   what you can do, in the page's flow. */
+.hx-paused {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgb(166 178 198 / 32%);
+  border-radius: 10px;
+  background: rgb(166 178 198 / 6%);
+  font-size: 13px;
+  line-height: 1.5;
+  color: #d3d9e3;
+}
+.hx-paused b {
+  font-weight: 500;
+  color: #e6eaf1;
+}
+.hx-paused-what,
+.hx-paused-kept {
+  margin: 0;
+}
+.hx-paused-do {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+.hx-paused-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: #c3c8d2;
+  cursor: pointer;
+}
+.hx-paused-switch {
+  min-width: 0;
+  max-width: 100%;
+}
+.hx-paused-kept {
+  font-size: 12px;
+  color: #9aa1ad;
+  overflow-wrap: anywhere;
+}
+.hx-paused-kept code {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: #b8c2d3;
 }
 
 .hx-pre-wrap {
