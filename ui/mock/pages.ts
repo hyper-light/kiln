@@ -661,6 +661,7 @@ function syncView(ctx: PagesCtx): SyncView {
     repos: [
       {
         id: "sy_kiln",
+        error: null,
         name: "kiln",
         created: T0 - 86_400 * 9,
         exclude: ["dist"],
@@ -671,6 +672,7 @@ function syncView(ctx: PagesCtx): SyncView {
       },
       {
         id: "sy_notes",
+        error: null,
         name: "notes",
         created: T0 - 86_400 * 30,
         exclude: [],
