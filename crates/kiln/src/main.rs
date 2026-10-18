@@ -208,11 +208,18 @@ struct AgentArgs {
     shell: Option<String>,
 }
 
+/// The log's lines, as `filter` says; and kiln's own spans that observe keeps (its own filter: what
+/// the log shows does not decide what observe sees).
 fn init_tracing(filter: &str, json: bool) {
+    use tracing_subscriber::prelude::*;
     let filter = tracing_subscriber::EnvFilter::try_new(filter)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
-    let _ = if json { builder.json().try_init() } else { builder.try_init() };
+    let registry = tracing_subscriber::registry().with(kiln::observe::spans::layer());
+    let _ = if json {
+        registry.with(tracing_subscriber::fmt::layer().json().with_target(false).with_filter(filter)).try_init()
+    } else {
+        registry.with(tracing_subscriber::fmt::layer().with_target(false).with_filter(filter)).try_init()
+    };
 }
 
 /// Panics are contained at task boundaries; the hook makes sure each one is logged loudly.

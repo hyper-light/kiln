@@ -334,6 +334,15 @@ time, sent again until answered; §5), from:
   events`).
 
 - **Clouds**: AWS CloudWatch, Google Cloud Monitoring and Azure Monitor, pulled (§10.1).
+- **kiln's own spans** (`crate::observe::spans`): each closed `tracing` span of a target observe
+  keeps (`kiln::upgrade`: runners' blue/green upgrades, `upgrade`, `upgrade.start`,
+  `upgrade.healthy`, `upgrade.move`, `upgrade.retire`, `upgrade.rollback`) is
+  `kiln.<span>.duration` (seconds of wall time, a gauge a close) and `kiln.<span>.count`, tagged
+  with the fields low in cardinality (`runner`, `from`, `to`, `what`, `result`, `reason`, …; a
+  child's taken from its ancestors), and an event (`service:kiln.upgrade @event.type:<span>`)
+  holding every field, ids too (`@upgrade_id:…` finds one upgrade's story), an error when its
+  `result` failed or rolled back. A layer of kiln's subscriber with its own filter: `KILN_LOG`
+  does not hide these spans from observe, nor do they reach the log.
 
 To come: Prometheus endpoints scraped; CloudWatch Metric Streams taken (Firehose's HTTP endpoint
 delivery of OTLP).
