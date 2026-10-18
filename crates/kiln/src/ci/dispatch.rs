@@ -52,6 +52,8 @@ pub enum Msg {
     Finished { agent: String, result: JobResult },
     Rejected { agent: String, leg: String },
     Cancel { run: String, reason: String },
+    /// Why a leg waits, and how each runner measures up against it (W05-R11).
+    Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
 }
 
 /// The hub's handle on the dispatcher.
@@ -238,6 +240,11 @@ impl Dispatch {
                 Ok(())
             }
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
+            Msg::Explain { leg, reply } => {
+                let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "runners": self.sched.explain(&leg) });
+                let _ = reply.try_send(v);
+                Ok(())
+            }
         };
         if let Err(e) = r {
             tracing::warn!(error = %format!("{e:#}"), "CI dispatcher");

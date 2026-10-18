@@ -160,3 +160,20 @@ pub async fn repository_dispatch(hub: &Hub, repo: &str, body: Incoming) -> Resul
     super::events::repository_dispatch(hub, &repo, &ask.event_type, &ask.client_payload, "kiln").await.map_err(|r| (r.status, r.message))?;
     Ok(srv::status(StatusCode::NO_CONTENT))
 }
+
+#[derive(Deserialize)]
+struct NamedDispatchAsk {
+    workflow: String,
+    #[serde(rename = "ref")]
+    git_ref: String,
+    #[serde(default)]
+    inputs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /api/ci/repos/:repo/dispatch { workflow, ref, inputs }` (§4.1's form of the same).
+pub async fn dispatch_named(hub: &Hub, repo: &str, body: Incoming) -> Result<Response, Fail> {
+    let repo = find_repo(hub, repo).await?;
+    let ask: NamedDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, &ask.workflow, &ask.inputs, "kiln").await.map_err(|r| (r.status, r.message))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
