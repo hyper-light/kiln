@@ -17,6 +17,7 @@ pub mod oidc;
 pub mod ops;
 pub mod preview;
 pub mod repo_config;
+pub mod results;
 pub mod rest;
 pub mod reusable;
 pub mod routing;

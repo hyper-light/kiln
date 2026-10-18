@@ -88,6 +88,25 @@ export interface CiAnnotation {
   end_col: number | null;
 }
 
+/** A test's result in a run (W16-R03). */
+export interface CiTest {
+  id: string;
+  suite: string;
+  name: string;
+  file: string | null;
+  line: number | null;
+  leg: string;
+  leg_key: string;
+  attempt: number;
+  outcome: "passed" | "failed" | "skipped" | "error";
+  duration_ms: number | null;
+  message: string | null;
+  trace: string | null;
+  retried: number;
+  quarantined: boolean;
+  flaky: { class: "flaky" | "probably_flaky"; why: string } | null;
+}
+
 export interface CiSummary {
   leg: string;
   leg_key: string;
@@ -240,6 +259,9 @@ export const ci = {
     request<{ annotations: CiAnnotation[] }>("GET", `/api/ci/runs/${enc(id)}/annotations${at(attempt)}`, undefined, { signal }),
   summaries: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<{ summaries: CiSummary[] }>("GET", `/api/ci/runs/${enc(id)}/summary${at(attempt)}`, undefined, { signal }),
   artifacts: (id: string, signal?: AbortSignal) => request<{ artifacts: CiArtifact[] }>("GET", `/api/ci/runs/${enc(id)}/artifacts`, undefined, { signal }),
+  /** The run's tests, failures first (W16-R03). */
+  tests: (id: string, attempt: number | undefined, signal?: AbortSignal) =>
+    request<{ counts: Record<string, number>; tests: CiTest[] }>("GET", `/api/ci/runs/${enc(id)}/tests${at(attempt)}`, undefined, { signal }),
   rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean, keepFailed = false) =>
     request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug, keep_failed: keepFailed }),
   /** A review of the run's deployments waiting on their environments (W15-R04). */

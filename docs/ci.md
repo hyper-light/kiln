@@ -186,7 +186,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images (GitHub's common toolchains, a slim variant), opt-in Docker inside, host networking; probes, pools, microVMs, k8s left |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
-| W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
+| W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, the run page's Tests panel, flaky and probably flaky, quarantine with `enforce`, timing for shards; metrics, regressions, gates and the tests page left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server; MCP, log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
@@ -3376,7 +3376,52 @@ opt-in quarantine, timing data for shards, regression tracking and opt-in gates 
 - **W16-AC05 End to end.** kiln's own `bench.yaml` on an exclusive runner records criterion
   metrics and shows trends per fingerprint. *E2E.*
 
-**Progress.** Not started.
+**Progress.** In progress: R01 (formats and `test-results:`), R02, R03 (the run page and
+annotations), R04, R05 and R06; AC01 to AC03.
+
+- *R01* (`kiln_ci::results`): the formats are told apart by their first bytes, and read by a
+  small XML reader of kiln's own (no dependency):
+  - JUnit XML, in Surefire's, pytest's, jest-junit's, go-junit-report's and nextest's dialects
+    (with Surefire's and nextest's retries);
+  - TAP 12 to 14, with subtests, YAML diagnostics, `SKIP` and `TODO`, and `Bail out!`;
+  - `go test -json` (a package that doesn't build is an error) and libtest JSON (cargo's and
+    nextest's);
+  - TRX, xUnit v2, Mocha JSON and CTRF.
+
+  The step key `test-results: { path, format? }` (kiln dialect and overlays) takes patterns as
+  `@actions/glob` reads them, from the step's working directory. Each report goes to the server
+  (`PUT /_kiln/test-results`, with the leg's runtime token), which keeps it in the CAS and parses
+  it. The step's log says what it found.
+- *R02*: `test_cases`, `test_reports` and `test_results`. A result records the run's attempt, the
+  leg's key and the commit, which together are a test's input. Rollups (runs, failures, p50, p90
+  per branch) are computed when read.
+- *R03*:
+  - Failures are annotated at their file and line, with paths made relative to the workspace;
+    quarantined ones are warnings.
+  - The run page has a Tests panel: failures first, with message, place, trace, and quarantined
+    and flaky marks; what passed is folded.
+  - `GET /api/ci/runs/:id/tests`, `/api/ci/legs/:id/tests`, and
+    `/api/ci/repos/:repo/tests?sort=failing|slowest|flaky`.
+- *R04*: a test is `flaky` when it passed and failed on the same input (across attempts) or a
+  tool's retry passed it. It is `probably flaky` when it flips in more than 20 % of its last 30
+  runs; a change that breaks it for good doesn't count.
+- *R05*: `.kiln/quarantine.yaml` entries name a `test` (by id, name, or suite and name, with `*`
+  wildcards), a `reason`, an `issue` and an `until`.
+  - A job's `quarantine: enforce` passes a step whose failed tests are all quarantined, with a
+    warning; its `outcome` stays `failure`.
+  - Quarantined tests still run and are reported.
+  - An entry past `until` stops applying and is flagged on the step.
+- *R06*: each run gets a timing table, which feeds `balance: timing`. It holds test files' and
+  tests' median durations over two weeks, cached for ten minutes, and is saved with the run so a
+  replay shards alike.
+- *Verified end to end*:
+  - a step that exited 1 with one quarantined failure passed, with the run, and showed the test
+    at `src/calc.rs:12`;
+  - its rerun (the test passing on attempt 2) marked it flaky;
+  - one more failure than quarantine covers failed the step, and an expired entry was flagged;
+  - the Tests panel in Chromium and WebKit, at desktop and phone widths.
+- *Left*: R07 to R09 (metrics, regressions, gates), the repository's tests page,
+  `kiln/test-results@v1` and discovery of the usual paths (with W07's built-ins), AC04 and AC05.
 
 ### W17 Debugging
 
@@ -4112,6 +4157,8 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job, job?, debug?, fresh_actions?, no_reuse? }`) | runs.rerun | W05 |
 | POST | `/api/ci/runs/:id/approve` | `ci.runs.approve` (untrusted run or environment) | runs.approve | W15, W18 |
 | GET | `/api/ci/runs/:id/{summary,annotations,artifacts,tests,flow,actions}` | `ci.runs.<part>` | runs.read | W06, W08, W16, W04, W07 |
+| GET | `/api/ci/legs/:id/tests` · `/api/ci/repos/:repo/tests?sort=failing\|slowest\|flaky` | `ci.tests.*` | runs.read | W16 |
+| PUT | `/_kiln/test-results?step=&format=&path=` | a leg's report (its runtime token) | the leg | W16 |
 | GET | `/api/ci/runs/:a/compare/:b` | `ci.runs.compare` | runs.read | W19 |
 | GET | `/api/ci/legs/:id` | `ci.legs.get` (attempts, steps, outputs, wait reason) | runs.read | W05, W06 |
 | GET | `/api/ci/legs/:id/logs?step=&attempt=&from=` · `/logs/ws` | `ci.legs.logs` (`from`: a byte offset, for followers) | logs.read | W06 |

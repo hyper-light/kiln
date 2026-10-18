@@ -40,6 +40,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         _ if super::rest::is_web(seg) => Some(super::rest::web(hub, seg).await),
         // W10: ID tokens for jobs, and the issuer's documents.
         ["_kiln", "oidc", "token"] => Some(super::oidc::token(hub, &req).await),
+        // W16: test reports from legs.
+        ["_kiln", "test-results"] => Some(super::results::ingest(hub, req).await),
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -129,6 +131,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["runs"]) => super::runs_api::list(hub, q).await,
         (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id, q).await,
         (&Method::GET, ["runs", id, "graph"]) => super::runs_api::graph(hub, id, q).await,
+        // W16-R03: tests, failures first.
+        (&Method::GET, ["runs", id, "tests"]) => super::results::of(hub, Some(id), None, q).await,
+        (&Method::GET, ["legs", id, "tests"]) => super::results::of(hub, None, Some(id), q).await,
+        (&Method::GET, ["repos", repo, "tests"]) => super::results::repo(hub, repo, q).await,
         (&Method::GET, ["runs", id, which @ ("annotations" | "summary" | "artifacts")]) => super::runs_api::part(hub, id, which, q).await,
         (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
         (&Method::POST, ["runs", id, "rerun"]) => {

@@ -2,7 +2,7 @@
  * leaves behind (summaries, annotations, artifacts, the actions it pinned). */
 import * as React from "react";
 import { RotateCcw, Square } from "lucide-react";
-import { ci, reviewOf, waitSentence, type CiAnnotation, type CiRunDetail, type RerunMode } from "@/api/ci";
+import { ci, reviewOf, waitSentence, type CiAnnotation, type CiRunDetail, type CiTest, type RerunMode } from "@/api/ci";
 import { Button } from "@/components/ui/button";
 import { Confirm, Panel, SelectField, TextField } from "@/components/ui/misc";
 import { Link } from "@/lib/router";
@@ -172,8 +172,10 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
   const summaries = useSuspenseResource(`ci-run/${id}/summary/${attempt ?? ""}`, (s) => ci.summaries(id, attempt, s)).data.summaries;
   const annotations = useSuspenseResource(`ci-run/${id}/annotations/${attempt ?? ""}`, (s) => ci.annotations(id, attempt, s)).data.annotations;
   const artifacts = useSuspenseResource(`ci-run/${id}/artifacts`, (s) => ci.artifacts(id, s)).data.artifacts;
+  const tests = useSuspenseResource(`ci-run/${id}/tests/${attempt ?? ""}`, (s) => ci.tests(id, attempt, s)).data;
   return (
     <div className="mt-6 flex flex-col gap-4">
+      {tests.tests.length > 0 && <Tests list={tests.tests} counts={tests.counts} />}
       {summaries.length > 0 && (
         <Panel eyebrow={`Summaries · ${summaries.length}`} title="Job summaries">
           <div className="flex flex-col gap-6">
@@ -224,6 +226,82 @@ export function CiRunParts({ detail, attempt }: { detail: CiRunDetail; attempt: 
         </Panel>
       )}
     </div>
+  );
+}
+
+const OUTCOME_DOT: Record<CiTest["outcome"], string> = { failed: "failed", error: "failed", passed: "succeeded", skipped: "skipped" };
+
+/** A test's time, short. */
+function testTime(ms: number | null): string {
+  if (ms == null) return "";
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)} s`;
+}
+
+/** The run's tests (W16-R03): failures first, each with its message, where it is, its trace, and
+ * whether it's quarantined or flaky; what passed folds under one line. */
+function Tests({ list, counts }: { list: CiTest[]; counts: Record<string, number> }) {
+  const failing = list.filter((t) => t.outcome === "failed" || t.outcome === "error" || t.flaky);
+  const rest = list.filter((t) => !failing.includes(t));
+  const summary = ["failed", "error", "passed", "skipped"]
+    .filter((o) => counts[o])
+    .map((o) => `${counts[o]} ${o}`)
+    .join(" · ");
+  return (
+    <Panel eyebrow={summary} title="Tests" bodyClassName="px-0 pb-1">
+      <ul className="row-list">
+        {failing.map((t) => (
+          <TestRow key={`${t.leg}-${t.id}`} t={t} />
+        ))}
+      </ul>
+      {rest.length > 0 && (
+        <details className="px-5 py-2">
+          <summary className="cursor-pointer font-mono text-[11px] text-[#93a1b4]">{`${rest.length} more: ${rest.filter((t) => t.outcome === "passed").length} passed, ${rest.filter((t) => t.outcome === "skipped").length} skipped`}</summary>
+          <ul className="row-list mt-2">
+            {rest.map((t) => (
+              <TestRow key={`${t.leg}-${t.id}`} t={t} />
+            ))}
+          </ul>
+        </details>
+      )}
+    </Panel>
+  );
+}
+
+function TestRow({ t }: { t: CiTest }) {
+  return (
+    <li className="flex flex-col gap-1 px-5 py-2.5">
+      <span className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1">
+        <i className="dot" data-status={OUTCOME_DOT[t.outcome] ?? "pending"} aria-hidden="true" />
+        <span className="min-w-0 text-[13px] [overflow-wrap:anywhere] text-[#d4dde8]">
+          {t.suite ? <span className="text-[#93a1b4]">{t.suite} </span> : null}
+          {t.name}
+        </span>
+        {t.quarantined && <span className="font-mono text-[10px] tracking-[0.06em] text-[#c9a86a] uppercase">quarantined</span>}
+        {t.flaky && (
+          <span className="font-mono text-[10px] tracking-[0.06em] text-[#c9a86a] uppercase" title={t.flaky.why}>
+            {t.flaky.class === "flaky" ? "flaky" : "probably flaky"}
+          </span>
+        )}
+        <span className="ml-auto font-mono text-[10.5px] text-[#7f8a9a] tabular-nums">
+          {t.leg_key}
+          {t.duration_ms != null ? ` · ${testTime(t.duration_ms)}` : ""}
+        </span>
+      </span>
+      {t.message && <span className="text-[12.5px] leading-[1.55] [overflow-wrap:anywhere] whitespace-pre-wrap text-[#c5cdd8]">{t.message}</span>}
+      {t.file && (
+        <span className="font-mono text-[11px] text-[#a6b2c6]">
+          {t.file}
+          {t.line ? `:${t.line}` : ""}
+        </span>
+      )}
+      {t.flaky && <span className="text-[11.5px] text-[#8c8f98]">{t.flaky.why}</span>}
+      {t.trace && (
+        <details>
+          <summary className="cursor-pointer font-mono text-[11px] text-[#93a1b4]">Trace</summary>
+          <pre className="mt-1.5 max-h-80 overflow-auto rounded border border-[#22262d] bg-[#0d0f13] px-3 py-2 font-mono text-[11px] leading-[1.5] whitespace-pre-wrap text-[#a6b2c6]">{t.trace}</pre>
+        </details>
+      )}
+    </li>
   );
 }
 

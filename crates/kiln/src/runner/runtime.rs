@@ -1192,8 +1192,18 @@ impl Leg {
                 (End::Exit(None), BTreeMap::new())
             }
         };
+        // W16-R01: the step's test reports go to the server, which keeps and parses them. With
+        // `quarantine: enforce`, a failure of quarantined tests only passes, with a warning (R05).
+        let excused = match &step.kiln.test_results {
+            Some(spec) if !matches!(end, End::Cancelled) => self.test_reports(st, idx, spec, &wd).await && !matches!(end, End::Exit(Some(0))) && self.a.quarantine,
+            _ => false,
+        };
         let (outcome, exit_code) = match end {
             End::Exit(Some(0)) => (Conclusion::Success, Some(0)),
+            End::Exit(code) if excused => {
+                self.annotate(idx, "warning", &format!("Process completed with exit code {}: every test that failed is quarantined (.kiln/quarantine.yaml), so the step passes.", code.map_or_else(|| "none".to_owned(), |c| c.to_string()))).await;
+                (Conclusion::Failure, code)
+            }
             End::Exit(code) => {
                 let msg = match code {
                     Some(c) => format!("Process completed with exit code {c}."),
@@ -1211,12 +1221,124 @@ impl Leg {
                 (Conclusion::Cancelled, None)
             }
         };
-        let conclusion = if outcome == Conclusion::Failure && continue_on_error { Conclusion::Success } else { outcome };
+        let conclusion = if outcome == Conclusion::Failure && (continue_on_error || excused) { Conclusion::Success } else { outcome };
         if conclusion == Conclusion::Failure {
             st.failed = true;
         }
         self.finish(st, idx, id, outcome, conclusion, exit_code, outputs, nested).await;
         Some(end)
+    }
+
+    /// A step's `test-results:` (W16-R01): `path` (one, a list, or lines; `@actions/glob`'s
+    /// patterns, from the step's working directory) and `format` (found from each file when left
+    /// out). Each report goes to the server, which keeps and parses it; what it found goes to the
+    /// step's log. Whether there were failures and quarantine covers every one of them (W16-R05).
+    async fn test_reports(&self, st: &mut State, idx: u32, spec: &YVal, wd: &Path) -> bool {
+        const MAX_REPORTS: usize = 64;
+        const MAX_BYTES: u64 = 64 << 20;
+        let (path_v, format_v) = match spec {
+            YVal::Map(_) => (spec.get("path").cloned(), spec.get("format").cloned()),
+            other => (Some(other.clone()), None),
+        };
+        let mut patterns: Vec<String> = Vec::new();
+        let items = match path_v {
+            Some(YVal::Seq(items)) => items,
+            Some(v) => vec![v],
+            None => Vec::new(),
+        };
+        for v in &items {
+            match st.value(v, Site::StepWith, "test-results.path") {
+                Ok(x) => patterns.extend(x.coerce_string().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned)),
+                Err(e) => {
+                    self.annotate(idx, "warning", &format!("test-results: {e}")).await;
+                    return false;
+                }
+            }
+        }
+        if patterns.is_empty() {
+            self.annotate(idx, "warning", "test-results: say where the reports are (`test-results: { path: … }`)").await;
+            return false;
+        }
+        let format = match &format_v {
+            Some(v) => st.value(v, Site::StepWith, "test-results.format").map(|x| x.coerce_string()).unwrap_or_default(),
+            None => String::new(),
+        };
+        // Patterns are the working directory's; the workspace is what they may reach.
+        let root = st.layout.workspace.clone();
+        let rel = wd.strip_prefix(&root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+        let patterns: Vec<String> = patterns
+            .iter()
+            .map(|p| {
+                let (neg, body) = p.strip_prefix('!').map_or(("", p.as_str()), |b| ("!", b));
+                if Path::new(body).is_absolute() || rel.is_empty() { p.clone() } else { format!("{neg}{rel}/{body}") }
+            })
+            .collect();
+        let files = match super::hashfiles::Workspace::new(&root).and_then(|w| w.matching(&patterns)) {
+            Ok(f) => f,
+            Err(e) => {
+                self.annotate(idx, "warning", &format!("test-results: {}", e.message)).await;
+                return false;
+            }
+        };
+        if files.is_empty() {
+            self.annotate(idx, "warning", &format!("test-results: no report at {}", patterns.join(", "))).await;
+            return false;
+        }
+        let base = self.a.runtime.results_url.trim_end_matches('/').to_owned();
+        let (mut failed, mut all_quarantined) = (0u64, true);
+        for f in files.iter().take(MAX_REPORTS) {
+            let full = root.join(f);
+            let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+            if size > MAX_BYTES {
+                self.annotate(idx, "warning", &format!("test-results: {f} is {} MiB, more than the {} MiB a report may be", size >> 20, MAX_BYTES >> 20)).await;
+                continue;
+            }
+            let body = match std::fs::read(&full) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.annotate(idx, "warning", &format!("test-results: {f}: {e}")).await;
+                    continue;
+                }
+            };
+            let url = format!("{base}/_kiln/test-results?step={idx}&format={}&path={}&root={}", crate::ci::cli::enc(&format), crate::ci::cli::enc(f), crate::ci::cli::enc(&root.to_string_lossy()));
+            let sent = async {
+                let resp = self.http.put(&url).bearer(&self.a.runtime.runtime_token).body(body).timeout(Duration::from_secs(120)).send().await?;
+                let status = resp.status();
+                let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+                anyhow::ensure!((200..300).contains(&status), "{}", v.get("error").and_then(serde_json::Value::as_str).unwrap_or("the server refused the report"));
+                Ok(v)
+            }
+            .await;
+            let v = match sent {
+                Ok(v) => v,
+                Err(e) => {
+                    self.annotate(idx, "warning", &format!("test-results: {f}: {e:#}")).await;
+                    all_quarantined = false;
+                    continue;
+                }
+            };
+            let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let (fails, errors) = (n("failed"), n("errors"));
+            failed += fails + errors;
+            let mut line = format!("Test results ({f}, {}): {} passed, {} failed, {} skipped", v.get("format").and_then(serde_json::Value::as_str).unwrap_or("?"), n("passed"), fails + errors, n("skipped"));
+            let names: Vec<&str> = v.get("failures").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str).take(10).collect();
+            if !names.is_empty() {
+                line.push_str(&format!("\n  failed: {}", names.join(", ")));
+            }
+            let q = v.get("quarantine").cloned().unwrap_or_default();
+            let quarantined: Vec<String> = q.get("quarantined").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|x| x.get(0).and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+            if !quarantined.is_empty() {
+                line.push_str(&format!("\n  quarantined: {}", quarantined.join(", ")));
+            }
+            self.note(idx, &line).await;
+            for w in v.get("warnings").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str) {
+                self.annotate(idx, "warning", w).await;
+            }
+            if fails + errors > 0 && q.get("only_quarantined").and_then(serde_json::Value::as_bool) != Some(true) {
+                all_quarantined = false;
+            }
+        }
+        failed > 0 && all_quarantined
     }
 
     /// A step begins: its own row, or a header in its composite caller's log.

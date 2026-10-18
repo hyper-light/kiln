@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assemblies timestamp="10/18/2026 12:00:00">
+  <assembly name="/repo/tests/bin/Acme.Tests.dll" run-date="2026-10-18" run-time="12:00:00" total="3" passed="1" failed="1" skipped="1" time="0.123" errors="0">
+    <errors />
+    <collection total="3" passed="1" failed="1" skipped="1" name="Test collection for Acme.Tests.MathTests" time="0.100">
+      <test name="Acme.Tests.MathTests.Adds" type="Acme.Tests.MathTests" method="Adds" time="0.0012" result="Pass" />
+      <test name="Acme.Tests.MathTests.Divides" type="Acme.Tests.MathTests" method="Divides" time="0.023" result="Fail" source-file="/repo/tests/MathTests.cs" source-line="14">
+        <failure exception-type="Xunit.Sdk.EqualException">
+          <message><![CDATA[Assert.Equal() Failure: Values differ]]></message>
+          <stack-trace><![CDATA[   at Acme.Tests.MathTests.Divides() in /repo/tests/MathTests.cs:line 14]]></stack-trace>
+        </failure>
+      </test>
+      <test name="Acme.Tests.MathTests.Later" type="Acme.Tests.MathTests" method="Later" time="0" result="Skip">
+        <reason><![CDATA[not yet]]></reason>
+      </test>
+    </collection>
+  </assembly>
+</assemblies>

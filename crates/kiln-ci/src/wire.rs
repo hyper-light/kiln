@@ -76,6 +76,10 @@ pub struct AssignmentV2 {
     /// kiln (W04-R21): the workflow's `run-env: true`; `$KILN_RUN_ENV` lines go into `run.env`.
     #[serde(default)]
     pub run_env: bool,
+    /// kiln (W16-R05): the job's `quarantine: enforce`: a step whose failed tests are all
+    /// quarantined passes, with a warning.
+    #[serde(default)]
+    pub quarantine: bool,
     pub debug: Debug,
     pub limits: Limits,
 }
