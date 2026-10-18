@@ -1293,7 +1293,8 @@ impl Dispatch {
             services: spec.services.iter().cloned().collect(),
             job_container: job.and_then(|j| j.container.clone()),
             job_services: job.map(|j| j.services.clone()).unwrap_or_default(),
-            steps: job.map(|j| j.steps.clone()).unwrap_or_default(),
+            // A job's `attest:` (kiln) runs as `kiln/attest@v1` after its own steps (W18-R01).
+            steps: job.map(|j| j.steps.iter().cloned().chain(j.kiln.attest.as_ref().and_then(kiln_ci::attest::job_step)).collect()).unwrap_or_default(),
             workflow_env: wf.env.clone(),
             job_env: job.map(|j| j.env.clone()).unwrap_or_default(),
             workflow_defaults: wf.defaults.clone(),
@@ -1405,6 +1406,12 @@ impl Dispatch {
             JobEventV2::Metrics { idx, points, fingerprint } => {
                 if let Err(e) = super::results::metrics(&self.hub, leg, idx, &points, &fingerprint).await {
                     tracing::warn!(leg, error = %format!("{e:#}"), "metrics could not be kept");
+                }
+            }
+            // W18-R01: the attest step's statements, made from the server's own records and signed.
+            JobEventV2::Attest { idx, nonce, subjects, provenance, sbom } => {
+                if let Err(e) = super::attest::reported(&self.hub, leg, idx, &nonce, subjects, provenance, sbom).await {
+                    tracing::warn!(leg, error = %format!("{e:#}"), "attestations could not be made");
                 }
             }
             JobEventV2::Group { .. } | JobEventV2::Mask { .. } | JobEventV2::TestReport { .. } => {}

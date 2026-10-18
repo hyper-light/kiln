@@ -133,6 +133,8 @@ enum Cmd {
     /// Inside a CI leg: an integration's credentials, exchanged with the leg's ID token or
     /// stored, as variables (`--print-env`) or for a command (`--exec CMD…`).
     Auth(kiln::runner::auth::AuthArgs),
+    /// The packages a tree's lockfiles pin, as an SBOM (SPDX 2.3 or CycloneDX 1.6).
+    Sbom(kiln::ci::sbom::SbomArgs),
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// A CI run's or leg's logs.
@@ -658,6 +660,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
         Cmd::Auth(a) => kiln::runner::auth::cli(a).await,
+        Cmd::Sbom(a) => kiln::ci::sbom::cli(a).await,
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();
