@@ -4,7 +4,7 @@
  */
 import * as React from "react";
 import { NavLink, useSearchParams } from "@/lib/router";
-import { observeApi, type Dashboard, type DashboardSummary, type Integration, type LogHistogram, type LogSearch, type Monitor, type ObserveStatus, type QueryAnswer } from "@/api/observe";
+import { observeApi, type Cloud, type Dashboard, type DashboardSummary, type Integration, type LogHistogram, type LogSearch, type Monitor, type ObserveStatus, type QueryAnswer } from "@/api/observe";
 import { Chart } from "@/components/charts/chart";
 import { SERIES } from "@/components/charts/types";
 import { Segmented, tabsTriggerClass } from "@/components/ui/tabs";
@@ -288,6 +288,7 @@ export const monitorsRes: Res<Monitor[]> = { key: "observe/monitors", fetch: (s)
 // One item's key is not under its list's: a list refreshed after a delete must not refresh the item deleted.
 export const monitorRes = (id: string): Res<Monitor> => ({ key: `observe/monitor/${id}`, fetch: (s) => observeApi.monitor(id, s), opts: { pollMs: 30_000 } });
 export const integrationsRes: Res<Integration[]> = { key: "observe/integrations", fetch: (s) => observeApi.integrations(s) };
+export const cloudsRes: Res<Cloud[]> = { key: "observe/clouds", fetch: (s) => observeApi.clouds(s), opts: { pollMs: 10_000 } };
 export const dashboardsRes: Res<DashboardSummary[]> = { key: "observe/dashboards", fetch: (s) => observeApi.dashboards(s) };
 export const dashboardRes = (id: string): Res<Dashboard> => ({ key: `observe/dashboard/${id}`, fetch: (s) => observeApi.dashboard(id, s) });
 export const tagValuesRes = (tag: string): Res<string[]> => ({ key: `observe/tags/${tag}`, fetch: (s) => observeApi.tagValues(tag, s).then((r) => r.values), opts: { pollMs: 300_000 } });

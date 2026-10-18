@@ -197,6 +197,96 @@ const scenarios = {
     await page.getByRole("dialog").getByRole("button", { name: "Remove" }).click();
     await until("the integration gone", async () => !(await api("GET", "/api/observe/v1/integrations")).body.integrations.some((i) => i.name === name));
   },
+  /**
+   * A cloud added from the form (a key that is not one refused; the server's own credentials tested,
+   * the test saying why they are not there), and one the API made against a stand-in for CloudWatch
+   * shown pulling, edited without its secret (kept: the next pull is signed by its key), pulled now,
+   * and both removed.
+   */
+  async "a cloud is added, tested, edited keeping its secret, and removed"() {
+    const http = await import("node:http");
+    // CloudWatch as far as a pull asks it: one metric, a point a minute.
+    const seen = [];
+    const cw = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        const target = req.headers["x-amz-target"] ?? "";
+        seen.push({ target, auth: req.headers.authorization ?? "" });
+        const q = JSON.parse(body || "{}");
+        const minutes = [];
+        for (let t = Math.ceil((q.StartTime ?? 0) / 60) * 60; t < (q.EndTime ?? 0); t += 60) minutes.push(t);
+        const out = target.endsWith("ListMetrics")
+          ? { Metrics: [{ Namespace: "AWS/EC2", MetricName: "CPUUtilization", Dimensions: [{ Name: "InstanceId", Value: "i-e2e" }] }] }
+          : {
+              MetricDataResults: (q.MetricDataQueries ?? []).map((m) => ({ Id: m.Id, Timestamps: minutes, Values: minutes.map(() => (m.MetricStat.Stat === "Sum" ? 42 : 1)), StatusCode: "Complete" })),
+            };
+        res.writeHead(200, { "content-type": "application/x-amz-json-1.0" });
+        res.end(JSON.stringify(out));
+      });
+    });
+    await new Promise((r) => cw.listen(0, "127.0.0.1", r));
+    const endpoint = `http://127.0.0.1:${cw.address().port}/cw/{region}/`;
+    const name = `e2e-${run}`;
+    const rowOf = (n) => page.locator("table.data-table tbody tr").filter({ has: page.getByText(n, { exact: true }) });
+    const clouds = async () => (await api("GET", "/api/observe/v1/clouds")).body.clouds;
+    try {
+      await page.goto(`${BASE}/observe/integrations`);
+      await page.getByRole("button", { name: "Add cloud" }).click();
+      const add = page.getByRole("dialog");
+      await add.getByLabel("Cloud", { exact: true }).selectOption("gcp");
+      await add.getByLabel("Name", { exact: true }).fill(`${name}-g`);
+      await add.getByLabel("Service account key (JSON)").fill("not a key");
+      await add.getByText("Not a key file's JSON.").waitFor();
+      expect(await add.getByRole("button", { name: "Add" }).isDisabled(), "a key that is not one: Add is off");
+      await add.getByLabel("Credentials", { exact: true }).selectOption("server");
+      await add.getByRole("button", { name: "Test" }).click();
+      await add
+        .getByRole("status")
+        .getByText(/no Google credentials/)
+        .waitFor({ timeout: 20_000 });
+      await add.getByRole("button", { name: "Add" }).click();
+      await rowOf(`${name}-g`).waitFor();
+      expect(
+        (await clouds()).some((c) => c.name === `${name}-g` && c.kind === "gcp" && c.service_account === undefined),
+        "kept, with the server's own credentials",
+      );
+
+      const made = await api("PUT", `/api/observe/v1/clouds/${name}`, {
+        kind: "aws",
+        regions: ["us-east-1"],
+        namespaces: ["AWS/EC2"],
+        access_key_id: "AKIDE2E",
+        secret_access_key: `secret-${run}`,
+        endpoint,
+        interval_s: 300,
+      });
+      expect(made.status === 204, `the cloud made, got ${made.status}`);
+      const row = rowOf(name);
+      await until("shown pulling, its series counted", async () => /Pulling/.test((await row.textContent()) ?? "") && /3 series/.test((await row.textContent()) ?? ""), 30_000);
+      await row.getByRole("button", { name: `Edit ${name}` }).click();
+      const edit = page.getByRole("dialog");
+      await edit.getByText("Kept. Type a new one to replace it.").waitFor();
+      await edit.getByLabel("Every (seconds)").fill("120");
+      await edit.getByRole("button", { name: "Save" }).click();
+      const after = await until("saved", async () => (await clouds()).find((c) => c.name === name && c.interval_s === 120));
+      expect(after.secret_access_key === "…" && after.endpoint === endpoint && after.access_key_id === "AKIDE2E", `its secret, key and endpoint kept: ${JSON.stringify(after)}`);
+      const calls = seen.length;
+      await row.getByRole("button", { name: `Pull ${name} now` }).click();
+      await until("a pull after the change, signed by its key", async () => seen.length > calls && seen.slice(calls).every((s) => s.auth.includes("Credential=AKIDE2E/")));
+      await until("pulling still", async () => (await clouds()).find((c) => c.name === name)?.status.state === "ok");
+      for (const n of [name, `${name}-g`]) {
+        await rowOf(n)
+          .getByRole("button", { name: `Remove ${n}` })
+          .click();
+        await page.getByRole("dialog").getByRole("button", { name: "Remove" }).click();
+        await until(`${n} gone`, async () => !(await clouds()).some((c) => c.name === n));
+      }
+    } finally {
+      cw.close();
+      for (const n of [name, `${name}-g`]) await api("DELETE", `/api/observe/v1/clouds/${n}`);
+    }
+  },
 };
 
 let failed = 0;

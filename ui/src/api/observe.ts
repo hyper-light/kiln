@@ -154,6 +154,85 @@ export interface Integration {
 /** An integration as it is sent: whole. */
 export type IntegrationIn = { kind: "slack" | "discord" | "teams"; url: string } | { kind: "pagerduty"; routing_key: string; url?: string } | { kind: "webhook"; url: string; secret?: string };
 
+export type CloudKind = "aws" | "gcp" | "azure";
+
+/** What a cloud integration is doing (docs/observe.md §10.1). Times are unix ms. */
+export interface CloudStatus {
+  state: "starting" | "ok" | "failing" | "paused";
+  error?: string;
+  warnings?: string[];
+  last_pull: number | null;
+  last_ok: number | null;
+  next_pull: number | null;
+  series: number;
+  over: number;
+  points: number;
+  deferred: number;
+  calls: number;
+  took_ms: number;
+  pulls: number;
+  failures: number;
+}
+
+interface CloudCommon {
+  interval_s?: number;
+  lookback_s?: number;
+  tags?: string[];
+  max_series?: number;
+  paused?: boolean;
+}
+
+/**
+ * A cloud integration as it is sent. A secret left out (or "…", as shown) is the one kept; an empty
+ * one removes it.
+ */
+export type CloudIn = (
+  | {
+      kind: "aws";
+      regions?: string[];
+      namespaces?: string[];
+      stats?: string[];
+      period_s?: number;
+      access_key_id?: string;
+      secret_access_key?: string;
+      role_arn?: string;
+      external_id?: string;
+      endpoint?: string;
+      sts_endpoint?: string;
+    }
+  | { kind: "gcp"; projects?: string[]; services?: string[]; period_s?: number; service_account?: string; endpoint?: string }
+  | {
+      kind: "azure";
+      tenant_id?: string;
+      client_id?: string;
+      client_secret?: string;
+      subscriptions?: string[];
+      resource_types?: string[];
+      aggregations?: string[];
+      period_s?: number;
+      authority?: string;
+      endpoint?: string;
+    }
+) &
+  CloudCommon;
+
+/** A cloud integration as the API shows it: its secrets "…", its status. */
+export type Cloud = CloudIn & { name: string; status: CloudStatus };
+
+/** What a configuration would read, pulled once and nothing written. */
+export interface CloudTest {
+  ok: boolean;
+  error?: string;
+  series?: number;
+  over?: number;
+  points?: number;
+  calls?: number;
+  took_ms?: number;
+  metrics?: number;
+  sample?: string[];
+  warnings?: string[];
+}
+
 export type WidgetKind = "timeseries" | "query_value" | "toplist" | "table" | "logs" | "events" | "monitors" | "note";
 
 export interface Widget {
@@ -216,6 +295,11 @@ export const observeApi = {
   putIntegration: (name: string, i: IntegrationIn) => request<void>("PUT", `${BASE}/integrations/${enc(name)}`, i),
   deleteIntegration: (name: string) => request<void>("DELETE", `${BASE}/integrations/${enc(name)}`),
   testIntegration: (name: string) => request<unknown>("POST", `${BASE}/integrations/${enc(name)}/test`, {}),
+  clouds: (signal?: AbortSignal) => request<{ clouds: Cloud[] }>("GET", `${BASE}/clouds`, undefined, { signal }).then((r) => r.clouds),
+  putCloud: (name: string, c: CloudIn) => request<void>("PUT", `${BASE}/clouds/${enc(name)}`, c),
+  deleteCloud: (name: string) => request<void>("DELETE", `${BASE}/clouds/${enc(name)}`),
+  pullCloud: (name: string) => request<unknown>("POST", `${BASE}/clouds/${enc(name)}/pull`, {}),
+  testCloud: (name: string, c: CloudIn) => request<CloudTest>("POST", `${BASE}/clouds/${enc(name)}/test`, c),
   dashboards: (signal?: AbortSignal) => request<{ dashboards: DashboardSummary[] }>("GET", `${BASE}/dashboards`, undefined, { signal }).then((r) => r.dashboards),
   dashboard: (id: string, signal?: AbortSignal) => request<Dashboard>("GET", `${BASE}/dashboards/${enc(id)}`, undefined, { signal }),
   createDashboard: (d: Omit<Dashboard, "id" | "builtin" | "created" | "modified">) => request<Dashboard>("POST", `${BASE}/dashboards`, d),

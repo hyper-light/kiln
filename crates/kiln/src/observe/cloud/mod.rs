@@ -178,14 +178,17 @@ impl Cloud {
         serde_json::to_value(&c).unwrap_or(Value::Null)
     }
 
-    /// Secrets left out (or `"…"`) are `old`'s, when it is of the same cloud: a change of settings
-    /// need not give them again.
+    /// Secrets left out (or `"…"`, as shown) are `old`'s, when it is of the same cloud: a change of
+    /// settings need not give them again. An empty one is none: a secret removed (the server's own
+    /// credentials from now).
     fn keep_secrets(&mut self, old: Option<&Self>) {
         let mut old = old.filter(|o| o.kind() == self.kind()).cloned();
         let kept: HashMap<&'static str, Option<String>> = old.as_mut().map(|o| o.secrets_mut().into_iter().map(|(k, v)| (k, v.clone())).collect()).unwrap_or_default();
         for (k, v) in self.secrets_mut() {
-            if v.as_deref().is_none_or(|s| s == HIDDEN) {
-                *v = kept.get(k).cloned().flatten();
+            match v.as_deref() {
+                None | Some(HIDDEN) => *v = kept.get(k).cloned().flatten(),
+                Some("") => *v = None,
+                Some(_) => {}
             }
         }
     }
@@ -919,6 +922,9 @@ mod tests {
         let mut changed = aws(Some(HIDDEN));
         changed.keep_secrets(again.get("prod").as_ref());
         anyhow::ensure!(changed == aws(Some("s3cr3t-key")));
+        let mut removed = Cloud::Aws(aws::Config { access_key_id: None, secret_access_key: Some(String::new()), regions: vec!["us-east-1".into()], ..aws::Config::default() });
+        removed.keep_secrets(again.get("prod").as_ref());
+        anyhow::ensure!(matches!(&removed, Cloud::Aws(c) if c.secret_access_key.is_none()) && removed.check().is_ok(), "an empty secret removes the kept one");
         let mut other = Cloud::Gcp(gcp::Config::default());
         other.keep_secrets(again.get("prod").as_ref());
         anyhow::ensure!(matches!(other, Cloud::Gcp(gcp::Config { service_account: None, .. })), "another cloud's secrets are not taken");

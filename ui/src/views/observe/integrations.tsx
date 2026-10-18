@@ -1,7 +1,8 @@
 /**
  * Integrations: where monitors' messages go (Slack, Discord, Microsoft Teams, PagerDuty, or any
- * webhook, signed), each named, each mentioned in a message as `@<kind>-<name>`. Secrets are kept
- * by the server and never shown again; a test sends a message at once.
+ * webhook, signed), each named, each mentioned in a message as `@<kind>-<name>`; and the clouds
+ * whose metrics kiln reads (`./clouds`). Secrets are kept by the server and never shown again; a
+ * test sends a message at once.
  */
 import * as React from "react";
 import { Plus, Send, Trash2 } from "lucide-react";
@@ -10,11 +11,12 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog, Dialog, DialogContent } from "@/components/ui/dialog";
 import { TableHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
-import { CopyButton, PageIntro, SelectField, TextField } from "@/components/ui/misc";
+import { CopyButton, PageIntro, SectionHeading, SelectField, TextField } from "@/components/ui/misc";
 import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
+import { Clouds } from "./clouds";
 import { ObserveNav, integrationsRes } from "./parts";
 
 const KINDS: { value: IntegrationKind; label: string; url: string }[] = [
@@ -35,7 +37,7 @@ export default function Integrations() {
         index={8}
         label="Observe"
         title="Integrations"
-        lead="Where monitors' messages go. Mention one in a monitor's message as @kind-name: it is told when a group alerts, warns, stops having data, and recovers."
+        lead="Where monitors' messages go, and the clouds whose metrics kiln reads. Mention one in a monitor's message as @kind-name: it is told when a group alerts, warns, stops having data, and recovers."
         actions={
           <Button onClick={() => setAdding(true)}>
             <Plus /> Add integration
@@ -43,10 +45,12 @@ export default function Integrations() {
         }
       />
       <ObserveNav />
+      <SectionHeading index="01" label="Notifications" title="Where monitors' messages go" />
       <Loadable label="the integrations" fallback={<TableHold head={<Head />} rows={3} />}>
         <List onAdd={() => setAdding(true)} />
       </Loadable>
       {adding && <AddDialog onClose={() => setAdding(false)} />}
+      <Clouds />
     </div>
   );
 }
