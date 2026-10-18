@@ -459,6 +459,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
+                // The kiln it runs, so the server knows its commit (`crate::fleet`).
+                if !o.ephemeral
+                    && let Ok(b) = proto::encode(&crate::updates::runner_facts())
+                {
+                    net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                }
                 connected = true;
                 if let Some(s) = &sync {
                     s.connected(true);
@@ -862,11 +868,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = done.send(result).await;
                         });
                     }
+                    ServerMsg::ProbeFacts => {
+                        if let Ok(b) = proto::encode(&crate::updates::runner_facts()) {
+                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                        }
+                    }
                     // The rest of CI's messages (W13, W17) land with their workstreams.
-                    ServerMsg::SecretsFor { .. }
-                    | ServerMsg::JobTerminalOpen { .. }
-                    | ServerMsg::KeepRelease { .. }
-                    | ServerMsg::ProbeFacts => {
+                    ServerMsg::SecretsFor { .. } | ServerMsg::JobTerminalOpen { .. } | ServerMsg::KeepRelease { .. } => {
                         tracing::debug!("ignoring a CI message this runner does not take yet");
                     }
                 }

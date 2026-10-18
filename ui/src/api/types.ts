@@ -508,13 +508,16 @@ export interface UpdateJob {
   /** The machine, or "server". */
   target: string;
   /** native: the runner's own upgrade command · terminal: through a terminal on an older runner ·
-   * restart: Kubernetes rollout restart · replace: the server's binary replaced. */
-  method: "native" | "terminal" | "restart" | "replace";
+   * build: the machine builds the newest kiln itself · restart: Kubernetes rollout restart ·
+   * replace: the server's binary replaced. */
+  method: "native" | "terminal" | "build" | "restart" | "replace";
   state: "running" | "done" | "failed";
   started_at: number;
   ended_at: number | null;
   from_build: string | null;
   to_build: string | null;
+  /** The commit it brings the machine to, when kiln knows it. */
+  commit?: string;
   /** The machine reported running to_build. */
   reached: boolean;
   log: string[];
@@ -527,12 +530,14 @@ export interface KilnBinary {
   sha256: string;
   size: number;
   build: string;
-  /** server: the server's own · upload: uploaded here · release: fetched from GitHub · built: by kiln's own release pipeline. */
-  origin: "server" | "upload" | "release" | "built";
+  /** server: the server's own · upload: uploaded here · release: fetched from GitHub · built: by kiln's own release pipeline · machine: a machine built it of itself. */
+  origin: "server" | "upload" | "release" | "built" | "machine";
   at: number;
   /** The release pipeline's run that built it, and the commit. */
   run?: number;
   sha?: string;
+  /** The machine that built it of itself. */
+  by?: string;
 }
 
 /** The pipeline that builds kiln for every platform, and its latest run. */
@@ -542,7 +547,7 @@ export interface ReleaseBuild {
   branch?: string;
   last?: Run | null;
   error?: string;
-  /** The commit the server runs; null: it was built without knowing one (`KILN_COMMIT`). */
+  /** The newest kiln's commit (the server's, or a newer one a runner runs); null: unknown (a server built without `KILN_COMMIT`). */
   commit?: string | null;
   /** Every other platform's binary is built from that commit. */
   in_step?: boolean;
@@ -598,10 +603,28 @@ export interface RunnerUpdate {
   /** The build it would be upgraded to; null when kiln has no binary for its platform yet. */
   target_build: string | null;
   build: string | null;
+  /** It runs the newest kiln. */
   up_to_date: boolean;
   method: "native" | "terminal";
   terminal: boolean;
   instances: RunnerInstance[];
+  /** The commit it runs, when kiln knows it. */
+  commit?: string | null;
+  /** Against the newest kiln: branch and local builds run something on purpose and are left alone. */
+  standing?: "current" | "behind" | "unknown" | "branch" | "local" | null;
+  /** What it does next to reach the newest kiln, as the end of a sentence about it. */
+  next?: string | null;
+  how?: "download" | "build" | "wait" | "upgrading" | "left" | null;
+  /** Its kiln checkout, as it reports it. */
+  checkout?: string | null;
+}
+
+/** The newest kiln: the commit of the release branch every runner is brought to. */
+export interface FleetTarget {
+  commit: string;
+  /** Who ran it first: "server", or a machine's name. */
+  from: string;
+  since: number;
 }
 
 export interface UpdatesOverview {
@@ -611,6 +634,9 @@ export interface UpdatesOverview {
   binaries: KilnBinary[];
   targets: string[];
   build?: ReleaseBuild;
+  newest?: FleetTarget | null;
+  /** Every runner follows the newest kiln on its own (`[updates] follow`). */
+  follow?: boolean;
 }
 
 export type LogControlFrame = { type: "step"; idx: number; status: Status } | { type: "end" };

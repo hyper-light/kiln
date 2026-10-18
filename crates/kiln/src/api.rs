@@ -200,6 +200,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
         (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
         (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
+        (&Method::GET, ["dl", "kiln", target, build]) => return download_build(&hub, target, build).await,
+        // A machine building kiln itself (`crate::fleet`), with its build's token.
+        (&Method::GET, ["api", "updates", "jobs", id, "source"]) => return build_source(&hub, id, req.headers()).await,
+        (&Method::POST, ["api", "updates", "jobs", id, "binary"]) => {
+            let id = (*id).to_owned();
+            let q = srv::query(&req);
+            return build_binary(&hub, &id, &q, req).await;
+        }
         (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
         (&Method::GET, ["install.ps1"]) => return Ok(install_powershell(&hub)),
         // kiln's CA for devices (it is public): PEM, DER, and an Apple configuration profile.
@@ -1828,6 +1836,46 @@ async fn download_for(hub: &Hub, target: &str) -> R {
     Ok(srv::with_header(r, header::CACHE_CONTROL, "no-store"))
 }
 
+/// Build `build` for `target`: what an upgrade names, so a machine gets exactly the binary it
+/// was told the SHA-256 of (kiln may hand out more than one for a platform).
+async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
+    let Some(b) = crate::updates::binaries(hub).into_iter().find(|b| b.target == target && b.build == build) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")));
+    };
+    if b.origin == "server" {
+        return download_binary().await;
+    }
+    let (path, _) = crate::updates::stored(hub, target).filter(|(_, m)| m.build == build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
+    let body = crate::rt::file_source(path)?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+}
+
+fn build_token_ok(hub: &Hub, headers: &HeaderMap, job: &str) -> bool {
+    bearer(headers).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::fleet::token(hub, job).as_bytes()))
+}
+
+/// `GET /api/updates/jobs/{id}/source`: the source of the commit a machine builds itself
+/// (`crate::fleet`), as tar.
+async fn build_source(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
+    if !build_token_ok(hub, headers, id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad build token"));
+    }
+    let stdout = crate::fleet::source(hub, id).await.map_err(|e| err(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(srv::response(StatusCode::OK, "application/x-tar", srv::channel_body(stdout)))
+}
+
+/// `POST /api/updates/jobs/{id}/binary?sha256=<hex>`: what a machine built of itself; the binary
+/// as the body when it is kept for the machine's platform, else nothing.
+async fn build_binary(hub: &Arc<Hub>, id: &str, q: &HashMap<String, String>, req: Request) -> R {
+    if !build_token_ok(hub, req.headers(), id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad build token"));
+    }
+    let sha256 = q.get("sha256").cloned().unwrap_or_default();
+    let bytes = srv::body_bytes(req.into_body(), crate::updates::MAX_BINARY).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
+    crate::fleet::on_built(hub, id, &sha256, Some(bytes.to_vec())).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 // ------------------------------------------------------------------ updates (Settings → Updates)
 
 /// `GET /api/updates`: this server and how it is upgraded, every machine's runner, the latest
@@ -1849,6 +1897,8 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
             "binaries": crate::updates::binaries(hub),
             "targets": targets,
             "build": release_build(hub).await,
+            "newest": hub.updates.fleet.target(),
+            "follow": hub.cfg.updates.follow,
         }),
     )
 }
@@ -1861,7 +1911,9 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
         return json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "error": format!("kiln doesn't build {} (no repository of that name)", u.release_repo) });
     };
     let last = hub.store.runs(Some(repo.id.clone()), 100, None).await.unwrap_or_default().into_iter().find(|r| r.pipeline == u.release_pipeline);
-    let s = crate::updates::in_step(hub, COMMIT);
+    // The newest kiln (`crate::fleet`): the server's commit, or a newer one a runner runs.
+    let newest = hub.updates.fleet.target().map_or_else(|| COMMIT.to_owned(), |t| t.commit);
+    let s = crate::updates::in_step(hub, &newest);
     json!({
         "repo": u.release_repo,
         "pipeline": u.release_pipeline,
@@ -1879,14 +1931,15 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
 async fn build_every_platform(hub: &Hub) -> R {
     let u = &hub.cfg.updates;
     let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln doesn't build {}", u.release_repo)))?;
-    // The commit this server runs, when it knows it: only that build is what runners take.
-    let run = if COMMIT.is_empty() {
+    // The newest kiln (`crate::fleet`), when kiln knows it: only that build is what runners take.
+    let newest = hub.updates.fleet.target().map_or_else(|| COMMIT.to_owned(), |t| t.commit);
+    let run = if newest.is_empty() {
         let runs = crate::gitops::manual(hub, &repo, Some(u.release_branch.clone()), Some(u.release_pipeline.clone()))
             .await
             .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
         runs.into_iter().next().ok_or_else(|| err(StatusCode::CONFLICT, format!("{} has no pipeline called {}", u.release_repo, u.release_pipeline)))?
     } else {
-        crate::updates::build_commit(hub, &repo, COMMIT).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?
+        crate::updates::build_commit(hub, &repo, &newest).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?
     };
     hub.store.audit("admin".into(), "upgrade.build".into(), format!("{} {} #{}", u.release_repo, u.release_pipeline, run.number)).await;
     Ok(srv::json(StatusCode::ACCEPTED, &run))

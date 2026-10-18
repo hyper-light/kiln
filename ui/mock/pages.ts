@@ -520,13 +520,17 @@ const PLANS = [
 
 /* ------------------------------------------------------------------ the rest */
 
+const NEWEST = "94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901";
+
 function updates(ctx: PagesCtx): UpdatesOverview {
   const runners = ctx
     .agents()
     .filter((a) => !a.ephemeral)
     .map((a) => {
       const target = `${a.arch}-${a.os === "macos" ? "apple-darwin" : "unknown-linux-gnu"}`;
-      const up = a.version === ctx.version;
+      const mac = a.os === "macos";
+      // The Mac is behind and builds the newest kiln itself (crate::fleet).
+      const up = a.version === ctx.version && !mac;
       return {
         name: a.name,
         hostname: a.hostname,
@@ -541,6 +545,11 @@ function updates(ctx: PagesCtx): UpdatesOverview {
         method: up ? ("native" as const) : ("terminal" as const),
         terminal: true,
         instances: [],
+        commit: up ? NEWEST : mac ? "24e80a198f19253bd115906660f719b06b4d0016" : null,
+        standing: up ? ("current" as const) : mac ? ("behind" as const) : ("unknown" as const),
+        next: up ? null : mac ? `builds ${NEWEST.slice(0, 12)} itself` : `downloads build 0.1.0+a1b2c3d (${NEWEST.slice(0, 12)})`,
+        how: up ? null : mac ? ("build" as const) : ("download" as const),
+        checkout: mac ? "/Users/ada/Projects/kiln" : null,
       };
     });
   return {
@@ -566,7 +575,9 @@ function updates(ctx: PagesCtx): UpdatesOverview {
       { target: "aarch64-unknown-linux-gnu", sha256: "cd".repeat(32), size: 36_900_000, build: "0.1.0+a1b2c3d", origin: "built", at: T0 - 80_000, run: 412, sha: "a1b2c3d4e5" },
     ],
     targets: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"],
-    build: { repo: "hyper-light/kiln", pipeline: "release", last: null, commit: "a1b2c3d4e5f6", in_step: false, behind: ["aarch64-apple-darwin"], keeps_in_step: true },
+    build: { repo: "hyper-light/kiln", pipeline: "release", last: null, commit: NEWEST, in_step: false, behind: ["aarch64-apple-darwin"], keeps_in_step: true },
+    newest: { commit: NEWEST, from: "server", since: T0 - 3600 },
+    follow: true,
   };
 }
 

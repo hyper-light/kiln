@@ -15,6 +15,7 @@ pub mod dirs;
 pub mod discovery;
 pub mod dns;
 pub mod exec;
+pub mod fleet;
 pub mod frontdoor;
 pub mod gitops;
 pub mod harness;
