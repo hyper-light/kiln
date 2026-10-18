@@ -100,6 +100,26 @@ enum CdCmd {
     },
     /// Let a rolled-back app follow git again.
     Follow { id: String },
+    /// An app's rollout on a target beyond Kubernetes: `status` (where it stands), `promote`
+    /// (`--full`: past every step and check), `pause`, `resume`, `abort` (traffic back to blue),
+    /// `retry` (an aborted one, from its first step), or `approve` / `deny` the approval check it
+    /// waits for (`--check`).
+    Rollout {
+        #[arg(value_parser = ["status", "promote", "pause", "resume", "abort", "retry", "approve", "deny"])]
+        action: String,
+        id: String,
+        #[arg(long)]
+        full: bool,
+        /// approve, deny: the approval check.
+        #[arg(long)]
+        check: Option<String>,
+        /// abort: why, for the rollout's record.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Which rollout, by id, when the app has more than one under way.
+        #[arg(long)]
+        rollout: Option<String>,
+    },
     /// Watch a rollout of kiln's own Deployment, putting the previous image back if it isn't
     /// available in time (run by kiln as a Job before it deploys itself).
     #[command(hide = true)]
@@ -382,6 +402,23 @@ pub async fn run(args: CdArgs, cfg: &Config) -> Result<()> {
             v
         }
         CdCmd::Follow { id } => api.call(Method::Post, &format!("{}/follow", app_path(&id)), None).await?,
+        CdCmd::Rollout { action, id, full, check, reason, rollout } => {
+            let path = format!("{}/rollout", app_path(&id));
+            if action == "status" {
+                let v = api.call(Method::Get, &path, None).await?;
+                if !args.json {
+                    print_rollouts(&v);
+                    return Ok(());
+                }
+                v
+            } else {
+                let mut body = json!({"full": full, "check": check, "reason": reason, "rollout": rollout});
+                if let Some(m) = body.as_object_mut() {
+                    m.retain(|_, v| !v.is_null() && *v != Value::Bool(false));
+                }
+                api.call(Method::Post, &format!("{path}/{action}"), Some(body)).await?
+            }
+        }
         CdCmd::Plan { commit, stack, base, trunk, pr, repo, project, cluster, diff } => {
             if commit.as_deref().is_some_and(|c| c.len() > 1 && c.starts_with('D') && c[1..].chars().all(|x| x.is_ascii_digit())) {
                 bail!("plans of kiln's own diffs (D123) come with its review, which isn't built yet: plan the commit or the stack (--stack)");
@@ -620,6 +657,37 @@ async fn wait_for(api: &Api, path: &str, json_out: bool, before: Option<u64>) ->
 
 /// What differs in an app, by what a sync does about it: `14 changed · 92 to take over · 3 to
 /// prune`, or how many objects it has when nothing differs.
+/// An app's rollouts, as `kiln cd rollout status` prints them.
+fn print_rollouts(v: &Value) {
+    let list = v.get("rollouts").and_then(Value::as_array).cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("No rollouts.");
+    }
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    for r in &list {
+        let st = r.get("status").cloned().unwrap_or(Value::Null);
+        let why = [s(&st, "why"), s(&st, "waiting")].into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join("; ");
+        let held = if st.get("held").and_then(Value::as_bool) == Some(true) { ", paused by a person" } else { "" };
+        println!("{} {}  {}{held}  {}% of the traffic, step {} of {}{}", s(r, "kind"), s(r, "name"), s(&st, "state"), n(&st, "weight"), n(&st, "step"), n(&st, "steps"), if why.is_empty() { String::new() } else { format!(": {why}") });
+        let version = |k: &str| r.get(k).map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned)).unwrap_or_default();
+        println!("  blue {} → green {}, revision {}  (rollout {})", version("blue"), version("green"), s(r, "revision"), s(r, "id"));
+        if let Some(u) = r.get("preview_url").and_then(Value::as_str) {
+            println!("  preview  {u}");
+        }
+        for c in r.get("waiting").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+            println!("  waiting for approval {c}: kiln cd rollout approve {} --check {c}", s(v, "app"));
+        }
+        for c in r.get("checks").and_then(Value::as_array).into_iter().flatten().chain(r.get("watching").and_then(Value::as_array).into_iter().flatten()) {
+            let t = c.get("tally").cloned().unwrap_or(Value::Null);
+            let verdict = c.get("verdict").and_then(Value::as_str).unwrap_or("measuring");
+            println!("  check {} ({}): {verdict}, {} passed, {} failed, {} inconclusive, {} errors{}", s(c, "name"), s(c, "against"), n(&t, "passed"), n(&t, "failed"), n(&t, "inconclusive"), n(&t, "errors"), if s(c, "why").is_empty() { String::new() } else { format!(": {}", s(c, "why")) });
+        }
+        if let Some(last) = r.get("log").and_then(Value::as_array).and_then(|l| l.last()) {
+            println!("  last: {}", s(last, "event"));
+        }
+    }
+}
+
 pub fn what_differs(a: &Value) -> String {
     let n = |k: &str| a.get(k).and_then(Value::as_u64).unwrap_or(0);
     let (differ, total) = (n("out_of_sync"), n("resources"));

@@ -366,6 +366,8 @@ export type ServerEvent =
   | { type: "cd_apps"; apps: CdStatus[] }
   /** An app was deleted. */
   | { type: "cd_app_deleted"; app: string }
+  /** A rollout of an app's object on a target moved on: refetch GET /api/cd/apps/:app/rollout. */
+  | { type: "cd_rollout"; app: string; id: string }
   /** What machines hold, or a task moving a repository between them, changed: refetch GET /api/places. */
   | { type: "places" };
 
@@ -1029,6 +1031,92 @@ export interface CdDeployment {
   /** What the deployed commit says. */
   commit?: CdCommit;
 }
+
+/** A rollout's step (docs/cd-targets.md §5). */
+export type CdRolloutStep =
+  | { step: "weight"; weight: number }
+  | { step: "pause"; ms: number | null }
+  | { step: "checks"; names: string[]; against: "preview" | "production"; parallel: boolean }
+  | { step: "watch"; names: string[]; window_ms: number }
+  | { step: "approve" };
+
+export type CdVerdict = "pass" | "fail" | "inconclusive" | "error";
+
+export interface CdMeasurement {
+  at_ms: number;
+  verdict: CdVerdict;
+  value: unknown;
+  message: string;
+}
+
+/** A check measuring for a rollout: its measurements (the last ten), tally and verdict. */
+export interface CdCheckRun {
+  name: string;
+  against: "preview" | "production";
+  measurements: CdMeasurement[];
+  tally: { passed: number; failed: number; inconclusive: number; errors: number; streak: number; errors_in_a_row: number };
+  /** Measuring now. */
+  asked: { id: number; at_ms: number } | null;
+  next_ms: number;
+  verdict: CdVerdict | null;
+  why: string;
+  timing: { count: number | null; every_ms: number; dry_run: boolean };
+}
+
+/** Where a rollout stands, as its object's status carries it. */
+export interface CdRolloutStatus {
+  state: "running" | "paused" | "succeeded" | "aborted" | "superseded";
+  why: string;
+  /** A person paused it. */
+  held: boolean;
+  /** Green's share of the traffic, and the share the step wants. */
+  weight: number;
+  target: number;
+  /** The step it's at (1-based), of how many. */
+  step: number;
+  steps: number;
+  /** What it waits on the platform for. */
+  waiting: string;
+}
+
+/** A rollout of one traffic-carrying object on a target (GET /api/cd/apps/:app/rollout). */
+export interface CdRollout {
+  id: string;
+  target: string;
+  kind: string;
+  name: string;
+  revision: string | null;
+  previous_revision: string | null;
+  /** The deployment an abort goes back to (auto-rollback). */
+  back_to: number | null;
+  /** What had the traffic, and what rolls out (a Lambda version). */
+  blue: string | number;
+  green: string | number;
+  preview_url: string | null;
+  /** The object's own address: production's. */
+  stable_url?: string | null;
+  environment?: string | null;
+  started_ms: number;
+  updated_ms: number;
+  status: CdRolloutStatus;
+  steps: CdRolloutStep[];
+  /** The step it's at (0-based; `steps.length` once past them all). */
+  step: number;
+  auto_rollback: boolean;
+  /** Green can take traffic, or why not. */
+  ready: boolean;
+  unready?: string;
+  checks: CdCheckRun[];
+  /** Checks measured in the background, from a step to the end. */
+  watching: CdCheckRun[];
+  /** What happened, in order: `{ event, at_ms, … }`. */
+  log: ({ event: string; at_ms: number } & Record<string, unknown>)[];
+  dropped: number;
+  /** Approval checks waiting for a person. */
+  waiting: string[];
+}
+
+export type CdRolloutAction = "promote" | "pause" | "resume" | "abort" | "retry" | "approve" | "deny";
 
 export interface CdCluster {
   name: string;

@@ -190,6 +190,11 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             ("cd.apps.rollback".into(), b)
         }
         (&Method::POST, ["apps", p, n, "follow"]) => ("cd.apps.follow".into(), app(p, n)),
+        (&Method::GET, ["apps", p, n, "rollout"]) => ("cd.apps.rollout".into(), app(p, n)),
+        (&Method::POST, ["apps", p, n, "rollout", action]) => {
+            let b = json_body(body).await?;
+            ("cd.apps.rollout_act".into(), with(with(b, "app", json!(format!("{p}/{n}"))), "action", json!(action)))
+        }
         (&Method::GET, ["plans"]) => {
             if q.contains_key("diff") {
                 return Err(bad("plans of kiln's own diffs (D123) come with its review, which isn't built yet: plan the commit (commit=) or the stack (head=, base=)"));

@@ -26,6 +26,8 @@ pub struct Function {
     pub policy: Vec<String>,
     /// Its configuration's `RevisionId`, moved on by every change.
     pub revision: u64,
+    /// Versions' states other than `Active` (a test makes one `Pending` or `Failed`).
+    pub version_state: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -171,6 +173,25 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
             let c = config_of(&name, &f);
             st.functions.insert(name, f);
             ok(c)
+        }
+        // A version's (or an alias's) configuration, as published.
+        ("GET", ["2015-03-31", "functions", name]) if query.get("Qualifier").is_some_and(|q| q != "$LATEST") => {
+            let Some(f) = st.functions.get(*name) else { return err(404, "ResourceNotFoundException", "Function not found") };
+            let q = query.get("Qualifier").cloned().unwrap_or_default();
+            let v = f.aliases.get(&q).and_then(|a| a.get("FunctionVersion").and_then(Value::as_str).map(str::to_owned)).unwrap_or(q);
+            match f.versions.iter().find(|(n, _, _)| *n == v) {
+                Some((n, sha, snap)) => {
+                    let mut c = snap.get("config").and_then(Value::as_object).cloned().unwrap_or_default();
+                    c.remove("__created");
+                    c.insert("FunctionName".into(), json!(name));
+                    c.insert("Version".into(), json!(n));
+                    c.insert("CodeSha256".into(), json!(sha));
+                    c.insert("State".into(), json!(f.version_state.get(n).cloned().unwrap_or_else(|| "Active".into())));
+                    c.insert("LastUpdateStatus".into(), json!("Successful"));
+                    ok(json!({ "Configuration": c }))
+                }
+                None => err(404, "ResourceNotFoundException", "Function not found"),
+            }
         }
         ("GET", ["2015-03-31", "functions", name]) => match st.functions.get_mut(*name) {
             Some(f) => {
@@ -341,7 +362,9 @@ fn lambda(st: &mut State, method: &http::Method, path: &str, query: &std::collec
                 "POST" if f.urls.contains_key(&q) => err(409, "ResourceConflictException", "exists"),
                 "POST" | "PUT" => {
                     let mut u = body.as_object().cloned().unwrap_or_default();
-                    u.insert("FunctionUrl".into(), json!(format!("https://{name}.lambda-url.us-east-1.on.aws/")));
+                    // A preview alias's URL is its own.
+                    let host = if q.contains("preview") { format!("{name}-{q}") } else { (*name).to_owned() };
+                    u.insert("FunctionUrl".into(), json!(format!("https://{host}.lambda-url.us-east-1.on.aws/")));
                     f.urls.insert(q, Value::Object(u.clone()));
                     ok(Value::Object(u))
                 }
@@ -559,9 +582,9 @@ pub async fn start(fake: Arc<Fake>) -> anyhow::Result<String> {
     Ok(format!("http://{addr}"))
 }
 
-/// Records kept in memory.
+/// Records kept in memory: what kiln applied, and rollouts.
 #[derive(Default)]
-pub struct MemRecords(pub Mutex<BTreeMap<(String, String), kiln_cd::state::Applied>>);
+pub struct MemRecords(pub Mutex<BTreeMap<(String, String), kiln_cd::state::Applied>>, pub Mutex<BTreeMap<(String, String), kiln_cd::state::RolloutRecord>>);
 
 impl super::Records for MemRecords {
     fn get(&self, target: &str, key: &str) -> Option<kiln_cd::state::Applied> {
@@ -575,6 +598,31 @@ impl super::Records for MemRecords {
                 None => self.0.lock().remove(&(target.to_owned(), key)),
             };
             Ok(())
+        })
+    }
+
+    fn rollout(&self, target: &str, key: &str) -> Option<kiln_cd::state::RolloutRecord> {
+        self.1.lock().get(&(target.to_owned(), key.to_owned())).cloned()
+    }
+
+    fn keep_rollout<'a>(&'a self, target: &'a str, key: &'a str, record: Option<kiln_cd::state::RolloutRecord>, expect: Option<u64>) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut kept = self.1.lock();
+            let k = (target.to_owned(), key.to_owned());
+            let version = kept.get(&k).map(|r| r.version);
+            if expect.is_some_and(|e| version != Some(e)) {
+                return Ok(false);
+            }
+            match record {
+                Some(mut r) => {
+                    r.version = version.unwrap_or(0) + 1;
+                    kept.insert(k, r);
+                }
+                None => {
+                    kept.remove(&k);
+                }
+            }
+            Ok(true)
         })
     }
 }

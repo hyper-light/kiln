@@ -23,6 +23,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::health::Status;
+use crate::model::Health;
 
 /// What a provider can do (§2.1). The UI offers only that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -660,8 +661,13 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
     }
 }
 
-/// The health of a provider's object, by its group (§2.5); `None` for kinds with no rule.
+/// The health of a provider's object, by its group (§2.5); `None` for kinds with no rule. An
+/// object a rollout is moving traffic to reads as Argo CD reads a Rollout: `Progressing` while it
+/// runs, `Suspended` while it waits for a person, `Degraded` once it aborted.
 pub fn health(obj: &Value) -> Option<Status> {
+    if let Some(s) = rollout_health(obj) {
+        return Some(s);
+    }
     let group = crate::obj::group(obj);
     match for_group(group)?.name {
         "aws-ecs" => aws_ecs::health(obj),
@@ -670,6 +676,25 @@ pub fn health(obj: &Value) -> Option<Status> {
         "vercel" => vercel::health(obj),
         _ => None,
     }
+}
+
+/// The health of an object under a rollout, from the summary it carries (`status.rollout`, from
+/// [`crate::rollout::Rollout::summary`]); `None` when no rollout is moving traffic to it.
+pub fn rollout_health(obj: &Value) -> Option<Status> {
+    let r = obj.pointer("/status/rollout")?;
+    let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default();
+    let n = |k: &str| r.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let at = format!("{}% of the traffic, step {} of {}", n("weight"), n("step"), n("steps"));
+    let waiting = if s("waiting").is_empty() { String::new() } else { format!(": {}", s("waiting")) };
+    let (health, message) = match s("state") {
+        "succeeded" => return None,
+        "aborted" => (Health::Degraded, format!("rollout aborted: {}", s("why"))),
+        "paused" => (Health::Suspended, format!("rollout paused at {at}: {}", s("why"))),
+        _ if r.get("held").and_then(Value::as_bool) == Some(true) => (Health::Suspended, format!("rollout paused by a person at {at}")),
+        "superseded" => (Health::Progressing, s("why").to_owned()),
+        _ => (Health::Progressing, format!("rolling out: {at}{waiting}")),
+    };
+    Some(Status { health, message })
 }
 
 // ------------------------------------------------------------------ helpers
