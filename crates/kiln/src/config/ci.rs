@@ -13,6 +13,10 @@ pub struct Ci {
     /// Whether `.github/workflows` run (docs/ci.md W02-R02): `auto` (when a commit has no
     /// `.kiln/` workflow), `on` or `off`. Repositories will be able to override it.
     pub github_workflows: kiln_ci::wf::GithubWorkflows,
+    /// Run `.kiln/` workflows on the CI engine too (docs/ci.md W02-R06): the kiln dialect, with
+    /// its typed outputs, exports, implicit checkout and the rest. v1 then runs nothing for a
+    /// commit the engine took. Off by default: `.kiln/` pipelines stay on v1 until it's on.
+    pub kiln_workflows: bool,
     /// Route GitHub's hosted labels (`ubuntu-latest`, `macos-latest`, …) by OS and architecture
     /// (docs/ci.md W05-R21). Off by default: then such a label must be on a runner, as it must for
     /// GitHub's self-hosted runners.

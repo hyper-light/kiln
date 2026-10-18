@@ -741,7 +741,13 @@ impl Dispatch {
         // (W10-R03, R04).
         let job_token = super::token::mint_job(&self.hub, leg, &l.run, &r.repo.id, &l.spec.permissions, ttl).await?;
         let (secrets, used_ids, vars) = self.leg_secrets(l, r, &job_token).await;
-        let a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        let secret_env = secret_outputs_for(&self.hub, l, r).await;
+        let mut a = self.assignment(leg, l, r, attempt, executor.clone(), image, token, job_token, cache_mode, secrets, vars);
+        // Needed jobs' secret outputs, as masked environment only (W04-R22).
+        for (k, v) in secret_env {
+            a.masks.push(v.clone());
+            a.env_from.push((k, v));
+        }
         let json = serde_json::to_string(&a)?;
         if let Err(e) = super::secrets::record_uses(&self.hub, leg, used_ids).await {
             tracing::warn!(leg, error = %format!("{e:#}"), "secret uses could not be recorded");
@@ -844,7 +850,15 @@ impl Dispatch {
             workflow_defaults: wf.defaults.clone(),
             job_defaults: job.map(|j| j.defaults.clone()).unwrap_or_default(),
             outputs: job.map(|j| j.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect()).unwrap_or_default(),
-            contexts: wire::Contexts { github: r.github.clone(), vars, needs: spec.needs.clone(), strategy: spec.strategy.clone(), matrix: spec.matrix.clone(), inputs: spec.inputs.clone() },
+            contexts: wire::Contexts {
+                github: r.github.clone(),
+                vars,
+                needs: spec.needs.clone(),
+                strategy: spec.strategy.clone(),
+                matrix: spec.matrix.clone(),
+                inputs: spec.inputs.clone(),
+                run: serde_json::json!({ "env": spec.run_env.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect::<serde_json::Map<String, serde_json::Value>>() }),
+            },
             secrets,
             masks: Vec::new(),
             env_from,
@@ -872,6 +886,9 @@ impl Dispatch {
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
             actions: r.actions.clone(),
             debug: wire::Debug { runner_debug: r.debug, step_debug: r.debug, ..wire::Debug::default() },
+            exports_env: job.map(|j| j.kiln.exports_env.clone()).unwrap_or_default(),
+            secret_outputs: job.map(|j| j.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect()).unwrap_or_default(),
+            run_env: wf.run_env,
             limits: wire::Limits::default(),
         }
     }
@@ -908,7 +925,13 @@ impl Dispatch {
                 runs::annotation(&self.hub, leg, Some(idx), &level, title, &message, file, line, end_line, col, end_col).await?;
             }
             JobEventV2::Summary { idx, markdown } => runs::summary(&self.hub, leg, idx, &markdown).await?,
-            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs } => {
+            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values } => {
+                // Secret outputs are sealed the moment they arrive (W04-R22, W09-R10).
+                if !secret_values.is_empty()
+                    && let Some(run) = self.legs.get(leg).map(|l| l.run.clone())
+                {
+                    seal_secret_outputs(&self.hub, &run, leg, &secret_values).await?;
+                }
                 if let Some(l) = self.legs.get_mut(leg) {
                     l.report.outputs = outputs.into_iter().collect();
                     l.report.json_outputs = json_outputs.into_iter().collect();
@@ -1187,6 +1210,61 @@ fn placeholder_spec(wf: &Arc<Workflow>, job: &str) -> LegSpec {
         workflow: Arc::clone(wf),
         job_index: index,
     }
+}
+
+/// The AAD a secret output is sealed under: the leg and the name, so a value opens only there.
+fn secret_output_aad(leg: &str, name: &str) -> Vec<u8> {
+    format!("kiln secret output\0{leg}\0{name}").into_bytes()
+}
+
+/// A leg's secret outputs (W04-R22), sealed by the master key (W09-R10).
+async fn seal_secret_outputs(hub: &Hub, run: &str, leg: &str, values: &std::collections::BTreeMap<String, String>) -> anyhow::Result<()> {
+    let mut rows = Vec::new();
+    for (name, value) in values {
+        let (sealed, nonce) = super::secrets::seal_master(hub, value.as_bytes(), &secret_output_aad(leg, name))?;
+        rows.push((name.clone(), sealed, nonce));
+    }
+    let (run, leg) = (run.to_owned(), leg.to_owned());
+    hub.store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            for (name, sealed, nonce) in rows {
+                tx.execute(
+                    "INSERT INTO ci_secret_outputs (run_id, leg_id, name, sealed, nonce) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(leg_id, name) DO UPDATE SET sealed = excluded.sealed, nonce = excluded.nonce",
+                    rusqlite::params![run, leg, name, sealed, nonce],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+}
+
+/// The secret outputs of the jobs a leg needs, opened, as the environment it gets them in:
+/// `KILN_NEEDS_<JOB>_<NAME>` (W04-R22).
+async fn secret_outputs_for(hub: &Hub, l: &LegSt, r: &RunSt) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for so in &l.spec.secret_outputs {
+        let Some(producer) = r.keys.get(&so.leg).cloned() else { continue };
+        let name = so.name.clone();
+        let found: Option<(Vec<u8>, Vec<u8>)> = hub
+            .store
+            .call({
+                let (producer, name) = (producer.clone(), name.clone());
+                move |c| Ok(c.query_row("SELECT sealed, nonce FROM ci_secret_outputs WHERE leg_id = ?1 AND name = ?2", rusqlite::params![producer, name], |x| Ok((x.get(0)?, x.get(1)?))).optional()?)
+            })
+            .await
+            .unwrap_or_default();
+        let Some((sealed, nonce)) = found else { continue };
+        match super::secrets::open_master(hub, &sealed, &nonce, &secret_output_aad(&producer, &name)) {
+            Ok(v) => {
+                let var = format!("KILN_NEEDS_{}_{}", so.job, so.name).chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect();
+                out.push((var, String::from_utf8_lossy(&v).into_owned()));
+            }
+            Err(e) => tracing::warn!(leg = %producer, output = %name, error = %format!("{e:#}"), "a secret output could not be opened"),
+        }
+    }
+    out
 }
 
 /// A leg's stored conclusion, as the plan has it.

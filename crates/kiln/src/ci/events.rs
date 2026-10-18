@@ -24,7 +24,9 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     let commit = load::load(hub, repo, &t.sha).await?;
     // A manual run of one pipeline runs that one only.
     let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p));
-    let running: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && l.dialect == kiln_ci::expr::Dialect::Gha && wanted(l)).collect();
+    // GitHub's workflows; the kiln dialect's too once `[ci] kiln_workflows` takes them off v1.
+    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows;
+    let running: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && engine_runs(l) && wanted(l)).collect();
     if running.is_empty() {
         return Ok(false);
     }

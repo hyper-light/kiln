@@ -417,9 +417,10 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
       {/* steps */}
       <div className="border-t border-[#28313d]">
         {job.steps.length === 0 && <p className="empty-line px-5 py-6">No steps reported yet.</p>}
-        {job.steps.map((s) => (
+        {inRunOrder(job.steps).map((s, i) => (
           <StepRow
             key={s.idx}
+            position={i + 1}
             jobId={job.id}
             step={s}
             open={open.has(s.idx)}
@@ -455,7 +456,14 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
   );
 }
 
+/** Steps as they ran: by when each started, those yet to start after, in their order. Steps a run
+ * adds as it goes (an implicit checkout, pre and post steps) come after the job's own by number. */
+function inRunOrder(steps: Step[]): Step[] {
+  return [...steps].sort((a, b) => (a.started_at ?? Infinity) - (b.started_at ?? Infinity) || a.idx - b.idx);
+}
+
 function StepRow({
+  position,
   jobId,
   step,
   open,
@@ -464,6 +472,7 @@ function StepRow({
   command,
   now,
 }: {
+  position: number;
   jobId: string;
   step: Step;
   open: boolean;
@@ -479,7 +488,7 @@ function StepRow({
       <button className="flex min-h-11 w-full items-center gap-3 px-5 py-2 text-left transition-colors hover:bg-[#0e1014]" onClick={onToggle} aria-expanded={open}>
         <ChevronRight size={13} className={cn("shrink-0 text-[#7f8a9a] transition-transform duration-200", open && "rotate-90")} />
         <StatusDot status={step.status} />
-        <span className="font-mono text-[10px] text-[#6d7078]">{String(step.idx + 1).padStart(2, "0")}</span>
+        <span className="font-mono text-[10px] text-[#6d7078]">{String(position).padStart(2, "0")}</span>
         <span className="min-w-0 flex-1 truncate text-[13px] text-[#d4dde8]">{step.name}</span>
         {step.exit_code !== null && step.exit_code !== 0 && <span className="font-mono text-[10px] text-[#d1aaad]">exit {step.exit_code}</span>}
         <span className={cn("font-mono text-[11px] tabular-nums", step.status === "running" ? "text-[#d8d0f2]" : "text-[#93a1b4]")}>{dur === null ? "—" : formatDuration(dur)}</span>

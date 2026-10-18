@@ -64,6 +64,15 @@ pub struct AssignmentV2 {
     pub checkout: String,
     /// Remote actions the steps use, resolved when the run started (W07-R02), by `uses`.
     pub actions: BTreeMap<String, ActionRef>,
+    /// kiln (W04-R21): the job's `exports: { env }`, whose final values it publishes.
+    #[serde(default)]
+    pub exports_env: Vec<String>,
+    /// kiln (W04-R22): the job's outputs declared `secret: true`.
+    #[serde(default)]
+    pub secret_outputs: Vec<String>,
+    /// kiln (W04-R21): the workflow's `run-env: true`; `$KILN_RUN_ENV` lines go into `run.env`.
+    #[serde(default)]
+    pub run_env: bool,
     pub debug: Debug,
     pub limits: Limits,
 }
@@ -99,6 +108,9 @@ pub struct Contexts {
     pub strategy: serde_json::Value,
     pub matrix: serde_json::Value,
     pub inputs: serde_json::Value,
+    /// kiln: `run.env` from the jobs it needs (W04-R21).
+    #[serde(default)]
+    pub run: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,7 +242,8 @@ pub enum JobEventV2 {
     JobOutputs {
         outputs: BTreeMap<String, String>,
         /// kiln: typed outputs (`$KILN_OUTPUT_JSON`), exported environment, `run.env` lines, and
-        /// the names of secret outputs that were set (their values go to W09, not here).
+        /// the names of secret outputs that were set. Their values come in `secret_values`, which
+        /// the server seals the moment it reads them (W09-R10) and never keeps in the clear.
         #[serde(default)]
         json_outputs: BTreeMap<String, serde_json::Value>,
         #[serde(default)]
@@ -239,6 +252,8 @@ pub enum JobEventV2 {
         run_env: Vec<(String, String)>,
         #[serde(default)]
         secret_outputs: Vec<String>,
+        #[serde(default)]
+        secret_values: BTreeMap<String, String>,
     },
     TestReport { idx: u32, format: String, object: String },
     Metrics { idx: u32, points: Vec<serde_json::Value> },
