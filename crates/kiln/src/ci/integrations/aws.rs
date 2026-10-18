@@ -167,24 +167,18 @@ fn client() -> Result<&'static Client> {
     Ok(C.get_or_init(|| c))
 }
 
-/// A service's endpoint in a region: `https://ecs.us-east-1.amazonaws.com`. Tests point a service
-/// elsewhere with [`override_endpoint`].
+/// A service's endpoint in a region: `https://ecs.us-east-1.amazonaws.com` (or the fake a test
+/// put in its place, as `aws:<service>`).
 pub fn endpoint(service: &str, region: &str) -> String {
-    if let Some(e) = overrides().lock().get(service) {
-        return e.clone();
-    }
-    let domain = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
-    format!("https://{service}.{region}.{domain}")
-}
-
-fn overrides() -> &'static Mutex<HashMap<String, String>> {
-    static O: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    O.get_or_init(|| Mutex::new(HashMap::new()))
+    super::endpoint(&format!("aws:{service}"), || {
+        let domain = if region.starts_with("cn-") { "amazonaws.com.cn" } else { "amazonaws.com" };
+        format!("https://{service}.{region}.{domain}")
+    })
 }
 
 /// Sends `service`'s requests to `base` instead (a fake, in tests).
 pub fn override_endpoint(service: &str, base: &str) {
-    overrides().lock().insert(service.to_owned(), base.trim_end_matches('/').to_owned());
+    super::override_endpoint(&format!("aws:{service}"), base);
 }
 
 /// A client for one region, with credentials.
@@ -451,12 +445,9 @@ pub fn session_name(s: &str) -> String {
 
 /// STS's endpoint for `region` (the global one without).
 pub fn sts_endpoint(region: Option<&str>) -> String {
-    if let Some(e) = overrides().lock().get("sts") {
-        return e.clone();
-    }
     match region.filter(|r| !r.is_empty()) {
         Some(r) => endpoint("sts", r),
-        None => "https://sts.amazonaws.com".into(),
+        None => super::endpoint("aws:sts", || "https://sts.amazonaws.com".into()),
     }
 }
 
