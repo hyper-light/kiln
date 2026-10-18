@@ -240,7 +240,8 @@ is sent again with its definition. Gathering follows the OpenTelemetry Collector
 (200 ms); a write is never larger than the group's entry (1 MiB).
 
 **The lane.** `LANE_OBSERVE` (5) carries the group's messages and writes as JSON beside their bytes,
-payloads past 512 KiB in parts put back together under bounds (16 MiB, four a side, a minute).
+payloads past 512 KiB in parts put back together under bounds (16 MiB a payload, sixteen at once
+from a side, a minute for its parts).
 Snapshot files go over HTTP so that a big image never waits ahead of a heartbeat.
 
 ## 6. Query language
