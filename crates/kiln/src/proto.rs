@@ -300,6 +300,9 @@ pub enum ServerMsg {
     /// Reach: the answer to [`AgentMsg::ReachAsk`] (JSON). Appended last: postcard encodes
     /// variants by index.
     ReachAnswer { req: u64, json: String },
+    /// CI: keep a kept leg `minutes` from now (docs/ci.md W17-R02, "Extend"). Only to runners
+    /// announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
+    KeepExtend { job: String, minutes: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

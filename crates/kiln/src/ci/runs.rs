@@ -174,6 +174,12 @@ pub async fn requeue(hub: &Hub, leg: &str, attempt: u32, note: Option<String>) -
         .await
 }
 
+/// A failed leg kept until `until` (W17-R02), or no longer kept.
+pub async fn kept(hub: &Hub, leg: &str, until: Option<i64>) -> anyhow::Result<()> {
+    let leg = leg.to_owned();
+    hub.store.call(move |c| Ok(c.execute("UPDATE jobs SET kept_until = ?2 WHERE id = ?1", params![leg, until]).map(|_| ())?)).await
+}
+
 /// When a leg was queued (Unix seconds).
 pub async fn queued_at(hub: &Hub, leg: &str) -> anyhow::Result<i64> {
     let leg = leg.to_owned();

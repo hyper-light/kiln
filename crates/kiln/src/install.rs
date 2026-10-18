@@ -263,6 +263,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         ephemeral: false,
         dedicated_job: None,
         terminal: true,
+        job_terminal: true,
         shell: None,
         credentials: None,
         instance: None,

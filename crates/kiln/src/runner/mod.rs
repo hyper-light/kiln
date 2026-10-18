@@ -4,5 +4,6 @@
 
 pub mod docker;
 pub mod hashfiles;
+pub mod kept;
 pub mod runtime;
 pub mod workspaces;

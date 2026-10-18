@@ -182,6 +182,22 @@ impl Cli {
         c
     }
 
+    /// The program, arguments and environment that open an interactive shell in `container`
+    /// (W17-R01): bash where it has one, else sh, with `env` passed by name.
+    pub fn shell_argv(&self, container: &str, user: Option<&str>, workdir: &str, env: &BTreeMap<String, String>) -> (Vec<String>, Vec<(String, String)>) {
+        let mut a: Vec<String> = vec![self.bin.clone(), "exec".into(), "-it".into(), "--workdir".into(), workdir.to_owned()];
+        if let Some(u) = user {
+            a.extend(["--user".to_owned(), u.to_owned()]);
+        }
+        for k in env.keys() {
+            a.extend(["-e".to_owned(), k.clone()]);
+        }
+        a.extend([container.to_owned(), "sh".into(), "-c".into(), "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi".into()]);
+        let mut vars: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        vars.push(("DOCKER_CONFIG".into(), self.config.to_string_lossy().into_owned()));
+        (a, vars)
+    }
+
     /// Runs the CLI: its standard output, or an error with its standard error.
     pub async fn run(&self, args: &[String], env: &BTreeMap<String, String>, timeout: Duration) -> anyhow::Result<String> {
         let out = crate::proc::output(self.command(args, env), timeout).await?;

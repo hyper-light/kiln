@@ -42,6 +42,9 @@ pub struct Opts {
     pub ephemeral: bool,
     pub dedicated_job: Option<String>,
     pub terminal: bool,
+    /// Terminals into CI legs (docs/ci.md W17-R01): a runner's follow its terminal switch; the
+    /// server's in-process runner's follow `[terminal] enabled`.
+    pub job_terminal: bool,
     pub shell: Option<String>,
     /// In-process agent: credentials handed over directly, no enrollment.
     pub credentials: Option<(Vec<u8>, Leaf)>,
@@ -976,8 +979,82 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                         }
                     }
-                    // The rest of CI's messages (W13, W17) land with their workstreams.
-                    ServerMsg::SecretsFor { .. } | ServerMsg::JobTerminalOpen { .. } | ServerMsg::KeepRelease { .. } => {
+                    // A terminal into a running or kept leg (docs/ci.md W17-R01): its workspace
+                    // and environment, or its container; the leg's secrets masked in what it shows.
+                    ServerMsg::JobTerminalOpen { job, session, cols, rows } => {
+                        if !o.job_terminal {
+                            uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal disabled on this agent".into()) })).await.ok();
+                            continue;
+                        }
+                        if terms.contains_key(&session) {
+                            continue;
+                        }
+                        let Some(shell) = crate::runner::kept::shell(&job) else {
+                            uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg isn't running or kept on this runner".into()) })).await.ok();
+                            continue;
+                        };
+                        let (program, env) = match &shell.exec {
+                            Some((argv, env)) => (Some(argv.clone()), env.clone()),
+                            None => (None, shell.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                        };
+                        let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                        let cwd = program.is_none().then_some(shell.workdir.as_path());
+                        match terminal::spawn_at(o.shell.as_deref(), None, program.as_deref(), cwd, cols, rows, &env) {
+                            Ok((pty, rx)) => {
+                                let tx = term_tx.clone();
+                                let s = session.clone();
+                                let mut masker = kiln_ci::runner::mask::Masker::new(&shell.masks);
+                                crate::rt::spawn(async move {
+                                    // The masker holds back what could be the start of a secret (as
+                                    // long as the leg's longest, a token of a kilobyte); a terminal
+                                    // shows the rest, masked, as soon as output pauses.
+                                    loop {
+                                        let out = match crate::rt::timeout(std::time::Duration::from_millis(25), rx.recv()).await {
+                                            Ok(Ok(out)) => out,
+                                            Ok(Err(_)) => break,
+                                            Err(_) => {
+                                                let held = masker.finish();
+                                                if !held.is_empty() && tx.send((s.clone(), PtyOut::Data(held))).await.is_err() {
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                        };
+                                        let (out, exit) = match out {
+                                            PtyOut::Data(d) => (PtyOut::Data(masker.push(&d)), false),
+                                            PtyOut::Exit(code) => {
+                                                let rest = masker.finish();
+                                                if !rest.is_empty() && tx.send((s.clone(), PtyOut::Data(rest))).await.is_err() {
+                                                    break;
+                                                }
+                                                (PtyOut::Exit(code), true)
+                                            }
+                                        };
+                                        let empty = matches!(&out, PtyOut::Data(d) if d.is_empty());
+                                        if (!empty && tx.send((s.clone(), out)).await.is_err()) || exit {
+                                            break;
+                                        }
+                                    }
+                                });
+                                let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
+                                terms.insert(session, (pty, state));
+                            }
+                            Err(e) => {
+                                uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some(format!("{e:#}")) })).await.ok();
+                            }
+                        }
+                    }
+                    // A kept leg let go now, or kept longer (W17-R02).
+                    ServerMsg::KeepRelease { job } => {
+                        crate::rt::spawn(async move {
+                            crate::runner::kept::release(&job).await;
+                        });
+                    }
+                    ServerMsg::KeepExtend { job, minutes } => {
+                        crate::runner::kept::extend(&job, minutes);
+                    }
+                    // The rest of CI's messages (W09, W13) land with their workstreams.
+                    ServerMsg::SecretsFor { .. } => {
                         tracing::debug!("ignoring a CI message this runner does not take yet");
                     }
                 }

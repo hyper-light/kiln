@@ -271,6 +271,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     match (&method, s.as_slice()) {
         (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION")))),
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ci", "legs", id, "terminal"]) => {
+            let id = (*id).to_owned();
+            leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
+        }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
@@ -2421,8 +2425,51 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     let cmd = q.get("cmd").cloned();
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, cols, rows, cmd, socket).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), socket).await {
             tracing::debug!(error = %format!("{e:#}"), "terminal websocket ended");
+        }
+    });
+    Ok(resp)
+}
+
+/// `GET /api/ci/legs/:id/terminal` (WebSocket): a terminal inside a running or kept CI leg
+/// (docs/ci.md W17-R01), on the terminal protocol of `/api/terminal/ws`; `?session=` attaches
+/// again to one of that leg's.
+async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, caller: &crate::authz::Caller, req: Request) -> R {
+    let leg = id.to_owned();
+    let row: Option<(Option<String>, Option<String>, String, Option<i64>)> = hub
+        .store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row("SELECT agent, executor, status, kept_until FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?)
+        })
+        .await?;
+    let Some((agent, executor, status, kept_until)) = row else { return Err(err(StatusCode::NOT_FOUND, "no such leg of the CI engine")) };
+    let kept = kept_until.is_some_and(|t| t > crate::util::now_unix());
+    let Some(agent) = agent.filter(|_| status == "running" || kept) else {
+        return Err(err(StatusCode::CONFLICT, "the leg isn't running or kept: a terminal opens into a running leg, or a failed one kept with keep-on-failure"));
+    };
+    // On the host executor a terminal is a shell on the runner itself.
+    if executor.as_deref() == Some("host") && !caller.can("runners.terminal", &crate::authz::Scope::Runner { runner: agent.clone() }) {
+        return Err(err(StatusCode::FORBIDDEN, format!("{} may not open a shell on runner {agent}: a host leg's terminal needs runners.terminal there", caller.name)));
+    }
+    let existing = q.get("session").cloned();
+    if let Some(s) = &existing
+        && hub.terminals.get(s).is_some_and(|t| t.target != format!("leg:{id}"))
+    {
+        return Err(err(StatusCode::FORBIDDEN, "that terminal isn't this leg's"));
+    }
+    if existing.is_none() && hub.terminals.live() >= hub.cfg.terminal.max_sessions {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
+    }
+    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
+    let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
+    let (target, actor) = (format!("leg:{id}@{agent}"), caller.name.clone());
+    crate::rt::spawn(async move {
+        let Ok(socket) = upgrade.await else { return };
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, socket).await {
+            tracing::debug!(error = %format!("{e:#}"), "leg terminal websocket ended");
         }
     });
     Ok(resp)
@@ -2430,15 +2477,7 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
 
 /// One browser on one session: identity, replay, then live output; input both ways. Closing the
 /// socket only detaches — the shell keeps running for the next attach.
-async fn terminal_attach(
-    hub: Arc<Hub>,
-    existing: Option<String>,
-    target: String,
-    cols: u16,
-    rows: u16,
-    cmd: Option<String>,
-    socket: ws::WebSocket,
-) -> anyhow::Result<()> {
+async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, socket: ws::WebSocket) -> anyhow::Result<()> {
     use crate::termsess::{Frame, Input};
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
@@ -2452,16 +2491,19 @@ async fn terminal_attach(
             }
         },
         None => {
-            hub.store.audit("admin".into(), "terminal.open".into(), target.clone()).await;
-            match target.strip_prefix("agent:") {
-                Some(machine) => crate::termsess::open_agent(&hub, machine.to_owned(), cmd, cols, rows),
-                None => match crate::termsess::open_local(&hub, cmd, cols, rows) {
+            hub.store.audit(actor, "terminal.open".into(), target.clone()).await;
+            if let Some((job, machine)) = target.strip_prefix("leg:").and_then(|t| t.split_once('@')) {
+                crate::termsess::open_leg(&hub, machine.to_owned(), job, cols, rows)
+            } else if let Some(machine) = target.strip_prefix("agent:") {
+                crate::termsess::open_agent(&hub, machine.to_owned(), cmd, cols, rows)
+            } else {
+                match crate::termsess::open_local(&hub, cmd, cols, rows) {
                     Ok(s) => s,
                     Err(e) => {
                         tx.send(ws::text(json!({"type": "error", "message": format!("{e:#}")}).to_string())).await?;
                         return Ok(());
                     }
-                },
+                }
             }
         }
     };

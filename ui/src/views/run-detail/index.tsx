@@ -410,7 +410,14 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
 
       {ciDetail && (
         <Loadable label="the leg's notes" fallback={null}>
-          <CiLegExtras runId={ciDetail.run.id} attempt={attempt} legId={job.id} status={job.status} reused={!!ciDetail.legs.find((l) => l.id === job.id)?.reused_from} />
+          <CiLegExtras
+            runId={ciDetail.run.id}
+            attempt={attempt}
+            legId={job.id}
+            status={job.status}
+            reused={!!ciDetail.legs.find((l) => l.id === job.id)?.reused_from}
+            keptUntil={ciDetail.legs.find((l) => l.id === job.id)?.kept_until}
+          />
         </Loadable>
       )}
 

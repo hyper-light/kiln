@@ -46,6 +46,8 @@ export interface CiLeg {
   exit_code: number | null;
   /** A leg a rerun kept: the leg whose result it keeps. */
   reused_from: string | null;
+  /** A failed leg kept to look into, until when (W17-R02). */
+  kept_until?: number | null;
 }
 
 export interface CiRunDetail {
@@ -238,11 +240,15 @@ export const ci = {
     request<{ annotations: CiAnnotation[] }>("GET", `/api/ci/runs/${enc(id)}/annotations${at(attempt)}`, undefined, { signal }),
   summaries: (id: string, attempt: number | undefined, signal?: AbortSignal) => request<{ summaries: CiSummary[] }>("GET", `/api/ci/runs/${enc(id)}/summary${at(attempt)}`, undefined, { signal }),
   artifacts: (id: string, signal?: AbortSignal) => request<{ artifacts: CiArtifact[] }>("GET", `/api/ci/runs/${enc(id)}/artifacts`, undefined, { signal }),
-  rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean) => request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug }),
+  rerun: (id: string, mode: RerunMode, job: string | null, debug: boolean, keepFailed = false) =>
+    request<{ run: string; attempt: number }>("POST", `/api/ci/runs/${enc(id)}/rerun`, { mode, job, debug, keep_failed: keepFailed }),
   /** A review of the run's deployments waiting on their environments (W15-R04). */
   approve: (id: string, environments: string[], state: "approved" | "rejected", comment: string) =>
     request<{ run: string; environments: string[]; state: string }>("POST", `/api/ci/runs/${enc(id)}/approve`, { environments, state, comment }),
   cancel: (id: string) => request<void>("POST", `/api/ci/runs/${enc(id)}/cancel`, {}),
+  /** A kept leg kept `minutes` more from now, or let go (W17-R02). */
+  keep: (leg: string, minutes: number) => request<{ leg: string; kept_until: number }>("POST", `/api/ci/legs/${enc(leg)}/keep`, { minutes }),
+  release: (leg: string) => request<void>("POST", `/api/ci/legs/${enc(leg)}/release`, {}),
   routing: (leg: string, signal?: AbortSignal) => request<CiRouting>("GET", `/api/ci/legs/${enc(leg)}/routing`, undefined, { signal }),
   validate: (path: string, content: string, signal?: AbortSignal) => request<CiChecked>("POST", `/api/ci/validate`, { path, content }, { signal }),
   workflows: (repo: string, ref: string, signal?: AbortSignal) =>

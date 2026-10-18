@@ -136,6 +136,8 @@ enum Cmd {
     Env(kiln::ci::cli::EnvArgs),
     /// Approve (or reject) a run's deployments waiting for review.
     Approve(kiln::ci::cli::ApproveArgs),
+    /// A kept CI leg: keep it longer, or release it.
+    Debug(kiln::ci::cli::DebugArgs),
     /// People who sign in: add (with a sign-in link), list, link, sign out, remove.
     Users(kiln::authz::cli::UsersArgs),
     /// What users may do: roles and capabilities in scopes (`developer@org:acme`).
@@ -395,6 +397,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 ephemeral: a.ephemeral,
                 dedicated_job: a.job,
                 terminal: !a.no_terminal && !a.ephemeral,
+                job_terminal: !a.no_terminal,
                 shell: a.shell,
                 credentials: None,
                 instance: a.instance,
@@ -426,6 +429,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 ephemeral: false,
                 dedicated_job: None,
                 terminal: true,
+                job_terminal: true,
                 shell: a.shell,
                 credentials: None,
                 instance: None,
@@ -624,6 +628,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Env(a) => kiln::ci::cli::env(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Approve(a) => kiln::ci::cli::approve(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Debug(a) => kiln::ci::cli::debug(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Grants(a) => kiln::authz::cli::grants(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Roles(a) => kiln::authz::cli::roles(a, &config::Config::load(&config_path).unwrap_or_default()).await,

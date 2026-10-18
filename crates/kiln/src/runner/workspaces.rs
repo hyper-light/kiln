@@ -7,7 +7,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::Duration;
 
 /// A running leg's own tool cache (W06-R01). GitHub's self-hosted runner runs one job at a time,
 /// so its tool cache is never written twice at once; a kiln runner runs several legs, and two
@@ -106,30 +105,20 @@ pub async fn claim(work: &Path, ws: &Path) {
     }
 }
 
-/// A leg is done with `ws`: removed now, or kept `keep_minutes` (a failed leg's
-/// `keep-on-failure`, W17-R02) and removed then, unless kept longer meanwhile.
-pub async fn release(ws: &Path, keep_minutes: Option<u32>) {
+/// A leg is done with `ws` (or a kept one's keep ran out): it is removed, and the sweep leaves
+/// it be no longer.
+pub async fn release(ws: &Path) {
     IN_USE.lock().remove(ws);
     let ws = ws.to_path_buf();
-    match keep_minutes.filter(|m| *m > 0) {
-        Some(m) => {
-            let until = crate::util::now_unix() + i64::from(m) * 60;
-            if let Err(e) = std::fs::write(ws.join(KEEP_FILE), until.to_string()) {
-                tracing::warn!(error = %e, "a failed leg's workspace could not be kept");
-            }
-            crate::rt::spawn(async move {
-                crate::rt::sleep(Duration::from_secs(u64::from(m) * 60)).await;
-                let _ = crate::rt::blocking(move || {
-                    if !in_use(&ws) && kept_until(&ws).is_none_or(|t| t <= crate::util::now_unix()) {
-                        remove(&ws);
-                    }
-                })
-                .await;
-            });
-        }
-        None => {
-            let _ = crate::rt::blocking(move || remove(&ws)).await;
-        }
+    let _ = crate::rt::blocking(move || remove(&ws)).await;
+}
+
+/// A failed leg's workspace is kept until `until` (Unix seconds): the sweep leaves it until then,
+/// even after this runner restarts (W17-R02).
+pub fn keep_until(ws: &Path, until: i64) {
+    IN_USE.lock().remove(ws);
+    if let Err(e) = std::fs::write(ws.join(KEEP_FILE), until.to_string()) {
+        tracing::warn!(error = %e, "a failed leg's workspace could not be marked kept");
     }
 }
 

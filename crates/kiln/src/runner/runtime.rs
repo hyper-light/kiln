@@ -531,7 +531,9 @@ impl Leg {
         };
         // The workspace goes with the leg, unless a failed leg is kept to look into (W17-R02).
         let keep = if matches!(status, Status::Failed | Status::TimedOut) { self.a.debug.keep_on_failure_minutes } else { None };
-        super::workspaces::release(&ws, keep).await;
+        if let Some(until) = super::kept::ended(&job, ws, keep).await {
+            self.event(&JobEventV2::Kept { until }).await;
+        }
         let _ = started;
         JobResult { job, status, exit_code: None, error, peak_rss: None, cpu_seconds: None }
     }
@@ -742,6 +744,15 @@ impl Leg {
             }
             return Ok(Status::Failed);
         }
+        // What a terminal into the leg opens (W17-R01): its workspace and environment, or its
+        // container.
+        let mut shell_env = self.env_vars(&st);
+        shell_env.extend(st.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let exec = st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c, j))).map(|(c, j)| {
+            let inside: BTreeMap<String, String> = shell_env.iter().map(|(k, v)| (k.clone(), j.map.translate(v))).collect();
+            c.cli.shell_argv(&j.id, j.user.as_deref(), &j.map.translate(&st.layout.workspace.to_string_lossy()), &inside)
+        });
+        super::kept::running(&a.job_id, super::kept::Shell { workdir: st.layout.workspace.clone(), env: shell_env, masks: masks.clone(), exec });
         // The kiln dialect's implicit checkout (W06-R14); GitHub's workflows never get one.
         if a.checkout == "auto" && !self.implicit_checkout(&mut st).await {
             st.failed = true;
@@ -777,12 +788,18 @@ impl Leg {
         }
         self.job_outputs(&st).await;
         self.post_steps(&mut st, deadline).await;
+        // A failed leg kept to look into keeps its containers up (W17-R02).
+        let keep = (st.failed || timed_out) && !st.cancelled && a.debug.keep_on_failure_minutes.is_some_and(|m| m > 0);
         if let Some(c) = st.containers.take() {
-            let idx = st.next_idx;
-            st.next_idx += 1;
-            self.start(idx, "Stop containers", "internal", None).await;
-            c.stop().await;
-            self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Success, conclusion: Conclusion::Success, exit_code: None, outputs: BTreeMap::new() }).await;
+            if keep {
+                super::kept::hold(&a.job_id, c);
+            } else {
+                let idx = st.next_idx;
+                st.next_idx += 1;
+                self.start(idx, "Stop containers", "internal", None).await;
+                c.stop().await;
+                self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Success, conclusion: Conclusion::Success, exit_code: None, outputs: BTreeMap::new() }).await;
+            }
         }
         // The leg's processes end with it (GitHub's "Cleaning up orphan processes").
         for g in &st.groups {

@@ -83,7 +83,8 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
     hub.store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from
+                "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from,
+                        CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END
                  FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
@@ -94,6 +95,8 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
                     "executor": r.get::<_, Option<String>>(8)?, "attempt": r.get::<_, i64>(9)?, "wait_reason": json_col(10)?, "queued_at": r.get::<_, Option<i64>>(11)?,
                     "started_at": r.get::<_, Option<i64>>(12)?, "finished_at": r.get::<_, Option<i64>>(13)?, "error": r.get::<_, Option<String>>(14)?, "needs": json_col(15)?,
                     "exit_code": r.get::<_, Option<i64>>(16)?, "reused_from": r.get::<_, Option<String>>(17)?,
+                    // A failed leg kept to look into, until when (W17-R02).
+                    "kept_until": r.get::<_, Option<i64>>(18)?,
                 }))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -241,6 +244,12 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
         other => return Err((StatusCode::BAD_REQUEST, format!("rerun mode `{other}`: `all`, `failed` or `job`"))),
     };
     let debug = body.get("debug").and_then(Value::as_bool).unwrap_or(false);
+    // "Re-run and keep if it fails" (W17-R02): `keep_failed: true` (30 minutes) or minutes.
+    let keep_failed = match body.get("keep_failed") {
+        Some(Value::Bool(true)) => Some(30),
+        Some(Value::Number(n)) => n.as_u64().filter(|m| *m > 0).map(|m| u32::try_from(m.min(u64::from(crate::runner::kept::MAX_KEEP_MINUTES))).unwrap_or(30)),
+        _ => None,
+    };
     // "Rerun with fresh actions" (W07-R02): pinned again now, instead of the run's pins.
     let actions = if body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false) {
         let run = id.to_owned();
@@ -253,7 +262,7 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
         None
     };
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, actions, reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),
@@ -291,6 +300,41 @@ pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
     let all = legs(hub, &run, attempt).await?;
     let me = all.into_iter().find(|l| l.get("id").and_then(Value::as_str) == Some(id)).unwrap_or(Value::Null);
     Ok(srv::json(StatusCode::OK, &json!({ "run": run, "leg": me, "steps": steps, "annotations": annotations })))
+}
+
+/// A leg's runner, if it is kept there now.
+async fn kept_on(hub: &Hub, id: &str) -> Result<String, Fail> {
+    let leg = id.to_owned();
+    let row: Option<(Option<String>, Option<i64>)> = hub.store.call(move |c| Ok(c.query_row("SELECT agent, kept_until FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await.map_err(internal)?;
+    match row {
+        None => Err(missing("no such leg of the CI engine")),
+        Some((Some(agent), Some(until))) if until > crate::util::now_unix() => Ok(agent),
+        Some(_) => Err((StatusCode::CONFLICT, "the leg isn't kept (only a failed leg with keep-on-failure is)".into())),
+    }
+}
+
+/// `POST /api/ci/legs/:id/release`: a kept leg let go now (W17-R02).
+pub async fn release(hub: &Hub, id: &str, by: &str) -> Result<Response, Fail> {
+    let agent = kept_on(hub, id).await?;
+    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }).await;
+    super::runs::kept(hub, id, None).await.map_err(internal)?;
+    hub.store.audit(by.to_owned(), "ci.legs.release".into(), id.to_owned()).await;
+    hub.emit_job(id).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/ci/legs/:id/keep` with `{ minutes }` (default 30): a kept leg kept that much longer
+/// from now ("Extend", W17-R02).
+pub async fn extend(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
+    let agent = kept_on(hub, id).await?;
+    let minutes = body.get("minutes").and_then(Value::as_u64).unwrap_or(30).clamp(1, u64::from(crate::runner::kept::MAX_KEEP_MINUTES));
+    let minutes = u32::try_from(minutes).unwrap_or(30);
+    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }).await;
+    let until = crate::util::now_unix() + i64::from(minutes) * 60;
+    super::runs::kept(hub, id, Some(until)).await.map_err(internal)?;
+    hub.store.audit(by.to_owned(), "ci.legs.keep".into(), format!("{id} {minutes}m")).await;
+    hub.emit_job(id).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "leg": id, "kept_until": until })))
 }
 
 /// `GET /api/ci/legs/:id/logs?step=`.

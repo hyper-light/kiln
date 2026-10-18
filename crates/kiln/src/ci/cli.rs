@@ -442,12 +442,16 @@ pub struct RerunArgs {
     /// Resolve the actions' refs again instead of reusing the run's pins.
     #[arg(long)]
     fresh_actions: bool,
+    /// Keep a leg that fails this many minutes to look into (terminal, `kiln debug`).
+    #[arg(long, value_name = "MINUTES", num_args = 0..=1, default_missing_value = "30")]
+    keep_failed: Option<u32>,
 }
 
 pub async fn rerun(args: RerunArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     let mode = if args.failed { "failed" } else if args.job.is_some() { "job" } else { "all" };
-    let v = api.call(Method::Post, &format!("/runs/{}/rerun", enc(&args.run)), Some(json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions }))).await?;
+    let body = json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions, "keep_failed": args.keep_failed });
+    let v = api.call(Method::Post, &format!("/runs/{}/rerun", enc(&args.run)), Some(body)).await?;
     match v.get("attempt").and_then(Value::as_i64) {
         Some(a) => println!("attempt {a} of run {} started", args.run),
         None => println!("rerun of {} started", args.run),
@@ -799,6 +803,42 @@ pub async fn approve(args: ApproveArgs, cfg: &Config) -> Result<()> {
     let v = api.call(Method::Post, &format!("/runs/{}/approve", enc(&args.run)), Some(body)).await?;
     let envs: Vec<String> = v.get("environments").and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|e| e.as_str().map(str::to_owned)).collect();
     println!("{} the deployments to {}", if args.reject { "rejected" } else { "approved" }, envs.join(", "));
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct DebugArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: DebugCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum DebugCmd {
+    /// Keep a kept leg longer: MINUTES from now (default 30).
+    Keep {
+        leg: String,
+        #[arg(long, default_value_t = 30)]
+        minutes: u32,
+    },
+    /// Let a kept leg go now: its workspace and containers are removed.
+    Release { leg: String },
+}
+
+/// `kiln debug`.
+pub async fn debug(args: DebugArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    match args.cmd {
+        DebugCmd::Keep { leg, minutes } => {
+            let v = api.call(Method::Post, &format!("/legs/{}/keep", enc(&leg)), Some(json!({ "minutes": minutes }))).await?;
+            println!("{leg} kept until {}", when(v.get("kept_until").and_then(Value::as_i64)));
+        }
+        DebugCmd::Release { leg } => {
+            api.call(Method::Post, &format!("/legs/{}/release", enc(&leg)), Some(json!({}))).await?;
+            println!("released {leg}");
+        }
+    }
     Ok(())
 }
 

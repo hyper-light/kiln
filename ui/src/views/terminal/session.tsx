@@ -36,6 +36,8 @@ interface Props {
   /** Server session to attach to; null opens a new session on `target`. */
   sessionId: string | null;
   target: string;
+  /** The WebSocket path to attach over (default `/api/terminal/ws`; a CI leg's is `/api/ci/legs/:id/terminal`). */
+  endpoint?: string;
   /** The selected tab of a visible terminal page: the view the user is using right now. */
   active: boolean;
   fontSize: number;
@@ -83,7 +85,7 @@ const TAP_SLOP_PX = 6;
  * the view keeps reattaching by session id and repaints from the server's replay.
  */
 const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function TerminalSession(
-  { tabId, sessionId, target, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer },
+  { tabId, sessionId, target, endpoint, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer },
   ref,
 ) {
   const hostRef = React.useRef<HTMLDivElement>(null);
@@ -93,8 +95,8 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
   /** The connection to the session: started once the terminal exists, again on reconnect(). */
   const connRef = React.useRef<{ stop: () => void } | null>(null);
   // Everything handlers read lives in refs: handlers never go stale and nothing re-renders for them.
-  const live = React.useRef({ tabId, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer });
-  live.current = { tabId, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer };
+  const live = React.useRef({ tabId, endpoint, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer });
+  live.current = { tabId, endpoint, active, fontSize, copyOnSelect, deviceKeyboard, onState, onTitle, onSession, onClosed, onGesture, onRenderer };
   /** The session's size as the server last announced it. */
   const sessionSize = React.useRef<Size | null>(null);
   /** The size that fills this view at the user's font size (measured on layout changes only). */
@@ -260,7 +262,7 @@ const TerminalSessionView = React.forwardRef<SessionHandle, Props>(function Term
         params.set("cols", String(d?.cols ?? term.cols));
         params.set("rows", String(d?.rows ?? term.rows));
       }
-      const sock = new WebSocket(wsUrl(`/api/terminal/ws?${params}`));
+      const sock = new WebSocket(wsUrl(`${live.current.endpoint ?? "/api/terminal/ws"}?${params}`));
       sock.binaryType = "arraybuffer";
       ws = sock;
       wsRef.current = sock;

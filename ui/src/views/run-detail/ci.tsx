@@ -13,6 +13,7 @@ import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 
 const Markdown = React.lazy(() => import("@/lib/markdown").then((m) => ({ default: m.MarkdownBody })));
+const TerminalSession = React.lazy(() => import("@/views/terminal/session").then((m) => ({ default: m.TerminalSession })));
 
 /** A leg's key, as the graph groups it: a matrix leg's job, without its values. */
 export function nodeKey(legKey: string): string {
@@ -51,9 +52,11 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
   const failed = detail.legs.some((l) => l.conclusion === "failure" || l.conclusion === "cancelled" || l.conclusion === "timed_out");
   const [mode, setMode] = React.useState<string>(failed ? "failed" : "all");
   const [debug, setDebug] = React.useState(false);
+  const [keepFailed, setKeepFailed] = React.useState(false);
   const [confirm, setConfirm] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const debugId = React.useId();
+  const keepId = React.useId();
 
   const go = async (fn: () => Promise<unknown>, ok: string) => {
     setBusy(true);
@@ -110,7 +113,11 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
         <input id={debugId} type="checkbox" className="check" checked={debug} onChange={(e) => setDebug(e.target.checked)} />
         Debug logging
       </label>
-      <Button variant="primary" disabled={busy} onClick={() => go(() => ci.rerun(run.id, m, job, debug), `Attempt ${run.attempt + 1} started`)}>
+      <label htmlFor={keepId} className="inline-flex min-h-9 items-center gap-2 text-[12.5px] text-[#b0b4be]" title="A leg that fails is kept for 30 minutes to look into, with a terminal">
+        <input id={keepId} type="checkbox" className="check" checked={keepFailed} onChange={(e) => setKeepFailed(e.target.checked)} />
+        Keep failed legs
+      </label>
+      <Button variant="primary" disabled={busy} onClick={() => go(() => ci.rerun(run.id, m, job, debug, keepFailed), `Attempt ${run.attempt + 1} started`)}>
         <RotateCcw /> Rerun
       </Button>
     </div>
@@ -264,10 +271,25 @@ export function Annotations({ list, title = "Annotations" }: { list: CiAnnotatio
 
 /** A CI leg's own notes on its panel: a kept result, its annotations, and why it waits or where it
  * would run (W21-R05, W05-R20). */
-export function CiLegExtras({ runId, attempt, legId, status, reused }: { runId: string; attempt: number | undefined; legId: string; status: string; reused: boolean }) {
+export function CiLegExtras({
+  runId,
+  attempt,
+  legId,
+  status,
+  reused,
+  keptUntil,
+}: {
+  runId: string;
+  attempt: number | undefined;
+  legId: string;
+  status: string;
+  reused: boolean;
+  keptUntil?: number | null;
+}) {
   const annotations = useSuspenseResource(`ci-run/${runId}/annotations/${attempt ?? ""}`, (s) => ci.annotations(runId, attempt, s)).data.annotations.filter((a) => a.leg === legId);
   return (
     <div className="border-t border-[#28313d]">
+      <LegDebug runId={runId} legId={legId} running={status === "running"} keptUntil={keptUntil ?? null} />
       {reused && <p className="px-5 py-3 font-mono text-[11px] text-[#a6b2c6]">Kept from the last attempt: this rerun didn't run it again.</p>}
       {status === "queued" && (
         <React.Suspense fallback={<p className="px-5 py-3 font-mono text-[11px] text-[#7f8a9a]">Asking the scheduler why it waits…</p>}>
@@ -300,6 +322,72 @@ export function CiLegExtras({ runId, attempt, legId, status, reused }: { runId: 
 }
 
 /** Why a queued leg waits, and each runner's checks against it. */
+const noop = () => {};
+
+/** A running or kept leg's terminal, and a kept one's time left with Extend and Release (W17-R01, R02). */
+function LegDebug({ runId, legId, running, keptUntil }: { runId: string; legId: string; running: boolean; keptUntil: number | null }) {
+  const [open, setOpen] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [state, setState] = React.useState<string | null>(null);
+  const kept = keptUntil !== null && keptUntil * 1000 > Date.now();
+  if (!running && !kept) return null;
+  const minutes = kept ? Math.max(1, Math.round((keptUntil * 1000 - Date.now()) / 60000)) : 0;
+  const act = async (fn: () => Promise<unknown>, ok: string) => {
+    setBusy(true);
+    try {
+      await fn();
+      toast({ title: ok, tone: "info" });
+      invalidate(`run/${runId}`);
+      invalidate(`ci-run/${runId}`);
+    } catch (e) {
+      toast.error("Action failed", errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="border-b border-[#28313d]">
+      <div className="flex flex-wrap items-center gap-2 px-5 py-3">
+        <span className="mr-auto font-mono text-[11px] text-[#a6b2c6]">{kept ? `Kept to look into for ${minutes} more minute${minutes === 1 ? "" : "s"}` : "Running"}</span>
+        <Button size="xs" variant={open ? "ghost" : "primary"} aria-expanded={open} onClick={() => setOpen(!open)}>
+          {open ? "Close terminal" : "Open terminal"}
+        </Button>
+        {kept && (
+          <>
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => act(() => ci.keep(legId, 30), "Kept 30 more minutes")}>
+              Keep 30 more minutes
+            </Button>
+            <Button size="xs" variant="ghost" disabled={busy} onClick={() => act(() => ci.release(legId), "Released")}>
+              Release
+            </Button>
+          </>
+        )}
+      </div>
+      {open && (
+        <div className="leg-terminal">
+          <React.Suspense fallback={<p className="px-5 py-3 font-mono text-[11px] text-[#7f8a9a]">Opening the terminal…</p>}>
+            <TerminalSession
+              tabId={legId}
+              sessionId={null}
+              target=""
+              endpoint={`/api/ci/legs/${encodeURIComponent(legId)}/terminal`}
+              active
+              fontSize={13}
+              copyOnSelect={false}
+              deviceKeyboard
+              onState={(_, s) => setState(s.kind === "error" ? s.message : s.kind === "exited" ? "The shell exited." : null)}
+              onTitle={noop}
+              onSession={noop}
+              onClosed={() => setOpen(false)}
+            />
+          </React.Suspense>
+        </div>
+      )}
+      {open && state && <p className="px-5 py-2 font-mono text-[11px] text-[#d1aaad]">{state}</p>}
+    </div>
+  );
+}
+
 function WhyWaiting({ legId }: { legId: string }) {
   const r = useSuspenseResource(`ci-routing/${legId}`, (s) => ci.routing(legId, s), { on: ["job"] }).data;
   const why = waitSentence(r.wait_reason);

@@ -266,6 +266,8 @@ pub enum JobEventV2 {
     /// Why the attempt failed (W05-R15): `runner-lost`, `infra`, `image-pull`, `oom`, `disk-full`,
     /// `timeout`, `failure`.
     FailureClass { class: String },
+    /// The failed leg is kept to look into until `until` (Unix seconds, W17-R02).
+    Kept { until: i64 },
 }
 
 #[cfg(test)]

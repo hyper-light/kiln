@@ -228,6 +228,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             ephemeral: false,
             dedicated_job: None,
             terminal: false, // the server already offers the "local" terminal
+            job_terminal: cfg.terminal.enabled,
             shell: cfg.terminal.shell.clone(),
             credentials: Some(creds),
             instance: None,
