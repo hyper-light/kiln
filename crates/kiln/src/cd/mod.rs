@@ -162,6 +162,8 @@ pub struct Cd {
     artifacts: Mutex<HashMap<String, (crate::ci::integrations::oci::Resolved, Instant)>>,
     /// Why a repository's deploy file doesn't read, by repository.
     pub deploy_errors: Mutex<BTreeMap<String, String>>,
+    /// Each repository's environments (`.kiln/environments.yaml` at trunk), by its URL.
+    pub environments: RwLock<BTreeMap<String, BTreeMap<String, apps::EnvironmentSpec>>>,
 }
 
 impl Cd {
@@ -318,7 +320,11 @@ impl Cd {
                     scope.set("git.short_sha", json!(short(&commit)));
                     scope.set("git.ref", json!(format!("refs/heads/{trunk}")));
                     scope.set("repo.name", json!(repo.name));
-                    match apps::from_deploy_file(&text, &repo.clone_url, &trunk, &environments, &scope) {
+                    let parsed = apps::from_deploy_file(&text, &repo.clone_url, &trunk, &environments, &scope);
+                    if parsed.is_ok() {
+                        self.environments.write().insert(repo.clone_url.clone(), environments);
+                    }
+                    match parsed {
                         Ok(d) => d,
                         Err(e) => {
                             self.deploy_file_error(&repo.name, Some(format!(".kiln/deploy.yaml at {}: {}", short(&commit), e.0)));
@@ -1264,6 +1270,7 @@ pub async fn run(hub: Arc<Hub>) -> Result<()> {
         plans: plans::Renders::default(),
         artifacts: Mutex::new(HashMap::new()),
         deploy_errors: Mutex::new(BTreeMap::new()),
+        environments: RwLock::new(BTreeMap::new()),
     });
     *CD.write() = Some(cd.clone());
     // Apps kept in kiln, then the clusters they deploy to.

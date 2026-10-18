@@ -257,6 +257,37 @@ fn app_id(v: &Value) -> Result<String, Fail> {
     Ok(if a.contains('/') { a.to_owned() } else { format!("default/{a}") })
 }
 
+/// Agents change what runs only where people let them (docs/cd-targets.md §6): an environment
+/// with `agents: { deploy: true }`, or, for an app outside environments, `[cd] agents_deploy`.
+/// Otherwise an agent plans, and asks a person.
+fn agents_may(cx: &Cx, id: &str, what: &str) -> Result<(), Fail> {
+    if !cx.actor.starts_with("agent:") {
+        return Ok(());
+    }
+    let (env, repo) = cx
+        .cd
+        .apps
+        .read()
+        .get(id)
+        .map(|e| (e.def.environment.clone(), if let Origin::Deploy { repo } = &e.def.origin { Some(repo.clone()) } else { None }))
+        .unwrap_or_default();
+    let allowed = match (&env, &repo) {
+        (Some(env), Some(repo)) => cx.cd.environments.read().get(repo).and_then(|m| m.get(env)).is_some_and(|e| e.agents.deploy),
+        (Some(_), None) => false,
+        (None, _) => cx.hub.cfg.cd.agents_deploy,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        match env {
+            Some(e) => format!("agents may not {what} {id}: environment {e} doesn't let agents deploy. Ask a person to, or have them allow it in .kiln/environments.yaml (agents: {{ deploy: true }})"),
+            None => format!("agents may not {what} {id}: ask a person to, or have them allow agents to deploy ([cd] agents_deploy = true)"),
+        },
+    ))
+}
+
 fn exists(cd: &Cd, id: &str) -> Result<(), Fail> {
     if cd.apps.read().contains_key(id) { Ok(()) } else { Err(missing(format!("no app {id}"))) }
 }
@@ -903,6 +934,7 @@ fn ready_to_sync(cd: &Cd, id: &str) -> Result<(), Fail> {
 async fn sync(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
+    agents_may(&cx, &id, "sync")?;
     ready_to_sync(&cx.cd, &id)?;
     let request = sync_request(&v, &cx.actor)?;
     cx.cd.input(Input::Sync { app: id.as_str().into(), request });
@@ -912,13 +944,17 @@ async fn sync(cx: Cx, v: Value) -> Out {
 
 async fn sync_many(cx: Cx, v: Value) -> Out {
     let max = v.get("max").and_then(Value::as_u64).unwrap_or(1000).clamp(1, 100_000) as usize;
-    let ids = selected(&cx.cd, &v, max);
+    let all = selected(&cx.cd, &v, max);
+    let (ids, refused): (Vec<String>, Vec<String>) = all.into_iter().partition(|id| agents_may(&cx, id, "sync").is_ok());
+    if ids.is_empty() && !refused.is_empty() {
+        return Err((StatusCode::FORBIDDEN, format!("agents may not sync these {} apps: their environments don't let agents deploy; ask a person to", refused.len())));
+    }
     let request = sync_request(&v, &cx.actor)?;
     for id in &ids {
         cx.cd.input(Input::Sync { app: id.as_str().into(), request: request.clone() });
     }
     audit(&cx, "cd.sync_many", format!("{} apps", ids.len())).await;
-    Ok(json!({"started": ids.len(), "apps": ids.iter().take(100).collect::<Vec<_>>()}))
+    Ok(json!({"started": ids.len(), "apps": ids.iter().take(100).collect::<Vec<_>>(), "refused": refused.iter().take(100).collect::<Vec<_>>()}))
 }
 
 async fn refresh(cx: Cx, v: Value) -> Out {
@@ -949,6 +985,7 @@ async fn terminate(cx: Cx, v: Value) -> Out {
 
 async fn take_over(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
+    agents_may(&cx, &id, "take over")?;
     let mut def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
     def.labels.insert("kiln.dev/take-over".into(), "true".into());
     // Kept in kiln from now on, so the take-over survives restarts and the parent's re-renders.
@@ -960,6 +997,7 @@ async fn take_over(cx: Cx, v: Value) -> Out {
 
 async fn rollback(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
+    agents_may(&cx, &id, "roll back")?;
     let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
     if super::is_shadow(&def) {
         return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
@@ -1021,6 +1059,7 @@ async fn rollback(cx: Cx, v: Value) -> Out {
 async fn follow(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
+    agents_may(&cx, &id, "let go of the rollback of")?;
     if cx.cd.store.read(|d| d.pins.contains_key(&id)) {
         propose(&cx.cd, Command::Pin { app: id.clone(), pin: None }).await?;
         cx.cd.kick();
@@ -1037,6 +1076,10 @@ async fn create(cx: Cx, v: Value) -> Out {
         return Err(bad("an app needs a name and a source"));
     }
     let id = def.id();
+    // A new app in kiln is outside environments: agents need the server's say-so.
+    if cx.actor.starts_with("agent:") && !cx.hub.cfg.cd.agents_deploy {
+        return Err((StatusCode::FORBIDDEN, format!("agents may not create {id}: ask a person to, or have them allow agents to deploy ([cd] agents_deploy = true)")));
+    }
     propose(&cx.cd, Command::PutApp(Box::new(def))).await?;
     audit(&cx, "cd.app.put", id.clone()).await;
     Ok(json!({"app": id}))
@@ -1068,6 +1111,7 @@ async fn import(cx: Cx, v: Value) -> Out {
 
 async fn delete(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
+    agents_may(&cx, &id, "delete")?;
     let entry = cx.cd.apps.read().get(&id).cloned().ok_or_else(|| missing(format!("no app {id}")))?;
     let cascade = str_in(&v, "cascade").map(|c| c != "orphan").unwrap_or(entry.def.cascade);
     if matches!(entry.def.origin, Origin::Api | Origin::Argo { parent: None }) {

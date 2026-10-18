@@ -832,6 +832,22 @@ pub struct EnvironmentSpec {
     /// How long a revision must run healthy in `after` first.
     #[serde(default)]
     pub soak: Option<String>,
+    /// What agents may do in it (docs/cd-targets.md §6): nothing that changes what runs, unless
+    /// people say so.
+    #[serde(default)]
+    pub agents: AgentRights,
+}
+
+/// What agents may do in an environment. Off unless said (docs/cd-targets.md, D6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AgentRights {
+    /// Sync, roll back, take over and delete its apps.
+    #[serde(default)]
+    pub deploy: bool,
+    /// Approve what waits for approval there (ci.md W15's `agents-can-approve`).
+    #[serde(default)]
+    pub approve: bool,
 }
 
 /// What `${{ }}` in a deploy file can read.

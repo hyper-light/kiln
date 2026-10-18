@@ -232,6 +232,9 @@ pub struct Cd {
     pub qps: f64,
     /// Wait between sync waves (Argo CD's `ARGOCD_SYNC_WAVE_DELAY`).
     pub wave_delay_ms: u64,
+    /// Whether agents may sync, roll back, take over and delete apps outside any environment.
+    /// An environment says so itself (`agents: { deploy: true }`). Off: agents plan and ask.
+    pub agents_deploy: bool,
 }
 
 impl Default for Cd {
@@ -248,6 +251,7 @@ impl Default for Cd {
             render_timeout_seconds: 90,
             qps: 50.0,
             wave_delay_ms: 2_000,
+            agents_deploy: false,
         }
     }
 }
