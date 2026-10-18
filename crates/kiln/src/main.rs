@@ -120,6 +120,9 @@ enum Cmd {
     Oidc(kiln::ci::cli::OidcArgs),
     /// CI actions: the mirrored catalog, prefetching, the action policy.
     Actions(kiln::ci::cli::ActionsArgs),
+    /// Workflows of this working tree: `kiln workflow run [WORKFLOW]` runs them here, or on a
+    /// server's runners (`--server`), before you push.
+    Workflow(kiln::ci::local::WorkflowArgs),
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// A CI run's or leg's logs.
@@ -305,11 +308,14 @@ fn repo_path(file: &std::path::Path) -> String {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_tracing(&cli.log, cli.json);
+    // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
+    // the server says only what goes wrong unless asked for more.
+    let quiet = matches!(cli.cmd, Cmd::Workflow(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
+    init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
     install_panic_hook();
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
     kiln::rt::configure(match &cli.cmd {
-        Cmd::Server | Cmd::Up => kiln::rt::Profile::server(),
+        Cmd::Server | Cmd::Up | Cmd::Workflow(_) => kiln::rt::Profile::server(),
         Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_) => kiln::rt::Profile::agent(),
         _ => kiln::rt::Profile::tool(),
     });
@@ -621,6 +627,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             kiln::ci::cli::actions(a, &cfg).await
         }
         Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Workflow(a) => {
+            shutdown_on_signals(shutdown.clone());
+            kiln::ci::local::workflow(a, &config::Config::load(&config_path).unwrap_or_default(), shutdown).await
+        }
         Cmd::Logs(a) => kiln::ci::cli::logs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Dispatch(a) => kiln::ci::cli::dispatch(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Rerun(a) => kiln::ci::cli::rerun(a, &config::Config::load(&config_path).unwrap_or_default()).await,

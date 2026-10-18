@@ -50,7 +50,11 @@ struct Run {
 
 impl Run {
     fn with(src: &str, dialect: Dialect, input: RunInput, source: Source) -> Run {
-        let started = RunPlan::start(workflow(src, dialect), input, Settings::default(), &source);
+        Run::with_settings(src, dialect, input, source, Settings::default())
+    }
+
+    fn with_settings(src: &str, dialect: Dialect, input: RunInput, source: Source, settings: Settings) -> Run {
+        let started = RunPlan::start(workflow(src, dialect), input, settings, &source);
         assert!(started.is_ok(), "start: {:?}", started.as_ref().err());
         let (plan, acts) = started.unwrap_or_else(|_| (empty_plan(), Vec::new()));
         let mut r = Run { plan, src: source, specs: HashMap::new(), queued: Vec::new(), cancels: Vec::new(), log: Vec::new(), warnings: Vec::new(), finished: None };
@@ -295,6 +299,18 @@ fn strategy_context_and_leg_names() {
     assert_eq!(s.name, "Build windows-latest");
     assert_eq!(s.runs_on.labels, vec!["windows-latest"]);
     assert_eq!((at(&s.strategy, "/job-index").as_f64(), at(&s.strategy, "/job-total").as_f64()), (Some(1.0), Some(2.0)));
+}
+
+/// W17-R06: `kiln workflow run --matrix os=windows-latest` runs those combinations; a job whose
+/// matrix lacks the key runs them all, and one with none that match is skipped, saying why.
+#[test]
+fn w17_r06_only_matrix() {
+    let body = "  test:\n    runs-on: ${{ matrix.os }}\n    strategy:\n      matrix:\n        os: [macos-latest, windows-latest]\n        version: [12, 14]\n    steps: [{run: t}]\n  lint:\n    runs-on: x\n    strategy:\n      matrix:\n        node: [20, 22]\n    steps: [{run: l}]\n  pick:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [linux]\n    steps: [{run: p}]\n";
+    let only = Settings { only_matrix: vec![("os".into(), "windows-latest".into())], ..Settings::default() };
+    let r = Run::with_settings(&jobs(body), Dialect::Gha, RunInput { trusted: true, ..RunInput::default() }, Source::default(), only);
+    assert_eq!(r.queued, vec!["test (windows-latest, 12)", "test (windows-latest, 14)", "lint (20)", "lint (22)"]);
+    assert!(r.logged("pick skipped: no combination of the matrix has os=windows-latest"), "{:?}", r.log);
+    assert_eq!(at(&r.spec("test (windows-latest, 14)").strategy, "/job-total").as_f64(), Some(2.0), "counted over what runs");
 }
 
 /// W04-S01: GitHub's documented example.

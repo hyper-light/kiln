@@ -136,6 +136,9 @@ pub struct Step {
     pub started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub exit_code: Option<i32>,
+    /// The order it started in among the job's steps (CI legs; docs/ci.md W21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1081,7 +1084,7 @@ fn row_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
 
 fn steps_of(c: &Connection, job_id: &str) -> rusqlite::Result<Vec<Step>> {
     let mut st = c.prepare_cached(
-        "SELECT idx, name, status, started_at, finished_at, exit_code FROM steps
+        "SELECT idx, name, status, started_at, finished_at, exit_code, started_seq FROM steps
          WHERE job_id = ?1 ORDER BY idx",
     )?;
     st.query_map([job_id], |r| {
@@ -1092,6 +1095,7 @@ fn steps_of(c: &Connection, job_id: &str) -> rusqlite::Result<Vec<Step>> {
             started_at: r.get(3)?,
             finished_at: r.get(4)?,
             exit_code: r.get(5)?,
+            seq: r.get(6)?,
         })
     })?
     .collect()

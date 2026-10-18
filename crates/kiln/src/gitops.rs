@@ -31,7 +31,7 @@ fn github_token(hub: &Hub) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
-fn git(hub: &Hub) -> Command {
+pub(crate) fn git(hub: &Hub) -> Command {
     let mut c = Command::new("git");
     crate::os::git_no_prompts(&mut c)
         .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")

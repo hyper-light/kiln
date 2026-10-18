@@ -226,8 +226,9 @@ pub async fn step_started(hub: &Hub, leg: &str, idx: u32, name: &str, kind: &str
         .call(move |c| {
             let now = crate::util::now_unix();
             c.execute(
-                "INSERT INTO steps (job_id, idx, name, status, started_at, kind, action) VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)
-                 ON CONFLICT (job_id, idx) DO UPDATE SET name = ?3, status = 'running', started_at = ?4, kind = ?5, action = ?6",
+                "INSERT INTO steps (job_id, idx, name, status, started_at, kind, action, started_seq)
+                 VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, (SELECT COALESCE(MAX(started_seq), 0) + 1 FROM steps WHERE job_id = ?1))
+                 ON CONFLICT (job_id, idx) DO UPDATE SET name = ?3, status = 'running', started_at = ?4, kind = ?5, action = ?6, started_seq = excluded.started_seq",
                 params![leg, idx, name, now, kind, action],
             )?;
             Ok(())

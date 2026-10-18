@@ -96,9 +96,26 @@ impl Api {
         Ok(Api { client: Client::public()?, url: t.url, token: t.token })
     }
 
+    /// A server this process runs (`kiln workflow run`'s own).
+    pub(crate) fn local(url: &str, token: &str) -> Result<Api> {
+        Ok(Api { client: Client::public()?, url: url.trim_end_matches('/').to_owned(), token: token.to_owned() })
+    }
+
     /// A CI route (`/api/ci<path>`).
-    async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+    pub(crate) async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         self.call_api(method, &format!("/api/ci{path}"), body).await
+    }
+
+    /// `POST /api/ci<path>` with a body streamed from `rx` (a pack, W17-R06).
+    pub(crate) async fn upload(&self, path: &str, rx: async_channel::Receiver<bytes::Bytes>) -> Result<Value> {
+        let resp = self.client.request(Method::Post, &format!("{}/api/ci{path}", self.url)).bearer(&self.token).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(3600)).send().await?;
+        let status = resp.status();
+        let bytes = resp.bytes(1 << 20).await?;
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        if !(200..300).contains(&status) {
+            bail!("{}", v.get("error").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        Ok(v)
     }
 
     /// Any route of the API (`path` from `/api`).

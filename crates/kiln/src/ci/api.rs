@@ -162,6 +162,16 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W03-R11: dispatches.
         (&Method::POST, ["repos", repo, "workflows", path @ .., "dispatches"]) => workflows::dispatch(hub, repo, &path.join("/"), req.into_body()).await,
         (&Method::POST, ["repos", repo, "dispatches"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
+        // W17-R06: runs of a working tree (`kiln workflow run`).
+        (&Method::GET, ["repos", repo, "heads"]) => super::uploads::heads(hub, repo).await,
+        (&Method::POST, ["repos", repo, "packs"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            super::uploads::pack(hub, repo, q, req.into_body(), &by).await
+        }
+        (&Method::POST, ["repos", repo, "local-runs"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            super::uploads::local_runs(hub, repo, caller.as_ref(), req.into_body()).await
+        }
         _ => Err((StatusCode::NOT_FOUND, format!("no such CI route: {method} /api/ci/{}", rest.join("/")))),
     }
 }

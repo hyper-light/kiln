@@ -34,6 +34,10 @@ pub struct Ci {
     pub artifacts: Artifacts,
     pub oidc: Oidc,
     pub actions: Actions,
+    /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
+    /// whatever names for runners its `runs-on` uses. Not a setting.
+    #[serde(skip)]
+    pub local: bool,
 }
 
 /// `[ci.actions]`: which remote actions runs may use, and what to mirror ahead (docs/ci.md

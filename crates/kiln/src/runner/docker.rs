@@ -289,7 +289,15 @@ pub const HOST_ALIAS: &str = "host.docker.internal";
 /// are then reached by their names at 127.0.0.1, and legs running at once can't both have a
 /// service on the same port.
 pub fn host_network() -> bool {
-    std::env::var("KILN_CONTAINER_NETWORK").is_ok_and(|v| v.trim().eq_ignore_ascii_case("host"))
+    HOST_NETWORK.load(std::sync::atomic::Ordering::Relaxed) || std::env::var("KILN_CONTAINER_NETWORK").is_ok_and(|v| v.trim().eq_ignore_ascii_case("host"))
+}
+
+static HOST_NETWORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Containers on the host's network from now on, as `KILN_CONTAINER_NETWORK=host` says: for
+/// `kiln workflow run`, whose server listens on loopback (docs/ci.md W17-R06).
+pub fn use_host_network() {
+    HOST_NETWORK.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Where `host.docker.internal` points: the host's gateway, or the host itself on its network.

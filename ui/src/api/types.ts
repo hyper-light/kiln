@@ -74,6 +74,8 @@ export interface Step {
   started_at: number | null;
   finished_at: number | null;
   exit_code: number | null;
+  /** The order it started in (CI legs): steps that start in the same second keep it. */
+  seq?: number | null;
 }
 
 export interface StepSpec {

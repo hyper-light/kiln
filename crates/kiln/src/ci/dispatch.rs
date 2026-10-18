@@ -40,6 +40,22 @@ pub struct Start {
     pub actions: std::collections::BTreeMap<String, wire::ActionRef>,
     /// The `inputs` context, typed (`workflow_dispatch`, W03-R11); null takes the payload's.
     pub inputs: serde_json::Value,
+    /// What `kiln workflow run` asked for besides (W17-R06).
+    pub given: Given,
+}
+
+/// What a run of a working tree (`kiln workflow run`, W17-R06) brings besides its event.
+#[derive(Debug, Clone, Default)]
+pub struct Given {
+    /// Only these matrix combinations (`--matrix k=v`).
+    pub only_matrix: Vec<(String, String)>,
+    /// Secrets for this run only (`--secret-file`). They stay in the server's memory, never on
+    /// disk, while the run runs: legs after a restart, and reruns, go without them.
+    pub secrets: Arc<std::collections::BTreeMap<String, String>>,
+    /// Variables over the server's (`--var`), in `vars`.
+    pub vars: Arc<std::collections::BTreeMap<String, String>>,
+    /// Told the run's id once it's created.
+    pub reply: Option<async_channel::Sender<String>>,
 }
 
 /// What the dispatcher hears.
@@ -71,7 +87,15 @@ pub enum Msg {
 pub use kiln_ci::plan::rerun::Mode as RerunMode;
 
 /// What a leg asks of routing (W05-R20).
-fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str) -> LegRoute {
+/// Whether a `runs-on` label says what machine a leg needs: GitHub's hosted labels, and the OS and
+/// architecture labels every self-hosted runner has.
+fn machine_label(l: &str) -> bool {
+    matches!(l.to_ascii_lowercase().as_str(), "self-hosted" | "linux" | "windows" | "macos" | "x64" | "arm64" | "arm") || kiln_ci::sched::routing::github_label_rules().iter().any(|r| r.matches.labels.iter().any(|x| x.eq_ignore_ascii_case(l)))
+}
+
+/// A leg's route. On `kiln workflow run`'s own server (`local`, W17-R06) a leg keeps only the labels
+/// that say what machine it needs: the rest name the user's runners, and it runs on this one.
+fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str, local: bool) -> LegRoute {
     let job = spec.def();
     let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
     let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
@@ -82,8 +106,8 @@ fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str) -> LegRoute
         workflow: workflow.to_owned(),
         repo: repo.to_owned(),
         event: event.to_owned(),
-        labels: spec.runs_on.labels.clone(),
-        group: spec.runs_on.group.clone(),
+        labels: if local { spec.runs_on.labels.iter().filter(|l| machine_label(l)).cloned().collect() } else { spec.runs_on.labels.clone() },
+        group: if local { None } else { spec.runs_on.group.clone() },
         requires: spec.requires.clone(),
         caps,
     }
@@ -102,9 +126,9 @@ fn keep_minutes(debug: Option<&kiln_ci::wf::ir::YVal>) -> Option<u32> {
 }
 
 /// What the scheduler gets of a leg: its route, priority, concurrency group and retries.
-fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec) -> LegIn {
+fn leg_in(r: &RunSt, run: &str, id: &str, spec: &LegSpec, local: bool) -> LegIn {
     let job = spec.def();
-    let route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name);
+    let route = route_of(spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name, local);
     let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
     let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
     LegIn {
@@ -209,6 +233,9 @@ struct RunSt {
     debug: bool,
     /// "Re-run and keep if it fails" (W17-R02): minutes a failed leg is kept.
     keep_failed: Option<u32>,
+    /// What `kiln workflow run` gave the run besides (W17-R06): secrets, in memory only, and
+    /// variables.
+    given: Given,
 }
 
 /// A leg the scheduler has.
@@ -476,6 +503,9 @@ impl Dispatch {
             input: String::new(),
         };
         let (number, rowid) = runs::create(&self.hub, &s.repo, new).await?;
+        if let Some(r) = &s.given.reply {
+            let _ = r.try_send(id.clone());
+        }
         // A kiln workflow that declares its secrets needs every required one (W09-R06).
         if let Some(why) = self.missing_secrets(&s).await {
             runs::finish_run(&self.hub, &id, Status::Failed, "startup_failure", Some(why)).await?;
@@ -484,19 +514,25 @@ impl Dispatch {
         }
         let github = self.github_context(&s, number, rowid, &name);
         let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
-        // The `vars` context (W09-R09): every scope but environments', which legs add.
-        let vars = match super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await {
+        // The `vars` context (W09-R09): every scope but environments', which legs add, and what
+        // the run was given (W17-R06) over them.
+        let mut vars = match super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await {
             Ok(v) => serde_json::Value::Object(v),
             Err(e) => {
                 tracing::warn!(run = %id, error = %format!("{e:#}"), "variables could not be read");
                 serde_json::json!({})
             }
         };
+        if let Some(o) = vars.as_object_mut() {
+            o.extend(s.given.vars.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))));
+        }
         let input = RunInput { github: github.clone(), inputs, vars: vars.clone(), changed: s.event.changed.clone().map(Arc::new), trusted };
         let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
-        self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), perms).await?;
+        let only: serde_json::Map<String, serde_json::Value> = s.given.only_matrix.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+        let settings = serde_json::json!({ "default_permissions": perms, "only_matrix": only });
+        self.save_input(&id, &input, &s.actions, &s.event, (false, None), &HashMap::new(), &settings).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
-        let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&serde_json::json!({ "default_permissions": perms })), &Source { files: &files });
+        let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&settings), &Source { files: &files });
         let (plan, actions) = match started {
             Ok(x) => x,
             Err(e) => {
@@ -507,7 +543,7 @@ impl Dispatch {
         };
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None };
+        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false, keep_failed: None, given: s.given };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(id.clone(), st);
         self.hub.ci.runs.lock().insert(id.clone());
@@ -595,7 +631,7 @@ impl Dispatch {
             .legs
             .iter()
             .map(|spec| {
-                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name));
+                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name, self.hub.cfg.ci.local));
                 let mut v = serde_json::to_value(spec).unwrap_or_default();
                 if let Some(o) = v.as_object_mut() {
                     let constraints: Vec<&String> = req.constraints.iter().map(|(text, _)| text).collect();
@@ -611,18 +647,20 @@ impl Dispatch {
         Settings { default_runs_on: vec!["k8s".into()], ..Settings::default() }
     }
 
-    /// A run's settings: the repository's default token permissions (W10-R04), as it started or
-    /// as its saved input says, so a replay or rerun plans exactly as the run did.
+    /// A run's settings: the repository's default token permissions (W10-R04) and the matrix
+    /// combinations asked for (W17-R06), as it started or as its saved input says, so a replay or
+    /// rerun plans exactly as the run did.
     fn settings_with(&self, saved: &serde_json::Value) -> Settings {
         let default_permissions = if saved.get("default_permissions").and_then(serde_json::Value::as_str) == Some("write") { plan::perms::Default::Write } else { plan::perms::Default::Read };
-        Settings { default_permissions, ..self.settings() }
+        let only_matrix = saved.get("only_matrix").and_then(serde_json::Value::as_object).map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect()).unwrap_or_default();
+        Settings { default_permissions, only_matrix, ..self.settings() }
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, default_permissions: &str) -> anyhow::Result<()> {
+    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: (bool, Option<u32>), keep: &HashMap<String, (LegReport, String)>, settings: &serde_json::Value) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
         let (debug, keep_failed) = debug;
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": default_permissions }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep_failed": keep_failed, "keep": keep, "default_permissions": settings.get("default_permissions"), "only_matrix": settings.get("only_matrix") }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -781,8 +819,8 @@ impl Dispatch {
         let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
         let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
         let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
-        let perms = v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read").to_owned();
-        self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &perms).await?;
+        let settings = serde_json::json!({ "default_permissions": v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read"), "only_matrix": v.get("only_matrix") });
+        self.save_input(run, &input, &actions, &event, (debug, keep_failed), &keep, &settings).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
         let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files }) {
             Ok(x) => x,
@@ -794,7 +832,7 @@ impl Dispatch {
         };
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let path = run_path(&github);
-        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed };
+        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug, keep_failed, given: Given::default() };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(run.to_owned(), st);
         self.hub.ci.runs.lock().insert(run.to_owned());
@@ -854,7 +892,7 @@ impl Dispatch {
         let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
-        let leg = leg_in(r, run, &id, &spec);
+        let leg = leg_in(r, run, &id, &spec, self.hub.cfg.ci.local);
         self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key: spec.key.clone(), spec, attempt: 1, agent: None, report: LegReport::default(), class: None, deployment: None, env_url: None });
         self.hub.emit_job(&id).await;
         // A leg bound to an environment starts when its protection lets it (W15-R04).
@@ -995,25 +1033,34 @@ impl Dispatch {
         let env = spec.environment.as_ref().map(|e| e.name.clone());
         let vars = match &env {
             Some(e) => match super::secrets::vars_for(&self.hub, &r.repo, &r.path, Some(e)).await {
-                Ok(v) => serde_json::Value::Object(v),
+                Ok(mut v) => {
+                    v.extend(r.given.vars.iter().map(|(k, x)| (k.clone(), serde_json::Value::String(x.clone()))));
+                    serde_json::Value::Object(v)
+                }
                 Err(_) => r.vars.clone(),
             },
             None => r.vars.clone(),
         };
         let token_secret = wire::Secret { name: "GITHUB_TOKEN".into(), value: token.to_owned() };
-        if !r.trusted {
+        if !r.trusted && r.given.secrets.is_empty() {
             return (vec![token_secret], Vec::new(), vars);
         }
         let used = spec.def().map(kiln_ci::secrets::used).unwrap_or_default();
         let needed = kiln_ci::secrets::needed(&spec.secrets, &used);
-        let resolved = match super::secrets::for_leg(&self.hub, &r.repo, &r.path, env.as_deref(), &needed).await {
-            Ok(x) => x,
-            Err(e) => {
-                tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "secrets could not be read; the leg gets none");
-                Default::default()
+        // An untrusted run gets none of the server's secrets: only those given with it (W17-R06).
+        let resolved = if !r.trusted {
+            Default::default()
+        } else {
+            match super::secrets::for_leg(&self.hub, &r.repo, &r.path, env.as_deref(), &needed).await {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!(leg = %spec.key, error = %format!("{e:#}"), "secrets could not be read; the leg gets none");
+                    Default::default()
+                }
             }
         };
         let mut run: std::collections::BTreeMap<String, String> = resolved.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect();
+        run.extend(r.given.secrets.iter().map(|(k, v)| (k.clone(), v.clone())));
         run.insert("GITHUB_TOKEN".into(), token.to_owned());
         let given = kiln_ci::secrets::deliver(&spec.secrets, &used, &run);
         let ids: Vec<String> = resolved.values().filter_map(|v| v.id.clone()).collect();
@@ -1329,7 +1376,7 @@ impl Dispatch {
                     .collect()
             })
             .unwrap_or_default();
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq, keep, debug, keep_failed };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq, keep, debug, keep_failed, given: Given::default() };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
@@ -1348,7 +1395,7 @@ impl Dispatch {
             };
             self.hub.ci.legs.lock().insert(id.clone());
             self.legs.insert(id.clone(), LegSt { run: run.to_owned(), key, spec: spec.clone(), attempt: attempt.max(1), agent: agent.clone(), report: LegReport::default(), class: None, deployment: None, env_url: None });
-            let li = leg_in(&st, run, &id, &spec);
+            let li = leg_in(&st, run, &id, &spec, self.hub.cfg.ci.local);
             match (s, agent) {
                 (Status::Running, Some(a)) => {
                     let _ = self.sched.handle(Input::LegRunning { leg: Box::new(li), runner: a.clone(), attempt: attempt.max(1) }, now_ms());

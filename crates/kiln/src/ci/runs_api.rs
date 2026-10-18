@@ -277,13 +277,13 @@ pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
         .store
         .call(move |c| {
             let Some(run) = c.query_row("SELECT run_id FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg_id], |r| r.get::<_, String>(0)).optional()? else { return Ok(None) };
-            let mut st = c.prepare("SELECT idx, name, status, kind, step_id, action, outcome, conclusion, outputs, started_at, finished_at FROM steps WHERE job_id = ?1 ORDER BY idx")?;
+            let mut st = c.prepare("SELECT idx, name, status, kind, step_id, action, outcome, conclusion, outputs, started_at, finished_at, started_seq FROM steps WHERE job_id = ?1 ORDER BY idx")?;
             let steps = st
                 .query_map([&leg_id], |r| {
                     Ok(json!({ "idx": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?, "status": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
                                "id": r.get::<_, Option<String>>(4)?, "action": r.get::<_, Option<String>>(5)?, "outcome": r.get::<_, Option<String>>(6)?,
                                "conclusion": r.get::<_, Option<String>>(7)?, "outputs": r.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
-                               "started_at": r.get::<_, Option<i64>>(9)?, "finished_at": r.get::<_, Option<i64>>(10)? }))
+                               "started_at": r.get::<_, Option<i64>>(9)?, "finished_at": r.get::<_, Option<i64>>(10)?, "seq": r.get::<_, Option<i64>>(11)? }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             let mut st = c.prepare("SELECT step_idx, level, title, message, file, line FROM ci_annotations WHERE leg_id = ?1 ORDER BY id")?;
@@ -371,18 +371,20 @@ pub async fn rerun_step(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<R
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "leg": id, "step": step, "idx": next })))
 }
 
-/// `GET /api/ci/legs/:id/logs?step=`.
+/// `GET /api/ci/legs/:id/logs?step=&from=`: from byte `from` on, for a follower.
 pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let from: usize = q.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut data = hub.logs.read(id, step).await;
     // A leg a rerun kept: the logs are those of the leg whose result it keeps (W05-R17).
     if data.is_empty() {
         let leg = id.to_owned();
-        let from: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&leg], |r| r.get(0)).optional()?.flatten())).await.map_err(internal)?;
-        if let Some(from) = from {
-            data = hub.logs.read(&from, step).await;
+        let from_leg: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&leg], |r| r.get(0)).optional()?.flatten())).await.map_err(internal)?;
+        if let Some(reused) = from_leg {
+            data = hub.logs.read(&reused, step).await;
         }
     }
+    let data = if from == 0 { data } else { data.get(from..).map(<[u8]>::to_vec).unwrap_or_default() };
     Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)))
 }
 

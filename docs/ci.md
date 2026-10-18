@@ -187,7 +187,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (repository reads, statuses, checks, releases, artifacts, dispatches, dependency snapshots, deployments, environments); hosting, review left |
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | blocked (W06) | |
-| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place; MCP, `kiln run`, log search, microVM and k8s terminals left |
+| W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server; MCP, log search, microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
@@ -3412,8 +3412,8 @@ reruns, rerunning a failed step in place, and running workflows locally with `ki
 - **W17-AC04 `kiln run`.** The jobs of F-03 that need no secrets give the same step results with
   `kiln run` as on the server. *Integration test.*
 
-**Progress.** In progress: R01, R02 and R04 on the `host` and `docker` executors. R03 is W06-R13's
-debug reruns.
+**Progress.** In progress: R01, R02 and R04 on the `host` and `docker` executors, and R06. R03 is
+W06-R13's debug reruns.
 
 - *R01, terminals* (`runner/kept.rs`, the agent's `JobTerminalOpen`, `GET /api/ci/legs/:id/terminal`):
   - A running or kept leg says what a terminal into it opens. On `host` that is a shell in its
@@ -3446,8 +3446,36 @@ debug reruns.
   - AC03: a step that failed on a missing file passed when rerun after the file was created in the
     kept leg's terminal.
   - The run page's controls in Chromium and WebKit, at desktop and phone widths.
-- *Left*: R05 (W20's MCP tools), R06 `kiln run` and AC04, R07 (W19), and terminals in microVMs and
-  on k8s (with W13's executors).
+- *R06* ships as **`kiln workflow run`**: `kiln run` was taken by reach (a command on another runner,
+  `kiln run --on linux/amd64 -- make`), which machines and agents already use. Everything else is
+  as written (`crates/kiln/src/ci/local.rs`, `ci/uploads.rs`):
+  - The working tree becomes a commit on `HEAD` (`HEAD` itself when nothing changed), made in a
+    copy of the index, so the index and the branches don't move.
+  - Here, it runs on a server of its own in the same process: CI only, on loopback, with this
+    machine as its one runner, and a directory that goes when the run ends. The server reads the
+    commit through git's alternates, so nothing is copied, and it has the caches, artifacts and
+    OIDC tokens legs talk to.
+  - Every leg runs here. `runs-on` keeps only what says which OS and architecture a leg needs, and
+    a leg this machine can't run, or an approval nobody here can give, says so and the run stops.
+  - `--executor` picks the executor; by default legs are routed as a server routes them.
+  - `--server URL` sends the commit as a thin pack over the commits the server has (whole when it
+    can't take that). It is kept under `refs/kiln/uploads/` for a week, and the server's runners
+    run it.
+  - Runs there are trusted only for the server's owner; anyone else's are a fork's: a read-only
+    token, and only the secrets sent with them (`--secret-file`). Those stay in the server's memory,
+    never on disk.
+  - Logs print as they come, one line per leg; `--report FILE` writes every leg's and step's
+    conclusion; the exit code is 0 when every run succeeded.
+  - Also: `--job` (and the jobs it needs), `--matrix k=v` (a planner filter kept for replays),
+    `--event` and `--payload` (as the plan preview makes events), `--input` and `--var`.
+  - Steps record the order they started in, so the CLI and the run page show a job container's
+    setup before the step it ran with.
+- *AC04*: `crates/kiln/tests/workflow_run.rs` runs the binary on a scratch repository, with
+  uncommitted work, a secret, a variable, needs, outputs, a matrix and a failing job.
+  `ci/conformance/local_vs_server.py` runs the starter workflows the server ran again here and
+  compares every leg's and step's conclusion (`docs/ci-conformance-local.md`).
+- *Left*: R05 (W20's MCP tools), R07 (W19), and terminals in microVMs and on k8s (with W13's
+  executors).
 
 ### W18 Supply chain and untrusted code
 
@@ -4017,13 +4045,16 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/runs/:id/graph` | `ci.runs.graph` (with critical path) | runs.read | W04, W19 |
 | POST | `/api/ci/repos/:repo/dispatch` | `ci.runs.dispatch` (`workflow_dispatch`) | runs.trigger | W03 |
 | POST | `/api/ci/repos/:repo/repository-dispatch` | `ci.runs.repository_dispatch` | runs.trigger | W03 |
+| GET | `/api/ci/repos/:repo/heads` | `ci.uploads.heads` (the commits a pack can leave out) | runs.read | W17 |
+| POST | `/api/ci/repos/:repo/packs?sha=` | `ci.uploads.pack` (a working tree's commit, as a thin pack) | runs.trigger | W17 |
+| POST | `/api/ci/repos/:repo/local-runs` | `ci.runs.local` (`{ sha, ref, event, payload?, workflows?, job?, matrix?, inputs?, vars?, secrets? }`; untrusted unless the owner's) | runs.trigger | W17 |
 | POST | `/api/ci/runs/:id/cancel` | `ci.runs.cancel` | runs.cancel | W05 |
 | POST | `/api/ci/runs/:id/rerun` | `ci.runs.rerun` (`{ mode: all\|failed\|job, job?, debug?, fresh_actions?, no_reuse? }`) | runs.rerun | W05 |
 | POST | `/api/ci/runs/:id/approve` | `ci.runs.approve` (untrusted run or environment) | runs.approve | W15, W18 |
 | GET | `/api/ci/runs/:id/{summary,annotations,artifacts,tests,flow,actions}` | `ci.runs.<part>` | runs.read | W06, W08, W16, W04, W07 |
 | GET | `/api/ci/runs/:a/compare/:b` | `ci.runs.compare` | runs.read | W19 |
 | GET | `/api/ci/legs/:id` | `ci.legs.get` (attempts, steps, outputs, wait reason) | runs.read | W05, W06 |
-| GET | `/api/ci/legs/:id/logs?step=&attempt=` · `/logs/ws` | `ci.legs.logs` | logs.read | W06 |
+| GET | `/api/ci/legs/:id/logs?step=&attempt=&from=` · `/logs/ws` | `ci.legs.logs` (`from`: a byte offset, for followers) | logs.read | W06 |
 | GET | `/api/ci/legs/:id/logs/search?q=` · `/failure` | `ci.legs.search`, `ci.legs.failure_excerpt` | logs.read | W19, W20 |
 | GET | `/api/ci/legs/:id/routing` | `ci.legs.routing` (explain) | runs.read | W05 |
 | GET | `/api/ci/legs/:id/terminal` (WebSocket) | `ci.legs.terminal` | runs.debug | W17 |
@@ -4093,7 +4124,7 @@ progress), `ci_step`, `ci_annotation`, `ci_artifact`, `ci_runner` (facts, health
 ### 4.3 CLI
 
 ```
-kiln validate FILE…                     kiln run [WORKFLOW] [--job ID] [--event E] [--executor X]
+kiln validate FILE…                     kiln workflow run [WORKFLOW] [--job ID] [--event E] [--executor X] [--server URL]
 kiln runs [--repo r] [--follow]         kiln logs <run|leg> [--step n] [--follow]
 kiln dispatch <workflow> [--ref r] [--input k=v]   kiln rerun <run> [--failed|--job J] [--debug] [--no-reuse]
 kiln cancel <run>                       kiln debug terminal|keep|release|rerun-step <leg> …

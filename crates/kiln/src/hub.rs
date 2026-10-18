@@ -701,7 +701,12 @@ impl Hub {
     }
 
     async fn agent_lost(&self, name: &str, reason: &str) {
-        tracing::warn!(agent = name, reason, "agent disconnected");
+        // Agents leaving as the server stops are expected.
+        if self.shutdown.is_cancelled() {
+            tracing::info!(agent = name, reason, "agent disconnected");
+        } else {
+            tracing::warn!(agent = name, reason, "agent disconnected");
+        }
         let snapshot = {
             let mut g = self.agents.lock();
             let Some(a) = g.get_mut(name) else { return };

@@ -12,6 +12,7 @@ pub mod facade;
 pub mod hooks;
 pub mod integrations;
 pub mod load;
+pub mod local;
 pub mod oidc;
 pub mod preview;
 pub mod repo_config;
@@ -24,6 +25,7 @@ pub mod schedule;
 pub mod secrets;
 pub mod services;
 pub mod token;
+pub mod uploads;
 pub mod workflows;
 
 /// A failure: an HTTP status and why (as `cd::ops::Fail`).

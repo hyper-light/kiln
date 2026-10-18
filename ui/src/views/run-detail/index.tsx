@@ -467,7 +467,7 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
 /** Steps as they ran: by when each started, those yet to start after, in their order. Steps a run
  * adds as it goes (an implicit checkout, pre and post steps) come after the job's own by number. */
 function inRunOrder(steps: Step[]): Step[] {
-  return [...steps].sort((a, b) => (a.started_at ?? Infinity) - (b.started_at ?? Infinity) || a.idx - b.idx);
+  return [...steps].sort((a, b) => (a.started_at ?? Infinity) - (b.started_at ?? Infinity) || (a.seq ?? Infinity) - (b.seq ?? Infinity) || a.idx - b.idx);
 }
 
 /** Whether a leg is kept to look into now (W17-R02). */

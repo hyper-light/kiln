@@ -79,11 +79,15 @@ pub struct Settings {
     pub max_job_minutes: u32,
     /// `runs-on` for kiln-dialect jobs that don't say (`[ci] default_runs_on`).
     pub default_runs_on: Vec<String>,
+    /// Only the matrix combinations with these values (`kiln workflow run --matrix k=v`,
+    /// W17-R06): a job whose matrix has one of these keys runs the combinations whose value of it
+    /// matches; other jobs run as they would.
+    pub only_matrix: Vec<(String, String)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_legs: 1_024, default_permissions: perms::Default::Read, max_job_minutes: 7 * 24 * 60, default_runs_on: vec!["k8s".into()] }
+        Settings { max_legs: 1_024, default_permissions: perms::Default::Read, max_job_minutes: 7 * 24 * 60, default_runs_on: vec!["k8s".into()], only_matrix: Vec::new() }
     }
 }
 
@@ -1015,13 +1019,23 @@ impl RunPlan {
             }
         }
         let cx = self.base_cx(n, self.needs_context(n, None));
-        let legs = match self.legs_of(n, &job, dialect, &cx, src) {
+        let mut legs = match self.legs_of(n, &job, dialect, &cx, src) {
             Ok(l) => l,
             Err(e) => {
                 self.conclude_job(n, Conclusion::Failure, e, out);
                 return;
             }
         };
+        if !self.settings.only_matrix.is_empty() {
+            let only = &self.settings.only_matrix;
+            let had = !legs.is_empty();
+            legs.retain(|(combo, ..)| only.iter().all(|(k, v)| matrix::get(combo, k).is_none_or(|x| matrix::display(x) == *v)));
+            if had && legs.is_empty() {
+                let asked: Vec<String> = only.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                self.conclude_job(n, Conclusion::Skipped, format!("no combination of the matrix has {}", asked.join(", ")), out);
+                return;
+            }
+        }
         let (ff, max_parallel, per_axis) = match strategy_settings(&job, dialect, &cx) {
             Ok(s) => s,
             Err(e) => {
