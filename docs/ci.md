@@ -177,7 +177,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
-| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins left |
+| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1` and `kiln/test-results@v1`; `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
@@ -2125,11 +2125,26 @@ Gives step execution for `uses:`.
     - `kiln actions sync` mirrors `prefetch`.
   - R12: `GET /api/ci/actions?q=` (`kiln actions list`): the mirrored actions, their newest
     versions and their `action.yml`.
+- *R10* (`crates/kiln/src/runner/builtins.rs`): `kiln/<name>@v1` runs on the runner itself, in
+  either dialect. The server never pins or fetches `kiln/*`, an unknown one fails the run at
+  start, and the action policy doesn't apply.
+  - `kiln/checkout@v1`: from the server's mirror, with `path`, `ref`, `fetch-depth` (0 for all),
+    `sparse-checkout` (cone or not) and `filter` (a partial clone). Its outputs are `ref` and
+    `commit`. The kiln dialect's implicit checkout is the same code.
+  - `kiln/test-results@v1`: W16's reports as a step of its own, failing on failed tests
+    (quarantined ones excepted under `enforce`), with `failed` and `passed` as outputs.
+  - Inputs are checked as JavaScript actions' are (required ones, GitHub's "Unexpected
+    input(s)" warning). Their metadata is at `GET /api/ci/actions/kiln`, and they lead
+    `GET /api/ci/actions?q=` (R12).
+  - Verified end to end from a GitHub workflow: a sparse checkout held only what it asked for,
+    and `kiln/test-results@v1` failed on a failed test with its counts as outputs.
 - *Left.*
-  - R01's `kiln://` and `kiln/*`.
+  - R01's `kiln://`.
   - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
     tarballs in W08's store (today they are files under `<data>/actions/tar`).
-  - R09 beyond checkout (with W14's REST facade), R10, R11, R12's built-ins.
+  - R09 beyond checkout (with W14's REST facade); R10's other built-ins: `kiln/cache`,
+    `kiln/auth`, `kiln/deploy`, `kiln/attest`, `kiln/notify`, `kiln/upload` and `kiln/download`,
+    each with its workstream; R11.
   - musl Node for Alpine job containers, with W13.
   - AC01 to AC06.
 

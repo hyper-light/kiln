@@ -144,6 +144,15 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
         if out.contains_key(&uses) {
             continue;
         }
+        // kiln's own actions (W07-R10) run on the runner itself: nothing to fetch or pin, and no
+        // repository by that name is ever asked for.
+        if crate::runner::builtins::is_kiln(&uses) {
+            if crate::runner::builtins::builtin(&uses).is_none() {
+                let names: Vec<String> = crate::runner::builtins::BUILTINS.iter().map(|b| format!("kiln/{}@v1", b.name)).collect();
+                return Err(format!("`{uses}` isn't one of kiln's built-in actions: {}", names.join(", ")));
+            }
+            continue;
+        }
         allowed(&uses)?;
         // `$/path`: this repository at the running commit (W07-R01), read from the server's
         // mirror, so no checkout is needed.
@@ -315,7 +324,15 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
 pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: Value) -> Result<Response, Fail> {
     let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     match (method, rest) {
-        (&http::Method::GET, []) => Ok(srv::json(StatusCode::OK, &json!({ "actions": catalog(hub, q.get("q").map(String::as_str).unwrap_or_default()).await }))),
+        (&http::Method::GET, []) => {
+            // The built-ins first, then what the mirrors hold (W07-R12).
+            let want = q.get("q").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            let mut list: Vec<Value> = crate::runner::builtins::catalog().as_array().cloned().unwrap_or_default().into_iter().filter(|b| b.get("uses").and_then(Value::as_str).is_some_and(|u| u.contains(&want))).collect();
+            list.extend(catalog(hub, q.get("q").map(String::as_str).unwrap_or_default()).await);
+            Ok(srv::json(StatusCode::OK, &json!({ "actions": list })))
+        }
+        // W07-R10: the built-in actions' metadata.
+        (&http::Method::GET, ["kiln"]) => Ok(srv::json(StatusCode::OK, &json!({ "actions": crate::runner::builtins::catalog() }))),
         (&http::Method::POST, ["sync"]) => {
             let mut done = Vec::new();
             for uses in &hub.cfg.ci.actions.prefetch {

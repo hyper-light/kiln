@@ -54,6 +54,30 @@ struct Ran {
     state: Vec<(String, String)>,
 }
 
+/// What a step's test reports said (W16-R01).
+#[derive(Default)]
+struct Reported {
+    failed: u64,
+    passed: u64,
+    /// There were failures, and quarantine covers each of them (W16-R05).
+    only_quarantined: bool,
+    /// No file matched.
+    missing: bool,
+}
+
+/// How to check a commit out (the kiln dialect's implicit checkout, `kiln/checkout@v1`).
+struct Checkout {
+    /// Below the workspace; empty for the workspace itself.
+    path: String,
+    /// A commit, branch or tag.
+    git_ref: String,
+    /// Commits of history; 0 for all.
+    depth: u32,
+    sparse: Vec<String>,
+    cone: bool,
+    filter: Option<String>,
+}
+
 /// A secret or variable `name` set to `true` (W06-R13: `ACTIONS_STEP_DEBUG`, `ACTIONS_RUNNER_DEBUG`).
 fn debug_flag(a: &AssignmentV2, name: &str) -> bool {
     let truthy = |v: &str| v.eq_ignore_ascii_case("true");
@@ -895,7 +919,8 @@ impl Leg {
         let idx = st.next_idx;
         st.next_idx += 1;
         self.start(idx, "Check out the commit", "internal", None).await;
-        let r = self.checkout_commit(st, idx).await;
+        let sha = self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        let r = self.checkout(st, idx, &Checkout { path: String::new(), git_ref: sha, depth: 1, sparse: Vec::new(), cone: true, filter: None }).await;
         if let Err(e) = &r {
             self.annotate(idx, "error", &format!("Checking out the commit failed: {e:#}")).await;
         }
@@ -904,23 +929,42 @@ impl Leg {
         r.is_ok()
     }
 
-    async fn checkout_commit(&self, st: &State, idx: u32) -> anyhow::Result<()> {
+    /// Checks `c.git_ref` out from the server's mirror into the workspace (or `c.path` below it),
+    /// through the git facade with the job's token; with no git, the commit's tarball.
+    async fn checkout(&self, st: &State, idx: u32, c: &Checkout) -> anyhow::Result<()> {
         use base64::Engine as _;
         let a = &self.a;
-        let sha = a.contexts.github.get("sha").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("the run has no commit"))?.to_owned();
-        let ws = st.layout.workspace.clone();
+        let sha = Some(c.git_ref.clone()).filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("the run has no commit"))?;
+        let ws = if c.path.is_empty() || c.path == "." { st.layout.workspace.clone() } else { st.layout.workspace.join(&c.path) };
+        anyhow::ensure!(ws.starts_with(&st.layout.workspace) && !c.path.split(['/', '\\']).any(|p| p == ".."), "`path` must stay inside the workspace");
         let remote = format!("{}/{}", st.server_url.trim_end_matches('/'), a.repo);
         let token = a.runtime.github_token.clone();
         if crate::rt::blocking(|| which("git")).await.unwrap_or(false) {
             // The token rides in git's environment config, never on a command line.
             let header = format!("AUTHORIZATION: basic {}", base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}")));
             let w = ws.to_string_lossy().to_string();
-            let steps: [Vec<&str>; 4] = [
-                vec!["init", "--quiet", &w],
-                vec!["-C", &w, "fetch", "--quiet", "--depth=1", "--no-tags", &remote, &sha],
-                vec!["-C", &w, "checkout", "--quiet", "--detach", "FETCH_HEAD"],
-                vec!["-C", &w, "remote", "add", "origin", &remote],
-            ];
+            let depth = format!("--depth={}", c.depth);
+            let filter = c.filter.as_ref().map(|f| format!("--filter={f}"));
+            let mut fetch: Vec<&str> = vec!["-C", &w, "fetch", "--quiet", "--no-tags"];
+            if c.depth > 0 {
+                fetch.push(&depth);
+            }
+            if let Some(f) = &filter {
+                fetch.push(f);
+            }
+            fetch.extend(["origin", &sha]);
+            let mut steps: Vec<Vec<&str>> = vec![vec!["init", "--quiet", &w], vec!["-C", &w, "remote", "add", "origin", &remote]];
+            if !c.sparse.is_empty() {
+                let mut set = vec!["-C", w.as_str(), "sparse-checkout", "set"];
+                if !c.cone {
+                    set.push("--no-cone");
+                }
+                set.extend(c.sparse.iter().map(String::as_str));
+                steps.push(set);
+            }
+            steps.push(fetch);
+            steps.push(vec!["-C", &w, "checkout", "--quiet", "--detach", "FETCH_HEAD"]);
+            std::fs::create_dir_all(&ws)?;
             for args in steps {
                 // As typed in the workspace: without `-C <workspace>`.
                 let shown: Vec<&str> = if args.first() == Some(&"-C") { args.iter().skip(2).copied().collect() } else { args.iter().copied().filter(|x| *x != w.as_str()).collect() };
@@ -935,6 +979,7 @@ impl Leg {
             return Ok(());
         }
         // No git: the commit's tarball from the REST facade, its top directory stripped.
+        anyhow::ensure!(c.sparse.is_empty() && c.filter.is_none(), "sparse and partial checkouts need git, which isn't installed here");
         let url = format!("{}/api/v3/repos/{}/tarball/{sha}", st.server_url.trim_end_matches('/'), a.repo);
         self.note(idx, &format!("git isn't installed here: downloading {} at {}", a.repo, sha.get(..12).unwrap_or(&sha))).await;
         let mut resp = self.http.get(&url).bearer(&token).timeout(Duration::from_secs(600)).send().await?;
@@ -1209,7 +1254,7 @@ impl Leg {
         // W16-R01: the step's test reports go to the server, which keeps and parses them. With
         // `quarantine: enforce`, a failure of quarantined tests only passes, with a warning (R05).
         let excused = match &step.kiln.test_results {
-            Some(spec) if !matches!(end, End::Cancelled) => self.test_reports(st, idx, spec, &wd).await && !matches!(end, End::Exit(Some(0))) && self.a.quarantine,
+            Some(spec) if !matches!(end, End::Cancelled) => self.test_reports(st, idx, spec, &wd).await.only_quarantined && !matches!(end, End::Exit(Some(0))) && self.a.quarantine,
             _ => false,
         };
         let (outcome, exit_code) = match end {
@@ -1247,7 +1292,7 @@ impl Leg {
     /// patterns, from the step's working directory) and `format` (found from each file when left
     /// out). Each report goes to the server, which keeps and parses it; what it found goes to the
     /// step's log. Whether there were failures and quarantine covers every one of them (W16-R05).
-    async fn test_reports(&self, st: &mut State, idx: u32, spec: &YVal, wd: &Path) -> bool {
+    async fn test_reports(&self, st: &mut State, idx: u32, spec: &YVal, wd: &Path) -> Reported {
         const MAX_REPORTS: usize = 64;
         const MAX_BYTES: u64 = 64 << 20;
         let (path_v, format_v) = match spec {
@@ -1265,13 +1310,13 @@ impl Leg {
                 Ok(x) => patterns.extend(x.coerce_string().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned)),
                 Err(e) => {
                     self.annotate(idx, "warning", &format!("test-results: {e}")).await;
-                    return false;
+                    return Reported::default();
                 }
             }
         }
         if patterns.is_empty() {
             self.annotate(idx, "warning", "test-results: say where the reports are (`test-results: { path: … }`)").await;
-            return false;
+            return Reported::default();
         }
         let format = match &format_v {
             Some(v) => st.value(v, Site::StepWith, "test-results.format").map(|x| x.coerce_string()).unwrap_or_default(),
@@ -1291,15 +1336,15 @@ impl Leg {
             Ok(f) => f,
             Err(e) => {
                 self.annotate(idx, "warning", &format!("test-results: {}", e.message)).await;
-                return false;
+                return Reported::default();
             }
         };
         if files.is_empty() {
             self.annotate(idx, "warning", &format!("test-results: no report at {}", patterns.join(", "))).await;
-            return false;
+            return Reported { missing: true, ..Reported::default() };
         }
         let base = self.a.runtime.results_url.trim_end_matches('/').to_owned();
-        let (mut failed, mut all_quarantined) = (0u64, true);
+        let (mut failed, mut passed, mut all_quarantined) = (0u64, 0u64, true);
         for f in files.iter().take(MAX_REPORTS) {
             let full = root.join(f);
             let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
@@ -1334,6 +1379,7 @@ impl Leg {
             let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
             let (fails, errors) = (n("failed"), n("errors"));
             failed += fails + errors;
+            passed += n("passed");
             let mut line = format!("Test results ({f}, {}): {} passed, {} failed, {} skipped", v.get("format").and_then(serde_json::Value::as_str).unwrap_or("?"), n("passed"), fails + errors, n("skipped"));
             let names: Vec<&str> = v.get("failures").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str).take(10).collect();
             if !names.is_empty() {
@@ -1352,7 +1398,7 @@ impl Leg {
                 all_quarantined = false;
             }
         }
-        failed > 0 && all_quarantined
+        Reported { failed, passed, only_quarantined: failed > 0 && all_quarantined, missing: false }
     }
 
     /// A step begins: its own row, or a header in its composite caller's log.
@@ -2212,9 +2258,64 @@ impl Leg {
         Ok(super::docker::Cli::new(&bin, config))
     }
 
-    /// A `uses:` step (W07): JavaScript, composite, Docker.
+    /// A built-in kiln action (W07-R10), run here.
+    async fn builtin(&self, st: &mut State, idx: u32, b: &super::builtins::Builtin, mut with: BTreeMap<String, String>, wd: &Path) -> anyhow::Result<Ran> {
+        for i in b.inputs {
+            if let (Some(d), false) = (i.default, with.contains_key(i.name)) {
+                with.insert(i.name.to_owned(), d.to_owned());
+            }
+            anyhow::ensure!(!i.required || with.get(i.name).is_some_and(|v| !v.trim().is_empty()), "Input required and not supplied: {}", i.name);
+        }
+        for k in with.keys().filter(|k| !b.inputs.iter().any(|i| i.name == k.as_str())) {
+            self.annotate(idx, "warning", &format!("Unexpected input(s) '{k}', valid inputs are [{}]", b.inputs.iter().map(|i| format!("'{}'", i.name)).collect::<Vec<_>>().join(", "))).await;
+        }
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let mut outputs = BTreeMap::new();
+        let ok = match b.name {
+            "checkout" => {
+                let sha = self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                let c = Checkout {
+                    path: get("path").unwrap_or_default(),
+                    git_ref: get("ref").unwrap_or(sha),
+                    depth: get("fetch-depth").and_then(|d| d.parse().ok()).unwrap_or(1),
+                    sparse: get("sparse-checkout").map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
+                    cone: get("sparse-checkout-cone-mode").is_none_or(|v| v != "false"),
+                    filter: get("filter"),
+                };
+                self.checkout(st, idx, &c).await?;
+                let dir = if c.path.is_empty() || c.path == "." { st.layout.workspace.clone() } else { st.layout.workspace.join(&c.path) };
+                let commit = Command::new("git").args(["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"]).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default();
+                outputs.insert("ref".to_owned(), c.git_ref);
+                outputs.insert("commit".to_owned(), commit);
+                true
+            }
+            "test-results" => {
+                let mut spec = vec![("path".to_owned(), YVal::Str(Tpl::new(get("path").unwrap_or_default(), Default::default())))];
+                if let Some(f) = get("format") {
+                    spec.push(("format".to_owned(), YVal::Str(Tpl::new(f, Default::default()))));
+                }
+                let r = self.test_reports(st, idx, &YVal::Map(spec), wd).await;
+                outputs.insert("failed".to_owned(), r.failed.to_string());
+                outputs.insert("passed".to_owned(), r.passed.to_string());
+                let fail_on = get("fail-on-failure").is_none_or(|v| v != "false");
+                let excused = r.only_quarantined && self.a.quarantine;
+                if r.missing {
+                    anyhow::bail!("no test report matched `{}`", get("path").unwrap_or_default());
+                }
+                !(fail_on && r.failed > 0 && !excused)
+            }
+            other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
+        };
+        Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })
+    }
+
+    /// A `uses:` step (W07): built in, JavaScript, composite, Docker.
     #[allow(clippy::too_many_arguments)]
     async fn action(&self, st: &mut State, idx: u32, step: &Step, uses: &str, with: BTreeMap<String, String>, wd: &Path, env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
+        // `uses: kiln/<name>@v1`: built in, before any remote repository (W07-R10).
+        if let Some(b) = super::builtins::builtin(uses) {
+            return self.builtin(st, idx, b, with, wd).await;
+        }
         // `uses: docker://image`: the image itself, with `with.entrypoint` and `with.args`.
         if uses.starts_with("docker://") {
             let cli = self.cli(st).await?;
