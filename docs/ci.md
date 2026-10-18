@@ -179,7 +179,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host executor; background steps, matchers, containers left |
 | W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local; `actions/checkout@v4` unmodified; Docker, `$/`, policy left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
-| W09 | Secrets and variables | W01 | ready | |
+| W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | ready | |
 | W11 | Integrations and credential broker | W10 | blocked (W10) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
@@ -2336,7 +2336,38 @@ and masking), names to the editor's completion (W21; names only).
 - **W09-AC09 Rotation.** `rotate-key` re-wraps every value; runs keep working throughout.
   *Integration test.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - `kiln_ci::secrets`, pure code:
+    - names and scopes, and which scope wins (R01, R02, AC03);
+    - which secrets a job reads, and what a called workflow's leg gets (R04, R05);
+    - declared secrets (R06): `KCI4041` from the validator, `KCI4040` at run start.
+  - `crates/kiln/src/ci/secrets.rs` (R03, R09):
+    - AES-256-GCM under a data key wrapped by the master key file, ciphertexts bound to scope and
+      name;
+    - rotation;
+    - the config's `[secrets]` as server scope;
+    - uses recorded;
+    - variables.
+  - Each trusted leg gets exactly the secrets it references, plus `GITHUB_TOKEN`; untrusted runs
+    get only the token (R04).
+  - The API (names only) and the CLI: `kiln secrets`, `kiln vars` (R11).
+  - Checked end to end on a local server:
+    - resolution across the repository, server, workflow and organization scopes;
+    - AC05, a workflow-scoped secret invisible to another workflow;
+    - AC04, each leg receiving only its references, read from the recorded uses;
+    - masking;
+    - `vars` by scope;
+    - AC01, no stored value anywhere in the data directory;
+    - AC09, rotation with runs still working.
+- *Left.*
+  - Environment secrets after approval, `SecretsFor` (R04, AC07), with W15.
+  - R07 (kiln actions' declared secrets).
+  - R08 (brokered, W11).
+  - R10 (secret outputs).
+  - The UI (W21).
+  - AC02 as a route walk, AC06 as an integration test, AC08 (fork pull requests, with W18).
 
 ### W10 Identity: tokens, principals, OIDC issuer
 
