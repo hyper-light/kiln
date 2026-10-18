@@ -40,8 +40,16 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         _ if super::rest::is_web(seg) => Some(super::rest::web(hub, seg).await),
         // W10: ID tokens for jobs, and the issuer's documents.
         ["_kiln", "oidc", "token"] => Some(super::oidc::token(hub, &req).await),
-        // Only while the engine runs: fetching the keys makes the first one.
-        _ if hub.ci.enabled() && super::oidc::is_issuer(hub, seg).is_some() => Some(super::oidc::document(hub, super::oidc::is_issuer(hub, seg).unwrap_or_default()).await),
+        // W16: test reports from legs.
+        ["_kiln", "test-results"] => Some(super::results::ingest(hub, req).await),
+        // W19: a step's message (`kiln/notify@v1`).
+        ["_kiln", "notify"] => Some(super::notify::from_leg(hub, req).await),
+        // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
+        // makes the first one.
+        _ if super::oidc::is_issuer(hub, seg).is_some() => {
+            let doc = super::oidc::is_issuer(hub, seg).unwrap_or_default();
+            Some(if super::oidc::active(hub).await { super::oidc::document(hub, doc).await } else { Err((StatusCode::NOT_FOUND, "not found".into())) })
+        }
         ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] => Some(Err((StatusCode::NOT_FOUND, "not found".into()))),
         _ => None,
     }
@@ -72,10 +80,19 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W02: workflows.
         (&Method::POST, ["validate"]) => workflows::validate(req.into_body()).await,
         // W04-R29: a plan without a run.
-        (&Method::POST, ["plan-preview"]) => super::preview::route(hub, req.into_body()).await,
+        (&Method::POST, ["plan-preview"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            super::preview::route(hub, caller.as_ref(), req.into_body()).await
+        }
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
         (&Method::GET, ["repos", repo, "workflows"]) => workflows::list(hub, repo, q).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => workflows::get(hub, repo, &path.join("/"), q).await,
+        // W10-R09: subjects per organization and repository.
+        (_, ["oidc", "subject"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = if method == Method::PUT { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+            super::oidc::subject(hub, &method, q, body, &by).await
+        }
         // W10-R12: the OIDC issuer's status, keys to publish, rotation.
         (_, ["oidc", tail @ ..]) => {
             let body: serde_json::Value = if method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
@@ -86,15 +103,50 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let body: serde_json::Value = if method == Method::PUT || method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
             super::actions::route(hub, &method, tail, q, body).await
         }
+        // W15: environments, their deployments, and reviews of runs waiting on them.
+        (_, ["environments", tail @ ..]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = if matches!(method, Method::POST | Method::PUT | Method::PATCH) { crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+            super::environments::route(hub, &method, tail, q, body, caller.as_ref()).await
+        }
+        (&Method::POST, ["runs", id, "approve"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::environments::approve(hub, id, body, caller.as_ref()).await
+        }
+        // W05-R21: routing rules, and where a leg would go.
+        (&Method::GET, ["routing", "rules"]) => super::routing::get(hub).await,
+        (&Method::PUT, ["routing", "rules"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::routing::put(hub, q, body, &by).await
+        }
+        (&Method::POST, ["routing", "explain"]) => {
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::routing::explain(hub, body).await
+        }
         // W09: secrets (names only) and variables.
         (_, ["secrets", ..] | ["variables", ..]) => super::secrets::route(hub, &method, rest, q, req.into_body()).await,
         // W11: integrations, shared by jobs and deployments (docs/cd-targets.md §6, §7.1).
         (_, ["integrations", ..]) => super::integrations::route(hub, &method, rest, q, req.into_body()).await,
         // §4.1: the engine's runs, legs and caches (W21's data).
         (&Method::GET, ["runs"]) => super::runs_api::list(hub, q).await,
-        (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id).await,
-        (&Method::GET, ["runs", id, "graph"]) => super::runs_api::graph(hub, id).await,
-        (&Method::GET, ["runs", id, which @ ("annotations" | "summary" | "artifacts")]) => super::runs_api::part(hub, id, which).await,
+        (&Method::GET, ["runs", id]) => super::runs_api::get(hub, id, q).await,
+        (&Method::GET, ["runs", id, "graph"]) => super::runs_api::graph(hub, id, q).await,
+        // W16-R03: tests, failures first.
+        (&Method::GET, ["runs", id, "tests"]) => super::results::of(hub, Some(id), None, q).await,
+        (&Method::GET, ["legs", id, "tests"]) => super::results::of(hub, None, Some(id), q).await,
+        (&Method::GET, ["repos", repo, "tests"]) => super::results::repo(hub, repo, q).await,
+        // W19-R06: what notifications went out.
+        (&Method::GET, ["notify", "deliveries"]) => super::notify::deliveries(hub, q).await,
+        // W19-R01: insights.
+        (&Method::GET, ["insights", rest @ ..]) => super::insights::route(hub, rest, q).await,
+        // W19-R07: outgoing webhooks' deliveries, and sending one again.
+        (_, ["webhooks", rest @ ..]) => super::webhooks::route(hub, &method, rest, q).await,
+        // W16-R07, R08: benchmark metrics and their trends.
+        (&Method::GET, ["runs", id, "metrics"]) => super::results::run_metrics(hub, id).await,
+        (&Method::GET, ["repos", repo, "metrics"]) => super::results::repo_metrics(hub, repo, q).await,
+        (&Method::GET, ["runs", id, which @ ("annotations" | "summary" | "artifacts")]) => super::runs_api::part(hub, id, which, q).await,
         (&Method::POST, ["runs", id, "cancel"]) => super::runs_api::cancel(hub, id).await,
         (&Method::POST, ["runs", id, "rerun"]) => {
             let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -103,7 +155,34 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["legs", id]) => super::runs_api::leg(hub, id).await,
         (&Method::GET, ["legs", id, "logs"]) => super::runs_api::logs(hub, id, q).await,
         (&Method::GET, ["legs", id, "routing"]) => super::runs_api::routing(hub, id).await,
+        (&Method::POST, ["legs", id, "rerun-step"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::runs_api::rerun_step(hub, id, &body, &by).await
+        }
+        (&Method::POST, ["legs", id, "exec"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::runs_api::exec(hub, id, &body, caller.as_ref()).await
+        }
+        (&Method::POST, ["legs", id, "release"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            super::runs_api::release(hub, id, &by).await
+        }
+        (&Method::POST, ["legs", id, "keep"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::runs_api::extend(hub, id, &body, &by).await
+        }
         (&Method::GET, ["repos", repo, "caches"]) => super::runs_api::caches(hub, repo, None).await,
+        // W21-R01: the secret and variable names a workflow sees (names only), for completion.
+        (&Method::GET, ["repos", repo, "names"]) => {
+            let path = q.get("path").cloned().unwrap_or_default();
+            let repo = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().find(|r| r.id == *repo || r.name == *repo).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no repository `{repo}`")))?;
+            let secrets = super::secrets::names_for(hub, &repo, &path, None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            let vars = super::secrets::vars_for(hub, &repo, &path, None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+            Ok(crate::http::server::json(StatusCode::OK, &serde_json::json!({ "secrets": secrets, "variables": vars.keys().collect::<Vec<_>>() })))
+        }
         (&Method::DELETE, ["repos", repo, "caches", id]) => super::runs_api::caches(hub, repo, Some(id)).await,
         // §4.1's names for the dispatches.
         (&Method::POST, ["repos", repo, "dispatch"]) => workflows::dispatch_named(hub, repo, req.into_body()).await,
@@ -111,6 +190,16 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         // W03-R11: dispatches.
         (&Method::POST, ["repos", repo, "workflows", path @ .., "dispatches"]) => workflows::dispatch(hub, repo, &path.join("/"), req.into_body()).await,
         (&Method::POST, ["repos", repo, "dispatches"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
+        // W17-R06: runs of a working tree (`kiln workflow run`).
+        (&Method::GET, ["repos", repo, "heads"]) => super::uploads::heads(hub, repo).await,
+        (&Method::POST, ["repos", repo, "packs"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            super::uploads::pack(hub, repo, q, req.into_body(), &by).await
+        }
+        (&Method::POST, ["repos", repo, "local-runs"]) => {
+            let caller = req.extensions().get::<crate::authz::Caller>().cloned();
+            super::uploads::local_runs(hub, repo, caller.as_ref(), req.into_body()).await
+        }
         _ => Err((StatusCode::NOT_FOUND, format!("no such CI route: {method} /api/ci/{}", rest.join("/")))),
     }
 }

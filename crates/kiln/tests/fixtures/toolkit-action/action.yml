@@ -1,0 +1,15 @@
+name: Toolkit conformance (F-20)
+description: Every command and file API of @actions/core, @actions/exec and @actions/io, for docs/ci.md W06-AC01.
+inputs:
+  required: { description: Must be given, required: true }
+  missing: { description: Optional, with no default, required: false }
+  padded: { description: Whitespace around it, default: "  spaced  " }
+  flag: { description: A boolean, default: "true" }
+  lines: { description: Several lines, one of them empty, default: "a\nb\n\nc" }
+outputs:
+  o1: { description: An output }
+  multi: { description: An output of two lines }
+runs:
+  using: node24
+  main: dist/main.mjs
+  post: dist/post.mjs

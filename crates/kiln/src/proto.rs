@@ -152,6 +152,13 @@ pub const CAP_FRONT_DOOR: u32 = 16;
 /// clones, bundles and deletes them for the server's tasks (`crate::sync::repos`), inside
 /// [`AgentMsg::Sync`] / [`ServerMsg::Sync`]. Clear of CI's bits and of `CAP_REACH` (1 << 17).
 pub const CAP_REPOS: u32 = 1 << 18;
+/// [`AgentMsg::Build`] capability: an outpost, kiln run on a machine where it isn't installed
+/// (`kiln outpost`). It takes no jobs and the server never upgrades it (nothing there is installed
+/// to upgrade); the machine's terminals, AI sessions and agents work as a runner's do. It also
+/// carries [`OUTPOST_LABEL`], so it is known as one while it's away too.
+pub const CAP_OUTPOST: u32 = 32;
+/// The label an outpost carries (see [`CAP_OUTPOST`]).
+pub const OUTPOST_LABEL: &str = "outpost";
 
 // CI's capability bits (docs/ci.md §2.5) start at 1 << 10, clear of the rest of kiln's.
 /// The runner takes [`ServerMsg::AssignV2`], sends [`AgentMsg::JobEvent`], runs the GitHub-exact
@@ -303,6 +310,17 @@ pub enum ServerMsg {
     /// Reach: the answer to [`AgentMsg::ReachAsk`] (JSON). Appended last: postcard encodes
     /// variants by index.
     ReachAnswer { req: u64, json: String },
+    /// CI: keep a kept leg `minutes` from now (docs/ci.md W17-R02, "Extend"). Only to runners
+    /// announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
+    KeepExtend { job: String, minutes: u32 },
+    /// CI: run step `step` of kept leg `job` again in place, as step `idx` of its log (docs/ci.md
+    /// W17-R04). Only to runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes
+    /// variants by index.
+    JobRerunStep { job: String, step: u32, idx: u32 },
+    /// CI: run `command` in running or kept leg `job`'s shell (its workspace and environment, or
+    /// its container), its output on terminal session `session` (docs/ci.md W17-R05). Only to
+    /// runners announcing [`CAP_JOB_TTY`]. Appended last: postcard encodes variants by index.
+    JobExec { job: String, session: String, command: String },
     /// Observe (`crate::observe`, on [`LANE_OBSERVE`]): as [`AgentMsg::Observe`]. Only to runners
     /// announcing [`CAP_OBSERVE`]. Appended last: postcard encodes variants by index.
     Observe { json: String, bytes: Vec<u8> },
@@ -459,6 +477,10 @@ mod tests {
         let ci = [CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY];
         let others = CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP | CAP_SYNC | CAP_FRONT_DOOR | CAP_REPOS;
         assert!(CAP_REPOS.is_power_of_two() && CAP_REPOS & (CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP | CAP_SYNC | CAP_FRONT_DOOR) == 0);
+        assert!(
+            CAP_OUTPOST.is_power_of_two() && CAP_OUTPOST & (CAP_UPGRADE | CAP_TAKEOVER | CAP_DIRS | CAP_TAKEOVER_STOP | CAP_SYNC | CAP_FRONT_DOOR | CAP_REPOS) == 0,
+            "CAP_OUTPOST is a bit of its own"
+        );
         let mut seen = 0u32;
         for c in ci {
             assert!(c.is_power_of_two() && c & others == 0 && c & seen == 0, "{c} is a bit of its own");
@@ -471,13 +493,13 @@ mod tests {
     fn observe_messages_are_appended_after_every_older_variant() -> anyhow::Result<()> {
         let s = ServerMsg::Observe { json: "{}".into(), bytes: vec![1, 2] };
         let b = encode(&s)?;
-        assert_eq!(b.first(), Some(&30), "ServerMsg::Observe is variant 30 on the wire, after ReachAnswer");
+        assert_eq!(b.first(), Some(&33), "ServerMsg::Observe is variant 33 on the wire, after JobExec (main's, deployed)");
         assert_eq!(decode::<ServerMsg>(&b)?, s);
         let a = AgentMsg::Observe { json: "{}".into(), bytes: vec![3] };
         let b = encode(&a)?;
         assert_eq!(b.first(), Some(&32), "AgentMsg::Observe is variant 32 on the wire, after ReachAsk");
         assert_eq!(decode::<AgentMsg>(&b)?, a);
-        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_REPOS, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH];
+        let every = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_OUTPOST, CAP_REPOS, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH];
         assert!(CAP_OBSERVE.is_power_of_two() && every.iter().all(|c| c & CAP_OBSERVE == 0), "CAP_OBSERVE is a bit of its own");
         Ok(())
     }

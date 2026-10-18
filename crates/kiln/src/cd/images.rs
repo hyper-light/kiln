@@ -118,7 +118,51 @@ impl Cd {
                 platforms: spec.platforms.clone(),
                 published: None,
                 pipeline: None,
+                workflow: None,
+                artifact: None,
             }),
+        }
+    }
+
+    /// A workflow's artifact at `revision` (docs/cd-targets.md §7): the newest run of `workflow` at
+    /// that commit in the app's repository, and the content of the artifact it uploaded, by its
+    /// SHA-256 (hex). A run still going, or none yet, waits; a run that failed, or that uploaded
+    /// no such artifact, is an error that says which.
+    pub(crate) async fn workflow_artifact(&self, def: &AppDef, workflow: &str, artifact: &str, revision: &str) -> Result<String> {
+        let url = match &def.origin {
+            Origin::Deploy { repo } => repo.clone(),
+            _ => def.sources.first().map(|s| s.repo.clone()).unwrap_or_default(),
+        };
+        let repos = self.hub.store.repos().await?;
+        let Some(repo) = repos.iter().find(|r| r.clone_url == url) else { bail!("{url} isn't one of kiln's repositories: its workflows' artifacts aren't kiln's") };
+        let (repo_id, sha, wf, name) = (repo.id.clone(), revision.to_owned(), workflow.to_owned(), artifact.to_owned());
+        type Found = (String, i64, String, Option<String>, Option<bool>);
+        let found: Option<Found> = self
+            .hub
+            .store
+            .call(move |c| {
+                use rusqlite::OptionalExtension as _;
+                Ok(c.query_row(
+                    "SELECT r.id, r.number, r.status, a.object, a.finalized = 1 FROM runs r
+                     LEFT JOIN ci_artifacts a ON a.run_id = r.id AND a.name = ?3
+                     WHERE r.repo_id = ?1 AND r.sha = ?2
+                       AND (lower(r.pipeline) = lower(?4) OR r.workflow_id = ?4 OR r.workflow_id LIKE '%/' || ?4 || '.yml' OR r.workflow_id LIKE '%/' || ?4 || '.yaml')
+                     ORDER BY r.created_at DESC, r.number DESC LIMIT 1",
+                    rusqlite::params![repo_id, sha, name, wf],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?)
+            })
+            .await?;
+        let short = revision.get(..7).unwrap_or(revision);
+        let Some((_, number, status, object, finalized)) = found else { bail!("waiting for the {workflow} workflow to run at {short}") };
+        match Status::parse(&status) {
+            Status::Succeeded => match (object, finalized) {
+                (Some(o), Some(true)) => Ok(o),
+                _ => bail!("the {workflow} workflow's run #{number} at {short} uploaded no artifact {artifact} (or it expired)"),
+            },
+            Status::Failed | Status::Cancelled | Status::TimedOut | Status::Skipped => bail!("the {workflow} workflow didn't build {short} (run #{number}, {status}): run it again, or deploy another commit"),
+            _ => bail!("waiting for the {workflow} workflow at {short} (run #{number}, {status})"),
         }
     }
 

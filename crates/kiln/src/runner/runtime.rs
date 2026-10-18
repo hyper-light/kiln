@@ -28,6 +28,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::store::Status;
 
 /// One leg, run on this machine.
+#[derive(Clone)]
 pub struct Leg {
     pub a: AssignmentV2,
     pub work_dir: PathBuf,
@@ -51,6 +52,71 @@ struct Ran {
     end: End,
     outputs: BTreeMap<String, String>,
     state: Vec<(String, String)>,
+}
+
+/// What a step's test reports said (W16-R01).
+#[derive(Default)]
+struct Reported {
+    failed: u64,
+    passed: u64,
+    /// There were failures, and quarantine covers each of them (W16-R05).
+    only_quarantined: bool,
+    /// No file matched.
+    missing: bool,
+}
+
+/// How to check a commit out (the kiln dialect's implicit checkout, `kiln/checkout@v1`).
+struct Checkout {
+    /// Below the workspace; empty for the workspace itself.
+    path: String,
+    /// A commit, branch or tag.
+    git_ref: String,
+    /// Commits of history; 0 for all.
+    depth: u32,
+    sparse: Vec<String>,
+    cone: bool,
+    filter: Option<String>,
+}
+
+/// A secret or variable `name` set to `true` (W06-R13: `ACTIONS_STEP_DEBUG`, `ACTIONS_RUNNER_DEBUG`).
+fn debug_flag(a: &AssignmentV2, name: &str) -> bool {
+    let truthy = |v: &str| v.eq_ignore_ascii_case("true");
+    a.secrets.iter().any(|s| s.name == name && truthy(&s.value)) || a.contexts.vars.get(name).and_then(serde_json::Value::as_str).is_some_and(truthy)
+}
+
+/// Debug logging (`RUNNER_DEBUG=1`, `runner.debug`, what `core.isDebug()` reads): a debug rerun,
+/// or `ACTIONS_STEP_DEBUG` or `ACTIONS_RUNNER_DEBUG` set.
+fn runner_debug(a: &AssignmentV2) -> bool {
+    a.debug.runner_debug || a.debug.step_debug || debug_flag(a, "ACTIONS_RUNNER_DEBUG") || debug_flag(a, "ACTIONS_STEP_DEBUG")
+}
+
+/// The step outputs (step id, name) the job's secret outputs read (W04-R22).
+fn secret_feeds(a: &AssignmentV2, dialect: Dialect) -> std::collections::BTreeSet<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    for (_, t) in a.outputs.iter().filter(|(k, _)| a.secret_outputs.contains(k)) {
+        let Ok(tpl) = Template::parse_with(&t.src, &options(Site::JobOutputs, dialect)) else { continue };
+        for r in tpl.references() {
+            if r.root() == "steps" && r.name(2) == Some("outputs")
+                && let (Some(step), Some(name)) = (r.name(1), r.name(3))
+            {
+                out.insert((step.to_owned(), name.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a program is on `PATH`.
+fn which(prog: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file() || d.join(format!("{prog}.exe")).is_file()))
+}
+
+/// GitHub's view of a typed output (W04-R20): its JSON, but a string as itself.
+fn json_text(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// An action's post step, run after the main steps in reverse order (W06-R11).
@@ -80,6 +146,9 @@ const SIGTERM_GRACE: Duration = Duration::from_millis(2_500);
 const MAX_BACKGROUND: usize = 10;
 /// `cancel:` of a background step: SIGTERM, then SIGKILL after this.
 const BACKGROUND_GRACE: Duration = Duration::from_secs(10);
+/// How long post steps have once the job's steps are done, a cancelled or timed-out job's
+/// included (GitHub's `cancel-timeout-minutes`).
+const CLEANUP_TIME: Duration = Duration::from_secs(5 * 60);
 
 /// The paths of W06-R01.
 #[derive(Clone)]
@@ -141,6 +210,8 @@ enum End {
 struct Done {
     id: Option<String>,
     outputs: BTreeMap<String, String>,
+    /// Typed outputs (W04-R20): what the kiln dialect sees for these names.
+    json: BTreeMap<String, serde_json::Value>,
     outcome: Option<Conclusion>,
     conclusion: Option<Conclusion>,
 }
@@ -199,6 +270,10 @@ fn str_map(m: &BTreeMap<String, String>) -> Value {
 /// The leg's state as its steps change it.
 #[derive(Clone)]
 struct State {
+    /// The next step's title starts with this (a step rerun in place, W17-R04).
+    rerun_label: Option<String>,
+    /// Post steps run: as on GitHub, a cancelled job's cleanup runs to its end, on time of its own.
+    cleanup: bool,
     dialect: Dialect,
     layout: Layout,
     /// The job's environment: the workflow's and the job's `env`, `env-from`, `$GITHUB_ENV`.
@@ -229,6 +304,13 @@ struct State {
     stop: Option<Shutdown>,
     /// Values `::add-mask::` added, for a background step's `wait` to carry into the leg.
     masks_added: Vec<String>,
+    /// The running step's typed outputs (`$KILN_OUTPUT_JSON`, W04-R20), for its `steps` entry.
+    step_json: BTreeMap<String, serde_json::Value>,
+    /// `$KILN_RUN_ENV` lines (W04-R21), for `run.env`.
+    run_env: Vec<(String, String)>,
+    /// Step outputs (step id, name) that feed a secret job output (W04-R22): masked the moment
+    /// their step ends, so they're never reported or kept in the clear.
+    sensitive: std::collections::BTreeSet<(String, String)>,
 }
 
 /// A background step that finished, and what it changed: applied to the leg at its `wait`, in
@@ -369,7 +451,7 @@ impl State {
             Some((
                 id,
                 Value::object([
-                    ("outputs".to_owned(), str_map(&d.outputs)),
+                    ("outputs".to_owned(), self.step_outputs(d)),
                     ("outcome".to_owned(), d.outcome.map_or(Value::Null, |c| Value::str(word(c)))),
                     ("conclusion".to_owned(), d.conclusion.map_or(Value::Null, |c| Value::str(word(c)))),
                 ]),
@@ -377,6 +459,14 @@ impl State {
         }));
         values.push(("steps", steps));
         Cx { values, status: StatusView { failed: self.failed, cancelled: self.cancelled, skipped: false }, workspace: &self.layout.workspace }
+    }
+
+    /// A step's outputs as this dialect sees them: kiln's typed ones as their JSON values.
+    fn step_outputs(&self, d: &Done) -> Value {
+        if self.dialect != Dialect::Kiln || d.json.is_empty() {
+            return str_map(&d.outputs);
+        }
+        Value::object(d.outputs.iter().map(|(k, v)| (k.clone(), d.json.get(k).map_or_else(|| Value::str(v), Value::from_json))))
     }
 
     fn render(&self, t: &Tpl, site: Site, what: &str) -> Result<String, String> {
@@ -456,16 +546,82 @@ fn script_file(shell: Option<&str>, body: &str) -> (&'static str, String) {
     }
 }
 
+/// What decides whether two benchmark runs compare (W16-R07): this machine's OS and architecture,
+/// CPU model and kernel, and the executor.
+fn fingerprint(executor: &str) -> String {
+    static MACHINE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let cpu = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("model name").and_then(|r| r.split_once(':')).map(|(_, m)| m.trim().to_owned())))
+            .unwrap_or_default();
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").map(|k| k.trim().to_owned()).unwrap_or_default();
+        [format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH), cpu, kernel].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
+    });
+    format!("{} · {}", *MACHINE, if executor.is_empty() { "host" } else { executor })
+}
+
+/// Kept legs' runtimes and states, by leg: what rerunning one of their steps needs (W17-R04).
+static PARKED: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, (Leg, State)>>> = std::sync::LazyLock::new(Default::default);
+
+/// A kept leg let go: its state goes too.
+pub fn unpark(job: &str) {
+    PARKED.lock().remove(job);
+}
+
+/// Runs step `step` of kept leg `job` again in place, as step `idx` of its log (W17-R04): with the
+/// environment, paths and outputs the leg ended with, whatever its earlier steps concluded.
+/// `false` when the leg isn't kept here.
+pub fn rerun_step(job: &str, step: u32, idx: u32) -> bool {
+    let Some((leg, mut st)) = PARKED.lock().remove(job) else { return false };
+    let job = job.to_owned();
+    crate::rt::spawn(async move {
+        let def = usize::try_from(step).ok().and_then(|i| leg.a.steps.get(i)).cloned();
+        match def {
+            Some(def) if !def.is_control() => {
+                st.failed = false;
+                st.cancelled = false;
+                st.rerun_label = Some("Rerun: ".into());
+                let deadline = Instant::now() + Duration::from_secs(u64::from(leg.a.timeout_minutes.max(1)) * 60);
+                let _ = leg.step(&mut st, idx, &def, deadline, false).await;
+                for g in &st.groups {
+                    crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={job}"));
+                }
+                st.groups.clear();
+            }
+            _ => {
+                leg.start(idx, "Rerun", "internal", None).await;
+                leg.note(idx, &format!("Step {} can't be rerun: it isn't one of the job's steps.", step + 1)).await;
+                leg.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Failure, conclusion: Conclusion::Failure, exit_code: None, outputs: BTreeMap::new() }).await;
+            }
+        }
+        // Still kept (not released meanwhile): ready for the next rerun.
+        if super::kept::kept_until(&job).is_some() {
+            PARKED.lock().insert(job, (leg, st));
+        }
+    });
+    true
+}
+
 impl Leg {
     pub async fn run(self) -> JobResult {
         let job = self.a.job_id.clone();
         let started = Instant::now();
-        let r = std::panic::AssertUnwindSafe(self.run_inner()).catch_unwind().await;
+        let layout = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo, self.hosted_image());
+        let ws = layout.runner_workspace;
+        super::workspaces::claim(&self.work_dir, &ws).await;
+        let tools = super::workspaces::ToolCache::take(&layout.tool_cache);
+        let r = std::panic::AssertUnwindSafe(self.run_inner(tools.path())).catch_unwind().await;
+        drop(tools);
         let (status, error) = match r {
             Ok(Ok(s)) => (s, None),
             Ok(Err(e)) => (Status::Failed, Some(format!("{e:#}"))),
             Err(_) => (Status::Failed, Some("the runtime failed unexpectedly".into())),
         };
+        // The workspace goes with the leg, unless a failed leg is kept to look into (W17-R02).
+        let keep = if matches!(status, Status::Failed | Status::TimedOut) { self.a.debug.keep_on_failure_minutes } else { None };
+        if let Some(until) = super::kept::ended(&job, ws, keep).await {
+            self.event(&JobEventV2::Kept { until }).await;
+        }
         let _ = started;
         JobResult { job, status, exit_code: None, error, peak_rss: None, cpu_seconds: None }
     }
@@ -539,7 +695,7 @@ impl Leg {
         set("AGENT_TOOLSDIRECTORY", l.tool_cache.to_string_lossy().to_string());
         set("RUNNER_WORKSPACE", l.runner_workspace.to_string_lossy().to_string());
         set("RUNNER_ENVIRONMENT", "self-hosted".into());
-        if a.debug.runner_debug {
+        if runner_debug(a) {
             set("RUNNER_DEBUG", "1".into());
         }
         let rt = &a.runtime;
@@ -564,10 +720,10 @@ impl Leg {
         v
     }
 
-    async fn run_inner(&self) -> anyhow::Result<Status> {
+    async fn run_inner(&self, tool_cache: PathBuf) -> anyhow::Result<Status> {
         let a = &self.a;
         let dialect = if a.dialect == "kiln" { Dialect::Kiln } else { Dialect::Gha };
-        let layout = Layout::new(&self.work_dir, &a.job_id, &a.repo, self.hosted_image());
+        let layout = Layout { tool_cache, ..Layout::new(&self.work_dir, &a.job_id, &a.repo, self.hosted_image()) };
         let (ws, temp, cmds) = (layout.workspace.clone(), layout.temp.clone(), layout.commands.clone());
         let event = serde_json::to_vec(&a.contexts.github.get("event").cloned().unwrap_or_default()).unwrap_or_default();
         crate::rt::blocking(move || -> std::io::Result<()> {
@@ -579,26 +735,32 @@ impl Leg {
         })
         .await??;
         let secrets: BTreeMap<String, String> = a.secrets.iter().map(|s| (s.name.clone(), s.value.clone())).collect();
-        let mut masks: Vec<String> = secrets.values().cloned().collect();
+        let mut masks: Vec<String> = secrets.iter().filter(|(k, _)| !kiln_ci::secrets::DEBUG_FLAGS.contains(&k.as_str())).map(|(_, v)| v.clone()).collect();
         masks.extend(a.masks.iter().cloned());
         masks.push(a.runtime.github_token.clone());
         masks.push(a.runtime.runtime_token.clone());
-        let step_debug = a.debug.step_debug || secrets.get("ACTIONS_STEP_DEBUG").is_some_and(|v| v == "true");
+        let step_debug = a.debug.step_debug || debug_flag(a, "ACTIONS_STEP_DEBUG");
+        // The paths expressions see: the leg's own. In the `docker` executor's container (the
+        // leg's machine) they're the container's; a job's `container:` sees the host's, as on
+        // GitHub (`github.workspace` there is the runner's path).
+        let hosted = self.hosted_image().map(|_| self.container_map(&layout));
+        let seen = |p: &Path| hosted.as_ref().map_or_else(|| p.to_string_lossy().into_owned(), |m| m.translate(&p.to_string_lossy()));
         let base = vec![
             ("vars", Value::from_json(&a.contexts.vars)),
             ("needs", Value::from_json(&a.contexts.needs)),
             ("strategy", Value::from_json(&a.contexts.strategy)),
             ("matrix", Value::from_json(&a.contexts.matrix)),
             ("inputs", Value::from_json(&a.contexts.inputs)),
+            ("run", Value::from_json(&a.contexts.run)),
             (
                 "runner",
                 Value::object([
                     ("name".to_owned(), Value::str(&self.runner_name)),
                     ("os".to_owned(), Value::str(runner_os())),
                     ("arch".to_owned(), Value::str(runner_arch())),
-                    ("temp".to_owned(), Value::str(&layout.temp.to_string_lossy())),
-                    ("tool_cache".to_owned(), Value::str(&layout.tool_cache.to_string_lossy())),
-                    ("debug".to_owned(), Value::str(if a.debug.runner_debug { "1" } else { "" })),
+                    ("temp".to_owned(), Value::str(&seen(&layout.temp))),
+                    ("tool_cache".to_owned(), Value::str(&seen(&layout.tool_cache))),
+                    ("debug".to_owned(), Value::str(if runner_debug(a) { "1" } else { "" })),
                     ("environment".to_owned(), Value::str("self-hosted")),
                 ]),
             ),
@@ -606,10 +768,10 @@ impl Leg {
         // The github context, completed with what only the runner knows.
         let mut github = a.contexts.github.clone();
         if let Some(m) = github.as_object_mut() {
-            m.insert("workspace".into(), serde_json::json!(layout.workspace.to_string_lossy()));
+            m.insert("workspace".into(), serde_json::json!(seen(&layout.workspace)));
             m.insert("token".into(), serde_json::json!(a.runtime.github_token));
             m.insert("job".into(), serde_json::json!(a.leg.job_id.rsplit('/').next().unwrap_or_default()));
-            m.insert("event_path".into(), serde_json::json!(layout.temp.join("_github_workflow").join("event.json").to_string_lossy()));
+            m.insert("event_path".into(), serde_json::json!(seen(&layout.temp.join("_github_workflow").join("event.json"))));
             m.insert("action".into(), serde_json::json!(""));
             // The server, as this runner reaches it.
             m.insert("server_url".into(), serde_json::json!(a.runtime.facade_url));
@@ -617,6 +779,8 @@ impl Leg {
             m.insert("graphql_url".into(), serde_json::json!(a.runtime.graphql_url));
         }
         let mut st = State {
+            rerun_label: None,
+            cleanup: false,
             dialect,
             layout,
             env: BTreeMap::new(),
@@ -638,6 +802,9 @@ impl Leg {
             matchers: matchers::Job::default(),
             stop: None,
             masks_added: Vec::new(),
+            step_json: BTreeMap::new(),
+            run_env: Vec::new(),
+            sensitive: secret_feeds(a, dialect),
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -666,6 +833,19 @@ impl Leg {
                 c.stop().await;
             }
             return Ok(Status::Failed);
+        }
+        // What a terminal into the leg opens (W17-R01): its workspace and environment, or its
+        // container.
+        let mut shell_env = self.env_vars(&st);
+        shell_env.extend(st.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let exec = st.containers.as_ref().and_then(|c| c.job.as_ref().map(|j| (c, j))).map(|(c, j)| {
+            let inside: BTreeMap<String, String> = shell_env.iter().map(|(k, v)| (k.clone(), j.map.translate(v))).collect();
+            c.cli.shell_argv(&j.id, j.user.as_deref(), &j.map.translate(&st.layout.workspace.to_string_lossy()), &inside)
+        });
+        super::kept::running(&a.job_id, super::kept::Shell { workdir: st.layout.workspace.clone(), env: shell_env, masks: masks.clone(), exec });
+        // The kiln dialect's implicit checkout (W06-R14); GitHub's workflows never get one.
+        if a.checkout == "auto" && !self.implicit_checkout(&mut st).await {
+            st.failed = true;
         }
         self.pre_steps(&mut st, deadline).await;
         let turns = async_lock::Semaphore::new(MAX_BACKGROUND);
@@ -697,19 +877,26 @@ impl Leg {
             self.fold(&mut st, &mut bg, &rest);
         }
         self.job_outputs(&st).await;
-        self.post_steps(&mut st, deadline).await;
+        self.post_steps(&mut st).await;
+        // A failed leg kept to look into keeps its containers up (W17-R02).
+        let keep = (st.failed || timed_out) && !st.cancelled && a.debug.keep_on_failure_minutes.is_some_and(|m| m > 0);
         if let Some(c) = st.containers.take() {
-            let idx = st.next_idx;
-            st.next_idx += 1;
-            self.start(idx, "Stop containers", "internal", None).await;
-            c.stop().await;
-            self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Success, conclusion: Conclusion::Success, exit_code: None, outputs: BTreeMap::new() }).await;
+            if keep {
+                super::kept::hold(&a.job_id, c);
+            } else {
+                let idx = st.next_idx;
+                st.next_idx += 1;
+                self.start(idx, "Stop containers", "internal", None).await;
+                c.stop().await;
+                self.event(&JobEventV2::StepFinished { idx, outcome: Conclusion::Success, conclusion: Conclusion::Success, exit_code: None, outputs: BTreeMap::new() }).await;
+            }
         }
         // The leg's processes end with it (GitHub's "Cleaning up orphan processes").
         for g in &st.groups {
             crate::proc::kill_orphan_group(*g, &format!("KILN_LEG={}", a.job_id));
         }
-        Ok(if timed_out {
+        st.groups.clear();
+        let status = if timed_out {
             Status::TimedOut
         } else if st.cancelled || self.cancel.is_cancelled() {
             Status::Cancelled
@@ -717,7 +904,113 @@ impl Leg {
             Status::Failed
         } else {
             Status::Succeeded
+        };
+        // A kept leg keeps its state, to rerun a step in place (W17-R04).
+        if keep {
+            PARKED.lock().insert(a.job_id.clone(), (self.clone(), st));
+        }
+        Ok(status)
+    }
+
+    /// `checkout: auto` (W06-R14): the run's commit in the workspace before the first step, as a
+    /// step of its own. A shallow git fetch through the server's git facade with the leg's token
+    /// (`.git` kept for tools that need it), else the facade's tarball of the commit.
+    async fn implicit_checkout(&self, st: &mut State) -> bool {
+        let idx = st.next_idx;
+        st.next_idx += 1;
+        self.start(idx, "Check out the commit", "internal", None).await;
+        let sha = self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+        let r = self.checkout(st, idx, &Checkout { path: String::new(), git_ref: sha, depth: 1, sparse: Vec::new(), cone: true, filter: None }).await;
+        if let Err(e) = &r {
+            self.annotate(idx, "error", &format!("Checking out the commit failed: {e:#}")).await;
+        }
+        let c = if r.is_ok() { Conclusion::Success } else { Conclusion::Failure };
+        self.event(&JobEventV2::StepFinished { idx, outcome: c, conclusion: c, exit_code: None, outputs: BTreeMap::new() }).await;
+        r.is_ok()
+    }
+
+    /// Checks `c.git_ref` out from the server's mirror into the workspace (or `c.path` below it),
+    /// through the git facade with the job's token; with no git, the commit's tarball.
+    async fn checkout(&self, st: &State, idx: u32, c: &Checkout) -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let a = &self.a;
+        let sha = Some(c.git_ref.clone()).filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("the run has no commit"))?;
+        let ws = if c.path.is_empty() || c.path == "." { st.layout.workspace.clone() } else { st.layout.workspace.join(&c.path) };
+        anyhow::ensure!(ws.starts_with(&st.layout.workspace) && !c.path.split(['/', '\\']).any(|p| p == ".."), "`path` must stay inside the workspace");
+        let remote = format!("{}/{}", st.server_url.trim_end_matches('/'), a.repo);
+        let token = a.runtime.github_token.clone();
+        if crate::rt::blocking(|| which("git")).await.unwrap_or(false) {
+            // The token rides in git's environment config, never on a command line.
+            let header = format!("AUTHORIZATION: basic {}", base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}")));
+            let w = ws.to_string_lossy().to_string();
+            let depth = format!("--depth={}", c.depth);
+            let filter = c.filter.as_ref().map(|f| format!("--filter={f}"));
+            let mut fetch: Vec<&str> = vec!["-C", &w, "fetch", "--quiet", "--no-tags"];
+            if c.depth > 0 {
+                fetch.push(&depth);
+            }
+            if let Some(f) = &filter {
+                fetch.push(f);
+            }
+            fetch.extend(["origin", &sha]);
+            let mut steps: Vec<Vec<&str>> = vec![vec!["init", "--quiet", &w], vec!["-C", &w, "remote", "add", "origin", &remote]];
+            if !c.sparse.is_empty() {
+                let mut set = vec!["-C", w.as_str(), "sparse-checkout", "set"];
+                if !c.cone {
+                    set.push("--no-cone");
+                }
+                set.extend(c.sparse.iter().map(String::as_str));
+                steps.push(set);
+            }
+            steps.push(fetch);
+            steps.push(vec!["-C", &w, "checkout", "--quiet", "--detach", "FETCH_HEAD"]);
+            std::fs::create_dir_all(&ws)?;
+            for args in steps {
+                // As typed in the workspace: without `-C <workspace>`.
+                let shown: Vec<&str> = if args.first() == Some(&"-C") { args.iter().skip(2).copied().collect() } else { args.iter().copied().filter(|x| *x != w.as_str()).collect() };
+                self.note(idx, &format!("git {}", shown.join(" "))).await;
+                let mut cmd = Command::new("git");
+                cmd.args(&args).env("GIT_TERMINAL_PROMPT", "0").env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "http.extraheader").env("GIT_CONFIG_VALUE_0", &header);
+                let out = crate::proc::output(cmd, Duration::from_secs(1800)).await?;
+                if !out.status.success() {
+                    anyhow::bail!("git {}: {}", args.get(2).copied().unwrap_or_default(), String::from_utf8_lossy(&out.stderr).trim());
+                }
+            }
+            return Ok(());
+        }
+        // No git: the commit's tarball from the REST facade, its top directory stripped.
+        anyhow::ensure!(c.sparse.is_empty() && c.filter.is_none(), "sparse and partial checkouts need git, which isn't installed here");
+        let url = format!("{}/api/v3/repos/{}/tarball/{sha}", st.server_url.trim_end_matches('/'), a.repo);
+        self.note(idx, &format!("git isn't installed here: downloading {} at {}", a.repo, sha.get(..12).unwrap_or(&sha))).await;
+        let mut resp = self.http.get(&url).bearer(&token).timeout(Duration::from_secs(600)).send().await?;
+        if !resp.is_success() {
+            anyhow::bail!("the commit's tarball: HTTP {}", resp.status());
+        }
+        let mut bytes = Vec::new();
+        while let Some(c) = resp.chunk().await? {
+            bytes.extend_from_slice(&c);
+            anyhow::ensure!(bytes.len() < 8 << 30, "the commit is over 8 GiB");
+        }
+        crate::rt::blocking(move || -> anyhow::Result<()> {
+            std::fs::create_dir_all(&ws)?;
+            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()));
+            for entry in ar.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.into_owned();
+                let rel: PathBuf = path.components().skip(1).collect();
+                if rel.as_os_str().is_empty() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                    continue;
+                }
+                let target = ws.join(rel);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                entry.unpack(target)?;
+            }
+            Ok(())
         })
+        .await??;
+        Ok(())
     }
 
     /// Starts `step` in the background when it says so (W06-R17): on a copy of the leg's state,
@@ -864,6 +1157,10 @@ impl Leg {
             None => fallback_name,
         };
         let name = st.masker.mask(&name);
+        let name = match st.rerun_label.take() {
+            Some(label) => format!("{label}{name}"),
+            None => name,
+        };
         let kind = if step.uses.is_some() { "uses" } else { "run" };
         let run = match st.condition(step.cond.as_ref()) {
             Ok(r) => r,
@@ -954,8 +1251,18 @@ impl Leg {
                 (End::Exit(None), BTreeMap::new())
             }
         };
+        // W16-R01: the step's test reports go to the server, which keeps and parses them. With
+        // `quarantine: enforce`, a failure of quarantined tests only passes, with a warning (R05).
+        let excused = match &step.kiln.test_results {
+            Some(spec) if !matches!(end, End::Cancelled) => self.test_reports(st, idx, spec, &wd).await.only_quarantined && !matches!(end, End::Exit(Some(0))) && self.a.quarantine,
+            _ => false,
+        };
         let (outcome, exit_code) = match end {
             End::Exit(Some(0)) => (Conclusion::Success, Some(0)),
+            End::Exit(code) if excused => {
+                self.annotate(idx, "warning", &format!("Process completed with exit code {}: every test that failed is quarantined (.kiln/quarantine.yaml), so the step passes.", code.map_or_else(|| "none".to_owned(), |c| c.to_string()))).await;
+                (Conclusion::Failure, code)
+            }
             End::Exit(code) => {
                 let msg = match code {
                     Some(c) => format!("Process completed with exit code {c}."),
@@ -973,12 +1280,125 @@ impl Leg {
                 (Conclusion::Cancelled, None)
             }
         };
-        let conclusion = if outcome == Conclusion::Failure && continue_on_error { Conclusion::Success } else { outcome };
+        let conclusion = if outcome == Conclusion::Failure && (continue_on_error || excused) { Conclusion::Success } else { outcome };
         if conclusion == Conclusion::Failure {
             st.failed = true;
         }
         self.finish(st, idx, id, outcome, conclusion, exit_code, outputs, nested).await;
         Some(end)
+    }
+
+    /// A step's `test-results:` (W16-R01): `path` (one, a list, or lines; `@actions/glob`'s
+    /// patterns, from the step's working directory) and `format` (found from each file when left
+    /// out). Each report goes to the server, which keeps and parses it; what it found goes to the
+    /// step's log. Whether there were failures and quarantine covers every one of them (W16-R05).
+    async fn test_reports(&self, st: &mut State, idx: u32, spec: &YVal, wd: &Path) -> Reported {
+        const MAX_REPORTS: usize = 64;
+        const MAX_BYTES: u64 = 64 << 20;
+        let (path_v, format_v) = match spec {
+            YVal::Map(_) => (spec.get("path").cloned(), spec.get("format").cloned()),
+            other => (Some(other.clone()), None),
+        };
+        let mut patterns: Vec<String> = Vec::new();
+        let items = match path_v {
+            Some(YVal::Seq(items)) => items,
+            Some(v) => vec![v],
+            None => Vec::new(),
+        };
+        for v in &items {
+            match st.value(v, Site::StepWith, "test-results.path") {
+                Ok(x) => patterns.extend(x.coerce_string().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned)),
+                Err(e) => {
+                    self.annotate(idx, "warning", &format!("test-results: {e}")).await;
+                    return Reported::default();
+                }
+            }
+        }
+        if patterns.is_empty() {
+            self.annotate(idx, "warning", "test-results: say where the reports are (`test-results: { path: … }`)").await;
+            return Reported::default();
+        }
+        let format = match &format_v {
+            Some(v) => st.value(v, Site::StepWith, "test-results.format").map(|x| x.coerce_string()).unwrap_or_default(),
+            None => String::new(),
+        };
+        // Patterns are the working directory's; the workspace is what they may reach.
+        let root = st.layout.workspace.clone();
+        let rel = wd.strip_prefix(&root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+        let patterns: Vec<String> = patterns
+            .iter()
+            .map(|p| {
+                let (neg, body) = p.strip_prefix('!').map_or(("", p.as_str()), |b| ("!", b));
+                if Path::new(body).is_absolute() || rel.is_empty() { p.clone() } else { format!("{neg}{rel}/{body}") }
+            })
+            .collect();
+        let files = match super::hashfiles::Workspace::new(&root).and_then(|w| w.matching(&patterns)) {
+            Ok(f) => f,
+            Err(e) => {
+                self.annotate(idx, "warning", &format!("test-results: {}", e.message)).await;
+                return Reported::default();
+            }
+        };
+        if files.is_empty() {
+            self.annotate(idx, "warning", &format!("test-results: no report at {}", patterns.join(", "))).await;
+            return Reported { missing: true, ..Reported::default() };
+        }
+        let base = self.a.runtime.results_url.trim_end_matches('/').to_owned();
+        let (mut failed, mut passed, mut all_quarantined) = (0u64, 0u64, true);
+        for f in files.iter().take(MAX_REPORTS) {
+            let full = root.join(f);
+            let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+            if size > MAX_BYTES {
+                self.annotate(idx, "warning", &format!("test-results: {f} is {} MiB, more than the {} MiB a report may be", size >> 20, MAX_BYTES >> 20)).await;
+                continue;
+            }
+            let body = match std::fs::read(&full) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.annotate(idx, "warning", &format!("test-results: {f}: {e}")).await;
+                    continue;
+                }
+            };
+            let url = format!("{base}/_kiln/test-results?step={idx}&format={}&path={}&root={}", crate::ci::cli::enc(&format), crate::ci::cli::enc(f), crate::ci::cli::enc(&root.to_string_lossy()));
+            let sent = async {
+                let resp = self.http.put(&url).bearer(&self.a.runtime.runtime_token).body(body).timeout(Duration::from_secs(120)).send().await?;
+                let status = resp.status();
+                let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+                anyhow::ensure!((200..300).contains(&status), "{}", v.get("error").and_then(serde_json::Value::as_str).unwrap_or("the server refused the report"));
+                Ok(v)
+            }
+            .await;
+            let v = match sent {
+                Ok(v) => v,
+                Err(e) => {
+                    self.annotate(idx, "warning", &format!("test-results: {f}: {e:#}")).await;
+                    all_quarantined = false;
+                    continue;
+                }
+            };
+            let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let (fails, errors) = (n("failed"), n("errors"));
+            failed += fails + errors;
+            passed += n("passed");
+            let mut line = format!("Test results ({f}, {}): {} passed, {} failed, {} skipped", v.get("format").and_then(serde_json::Value::as_str).unwrap_or("?"), n("passed"), fails + errors, n("skipped"));
+            let names: Vec<&str> = v.get("failures").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str).take(10).collect();
+            if !names.is_empty() {
+                line.push_str(&format!("\n  failed: {}", names.join(", ")));
+            }
+            let q = v.get("quarantine").cloned().unwrap_or_default();
+            let quarantined: Vec<String> = q.get("quarantined").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|x| x.get(0).and_then(serde_json::Value::as_str).map(str::to_owned)).collect();
+            if !quarantined.is_empty() {
+                line.push_str(&format!("\n  quarantined: {}", quarantined.join(", ")));
+            }
+            self.note(idx, &line).await;
+            for w in v.get("warnings").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(serde_json::Value::as_str) {
+                self.annotate(idx, "warning", w).await;
+            }
+            if fails + errors > 0 && q.get("only_quarantined").and_then(serde_json::Value::as_bool) != Some(true) {
+                all_quarantined = false;
+            }
+        }
+        Reported { failed, passed, only_quarantined: failed > 0 && all_quarantined, missing: false }
     }
 
     /// A step begins: its own row, or a header in its composite caller's log.
@@ -1055,31 +1475,50 @@ impl Leg {
         if a.job_container.is_none() && a.executor.kind == "docker" { a.executor.image.as_deref() } else { None }
     }
 
+    /// Whether the `docker` executor's container gets the host's Docker socket (W13-R04: the
+    /// routing rules' `docker: socket`, for trusted runs).
+    fn docker_inside(&self) -> bool {
+        self.hosted_image().is_some() && self.a.executor.options.get("docker").and_then(serde_json::Value::as_str) == Some("socket")
+    }
+
+    /// Where the leg's directories are inside its containers. A job's `container:` gets
+    /// GitHub's `/__w`. The `docker` executor's container (the leg's machine) keeps the host's
+    /// paths for the workspace, temporary and action directories: what a step bind-mounts
+    /// through the host's Docker (`docker run -v $GITHUB_WORKSPACE:/src`) is what the daemon
+    /// finds, and every such leg on a runner has its workspace at the same depth, so the paths a
+    /// cache saved relative to it (`actions/cache`) restore in any other.
+    fn container_map(&self, l: &Layout) -> super::docker::PathMap {
+        let repo = self.a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
+        let work = &self.work_dir;
+        let same = self.hosted_image().is_some();
+        let at = |host: &Path, inside: String| if same { host.to_string_lossy().into_owned() } else { inside };
+        super::docker::PathMap::new(vec![
+            (l.workspace.clone(), at(&l.workspace, format!("/__w/{repo}/{repo}"))),
+            (l.temp.join("_github_home"), "/github/home".into()),
+            (l.temp.join("_github_workflow"), "/github/workflow".into()),
+            (l.temp.clone(), at(&l.temp, "/__w/_temp".into())),
+            (work.join("_actions"), at(&work.join("_actions"), "/__w/_actions".into())),
+            // The `docker` executor's container is the machine, laid out as GitHub's hosted
+            // runners are (prebuilt tools expect it); a job's `container:` gets `/__t`.
+            (l.tool_cache.clone(), if self.hosted_image().is_some() { "/opt/hostedtoolcache".into() } else { "/__t".into() }),
+            (work.join("_externals"), "/__e".into()),
+        ])
+    }
+
     async fn try_init_containers(&self, st: &mut State, idx: u32) -> anyhow::Result<()> {
         let a = &self.a;
         let bin = crate::rt::blocking(super::docker::find).await?.ok_or_else(|| anyhow::anyhow!("this job uses `container:` or `services:`, and this runner has no working Docker or Podman"))?;
         let config = st.layout.temp.join("_docker_config");
         let l = &st.layout;
-        let repo = a.repo.rsplit('/').next().unwrap_or("repo").to_owned();
         let work = self.work_dir.clone();
         let dirs = [config.clone(), l.temp.join("_github_home"), l.temp.join("_github_workflow"), work.join("_actions"), l.tool_cache.clone(), work.join("_externals")];
         crate::rt::blocking(move || dirs.iter().try_for_each(std::fs::create_dir_all)).await??;
-        let map = super::docker::PathMap::new(vec![
-            (l.workspace.clone(), format!("/__w/{repo}/{repo}")),
-            (l.temp.join("_github_home"), "/github/home".into()),
-            (l.temp.join("_github_workflow"), "/github/workflow".into()),
-            (l.temp.clone(), "/__w/_temp".into()),
-            (work.join("_actions"), "/__w/_actions".into()),
-            // The `docker` executor's container is the machine, laid out as GitHub's hosted
-            // runners are (prebuilt tools expect it); a job's `container:` gets `/__t`.
-            (l.tool_cache.clone(), if self.hosted_image().is_some() { "/opt/hostedtoolcache".into() } else { "/__t".into() }),
-            (work.join("_externals"), "/__e".into()),
-        ]);
+        let map = self.container_map(l);
         let workdir = map.translate(&l.workspace.to_string_lossy());
         // The job's `container:` (GitHub-exact), else the `docker` executor's image (W13-R04).
         let job = match (&a.job_container, &a.executor.image) {
             (Some(c), _) => Some(super::docker::Spec { docker_socket: true, ..self.container_spec(st, c, a.container.as_ref(), false).map_err(anyhow::Error::msg)? }),
-            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), ..super::docker::Spec::default() }),
+            (None, Some(image)) if a.executor.kind == "docker" => Some(super::docker::Spec { image: image.clone(), user: super::docker::host_user(), docker_socket: self.docker_inside(), ..super::docker::Spec::default() }),
             _ => None,
         };
         let mut services = Vec::new();
@@ -1103,11 +1542,20 @@ impl Leg {
 
     #[allow(clippy::too_many_arguments)]
     async fn finish(&self, st: &mut State, idx: u32, id: Option<String>, outcome: Conclusion, conclusion: Conclusion, exit_code: Option<i32>, outputs: BTreeMap<String, String>, nested: bool) {
+        // A step output a secret job output reads is masked from here on (W04-R22).
+        if let Some(step) = &id {
+            for (k, v) in &outputs {
+                if !v.is_empty() && st.sensitive.contains(&(step.clone(), k.clone())) && st.masker.add(v) {
+                    self.event(&JobEventV2::Mask { value_sha256: crate::util::sha256_hex(v.as_bytes()) }).await;
+                }
+            }
+        }
         if !nested {
             let masked: BTreeMap<String, String> = outputs.iter().map(|(k, v)| (k.clone(), st.masker.mask(v))).collect();
             self.event(&JobEventV2::StepFinished { idx, outcome, conclusion, exit_code, outputs: masked }).await;
         }
-        st.steps.push(Done { id, outputs, outcome: Some(outcome), conclusion: Some(conclusion) });
+        let json = std::mem::take(&mut st.step_json);
+        st.steps.push(Done { id, outputs, json, outcome: Some(outcome), conclusion: Some(conclusion) });
     }
 
     async fn annotate(&self, idx: u32, level: &str, message: &str) {
@@ -1130,7 +1578,7 @@ impl Leg {
             }
             Run::Program { .. } | Run::Container { .. } => (None, String::new(), None),
         };
-        let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV"]
+        let files: Vec<(&str, PathBuf)> = ["GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY", "KILN_OUTPUT_JSON", "KILN_RUN_ENV", "KILN_METRICS"]
             .iter()
             .map(|k| (*k, st.layout.commands.join(format!("{}_{id}", k.to_ascii_lowercase()))))
             .collect();
@@ -1233,10 +1681,18 @@ impl Leg {
                 Stop,
                 Deadline,
             }
+            // Cleanup isn't cut short by the cancel it may follow.
+            let cleanup = st.cleanup;
+            let cancelled = std::pin::pin!(async {
+                if cleanup {
+                    futures::future::pending::<()>().await;
+                }
+                self.cancel.cancelled().await;
+            });
             let ev = futures::select_biased! {
                 c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
-                () = self.cancel.cancelled().fuse() => Ev::Cancel,
+                () = cancelled.fuse() => Ev::Cancel,
                 () = stopped => Ev::Stop,
                 () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
                 () = flush.tick().fuse() => Ev::Flush,
@@ -1272,9 +1728,31 @@ impl Leg {
         let get = |k: &str| files.iter().find(|(x, _)| *x == k).map(|(_, p)| p.clone()).unwrap_or_default();
         let (envf, outf, pathf, statef, sumf, jsonf, runf) = (get("GITHUB_ENV"), get("GITHUB_OUTPUT"), get("GITHUB_PATH"), get("GITHUB_STATE"), get("GITHUB_STEP_SUMMARY"), get("KILN_OUTPUT_JSON"), get("KILN_RUN_ENV"));
         let texts = crate::rt::blocking(move || (read(&envf), read(&outf), read(&pathf), read(&statef), read(&sumf), read(&jsonf), read(&runf))).await?;
-        let (env_t, out_t, path_t, state_t, sum_t, _json_t, _run_t) = texts;
+        let (env_t, out_t, path_t, state_t, sum_t, json_t, run_t) = texts;
         let mut outputs = std::mem::take(&mut r.set_output);
         let mut failed_files = false;
+        // kiln's typed outputs (W04-R20): `{"name": …, "value": <any JSON>}` per line.
+        for (n, line) in json_t.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(line.trim());
+            match parsed.ok().and_then(|v| Some((v.get("name")?.as_str()?.to_owned(), v.get("value")?.clone()))) {
+                Some((name, value)) => {
+                    outputs.insert(name.clone(), json_text(&value));
+                    st.step_json.insert(name, value);
+                }
+                None => {
+                    self.annotate(idx, "error", &format!("$KILN_OUTPUT_JSON line {}: expected {{\"name\": …, \"value\": …}}", n + 1)).await;
+                    failed_files = true;
+                }
+            }
+        }
+        // `run.env` (W04-R21): name=value lines, as `$GITHUB_ENV` takes them.
+        match envfiles::env(&run_t) {
+            Ok(pairs) => st.run_env.extend(pairs),
+            Err(e) => {
+                self.annotate(idx, "error", &format!("$KILN_RUN_ENV: {e}")).await;
+                failed_files = true;
+            }
+        }
         match envfiles::env(&env_t) {
             Ok(pairs) => {
                 for (k, v) in pairs {
@@ -1300,6 +1778,22 @@ impl Leg {
             match envfiles::summary(&sum_t) {
                 Ok(md) => self.event(&JobEventV2::Summary { idx, markdown: st.masker.mask(&st.unfake(md)) }).await,
                 Err(e) => self.annotate(idx, "warning", &e).await,
+            }
+        }
+        // Benchmark metrics (W16-R07): `{ name, value, unit, better, tags }` per line.
+        let metf = get("KILN_METRICS");
+        let met_t = crate::rt::blocking(move || read(&metf)).await.unwrap_or_default();
+        if !met_t.trim().is_empty() {
+            let (points, bad) = kiln_ci::results::metrics::parse_lines(&met_t);
+            for b in bad.iter().take(5) {
+                self.annotate(idx, "warning", &format!("$KILN_METRICS {b}")).await;
+            }
+            if !points.is_empty() {
+                let points = points.into_iter().map(|mut p| {
+                    p.name = st.masker.mask(&p.name);
+                    serde_json::to_value(p).unwrap_or_default()
+                }).collect();
+                self.event(&JobEventV2::Metrics { idx, points, fingerprint: fingerprint(&self.a.executor.kind) }).await;
             }
         }
         if let Some(f) = file {
@@ -1501,20 +1995,70 @@ impl Leg {
     /// The job's outputs, after its steps (W06-R10); one holding a secret is not set, as GitHub
     /// doesn't.
     async fn job_outputs(&self, st: &State) {
-        if self.a.outputs.is_empty() {
+        let a = &self.a;
+        if a.outputs.is_empty() && a.exports_env.is_empty() && !(a.run_env && !st.run_env.is_empty()) && a.environment_url.is_none() {
             return;
         }
-        let mut outputs = BTreeMap::new();
-        for (k, t) in &self.a.outputs {
-            match st.render(t, Site::JobOutputs, &format!("outputs.{k}")) {
+        // `environment.url` (W15-R04): its deployment's URL, as the steps left things.
+        let environment_url = match &a.environment_url {
+            Some(t) => match st.render(t, Site::JobOutputs, "environment.url") {
+                Ok(v) if st.masker.mask(&v) != v => {
+                    self.annotate(0, "warning", "Skip the environment's url since it may contain secret.").await;
+                    None
+                }
+                Ok(v) => Some(v).filter(|v| !v.is_empty()),
+                Err(e) => {
+                    self.annotate(0, "warning", &e).await;
+                    None
+                }
+            },
+            None => None,
+        };
+        let (mut outputs, mut json_outputs, mut secret_values) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+        for (k, t) in &a.outputs {
+            let what = format!("outputs.{k}");
+            // A secret output (W04-R22) keeps its value: it goes to the server to be sealed.
+            if a.secret_outputs.contains(k) {
+                match st.render(t, Site::JobOutputs, &what) {
+                    Ok(v) if !v.is_empty() => {
+                        secret_values.insert(k.clone(), v);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.annotate(0, "warning", &e).await,
+                }
+                continue;
+            }
+            match st.render(t, Site::JobOutputs, &what) {
                 Ok(v) if st.masker.mask(&v) != v => self.annotate(0, "warning", &format!("Skip output '{k}' since it may contain secret.")).await,
                 Ok(v) => {
+                    // kiln: a typed value stays typed for kiln consumers (W04-R20).
+                    if st.dialect == Dialect::Kiln
+                        && let Ok(tpl) = Template::parse_with(&t.src, &options(Site::JobOutputs, st.dialect))
+                        && tpl.single_expr().is_some()
+                        && let Ok(val) = expr::eval_value(&tpl, &st.cx(), &mut Budget::default())
+                        && !matches!(val, Value::String(_) | Value::Null)
+                    {
+                        json_outputs.insert(k.clone(), val.to_json());
+                    }
                     outputs.insert(k.clone(), v);
                 }
                 Err(e) => self.annotate(0, "warning", &e).await,
             }
         }
-        self.event(&JobEventV2::JobOutputs { outputs, json_outputs: BTreeMap::new(), env: BTreeMap::new(), run_env: Vec::new(), secret_outputs: Vec::new() }).await;
+        // `exports: { env }` (W04-R21): the final values, masked ones withheld.
+        let mut env = BTreeMap::new();
+        for name in &a.exports_env {
+            match st.env.get(name) {
+                Some(v) if st.masker.mask(v) != *v => self.annotate(0, "warning", &format!("Skip exporting '{name}' since it may contain secret.")).await,
+                Some(v) => {
+                    env.insert(name.clone(), v.clone());
+                }
+                None => {}
+            }
+        }
+        let run_env = if a.run_env { st.run_env.iter().filter(|(_, v)| st.masker.mask(v) == **v).cloned().collect() } else { Vec::new() };
+        let secret_outputs = secret_values.keys().cloned().collect();
+        self.event(&JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values, environment_url }).await;
     }
 }
 
@@ -1714,9 +2258,88 @@ impl Leg {
         Ok(super::docker::Cli::new(&bin, config))
     }
 
-    /// A `uses:` step (W07): JavaScript, composite, Docker.
+    /// A built-in kiln action (W07-R10), run here.
+    async fn builtin(&self, st: &mut State, idx: u32, b: &super::builtins::Builtin, mut with: BTreeMap<String, String>, wd: &Path) -> anyhow::Result<Ran> {
+        for i in b.inputs {
+            if let (Some(d), false) = (i.default, with.contains_key(i.name)) {
+                with.insert(i.name.to_owned(), d.to_owned());
+            }
+            anyhow::ensure!(!i.required || with.get(i.name).is_some_and(|v| !v.trim().is_empty()), "Input required and not supplied: {}", i.name);
+        }
+        for k in with.keys().filter(|k| !b.inputs.iter().any(|i| i.name == k.as_str())) {
+            self.annotate(idx, "warning", &format!("Unexpected input(s) '{k}', valid inputs are [{}]", b.inputs.iter().map(|i| format!("'{}'", i.name)).collect::<Vec<_>>().join(", "))).await;
+        }
+        let get = |k: &str| with.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let mut outputs = BTreeMap::new();
+        let ok = match b.name {
+            "checkout" => {
+                let sha = self.a.contexts.github.get("sha").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+                let c = Checkout {
+                    path: get("path").unwrap_or_default(),
+                    git_ref: get("ref").unwrap_or(sha),
+                    depth: get("fetch-depth").and_then(|d| d.parse().ok()).unwrap_or(1),
+                    sparse: get("sparse-checkout").map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect()).unwrap_or_default(),
+                    cone: get("sparse-checkout-cone-mode").is_none_or(|v| v != "false"),
+                    filter: get("filter"),
+                };
+                self.checkout(st, idx, &c).await?;
+                let dir = if c.path.is_empty() || c.path == "." { st.layout.workspace.clone() } else { st.layout.workspace.join(&c.path) };
+                let commit = Command::new("git").args(["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"]).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default();
+                outputs.insert("ref".to_owned(), c.git_ref);
+                outputs.insert("commit".to_owned(), commit);
+                true
+            }
+            "test-results" => {
+                let mut spec = vec![("path".to_owned(), YVal::Str(Tpl::new(get("path").unwrap_or_default(), Default::default())))];
+                if let Some(f) = get("format") {
+                    spec.push(("format".to_owned(), YVal::Str(Tpl::new(f, Default::default()))));
+                }
+                let r = self.test_reports(st, idx, &YVal::Map(spec), wd).await;
+                outputs.insert("failed".to_owned(), r.failed.to_string());
+                outputs.insert("passed".to_owned(), r.passed.to_string());
+                let fail_on = get("fail-on-failure").is_none_or(|v| v != "false");
+                let excused = r.only_quarantined && self.a.quarantine;
+                if r.missing {
+                    anyhow::bail!("no test report matched `{}`", get("path").unwrap_or_default());
+                }
+                !(fail_on && r.failed > 0 && !excused)
+            }
+            "notify" => {
+                let to: Vec<String> = get("to").unwrap_or_default().lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+                let message = st.masker.mask(&get("message").unwrap_or_default());
+                let url = format!("{}/_kiln/notify", self.a.runtime.results_url.trim_end_matches('/'));
+                let body = serde_json::to_vec(&serde_json::json!({ "to": to, "message": message }))?;
+                let resp = self.http.post(&url).bearer(&self.a.runtime.runtime_token).header("content-type", "application/json").body(body).timeout(Duration::from_secs(120)).send().await?;
+                let status = resp.status();
+                let v: serde_json::Value = resp.json(1 << 20).await.unwrap_or_default();
+                anyhow::ensure!((200..300).contains(&status), "{}", v.get("error").and_then(serde_json::Value::as_str).unwrap_or("the server refused the message"));
+                let mut sent = 0;
+                for r in v.get("sent").and_then(serde_json::Value::as_array).into_iter().flatten() {
+                    let to = r.get("to").and_then(serde_json::Value::as_str).unwrap_or_default();
+                    match r.get("error").and_then(serde_json::Value::as_str) {
+                        Some(e) => self.annotate(idx, "warning", &format!("{to}: {e}")).await,
+                        None => {
+                            sent += 1;
+                            self.note(idx, &format!("sent to {to}")).await;
+                        }
+                    }
+                }
+                outputs.insert("sent".to_owned(), sent.to_string());
+                // It fails only when no channel took it.
+                sent > 0
+            }
+            other => anyhow::bail!("kiln/{other}@v1 isn't built into this runner"),
+        };
+        Ok(Ran { end: End::Exit(Some(if ok { 0 } else { 1 })), outputs, state: Vec::new() })
+    }
+
+    /// A `uses:` step (W07): built in, JavaScript, composite, Docker.
     #[allow(clippy::too_many_arguments)]
     async fn action(&self, st: &mut State, idx: u32, step: &Step, uses: &str, with: BTreeMap<String, String>, wd: &Path, env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
+        // `uses: kiln/<name>@v1`: built in, before any remote repository (W07-R10).
+        if let Some(b) = super::builtins::builtin(uses) {
+            return self.builtin(st, idx, b, with, wd).await;
+        }
         // `uses: docker://image`: the image itself, with `with.entrypoint` and `with.args`.
         if uses.starts_with("docker://") {
             let cli = self.cli(st).await?;
@@ -1914,8 +2537,10 @@ impl Leg {
 
     /// Post steps (W06-R11): in reverse order of the actions that ran, under `post-if` (default
     /// `always()`), with the `STATE_*` their main step saved.
-    async fn post_steps(&self, st: &mut State, deadline: Instant) {
+    async fn post_steps(&self, st: &mut State) {
         let posts = std::mem::take(&mut st.posts);
+        st.cleanup = true;
+        let deadline = Instant::now() + CLEANUP_TIME;
         for p in posts.into_iter().rev() {
             let run = match &p.cond {
                 Some(t) => st.condition(Some(t)).unwrap_or(false),
@@ -1950,14 +2575,32 @@ mod tests {
     /// `sh`, so they and their helpers are Unix-only.)
     #[cfg(unix)]
     fn run_leg(workflow: &str, secrets: &[(&str, &str)]) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
-        let (w, d) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", workflow, Dialect::Gha);
+        run_leg_in(workflow, secrets, Dialect::Gha)
+    }
+
+    /// [`run_leg`] for a workflow of either dialect: a kiln one gets its job's kiln settings.
+    #[cfg(unix)]
+    fn run_leg_in(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
+        run_leg_prepared(workflow, secrets, dialect, &|_| Ok(()))
+    }
+
+    /// [`run_leg_in`], with `prepare` setting up the work directory first.
+    #[cfg(unix)]
+    fn run_leg_prepared(workflow: &str, secrets: &[(&str, &str)], dialect: Dialect, prepare: &dyn Fn(&Path) -> anyhow::Result<()>) -> anyhow::Result<(JobResult, BTreeMap<u32, String>, Vec<JobEventV2>)> {
+        let path = if dialect == Dialect::Kiln { ".kiln/t.yaml" } else { ".github/workflows/t.yml" };
+        let (w, d) = kiln_ci::wf::parse_workflow(path, workflow, dialect);
         anyhow::ensure!(d.iter().all(|x| !x.is_error()), "{d:?}");
+        let run_env = w.as_ref().is_some_and(|w| w.run_env);
         let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
         let tmp = tempfile::tempdir()?;
+        prepare(tmp.path())?;
         let a = AssignmentV2 {
             job_id: "leg-1".into(),
             repo: "acme/app".into(),
-            dialect: "gha".into(),
+            dialect: if dialect == Dialect::Kiln { "kiln".into() } else { "gha".into() },
+            exports_env: job.kiln.exports_env.clone(),
+            secret_outputs: job.outputs.iter().filter(|o| o.secret).map(|o| o.name.clone()).collect(),
+            run_env,
             steps: job.steps.clone(),
             job_env: job.env.clone(),
             outputs: job.outputs.iter().map(|o| (o.name.clone(), o.value.clone())).collect(),
@@ -2118,6 +2761,170 @@ jobs:
         assert_eq!(ann("Unable to process command '::add-matcher::nope.json' successfully.").map(|a| a.0), Some(4));
         assert_eq!(finished(&events, 5).map(|f| f.1), Some(Conclusion::Failure), "a disabled command fails its step");
         assert_eq!(ann("Unable to process command '::set-env name=A::b' successfully.").map(|a| a.0), Some(5));
+        Ok(())
+    }
+
+    /// W06-AC01: the toolkit conformance action (F-20, built on the current `@actions/core`,
+    /// `exec` and `io`), each effect seen by a later step, its post step, or the leg's events.
+    /// Runs on this machine's Node 24 instead of downloading one; skipped without it.
+    #[cfg(unix)]
+    #[test]
+    fn toolkit_conformance() -> anyhow::Result<()> {
+        let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file())) else { return Ok(()) };
+        let version = std::process::Command::new(&node).arg("--version").output()?;
+        if !String::from_utf8_lossy(&version.stdout).starts_with("v24.") {
+            return Ok(());
+        }
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toolkit-action");
+        let wf = format!(
+            r###"on: push
+jobs:
+  t:
+    runs-on: x
+    steps:
+      - run: mkdir -p .github/actions && cp -r "{}" .github/actions/toolkit
+      - id: t
+        uses: ./.github/actions/toolkit
+        with:
+          required: yes-req
+      - run: |
+          echo "o1=${{{{ steps.t.outputs.o1 }}}} EXPORTED=$EXPORTED" 'multi=${{{{ toJSON(steps.t.outputs.multi) }}}}'
+          case "$PATH" in /opt/f20-bin:*) echo "path first" ;; esac
+          echo "the secret again: super-secret-f20"
+"###,
+            fixture.display()
+        );
+        let prepare = |work: &Path| -> anyhow::Result<()> {
+            let bin = work.join("_externals/node24/bin");
+            std::fs::create_dir_all(&bin)?;
+            std::os::unix::fs::symlink(&node, bin.join("node"))?;
+            Ok(())
+        };
+        let (r, logs, events) = run_leg_prepared(&wf, &[("ACTIONS_STEP_DEBUG", "true")], Dialect::Gha, &prepare)?;
+        let all: String = logs.values().cloned().collect();
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {all}");
+        let step = logs.get(&1).cloned().unwrap_or_default();
+        assert!(step.contains(r#"inputs: required=yes-req missing=[] padded=[spaced] raw=[  spaced  ] flag=true lines=["a","b","c"]"#), "{step}");
+        assert!(step.contains("required absent: Input required and not supplied: absent"), "{step}");
+        assert!(step.contains("printing the secret: ***") && !all.contains("super-secret-f20"), "setSecret masks from then on");
+        assert!(step.contains("a debug line"), "debug shows with ACTIONS_STEP_DEBUG: {step}");
+        assert!(step.contains("from exec") && step.contains("exec output: captured (exit 0)"), "{step}");
+        assert!(step.contains("which sh: true") && step.contains("is debug: true"), "{step}");
+        assert!(events.iter().any(|e| matches!(e, JobEventV2::Group { op, title, .. } if op == "start" && title.as_deref() == Some("G"))));
+        let ann = |m: &str| events.iter().find_map(|e| match e {
+            JobEventV2::Annotation { level, message, title, file, line, end_line, col, end_col, .. } if message == m => Some((level.clone(), title.clone(), file.clone(), *line, *end_line, *col, *end_col)),
+            _ => None,
+        });
+        assert_eq!(ann("a notice"), Some(("notice".into(), Some("N".into()), Some("README.md".into()), Some(1), None, None, None)));
+        assert_eq!(ann("a warning"), Some(("warning".into(), None, Some("README.md".into()), Some(2), Some(3), Some(1), Some(4))));
+        assert!(ann("Error: an error object").is_some_and(|a| a.0 == "error"), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, JobEventV2::Summary { markdown, .. } if markdown.contains("<h1>F-20</h1>") && markdown.contains("<th>name</th>") && markdown.contains("<td>v1</td>"))));
+        let later = logs.get(&2).cloned().unwrap_or_default();
+        assert!(later.contains(r#"o1=v1 EXPORTED=e1 multi="line one\nline two""#), "{later}");
+        assert!(later.contains("path first") && later.contains("the secret again: ***"), "{later}");
+        assert!(all.contains("post: state=state-v"), "the post step reads the state: {all}");
+        Ok(())
+    }
+
+    /// A cancelled leg's post steps run to their end, as GitHub's do: the cancel stops the step
+    /// that was running, not the cleanup after it.
+    #[cfg(unix)]
+    #[test]
+    fn post_steps_run_after_a_cancel() -> anyhow::Result<()> {
+        let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|n| n.is_file())) else { return Ok(()) };
+        if !std::process::Command::new(&node).arg("--version").output().is_ok_and(|v| String::from_utf8_lossy(&v.stdout).starts_with("v24.")) {
+            return Ok(());
+        }
+        let wf = r###"on: push
+jobs:
+  t:
+    runs-on: x
+    steps:
+      - run: |
+          mkdir -p .github/actions/slow
+          printf 'name: slow\nruns:\n  using: node24\n  main: main.js\n  post: post.js\n' > .github/actions/slow/action.yml
+          echo 'setTimeout(() => {}, 60000)' > .github/actions/slow/main.js
+          echo 'setTimeout(() => console.log("post: cleaned up"), 1500)' > .github/actions/slow/post.js
+      - uses: ./.github/actions/slow
+"###;
+        let (w, _) = kiln_ci::wf::parse_workflow(".github/workflows/t.yml", wf, Dialect::Gha);
+        let job = w.and_then(|w| w.jobs.into_iter().next()).ok_or_else(|| anyhow::anyhow!("no job"))?;
+        let tmp = tempfile::tempdir()?;
+        let bin = tmp.path().join("_externals/node24/bin");
+        std::fs::create_dir_all(&bin)?;
+        std::os::unix::fs::symlink(&node, bin.join("node"))?;
+        let a = AssignmentV2 { job_id: "leg-c".into(), repo: "acme/app".into(), dialect: "gha".into(), steps: job.steps.clone(), timeout_minutes: 5, ..AssignmentV2::default() };
+        let (tx, rx) = async_channel::unbounded();
+        let cancel = Shutdown::new();
+        let leg = Leg { a, work_dir: tmp.path().to_path_buf(), runner_name: "test-runner".into(), up: Uplink(tx), cancel: cancel.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?) };
+        let result = crate::rt::block_on(async move {
+            crate::rt::spawn(async move {
+                crate::rt::sleep(Duration::from_secs(3)).await;
+                cancel.cancel();
+            });
+            Ok::<_, anyhow::Error>(leg.run().await)
+        })?;
+        let (mut logs, mut events) = (String::new(), Vec::new());
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                crate::exec::Up::Log(c) => logs.push_str(&String::from_utf8_lossy(&c.data)),
+                crate::exec::Up::Msg(AgentMsg::JobEvent { json, .. }) => events.push(serde_json::from_str::<JobEventV2>(&json)?),
+                _ => {}
+            }
+        }
+        assert_eq!(result.status, Status::Cancelled, "{logs}");
+        assert!(logs.contains("post: cleaned up"), "the post step ran to its end: {logs}");
+        let post = events.iter().find_map(|e| match e {
+            JobEventV2::StepStarted { idx, kind, .. } if kind == "post" => Some(*idx),
+            _ => None,
+        });
+        assert_eq!(post.and_then(|i| finished(&events, i)).map(|f| f.1), Some(Conclusion::Success), "{events:?}");
+        Ok(())
+    }
+
+    /// W04-R20 to R22 on the runner: typed outputs, exported environment, `run.env`, and a secret
+    /// output whose value leaves only for sealing (the step output it reads is masked).
+    #[cfg(unix)]
+    #[test]
+    fn kiln_outputs() -> anyhow::Result<()> {
+        let wf = r###"name: t
+on: push
+run-env: true
+jobs:
+  build:
+    runs-on: x
+    outputs:
+      info: ${{ steps.meta.outputs.info }}
+      plain: ${{ steps.meta.outputs.plain }}
+      token: { value: "${{ steps.meta.outputs.secret }}", secret: true }
+    exports: { env: [BUILD_ID] }
+    steps:
+      - id: meta
+        run: |
+          echo '{"name": "info", "value": {"version": "1.2.3", "count": 3}}' >> "$KILN_OUTPUT_JSON"
+          echo "plain=hello" >> "$GITHUB_OUTPUT"
+          echo "secret=s3cr3t-value-123" >> "$GITHUB_OUTPUT"
+          echo "BUILD_ID=build-42" >> "$GITHUB_ENV"
+          echo "SHARED=from-build" >> "$KILN_RUN_ENV"
+      - run: echo "typed ${{ steps.meta.outputs.info.version }} ${{ steps.meta.outputs.info.count }}"
+"###;
+        let (r, logs, events) = run_leg_in(wf, &[], Dialect::Kiln)?;
+        assert_eq!(r.status, Status::Succeeded, "{r:?} {logs:?}");
+        assert!(logs.get(&1).is_some_and(|l| l.contains("typed 1.2.3 3")), "the kiln dialect sees typed outputs: {logs:?}");
+        let outs = events.iter().find_map(|e| match e {
+            JobEventV2::JobOutputs { outputs, json_outputs, env, run_env, secret_outputs, secret_values, .. } => Some((outputs.clone(), json_outputs.clone(), env.clone(), run_env.clone(), secret_outputs.clone(), secret_values.clone())),
+            _ => None,
+        });
+        let Some((outputs, json_outputs, env, run_env, secret_outputs, secret_values)) = outs else { anyhow::bail!("no job outputs") };
+        assert_eq!(json_outputs.get("info"), Some(&serde_json::json!({"version": "1.2.3", "count": 3})));
+        assert_eq!(outputs.get("plain").map(String::as_str), Some("hello"));
+        assert!(!outputs.contains_key("token"), "a secret output never travels as a plain one");
+        assert_eq!((secret_outputs, secret_values.get("token").map(String::as_str)), (vec!["token".to_owned()], Some("s3cr3t-value-123")));
+        assert_eq!(env.get("BUILD_ID").map(String::as_str), Some("build-42"));
+        assert_eq!(run_env, vec![("SHARED".to_owned(), "from-build".to_owned())]);
+        // The step output the secret one reads was masked before it was reported.
+        let step = finished(&events, 0).map(|f| f.2).unwrap_or_default();
+        assert_eq!(step.get("secret").map(String::as_str), Some("***"), "{step:?}");
         Ok(())
     }
 

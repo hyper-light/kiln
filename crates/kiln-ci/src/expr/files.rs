@@ -29,6 +29,20 @@ pub trait FileSource {
 /// Computes `hashFiles(patterns…)` over `src`. `case_insensitive` is for Windows and macOS
 /// runners, as `@actions/glob` matches there.
 pub fn hash_files(src: &dyn FileSource, patterns: &[String], case_insensitive: bool) -> Result<String, ExprError> {
+    let files = matching(src, patterns, case_insensitive)?;
+    if files.is_empty() {
+        return Ok(String::new());
+    }
+    let mut outer = Sha256::new();
+    for f in &files {
+        outer.update(src.digest(f)?);
+    }
+    Ok(hex(&outer.finalize()))
+}
+
+/// The files `patterns` match in `src`, sorted, by `@actions/glob`'s rules as [`hash_files`]
+/// reads them (test reports use them too, W16-R01).
+pub fn matching(src: &dyn FileSource, patterns: &[String], case_insensitive: bool) -> Result<Vec<String>, ExprError> {
     let root = src.root();
     let pats: Vec<(bool, Vec<String>)> = patterns
         .iter()
@@ -44,14 +58,12 @@ pub fn hash_files(src: &dyn FileSource, patterns: &[String], case_insensitive: b
         })
         .collect();
     if pats.iter().all(|(neg, _)| *neg) {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     let mut files = src.files(&search_roots(&pats))?;
     files.sort();
     files.dedup();
-    let mut outer = Sha256::new();
-    let mut count = 0usize;
-    for f in &files {
+    files.retain(|f| {
         let parts: Vec<&str> = f.split('/').filter(|s| !s.is_empty()).collect();
         let mut included = false;
         for (neg, pat) in &pats {
@@ -59,15 +71,9 @@ pub fn hash_files(src: &dyn FileSource, patterns: &[String], case_insensitive: b
                 included = !neg;
             }
         }
-        if included {
-            outer.update(src.digest(f)?);
-            count += 1;
-        }
-    }
-    if count == 0 {
-        return Ok(String::new());
-    }
-    Ok(hex(&outer.finalize()))
+        included
+    });
+    Ok(files)
 }
 
 /// Where to look: the literal leading segments of each inclusion pattern, without the ones

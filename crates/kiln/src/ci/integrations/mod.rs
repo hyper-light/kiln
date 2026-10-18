@@ -10,7 +10,12 @@
 //!   that federate (AWS, Google Cloud, Azure) exchange kiln's OIDC identity for short-lived
 //!   credentials; the rest use a stored token.
 
+pub mod aws;
+pub mod azure;
+pub mod cloudflare;
+pub mod gcp;
 pub mod oci;
+pub mod vercel;
 
 use std::collections::HashMap;
 
@@ -25,6 +30,27 @@ use crate::http::server::{self as srv, Response};
 use super::Fail;
 use super::secrets::{self, Scope};
 use kiln_ci::secrets::ScopeKind;
+
+/// Where a service's requests go (`aws:ecs`, `gcp:sts`): its real endpoint, or a fake a test put
+/// in its place with [`override_endpoint`].
+pub fn endpoint(service: &str, real: impl FnOnce() -> String) -> String {
+    let found = overrides().lock().get(service).cloned();
+    // Tests never reach a real cloud: one that forgot to fake a service gets nowhere.
+    if cfg!(test) {
+        return found.unwrap_or_else(|| "http://127.0.0.1:9".into());
+    }
+    found.unwrap_or_else(real)
+}
+
+fn overrides() -> &'static parking_lot::Mutex<HashMap<String, String>> {
+    static O: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    O.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Sends `service`'s requests to `base` instead (a fake, in tests).
+pub fn override_endpoint(service: &str, base: &str) {
+    overrides().lock().insert(service.to_owned(), base.trim_end_matches('/').to_owned());
+}
 
 /// How kiln authenticates to a kind's service (W11-R02).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -86,7 +112,7 @@ pub const KINDS: &[KindInfo] = &[
         mode: Mode::Oidc,
         fields: &[f("role_arn", true, "the IAM role kiln assumes"), f("region", false, "the default region"), f("audience", false, "the token audience the role trusts (sts.amazonaws.com)")],
         secret: None,
-        built: false,
+        built: true,
     },
     KindInfo {
         kind: "gcp",
@@ -99,7 +125,7 @@ pub const KINDS: &[KindInfo] = &[
             f("project", false, "the default project"),
         ],
         secret: None,
-        built: false,
+        built: true,
     },
     KindInfo {
         kind: "azure",
@@ -108,10 +134,18 @@ pub const KINDS: &[KindInfo] = &[
         mode: Mode::Oidc,
         fields: &[f("tenant_id", true, "the Entra tenant"), f("client_id", true, "the app registration with kiln's federated credential"), f("subscription_id", false, "the default subscription")],
         secret: None,
-        built: false,
+        built: true,
     },
-    KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: false },
-    KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: false },
+    KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true },
+    // Chat, paging and webhooks: where notifications go (docs/ci.md W11-R06, W19-R06).
+    KindInfo { kind: "slack", title: "Slack", category: "notify", mode: Mode::Token, fields: &[f("channel", false, "the channel a bot token posts to when a rule names none (#ci)")], secret: Some("incoming webhook URL, or a bot token (xoxb-…)"), built: true },
+    KindInfo { kind: "discord", title: "Discord", category: "notify", mode: Mode::Token, fields: &[], secret: Some("webhook URL"), built: true },
+    KindInfo { kind: "teams", title: "Microsoft Teams", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Workflows webhook URL"), built: true },
+    KindInfo { kind: "telegram", title: "Telegram", category: "notify", mode: Mode::Token, fields: &[f("chat_id", false, "the chat a rule that names none posts to")], secret: Some("bot token"), built: true },
+    KindInfo { kind: "pagerduty", title: "PagerDuty", category: "notify", mode: Mode::Token, fields: &[], secret: Some("Events API v2 routing key"), built: true },
+    KindInfo { kind: "opsgenie", title: "Opsgenie", category: "notify", mode: Mode::Token, fields: &[], secret: Some("API key"), built: true },
+    KindInfo { kind: "webhook", title: "Webhook", category: "notify", mode: Mode::Optional, fields: &[f("url", true, "where kiln POSTs each event, as JSON"), f("events", false, "kiln events to send as they happen: run, job, agent, queue, cd_plan, cd_apps, cd_app_deleted, or * (comma-separated); without, only notify rules use it")], secret: Some("signing key (X-Kiln-Signature-256: sha256=<HMAC of the body>)"), built: true },
+    KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true },
     KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false },
     KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false },
     KindInfo { kind: "netlify", title: "Netlify", category: "hosting", mode: Mode::Token, fields: &[f("account", false, "the team slug")], secret: Some("personal access token"), built: false },
@@ -181,6 +215,9 @@ fn check_config(info: &KindInfo, config: &Value) -> Result<(), String> {
             return Err(format!("{} needs `{}`: {}", info.title, f.name, f.help));
         }
     }
+    if info.kind == "webhook" {
+        crate::ci::webhooks::check_events(config)?;
+    }
     if info.kind == "oci"
         && let Some(r) = obj.get("registry").and_then(Value::as_str)
     {
@@ -219,6 +256,15 @@ pub async fn list(hub: &Hub) -> anyhow::Result<Vec<Integration>> {
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         })
         .await
+}
+
+/// Whether any integration federates kiln's identity (`aws`, `gcp`, `azure`): then the issuer's
+/// documents are served, since those accounts' syncs mint tokens. Only reads.
+pub async fn federates(hub: &Hub) -> bool {
+    hub.store
+        .call(|c| Ok(c.query_row("SELECT 1 FROM ci_integrations WHERE kind IN ('aws', 'gcp', 'azure') LIMIT 1", [], |_| Ok(())).optional()?.is_some()))
+        .await
+        .unwrap_or(false)
 }
 
 pub async fn get(hub: &Hub, name: &str) -> anyhow::Result<Option<Integration>> {
@@ -314,6 +360,12 @@ pub async fn delete(hub: &Hub, name: &str, by: &str) -> anyhow::Result<bool> {
 }
 
 /// The integration's stored secret, for the server's own use.
+/// A token integration's stored token (`cloudflare`, `vercel`, …), for the providers that act
+/// through it.
+pub async fn token(hub: &Hub, i: &Integration) -> anyhow::Result<Option<String>> {
+    secret(hub, i).await
+}
+
 async fn secret(hub: &Hub, i: &Integration) -> anyhow::Result<Option<String>> {
     if !i.has_secret {
         return Ok(None);
@@ -378,7 +430,18 @@ pub async fn registry_for(hub: &Hub, registry: &str) -> anyhow::Result<Option<oc
 }
 
 /// Checks an integration against its service, and records the result.
-pub async fn verify(hub: &Hub, name: &str) -> anyhow::Result<Result<String, String>> {
+/// Whose identity a check runs with, for kinds that federate: the subject a role or a federated
+/// credential trusts (`repo:<repository>:environment:<environment>`). By default kiln's first
+/// repository.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct VerifyAs {
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
+}
+
+pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Result<String, String>> {
     let i = get(hub, name).await?.ok_or_else(|| anyhow::anyhow!("no integration `{name}`"))?;
     let info = kind(&i.kind).ok_or_else(|| anyhow::anyhow!("unknown kind {}", i.kind))?;
     let result = if !info.built {
@@ -394,11 +457,65 @@ pub async fn verify(hub: &Hub, name: &str) -> anyhow::Result<Result<String, Stri
                 }
                 Err(e) => Err(format!("{e:#}")),
             },
+            "aws" | "gcp" | "azure" => verify_federated(hub, &i, as_).await,
+            k if crate::ci::notify::CHANNELS.contains(&k) => crate::ci::notify::verify(hub, &i).await,
+            "vercel" => match secret(hub, &i).await {
+                Ok(Some(token)) => vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str)).await.map_err(|e| format!("{e:#}")),
+                Ok(None) => Err("no token stored".into()),
+                Err(e) => Err(format!("{e:#}")),
+            },
+            "cloudflare" => match secret(hub, &i).await {
+                Ok(Some(token)) => cloudflare::verify(&token, i.config.get("account_id").and_then(Value::as_str)).await.map_err(|e| format!("{e:#}")),
+                Ok(None) => Err("no token stored".into()),
+                Err(e) => Err(format!("{e:#}")),
+            },
             other => Err(format!("no check for {other} yet")),
         }
     };
     mark(hub, &i.id, &result).await;
     Ok(result)
+}
+
+/// A real exchange of kiln's identity, as a sync's would be: which subject, and what the cloud
+/// said, with what to check when it refused.
+async fn verify_federated(hub: &Hub, i: &Integration, as_: &VerifyAs) -> Result<String, String> {
+    let repository = match as_.repository.clone().filter(|r| !r.trim().is_empty()) {
+        Some(r) => r,
+        None => hub.store.repos().await.ok().and_then(|r| r.into_iter().find(|r| r.enabled).map(|r| r.name)).unwrap_or_else(|| "kiln/kiln".into()),
+    };
+    let environment = as_.environment.clone().filter(|e| !e.trim().is_empty());
+    let w = kiln_ci::oidc::Workload { repository: &repository, environment: environment.as_deref(), actor: "kiln", source: "cd", trigger: Some("verify"), ..Default::default() };
+    let subject = match &environment {
+        Some(e) => format!("repo:{repository}:environment:{e}"),
+        None => format!("repo:{repository}:ref:"),
+    };
+    let explain = |e: anyhow::Error, advice: Option<&str>| match advice {
+        Some(a) => format!("{e:#} — {a} (subject {subject})"),
+        None => format!("{e:#} (subject {subject})"),
+    };
+    match i.kind.as_str() {
+        "aws" => match aws::credentials(hub, i, &w).await {
+            Ok(c) => Ok(format!("assumed the role as {subject}: temporary key {}…", c.access_key_id.chars().take(8).collect::<String>())),
+            Err(e) => {
+                let advice = aws::advice(&e);
+                Err(explain(e, advice))
+            }
+        },
+        "gcp" => match gcp::token(hub, i, &w).await {
+            Ok(_) => Ok(format!("Google Cloud accepted kiln's token as {subject}")),
+            Err(e) => {
+                let advice = gcp::advice(&e);
+                Err(explain(e, advice))
+            }
+        },
+        _ => match azure::token(hub, i, &w, None).await {
+            Ok(_) => Ok(format!("signed in to Azure as {subject}")),
+            Err(e) => {
+                let advice = azure::advice(&e);
+                Err(explain(e, advice))
+            }
+        },
+    }
 }
 
 // ------------------------------------------------------------------ API
@@ -442,6 +559,7 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
             let i = create(hub, &c.kind, &c.name, config, c.secret.as_deref(), c.scope.as_deref(), "admin").await.map_err(|e| fail(StatusCode::UNPROCESSABLE_ENTITY, e))?;
             Ok(srv::json(StatusCode::CREATED, &i))
         }
+        (&Method::GET, ["integrations", "kinds"]) => Ok(srv::json(StatusCode::OK, &json!({ "kinds": KINDS }))),
         (&Method::GET, ["integrations", name]) => match get(hub, name).await.map_err(internal)? {
             Some(i) => Ok(srv::json(StatusCode::OK, &i)),
             None => Err(fail(StatusCode::NOT_FOUND, format!("no integration `{name}`"))),
@@ -459,7 +577,10 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], _q: &HashMap
             }
         }
         (&Method::POST, ["integrations", name, "verify"]) => {
-            let r = verify(hub, name).await.map_err(|e| fail(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+            // Optional: whose identity a federated check runs with.
+            let bytes = srv::body_bytes(body, 64 << 10).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            let as_: VerifyAs = if bytes.is_empty() { VerifyAs::default() } else { serde_json::from_slice(&bytes).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e}")))? };
+            let r = verify(hub, name, &as_).await.map_err(|e| fail(StatusCode::NOT_FOUND, format!("{e:#}")))?;
             Ok(srv::json(StatusCode::OK, &match r {
                 Ok(message) => json!({ "ok": true, "message": message }),
                 Err(error) => json!({ "ok": false, "error": error }),

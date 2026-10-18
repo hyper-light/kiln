@@ -471,6 +471,11 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
     // An agent kiln doesn't know right now is waited for: its runner is reconnecting, or the
     // server has just started. (A closed agent's stack goes when it's closed.)
     let Some(info) = info else { return Next::Wait };
+    // Paused for a usage limit: nothing is sent (no goal, no reminder) until the pause ends; the
+    // goal under way goes on then.
+    if info.pause.is_some() {
+        return Next::Wait;
+    }
     let busy = matches!(info.status, Status::Running | Status::Waiting | Status::Starting);
     // Nothing waiting on you or in its queue; stopped counts (a message starts it again).
     let free = matches!(info.status, Status::Idle | Status::Exited) && info.approvals.is_empty() && info.queued == 0;
@@ -606,6 +611,17 @@ mod tests {
 
     /// Past the first pause after the goal was sent.
     const LATER: i64 = 1_000 + REMIND_MS;
+
+    #[test]
+    fn an_agent_paused_for_a_limit_gets_no_goal_and_no_reminder() {
+        let pause = crate::harness::model::Pause { reason: "limit".into(), since: 1, auto: true, by: "harness".into(), ..Default::default() };
+        let paused = Info { pause: Some(pause), ..info(Status::Idle, None) };
+        assert!(matches!(decide(&stack(vec![item("pending", None)]), Some(&paused), 2_000), Next::Wait));
+        assert!(matches!(decide(&stack(vec![item("active", None)]), Some(&paused), LATER * 10), Next::Wait));
+        assert!(matches!(decide(&stack(vec![item("active", Some("goal"))]), Some(&paused), LATER * 10), Next::Wait));
+        // Once it goes on, so does the stack.
+        assert!(matches!(decide(&stack(vec![item("pending", None)]), Some(&info(Status::Idle, None)), 2_000), Next::Start { .. }));
+    }
 
     #[test]
     fn goals_start_when_the_agent_is_free_and_end_when_its_harness_says_met() {

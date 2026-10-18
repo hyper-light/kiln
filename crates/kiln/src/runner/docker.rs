@@ -71,6 +71,18 @@ pub struct Spec {
     pub user: Option<(u32, u32)>,
 }
 
+/// The group that owns the host's Docker socket.
+#[cfg(unix)]
+fn socket_group() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata("/var/run/docker.sock").ok().map(|m| m.gid())
+}
+
+#[cfg(not(unix))]
+fn socket_group() -> Option<u32> {
+    None
+}
+
 /// The user this runner runs as: (uid, gid).
 #[cfg(unix)]
 pub fn host_user() -> Option<(u32, u32)> {
@@ -83,15 +95,25 @@ pub fn host_user() -> Option<(u32, u32)> {
 }
 
 /// kiln's runner images (W13-R04), built on the runner the first time a leg needs one: what
-/// GitHub's hosted Ubuntu runners have that most workflows count on.
+/// GitHub's hosted Ubuntu runners have that most workflows count on. Besides the build and
+/// network basics, that's the toolchains workflows call without a `setup-*` action: CMake,
+/// Ninja, the autotools and Clang; a JDK with Maven, Ant and sbt (`JAVA_HOME` set); PHP with
+/// Composer; Ruby and Bundler; Leiningen; pipx; Rust (rustup, with rustfmt and clippy); Node.js
+/// 22; the Docker CLI with buildx and compose (for legs given the host's Docker, W13-R04). Each
+/// comes from Ubuntu's archive or the project's own release server. apt assumes yes, as GitHub's
+/// images set it, so `sudo apt-get install x` works without `-y`. `-slim` (`kiln/runner-ubuntu-24.04-slim`) is
+/// the basics alone, for rules that want a small image.
 ///
 /// With `user`, steps run as `runner`, a user with the host's uid and gid and passwordless
 /// sudo, as on GitHub's hosted runners. What they write in the mounted work directory then stays
-/// the host user's, and tools that refuse root, or another user's files, work.
+/// the host user's, and tools that refuse root, or another user's files, work; Cargo's and npm's
+/// global directories are theirs, so `cargo install` and `npm install -g` work as on GitHub.
 pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String> {
+    let name = image.strip_prefix("kiln/runner-")?;
+    let (name, slim) = name.strip_suffix("-slim").map_or((name, false), |n| (n, true));
     // `ImageOS` as GitHub's hosted runners set it: setup-ruby, setup-beam and others pick their
     // prebuilt tools by it.
-    let (base, os) = match image.strip_prefix("kiln/runner-")? {
+    let (base, os) = match name {
         "ubuntu-24.04" => ("ubuntu:24.04", "ubuntu24"),
         "ubuntu-22.04" => ("ubuntu:22.04", "ubuntu22"),
         _ => return None,
@@ -102,6 +124,26 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
          build-essential pkg-config python3 python3-venv python3-pip openssh-client rsync file lsb-release tzdata locales iproute2 netcat-openbsd \\\n    \
          && rm -rf /var/lib/apt/lists/*\n"
     );
+    if !slim {
+        d.push_str(
+            "ENV JAVA_HOME=/usr/lib/jvm/default-java RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+             RUN printf 'APT::Get::Assume-Yes \"true\";\\nAcquire::Retries \"5\";\\n' > /etc/apt/apt.conf.d/90kiln-runner \\\n    \
+             && apt-get update && apt-get install -y --no-install-recommends cmake ninja-build autoconf automake libtool gettext clang lld \\\n    \
+             default-jdk-headless maven ant php-cli php-xml php-mbstring php-curl php-zip php-intl php-sqlite3 composer ruby-full ruby-bundler leiningen pipx \\\n    \
+             && rm -rf /var/lib/apt/lists/*\n\
+             RUN curl -fsSL https://github.com/sbt/sbt/releases/download/v1.10.7/sbt-1.10.7.tgz | tar -xz -C /usr/local && ln -s /usr/local/sbt/bin/sbt /usr/local/bin/sbt\n\
+             RUN case \"$(dpkg --print-architecture)\" in amd64) d=x86_64 b=amd64 ;; arm64) d=aarch64 b=arm64 ;; esac \\\n    \
+             && curl -fsSL \"https://download.docker.com/linux/static/stable/$d/docker-27.5.1.tgz\" | tar -xz -C /usr/local/bin --strip-components=1 docker/docker \\\n    \
+             && mkdir -p /usr/local/lib/docker/cli-plugins \\\n    \
+             && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \"https://github.com/docker/buildx/releases/download/v0.20.1/buildx-v0.20.1.linux-$b\" \\\n    \
+             && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \"https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-$d\" \\\n    \
+             && chmod +x /usr/local/lib/docker/cli-plugins/*\n\
+             RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal -c rustfmt -c clippy --no-modify-path && chmod -R a+w \"$RUSTUP_HOME\" \"$CARGO_HOME\"\n\
+             RUN case \"$(dpkg --print-architecture)\" in amd64) a=x64 ;; arm64) a=arm64 ;; *) a=\"$(dpkg --print-architecture)\" ;; esac \\\n    \
+             && f=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | awk -v want=\"linux-$a.tar.xz\" 'substr($2, length($2) - length(want) + 1) == want { print $2 }') \\\n    \
+             && curl -fsSL \"https://nodejs.org/dist/latest-v22.x/$f\" | tar -xJ -C /usr/local --strip-components=1 --exclude CHANGELOG.md --exclude LICENSE --exclude README.md\n",
+        );
+    }
     if let Some((uid, gid)) = user.filter(|(uid, _)| *uid != 0) {
         // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000).
         d.push_str(&format!(
@@ -110,6 +152,11 @@ pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String
              && useradd -m -u {uid} -g {gid} -s /bin/bash runner \\\n    \
              && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner\n"
         ));
+        if !slim {
+            // And the directories setup actions install into without sudo, as GitHub's images
+            // let them (setup-dotnet's /usr/share/dotnet).
+            d.push_str(&format!("RUN mkdir -p /usr/share/dotnet && chown -R {uid}:{gid} /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet\n"));
+        }
     }
     Some(d)
 }
@@ -133,6 +180,22 @@ impl Cli {
         let mut c = Command::new(&self.bin);
         c.args(args).envs(env).env("DOCKER_CONFIG", &self.config);
         c
+    }
+
+    /// The program, arguments and environment that open an interactive shell in `container`
+    /// (W17-R01): bash where it has one, else sh, with `env` passed by name.
+    pub fn shell_argv(&self, container: &str, user: Option<&str>, workdir: &str, env: &BTreeMap<String, String>) -> (Vec<String>, Vec<(String, String)>) {
+        let mut a: Vec<String> = vec![self.bin.clone(), "exec".into(), "-it".into(), "--workdir".into(), workdir.to_owned()];
+        if let Some(u) = user {
+            a.extend(["--user".to_owned(), u.to_owned()]);
+        }
+        for k in env.keys() {
+            a.extend(["-e".to_owned(), k.clone()]);
+        }
+        a.extend([container.to_owned(), "sh".into(), "-c".into(), "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi".into()]);
+        let mut vars: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        vars.push(("DOCKER_CONFIG".into(), self.config.to_string_lossy().into_owned()));
+        (a, vars)
     }
 
     /// Runs the CLI: its standard output, or an error with its standard error.
@@ -219,6 +282,28 @@ pub struct PathMap(Vec<(PathBuf, String)>);
 
 /// The host, as containers reach it (`--add-host host.docker.internal:host-gateway`).
 pub const HOST_ALIAS: &str = "host.docker.internal";
+
+/// `KILN_CONTAINER_NETWORK=host` on a runner: a leg's containers (its job container, services
+/// and Docker actions) share the host's network instead of a network of their own, for machines
+/// whose firewall keeps containers from reaching the host (and so the server on it). Services
+/// are then reached by their names at 127.0.0.1, and legs running at once can't both have a
+/// service on the same port.
+pub fn host_network() -> bool {
+    HOST_NETWORK.load(std::sync::atomic::Ordering::Relaxed) || std::env::var("KILN_CONTAINER_NETWORK").is_ok_and(|v| v.trim().eq_ignore_ascii_case("host"))
+}
+
+static HOST_NETWORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Containers on the host's network from now on, as `KILN_CONTAINER_NETWORK=host` says: for
+/// `kiln workflow run`, whose server listens on loopback (docs/ci.md W17-R06).
+pub fn use_host_network() {
+    HOST_NETWORK.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where `host.docker.internal` points: the host's gateway, or the host itself on its network.
+fn host_alias() -> String {
+    format!("{HOST_ALIAS}:{}", if host_network() { "127.0.0.1" } else { "host-gateway" })
+}
 
 impl PathMap {
     pub fn new(mut pairs: Vec<(PathBuf, String)>) -> PathMap {
@@ -310,9 +395,12 @@ impl Containers {
         let start = crate::util::new_id();
         let short = format!("{leg}_{}", start.get(start.len().saturating_sub(6)..).unwrap_or(&start));
         let label = format!("kiln.leg={leg}");
-        let network = format!("kiln_{short}");
+        let shared = host_network();
+        let network = if shared { s("host") } else { format!("kiln_{short}") };
         let none = BTreeMap::new();
-        cli.run(&[s("network"), s("create"), s("--label"), label.clone(), network.clone()], &none, QUICK).await?;
+        if !shared {
+            cli.run(&[s("network"), s("create"), s("--label"), label.clone(), network.clone()], &none, QUICK).await?;
+        }
         let mut c = Containers { cli, network, label, job: None, services: Vec::new() };
         for spec in services.iter().map(|(_, x)| x).chain(job.iter()) {
             if let Some((u, p)) = &spec.credentials {
@@ -326,9 +414,12 @@ impl Containers {
             }
             say(format!("Starting service {key} ({})", spec.image));
             let image = c.prepare(&spec.image, None, say).await?;
-            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_{key}"), s("--label"), c.label.clone(), s("--network"), c.network.clone(), s("--network-alias"), key.clone()];
-            for p in &spec.ports {
-                args.extend([s("-p"), p.clone()]);
+            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_{key}"), s("--label"), c.label.clone(), s("--network"), c.network.clone()];
+            if !shared {
+                args.extend([s("--network-alias"), key.clone()]);
+                for p in &spec.ports {
+                    args.extend([s("-p"), p.clone()]);
+                }
             }
             let env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
             for k in env.keys() {
@@ -351,15 +442,29 @@ impl Containers {
                 _ => None,
             };
             let image = c.prepare(&spec.image, user, say).await?;
-            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), format!("{HOST_ALIAS}:host-gateway")];
+            let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), host_alias()];
+            if shared {
+                // Services by name, as on a network of the leg's own.
+                for svc in &c.services {
+                    args.extend([s("--add-host"), format!("{}:127.0.0.1", svc.key)]);
+                }
+            }
             if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
                 args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
+                // The runner user reaches it through the socket's group, as the host's user does.
+                if user.is_some()
+                    && let Some(gid) = socket_group()
+                {
+                    args.extend([s("--group-add"), gid.to_string()]);
+                }
             }
             for m in map.mounts() {
                 args.extend([s("-v"), m]);
             }
-            for p in &spec.ports {
-                args.extend([s("-p"), p.clone()]);
+            if !shared {
+                for p in &spec.ports {
+                    args.extend([s("-p"), p.clone()]);
+                }
             }
             let env: BTreeMap<String, String> = spec.env.iter().cloned().collect();
             for k in env.keys() {
@@ -387,7 +492,14 @@ impl Containers {
         }
         for i in 0..c.services.len() {
             let id = c.services.get(i).map(|x| x.id.clone()).unwrap_or_default();
-            let ports = c.ports(&id).await;
+            // On the host's network a service listens on its own ports.
+            let ports = if shared {
+                let key = c.services.get(i).map(|x| x.key.clone()).unwrap_or_default();
+                let spec = services.iter().find(|(k, _)| *k == key).map(|(_, x)| x.ports.clone()).unwrap_or_default();
+                spec.iter().filter_map(|p| p.rsplit(':').next()).map(|p| p.split('/').next().unwrap_or(p)).filter(|p| !p.is_empty()).map(|p| (p.to_owned(), p.to_owned())).collect()
+            } else {
+                c.ports(&id).await
+            };
             if let Some(x) = c.services.get_mut(i) {
                 x.ports = ports;
             }
@@ -415,7 +527,8 @@ impl Containers {
             if self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), QUICK).await.is_ok() {
                 return Ok(tag);
             }
-            let dockerfile = format!("{dockerfile}LABEL kiln.runner-image={image}\n");
+            let owner = user.map_or_else(|| "0".to_owned(), |(uid, _)| uid.to_string());
+            let dockerfile = format!("{dockerfile}LABEL kiln.runner-image={image} kiln.runner-user={owner}\n");
             say(format!("Building kiln's runner image {tag} (once per machine and version)"));
             let dir = self.cli.config.join(format!("image-{}", crate::util::new_id()));
             let d = dir.clone();
@@ -426,11 +539,31 @@ impl Containers {
             .await??;
             let r = self.cli.run(&[s("build"), s("--quiet"), s("-t"), tag.clone(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
             let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
+            if r.is_ok() {
+                self.forget_older(image, &owner, &tag).await;
+            }
             return r.map(|_| tag);
         }
         say(format!("{} pull {image}", self.cli.bin));
         self.cli.run(&[s("pull"), s("--quiet"), image.to_owned()], &BTreeMap::new(), SLOW).await?;
         Ok(image.to_owned())
+    }
+
+    /// Removes this user's earlier builds of runner image `image`, all but `keep`; one a
+    /// container still uses stays until a later build.
+    async fn forget_older(&self, image: &str, owner: &str, keep: &str) {
+        let none = BTreeMap::new();
+        let filters = [s("--filter"), format!("label=kiln.runner-image={image}"), s("--filter"), format!("label=kiln.runner-user={owner}")];
+        let mut args = vec![s("image"), s("ls")];
+        args.extend(filters);
+        args.extend([s("--format"), s("{{.Repository}}:{{.Tag}}")]);
+        let Ok(out) = self.cli.run(&args, &none, QUICK).await else { return };
+        let old: Vec<String> = out.lines().map(str::trim).filter(|t| !t.is_empty() && *t != keep && !t.ends_with(":<none>")).map(str::to_owned).collect();
+        for t in old {
+            if self.cli.run(&[s("image"), s("rm"), t.clone()], &none, QUICK).await.is_ok() {
+                tracing::info!(image = %t, "removed an older build of a runner image");
+            }
+        }
     }
 
     async fn image_path(&self, image: &str) -> Option<String> {
@@ -489,7 +622,9 @@ impl Containers {
                 tracing::warn!(error = %format!("{e:#}"), "the leg's containers could not be removed");
             }
         }
-        if let Err(e) = self.cli.run(&[s("network"), s("rm"), self.network.clone()], &none, QUICK).await {
+        if self.network != "host"
+            && let Err(e) = self.cli.run(&[s("network"), s("rm"), self.network.clone()], &none, QUICK).await
+        {
             tracing::warn!(error = %format!("{e:#}"), "the leg's network could not be removed");
         }
     }
@@ -532,9 +667,11 @@ pub async fn action_image(cli: &Cli, dir: &Path, image: &str, tag: &str, say: &(
 /// come by name from `env`).
 #[allow(clippy::too_many_arguments)]
 pub fn action_run_args(name: &str, label: &str, network: Option<&str>, mounts: &[String], env: &BTreeMap<String, String>, entrypoint: Option<&str>, image: &str, args: &[String]) -> Vec<String> {
-    let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned(), s("--label"), label.to_owned(), s("--workdir"), s("/github/workspace"), s("--add-host"), format!("{HOST_ALIAS}:host-gateway")];
+    let mut a = vec![s("run"), s("--rm"), s("--name"), name.to_owned(), s("--label"), label.to_owned(), s("--workdir"), s("/github/workspace"), s("--add-host"), host_alias()];
     if let Some(n) = network {
         a.extend([s("--network"), n.to_owned()]);
+    } else if host_network() {
+        a.extend([s("--network"), s("host")]);
     }
     if Path::new("/var/run/docker.sock").exists() {
         a.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
@@ -559,18 +696,26 @@ mod tests {
 
     #[test]
     fn runner_images_have_a_dockerfile() {
-        let d = runner_dockerfile("kiln/runner-ubuntu-24.04", None).unwrap_or_default();
+        let d = runner_dockerfile("kiln/runner-ubuntu-24.04-slim", None).unwrap_or_default();
         assert!(d.starts_with("FROM ubuntu:24.04\n"), "{d}");
         assert!(d.contains("apt-get install -y --no-install-recommends ca-certificates"), "{d}");
         assert!(d.contains(" \\\n    build-essential"), "line continuations: {d}");
         assert!(d.trim_end().ends_with("rm -rf /var/lib/apt/lists/*"), "{d}");
         assert!(d.contains(" ImageOS=ubuntu24\n"), "{d}");
+        // The full image: GitHub's toolchains that workflows call without a setup action.
+        let full = runner_dockerfile("kiln/runner-ubuntu-24.04", None).unwrap_or_default();
+        assert!(full.starts_with(&d), "the full image starts as the slim one");
+        for tool in ["cmake", "clang", "maven", "ant", "sbt", "composer", "ruby-full", "ruby-bundler", "leiningen", "sh.rustup.rs", "nodejs.org/dist/latest-v22.x", "JAVA_HOME=", "Assume-Yes", "docker-buildx", "docker-compose"] {
+            assert!(full.contains(tool) && !d.contains(tool), "{tool}");
+        }
+        assert!(full.lines().filter(|l| l.ends_with('\\')).all(|l| l.ends_with(" \\")), "continuations: {full}");
         assert!(runner_dockerfile("kiln/runner-ubuntu-22.04", None).unwrap_or_default().contains(" ImageOS=ubuntu22\n"));
         assert!(runner_dockerfile("ubuntu:24.04", None).is_none());
         assert!(runner_dockerfile("kiln/runner-centos", None).is_none());
         // The host's user, with sudo; root stays root.
         let u = runner_dockerfile("kiln/runner-ubuntu-24.04", Some((1000, 1000))).unwrap_or_default();
         assert!(u.contains("useradd -m -u 1000 -g 1000 -s /bin/bash runner") && u.contains("NOPASSWD:ALL"), "{u}");
+        assert!(u.trim_end().ends_with("chown -R 1000:1000 /usr/local/cargo /usr/local/rustup /usr/local/lib/node_modules /usr/local/bin /usr/share/dotnet"), "{u}");
         assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
     }
 

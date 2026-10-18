@@ -27,6 +27,7 @@ pub mod host;
 pub mod kinds;
 pub mod model;
 pub mod moving;
+pub mod pause;
 pub mod registry;
 pub mod relocate;
 pub mod screen;

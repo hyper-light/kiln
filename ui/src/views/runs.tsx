@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
-import { GitBranch, Search, Activity } from "lucide-react";
+import { ChartLine, GitBranch, Search, Activity } from "lucide-react";
 import { api } from "@/api/client";
 import { useServerEvents } from "@/api/events";
 import type { Repo, Run, Status } from "@/api/types";
@@ -32,7 +32,19 @@ export default function Runs() {
   return (
     <div className="container-console page">
       <title>Runs · kiln</title>
-      <PageIntro index={2} label="Runs" title="Runs" lead="Every pipeline run across your repositories, newest first. Filters stay in the URL so you can share a view." />
+      <PageIntro
+        index={2}
+        label="Runs"
+        title="Runs"
+        lead="Every pipeline run across your repositories, newest first. Filters stay in the URL so you can share a view."
+        actions={
+          <Button asChild variant="secondary" size="sm">
+            <Link to="/insights">
+              <ChartLine /> Insights
+            </Link>
+          </Button>
+        }
+      />
       <Loadable label="runs" fallback={<RunsHold />}>
         <RunsBody />
       </Loadable>

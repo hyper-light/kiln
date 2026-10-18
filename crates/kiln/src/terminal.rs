@@ -108,10 +108,34 @@ pub fn spawn_with(
     rows: u16,
     env: &[(&str, String)],
 ) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
+    spawn_at(shell, command, None, None, cols, rows, env)
+}
+
+/// [`spawn_with`], starting in `cwd` (else the home directory), or running `program` (its path
+/// and arguments) instead of a shell.
+pub fn spawn_at(
+    shell: Option<&str>,
+    command: Option<&str>,
+    program: Option<&[String]>,
+    cwd: Option<&std::path::Path>,
+    cols: u16,
+    rows: u16,
+    env: &[(&str, String)],
+) -> anyhow::Result<(PtySession, async_channel::Receiver<PtyOut>)> {
     let pty = native_pty_system().openpty(size(cols, rows))?;
     let shell = default_shell(shell);
-    let mut cmd = CommandBuilder::new(&shell);
-    cmd.args(shell_args(&shell, command));
+    let mut cmd = match program.and_then(|p| p.split_first()) {
+        Some((prog, args)) => {
+            let mut c = CommandBuilder::new(prog);
+            c.args(args);
+            c
+        }
+        None => {
+            let mut c = CommandBuilder::new(&shell);
+            c.args(shell_args(&shell, command));
+            c
+        }
+    };
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("KILN_TERMINAL", "1");
@@ -131,7 +155,7 @@ pub fn spawn_with(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.cwd(crate::os::home_dir());
+    cmd.cwd(cwd.map_or_else(crate::os::home_dir, std::path::Path::to_path_buf));
     let io = crate::os::pty::PtyIo::new(pty.master.as_ref()).context("PTY master")?;
     let child = pty.slave.spawn_command(cmd)?;
     drop(pty.slave);

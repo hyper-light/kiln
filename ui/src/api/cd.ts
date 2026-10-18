@@ -1,9 +1,14 @@
 /** Deployments (docs/cd.md): the /api/cd routes, each an operation of the server's one table. */
 import { request } from "./client";
 import type {
+  CdAdoption,
   CdApp,
   CdAppDetail,
   CdCluster,
+  CdDiscovery,
+  CdProvider,
+  CdTarget,
+  CdValidation,
   CdDeployment,
   CdDiff,
   CdEvent,
@@ -110,6 +115,18 @@ export const cdApi = {
   plan: (ask: CdPlanAsk, signal?: AbortSignal) => request<CdPlan>("POST", "/api/cd/plans", ask, { signal }),
   /** The repositories apps deploy from, with their branches. */
   planRepos: (signal?: AbortSignal) => request<{ repos: CdPlanRepo[] }>("GET", "/api/cd/plans/repos", undefined, { signal }),
+  /** Every platform kiln deploys to (docs/cd-targets.md §3), with the accounts that could serve each. */
+  providers: (signal?: AbortSignal) => request<{ providers: CdProvider[] }>("GET", "/api/cd/providers", undefined, { signal }),
+  /** The targets apps deploy to, connected or why not. */
+  targets: (signal?: AbortSignal) => request<{ targets: CdTarget[] }>("GET", "/api/cd/targets", undefined, { signal }),
+  /** What an account holds there. */
+  discover: (q: Record<string, string>, signal?: AbortSignal) => request<CdDiscovery>("GET", `/api/cd/discover${qs(q)}`, undefined, { signal }),
+  /** One resource as it runs, as the definition that adopts it. */
+  adopt: (q: Record<string, string>, signal?: AbortSignal) => request<CdAdoption>("GET", `/api/cd/discover${qs(q)}`, undefined, { signal }),
+  /** A deploy file checked as kiln reads it, provider apps rendered from `repo` at trunk. */
+  validate: (body: { deploy: string; environments?: string; repo?: string }) => request<CdValidation>("POST", "/api/cd/validate", body),
+  /** The apps a deploy file defines, kept in kiln rather than in the repository. */
+  keep: (body: { deploy: string; environments?: string; repo: string }) => request<{ apps: string[] }>("POST", "/api/cd/ops/cd.apps.keep", body),
 };
 
 /** The route of an app's page. */
@@ -117,3 +134,6 @@ export const appHref = (id: string) => `/deployments/apps/${id.split("/").map(en
 
 /** The route of the deploy plans page. */
 export const plansHref = "/deployments/plans";
+
+/** The route of the new app builder. */
+export const newAppHref = "/deployments/new";

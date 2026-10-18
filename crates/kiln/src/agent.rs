@@ -42,6 +42,9 @@ pub struct Opts {
     pub ephemeral: bool,
     pub dedicated_job: Option<String>,
     pub terminal: bool,
+    /// Terminals into CI legs (docs/ci.md W17-R01): a runner's follow its terminal switch; the
+    /// server's in-process runner's follow `[terminal] enabled`.
+    pub job_terminal: bool,
     pub shell: Option<String>,
     /// In-process agent: credentials handed over directly, no enrollment.
     pub credentials: Option<(Vec<u8>, Leaf)>,
@@ -54,13 +57,23 @@ pub struct Opts {
     /// Observe (`crate::observe`): whether this runner keeps a replica of the observe group and
     /// writes into it (off in a job pod and in the server's own in-process agent).
     pub observe: bool,
+    /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
+    /// installed. Its terminals, AI sessions and agents work; it takes no jobs, keeps no front
+    /// door or repo copies, and is never upgraded by the server.
+    pub outpost: bool,
 }
+
+/// Why an outpost turns a job down (an older server may still hand it one).
+const OUTPOST_TAKES_NO_JOBS: &str = "an outpost takes no jobs";
 
 #[derive(Serialize, Deserialize)]
 pub struct EnrollRequest {
     pub token: String,
     pub name: String,
     pub csr: String,
+    /// The machine's hostname: an outpost enrolling again keeps its name ([`crate::api`]).
+    #[serde(default)]
+    pub hostname: String,
 }
 
 /// `POST /api/agents/instance`: see `api::enroll_instance`.
@@ -117,7 +130,7 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
     loop {
         let r = http
             .post(&url)
-            .json(&EnrollRequest { token: token.clone(), name: o.name.clone(), csr: csr.clone() })
+            .json(&EnrollRequest { token: token.clone(), name: o.name.clone(), csr: csr.clone(), hostname: crate::config::Config::hostname() })
             .send()
             .await;
         match r {
@@ -253,7 +266,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let http = Arc::new(Client::new(Roots::WebPkiPlusDer(ca.clone()), None)?);
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
-    let front_door = (!o.ephemeral).then(|| {
+    let front_door = (!o.ephemeral && !o.outpost).then(|| {
         crate::frontdoor::runner::start(
             crate::frontdoor::runner::Ctx { dir: o.state_dir.join("front-door"), server_url: o.server_url.clone(), ca_der: ca.clone() },
             &shutdown,
@@ -266,8 +279,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let mut paths = crate::tunnel::Paths::new(&o.server_url, &quic_addr);
 
     let (up_tx, up_rx) = async_channel::bounded::<Up>(8192);
-    // Repo sync: the copies of synced repos this machine holds (none in a job pod).
-    let sync = (!o.ephemeral).then(|| {
+    // Repo sync: the copies of synced repos this machine holds (none in a job pod or an outpost).
+    let sync = (!o.ephemeral && !o.outpost).then(|| {
         let (sync, said) = crate::sync::runner::Runner::start(&o.state_dir, &name, http.clone(), o.server_url.clone());
         let up = up_tx.clone();
         crate::rt::spawn(async move {
@@ -412,7 +425,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         protocol: proto::VERSION,
         name: name.clone(),
         labels: o.labels.clone(),
-        slots: o.slots.max(1),
+        // An outpost takes no jobs: none of its slots are free (`Hub::pick_agent`).
+        slots: if o.outpost { 0 } else { o.slots.max(1) },
         hostname: crate::config::Config::hostname(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
@@ -496,6 +510,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         exe_mtime = now;
                     }
                 }
+                // Terminals into legs close once their leg ends, or is let go when kept (W17-AC01).
+                let gone: Vec<String> = terms.iter().filter(|(_, (_, st))| st.target.strip_prefix("leg:").is_some_and(|job| !crate::runner::kept::live(job))).map(|(id, _)| id.clone()).collect();
+                for session in gone {
+                    terms.remove(&session);
+                    uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg ended".into()) })).await.ok();
+                }
                 // A dial that never resolves (no Connected / Closed / Unreachable) would leave the
                 // agent waiting forever, e.g. after dialing before the network existed at boot.
                 // Treat it as failed: rebuild the endpoint on a fresh socket and dial again.
@@ -541,9 +561,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if let Ok(b) = proto::encode(&msg) {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                // Which build this is and that it takes upgrade commands (an older server skips it).
+                // Which build this is and that it takes upgrade commands (an older server skips it);
+                // an outpost says it's one instead.
+                let build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
                 if !o.ephemeral
-                    && let Ok(b) = proto::encode(&match crate::updates::runner_build() {
+                    && let Ok(b) = proto::encode(&match build {
                         // A runner that keeps no replica does not say it replicates.
                         AgentMsg::Build { build, caps } if observe.is_none() => AgentMsg::Build { build, caps: caps & !proto::CAP_OBSERVE },
                         m => m,
@@ -551,8 +573,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                 }
-                // The kiln it runs, so the server knows its commit (`crate::fleet`).
+                // The kiln it runs, so the server knows its commit (`crate::fleet`; outposts aren't
+                // part of the fleet).
                 if !o.ephemeral
+                    && !o.outpost
                     && let Ok(b) = proto::encode(&crate::updates::runner_facts())
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
@@ -680,8 +704,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         a.server_url = o.server_url.clone();
                         let id = a.job_id.clone();
                         let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
-                        if draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
-                            let reason = if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
+                        if o.outpost || draining || upgrade_pending || full || exclusive || (a.spec.exclusive && !jobs.is_empty()) || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
@@ -881,6 +905,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             h.close(&session);
                         }
                     }
+                    ServerMsg::Upgrade { job, path, sha256, size } if o.outpost => {
+                        // Nothing of an outpost is installed: its next kiln is the one downloaded next.
+                        let _ = (path, sha256, size);
+                        let error = Some("an outpost isn't installed, so the server doesn't upgrade it".to_owned());
+                        uplink.msg(AgentMsg::UpgradeDone { job, ok: false, error }).await;
+                    }
                     ServerMsg::Upgrade { job, path, sha256, size } => {
                         // Fetch the new binary from the server and install it beside or over this
                         // runner (`install --agent --upgrade`); nothing running here is stopped.
@@ -966,8 +996,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         };
                         let id = a.job_id.clone();
                         let full = u32::try_from(jobs.len()).unwrap_or(u32::MAX) >= o.slots.max(1);
-                        if draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
-                            let reason = if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
+                        if o.outpost || draining || upgrade_pending || full || exclusive || jobs.contains_key(&id) {
+                            let reason = if o.outpost { OUTPOST_TAKES_NO_JOBS } else if draining { "draining" } else if upgrade_pending { "upgrading" } else { "no free slot" };
                             uplink.msg(AgentMsg::Reject { job: id, reason: reason.into() }).await;
                             continue;
                         }
@@ -1008,8 +1038,97 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
                         }
                     }
-                    // The rest of CI's messages (W13, W17) land with their workstreams.
-                    ServerMsg::SecretsFor { .. } | ServerMsg::JobTerminalOpen { .. } | ServerMsg::KeepRelease { .. } => {
+                    // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
+                    // there (W17-R05): its workspace and environment, or its container; the leg's
+                    // secrets masked in what it shows.
+                    m @ (ServerMsg::JobTerminalOpen { .. } | ServerMsg::JobExec { .. }) => {
+                        let (job, session, cols, rows, command) = match m {
+                            ServerMsg::JobTerminalOpen { job, session, cols, rows } => (job, session, cols, rows, None),
+                            ServerMsg::JobExec { job, session, command } => (job, session, 200, 50, Some(command)),
+                            _ => continue,
+                        };
+                        if !o.job_terminal {
+                            uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("terminal disabled on this agent".into()) })).await.ok();
+                            continue;
+                        }
+                        if terms.contains_key(&session) {
+                            continue;
+                        }
+                        let Some(shell) = crate::runner::kept::shell(&job) else {
+                            uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some("the leg isn't running or kept on this runner".into()) })).await.ok();
+                            continue;
+                        };
+                        let (program, env) = match (&shell.exec, &command) {
+                            (Some(_), Some(c)) => shell.exec_with(c).map_or((None, Vec::new()), |(argv, env)| (Some(argv), env)),
+                            (Some((argv, env)), None) => (Some(argv.clone()), env.clone()),
+                            (None, _) => (None, shell.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+                        };
+                        let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+                        let cwd = program.is_none().then_some(shell.workdir.as_path());
+                        // A command runs as a step would, in bash; a terminal opens the runner's shell.
+                        let sh = if command.is_some() && !cfg!(windows) { Some("bash") } else { o.shell.as_deref() };
+                        let cmd = command.as_deref().filter(|_| program.is_none());
+                        match terminal::spawn_at(sh, cmd, program.as_deref(), cwd, cols, rows, &env) {
+                            Ok((pty, rx)) => {
+                                let tx = term_tx.clone();
+                                let s = session.clone();
+                                let mut masker = kiln_ci::runner::mask::Masker::new(&shell.masks);
+                                crate::rt::spawn(async move {
+                                    // The masker holds back what could be the start of a secret (as
+                                    // long as the leg's longest, a token of a kilobyte); a terminal
+                                    // shows the rest, masked, as soon as output pauses.
+                                    loop {
+                                        let out = match crate::rt::timeout(std::time::Duration::from_millis(25), rx.recv()).await {
+                                            Ok(Ok(out)) => out,
+                                            Ok(Err(_)) => break,
+                                            Err(_) => {
+                                                let held = masker.finish();
+                                                if !held.is_empty() && tx.send((s.clone(), PtyOut::Data(held))).await.is_err() {
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                        };
+                                        let (out, exit) = match out {
+                                            PtyOut::Data(d) => (PtyOut::Data(masker.push(&d)), false),
+                                            PtyOut::Exit(code) => {
+                                                let rest = masker.finish();
+                                                if !rest.is_empty() && tx.send((s.clone(), PtyOut::Data(rest))).await.is_err() {
+                                                    break;
+                                                }
+                                                (PtyOut::Exit(code), true)
+                                            }
+                                        };
+                                        let empty = matches!(&out, PtyOut::Data(d) if d.is_empty());
+                                        if (!empty && tx.send((s.clone(), out)).await.is_err()) || exit {
+                                            break;
+                                        }
+                                    }
+                                });
+                                let state = crate::termsess::Session::detached(session.clone(), format!("leg:{job}"), None, cols, rows);
+                                terms.insert(session, (pty, state));
+                            }
+                            Err(e) => {
+                                uplink.0.send(Up::Term(AgentMsg::TermExit { session, code: None, error: Some(format!("{e:#}")) })).await.ok();
+                            }
+                        }
+                    }
+                    // A kept leg let go now, or kept longer (W17-R02).
+                    ServerMsg::KeepRelease { job } => {
+                        crate::rt::spawn(async move {
+                            crate::runner::kept::release(&job).await;
+                        });
+                    }
+                    ServerMsg::KeepExtend { job, minutes } => {
+                        crate::runner::kept::extend(&job, minutes);
+                    }
+                    ServerMsg::JobRerunStep { job, step, idx } => {
+                        if !crate::runner::runtime::rerun_step(&job, step, idx) {
+                            tracing::info!(leg = %job, "a step rerun for a leg that isn't kept here");
+                        }
+                    }
+                    // The rest of CI's messages (W09, W13) land with their workstreams.
+                    ServerMsg::SecretsFor { .. } => {
                         tracing::debug!("ignoring a CI message this runner does not take yet");
                     }
                 }
@@ -1129,7 +1248,9 @@ const HARNESS_FRAME: usize = 512 * 1024;
 
 /// An agent-session update as frames that fit: a long run of events goes in parts (events are
 /// upserts by id, so the parts mean what the whole did), and an event too large on its own has
-/// its longest texts cut, saying so. Anything else too large is dropped, and logged.
+/// its longest texts cut, saying so. Anything else too large (a state, the changeset) is cut the
+/// same way: dropped, its page would go on showing what no longer is, the agent looking stuck.
+/// Only what still doesn't fit is dropped, and logged.
 fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
     use crate::harness::core::Update;
     let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
@@ -1137,8 +1258,17 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
         return vec![json];
     }
     let Update::Events { events } = u else {
-        tracing::warn!(session, bytes = json.len(), "agent session update too large to send; dropped");
-        return Vec::new();
+        let fitted = serde_json::to_value(u).ok().map(|v| cut_value(v, HARNESS_FRAME - 1024)).and_then(|v| serde_json::to_string(&v).ok());
+        return match fitted {
+            Some(j) if j.len() <= HARNESS_FRAME => {
+                tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session update cut to fit");
+                vec![j]
+            }
+            _ => {
+                tracing::warn!(session, bytes = json.len(), "agent session update too large to send, even cut; dropped");
+                Vec::new()
+            }
+        };
     };
     let one = HARNESS_FRAME - 1024;
     let mut frames = Vec::new();
@@ -1173,7 +1303,12 @@ fn json_len<T: Serialize>(v: &T) -> usize {
 
 /// An event cut to about `budget` bytes of JSON: its longest texts shortened, each saying so.
 fn cut(e: crate::harness::model::Event, budget: usize) -> crate::harness::model::Event {
-    let Ok(mut v) = serde_json::to_value(&e) else { return e };
+    let Ok(v) = serde_json::to_value(&e) else { return e };
+    serde_json::from_value(cut_value(v, budget)).unwrap_or(e)
+}
+
+/// JSON cut to about `budget` bytes: its longest texts shortened, each saying so.
+fn cut_value(mut v: serde_json::Value, budget: usize) -> serde_json::Value {
     for _ in 0..64 {
         let len = json_len(&v);
         if len <= budget {
@@ -1193,7 +1328,7 @@ fn cut(e: crate::harness::model::Event, budget: usize) -> crate::harness::model:
         s.truncate(at);
         s.push_str(&format!("\n… [{dropped} bytes cut by kiln to fit]"));
     }
-    serde_json::from_value(v).unwrap_or(e)
+    v
 }
 
 /// The JSON pointer of the longest string in `v`.
@@ -1361,5 +1496,22 @@ mod tests {
             _ => "",
         };
         assert!(text.starts_with("start ") && text.ends_with("bytes cut by kiln to fit]"), "{}", text.get(..40).unwrap_or(text));
+    }
+
+    #[test]
+    fn a_state_too_large_is_cut_not_dropped() {
+        use crate::harness::model::{State, Status};
+        // Dropped, its page would go on showing a turn under way that no longer is.
+        let state = State { status: Status::Idle, summary: format!("begin {}", "x".repeat(900_000)), ..State::default() };
+        let frames = harness_frames("s", &Update::State { state: Box::new(state) });
+        assert_eq!(frames.len(), 1);
+        assert!(frames.iter().all(|f| f.len() <= HARNESS_FRAME));
+        let state = match serde_json::from_str::<Update>(frames.first().map_or("", String::as_str)) {
+            Ok(Update::State { state }) => Some(state),
+            _ => None,
+        };
+        assert!(state.as_ref().is_some_and(|s| s.status == Status::Idle), "the state, whole");
+        let summary = state.map(|s| s.summary).unwrap_or_default();
+        assert!(summary.starts_with("begin ") && summary.ends_with("bytes cut by kiln to fit]"));
     }
 }

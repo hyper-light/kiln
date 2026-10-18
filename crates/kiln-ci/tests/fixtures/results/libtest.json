@@ -1,0 +1,7 @@
+{ "type": "suite", "event": "started", "test_count": 3 }
+{ "type": "test", "event": "started", "name": "tests::adds" }
+{ "type": "test", "event": "started", "name": "tests::divides" }
+{ "type": "test", "name": "tests::adds", "event": "ok", "exec_time": 0.001 }
+{ "type": "test", "name": "tests::divides", "event": "failed", "exec_time": 0.002, "stdout": "\nthread 'tests::divides' panicked at src/lib.rs:20:9:\nassertion `left == right` failed\n  left: 3\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+{ "type": "test", "name": "tests::later", "event": "ignored" }
+{ "type": "suite", "event": "failed", "passed": 1, "failed": 1, "ignored": 1, "measured": 0, "filtered_out": 0, "exec_time": 0.004 }

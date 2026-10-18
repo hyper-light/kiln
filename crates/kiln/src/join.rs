@@ -996,11 +996,13 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             ephemeral: false,
             dedicated_job: None,
             terminal: true,
+            job_terminal: true,
             shell: None,
             credentials: None,
             instance: None,
             reach: Some(true),
             observe: true,
+            outpost: false,
         }));
     }
     crate::install::install(crate::install::InstallArgs {

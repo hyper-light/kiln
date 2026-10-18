@@ -8,6 +8,8 @@
  *
  *   MOCK_NO_SYNCED=1   its socket doesn't end the snapshot with {"t":"synced"} (servers before it)
  *   MOCK_SLOW_SNAPSHOT=ms   frames of the snapshot are sent this far apart (a slow link)
+ *   MOCK_PAUSED=1   it is paused for a usage limit (the 5-hour window, resetting in 47 minutes) with
+ *                   two messages queued, after an older build said the limit seven times in a row
  *   MOCK_LATE_SESSION=ms   for this long after the mock starts, it doesn't know the session (as a
  *                          restarted server before the session's machine reconnects): its socket
  *                          says {"t":"closed"}; then the session is announced on /api/events
@@ -158,6 +160,42 @@ add({
 });
 let live = add({ id: "L-a-live", at: LIVE_AT + 5_000, kind: "assistant", text: "Working through the reconnect path:", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
 
+const PAUSED = process.env.MOCK_PAUSED === "1";
+const PAUSED_UNTIL = Date.now() + 47 * 60_000;
+if (PAUSED) {
+  live.streaming = false;
+  for (let i = 0; i < 7; i++) add({ id: `L-limit-${i}`, at: LIVE_AT + 6_000 + i, kind: "notice", level: "error", text: "You've hit your session limit · resets 10:30pm (America/Los_Angeles)" });
+  add({
+    id: "pause-1",
+    at: LIVE_AT + 7_000,
+    kind: "notice",
+    level: "warn",
+    text: "Paused: You've hit your session limit · resets 10:30pm (America/Los_Angeles). Queued messages and goals wait; it goes on by itself once the limit resets.",
+  });
+}
+const pause = (): State["pause"] =>
+  PAUSED
+    ? {
+        reason: "limit",
+        window: "five_hour",
+        label: "Session",
+        said: "You've hit your session limit · resets 10:30pm (America/Los_Angeles)",
+        until: PAUSED_UNTIL,
+        since: LIVE_AT + 7_000,
+        auto: true,
+        by: "harness",
+        cut: { message: "L-u-live", text: "Is the client still cancel-safe?", at: LIVE_AT + 7_000 },
+        checkpoint: { git_ref: "refs/kiln/checkpoints/demo-long/1792300000000", commit: "4f1c2a9e07b3d5c6a8e9f0b1c2d3e4f5a6b7c8d9", at: LIVE_AT + 8_000 },
+      }
+    : undefined;
+const limits = (): State["limits"] =>
+  PAUSED
+    ? [
+        { id: "five_hour", label: "Session", used_percent: 100, resets_at: PAUSED_UNTIL, window: "5h", status: "rejected" },
+        { id: "seven_day", label: "Weekly", used_percent: 62, resets_at: PAUSED_UNTIL + 3 * 86_400_000, window: "7d" },
+      ]
+    : undefined;
+
 const info: AgentInfo = {
   id: ID,
   kind: "claude",
@@ -166,7 +204,7 @@ const info: AgentInfo = {
   name: "Retry storm",
   cwd: "/home/ada/src/kiln",
   created_at: T0,
-  status: "running",
+  status: PAUSED ? "idle" : "running",
   title: "Retry backoff rework",
   model: "claude-opus-5-5",
   mode: "acceptEdits",
@@ -175,6 +213,8 @@ const info: AgentInfo = {
   tasks_running: 0,
   cost_usd: 4.21,
   last_activity: LIVE_AT,
+  pause: pause(),
+  limits: limits(),
 };
 
 const meta: Meta = {
@@ -197,8 +237,14 @@ const meta: Meta = {
 
 let activity = "Running cargo test";
 let effort = "high";
+// A long think under way, as the harness reports it (`doing`, since `turn_started`); an interrupt
+// doesn't take (so a stop can be forced), and a forced stop ends the turn.
+let running = !PAUSED;
+const turnStarted = Date.now() - 134_000;
 const state = (): State => ({
-  status: "running",
+  status: running ? "running" : "idle",
+  doing: running ? "Thinking" : undefined,
+  turn_started: running ? turnStarted : undefined,
   cwd: info.cwd,
   model: info.model,
   mode: info.mode,
@@ -206,12 +252,19 @@ const state = (): State => ({
   title: info.title,
   activity,
   approvals: [],
-  queue: [],
+  queue: PAUSED
+    ? [
+        { id: "q1", text: "Then run the whole suite again.", at: LIVE_AT + 7_500 },
+        { id: "q2", text: "Write it up for the changelog.", at: LIVE_AT + 7_600 },
+      ]
+    : [],
   delivery: {},
   tasks: [],
   todos: [],
   usage: { cost_usd: 4.21, input_tokens: 812_000, output_tokens: 64_000, cache_read_tokens: 5_100_000, turns: TURNS + 1 },
   dropped: 0,
+  pause: pause(),
+  limits: limits(),
 });
 
 const viewers = new Set<WebSocket>();
@@ -230,7 +283,7 @@ let timer: NodeJS.Timeout | null = null;
 
 /** While anyone watches: the reply streams, and now and then it stops to take a step and goes on after it (as a harness's turn does). */
 function tick() {
-  if (viewers.size === 0) {
+  if (viewers.size === 0 || PAUSED) {
     timer = null;
     return;
   }
@@ -313,6 +366,7 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
     if (c.type === "set_mode" && c.mode) info.mode = c.mode;
     else if (c.type === "set_model" && c.model) info.model = c.model;
     else if (c.type === "set_effort" && c.effort) effort = c.effort;
+    else if (c.type === "force_stop") running = false;
     else if (c.type === "send" && c.text) {
       const e = add({ id: `L-sent-${seq}`, at: Date.now(), kind: "user", text: c.text, client_id: c.id });
       // Steered and sent-now messages show where they went in; a queued one would wait (not modeled).
@@ -326,4 +380,4 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
 }
 
 /** Its row in the agents list. */
-export const longInfo = () => ({ ...info, status: "running" as const, activity, last_activity: Date.now() });
+export const longInfo = () => ({ ...info, status: PAUSED ? ("idle" as const) : ("running" as const), activity, last_activity: Date.now(), pause: pause(), limits: limits() });

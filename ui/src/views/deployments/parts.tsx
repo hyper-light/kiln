@@ -85,7 +85,52 @@ export function opWords(op: CdOperation | null | undefined) {
 export const shortRev = (r: string | null | undefined) => (r ? (/^[0-9a-f]{12,}$/.test(r) ? r.slice(0, 7) : r) : "");
 
 /** An app's place: cluster/namespace. */
-export const placeOf = (a: Pick<CdApp, "cluster" | "namespace">) => [a.cluster, a.namespace].filter(Boolean).join("/");
+/** Providers' names as people know them, for targets beyond Kubernetes (docs/cd-targets.md §3). */
+const PROVIDER_WORDS: Record<string, string> = {
+  "aws-ecs": "ECS",
+  "aws-lambda": "Lambda",
+  "aws-beanstalk": "Elastic Beanstalk",
+  "aws-ec2": "EC2",
+  "aws-static": "S3 + CloudFront",
+  cloudformation: "CloudFormation",
+  "gcp-run": "Cloud Run",
+  "gcp-functions": "Cloud Run functions",
+  "gcp-appengine": "App Engine",
+  "gcp-compute": "Compute Engine",
+  "azure-containerapps": "Container Apps",
+  "azure-functions": "Azure Functions",
+  "azure-appservice": "App Service",
+  "azure-vmss": "Scale Sets",
+  "azure-static": "Static Web Apps",
+  "cloudflare-workers": "Workers",
+  "cloudflare-pages": "Pages",
+  vercel: "Vercel",
+  railway: "Railway",
+  fly: "Fly.io",
+  netlify: "Netlify",
+  render: "Render",
+  heroku: "Heroku",
+  digitalocean: "App Platform",
+  nomad: "Nomad",
+  host: "hosts",
+  compose: "Compose",
+  microvm: "microVMs",
+  terraform: "Terraform",
+  pulumi: "Pulumi",
+  job: "a job",
+};
+
+/**
+ * Where an app runs: `cluster/namespace`, or for a target beyond Kubernetes (its cluster named
+ * `provider/account/place…`) the platform, its place and the account: `ECS · us-east-1 · aws-prod`,
+ * with the provider's scope (an ECS cluster) when it has one.
+ */
+export const placeOf = (a: Pick<CdApp, "cluster" | "namespace">) => {
+  const [provider, account, ...place] = (a.cluster ?? "").split("/");
+  const words = provider ? PROVIDER_WORDS[provider] : undefined;
+  if (words && account) return [words, ...place, account, a.namespace].filter(Boolean).join(" · ");
+  return [a.cluster, a.namespace].filter(Boolean).join("/");
+};
 
 /** An object as people say it: `Deployment web/api`. */
 export const objectLabel = (k: CdResourceKey) => `${k.kind} ${k.namespace ? `${k.namespace}/` : ""}${k.name}`;

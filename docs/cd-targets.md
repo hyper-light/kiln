@@ -736,5 +736,10 @@ Agreed with the Kiln CI work on 2026-10-18:
 | Published images (§7.1, §10): local Docker (loaded into the cluster's nodes by the image pipeline) or a registry, set in the UI (Settings → Deployments) | built; checked on the test cluster |
 | `.kiln/deploy.yaml` from kiln's repositories at trunk, apps registered and removed with the file | built; checked on the test cluster |
 | Agents deploy only where people let them (D6) | built; checked |
-| kiln deploying itself, with the guard (§10) | built; the guard checked on the test cluster; kiln's own move: next |
-| Providers other than Kubernetes, rollouts, the builder | not built yet |
+| kiln deploying itself, with the guard (§10) | built and live (2026-10-18); production's three apps registered from `.kiln/deploy.yaml`, differing from Argo CD's objects only by kiln's tracking marks; the move off Argo CD waits for your go-ahead |
+| Accounts (§6, W11): AWS (SigV4, AssumeRoleWithWebIdentity), Google Cloud (STS, then impersonation), Azure (client assertion) from kiln's identity; Cloudflare and Vercel tokens; Verify; the issuer's documents served while any account federates | built; checked against AWS's signing examples and fakes of each service; no real account yet (D8) |
+| The provider framework (§1, §2): targets as clusters, kinds and scopes, polling (60 s at rest, 3 s while a sync changes a kind), request budgets, what kiln applied kept and read back (drift as §2.4 says), tracking in tags, credentials per app's workload | built; checked against fakes |
+| Workflow artifacts (§7): a file a run uploaded, by its hash; zips opened; Lambda zips through kiln's bucket in the account | built; checked against fakes |
+| `aws-ecs`, `aws-lambda`, `cloudflare-workers` (Durable Object migrations, deletes confirmed in git), `vercel` (prebuilt output) | built; each driven through its whole life (create, change, drift, delete) against a fake of its API; not yet against a real account (D8) |
+| The builder (§8.2): New app on Deployments (platform, account, discovery and adoption, settings, artifacts, sync, the YAML checked and rendered, kept in kiln); Settings → Deployments → Accounts | built; typechecked and linted, not yet walked through in a browser |
+| Import in bulk and shadow mode for providers (§8.3), rollouts and analysis (§5), the rest of §3's providers (M2 to M4) | not built yet |

@@ -76,9 +76,13 @@ fn steps_uses(steps: &[Step], out: &mut Vec<String>) {
     }
 }
 
-/// The policies a run of `repo` answers to: the server's, then the repository's.
+/// The policies a run of `repo` answers to: the server's, then the repository's (its
+/// `.kiln/config.yaml` on the default branch, and one set through the API).
 pub async fn policies(hub: &Hub, repo: &Repo) -> Vec<Policy> {
     let mut out = vec![hub.cfg.ci.actions.policy()];
+    if let Some(p) = super::repo_config::load(hub, repo).await.actions {
+        out.push(p);
+    }
     let id = repo.id.clone();
     let own: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT policy FROM ci_action_policies WHERE repo_id = ?1", [&id], |r| r.get(0)).optional()?)).await.unwrap_or_default();
     if let Some(p) = own.and_then(|t| serde_json::from_str::<Policy>(&t).ok()) {
@@ -138,6 +142,15 @@ pub async fn resolve(hub: &Hub, repo: &Repo, sha: &str, wf: &Workflow) -> Result
     let mut shas: BTreeMap<(String, String), String> = BTreeMap::new();
     while let Some((uses, depth)) = todo.pop() {
         if out.contains_key(&uses) {
+            continue;
+        }
+        // kiln's own actions (W07-R10) run on the runner itself: nothing to fetch or pin, and no
+        // repository by that name is ever asked for.
+        if crate::runner::builtins::is_kiln(&uses) {
+            if crate::runner::builtins::builtin(&uses).is_none() {
+                let names: Vec<String> = crate::runner::builtins::BUILTINS.iter().map(|b| format!("kiln/{}@v1", b.name)).collect();
+                return Err(format!("`{uses}` isn't one of kiln's built-in actions: {}", names.join(", ")));
+            }
             continue;
         }
         allowed(&uses)?;
@@ -311,7 +324,15 @@ pub async fn tarball(hub: &Arc<Hub>, rest: &[&str], req: &Request) -> Result<Res
 pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::collections::HashMap<String, String>, body: Value) -> Result<Response, Fail> {
     let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     match (method, rest) {
-        (&http::Method::GET, []) => Ok(srv::json(StatusCode::OK, &json!({ "actions": catalog(hub, q.get("q").map(String::as_str).unwrap_or_default()).await }))),
+        (&http::Method::GET, []) => {
+            // The built-ins first, then what the mirrors hold (W07-R12).
+            let want = q.get("q").map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+            let mut list: Vec<Value> = crate::runner::builtins::catalog().as_array().cloned().unwrap_or_default().into_iter().filter(|b| b.get("uses").and_then(Value::as_str).is_some_and(|u| u.contains(&want))).collect();
+            list.extend(catalog(hub, q.get("q").map(String::as_str).unwrap_or_default()).await);
+            Ok(srv::json(StatusCode::OK, &json!({ "actions": list })))
+        }
+        // W07-R10: the built-in actions' metadata.
+        (&http::Method::GET, ["kiln"]) => Ok(srv::json(StatusCode::OK, &json!({ "actions": crate::runner::builtins::catalog() }))),
         (&http::Method::POST, ["sync"]) => {
             let mut done = Vec::new();
             for uses in &hub.cfg.ci.actions.prefetch {
@@ -336,8 +357,11 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::col
             let id = repo.id.clone();
             match *method {
                 http::Method::GET => {
-                    let own = policies(hub, &repo).await.into_iter().nth(1);
-                    Ok(srv::json(StatusCode::OK, &json!({ "server": server, "repository": own })))
+                    let file = super::repo_config::load(hub, &repo).await.actions;
+                    let rid = repo.id.clone();
+                    let set: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT policy FROM ci_action_policies WHERE repo_id = ?1", [&rid], |r| r.get(0)).optional()?)).await.map_err(fail)?;
+                    let own = set.and_then(|t| serde_json::from_str::<Policy>(&t).ok());
+                    Ok(srv::json(StatusCode::OK, &json!({ "server": server, "repository": own, "config_yaml": file })))
                 }
                 http::Method::PUT => {
                     let p: Policy = serde_json::from_value(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("not a policy ({{allow, deny, require_sha_pins}}): {e}")))?;

@@ -123,20 +123,29 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }};
     }
     child!("scheduler", h => h.scheduler_loop());
-    child!("sampler", h => h.sampler_loop());
-    child!("retention", h => h.retention_loop());
-    child!("terminals", h => h.terminal_loop());
-    child!("agent-screens", h => crate::harness::screen::watch(h));
-    child!("goal-stacks", h => crate::goals::run(h));
-    child!("harness", h => crate::harness::registry::Registry::run_local(h));
-    child!("gitops-discover", h => crate::gitops::discover_loop(h));
-    child!("gitops-poll", h => crate::gitops::poll_loop(h));
-    child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
-    if cfg.cd.enabled {
-        child!("cd", h => crate::cd::run(h));
+    // `kiln workflow run`'s own server (docs/ci.md W17-R06) runs CI and nothing else: no polling
+    // or schedules, terminals, agents, sync, fleet or UI.
+    if !cfg.ci.local {
+        child!("sampler", h => h.sampler_loop());
+        child!("retention", h => h.retention_loop());
+        child!("terminals", h => h.terminal_loop());
+        child!("agent-screens", h => crate::harness::screen::watch(h));
+        child!("goal-stacks", h => crate::goals::run(h));
+        child!("harness", h => crate::harness::registry::Registry::run_local(h));
+        child!("gitops-discover", h => crate::gitops::discover_loop(h));
+        child!("gitops-poll", h => crate::gitops::poll_loop(h));
+        child!("gitops-schedule", h => crate::gitops::schedule_loop(h));
+        if cfg.cd.enabled {
+            child!("cd", h => crate::cd::run(h));
+        }
+        child!("sync", h => h.sync_loop());
+        child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
+        child!("in-step", h => crate::updates::in_step_loop(h));
+        child!("ui-server", h => crate::uiserver::run(h));
+        child!("fleet", h => crate::fleet::follow_loop(h));
     }
-    child!("sync", h => h.sync_loop());
-    if cfg.observe.enabled {
+    // Observe (docs/observe.md): not in `kiln workflow run`'s own server, which runs CI alone.
+    if cfg.observe.enabled && !cfg.ci.local {
         let days = |d: u32| std::time::Duration::from_secs(u64::from(d.max(1)) * 86_400);
         let obs = crate::observe::Observe::start(crate::observe::Settings {
             dir: cfg.data("observe"),
@@ -172,10 +181,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             Err(e) => tracing::warn!(error = %e, "observe's ingest token could not be made: OTLP takes the admin token alone"),
         }
     }
-    child!("tailnet-dns", h => crate::frontdoor::tailnet::run(h));
-    child!("in-step", h => crate::updates::in_step_loop(h));
-    child!("ui-server", h => crate::uiserver::run(h));
-    child!("fleet", h => crate::fleet::follow_loop(h));
     // Home-network discovery (multicast DNS): announce this server, list the kiln instances nearby.
     if cfg.discovery.enabled && (cfg.discovery.announce || cfg.discovery.browse) {
         child!("discovery", h => crate::discovery::Discovery::serve(h));
@@ -264,14 +269,18 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             ephemeral: false,
             dedicated_job: None,
             terminal: false, // the server already offers the "local" terminal
+            job_terminal: cfg.terminal.enabled,
             shell: cfg.terminal.shell.clone(),
             credentials: Some(creds),
             instance: None,
             reach: None,
             // The server holds the group's store itself.
             observe: false,
+            outpost: false,
         };
-        sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), shutdown_child()));
+        // `kiln workflow run`'s server stops its runner itself, once the runs it follows ended.
+        let agent_down = if cfg.ci.local { shutdown.clone() } else { shutdown_child() };
+        sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), agent_down.clone()));
     }
 
     tracing::info!(
@@ -279,7 +288,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         data = %cfg.server.data_dir.display(),
         "kiln server started"
     );
-    if !std::env::var("KILN_SUPERVISED").is_ok_and(|v| v == "1") {
+    if !cfg.ci.local && !std::env::var("KILN_SUPERVISED").is_ok_and(|v| v == "1") {
         tracing::info!("tip: run under `kiln supervise -- server` (or `kiln install`) for automatic restarts");
     }
     shutdown.cancelled().await;

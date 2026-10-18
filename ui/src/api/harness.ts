@@ -298,6 +298,41 @@ export interface State {
   inventory?: { mcp?: Known; skills?: Known; plugins?: Known; limits?: Known };
   /** A switch to another harness's model, waiting for the turn under way to end. */
   switching?: { kind: string; model: string };
+  /** Nothing more goes to the harness until this ends: its account reached a usage limit. Queued messages, goals and plan steps wait. */
+  pause?: Pause;
+  /** It stops between turns once a limit is this full (percent); absent: only when one is reached. */
+  pause_at?: number;
+  /** A pause ends only when a person resumes it. */
+  manual_resume?: boolean;
+}
+
+/** Why a session waits for a usage limit, and until when (`State.pause`). */
+export interface Pause {
+  /** "limit" (a limit was reached) or "threshold" (a limit got as full as `pause_at`). */
+  reason: string;
+  /** The window, as a `Limit.id`, when known. */
+  window?: string;
+  label?: string;
+  /** What the harness said, as it said it. */
+  said?: string;
+  /** Unix ms the window starts over, when known. */
+  until?: number;
+  /** Unix ms it paused. */
+  since: number;
+  /** It goes on by itself once the limit resets. */
+  auto: boolean;
+  /** "harness" (it reached the limit), "account" (another agent on its account did) or "threshold". */
+  by: string;
+  /** The turn the limit cut off: it goes on first. */
+  cut?: { message?: string; text?: string; at: number };
+  /** Its folder as it was when it paused, kept in a hidden git ref. */
+  checkpoint?: { git_ref: string; commit: string; at: number };
+  /** Checks at the reset that found the limit still reached. */
+  tries?: number;
+  /** Unix ms a check started (waiting for the harness's answer). */
+  checking?: number;
+  /** Unix ms of the next check, when the reset time isn't known. */
+  next_check?: number;
 }
 
 /** loading: not reported yet; ready: reported (an empty list means none); unsupported: the harness can't say. */
@@ -507,6 +542,8 @@ export interface AgentInfo {
   left_behind?: number;
   /** Where its commands may run besides its machine: absent anywhere it needs, "off" only its own machine, else a runner or platform it prefers. */
   reach?: string | null;
+  /** It waits for a usage limit to reset (as `State.pause`). */
+  pause?: Pause;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -600,6 +637,8 @@ export type Command =
       choices?: { question: string; id?: string; selected: string[]; other?: string; note?: string }[];
     }
   | { type: "interrupt" }
+  /** The turn didn't stop when asked: the harness starts again at once, the conversation going on. */
+  | { type: "force_stop" }
   | { type: "set_mode"; mode: string }
   /** `kind`: the model is another harness's; the agent goes on in it (feature "switch_harness"). */
   | { type: "set_model"; model: string; kind?: string }
@@ -609,7 +648,13 @@ export type Command =
   | { type: "queue_steer"; id: string }
   | { type: "restart" }
   | { type: "suggest"; client: string; query: string }
-  | { type: "snapshot" };
+  | { type: "snapshot" }
+  /** End a pause now: the turn it cut off goes on, then the queue. */
+  | { type: "resume" }
+  /** Whether a pause ends by itself once its limit resets. */
+  | { type: "auto_resume"; on: boolean }
+  /** Stop between turns once a limit is this full (null: only when one is reached). */
+  | { type: "pause_at"; percent: number | null };
 
 export type Update =
   | { t: "open"; info: AgentInfo }
@@ -726,12 +771,14 @@ export interface Snapshot {
   error: string | null;
   /** The first snapshot is in: until then there's nothing to show but a loader. */
   ready: boolean;
+  /** A stop asked of the turn under way: which turn, and when (ms). Done with once none runs. */
+  stopAsked: { turn: number | undefined; at: number } | null;
 }
 
 /** A promise React reads as settled without waiting (its `status`, as React marks the ones it tracks). */
 const READY: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
-const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false };
+const EMPTY: Snapshot = { conn: "connecting", info: null, meta: null, state: null, events: [], changes: null, error: null, ready: false, stopAsked: null };
 const BACKOFF = [250, 500, 1000, 2000, 4000];
 /**
  * The snapshot sent as the socket opens ends with the server's "synced"; one sent later (a machine
@@ -898,6 +945,17 @@ export class SessionStore {
     if (this.ws?.readyState !== WebSocket.OPEN) return false;
     this.ws.send(JSON.stringify(c));
     return true;
+  };
+
+  /**
+   * Stop the turn under way; `force` when asking didn't take (the harness starts again, the
+   * conversation going on). Said over the socket, else over HTTP: a stop mustn't wait for a
+   * reconnect. An ask is remembered, so every stop control shows it and can offer to force it.
+   */
+  stop = (force = false) => {
+    const c: Command = force ? { type: "force_stop" } : { type: "interrupt" };
+    if (!force) this.patch({ stopAsked: { turn: this.snap.state?.turn_started, at: Date.now() } });
+    if (!this.send(c)) harnessApi.command(this.id, c).catch(() => this.patch({ error: "Couldn't reach the server to stop the turn; try again" }));
   };
 
   /** Ask for something answered by a `reply` update (file suggestions ...). */
@@ -1172,7 +1230,9 @@ export class SessionStore {
         break;
       case "state": {
         const state = share<State | null>(this.snap.state, u.state) ?? u.state;
-        this.snap = { ...this.snap, state, info: withState(this.snap.info, state) };
+        // A stop asked of a turn holds while one runs; once none does, it's done with.
+        const stopAsked = state.status === "running" || state.status === "waiting" ? this.snap.stopAsked : null;
+        this.snap = { ...this.snap, state, info: withState(this.snap.info, state), stopAsked };
         break;
       }
       case "meta":
@@ -1295,6 +1355,14 @@ export function useSession<T>(store: SessionStore, pick: (s: Snapshot) => T): T 
     () => pick(store.get()),
     () => pick(store.get()),
   );
+}
+
+/** How long a stop has to take before it can be forced. */
+export const FORCE_STOP_AFTER_MS = 8000;
+
+/** When a stop was asked of the turn under way (ms), or null. */
+export function useStopAt(store: SessionStore): number | null {
+  return useSession(store, (s) => (s.stopAsked && s.stopAsked.turn === s.state?.turn_started ? s.stopAsked.at : null));
 }
 
 /** Waits (Suspense) until the session's first snapshot is in. */

@@ -31,7 +31,7 @@ fn github_token(hub: &Hub) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
-fn git(hub: &Hub) -> Command {
+pub(crate) fn git(hub: &Hub) -> Command {
     let mut c = Command::new("git");
     crate::os::git_no_prompts(&mut c)
         .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new")
@@ -246,6 +246,10 @@ pub async fn trigger(hub: &Hub, repo: &Repo, t: Trigger) -> anyhow::Result<Vec<R
             false
         }
     };
+    // With `[ci] kiln_workflows` the engine ran the commit's `.kiln/` workflows too: v1 stands aside.
+    if github && hub.cfg.ci.kiln_workflows {
+        return Ok(vec![]);
+    }
     let pipelines = load_pipelines_opt(hub, repo, &t.sha, !github).await?;
     if pipelines.is_empty() {
         return Ok(vec![]);

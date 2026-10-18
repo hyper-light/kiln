@@ -1,0 +1,26 @@
+TAP version 13
+# Subtest: math
+    # Subtest: adds
+    ok 1 - adds
+      ---
+      duration_ms: 0.4
+      ...
+    # Subtest: divides
+    not ok 2 - divides
+      ---
+      duration_ms: 1.2
+      failureType: 'testCodeFailure'
+      error: 'Expected values to be strictly equal'
+      message: 'Expected values to be strictly equal: 3 !== 2'
+      location: '/repo/test/math.test.js:9:5'
+      stack: |-
+        TestContext.<anonymous> (file:///repo/test/math.test.js:10:12)
+      ...
+    1..2
+not ok 1 - math
+  ---
+  duration_ms: 2.1
+  ...
+ok 2 - standalone # SKIP needs a database
+not ok 3 - someday # TODO not written
+1..3

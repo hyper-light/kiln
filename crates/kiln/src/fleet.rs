@@ -318,7 +318,7 @@ pub async fn refresh(hub: &Arc<Hub>) -> Option<Target> {
     if is_commit(crate::api::COMMIT) {
         seen.push((crate::api::COMMIT.to_owned(), "server".to_owned()));
     }
-    for a in hub.agent_list().await.into_iter().filter(|a| a.connected && !a.ephemeral) {
+    for a in hub.agent_list().await.into_iter().filter(|a| a.connected && !a.ephemeral && !a.outpost) {
         let build = newest_build(hub, &a.name);
         if let Some(c) = runner_commit(hub, &a.name, build.as_deref())
             && !seen.iter().any(|(s, _)| s.eq_ignore_ascii_case(&c))

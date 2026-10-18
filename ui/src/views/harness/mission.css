@@ -148,6 +148,12 @@
 .ms-row[data-stand="crashed"] .ms-word > i {
   background: #d1aaad;
 }
+.ms-row[data-stand="paused"] .ms-word {
+  color: #b8c2d3;
+}
+.ms-row[data-stand="paused"] .ms-word > i {
+  background: #a6b2c6;
+}
 .ms-row[data-stand="working"] .ms-word {
   color: #cdc6ea;
 }
@@ -537,7 +543,8 @@ a.ms-why:hover {
     grid-area: actions;
   }
   .ms-row[data-stand="needs"] .ms-meta,
-  .ms-row[data-stand="crashed"] .ms-meta {
+  .ms-row[data-stand="crashed"] .ms-meta,
+  .ms-row[data-stand="paused"] .ms-meta {
     display: none;
   }
   /* The row's arrow opens it; one less word beside Allow and Deny. */

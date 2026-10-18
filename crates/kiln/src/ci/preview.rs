@@ -24,15 +24,24 @@ use super::{events, load};
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 
-pub async fn route(hub: &Arc<Hub>, body: hyper::body::Incoming) -> Result<Response, Fail> {
+pub async fn route(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, body: hyper::body::Incoming) -> Result<Response, Fail> {
+    let b: Value = srv::body_json(body, 4 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    of(hub, caller, b).await
+}
+
+/// [`route`], its body read (`ci.workflows.plan_preview`, W20).
+pub async fn of(hub: &Arc<Hub>, caller: Option<&crate::authz::Caller>, b: Value) -> Result<Response, Fail> {
     let bad = |m: String| (StatusCode::BAD_REQUEST, m);
     if !hub.ci.enabled() {
         return Err((StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled).".into()));
     }
-    let b: Value = srv::body_json(body, 4 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
     let name = b.get("repo").and_then(Value::as_str).ok_or_else(|| bad("`repo` is required".into()))?;
     let repos = hub.store.repos().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let repo = repos.into_iter().find(|r| r.name.eq_ignore_ascii_case(name)).ok_or_else(|| (StatusCode::NOT_FOUND, format!("No repository {name}")))?;
+    // The route is open to anyone who reads runs somewhere; this repository must be one of theirs.
+    if caller.is_some_and(|c| !c.can("runs.read", &crate::authz::Scope::Repo { repo: repo.name.clone() })) {
+        return Err((StatusCode::NOT_FOUND, format!("No repository {name}")));
+    }
     let refused = |r: events::Refused| (r.status, r.message);
     let (full_ref, sha) = events::preview_ref(hub, &repo, b.get("ref").and_then(Value::as_str).unwrap_or_default(), b.get("sha").and_then(Value::as_str)).await.map_err(refused)?;
     let path = b.get("path").and_then(Value::as_str).map(str::to_owned);
@@ -68,7 +77,7 @@ pub async fn route(hub: &Arc<Hub>, body: hyper::body::Incoming) -> Result<Respon
     // What the action policies refuse among its own `uses:` (a run checks the nested ones too).
     let policy = super::actions::refusals(&super::actions::policies(hub, &repo).await, super::actions::uses_of(&w));
     let (tx, rx) = async_channel::bounded(1);
-    let start = Start { repo, event, path, workflow: Arc::new(w), message: String::new(), author: String::new(), actions: Default::default(), inputs };
+    let start = Start { repo, event, path, workflow: Arc::new(w), message: String::new(), author: String::new(), actions: Default::default(), inputs, given: Default::default() };
     hub.ci.send(Msg::Preview { start: Box::new(start), reply: tx });
     let plan = match crate::rt::timeout(Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(p)) => p,

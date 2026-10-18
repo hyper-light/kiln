@@ -2,11 +2,12 @@
 import * as React from "react";
 import { Link } from "@/lib/router";
 import { ArrowDown, ArrowRight, ArrowUpRight, Check, ChevronRight, Copy, RotateCcw } from "lucide-react";
-import type { InstallOs, JoinInfo, JoinRequest } from "@/api/types";
+import { api } from "@/api/client";
+import type { InstallOs, JoinInfo, JoinRequest, OutpostInvite } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { SectionHeading } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
-import { useNow } from "@/lib/hooks";
+import { errorMessage, useNow } from "@/lib/hooks";
 import type { SuspenseResource } from "@/lib/resource";
 import { Optic } from "@/views/harness/signals";
 import { installCommand, jumpTo, listWords, type Arrival } from "./data";
@@ -72,13 +73,33 @@ export function InstallSection({
   );
 }
 
-/** Other ways in, as two disclosures sharing one line (one open at a time): containers, and no token. */
+type Alt = "k8s" | "ask" | "outpost";
+
+/** Other ways in, as disclosures sharing one line (one open at a time): containers, no token, and
+ *  a machine nothing can be installed on (an outpost). */
 function Alternatives({ info, os }: { info: JoinInfo | undefined; os: InstallOs }) {
-  const [open, setOpen] = React.useState<"k8s" | "ask" | null>(null);
+  const [open, setOpen] = React.useState<Alt | null>(null);
   const id = React.useId();
   const ask = info ? [os === "windows" ? info.join_windows : info.join, info.join_manual].filter((c): c is string => Boolean(c)) : [];
-  const trigger = (key: "k8s" | "ask", label: string) => (
-    <button type="button" className="am-fold" aria-expanded={open === key} aria-controls={`${id}-${key}`} onClick={() => setOpen(open === key ? null : key)}>
+  // An outpost's line carries a one-time invite: made as its fold opens, and again on asking.
+  const [invite, setInvite] = React.useState<OutpostInvite | null>(null);
+  const [inviteError, setInviteError] = React.useState<string | null>(null);
+  const makeInvite = () => {
+    setInvite(null);
+    setInviteError(null);
+    api.outpostInvite().then(setInvite, (e: unknown) => setInviteError(errorMessage(e)));
+  };
+  const trigger = (key: Alt, label: string) => (
+    <button
+      type="button"
+      className="am-fold"
+      aria-expanded={open === key}
+      aria-controls={`${id}-${key}`}
+      onClick={() => {
+        if (key === "outpost" && open !== key) makeInvite();
+        setOpen(open === key ? null : key);
+      }}
+    >
       <ChevronRight size={13} aria-hidden="true" />
       {label}
     </button>
@@ -88,6 +109,7 @@ function Alternatives({ info, os }: { info: JoinInfo | undefined; os: InstallOs 
       <div className="am-alts-line">
         {trigger("k8s", "Kubernetes or Docker instead?")}
         {ask.length > 0 && trigger("ask", "Without the token?")}
+        {trigger("outpost", "Can't install anything there?")}
       </div>
       <div id={`${id}-k8s`} hidden={open !== "k8s"} className="am-fold-body">
         {open === "k8s" && (
@@ -117,6 +139,9 @@ function Alternatives({ info, os }: { info: JoinInfo | undefined; os: InstallOs 
           </div>
         )}
       </div>
+      <div id={`${id}-outpost`} hidden={open !== "outpost"} className="am-fold-body">
+        {open === "outpost" && <OutpostLine os={os} invite={invite} error={inviteError} onRenew={makeInvite} />}
+      </div>
       <div id={`${id}-ask`} hidden={open !== "ask"} className="am-fold-body">
         {open === "ask" && (
           <div className="am-alt">
@@ -127,6 +152,31 @@ function Alternatives({ info, os }: { info: JoinInfo | undefined; os: InstallOs 
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** An outpost: kiln run where nothing can be installed, from a line with a one-time invite in it. */
+function OutpostLine({ os, invite, error, onRenew }: { os: InstallOs; invite: OutpostInvite | null; error: string | null; onRenew: () => void }) {
+  return (
+    <div className="am-alt">
+      <p>
+        Run it as an outpost instead: kiln goes in a folder of its own and runs in that terminal until you stop it (Ctrl-C). Nothing is installed and nothing starts on boot. That
+        machine&apos;s terminals, its Claude Code, Codex and Gemini sessions, and agents show up here; it takes no jobs.
+      </p>
+      {error ? (
+        <p className="am-warn">Couldn&apos;t make an invite: {error}</p>
+      ) : invite ? (
+        <>
+          <CodeLine command={invite.commands[os]} prompt={os === "windows" ? "PS>" : "$"} copyName="Copy the outpost command" />
+          <p className="am-note">
+            The invite in it works once.
+            <Expiry at={invite.expires_at} onRenew={onRenew} />
+          </p>
+        </>
+      ) : (
+        <p className="am-note">Making an invite…</p>
+      )}
     </div>
   );
 }

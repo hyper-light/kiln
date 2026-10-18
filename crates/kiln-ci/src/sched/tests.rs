@@ -251,6 +251,21 @@ fn w05_ac10_wait_reasons() {
     assert_eq!(s.reason("r"), Some(&WaitReason::Retry { at: 30_010 }));
 }
 
+/// A leg cancelled while it runs ends cancelled whatever its attempt reports, its runner lost
+/// with it included, and isn't retried.
+#[test]
+fn a_cancelled_leg_is_never_retried() {
+    let mut s = Scheduler::new(Config::default());
+    s.handle(Input::RunnerUp(Box::new(linux("a", 1))), 0);
+    let c = s.handle(Input::LegQueued(Box::new(leg("l", "acme/x", 60))), 0);
+    assert!(c.iter().any(|x| matches!(x, Command::Assign { leg, .. } if leg == "l")));
+    let c = s.handle(Input::LegCancelled { leg: "l".into(), reason: "the run was cancelled".into() }, 1);
+    assert!(c.iter().any(|x| matches!(x, Command::Cancel { leg, .. } if leg == "l")));
+    let c = s.handle(Input::RunnerLost { runner: "a".into() }, 2);
+    assert!(!c.iter().any(|x| matches!(x, Command::Retry { .. })), "{c:?}");
+    assert!(c.iter().any(|x| matches!(x, Command::Settled { leg, outcome: Outcome::Cancelled, .. } if leg == "l")), "{c:?}");
+}
+
 #[test]
 fn resources_mode_and_cancellation() {
     let cfg = Config { resources: true, ..Config::default() };

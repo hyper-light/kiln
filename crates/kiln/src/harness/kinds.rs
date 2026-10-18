@@ -242,6 +242,10 @@ impl Adapter {
     /// A run (`Effect::Run` or `Effect::Fetch`) ended: its exit code (None: it could not start
     /// or was stopped) and its output (stdout then stderr, shortened).
     pub fn run_done(&mut self, core: &mut Core, job: &str, code: Option<i32>, output: &str) {
+        if let Some(at) = job.strip_prefix(super::pause::CHECKPOINT_JOB) {
+            super::pause::checkpointed(core, at, code, output);
+            return;
+        }
         match self {
             Self::Claude(a) => a.run_done(core, job, code, output),
             Self::Codex(a) => a.run_done(core, job, code, output),
@@ -252,10 +256,41 @@ impl Adapter {
     /// Every few seconds while the process runs: a chance to poll what the harness only reports
     /// when asked (plan usage, servers still connecting).
     pub fn tick(&mut self, core: &mut Core) {
+        // A pause's timer: time to check whether its limit reset (or to stop waiting for the answer).
+        let key = core.state.harness_session.clone().unwrap_or_else(|| core.state.cwd.clone());
+        match super::pause::step(core, Core::now(), &key) {
+            super::pause::Step::Check => self.check_limits(core),
+            super::pause::Step::GoOn(p) => self.go_on(core, *p),
+            super::pause::Step::Nothing => {}
+        }
         match self {
             Self::Claude(a) => a.tick(core),
             Self::Codex(a) => a.tick(core),
             Self::Acp(_) => {}
+        }
+    }
+
+    /// Ask the harness whether a pause's limit has reset (its answer goes to `pause::checked`). One
+    /// that can't say goes on, and finds out.
+    fn check_limits(&mut self, core: &mut Core) {
+        match self {
+            Self::Claude(a) => a.check_limits(core),
+            Self::Codex(a) => a.check_limits(core),
+            Self::Acp(a) => {
+                if let Some(p) = super::pause::release(core, "The limit's reset time came; going on.") {
+                    a.go_on(core, p);
+                }
+            }
+        }
+    }
+
+    /// A pause ended (it reset, or a person resumed it): the turn it cut off goes on, then kiln's
+    /// queue.
+    pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
+        match self {
+            Self::Claude(a) => a.go_on(core, p),
+            Self::Codex(a) => a.go_on(core, p),
+            Self::Acp(a) => a.go_on(core, p),
         }
     }
 

@@ -1,0 +1,18 @@
+{"Time":"2026-10-18T12:00:00Z","Action":"start","Package":"example.com/acme/calc"}
+{"Time":"2026-10-18T12:00:00Z","Action":"run","Package":"example.com/acme/calc","Test":"TestAdd"}
+{"Time":"2026-10-18T12:00:00Z","Action":"output","Package":"example.com/acme/calc","Test":"TestAdd","Output":"=== RUN   TestAdd\n"}
+{"Time":"2026-10-18T12:00:00Z","Action":"output","Package":"example.com/acme/calc","Test":"TestAdd","Output":"--- PASS: TestAdd (0.00s)\n"}
+{"Time":"2026-10-18T12:00:00Z","Action":"pass","Package":"example.com/acme/calc","Test":"TestAdd","Elapsed":0.001}
+{"Time":"2026-10-18T12:00:00Z","Action":"run","Package":"example.com/acme/calc","Test":"TestDiv"}
+{"Time":"2026-10-18T12:00:00Z","Action":"output","Package":"example.com/acme/calc","Test":"TestDiv","Output":"=== RUN   TestDiv\n"}
+{"Time":"2026-10-18T12:00:00Z","Action":"output","Package":"example.com/acme/calc","Test":"TestDiv","Output":"    calc_test.go:14: got 3, want 2\n"}
+{"Time":"2026-10-18T12:00:00Z","Action":"output","Package":"example.com/acme/calc","Test":"TestDiv","Output":"--- FAIL: TestDiv (0.00s)\n"}
+{"Time":"2026-10-18T12:00:00Z","Action":"fail","Package":"example.com/acme/calc","Test":"TestDiv","Elapsed":0.002}
+{"Time":"2026-10-18T12:00:00Z","Action":"run","Package":"example.com/acme/calc","Test":"TestDiv/zero"}
+{"Time":"2026-10-18T12:00:00Z","Action":"skip","Package":"example.com/acme/calc","Test":"TestDiv/zero","Elapsed":0}
+{"Time":"2026-10-18T12:00:00Z","Action":"output","Package":"example.com/acme/calc","Output":"FAIL\n"}
+{"Time":"2026-10-18T12:00:00Z","Action":"fail","Package":"example.com/acme/calc","Elapsed":0.004}
+{"Time":"2026-10-18T12:00:01Z","Action":"start","Package":"example.com/acme/broken"}
+{"Time":"2026-10-18T12:00:01Z","Action":"output","Package":"example.com/acme/broken","Output":"# example.com/acme/broken\n"}
+{"Time":"2026-10-18T12:00:01Z","Action":"output","Package":"example.com/acme/broken","Output":"broken.go:3:1: syntax error: non-declaration statement outside function body\n"}
+{"Time":"2026-10-18T12:00:01Z","Action":"fail","Package":"example.com/acme/broken","Elapsed":0}

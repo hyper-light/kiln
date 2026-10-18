@@ -21,7 +21,9 @@ pub enum Level {
 impl Level {
     fn parse(s: &str) -> Level {
         match s {
-            "write" => Level::Write,
+            // kiln's scopes say what they allow: `binaries: publish`, `environments: deploy`,
+            // `registry: push` (W10-R04).
+            "write" | "publish" | "deploy" | "push" => Level::Write,
             "read" => Level::Read,
             _ => Level::None,
         }

@@ -24,7 +24,9 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     let commit = load::load(hub, repo, &t.sha).await?;
     // A manual run of one pipeline runs that one only.
     let wanted = |l: &load::Loaded| t.pipeline.as_deref().is_none_or(|p| l.path == p || l.workflow.as_ref().and_then(|w| w.name.as_deref()) == Some(p));
-    let running: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && l.dialect == kiln_ci::expr::Dialect::Gha && wanted(l)).collect();
+    // GitHub's workflows; the kiln dialect's too once `[ci] kiln_workflows` takes them off v1.
+    let engine_runs = |l: &load::Loaded| l.dialect == kiln_ci::expr::Dialect::Gha || hub.cfg.ci.kiln_workflows;
+    let running: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && engine_runs(l) && wanted(l)).collect();
     if running.is_empty() {
         return Ok(false);
     }
@@ -40,8 +42,16 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
 /// now (W07-R02). A workflow with errors gets a run that fails at once, listing them (W02-AC09).
 /// `inputs` are the run's typed inputs (`workflow_dispatch`), or null. Whether a run began.
 pub async fn start(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, message: &str, author: &str, inputs: serde_json::Value) -> anyhow::Result<bool> {
+    start_given(hub, repo, event, l, (message, author), inputs, super::dispatch::Given::default()).await
+}
+
+/// [`start`], with what a run of a working tree brings besides (W17-R06).
+pub async fn start_given(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, (message, author): (&str, &str), inputs: serde_json::Value, given: super::dispatch::Given) -> anyhow::Result<bool> {
     let (Some(w), false) = (&l.workflow, l.has_errors()) else {
-        startup_failure(hub, repo, event, l, message, author).await?;
+        let id = startup_failure(hub, repo, event, l, message, author).await?;
+        if let Some(r) = &given.reply {
+            let _ = r.try_send(id);
+        }
         return Ok(true);
     };
     if let Err(why) = kiln_ci::trigger::matches(w, event) {
@@ -64,9 +74,15 @@ pub async fn start(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, mess
                 author: author.to_owned(),
                 actions,
                 inputs,
+                given,
             })));
         }
-        Err(e) => fail_run(hub, repo, event, l, message, author, e).await?,
+        Err(e) => {
+            let id = fail_run(hub, repo, event, l, message, author, e).await?;
+            if let Some(r) = &given.reply {
+                let _ = r.try_send(id);
+            }
+        }
     }
     Ok(true)
 }
@@ -197,14 +213,14 @@ async fn commits(hub: &Hub, mirror: &str, before: Option<&str>, after: &str) -> 
 }
 
 /// A workflow that can't run: one failed run, its diagnostics as the error (W02-AC09).
-async fn startup_failure(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: &str, author: &str) -> anyhow::Result<()> {
+async fn startup_failure(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: &str, author: &str) -> anyhow::Result<String> {
     let lines: Vec<String> = l.diagnostics.iter().filter(|d| d.severity == kiln_ci::wf::Severity::Error).map(|d| format!("{}:{}:{}: {} {}", l.path, d.range.start.line, d.range.start.col, d.code, d.message)).collect();
     let error = if lines.is_empty() { format!("{} could not be read", l.path) } else { lines.join("\n") };
     fail_run(hub, repo, e, l, message, author, error).await
 }
 
-/// A run that fails before any job, saying why.
-async fn fail_run(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: &str, author: &str, error: String) -> anyhow::Result<()> {
+/// A run that fails before any job, saying why. Its id.
+async fn fail_run(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: &str, author: &str, error: String) -> anyhow::Result<String> {
     let id = crate::util::new_id();
     let n = super::runs::NewRun {
         id: id.clone(),
@@ -226,7 +242,7 @@ async fn fail_run(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: 
     super::runs::create(hub, repo, n).await?;
     super::runs::finish_run(hub, &id, Status::Failed, "startup_failure", Some(error)).await?;
     hub.emit_run(&id).await;
-    Ok(())
+    Ok(id)
 }
 
 /// Why a dispatch was refused: GitHub's status and message.

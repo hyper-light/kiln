@@ -12,16 +12,19 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AppRouteImport } from './routes/_app'
 import { Route as AppIndexRouteImport } from './routes/_app.index'
 import { Route as AppSplatRouteImport } from './routes/_app.$'
+import { Route as AppInsightsRouteImport } from './routes/_app.insights'
 import { Route as AppReposRouteImport } from './routes/_app.repos'
 import { Route as AppSettingsRouteImport } from './routes/_app.settings'
 import { Route as AppSyncRouteImport } from './routes/_app.sync'
 import { Route as AppSystemRouteImport } from './routes/_app.system'
 import { Route as AppTelemetryRouteImport } from './routes/_app.telemetry'
 import { Route as AppTerminalRouteImport } from './routes/_app.terminal'
+import { Route as AppWorkflowsRouteImport } from './routes/_app.workflows'
 import { Route as AppAgentsIndexRouteImport } from './routes/_app.agents.index'
 import { Route as AppAgentsIdRouteImport } from './routes/_app.agents.$id'
 import { Route as AppAgentsSessionsRouteImport } from './routes/_app.agents.sessions'
 import { Route as AppDeploymentsIndexRouteImport } from './routes/_app.deployments.index'
+import { Route as AppDeploymentsNewRouteImport } from './routes/_app.deployments.new'
 import { Route as AppDeploymentsPlansRouteImport } from './routes/_app.deployments.plans'
 import { Route as AppObserveIndexRouteImport } from './routes/_app.observe.index'
 import { Route as AppObserveEventsRouteImport } from './routes/_app.observe.events'
@@ -57,6 +60,11 @@ const AppSplatRoute = AppSplatRouteImport.update({
   path: '/$',
   getParentRoute: () => AppRoute,
 } as any)
+const AppInsightsRoute = AppInsightsRouteImport.update({
+  id: '/insights',
+  path: '/insights',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppReposRoute = AppReposRouteImport.update({
   id: '/repos',
   path: '/repos',
@@ -87,6 +95,11 @@ const AppTerminalRoute = AppTerminalRouteImport.update({
   path: '/terminal',
   getParentRoute: () => AppRoute,
 } as any)
+const AppWorkflowsRoute = AppWorkflowsRouteImport.update({
+  id: '/workflows',
+  path: '/workflows',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppAgentsIndexRoute = AppAgentsIndexRouteImport.update({
   id: '/agents/',
   path: '/agents/',
@@ -105,6 +118,11 @@ const AppAgentsSessionsRoute = AppAgentsSessionsRouteImport.update({
 const AppDeploymentsIndexRoute = AppDeploymentsIndexRouteImport.update({
   id: '/deployments/',
   path: '/deployments/',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppDeploymentsNewRoute = AppDeploymentsNewRouteImport.update({
+  id: '/deployments/new',
+  path: '/deployments/new',
   getParentRoute: () => AppRoute,
 } as any)
 const AppDeploymentsPlansRoute = AppDeploymentsPlansRouteImport.update({
@@ -213,14 +231,17 @@ const AppRunsIdJobsJobIdRoute = AppRunsIdJobsJobIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AppIndexRoute
   '/$': typeof AppSplatRoute
+  '/insights': typeof AppInsightsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
   '/sync': typeof AppSyncRoute
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
   '/terminal': typeof AppTerminalRoute
+  '/workflows': typeof AppWorkflowsRoute
   '/agents/$id': typeof AppAgentsIdRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
+  '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
   '/observe/events': typeof AppObserveEventsRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
@@ -246,15 +267,18 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/$': typeof AppSplatRoute
+  '/insights': typeof AppInsightsRoute
   '/repos': typeof AppReposRoute
   '/settings': typeof AppSettingsRoute
   '/sync': typeof AppSyncRoute
   '/system': typeof AppSystemRoute
   '/telemetry': typeof AppTelemetryRoute
   '/terminal': typeof AppTerminalRoute
+  '/workflows': typeof AppWorkflowsRoute
   '/': typeof AppIndexRoute
   '/agents/$id': typeof AppAgentsIdRoute
   '/agents/sessions': typeof AppAgentsSessionsRoute
+  '/deployments/new': typeof AppDeploymentsNewRoute
   '/deployments/plans': typeof AppDeploymentsPlansRoute
   '/observe/events': typeof AppObserveEventsRoute
   '/observe/integrations': typeof AppObserveIntegrationsRoute
@@ -282,15 +306,18 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_app': typeof AppRouteWithChildren
   '/_app/$': typeof AppSplatRoute
+  '/_app/insights': typeof AppInsightsRoute
   '/_app/repos': typeof AppReposRoute
   '/_app/settings': typeof AppSettingsRoute
   '/_app/sync': typeof AppSyncRoute
   '/_app/system': typeof AppSystemRoute
   '/_app/telemetry': typeof AppTelemetryRoute
   '/_app/terminal': typeof AppTerminalRoute
+  '/_app/workflows': typeof AppWorkflowsRoute
   '/_app/': typeof AppIndexRoute
   '/_app/agents/$id': typeof AppAgentsIdRoute
   '/_app/agents/sessions': typeof AppAgentsSessionsRoute
+  '/_app/deployments/new': typeof AppDeploymentsNewRoute
   '/_app/deployments/plans': typeof AppDeploymentsPlansRoute
   '/_app/observe/events': typeof AppObserveEventsRoute
   '/_app/observe/integrations': typeof AppObserveIntegrationsRoute
@@ -319,14 +346,17 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/$'
+    | '/insights'
     | '/repos'
     | '/settings'
     | '/sync'
     | '/system'
     | '/telemetry'
     | '/terminal'
+    | '/workflows'
     | '/agents/$id'
     | '/agents/sessions'
+    | '/deployments/new'
     | '/deployments/plans'
     | '/observe/events'
     | '/observe/integrations'
@@ -352,15 +382,18 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/$'
+    | '/insights'
     | '/repos'
     | '/settings'
     | '/sync'
     | '/system'
     | '/telemetry'
     | '/terminal'
+    | '/workflows'
     | '/'
     | '/agents/$id'
     | '/agents/sessions'
+    | '/deployments/new'
     | '/deployments/plans'
     | '/observe/events'
     | '/observe/integrations'
@@ -387,15 +420,18 @@ export interface FileRouteTypes {
     | '__root__'
     | '/_app'
     | '/_app/$'
+    | '/_app/insights'
     | '/_app/repos'
     | '/_app/settings'
     | '/_app/sync'
     | '/_app/system'
     | '/_app/telemetry'
     | '/_app/terminal'
+    | '/_app/workflows'
     | '/_app/'
     | '/_app/agents/$id'
     | '/_app/agents/sessions'
+    | '/_app/deployments/new'
     | '/_app/deployments/plans'
     | '/_app/observe/events'
     | '/_app/observe/integrations'
@@ -448,6 +484,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSplatRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/insights': {
+      id: '/_app/insights'
+      path: '/insights'
+      fullPath: '/insights'
+      preLoaderRoute: typeof AppInsightsRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/repos': {
       id: '/_app/repos'
       path: '/repos'
@@ -490,6 +533,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppTerminalRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/workflows': {
+      id: '/_app/workflows'
+      path: '/workflows'
+      fullPath: '/workflows'
+      preLoaderRoute: typeof AppWorkflowsRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/agents/': {
       id: '/_app/agents/'
       path: '/agents'
@@ -516,6 +566,13 @@ declare module '@tanstack/react-router' {
       path: '/deployments'
       fullPath: '/deployments/'
       preLoaderRoute: typeof AppDeploymentsIndexRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/deployments/new': {
+      id: '/_app/deployments/new'
+      path: '/deployments/new'
+      fullPath: '/deployments/new'
+      preLoaderRoute: typeof AppDeploymentsNewRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/deployments/plans': {
@@ -663,15 +720,18 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppSplatRoute: typeof AppSplatRoute
+  AppInsightsRoute: typeof AppInsightsRoute
   AppReposRoute: typeof AppReposRoute
   AppSettingsRoute: typeof AppSettingsRoute
   AppSyncRoute: typeof AppSyncRoute
   AppSystemRoute: typeof AppSystemRoute
   AppTelemetryRoute: typeof AppTelemetryRoute
   AppTerminalRoute: typeof AppTerminalRoute
+  AppWorkflowsRoute: typeof AppWorkflowsRoute
   AppIndexRoute: typeof AppIndexRoute
   AppAgentsIdRoute: typeof AppAgentsIdRoute
   AppAgentsSessionsRoute: typeof AppAgentsSessionsRoute
+  AppDeploymentsNewRoute: typeof AppDeploymentsNewRoute
   AppDeploymentsPlansRoute: typeof AppDeploymentsPlansRoute
   AppObserveEventsRoute: typeof AppObserveEventsRoute
   AppObserveIntegrationsRoute: typeof AppObserveIntegrationsRoute
@@ -697,15 +757,18 @@ interface AppRouteChildren {
 
 const AppRouteChildren: AppRouteChildren = {
   AppSplatRoute: AppSplatRoute,
+  AppInsightsRoute: AppInsightsRoute,
   AppReposRoute: AppReposRoute,
   AppSettingsRoute: AppSettingsRoute,
   AppSyncRoute: AppSyncRoute,
   AppSystemRoute: AppSystemRoute,
   AppTelemetryRoute: AppTelemetryRoute,
   AppTerminalRoute: AppTerminalRoute,
+  AppWorkflowsRoute: AppWorkflowsRoute,
   AppIndexRoute: AppIndexRoute,
   AppAgentsIdRoute: AppAgentsIdRoute,
   AppAgentsSessionsRoute: AppAgentsSessionsRoute,
+  AppDeploymentsNewRoute: AppDeploymentsNewRoute,
   AppDeploymentsPlansRoute: AppDeploymentsPlansRoute,
   AppObserveEventsRoute: AppObserveEventsRoute,
   AppObserveIntegrationsRoute: AppObserveIntegrationsRoute,

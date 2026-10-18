@@ -277,7 +277,9 @@ impl Acp {
                 core.reply(client, json!({"title": "Conversation", "text": core.export(), "format": "markdown", "filename": "conversation.md"}));
             }
             Command::SetEffort { .. } | Command::Control { .. } => {}
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            // A pause's commands are the session's (`harness::pause`).
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::LimitHold { .. } => {}
             // An ACP agent reports no MCP servers or skills of its own (its client hands it MCP
             // servers when the session opens); its commands run as "/name args" messages.
             Command::SkillRun { name, args, id, mode } => {
@@ -379,14 +381,34 @@ impl Acp {
         if self.busy(core) || self.session.is_none() || core.state.status == Status::Exited {
             return;
         }
+        // A pause (or a switch) holds what waits, and the stop point may start one here.
+        if (!self.waiting.is_empty() || !core.state.queue.is_empty()) && !super::pause::open(core) {
+            return;
+        }
         if !self.waiting.is_empty() {
             let m = self.waiting.remove(0);
             self.prompt(core, m);
         } else if !core.state.queue.is_empty() {
             let item = core.state.queue.remove(0);
             core.touch_state();
+            let id = item.id.clone();
             self.prompt(core, item);
+            super::pause::sent_from_queue(core, &id);
         }
+    }
+
+    /// A pause ended: the turn it cut off goes on first, then kiln's queue.
+    pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
+        if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
+            let id = crate::util::new_id();
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
+            super::pause::from_kiln(core, &id);
+            return;
+        }
+        if p.cut.is_some() {
+            super::pause::continue_later(core, super::pause::CONTINUE);
+        }
+        self.next(core);
     }
 
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>) {
@@ -455,7 +477,15 @@ impl Acp {
                 Pending::Prompt(id) => {
                     self.prompting = None;
                     core.state.delivery.insert(id, Delivery::Cancelled);
-                    self.notice(core, Level::Error, msg);
+                    if super::pause::says_limit(&msg) {
+                        // The account's usage limit: pause until it resets (the agent can't say
+                        // when; kiln checks back now and then).
+                        let hit = super::pause::Hit::from_limits(&core.state.limits, msg.clone(), None, Core::now());
+                        let cut = super::pause::cut_now(core);
+                        super::pause::hold(core, super::pause::LIMIT, "harness", hit, Some(cut));
+                    } else {
+                        self.notice(core, Level::Error, msg);
+                    }
                     core.state.turn_started = None;
                     core.state.doing = None;
                     core.touch_state();

@@ -14,6 +14,7 @@
 //! - [`obj`]: object identity, parsing, structural hashes, compressed storage.
 //! - [`model`]: app configuration, sync options and policies (Argo CD's spellings).
 //! - [`health`]: resource health, rule for rule as Argo CD assesses it.
+//! - [`providers`]: every platform beyond Kubernetes, as clusters of objects (docs/cd-targets.md).
 //! - [`diff`]: comparing desired and live objects by field ownership.
 //! - [`sync`]: planning a sync: phases, waves, hooks and prunes, in Argo CD's order.
 //! - [`engine`]: the controller.
@@ -32,6 +33,7 @@ pub mod health;
 pub mod kube;
 pub mod model;
 pub mod obj;
+pub mod providers;
 pub mod render;
 pub mod sim;
 pub mod state;

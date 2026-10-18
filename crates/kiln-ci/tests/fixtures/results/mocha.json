@@ -1,0 +1,11 @@
+{
+  "stats": { "suites": 1, "tests": 3, "passes": 1, "pending": 1, "failures": 1, "start": "2026-10-18T12:00:00.000Z", "end": "2026-10-18T12:00:00.020Z", "duration": 20 },
+  "tests": [
+    { "title": "adds", "fullTitle": "math adds", "file": "/repo/test/math.spec.js", "duration": 1, "currentRetry": 0, "speed": "fast", "err": {} },
+    { "title": "divides", "fullTitle": "math divides", "file": "/repo/test/math.spec.js", "duration": 2, "currentRetry": 0, "err": { "stack": "AssertionError [ERR_ASSERTION]: 3 == 2\n    at Context.<anonymous> (test/math.spec.js:9:12)", "message": "3 == 2", "generatedMessage": true, "name": "AssertionError", "code": "ERR_ASSERTION", "actual": "3", "expected": "2", "operator": "==" } },
+    { "title": "later", "fullTitle": "math later", "file": "/repo/test/math.spec.js", "currentRetry": 0, "err": {} }
+  ],
+  "pending": [ { "title": "later", "fullTitle": "math later", "file": "/repo/test/math.spec.js", "currentRetry": 0, "err": {} } ],
+  "failures": [ { "title": "divides", "fullTitle": "math divides" } ],
+  "passes": [ { "title": "adds", "fullTitle": "math adds" } ]
+}

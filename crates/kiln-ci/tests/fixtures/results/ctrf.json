@@ -1,0 +1,14 @@
+{
+  "reportFormat": "CTRF",
+  "specVersion": "0.0.0",
+  "results": {
+    "tool": { "name": "playwright" },
+    "summary": { "tests": 4, "passed": 2, "failed": 1, "pending": 0, "skipped": 1, "other": 0, "start": 1792324800000, "stop": 1792324801000 },
+    "tests": [
+      { "name": "logs in", "status": "passed", "duration": 120, "filePath": "e2e/login.spec.ts", "line": 4, "suite": ["login", "happy path"] },
+      { "name": "rejects a bad password", "status": "failed", "duration": 340, "message": "expected 401, got 500", "trace": "at e2e/login.spec.ts:20:5", "filePath": "e2e/login.spec.ts", "line": 18, "suite": "login" },
+      { "name": "resets", "status": "skipped", "duration": 0, "filePath": "e2e/login.spec.ts" },
+      { "name": "loads the dashboard", "status": "passed", "duration": 800, "filePath": "e2e/dash.spec.ts", "retries": 2, "flaky": true }
+    ]
+  }
+}

@@ -79,11 +79,15 @@ pub struct Settings {
     pub max_job_minutes: u32,
     /// `runs-on` for kiln-dialect jobs that don't say (`[ci] default_runs_on`).
     pub default_runs_on: Vec<String>,
+    /// Only the matrix combinations with these values (`kiln workflow run --matrix k=v`,
+    /// W17-R06): a job whose matrix has one of these keys runs the combinations whose value of it
+    /// matches; other jobs run as they would.
+    pub only_matrix: Vec<(String, String)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { max_legs: 1_024, default_permissions: perms::Default::Read, max_job_minutes: 7 * 24 * 60, default_runs_on: vec!["k8s".into()] }
+        Settings { max_legs: 1_024, default_permissions: perms::Default::Read, max_job_minutes: 7 * 24 * 60, default_runs_on: vec!["k8s".into()], only_matrix: Vec::new() }
     }
 }
 
@@ -612,6 +616,12 @@ impl RunPlan {
             .collect()
     }
 
+    /// The leg keyed `key`, as the plan made it (its workflow, a called one's included): what a
+    /// restarted dispatcher gives the legs it takes back (W05-R25).
+    pub fn spec_of(&self, key: &str) -> Option<&LegSpec> {
+        self.nodes.iter().flat_map(|n| n.legs.iter()).find(|l| l.spec.key == key).map(|l| &l.spec)
+    }
+
     /// The combinations `exclude` and `where:` removed, by job, with why (W04-R29).
     pub fn removed(&self) -> &BTreeMap<String, Vec<(serde_json::Value, String)>> {
         &self.removed
@@ -1009,13 +1019,23 @@ impl RunPlan {
             }
         }
         let cx = self.base_cx(n, self.needs_context(n, None));
-        let legs = match self.legs_of(n, &job, dialect, &cx, src) {
+        let mut legs = match self.legs_of(n, &job, dialect, &cx, src) {
             Ok(l) => l,
             Err(e) => {
                 self.conclude_job(n, Conclusion::Failure, e, out);
                 return;
             }
         };
+        if !self.settings.only_matrix.is_empty() {
+            let only = &self.settings.only_matrix;
+            let had = !legs.is_empty();
+            legs.retain(|(combo, ..)| only.iter().all(|(k, v)| matrix::get(combo, k).is_none_or(|x| matrix::display(x) == *v)));
+            if had && legs.is_empty() {
+                let asked: Vec<String> = only.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                self.conclude_job(n, Conclusion::Skipped, format!("no combination of the matrix has {}", asked.join(", ")), out);
+                return;
+            }
+        }
         let (ff, max_parallel, per_axis) = match strategy_settings(&job, dialect, &cx) {
             Ok(s) => s,
             Err(e) => {
@@ -1664,21 +1684,23 @@ impl RunPlan {
 
     /// The plan without running it (W04-R29): every leg the run would queue if each succeeded
     /// with no outputs, what the plan decided along the way, and what `exclude` and `where:`
-    /// removed. Jobs
-    /// whose `if` or matrix read needs are marked: what a real run decides for them may differ.
+    /// removed. Jobs whose `if` or matrix read needs, and the jobs after them, are decided only
+    /// when those finish: they are listed in `later`, and what the preview's empty outputs made
+    /// of them (a matrix from `fromJSON('')`, say) is not reported as decided.
     pub fn preview(wf: Arc<Workflow>, input: RunInput, settings: Settings, src: &dyn PlanSource) -> Result<Preview, String> {
-        let reads_needs: Vec<String> = wf
+        let mut reads_needs: Vec<String> = wf
             .jobs
             .iter()
-            .filter(|j| {
-                let mut srcs: Vec<&str> = j.cond.iter().map(|t| t.src.as_str()).collect();
-                if let Some(Matrix::Expr(t)) = j.strategy.as_ref().and_then(|s| s.matrix.as_ref()) {
-                    srcs.push(&t.src);
-                }
-                srcs.iter().any(|s| s.contains("needs."))
-            })
+            .filter(|j| j.cond.as_ref().is_some_and(|t| t.src.contains("needs.")) || j.strategy.as_ref().and_then(|s| s.matrix.as_ref()).is_some_and(matrix_reads_needs))
             .map(|j| j.id.clone())
             .collect();
+        loop {
+            let after: Vec<String> = wf.jobs.iter().filter(|j| !reads_needs.contains(&j.id) && j.needs.iter().any(|n| reads_needs.iter().any(|r| r == n.job()))).map(|j| j.id.clone()).collect();
+            if after.is_empty() {
+                break;
+            }
+            reads_needs.extend(after);
+        }
         let (mut plan, mut actions) = RunPlan::start(wf, input, settings, src)?;
         let mut legs = Vec::new();
         let mut decided = Vec::new();
@@ -1700,7 +1722,34 @@ impl RunPlan {
             }
         }
         legs.sort_by(|a, b| a.key.cmp(&b.key));
+        decided.retain(|d| !reads_needs.contains(&d.job));
         Ok(Preview { name: plan.name.clone(), legs, decided, removed: plan.removed.clone(), later: reads_needs })
+    }
+}
+
+/// Whether a matrix (as a whole, an axis, `include`, `exclude` or `where`) reads `needs`.
+fn matrix_reads_needs(m: &Matrix) -> bool {
+    fn yval(y: &YVal) -> bool {
+        match y {
+            YVal::Str(t) => t.src.contains("needs."),
+            YVal::Seq(xs) => xs.iter().any(yval),
+            YVal::Map(kv) => kv.iter().any(|(_, v)| yval(v)),
+            YVal::Null | YVal::Bool(_) | YVal::Num(_) => false,
+        }
+    }
+    let axis = |a: &Axis| match a {
+        Axis::Expr(t) => t.src.contains("needs."),
+        Axis::Values(vs) => vs.iter().any(yval),
+    };
+    match m {
+        Matrix::Expr(t) => t.src.contains("needs."),
+        Matrix::Spec(s) => {
+            s.axes.iter().any(|(_, a)| axis(a))
+                || s.include.as_ref().is_some_and(yval)
+                || s.exclude.as_ref().is_some_and(yval)
+                || s.filter.as_ref().is_some_and(|t| t.src.contains("needs."))
+                || s.platforms.as_ref().is_some_and(axis)
+        }
     }
 }
 

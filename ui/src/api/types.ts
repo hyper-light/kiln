@@ -74,6 +74,8 @@ export interface Step {
   started_at: number | null;
   finished_at: number | null;
   exit_code: number | null;
+  /** The order it started in (CI legs): steps that start in the same second keep it. */
+  seq?: number | null;
 }
 
 export interface StepSpec {
@@ -166,6 +168,8 @@ export interface Agent {
   sample: HostSample | null;
   /** While a new runner replaces an old one without a restart: both processes, newest first. */
   instances?: RunnerInstance[];
+  /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
+  outpost?: boolean;
 }
 
 /** One runner process of a machine (see `crates/kiln/src/instances.rs`). */
@@ -1098,6 +1102,14 @@ export interface DnsSdInfo {
 
 export type InstallOs = "linux" | "macos" | "windows";
 
+/** POST /api/outposts/invite: a one-time invite, and a line per system that runs kiln there as an outpost (nothing installed). */
+export interface OutpostInvite {
+  token: string;
+  /** When the invite stops working (unix seconds). */
+  expires_at: number;
+  commands: Record<InstallOs, string>;
+}
+
 export interface JoinInfo {
   /** One-liners with an embedded join token: download kiln from this server, install it as a service, join. */
   install?: Record<InstallOs, string>;
@@ -1434,4 +1446,89 @@ export interface ReachRunner {
   mem_total: number;
   mem_used: number;
   harnesses: string[];
+}
+
+/* ---------------------------- providers (docs/cd-targets.md) ---------------------------- */
+
+export interface CdProviderSetting {
+  name: string;
+  required: boolean;
+  help: string;
+}
+
+export interface CdProviderKind {
+  group: string;
+  kind: string;
+  namespaced: boolean;
+  title: string;
+  stateful: boolean;
+  child: boolean;
+}
+
+/** A platform kiln deploys to: its kinds, what an app's definition takes, and the accounts that could serve it. */
+export interface CdProvider {
+  name: string;
+  title: string;
+  /** The integration kind its accounts are. */
+  integration: string;
+  integration_title: string | null;
+  /** What names a place: `region`; `project` and `region`. */
+  place: string[];
+  /** The setting that names the provider's scope (an ECS cluster). */
+  scope: string | null;
+  settings: CdProviderSetting[];
+  kinds: CdProviderKind[];
+  capabilities: string[];
+  reads: string[];
+  built: boolean;
+  accounts: { name: string; verified_at: number | null; last_error: string | null }[];
+}
+
+/** A target apps deploy to: a provider, an account, a place. */
+export interface CdTarget {
+  name: string;
+  provider: string;
+  title: string;
+  account: string;
+  place: Record<string, string>;
+  connected: boolean;
+  error: string | null;
+  apps: string[];
+}
+
+/** Something an account holds, found for building or importing an app. */
+export interface CdDiscovered {
+  kind: string;
+  name: string;
+  /** Where in the account (an ECS cluster). */
+  scope?: string;
+  summary: string;
+  updated?: string;
+  description?: string;
+}
+
+export interface CdDiscovery {
+  scopes?: string[];
+  resources: CdDiscovered[];
+}
+
+/** One resource as it runs, as the definition that adopts it. */
+export interface CdAdoption {
+  definition: Record<string, unknown>;
+  note: string | null;
+}
+
+/** A deploy file as kiln reads it: each app with where it goes and, for a provider's, what it renders now. */
+export interface CdValidation {
+  ok: boolean;
+  error?: string;
+  apps: {
+    id: string;
+    name: string;
+    environment: string | null;
+    destination: { cluster: string; namespace: string };
+    provider?: string;
+    objects?: Record<string, unknown>[];
+    error?: string;
+  }[];
 }

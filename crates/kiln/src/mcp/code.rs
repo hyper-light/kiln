@@ -1,7 +1,7 @@
 //! Code mode's sandbox: QuickJS-NG (rquickjs) inside kiln, with hard bounds.
 //!
 //! A program is the body of an async function. Operations are async functions on `kiln`
-//! (generated from the registry: `kiln.cd.apps.list`) and on `kiln.call(name, input)`. A call
+//! (generated from the registry: `kiln.cd.apps.list`, `kiln.ci.runs.list`) and on `kiln.call(name, input)`. A call
 //! queues a promise; the driver here runs the engine's pending jobs, takes the next queued call,
 //! runs the operation, settles the promise and goes on, so the engine never calls back into
 //! kiln and an operation never runs on the engine's stack. Only what the program returns leaves
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use rquickjs::{Context, Runtime};
 use serde_json::{Value, json};
 
-use crate::cd::ops::{self, Cx};
+use crate::ops::{self, Cx};
 
 /// What a program sees.
 pub enum Mode {
@@ -119,9 +119,9 @@ function __kiln_build(names) {
 "#;
 
 /// The registry as `code_search` programs see it.
-pub fn registry() -> Value {
+pub fn registry(hub: &crate::hub::Hub) -> Value {
     Value::Array(
-        ops::ops()
+        ops::all(hub)
             .iter()
             .map(|o| {
                 json!({
@@ -158,12 +158,12 @@ pub fn run(cx: Cx, mode: Mode, program: &str, limits: Limits) -> Result<Value, C
             let skills: Vec<Value> = super::skills::list().into_iter().map(|s| json!({"name": s.get("name"), "description": s.get("description")})).collect();
             format!(
                 "{PRELUDE}\nconst registry = {};\nconst skills = {};\n__kiln_main((async () => {{\n{program}\n}})());",
-                registry(),
+                registry(&cx.hub),
                 Value::Array(skills)
             )
         }
         Mode::Run { input } => {
-            let names: Vec<&str> = ops::ops().iter().map(|o| o.name).collect();
+            let names: Vec<&str> = ops::all(&cx.hub).iter().map(|o| o.name).collect();
             format!(
                 "{PRELUDE}\nconst input = {};\nconst kiln = __kiln_build({});\n__kiln_main((async () => {{\n{program}\n}})());",
                 input,

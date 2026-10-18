@@ -1,0 +1,6 @@
+name: fixture
+version: 0.1.0
+
+targets:
+  fixture:
+    main: src/fixture.cr

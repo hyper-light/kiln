@@ -205,6 +205,10 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["repos"]) => ("cd.repos.list".into(), json!({})),
         (&Method::POST, ["repos"]) => ("cd.repos.add".into(), json_body(body).await?),
         (&Method::DELETE, ["repos"]) => ("cd.repos.remove".into(), json!({"url": q.get("url").cloned().unwrap_or_default()})),
+        (&Method::GET, ["providers"]) => ("cd.providers.list".into(), json!({})),
+        (&Method::GET, ["targets"]) => ("cd.targets.list".into(), json!({})),
+        (&Method::GET, ["discover"]) => ("cd.discover".into(), from_query(q, &["provider", "account", "region", "project", "zone", "subscription", "resource-group", "environment", "scope", "name"])),
+        (&Method::POST, ["validate"]) => ("cd.validate".into(), json_body(body).await?),
         (&Method::GET, ["images"]) => ("cd.images.list".into(), json!({})),
         (&Method::PUT, ["images", name]) => {
             let mut b = json_body(body).await?;

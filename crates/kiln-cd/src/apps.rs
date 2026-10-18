@@ -73,6 +73,14 @@ pub struct ArtifactSpec {
     /// The pipeline that builds a published image (default `image`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
+    /// Instead of an image: a file a workflow's run at the commit uploaded (`artifact`, its
+    /// name), from `workflow` (the workflow's name, or its file). It resolves to its content's
+    /// SHA-256 (`sha256:<hex>`): a zip, a bundle, a built site (docs/cd-targets.md §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// The artifact's name, with `workflow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
     /// Its tag, when `image` carries none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
@@ -291,6 +299,21 @@ pub enum Engine {
     Kustomize(Kustomize),
     /// A config management plugin.
     Plugin(Plugin),
+    /// A provider's definition (docs/cd-targets.md §4): the provider renders its objects.
+    Provider(ProviderSource),
+}
+
+/// An app's definition for a provider: its key in `.kiln/deploy.yaml`, and its target's other
+/// settings.
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize)]
+pub struct ProviderSource {
+    /// The provider (`aws-ecs`).
+    pub provider: String,
+    /// The definition: its key's value.
+    pub spec: Value,
+    /// The target's settings beyond its account and place (`worker-suffix`).
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub target: Map<String, Value>,
 }
 
 /// Directory settings.
@@ -628,9 +651,23 @@ pub fn from_argo(v: &Value, parent: Option<&str>, clusters: &dyn Fn(&str) -> Opt
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeployFile {
-    /// Apps by name.
+    /// Apps by name, as written: each an [`AppSpec`], plus at most one provider's key
+    /// (`aws-ecs:`), split off by [`split_provider`].
     #[serde(default)]
-    pub apps: BTreeMap<String, AppSpec>,
+    pub apps: BTreeMap<String, Value>,
+}
+
+/// An app's settings and its provider's key (`aws-ecs: {…}`), if it names one.
+pub fn split_provider(name: &str, raw: &Value) -> Result<(AppSpec, Option<(String, Value)>), DefError> {
+    let Value::Object(m) = raw else { return Err(DefError(format!("app {name}: a map of settings"))) };
+    let mut rest = m.clone();
+    let named: Vec<String> = m.keys().filter(|k| crate::providers::get(k).is_some()).cloned().collect();
+    if named.len() > 1 {
+        return Err(DefError(format!("app {name} names {}: one provider per app", named.join(" and "))));
+    }
+    let provider = named.first().map(|p| (p.clone(), rest.remove(p).unwrap_or(Value::Null)));
+    let spec: AppSpec = serde_json::from_value(Value::Object(rest)).map_err(|e| DefError(format!("app {name}: {e}")))?;
+    Ok((spec, provider))
 }
 
 /// One app in `.kiln/deploy.yaml`.
@@ -835,6 +872,10 @@ pub struct EnvironmentSpec {
     /// Its clusters.
     #[serde(default)]
     pub clusters: Vec<String>,
+    /// Its targets beyond clusters, by provider (docs/cd-targets.md §4):
+    /// `aws-ecs: { account: aws-prod, region: us-east-1 }`.
+    #[serde(default)]
+    pub targets: BTreeMap<String, Map<String, Value>>,
     /// The environment it follows.
     #[serde(default)]
     pub after: Option<String>,
@@ -902,6 +943,16 @@ impl Scope {
         self.interpolate_keeping(text, &["artifacts"])
     }
 
+    /// Every string in `v` interpolated, keeping `${{ }}` whose first name is in `keep`.
+    pub fn interpolate_value_keeping(&self, v: &Value, keep: &[&str]) -> Value {
+        match v {
+            Value::String(t) => Value::String(self.interpolate_keeping(t, keep)),
+            Value::Array(a) => Value::Array(a.iter().map(|x| self.interpolate_value_keeping(x, keep)).collect()),
+            Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), self.interpolate_value_keeping(x, keep))).collect()),
+            other => other.clone(),
+        }
+    }
+
     /// [`Self::interpolate`], keeping `${{ }}` whose first name is in `keep` as written.
     pub fn interpolate_keeping(&self, text: &str, keep: &[&str]) -> String {
         let mut out = String::with_capacity(text.len());
@@ -946,57 +997,84 @@ pub fn from_deploy_file(
 ) -> Result<Vec<AppDef>, DefError> {
     let file: DeployFile = serde_yaml::from_str(text).map_err(|e| DefError(format!(".kiln/deploy.yaml: {e}")))?;
     let mut out = Vec::new();
-    for (name, spec) in &file.apps {
-        // Each destination: (environment, cluster, namespace).
-        let places: Vec<(Option<String>, String, Option<String>)> = match &spec.to {
-            None => vec![(None, IN_CLUSTER.to_owned(), None)],
-            Some(ToSpec::Place { cluster, namespace }) => vec![(None, cluster.clone(), namespace.clone())],
-            Some(ToSpec::One(env)) => env_places(env, environments, name)?,
+    for (name, raw) in &file.apps {
+        let (spec, provider) = split_provider(name, raw)?;
+        let provider_name = provider.as_ref().map(|(p, _)| p.as_str());
+        // Each destination: (environment, cluster or target, namespace, the target's settings).
+        let places: Vec<Place> = match &spec.to {
+            None if provider.is_some() => return Err(DefError(format!("app {name} deploys with {}: say where with to: (an environment, or a target)", provider_name.unwrap_or_default()))),
+            None => vec![(None, IN_CLUSTER.to_owned(), None, Map::new())],
+            Some(ToSpec::Place { cluster, namespace }) => {
+                if let Some(p) = provider_name
+                    && crate::providers::Target::parse(cluster).is_none_or(|t| t.provider != p)
+                {
+                    return Err(DefError(format!("app {name} deploys with {p}, so to: names a {p} target (`{p}/<account>/<place>`), not `{cluster}`")));
+                }
+                vec![(None, cluster.clone(), namespace.clone(), Map::new())]
+            }
+            Some(ToSpec::One(env)) => env_places(env, environments, name, provider_name)?,
             Some(ToSpec::Many(envs)) => {
                 let mut all = Vec::new();
                 for env in envs {
-                    all.extend(env_places(env, environments, name)?);
+                    all.extend(env_places(env, environments, name, provider_name)?);
                 }
                 all
             }
         };
-        for (env, cluster, ns) in places {
+        for (env, cluster, ns, target) in places {
             let mut scope = scope.clone();
             scope.set("app.name", Value::String(name.clone()));
             scope.set("cluster.name", Value::String(cluster.clone()));
+            if let Some(t) = crate::providers::Target::parse(&cluster) {
+                scope.set("target.name", Value::String(cluster.clone()));
+                scope.set("target.account", Value::String(t.account.clone()));
+                for (k, v) in t.def().map(|d| d.place).unwrap_or_default().iter().zip(&t.place) {
+                    scope.set(&format!("target.{k}"), Value::String(v.clone()));
+                }
+                for (k, v) in &target {
+                    scope.set(&format!("target.{k}"), v.clone());
+                }
+            }
             if let Some(e) = &env {
                 scope.set("env.name", Value::String(e.clone()));
             }
             // web, web-staging, or web-production-prod-us when an environment has several clusters.
             let app_name = match &env {
                 None => name.clone(),
-                Some(e) if environments.get(e).is_some_and(|x| x.clusters.len() > 1) => format!("{name}-{e}-{cluster}"),
+                Some(e) if environments.get(e).is_some_and(|x| x.clusters.len() > 1 && provider.is_none()) => format!("{name}-{e}-{cluster}"),
                 Some(e) => format!("{name}-{e}"),
             };
-            out.push(app_from_spec(&app_name, spec, repo, trunk, env, &cluster, ns, &scope)?);
+            let p = provider.as_ref().map(|(p, v)| (p.as_str(), v, &target));
+            out.push(app_from_spec(&app_name, &spec, p, repo, trunk, env, &cluster, ns, &scope)?);
         }
     }
     Ok(out)
 }
 
-fn env_places(
-    env: &str,
-    environments: &BTreeMap<String, EnvironmentSpec>,
-    app: &str,
-) -> Result<Vec<(Option<String>, String, Option<String>)>, DefError> {
+/// Where an app deploys: its environment, its cluster (or target), the namespace it names, and
+/// its target's settings beyond account and place.
+type Place = (Option<String>, String, Option<String>, Map<String, Value>);
+
+fn env_places(env: &str, environments: &BTreeMap<String, EnvironmentSpec>, app: &str, provider: Option<&str>) -> Result<Vec<Place>, DefError> {
     let e = environments
         .get(env)
         .ok_or_else(|| DefError(format!("app {app} deploys to environment {env}, which .kiln/environments.yaml doesn't define")))?;
+    if let Some(p) = provider {
+        let spec = e.targets.get(p).ok_or_else(|| DefError(format!("app {app} deploys with {p} to environment {env}, which has no {p} target: add `targets: {{ {p}: {{ account: <integration>, … }} }}` to it")))?;
+        let (target, extra) = crate::providers::target_of(p, spec).map_err(|m| DefError(format!("environment {env}: {m}")))?;
+        return Ok(vec![(Some(env.to_owned()), target.name(), None, extra)]);
+    }
     if e.clusters.is_empty() {
         return Err(DefError(format!("environment {env} has no clusters")));
     }
-    Ok(e.clusters.iter().map(|c| (Some(env.to_owned()), c.clone(), None)).collect())
+    Ok(e.clusters.iter().map(|c| (Some(env.to_owned()), c.clone(), None, Map::new())).collect())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn app_from_spec(
     name: &str,
     spec: &AppSpec,
+    provider: Option<(&str, &Value, &Map<String, Value>)>,
     repo: &str,
     trunk: &str,
     environment: Option<String>,
@@ -1009,8 +1087,18 @@ fn app_from_spec(
     if let Some(src) = &spec.source {
         specs.insert(0, src);
     }
+    // A provider's app reads its files from its source, by default the repository's root.
+    let root = SourceSpec::Path(String::new());
+    if specs.is_empty() && provider.is_some() {
+        specs.push(&root);
+    }
     if specs.is_empty() {
         return Err(DefError(format!("app {name} has no source")));
+    }
+    if let Some((p, _, _)) = provider
+        && (spec.helm.is_some() || spec.kustomize.is_some() || spec.directory.is_some() || spec.plugin.is_some())
+    {
+        return Err(DefError(format!("app {name} deploys with {p}: helm, kustomize, directory and plugin are for Kubernetes apps")));
     }
     let mut sources = Vec::new();
     for src in specs {
@@ -1028,7 +1116,10 @@ fn app_from_spec(
     }
     // Engine settings apply to the first source that renders (not a `ref`-only one).
     if let Some(first) = sources.iter_mut().find(|s| s.as_ref.is_none() || s.chart.is_some()) {
-        if let Some(h) = &spec.helm {
+        if let Some((p, v, target)) = provider {
+            // `git.*` stays for the revision each render is at, `artifacts.*` for what it resolved.
+            first.engine = Engine::Provider(ProviderSource { provider: p.to_owned(), spec: scope.interpolate_value_keeping(v, &["git", "artifacts"]), target: target.clone() });
+        } else if let Some(h) = &spec.helm {
             let mut parameters: Vec<HelmParam> = h
                 .set
                 .iter()
@@ -1097,13 +1188,26 @@ fn app_from_spec(
         }
         None => SyncPolicy::default(),
     };
+    for (n, a) in &spec.artifacts {
+        let kinds = [!a.image.is_empty(), a.published.is_some(), a.artifact.is_some()].iter().filter(|x| **x).count();
+        if kinds != 1 {
+            return Err(DefError(format!("app {name}: artifact {n} is one of: an image, a published image, or a workflow's artifact (workflow and artifact)")));
+        }
+        if a.artifact.is_some() != a.workflow.is_some() {
+            return Err(DefError(format!("app {name}: artifact {n} needs both the workflow and its artifact")));
+        }
+    }
     Ok(AppDef {
         name: name.to_owned(),
         project: spec.project.clone().unwrap_or_else(|| "default".into()),
         sources,
         destination: Destination {
             cluster: cluster.to_owned(),
-            namespace: namespace.or_else(|| spec.namespace.as_deref().map(i)).unwrap_or_else(|| "default".into()),
+            namespace: match provider {
+                // A provider's scope (an ECS cluster) is its definition's, if it has one.
+                Some((p, v, _)) => crate::providers::get(p).and_then(|d| d.scope).and_then(|k| v.get(k)).and_then(Value::as_str).map(i).unwrap_or_default(),
+                None => namespace.or_else(|| spec.namespace.as_deref().map(i)).unwrap_or_else(|| "default".into()),
+            },
         },
         sync,
         ignore: spec
@@ -1139,6 +1243,8 @@ fn app_from_spec(
                         image: k(&a.image),
                         published: a.published.as_deref().map(k),
                         pipeline: a.pipeline.clone(),
+                        workflow: a.workflow.as_deref().map(k),
+                        artifact: a.artifact.as_deref().map(k),
                         tag: a.tag.as_deref().map(k),
                         registry: a.registry.as_deref().map(k),
                         pull_secret: a.pull_secret.as_deref().map(k),
@@ -1226,6 +1332,101 @@ apps:
             other => return Err(DefError(format!("expected helm, got {other:?}"))),
         }
         assert!(from_deploy_file("apps: { x: { source: a, to: nowhere } }", "r", "main", &envs, &scope).is_err());
+        Ok(())
+    }
+
+    /// docs/cd-targets.md §4: an app names its provider's key; each environment its target.
+    #[test]
+    fn provider_apps_deploy_to_their_environments_targets() -> Result<(), DefError> {
+        let envs: BTreeMap<String, EnvironmentSpec> = serde_yaml::from_str(
+            "staging: { targets: { aws-ecs: { account: aws-staging, region: us-east-1 } } }\nproduction: { clusters: [prod], targets: { aws-ecs: { account: aws-prod, region: us-west-2, suffix: -prod } } }\n",
+        )
+        .map_err(|e| DefError(e.to_string()))?;
+        let text = r#"
+apps:
+  api:
+    aws-ecs:
+      cluster: "main${{ target.suffix }}"
+      service: api
+      task: deploy/api/task.json
+      set: { "containerDefinitions[name=api].image": "${{ artifacts.image }}", "service.desiredCount": 2 }
+    artifacts:
+      image: { image: "docker.io/acme/api", tag: "${{ git.sha }}" }
+    to: [staging, production]
+"#;
+        let apps = from_deploy_file(text, "acme/api", "main", &envs, &Scope::default())?;
+        let names: Vec<(&str, &str, &str)> = apps.iter().map(|a| (a.name.as_str(), a.destination.cluster.as_str(), a.destination.namespace.as_str())).collect();
+        assert_eq!(names, [("api-staging", "aws-ecs/aws-staging/us-east-1", "main"), ("api-production", "aws-ecs/aws-prod/us-west-2", "main-prod")]);
+        let prod = apps.get(1).ok_or_else(|| DefError("no production app".into()))?;
+        let source = prod.sources.first().ok_or_else(|| DefError("no source".into()))?;
+        assert_eq!(source.path, "", "the repository's root by default");
+        let Engine::Provider(p) = &source.engine else { return Err(DefError(format!("expected a provider, got {:?}", source.engine))) };
+        assert_eq!(p.provider, "aws-ecs");
+        assert_eq!(p.spec.pointer("/set/containerDefinitions[name=api].image"), Some(&json!("${{ artifacts.image }}")), "artifacts wait for the revision");
+        assert_eq!(p.target.get("suffix"), Some(&json!("-prod")));
+
+        // Rendered from the source, with the revision's artifacts.
+        let dir = std::env::temp_dir().join(format!("kiln-provider-render-{}", std::process::id()));
+        let task = dir.join("deploy/api");
+        std::fs::create_dir_all(&task).map_err(|e| DefError(e.to_string()))?;
+        std::fs::write(task.join("task.json"), r#"{"family":"api","containerDefinitions":[{"name":"api","image":"x"}]}"#).map_err(|e| DefError(e.to_string()))?;
+        let digest = format!("sha256:{}", "d".repeat(64));
+        let refs = [ArtifactRef { name: "image".into(), reference: format!("docker.io/acme/api@{digest}"), repository: "docker.io/acme/api".into(), tag: None, digest }];
+        let sources = with_artifacts(&prod.sources, &refs)?;
+        let source = sources.first().ok_or_else(|| DefError("no source".into()))?;
+        let (refs_dirs, scratch) = (BTreeMap::new(), dir.join("scratch"));
+        let req = crate::render::Request { source, root: &dir, refs: &refs_dirs, app: &prod.name, namespace: &prod.destination.namespace, revision: "abc1234def", kube_version: None, api_versions: &[], scratch: &scratch };
+        let objs = crate::render::render(&req, &crate::render::Tools::default()).map_err(|e| DefError(format!("{e:#}")))?;
+        let _ = std::fs::remove_dir_all(&dir);
+        let td = objs.first().ok_or_else(|| DefError("no task definition".into()))?;
+        assert_eq!(td.pointer("/spec/containerDefinitions/0/image").and_then(Value::as_str), Some(refs.first().map(|r| r.reference.as_str()).unwrap_or_default()));
+        let svc = objs.get(1).ok_or_else(|| DefError("no service".into()))?;
+        assert_eq!((crate::obj::namespace(svc), svc.pointer("/spec/desiredCount")), ("main-prod", Some(&json!(2))));
+        let deps = crate::render::deps(source, crate::render::Kind::Provider, &|_| None);
+        assert_eq!(deps.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(), ["deploy/api/task.json"]);
+
+        // A provider's app says where it goes, to a target of its own provider.
+        assert!(from_deploy_file("apps: { x: { aws-ecs: { cluster: c, service: s, task: t.json } } }", "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("to:")));
+        assert!(from_deploy_file("apps: { x: { aws-lambda: { function: f, code: s3://b/k }, to: production } }", "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("no aws-lambda target")));
+        assert!(from_deploy_file("apps: { x: { aws-ecs: {}, aws-lambda: {}, to: production } }", "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("one provider")));
+        assert!(from_deploy_file("apps: { x: { aws-ecs: {}, to: { cluster: in-cluster } } }", "r", "main", &envs, &Scope::default()).is_err());
+        Ok(())
+    }
+
+    /// kiln's own deploy files (its production reads them every round) read as they always did.
+    #[test]
+    fn kilns_own_deploy_files_read() -> Result<(), DefError> {
+        let envs: BTreeMap<String, EnvironmentSpec> = serde_yaml::from_str(include_str!("../../../.kiln/environments.yaml")).map_err(|e| DefError(e.to_string()))?;
+        let mut scope = Scope::default();
+        scope.set("git.sha", json!("1111111111111111111111111111111111111111"));
+        let apps = from_deploy_file(include_str!("../../../.kiln/deploy.yaml"), "https://github.com/adalundhe/kiln.git", "main", &envs, &scope)?;
+        let mut names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["kiln-production", "kube-prometheus-stack-production", "namespaces-production"]);
+        assert!(apps.iter().all(|a| a.destination.cluster == IN_CLUSTER && !matches!(a.sources.first().map(|s| &s.engine), Some(Engine::Provider(_)))));
+        Ok(())
+    }
+
+    /// docs/cd-targets.md §7: a file a workflow uploaded is an artifact too; an artifact is one
+    /// kind of thing.
+    #[test]
+    fn workflow_artifacts_read_and_artifacts_are_one_thing() -> Result<(), DefError> {
+        let envs: BTreeMap<String, EnvironmentSpec> = serde_yaml::from_str("production: { targets: { aws-lambda: { account: aws, region: us-east-1 } } }").map_err(|e| DefError(e.to_string()))?;
+        let text = r#"
+apps:
+  thumbs:
+    aws-lambda: { function: thumbs, code: "${{ artifacts.zip }}", set: { Runtime: python3.13, Handler: app.handler, Role: r } }
+    artifacts:
+      zip: { workflow: ci, artifact: thumbs.zip }
+    to: production
+"#;
+        let apps = from_deploy_file(text, "acme/thumbs", "main", &envs, &Scope::default())?;
+        let a = apps.first().and_then(|a| a.artifacts.get("zip")).ok_or_else(|| DefError("no artifact".into()))?;
+        assert_eq!((a.workflow.as_deref(), a.artifact.as_deref()), (Some("ci"), Some("thumbs.zip")));
+        let both = "apps: { x: { aws-lambda: { function: f, code: c }, artifacts: { zip: { image: a/b, workflow: ci, artifact: z } }, to: production } }";
+        assert!(from_deploy_file(both, "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("one of")));
+        let half = "apps: { x: { aws-lambda: { function: f, code: c }, artifacts: { zip: { artifact: z } }, to: production } }";
+        assert!(from_deploy_file(half, "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("both")));
         Ok(())
     }
 

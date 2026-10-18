@@ -12,7 +12,7 @@ import "./harness.css";
 import "./console.css";
 import { Link, useNavigate, useParams } from "@/lib/router";
 import { ArrowLeft, ChevronRight, RotateCcw, X } from "lucide-react";
-import { harnessApi, sessionStore, useSession, useSessionReady, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
+import { harnessApi, sessionStore, useSession, useSessionReady, useStopAt, type Command, type FileChange, type HEvent, type Meta, type SessionStore, type Todo } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loading } from "@/components/ui/loading";
@@ -28,6 +28,7 @@ import { FindBar, findIn, type FindNow } from "./find";
 import { AgentHeader } from "./head";
 import { Inspector, type InspectorTab } from "./inspector";
 import { StateWord } from "./parts";
+import { PausedLine } from "./pause";
 import { useMarkSeen } from "./seen";
 import { ActivityLine } from "./background";
 import { Timeline } from "./timeline";
@@ -358,6 +359,7 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
   const state = useSession(store, (s) => s.state);
   const meta = useSession(store, (s) => s.meta);
   const conn = useSession(store, (s) => s.conn);
+  const stopAt = useStopAt(store);
   const status = state?.status ?? info?.status ?? "starting";
   const actions = useAgentActions(
     {
@@ -390,6 +392,9 @@ function Head({ store, cwd, send, onUsage, onSettings, onFind }: { store: Sessio
         onBackground={onUsage}
         onSettings={onSettings}
         onFind={onFind}
+        stopAt={stopAt}
+        onStop={() => store.stop()}
+        onForceStop={() => store.stop(true)}
       />
       {actions.dialogs}
     </>
@@ -448,6 +453,7 @@ function Dock({
           )}
         </div>
       ) : null}
+      <PausedLine store={store} send={send} />
       <Composer store={store} agent={id} attachments={attachments} toMain={toMain} onView={onView} onTerminal={onTerminal} />
     </div>
   );
