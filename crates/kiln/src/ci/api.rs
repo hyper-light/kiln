@@ -38,7 +38,8 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         _ if super::rest::is_web(seg) => Some(super::rest::web(hub, seg).await),
         // W10: ID tokens for jobs, and the issuer's documents.
         ["_kiln", "oidc", "token"] => Some(super::oidc::token(hub, &req).await),
-        _ if super::oidc::is_issuer(hub, seg).is_some() => Some(super::oidc::document(hub, super::oidc::is_issuer(hub, seg).unwrap_or_default()).await),
+        // Only while the engine runs: fetching the keys makes the first one.
+        _ if hub.ci.enabled() && super::oidc::is_issuer(hub, seg).is_some() => Some(super::oidc::document(hub, super::oidc::is_issuer(hub, seg).unwrap_or_default()).await),
         ["_kiln", ..] | ["_apis", ..] | ["oidc", ..] | ["twirp", ..] => Some(Err((StatusCode::NOT_FOUND, "not found".into()))),
         _ => None,
     }
