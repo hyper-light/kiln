@@ -244,7 +244,8 @@ pub async fn collect(hub: &Hub) -> anyhow::Result<Collected> {
                 "DELETE FROM cas_objects WHERE last_used_at < ?1
                    AND digest NOT IN (SELECT object FROM ci_caches WHERE object IS NOT NULL)
                    AND digest NOT IN (SELECT object FROM ci_artifacts WHERE object IS NOT NULL)
-                   AND digest NOT IN (SELECT object FROM ci_release_assets)",
+                   AND digest NOT IN (SELECT object FROM ci_release_assets)
+                   AND digest NOT IN (SELECT object FROM test_reports)",
                 params![now - grace],
             )?;
             let mut used = HashSet::new();

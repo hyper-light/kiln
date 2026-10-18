@@ -93,7 +93,9 @@ pub trait Source: Sync {
 pub async fn load(hub: &Hub, repo: &Repo, sha: &str) -> anyhow::Result<Commit> {
     let mirror = gitops::ensure_commit(hub, repo, sha).await?;
     let src = Mirror { hub, repo, dir: mirror.to_string_lossy().into_owned() };
-    load_from(&src, sha, hub.cfg.ci.github_workflows).await
+    // The repository's own setting, else the server's (W02-R02).
+    let setting = super::repo_config::load(hub, repo).await.github_workflows.unwrap_or(hub.cfg.ci.github_workflows);
+    load_from(&src, sha, setting).await
 }
 
 /// [`load`], reading through `src`.

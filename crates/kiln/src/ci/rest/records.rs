@@ -2,7 +2,9 @@
 //! - commit statuses (`POST /statuses/{sha}`, `GET /commits/{ref}/statuses`, `/status`);
 //! - check runs (`POST /check-runs`, `PATCH`/`GET /check-runs/{id}`, `GET /commits/{ref}/check-runs`);
 //! - releases (create, read, update, delete; by id, latest or tag) with assets uploaded to
-//!   `upload_url` (`/api/uploads/…`, GHES's path) and kept in the store (W08).
+//!   `upload_url` (`/api/uploads/…`, GHES's path) and kept in the store (W08);
+//! - dependency snapshots (`POST /dependency-graph/snapshots`), as build tools' submission
+//!   actions send them.
 //!
 //! For a repository kiln mirrors from GitHub they live in kiln, which doesn't write to GitHub
 //! (the App does that, W14-R10).
@@ -503,4 +505,252 @@ pub async fn upload_asset(s: &Site<'_>, release: &str, req: Request) -> Result<R
         return Ok(srv::json(StatusCode::UNPROCESSABLE_ENTITY, &json!({ "message": "Validation Failed", "errors": [{ "resource": "ReleaseAsset", "code": "already_exists", "field": "name" }] })));
     };
     Ok(srv::json(StatusCode::CREATED, &asset_json(s, &r.1, &(id, name, label, ct, size, at, 0))))
+}
+
+// ------------------------------------------------------------------ dependency snapshots
+
+/// `POST /repos/{o}/{r}/dependency-graph/snapshots`: a build's resolved dependencies (Gradle's,
+/// Maven's, sbt's submission actions), validated as GitHub validates them and kept.
+pub async fn dependency_snapshot(s: &Site<'_>, body: &Value) -> Result<Response, Fail> {
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).filter(|x| !x.is_empty()).map(str::to_owned);
+    if body.get("version").and_then(Value::as_i64).is_none() {
+        return Ok(invalid("version is required"));
+    }
+    let (Some(sha), Some(git_ref)) = (text(body.get("sha")), text(body.get("ref"))) else { return Ok(invalid("sha and ref are required")) };
+    let (Some(job), Some(detector)) = (body.get("job"), body.get("detector")) else { return Ok(invalid("job and detector are required")) };
+    let (Some(correlator), Some(name)) = (text(job.get("correlator")), text(detector.get("name"))) else { return Ok(invalid("job.correlator and detector.name are required")) };
+    if !git_ref.starts_with("refs/") {
+        return Ok(invalid("ref must be a fully qualified ref (refs/heads/…)"));
+    }
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(invalid("sha must be a full 40-character commit SHA"));
+    }
+    let manifests = body.get("manifests").and_then(Value::as_object).map_or(0, serde_json::Map::len);
+    let (repo, snap) = (s.repo.id.clone(), body.to_string());
+    let (sh, rf, jb, dt) = (sha, git_ref, correlator, name);
+    let (id, at) = s
+        .hub
+        .store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            c.execute(
+                "INSERT INTO ci_dependency_snapshots (repo_id, sha, git_ref, job, detector, manifests, snapshot, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![repo, sh, rf, jb, dt, i64::try_from(manifests).unwrap_or(i64::MAX), snap, now],
+            )?;
+            Ok((c.last_insert_rowid(), now))
+        })
+        .await
+        .map_err(internal)?;
+    Ok(srv::json(
+        StatusCode::CREATED,
+        &json!({ "id": id, "created_at": rfc3339(at), "result": "SUCCESS", "message": "Dependency results for the repo have been successfully updated." }),
+    ))
+}
+
+
+// ------------------------------------------------------------------ deployments (W15-R04)
+
+const DEPLOYMENT_COLUMNS: &str = "id, environment, sha, git_ref, task, payload, description, creator, created_at, updated_at, transient, production";
+
+/// `GET /repos/{o}/{r}/deployments` (`sha`, `ref`, `task`, `environment`), and one by id.
+pub async fn deployments(s: &Site<'_>, id: Option<&str>, q: &std::collections::HashMap<String, String>) -> Result<Response, Fail> {
+    let repo = s.repo.id.clone();
+    let id = id.map(|i| i.parse::<i64>().unwrap_or(-1));
+    let f = |k: &str| q.get(k).filter(|v| !v.is_empty()).cloned();
+    let (sha, git_ref, task, env) = (f("sha"), f("ref"), f("task"), f("environment"));
+    let per_page = q.get("per_page").and_then(|p| p.parse::<i64>().ok()).unwrap_or(30).clamp(1, 100);
+    let rows: Vec<rusqlite::Result<Value>> = {
+        let raw = s
+            .hub
+            .store
+            .call(move |c| {
+                let mut st = c.prepare(&format!(
+                    "SELECT {DEPLOYMENT_COLUMNS} FROM ci_deployments WHERE repo_id = ?1 AND (?2 IS NULL OR id = ?2) AND (?3 IS NULL OR sha = ?3) AND (?4 IS NULL OR git_ref = ?4)
+                     AND (?5 IS NULL OR task = ?5) AND (?6 IS NULL OR environment = ?6 COLLATE NOCASE) ORDER BY id DESC LIMIT ?7"
+                ))?;
+                let rows = st.query_map(params![repo, id, sha, git_ref, task, env, per_page], |r| {
+                    let v: Vec<Value> = (0..12).map(|i| r.get_ref(i).map(value_of).unwrap_or(Value::Null)).collect();
+                    Ok(v)
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .await
+            .map_err(internal)?;
+        raw.into_iter().map(|v| Ok(row_value(s, &v))).collect()
+    };
+    let list: Vec<Value> = rows.into_iter().filter_map(Result::ok).collect();
+    match id {
+        Some(_) => match list.into_iter().next() {
+            Some(d) => Ok(srv::json(StatusCode::OK, &d)),
+            None => Ok(srv::json(StatusCode::NOT_FOUND, &json!({ "message": "Not Found" }))),
+        },
+        None => Ok(srv::json(StatusCode::OK, &Value::Array(list))),
+    }
+}
+
+fn value_of(v: rusqlite::types::ValueRef<'_>) -> Value {
+    match v {
+        rusqlite::types::ValueRef::Null => Value::Null,
+        rusqlite::types::ValueRef::Integer(i) => json!(i),
+        rusqlite::types::ValueRef::Real(f) => json!(f),
+        rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+        rusqlite::types::ValueRef::Blob(_) => Value::Null,
+    }
+}
+
+/// A deployment row (as [`DEPLOYMENT_COLUMNS`] reads it) in GitHub's shape.
+fn row_value(s: &Site<'_>, v: &[Value]) -> Value {
+    let at = |i: usize| v.get(i).cloned().unwrap_or(Value::Null);
+    let id = at(0).as_i64().unwrap_or_default();
+    let env = at(1);
+    let payload = at(5).as_str().and_then(|p| serde_json::from_str::<Value>(p).ok()).unwrap_or(json!({}));
+    let time = |i: usize| rfc3339(at(i).as_i64().unwrap_or_default());
+    json!({
+        "url": format!("{}/deployments/{id}", s.api), "id": id, "node_id": format!("kiln-deployment-{id}"),
+        "sha": at(2), "ref": at(3), "task": at(4), "payload": payload, "original_environment": env, "environment": env,
+        "description": at(6), "creator": json!({ "login": at(7), "type": "User" }), "created_at": time(8), "updated_at": time(9),
+        "statuses_url": format!("{}/deployments/{id}/statuses", s.api), "repository_url": s.api,
+        "transient_environment": at(10).as_i64().unwrap_or_default() != 0, "production_environment": at(11).as_i64().unwrap_or_default() != 0,
+    })
+}
+
+/// `POST /repos/{o}/{r}/deployments`: a deployment an action makes itself.
+pub async fn create_deployment(s: &Site<'_>, body: &Value) -> Result<Response, Fail> {
+    let Some(git_ref) = body.get("ref").and_then(Value::as_str).filter(|r| !r.is_empty()).map(str::to_owned) else { return Ok(invalid("ref is required")) };
+    let Some(sha) = s.resolve(&git_ref).await else { return Ok(srv::json(StatusCode::CONFLICT, &json!({ "message": format!("No ref found for: {git_ref}") }))) };
+    let env = body.get("environment").and_then(Value::as_str).filter(|e| !e.is_empty()).unwrap_or("production").to_owned();
+    let task = body.get("task").and_then(Value::as_str).unwrap_or("deploy").to_owned();
+    let payload = body.get("payload").map_or_else(|| "{}".to_owned(), |p| if p.is_string() { p.as_str().unwrap_or("{}").to_owned() } else { p.to_string() });
+    let description = body.get("description").and_then(Value::as_str).map(str::to_owned);
+    let transient = body.get("transient_environment").and_then(Value::as_bool).unwrap_or(false);
+    let production = body.get("production_environment").and_then(Value::as_bool).unwrap_or(env == "production");
+    let repo = s.repo.id.clone();
+    let id = s
+        .hub
+        .store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            c.execute(
+                "INSERT INTO ci_deployments (repo_id, environment, sha, git_ref, task, payload, description, creator, transient, production, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'github-actions[bot]', ?8, ?9, ?10, ?10)",
+                params![repo, env, sha, git_ref, task, payload, description, transient, production, now],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+        .await
+        .map_err(internal)?;
+    deployment_by_id(s, id, StatusCode::CREATED).await
+}
+
+async fn deployment_by_id(s: &Site<'_>, id: i64, code: StatusCode) -> Result<Response, Fail> {
+    let q = std::collections::HashMap::new();
+    let r = deployments(s, Some(&id.to_string()), &q).await?;
+    if code == StatusCode::OK {
+        return Ok(r);
+    }
+    let mut r = r;
+    *r.status_mut() = code;
+    Ok(r)
+}
+
+/// `GET /repos/{o}/{r}/deployments/{id}/statuses`, and `POST` one.
+pub async fn deployment_statuses(s: &Site<'_>, id: &str, body: Option<&Value>) -> Result<Response, Fail> {
+    let Ok(dep) = id.parse::<i64>() else { return Ok(srv::json(StatusCode::NOT_FOUND, &json!({ "message": "Not Found" }))) };
+    let repo = s.repo.id.clone();
+    let env: Option<String> = s.hub.store.call(move |c| Ok(c.query_row("SELECT environment FROM ci_deployments WHERE id = ?1 AND repo_id = ?2", params![dep, repo], |r| r.get(0)).optional()?)).await.map_err(internal)?;
+    let Some(env) = env else { return Ok(srv::json(StatusCode::NOT_FOUND, &json!({ "message": "Not Found" }))) };
+    if let Some(b) = body {
+        let state = b.get("state").and_then(Value::as_str).unwrap_or_default().to_owned();
+        if !matches!(state.as_str(), "error" | "failure" | "inactive" | "in_progress" | "queued" | "pending" | "success") {
+            return Ok(invalid("state is error, failure, inactive, in_progress, queued, pending or success"));
+        }
+        let url = b.get("environment_url").and_then(Value::as_str).map(str::to_owned);
+        let log = b.get("log_url").or_else(|| b.get("target_url")).and_then(Value::as_str).map(str::to_owned);
+        let description = b.get("description").and_then(Value::as_str).map(|d| d.chars().take(140).collect::<String>());
+        let sid = s
+            .hub
+            .store
+            .call(move |c| {
+                let now = crate::util::now_unix();
+                c.execute(
+                    "INSERT INTO ci_deployment_statuses (deployment_id, state, description, environment_url, log_url, creator, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'github-actions[bot]', ?6)",
+                    params![dep, state, description, url, log, now],
+                )?;
+                c.execute("UPDATE ci_deployments SET updated_at = ?2 WHERE id = ?1", params![dep, now])?;
+                Ok(c.last_insert_rowid())
+            })
+            .await
+            .map_err(internal)?;
+        let v = s
+            .hub
+            .store
+            .call(move |c| Ok(c.query_row("SELECT id, state, description, environment_url, log_url, creator, created_at FROM ci_deployment_statuses WHERE id = ?1", [sid], |r| Ok(row_values(r)))?))
+            .await
+            .map_err(internal)?;
+        return Ok(srv::json(StatusCode::CREATED, &status_value(s, dep, &env, &v)));
+    }
+    let rows: Vec<Vec<Value>> = s
+        .hub
+        .store
+        .call(move |c| {
+            let mut st = c.prepare("SELECT id, state, description, environment_url, log_url, creator, created_at FROM ci_deployment_statuses WHERE deployment_id = ?1 ORDER BY id DESC")?;
+            let rows = st.query_map([dep], |r| Ok(row_values(r)))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+        .map_err(internal)?;
+    Ok(srv::json(StatusCode::OK, &Value::Array(rows.iter().map(|v| status_value(s, dep, &env, v)).collect())))
+}
+
+fn row_values(r: &rusqlite::Row<'_>) -> Vec<Value> {
+    (0..7).map(|i| r.get_ref(i).map(value_of).unwrap_or(Value::Null)).collect()
+}
+
+fn status_value(s: &Site<'_>, dep: i64, env: &str, v: &[Value]) -> Value {
+    let at = |i: usize| v.get(i).cloned().unwrap_or(Value::Null);
+    let id = at(0).as_i64().unwrap_or_default();
+    let time = rfc3339(at(6).as_i64().unwrap_or_default());
+    let text = |i: usize| at(i).as_str().unwrap_or_default().to_owned();
+    json!({
+        "url": format!("{}/deployments/{dep}/statuses/{id}", s.api), "id": id, "node_id": format!("kiln-deployment-status-{id}"),
+        "state": at(1), "creator": json!({ "login": at(5), "type": "Bot" }), "description": text(2), "environment": env,
+        "target_url": text(4), "log_url": text(4), "environment_url": text(3), "created_at": time, "updated_at": time,
+        "deployment_url": format!("{}/deployments/{dep}", s.api), "repository_url": s.api,
+    })
+}
+
+/// `GET /repos/{o}/{r}/environments`, and one by name, with their protection as GitHub's
+/// `protection_rules`.
+pub async fn environments(s: &Site<'_>, name: Option<&str>) -> Result<Response, Fail> {
+    let all = crate::ci::environments::defs(s.hub, &s.repo).await.map_err(internal)?;
+    let one = |d: &crate::ci::environments::EnvDef, i: usize| {
+        let p = &d.protection;
+        let mut rules = Vec::new();
+        if p.wait_timer > 0 {
+            rules.push(json!({ "id": i * 10 + 1, "type": "wait_timer", "wait_timer": p.wait_timer }));
+        }
+        if !p.reviewers.is_empty() {
+            let reviewers: Vec<Value> = p.reviewers.iter().map(|r| match r.strip_prefix("team:") {
+                Some(t) => json!({ "type": "Team", "reviewer": { "slug": t, "name": t } }),
+                None => json!({ "type": "User", "reviewer": { "login": r.strip_prefix("user:").unwrap_or(r) } }),
+            }).collect();
+            rules.push(json!({ "id": i * 10 + 2, "type": "required_reviewers", "prevent_self_review": p.prevent_self_review, "reviewers": reviewers }));
+        }
+        if p.branches.is_some() || p.tags.is_some() {
+            rules.push(json!({ "id": i * 10 + 3, "type": "branch_policy" }));
+        }
+        let policy = (p.branches.is_some() || p.tags.is_some()).then(|| json!({ "protected_branches": false, "custom_branch_policies": true }));
+        json!({ "id": i + 1, "node_id": format!("kiln-environment-{}", d.name), "name": d.name, "url": format!("{}/environments/{}", s.api, d.name),
+                "html_url": format!("{}/deployments/activity_log?environments_filter={}", s.html, d.name), "protection_rules": rules, "deployment_branch_policy": policy,
+                "can_admins_bypass": true })
+    };
+    match name {
+        Some(n) => match all.iter().enumerate().find(|(_, (k, _))| k.eq_ignore_ascii_case(n)) {
+            Some((i, (_, d))) => Ok(srv::json(StatusCode::OK, &one(d, i))),
+            None => Ok(srv::json(StatusCode::NOT_FOUND, &json!({ "message": "Not Found" }))),
+        },
+        None => {
+            let list: Vec<Value> = all.values().enumerate().map(|(i, d)| one(d, i)).collect();
+            Ok(srv::json(StatusCode::OK, &json!({ "total_count": list.len(), "environments": list })))
+        }
+    }
 }

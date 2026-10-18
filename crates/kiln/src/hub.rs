@@ -45,6 +45,40 @@ pub enum Launch {
     Retry { at: Instant, check_pods: bool },
 }
 
+/// How long an outpost invite works ([`OutpostInvites`]).
+pub const OUTPOST_INVITE_TTL: Duration = Duration::from_secs(3600);
+
+/// One-time invites for outposts (`kiln outpost`): each enrolls one, once, within
+/// [`OUTPOST_INVITE_TTL`].
+#[derive(Default)]
+pub struct OutpostInvites(Mutex<HashMap<String, Instant>>);
+
+impl OutpostInvites {
+    /// A new invite, and when it stops working (unix seconds).
+    pub fn mint(&self) -> (String, i64) {
+        let token = crate::util::random_token();
+        self.add(token.clone(), Instant::now() + OUTPOST_INVITE_TTL);
+        (token, crate::util::now_unix() + i64::try_from(OUTPOST_INVITE_TTL.as_secs()).unwrap_or(0))
+    }
+
+    fn add(&self, token: String, until: Instant) {
+        let mut g = self.0.lock();
+        g.retain(|_, u| *u > Instant::now());
+        g.insert(token, until);
+    }
+
+    /// Uses up an invite: whether it was one and still worked.
+    pub fn take(&self, token: &str) -> bool {
+        self.0.lock().remove(token).is_some_and(|until| until > Instant::now())
+    }
+}
+
+/// An outpost (`kiln outpost`) says so with its label and no slots; a runner given the label by
+/// hand still takes jobs.
+fn is_outpost(labels: &[String], slots: u32) -> bool {
+    slots == 0 && labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentLive {
     pub name: String,
@@ -65,6 +99,9 @@ pub struct AgentLive {
     pub draining: bool,
     pub sample: Option<HostSample>,
     pub terminal: bool,
+    /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
+    /// installed. It takes no jobs and the server doesn't upgrade it.
+    pub outpost: bool,
     #[serde(skip)]
     pub dedicated_job: Option<String>,
     #[serde(skip)]
@@ -124,6 +161,8 @@ pub struct Hub {
     pub join_token: String,
     /// One-time enrollment tokens for pod agents: token → (job id, expiry).
     pub ephemeral_tokens: Mutex<HashMap<String, (String, Instant)>>,
+    /// One-time outpost invites (`POST /api/outposts/invite`).
+    pub outpost_invites: OutpostInvites,
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
     pub gitops_kick: Notify,
     pub shutdown: Shutdown,
@@ -201,6 +240,7 @@ impl Hub {
             admin_token,
             join_token,
             ephemeral_tokens: Mutex::new(HashMap::new()),
+            outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
             shutdown,
@@ -368,6 +408,7 @@ impl Hub {
                 None => AgentLive {
                     name: r.name,
                     peer: None,
+                    outpost: is_outpost(&r.labels, r.slots),
                     labels: r.labels,
                     slots: r.slots,
                     hostname: r.hostname,
@@ -655,11 +696,17 @@ impl Hub {
 
     fn owns_job(&self, peer: PeerId, job: &str) -> bool {
         let Some(name) = self.agent_of(peer) else { return false };
-        self.agents.lock().get(&name).is_some_and(|a| a.running.iter().any(|j| j == job))
+        // A failed leg it keeps: a step rerun in place reports as the leg (W17-R04).
+        self.agents.lock().get(&name).is_some_and(|a| a.running.iter().any(|j| j == job)) || self.ci.kept_by(job, &name)
     }
 
     async fn agent_lost(&self, name: &str, reason: &str) {
-        tracing::warn!(agent = name, reason, "agent disconnected");
+        // Agents leaving as the server stops are expected.
+        if self.shutdown.is_cancelled() {
+            tracing::info!(agent = name, reason, "agent disconnected");
+        } else {
+            tracing::warn!(agent = name, reason, "agent disconnected");
+        }
         let snapshot = {
             let mut g = self.agents.lock();
             let Some(a) = g.get_mut(name) else { return };
@@ -1047,11 +1094,14 @@ impl Hub {
                     .await;
             }
         }
+        let outpost = is_outpost(&h.labels, h.slots);
         let live = AgentLive {
             name: name.clone(),
             peer: Some(peer),
             labels: h.labels.clone(),
-            slots: h.slots.max(1),
+            // An outpost takes no jobs: it keeps no slots (`pick_agent`, CI's dispatch).
+            slots: if outpost { 0 } else { h.slots.max(1) },
+            outpost,
             hostname: h.hostname.clone(),
             os: h.os.clone(),
             arch: h.arch.clone(),
@@ -1167,8 +1217,9 @@ impl Hub {
             let Some(a) = g.get_mut(name) else { return };
             if let Some((p, h)) = newest {
                 a.peer = Some(p);
+                a.outpost = is_outpost(&h.labels, h.slots);
                 a.labels = h.labels;
-                a.slots = h.slots.max(1);
+                a.slots = if a.outpost { 0 } else { h.slots.max(1) };
                 a.hostname = h.hostname;
                 a.os = h.os;
                 a.arch = h.arch;
@@ -1742,5 +1793,31 @@ impl Hub {
                 self.logs.remove(jobs).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_outpost_has_its_label_and_no_slots() {
+        let label = vec![crate::proto::OUTPOST_LABEL.to_owned()];
+        assert!(is_outpost(&label, 0));
+        // A runner given the label by hand still takes jobs.
+        assert!(!is_outpost(&label, 4));
+        assert!(!is_outpost(&["baremetal".to_owned()], 0));
+    }
+
+    #[test]
+    fn an_outpost_invite_works_once_and_not_once_it_has_expired() {
+        let invites = OutpostInvites::default();
+        let (token, until) = invites.mint();
+        assert!(until > crate::util::now_unix());
+        assert!(!invites.take("not-an-invite"));
+        assert!(invites.take(&token));
+        assert!(!invites.take(&token), "an invite works once");
+        invites.add("old".into(), Instant::now() - Duration::from_secs(1));
+        assert!(!invites.take("old"), "an expired invite doesn't work");
     }
 }

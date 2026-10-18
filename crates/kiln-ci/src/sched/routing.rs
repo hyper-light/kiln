@@ -526,6 +526,9 @@ pub struct Rule {
     /// The image for container and microVM executors (W13).
     pub image: Option<String>,
     pub prefer: Vec<Preference>,
+    /// Docker inside the leg (W13-R04), opt-in: `socket`, the host's Docker socket in the
+    /// `docker` executor's container, for trusted runs' legs only.
+    pub docker: Option<String>,
 }
 
 /// The rules mapping GitHub's hosted labels to requirements (W05-R21). They ship disabled: an
@@ -591,6 +594,8 @@ pub struct Requirement {
     pub executors: Vec<String>,
     pub image: Option<String>,
     pub prefer: Vec<Preference>,
+    /// Docker inside the leg, from the first rule that says (`socket`).
+    pub docker: Option<String>,
     /// The rules that applied, by index, for explanations.
     pub rules: Vec<usize>,
 }
@@ -647,6 +652,9 @@ pub fn resolve(leg: &LegRoute, rules: &[Rule]) -> Result<Requirement, String> {
         }
         if req.image.is_none() {
             req.image = r.image.clone();
+        }
+        if req.docker.is_none() {
+            req.docker = r.docker.clone();
         }
         req.prefer.extend(r.prefer.iter().cloned());
         req.rules.push(i);

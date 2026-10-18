@@ -6,7 +6,20 @@ use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{Approval, Body, Event, Meta, State, Status};
+use super::model::{Approval, Body, Event, Meta, State, Status, ToolStatus, TurnEnd};
+
+/// The ids of the messages kiln sends to keep an agent going (`goals::keep`); they show as kiln's.
+pub const KEEP_ID: &str = "kiln-keep-";
+
+/// Who a sent message is from, by its id: one of kiln's own keep-going ones, or a person's.
+pub fn origin_of(client_id: &str) -> &'static str {
+    if client_id.starts_with(KEEP_ID) { "kiln" } else { "human" }
+}
+
+/// Words that end by asking something (their last line ends with a question mark).
+fn asks_you(text: &str) -> bool {
+    text.trim_end().trim_end_matches(['*', '_', '`', ')', '"']).ends_with('?')
+}
 
 /// Timeline events kept per session (the oldest go first).
 pub const MAX_EVENTS: usize = 4_000;
@@ -87,6 +100,10 @@ pub enum Effect {
     /// running): the newest process under the harness whose command line runs `command`, with
     /// everything it started. The outcome comes back as a run's end (`run_done`, code 0: stopped).
     Kill { job: String, command: String },
+    /// Keep the session's folder as it is now in a hidden git ref (the pause that started at `at`
+    /// gets it as `Pause::checkpoint`), when the folder is a repository. Nothing in the folder,
+    /// its index or its branches changes.
+    Checkpoint { at: i64 },
 }
 
 /// The output of a task kiln keeps itself (a harness that streams it rather than writing a
@@ -306,6 +323,41 @@ impl Core {
         crate::util::now_ms()
     }
 
+    /// A message went to the agent: one kiln sent to keep it going counts toward `State::kept`;
+    /// anyone else's starts the count again.
+    pub fn note_sent(&mut self, client_id: &str) {
+        let kept = if client_id.starts_with(KEEP_ID) { self.state.kept.saturating_add(1) } else { 0 };
+        if kept != self.state.kept {
+            self.state.kept = kept;
+            self.touch_state();
+        }
+    }
+
+    /// The turn under way ended (`how`, `why`: see [`TurnEnd`]). What it did is read from the
+    /// timeline since it `started` (unknown: since the last thing said to it).
+    pub fn end_turn(&mut self, started: Option<i64>, how: &str, why: Option<&str>) {
+        let since = started.unwrap_or_else(|| self.events.iter().rev().find(|e| matches!(e.body, Body::User { .. })).map_or(0, |e| e.at));
+        let (tools, after_error, asks) = {
+            let mut tools = 0u32;
+            let mut last: Option<&Body> = None;
+            for e in self.events.iter().filter(|e| e.at >= since) {
+                match &e.body {
+                    Body::Tool(_) => {
+                        tools = tools.saturating_add(1);
+                        last = Some(&e.body);
+                    }
+                    Body::Assistant { text, .. } if !text.trim().is_empty() => last = Some(&e.body),
+                    _ => {}
+                }
+            }
+            let after_error = matches!(last, Some(Body::Tool(t)) if t.status == ToolStatus::Error);
+            let asks = matches!(last, Some(Body::Assistant { text, .. }) if asks_you(text));
+            (tools, after_error, asks)
+        };
+        self.state.last_turn = Some(TurnEnd { at: Self::now(), how: how.to_owned(), why: why.map(str::to_owned), tools, after_error, asks, kept: self.state.kept });
+        self.touch_state();
+    }
+
     pub fn events(&self) -> impl Iterator<Item = &Event> {
         self.events.iter()
     }
@@ -520,6 +572,66 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool(status: ToolStatus) -> Body {
+        use super::super::model::{ToolCall, ToolKind};
+        Body::Tool(Box::new(ToolCall {
+            tool_id: "t".into(),
+            name: "Bash".into(),
+            tool: ToolKind::Shell,
+            title: "run it".into(),
+            detail: None,
+            input: serde_json::Value::Null,
+            status,
+            output: None,
+            truncated: false,
+            diffs: Vec::new(),
+            todos: Vec::new(),
+            task: None,
+            exit_code: None,
+            started: 0,
+            ended: None,
+            server: None,
+            tool_short: None,
+            skill: None,
+        }))
+    }
+
+    fn said(text: &str) -> Body {
+        Body::Assistant { text: text.into(), streaming: false }
+    }
+
+    #[test]
+    fn a_turn_end_says_what_the_turn_did() {
+        let mut core = Core::new();
+        core.note_sent("u1");
+        core.upsert("u1", None, Body::User { text: "go".into(), images: 0, client_id: Some("u1".into()), origin: Some("human".into()), attachments: Vec::new() });
+        core.upsert("a1", None, said("Running it."));
+        core.upsert("t1", None, tool(ToolStatus::Done));
+        core.upsert("t2", None, tool(ToolStatus::Error));
+        core.end_turn(None, "done", Some("end_turn"));
+        let t = core.state.last_turn.clone().unwrap_or_default();
+        assert_eq!((t.tools, t.after_error, t.asks, t.kept), (2, true, false, 0), "a failed last step, nothing said after it");
+        // Words after the failure: not ended on it; a question at the end asks you.
+        core.upsert("a2", None, said("That failed on the box. **Should I retry there?**"));
+        core.end_turn(None, "done", None);
+        let t = core.state.last_turn.clone().unwrap_or_default();
+        assert_eq!((t.after_error, t.asks), (false, true));
+    }
+
+    #[test]
+    fn kiln_keep_going_messages_count_and_a_persons_restarts_the_count() {
+        let mut core = Core::new();
+        assert_eq!(origin_of("kiln-keep-1"), "kiln");
+        assert_eq!(origin_of("m1"), "human");
+        core.note_sent(&format!("{KEEP_ID}1"));
+        core.note_sent(&format!("{KEEP_ID}2"));
+        assert_eq!(core.state.kept, 2);
+        core.end_turn(None, "cut", Some("stop_sequence"));
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.kept), Some(2));
+        core.note_sent("m2");
+        assert_eq!(core.state.kept, 0);
+    }
 
     #[test]
     fn upserts_keep_order_and_stream_deltas_coalesce() {

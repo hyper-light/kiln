@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://maven.apache.org/surefire/maven-surefire-plugin/xsd/surefire-test-report.xsd" version="3.0" name="com.acme.AppTest" time="0.512" tests="4" errors="1" skipped="1" failures="1">
+  <properties>
+    <property name="java.version" value="17.0.10"/>
+  </properties>
+  <testcase name="adds" classname="com.acme.AppTest" time="0.003"/>
+  <testcase name="divides" classname="com.acme.AppTest" time="0.010">
+    <failure message="expected: &lt;2&gt; but was: &lt;3&gt;" type="org.opentest4j.AssertionFailedError"><![CDATA[org.opentest4j.AssertionFailedError: expected: <2> but was: <3>
+	at com.acme.AppTest.divides(AppTest.java:21)]]></failure>
+    <system-out><![CDATA[dividing]]></system-out>
+  </testcase>
+  <testcase name="connects" classname="com.acme.AppTest" time="0.400">
+    <error message="Connection refused" type="java.net.ConnectException">java.net.ConnectException: Connection refused</error>
+  </testcase>
+  <testcase name="later" classname="com.acme.AppTest" time="0">
+    <skipped message="not yet"/>
+  </testcase>
+  <testcase name="wobbles" classname="com.acme.AppTest" time="0.020">
+    <flakyFailure message="timing" type="java.lang.AssertionError"><stackTrace>java.lang.AssertionError: timing</stackTrace></flakyFailure>
+  </testcase>
+  <testcase name="breaks" classname="com.acme.AppTest" time="0.030">
+    <rerunFailure message="still broken" type="java.lang.AssertionError"><stackTrace>java.lang.AssertionError: still broken</stackTrace></rerunFailure>
+  </testcase>
+</testsuite>

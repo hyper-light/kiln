@@ -1,0 +1,68 @@
+# Turso Database, vendored for kiln's conversation store (docs/conversations.md): the four crates
+# kiln builds, from upstream commit 3e09a82750d8 (UPSTREAM.md says what changed). Its own workspace,
+# kept out of kiln's (kiln's Cargo.toml excludes vendor/turso), so kiln's lints don't apply here and
+# the crates' `workspace = true` settings resolve against this file.
+[workspace]
+resolver = "2"
+members = ["core", "sqlite/parser", "macros", "extensions/core"]
+
+[workspace.package]
+version = "0.9.0-pre.1"
+authors = ["the Turso authors"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/tursodatabase/turso"
+
+[workspace.dependencies]
+turso_ext = { path = "extensions/core", version = "0.9.0-pre.1" }
+turso_macros = { path = "macros", version = "0.9.0-pre.1" }
+turso_parser = { path = "sqlite/parser", version = "0.9.0-pre.1" }
+strum = { version = "0.26", features = ["derive"] }
+strum_macros = "0.26"
+serde = "1.0"
+serde_json = "1.0"
+mimalloc = { version = "0.1.47", default-features = false }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+rand = "0.9.2"
+rand_chacha = "0.9.0"
+tracing = "0.1.41"
+parking_lot = "0.12.4"
+tracing-subscriber = "0.3.20"
+thiserror = "2.0.16"
+tempfile = "3.20.0"
+miette = "7.6.0"
+bitflags = "2.9.4"
+fallible-iterator = "0.3.0"
+allocator-api2 = "0.4"
+getrandom = "0.4.2"
+criterion = "0.5.0"
+codspeed-criterion-compat = "4.2.1"
+divan = { package = "codspeed-divan-compat", version = "4.2.1" }
+chrono = { version = "0.4.42", default-features = false }
+hex = "0.4"
+antithesis_sdk = { version = "0.3.0", default-features = false }
+env_logger = { version = "0.11.6", default-features = false }
+regex = "1.11.1"
+regex-syntax = { version = "0.8.5", default-features = false }
+asserting = "0.16"
+either = { version = "1.15" }
+windows-sys = "0.61.2"
+loom = { version = "0.7" }
+shuttle = { version = "0.8.1" }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)', 'cfg(antithesis)', 'cfg(nightly)'] }
+# For now allow this for the allocator api migration
+unstable_name_collisions = "allow"
+
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+or_fun_call = "deny"
+clear_with_drain = "deny"
+collection_is_never_read = "deny"
+naive_bytecount = "deny"
+stable_sort_primitive = "deny"
+large_stack_frames = "deny"
+large_types_passed_by_value = "deny"
+redundant_clone = "deny"
+assigning_clones = "deny"

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="3" failures="1" errors="0" uuid="45c50ef6" timestamp="2026-10-18T12:00:00.000+00:00" time="0.512">
+    <testsuite name="calc" tests="3" disabled="0" errors="0" failures="1">
+        <testcase name="tests::adds" classname="calc" timestamp="2026-10-18T12:00:00.001+00:00" time="0.002">
+        </testcase>
+        <testcase name="tests::divides" classname="calc" timestamp="2026-10-18T12:00:00.002+00:00" time="0.003">
+            <failure type="test failure">thread &apos;tests::divides&apos; panicked at src/lib.rs:20:9:
+assertion `left == right` failed</failure>
+            <system-err>thread &apos;tests::divides&apos; panicked at src/lib.rs:20:9:</system-err>
+        </testcase>
+        <testcase name="tests::sometimes" classname="calc" timestamp="2026-10-18T12:00:00.003+00:00" time="0.010">
+            <flakyFailure type="test failure" message="code=101" timestamp="2026-10-18T12:00:00.003+00:00" time="0.004"><system-err>flaked</system-err></flakyFailure>
+        </testcase>
+    </testsuite>
+</testsuites>

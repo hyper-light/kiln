@@ -6,8 +6,10 @@
 import * as React from "react";
 import { Link, useNavigate } from "@/lib/router";
 import { ArrowLeft, MoreHorizontal, Pause, Power, RotateCcw, Search, SquareTerminal } from "lucide-react";
-import { harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
+import { FORCE_STOP_AFTER_MS, harnessApi, type AgentInfo, type Command, type KindInfo, type Meta, type State, type Status } from "@/api/harness";
 import { useSuspenseResource } from "@/lib/resource";
+import { useNow } from "@/lib/hooks";
+import { Button } from "@/components/ui/button";
 import { agentLabel, costText, hasOwnName, modelLabel, tildify } from "./derive";
 import { useListener } from "./dom";
 import { RoundButton } from "./figure/figure";
@@ -15,7 +17,36 @@ import { LimitBadge, UsagePanel } from "./limits";
 import { machineName, StateWord } from "./parts";
 import { RunSettings, type RunSettingsProps } from "./run-settings";
 import { NameField, type useAgentActions } from "./actions";
+import { Optic, PrismLabel, formatThought } from "./signals";
 import "./console.css";
+
+/** A turn under way, said plainly: for how long, at what effort while it thinks, and what it's
+ *  doing, so a long think doesn't look like nothing happening. Once a stop is asked it says so, and
+ *  if the turn goes on regardless it offers to force it. It ends its row and what changes most
+ *  comes last (the clock has a width of its own), so nothing on the row moves as it ticks. */
+function TurnLine({ state, activity, stopAt, onForce }: { state: State | null; activity?: string; stopAt: number | null; onForce?: () => void }) {
+  const now = useNow();
+  const doing = state?.doing || activity || "Working";
+  const thinking = /^think/i.test(doing);
+  const started = state?.turn_started;
+  const stuck = stopAt != null && now - stopAt > FORCE_STOP_AFTER_MS;
+  return (
+    <span className="ag-turn">
+      <Optic state={state?.status === "waiting" ? "waiting" : thinking ? "thinking" : "tool"} />
+      {started != null && <span className="ag-turn-meta ag-turn-time">{formatThought((now - started) / 1000)}</span>}
+      {thinking && stopAt == null && state?.effort && <span className="ag-turn-meta">{state.effort} effort</span>}
+      {(state?.kept ?? 0) > 0 && stopAt == null && <span className="ag-turn-meta">kept going ×{state?.kept}</span>}
+      <PrismLabel live className="ag-turn-what">
+        {stopAt == null ? doing : stuck ? "Still running" : "Stopping…"}
+      </PrismLabel>
+      {stuck && onForce && (
+        <Button size="xs" variant="ghost-danger" onClick={onForce}>
+          Force stop
+        </Button>
+      )}
+    </span>
+  );
+}
 
 export function AgentHeader({
   info,
@@ -30,9 +61,17 @@ export function AgentHeader({
   onSettings,
   onBackground,
   onFind,
+  stopAt,
+  onStop,
+  onForceStop,
 }: {
   /** Find in the conversation. */
   onFind?: () => void;
+  /** When a stop was asked of the turn under way (`useStopAt`), or null. */
+  stopAt: number | null;
+  onStop: () => void;
+  /** Force a stop that didn't take. */
+  onForceStop: () => void;
   info: AgentInfo | null;
   state: State | null;
   meta: Meta | null;
@@ -130,7 +169,11 @@ export function AgentHeader({
         </div>
         <div className="ag-actions">
           {running && features.includes("interrupt") && (
-            <RoundButton label="Stop the current turn" onClick={() => send({ type: "interrupt" })}>
+            <RoundButton
+              label={stopAt != null ? "Stopping…" : "Stop the current turn"}
+              disabled={stopAt != null}
+              onClick={onStop}
+            >
               <Pause size={15} aria-hidden="true" />
             </RoundButton>
           )}
@@ -161,8 +204,7 @@ export function AgentHeader({
         </div>
       </div>
       <div className="ag-state">
-        <StateWord a={{ status, approvals }} />
-        {status === "running" && activity && <span className="ag-activity">{activity}</span>}
+        <StateWord a={{ status, approvals, pause: state?.pause ?? info?.pause }} />
         <span className="ag-cwd ag-wide-only" title={cwd}>
           {tildify(cwd)}
         </span>
@@ -178,12 +220,15 @@ export function AgentHeader({
         )}
         <LimitBadge limits={limits} open={usage} controls={usageId} onClick={() => setUsage(!usage)} />
         {conn === "reconnecting" && <span className="ag-warn">reconnecting…</span>}
+        {running && <TurnLine state={state} activity={activity} stopAt={stopAt} onForce={features.includes("interrupt") ? onForceStop : undefined} />}
       </div>
       {usage && limits.length > 0 && (
         <UsagePanel
           id={usageId}
           limits={limits}
           plan={plan}
+          stopAt={state?.pause_at ?? null}
+          onStopAt={(percent) => send({ type: "pause_at", percent })}
           onMore={() => {
             setUsage(false);
             onUsage();

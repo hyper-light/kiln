@@ -29,6 +29,15 @@ impl Workspace {
         hash_files(self, patterns, cfg!(any(windows, target_os = "macos")))
     }
 
+    /// The files `patterns` match here, relative to the workspace (W16-R01's report paths).
+    pub fn matching(&self, patterns: &[String]) -> Result<Vec<String>, ExprError> {
+        kiln_ci::expr::files::matching(self, patterns, cfg!(any(windows, target_os = "macos")))
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+
     fn inside(&self, p: &Path) -> bool {
         p.starts_with(&self.root)
     }

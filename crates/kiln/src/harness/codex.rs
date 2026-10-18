@@ -111,6 +111,19 @@ const LETTING_GO: &str = "Waiting for Codex to let go of the conversation (it st
 /// Turns of a resumed thread's history loaded (the latest).
 const HISTORY_TURNS: u32 = 100;
 
+/// Whether a turn's error is the account's usage limit: `codexErrorInfo` says so
+/// (`usageLimitExceeded`, as a word or an object's key), or the message does.
+fn usage_limited(err: &Value) -> bool {
+    let info = err.get("codexErrorInfo").or_else(|| err.get("codex_error_info"));
+    let said = match info {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Object(o)) => o.keys().next().map(String::as_str),
+        _ => None,
+    };
+    said.is_some_and(|s| s.eq_ignore_ascii_case("usageLimitExceeded") || s.eq_ignore_ascii_case("usage_limit_exceeded"))
+        || err.get("message").and_then(Value::as_str).is_some_and(super::pause::says_limit)
+}
+
 /// Why Codex cannot open a thread yet, when that passes.
 fn not_yet(msg: &str) -> Option<&'static str> {
     if msg.contains("behind durable rollout") {
@@ -638,7 +651,7 @@ impl Codex {
             }
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             Command::StopTask { task } => self.stop_terminal(core, &task),
@@ -648,6 +661,8 @@ impl Codex {
                     self.stop_terminal(core, &task);
                 }
             }
+            // A pause's commands are the session's (`harness::pause`).
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::LimitHold { .. } => {}
             Command::McpEnable { name, enabled } => {
                 if !valid_server_name(&name) {
                     self.notice(core, Level::Warn, format!("{name}: not a server kiln can change"));
@@ -1095,7 +1110,8 @@ impl Codex {
     fn show_sent(&mut self, core: &mut Core, m: &QueueItem, d: Delivery) {
         core.state.delivery.insert(m.id.clone(), d);
         let (images, names) = super::model::attachment_summary(&m.attachments);
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some("human".into()), attachments: names });
+        core.note_sent(&m.id);
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names });
         core.touch_state();
     }
 
@@ -1146,7 +1162,11 @@ impl Codex {
 
     /// Between turns: the next waiting message, then kiln's queue.
     fn next(&mut self, core: &mut Core) {
-        if core.hold || self.busy(core) || core.state.status == Status::Exited {
+        if self.busy(core) || core.state.status == Status::Exited {
+            return;
+        }
+        // A pause (or a switch) holds what waits, and the stop point may start one here.
+        if (!self.waiting.is_empty() || !core.state.queue.is_empty()) && !super::pause::open(core) {
             return;
         }
         // No turn to steer into: what was to be steered goes out in order.
@@ -1160,8 +1180,43 @@ impl Codex {
         if !core.state.queue.is_empty() {
             let item = core.state.queue.remove(0);
             core.touch_state();
+            let id = item.id.clone();
             self.start_turn(core, &thread, item);
+            super::pause::sent_from_queue(core, &id);
         }
+    }
+
+    /// The account reached its usage limit (`usageLimitExceeded`): the session pauses until it
+    /// resets, its turn noted as cut off. Said once.
+    fn limit_reached(&mut self, core: &mut Core, said: &str) {
+        let now = Core::now();
+        let hit = super::pause::Hit::from_limits(&core.state.limits, said, None, now);
+        let cut = super::pause::cut_now(core);
+        super::pause::hold(core, super::pause::LIMIT, "harness", hit, Some(cut));
+    }
+
+    /// A pause's limit should have reset: ask for the rate limits now (the answer goes to
+    /// `pause::checked`).
+    pub fn check_limits(&mut self, core: &mut Core) {
+        if core.state.status == Status::Exited || self.pending.values().any(|p| matches!(p, Pending::RateLimits)) {
+            return;
+        }
+        self.usage_at = Core::now();
+        self.request(core, Pending::RateLimits, "account/rateLimits/read", json!({}));
+    }
+
+    /// A pause ended: the turn it cut off goes on first, then kiln's queue.
+    pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
+        if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
+            let id = crate::util::new_id();
+            self.send(core, QueueItem { id: id.clone(), text: super::pause::CONTINUE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None }, SendMode::Queue);
+            super::pause::from_kiln(core, &id);
+            return;
+        }
+        if p.cut.is_some() {
+            super::pause::continue_later(core, super::pause::CONTINUE);
+        }
+        self.next(core);
     }
 
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
@@ -1299,7 +1354,15 @@ impl Codex {
                     self.notice(core, Level::Warn, format!("Codex could not list the conversation's history: {msg}"));
                     self.ready(core);
                 }
-                Pending::Models | Pending::Interrupt | Pending::Hooks | Pending::Account | Pending::RateLimits => {}
+                Pending::RateLimits => {
+                    // A pause's check that can't be answered: go on, and let Codex say.
+                    if core.state.pause.as_ref().is_some_and(|p| p.checking.is_some())
+                        && let Some(p) = super::pause::release(core, "The limit's reset time came; going on.")
+                    {
+                        self.go_on(core, p);
+                    }
+                }
+                Pending::Models | Pending::Interrupt | Pending::Hooks | Pending::Account => {}
                 Pending::Skills => {
                     core.state.inventory.skills = Known::Ready;
                     core.touch_state();
@@ -1594,6 +1657,9 @@ impl Codex {
                     self.rate_limits.insert(id, snap.clone());
                 }
                 self.apply_limits(core);
+                if let Some(p) = super::pause::checked(core, Core::now()) {
+                    self.go_on(core, p);
+                }
             }
             Pending::Config => {
                 self.mcp_config = result.pointer("/config/mcp_servers").and_then(Value::as_object).cloned().unwrap_or_default();
@@ -1879,8 +1945,13 @@ impl Codex {
                 match status {
                     "interrupted" => self.notice(core, Level::Info, "Interrupted"),
                     "failed" => {
-                        let msg = turn.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("The turn failed.").to_owned();
-                        self.notice(core, Level::Error, msg);
+                        let err = turn.get("error").cloned().unwrap_or(Value::Null);
+                        let msg = err.get("message").and_then(Value::as_str).unwrap_or("The turn failed.").to_owned();
+                        if usage_limited(&err) {
+                            self.limit_reached(core, &msg);
+                        } else {
+                            self.notice(core, Level::Error, msg);
+                        }
                     }
                     _ => {}
                 }
@@ -1907,6 +1978,13 @@ impl Codex {
                     set_status(core, &id, ToolStatus::Cancelled);
                 }
                 self.turn = None;
+                // How it ended, for kiln's keep-going.
+                let how = match status {
+                    "completed" => "done",
+                    "interrupted" => "stopped",
+                    _ => "cut",
+                };
+                core.end_turn(core.state.turn_started, how, Some(status));
                 core.state.turn_started = None;
                 core.state.doing = None;
                 core.state.usage.turns += 1;
@@ -2033,9 +2111,14 @@ impl Codex {
                 }
             }
             "error" => {
-                let msg = p.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("Codex reported an error").to_owned();
+                let err = p.get("error").cloned().unwrap_or(Value::Null);
+                let msg = err.get("message").and_then(Value::as_str).unwrap_or("Codex reported an error").to_owned();
                 let retry = p.get("willRetry").and_then(Value::as_bool).unwrap_or(false);
-                self.notice(core, if retry { Level::Warn } else { Level::Error }, if retry { format!("{msg} (retrying)") } else { msg });
+                if !retry && usage_limited(&err) {
+                    self.limit_reached(core, &msg);
+                } else {
+                    self.notice(core, if retry { Level::Warn } else { Level::Error }, if retry { format!("{msg} (retrying)") } else { msg });
+                }
             }
             "warning" | "deprecationNotice" | "configWarning" | "guardianWarning" | "model/rerouted" => {
                 let msg = p.get("message").or_else(|| p.get("summary")).and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| method.to_owned());
@@ -2738,6 +2821,54 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_limit_pauses_the_thread_and_it_goes_on_at_the_reset() -> anyhow::Result<()> {
+        let mut core = Core::new();
+        core.state.cwd = "/work".into();
+        let mut c = Codex::new(None, None, None, false);
+        c.start(&mut core);
+        feed(&mut c, &mut core, &[json!({"id": 1, "result": {"userAgent": "codex_cli_rs/0.162.1"}})]);
+        feed(&mut c, &mut core, &[json!({"id": 2, "result": {"thread": {"id": "th1", "cliVersion": "0.162.1", "turns": []}, "model": "gpt-5", "cwd": "/work"}})]);
+        let _ = written(&mut core);
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "port the parser".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        let start = written(&mut core).into_iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).unwrap_or_default();
+        feed(
+            &mut c,
+            &mut core,
+            &[
+                json!({"id": start.get("id").cloned().unwrap_or_default(), "result": {"turn": {"id": "t1", "status": "inProgress", "items": []}}}),
+                json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}),
+            ],
+        );
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "then the tests".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        assert_eq!(core.state.queue.len(), 1);
+        let said = "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes.";
+        let before = Core::now();
+        feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "failed", "items": [], "error": {"message": said, "codexErrorInfo": "usageLimitExceeded"}}}})]);
+        // A failed turn is cut short (the pause, not keep-going, takes it from here).
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref())), Some(("cut", Some("failed"))));
+        let p = core.state.pause.clone().ok_or_else(|| anyhow::anyhow!("not paused"))?;
+        let wait = 2 * 3_600_000 + 13 * 60_000;
+        assert!(p.until.is_some_and(|u| u >= before + wait && u <= Core::now() + wait), "{p:?}");
+        assert_eq!(p.cut.as_ref().map(|c| c.text.as_str()), Some("port the parser"));
+        // Held: the queued message waits, and the limit is said once.
+        assert_eq!(core.state.queue.len(), 1);
+        assert!(!written(&mut core).iter().any(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")));
+        assert_eq!(core.events().filter(|e| matches!(e.body, Body::Notice { .. })).count(), 1);
+        // At the reset kiln reads the rate limits; the window started over, so the thread goes on.
+        let due = p.until.unwrap_or(0) + 10 * 60_000;
+        assert_eq!(crate::harness::pause::step(&mut core, due, "th1"), crate::harness::pause::Step::Check);
+        c.check_limits(&mut core);
+        let read = written(&mut core).into_iter().find(|v| v.get("method").and_then(Value::as_str) == Some("account/rateLimits/read")).ok_or_else(|| anyhow::anyhow!("no check"))?;
+        let resets = Core::now() / 1000 + 5 * 3_600;
+        feed(&mut c, &mut core, &[json!({"id": read.get("id").cloned().unwrap_or_default(), "result": {"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 4.0, "windowDurationMins": 300, "resetsAt": resets}}}})]);
+        assert!(core.state.pause.is_none());
+        let go_on = written(&mut core).into_iter().find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start")).ok_or_else(|| anyhow::anyhow!("nothing sent"))?;
+        assert_eq!(go_on.pointer("/params/input/0/text").and_then(Value::as_str), Some(crate::harness::pause::CONTINUE));
+        assert_eq!(core.state.queue.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn a_thread_a_turn_an_approval_and_the_result() -> anyhow::Result<()> {
         let mut core = Core::new();
         core.state.cwd = "/work".into();
@@ -2809,6 +2940,8 @@ mod tests {
         assert_eq!(core.state.status, Status::Idle);
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
         assert_eq!(core.state.usage.context_window, Some(1000));
+        // How the turn ended, for kiln's keep-going: done, with its command among its tools.
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref(), t.tools)), Some(("done", Some("completed"), 1)));
         assert_eq!(core.state.summary, "Removed build/.");
         Ok(())
     }

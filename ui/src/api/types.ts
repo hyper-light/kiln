@@ -74,6 +74,8 @@ export interface Step {
   started_at: number | null;
   finished_at: number | null;
   exit_code: number | null;
+  /** The order it started in (CI legs): steps that start in the same second keep it. */
+  seq?: number | null;
 }
 
 export interface StepSpec {
@@ -166,6 +168,8 @@ export interface Agent {
   sample: HostSample | null;
   /** While a new runner replaces an old one without a restart: both processes, newest first. */
   instances?: RunnerInstance[];
+  /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */
+  outpost?: boolean;
 }
 
 /** One runner process of a machine (see `crates/kiln/src/instances.rs`). */
@@ -1135,6 +1139,14 @@ export interface DnsSdInfo {
 }
 
 export type InstallOs = "linux" | "macos" | "windows";
+
+/** POST /api/outposts/invite: a one-time invite, and a line per system that runs kiln there as an outpost (nothing installed). */
+export interface OutpostInvite {
+  token: string;
+  /** When the invite stops working (unix seconds). */
+  expires_at: number;
+  commands: Record<InstallOs, string>;
+}
 
 export interface JoinInfo {
   /** One-liners with an embedded join token: download kiln from this server, install it as a service, join. */

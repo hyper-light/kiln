@@ -44,6 +44,13 @@ struct Saved {
     spec: Spec,
     #[serde(default)]
     queue: Vec<QueueItem>,
+    /// A pause for a usage limit, which goes on (with its timer) after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause: Option<super::model::Pause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause_at: Option<u8>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    manual_resume: bool,
 }
 
 pub struct Host {
@@ -160,7 +167,7 @@ impl Host {
             pkg.spec.cwd = Some(cwd.clone());
         }
         let items = super::moving::install(&pkg, &cwd)?;
-        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note };
+        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false };
         self.open_seeded(Some(pkg.id), pkg.spec, Some(seed)).map(|_| ()).map_err(|e| format!("{e:#}"))
     }
 
@@ -260,6 +267,13 @@ impl Host {
 
     /// Continue the sessions recorded before a restart.
     pub fn restore(&self) {
+        self.restore_from(None);
+    }
+
+    /// Continue the sessions recorded before a restart, each with its timeline and state as the
+    /// conversation store kept them (`crate::convo`), when it kept any; otherwise as before (a
+    /// Claude Code session's history from its transcript).
+    pub fn restore_from(&self, store: Option<&crate::convo::store::Store>) {
         let Some(file) = &self.file else { return };
         let Ok(raw) = std::fs::read(file) else { return };
         let saved: Vec<Saved> = match serde_json::from_slice(&raw) {
@@ -271,14 +285,21 @@ impl Host {
         };
         for s in saved {
             let id = s.id.clone();
-            match self.open(Some(s.id), s.spec) {
+            let seed = store.and_then(|st| kept_seed(st, &id));
+            let from_store = seed.is_some();
+            match self.open_seeded(Some(s.id), s.spec, seed) {
                 Ok(session) => {
-                    if !s.queue.is_empty() {
+                    let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume;
+                    if !s.queue.is_empty() || paused {
                         let mut core = session.core.lock();
                         core.state.queue = s.queue;
+                        // A check under way when it stopped is asked again.
+                        core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
+                        core.state.pause_at = s.pause_at;
+                        core.state.manual_resume = s.manual_resume;
                         core.touch_state();
                     }
-                    tracing::info!(session = %id, "agent session continued after a restart");
+                    tracing::info!(session = %id, from_store, "agent session continued after a restart");
                 }
                 Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
             }
@@ -306,7 +327,13 @@ impl Host {
             .sessions
             .lock()
             .values()
-            .map(|s| Saved { id: s.id.clone(), spec: s.resume_spec(), queue: s.core.lock().state.queue.clone() })
+            .map(|s| {
+                // resume_spec takes the session's lock itself: before this one, never inside it.
+                let spec = s.resume_spec();
+                let core = s.core.lock();
+                let st = &core.state;
+                Saved { id: s.id.clone(), spec, queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume }
+            })
             .collect();
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
         let tmp = file.with_extension("tmp");
@@ -315,6 +342,25 @@ impl Host {
             tracing::warn!(error = %e, file = %file.display(), "could not record agent sessions");
         }
     }
+}
+
+/// A session's timeline and state as the conversation store kept them, for its restart: None when
+/// the store kept nothing of it (or can't say in time), and the session starts as it always did.
+fn kept_seed(store: &crate::convo::store::Store, id: &str) -> Option<session::Seed> {
+    let kept = match store.kept(id, super::core::MAX_EVENTS) {
+        Ok(Some(k)) => k,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(session = %id, error = %format!("{e:#}"), "the conversation store couldn't say what it kept of an agent session");
+            return None;
+        }
+    };
+    let state: super::model::State = kept.state.as_deref().and_then(|s| serde_json::from_str(s).ok())?;
+    let events: Vec<super::model::Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();
+    if events.is_empty() {
+        return None;
+    }
+    Some(session::Seed { events, state, items: None, from: String::new(), from_cwd: String::new(), picks_up: false, note: None, restored: true })
 }
 
 /// SIGTERM a harness's process group, then SIGKILL it if it is still there after 3 s.
@@ -408,6 +454,9 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         plan: None,
         left_behind: 0,
         reach: spec.reach.clone(),
+        pause: None,
+        last_turn: None,
+        keep_off: false,
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]
@@ -439,6 +488,90 @@ mod tests {
             assert_eq!(host.inventory().sessions, vec!["a".to_owned()]);
             assert!(host.close("a"));
             assert!(host.list().is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_restarted_session_takes_its_timeline_from_the_conversation_store() -> anyhow::Result<()> {
+        use super::super::core::Update;
+        use super::super::model::{Body, Event, State};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                ..Spec::default()
+            };
+            // Before the restart: the session, saved; its conversation, in the store.
+            {
+                let (tx, _rx) = async_channel::unbounded();
+                let host = Host::new(tx, Some(file.clone()), Limits::default());
+                host.open(Some("a".into()), spec)?;
+                host.save_now();
+            }
+            let store = crate::convo::store::Store::start(Box::<crate::convo::store::Memory>::default())?;
+            let said = |id: &str, seq: u64, text: &str| Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] };
+            store.send("a", &Update::State { state: Box::new(State { title: "the parser".into(), ..State::default() }) });
+            store.send("a", &said("m1", 1, "first"));
+            store.send("a", &said("n1", 2, "a notice only kiln has"));
+            store.send("a", &said("m2", 3, "second"));
+            store.sync()?;
+            // After it: the session comes back with that timeline, in order, by id.
+            let (tx, _rx) = async_channel::unbounded();
+            let again = Host::new(tx, Some(file.clone()), Limits::default());
+            again.restore_from(Some(&store));
+            let back = again.sessions.lock().get("a").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            let core = back.core.lock();
+            assert_eq!(core.events().map(|e| e.id.as_str()).collect::<Vec<_>>(), vec!["m1", "n1", "m2"]);
+            assert_eq!(core.state.title, "the parser");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_session_is_saved_and_restored_with_its_pause_without_deadlocking() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let (tx, _rx) = async_channel::unbounded();
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let host = Host::new(tx, Some(file.clone()), Limits::default());
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                ..Spec::default()
+            };
+            let s = host.open(Some("a".into()), spec)?;
+            {
+                let mut core = s.core.lock();
+                core.state.harness_session = Some("h1".into());
+                core.state.pause = Some(super::super::model::Pause { reason: "limit".into(), since: 7, auto: true, by: "harness".into(), checking: Some(9), ..Default::default() });
+                core.state.pause_at = Some(90);
+            }
+            // Saving takes each session's lock: it must never take one twice.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let saver = host.clone();
+            std::thread::spawn(move || {
+                saver.save_now();
+                let _ = done_tx.send(());
+            });
+            anyhow::ensure!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "saving the sessions deadlocked");
+            let saved: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(&file)?)?;
+            let a = saved.first().ok_or_else(|| anyhow::anyhow!("nothing saved"))?;
+            assert_eq!(a.pointer("/spec/resume").and_then(serde_json::Value::as_str), Some("h1"));
+            assert_eq!(a.pointer("/pause/since").and_then(serde_json::Value::as_i64), Some(7));
+            assert_eq!(a.get("pause_at").and_then(serde_json::Value::as_u64), Some(90));
+            // Another start of the machine picks the pause up, its check under way asked again.
+            let (tx2, _rx2) = async_channel::unbounded();
+            let again = Host::new(tx2, Some(file.clone()), Limits::default());
+            again.restore();
+            let back = again.sessions.lock().get("a").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            let p = back.core.lock().state.pause.clone().ok_or_else(|| anyhow::anyhow!("pause not restored"))?;
+            assert_eq!((p.since, p.checking), (7, None));
+            assert_eq!(back.core.lock().state.pause_at, Some(90));
             Ok(())
         })
     }

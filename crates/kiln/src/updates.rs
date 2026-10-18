@@ -914,7 +914,8 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
         .agent_list()
         .await
         .into_iter()
-        .filter(|a| !a.ephemeral)
+        // Outposts aren't installed, so there's nothing of them to upgrade.
+        .filter(|a| !a.ephemeral && !a.outpost)
         .map(|a| {
             let instances = hub.runner_processes(&a.name);
             let newest = instances.iter().find(|i| i.newest);
@@ -1658,7 +1659,19 @@ pub const RUNNER_CAPS: u32 = CAP_UPGRADE
     | crate::proto::CAP_FRONT_DOOR
     | crate::proto::CAP_CI2
     | crate::proto::CAP_ACTIONS
-    | crate::proto::CAP_REACH;
+    | crate::proto::CAP_REACH
+    | crate::proto::CAP_JOB_TTY;
+
+/// What an outpost (`kiln outpost`) does ([`AgentMsg::Build`]): a runner's terminals, AI sessions
+/// and agents (taking a session over, listing folders), none of its jobs, upgrades, front door,
+/// repo copies or reach.
+pub const OUTPOST_CAPS: u32 =
+    crate::proto::CAP_OUTPOST | crate::proto::CAP_TAKEOVER | crate::proto::CAP_DIRS | crate::proto::CAP_TAKEOVER_STOP;
+
+/// An outpost's [`AgentMsg::Build`].
+pub fn outpost_build() -> AgentMsg {
+    AgentMsg::Build { build: own_build(), caps: OUTPOST_CAPS }
+}
 
 #[cfg(test)]
 mod tests {

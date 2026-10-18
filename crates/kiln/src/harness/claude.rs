@@ -603,6 +603,10 @@ impl Claude {
             Command::Interrupt => {
                 if self.busy(core) {
                     self.request(core, Pending::Interrupt, json!({"subtype": "interrupt"}));
+                } else {
+                    // Nothing is under way here: a page asking to stop it shows what no longer is,
+                    // so it's sent the state as it is.
+                    core.touch_state();
                 }
             }
             Command::SetMode { mode } => {
@@ -631,6 +635,8 @@ impl Claude {
                     self.request(core, Pending::StopTask, json!({"subtype": "stop_task", "task_id": task}));
                 }
             }
+            // A pause's commands are the session's (`harness::pause`).
+            Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::LimitHold { .. } => {}
             Command::SetEffort { effort } => {
                 self.request(core, Pending::ApplySettings, json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}));
                 core.state.effort = effort;
@@ -642,7 +648,7 @@ impl Claude {
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));
@@ -876,6 +882,53 @@ impl Claude {
         self.usage_at = Core::now();
         self.request(core, Pending::Usage, json!({"subtype": "get_usage", "skip_behaviors": true}));
         self.request(core, Pending::Status, json!({"subtype": "get_status"}));
+    }
+
+    /// A pause's limit should have reset: ask for the usage now (the answer goes to
+    /// `pause::checked`). A CLI that has ended can't say; the pause goes on waiting for a person.
+    pub fn check_limits(&mut self, core: &mut Core) {
+        if core.state.status == Status::Exited {
+            return;
+        }
+        if self.pending.values().any(|p| matches!(p, Pending::Usage)) {
+            return;
+        }
+        self.usage_at = Core::now();
+        self.request(core, Pending::Usage, json!({"subtype": "get_usage", "skip_behaviors": true}));
+    }
+
+    /// A pause ended: the turn it cut off goes on first, then kiln's queue.
+    pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {
+        if p.cut.is_some() && !self.busy(core) && core.state.status != Status::Exited {
+            let id = crate::util::new_id();
+            self.send(core, id.clone(), super::pause::CONTINUE.to_owned(), SendMode::Queue, Vec::new(), None);
+            super::pause::from_kiln(core, &id);
+            return;
+        }
+        if p.cut.is_some() {
+            super::pause::continue_later(core, super::pause::CONTINUE);
+        }
+        self.drain_queue(core);
+    }
+
+    /// The account reached a usage limit (the harness's `rate_limit` error): the session pauses
+    /// until it resets, its turn noted as cut off. Said once, however many calls it cuts off.
+    fn limit_reached(&mut self, core: &mut Core, v: &Value, said: &str) {
+        let now = Core::now();
+        // The error itself may carry the reset (the transcript's form): seconds.
+        let until = v
+            .pointer("/apiErrorParams/rate_limit_info/resetsAt")
+            .or_else(|| v.pointer("/quotaLimits/resetsAt"))
+            .and_then(Value::as_i64)
+            .map(|s| s.saturating_mul(1000));
+        let hit = super::pause::Hit::from_limits(&core.state.limits, said, until, now);
+        let cut = super::pause::cut_now(core);
+        let started = super::pause::hold(core, super::pause::LIMIT, "harness", hit, Some(cut));
+        // A turn that would go on regardless (a goal's Stop hook asking again and again) can't get
+        // anywhere until the reset: it stops here.
+        if started && self.turn {
+            self.request(core, Pending::Interrupt, json!({"subtype": "interrupt"}));
+        }
     }
 
     fn ask_mcp(&mut self, core: &mut Core) {
@@ -1276,19 +1329,23 @@ impl Claude {
         core.state.delivery.insert(id.clone(), Delivery::Sent);
         prune_delivery(core);
         let (images, names) = super::model::attachment_summary(&attachments);
-        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some("human".into()), attachments: names });
+        core.note_sent(&id);
+        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some(super::core::origin_of(&id).into()), attachments: names });
         core.touch_state();
         self.settle(core);
     }
 
-    /// The turn is over: the next message waiting in kiln's queue goes out.
+    /// The turn is over: the next message waiting in kiln's queue goes out (unless a pause or a
+    /// switch holds it).
     fn drain_queue(&mut self, core: &mut Core) {
-        if core.hold || self.busy(core) || core.state.queue.is_empty() || core.state.status == Status::Exited {
+        if self.busy(core) || core.state.queue.is_empty() || core.state.status == Status::Exited || !super::pause::open(core) {
             return;
         }
         let item = core.state.queue.remove(0);
         core.touch_state();
+        let id = item.id.clone();
         self.send(core, item.id, item.text, SendMode::Queue, item.attachments, item.overrides);
+        super::pause::sent_from_queue(core, &id);
     }
 
     fn answer(&mut self, core: &mut Core, id: &str, decision: Decision, message: Option<String>, always: Option<usize>, choices: Option<Vec<ChoiceAnswer>>) {
@@ -1408,6 +1465,12 @@ impl Claude {
                 Pending::Usage => {
                     core.state.inventory.limits = Known::Unsupported;
                     core.touch_state();
+                    // A pause's check that can't be answered: go on, and let the harness say.
+                    if core.state.pause.as_ref().is_some_and(|p| p.checking.is_some())
+                        && let Some(p) = super::pause::release(core, "The limit's reset time came; going on.")
+                    {
+                        self.go_on(core, p);
+                    }
                 }
                 // The commands initialize listed stand for the skills.
                 Pending::ReloadSkills => {
@@ -1586,6 +1649,9 @@ impl Claude {
                 core.state.inventory.limits = Known::Ready;
                 Self::usage(core, &body);
                 core.touch_state();
+                if let Some(p) = super::pause::checked(core, Core::now()) {
+                    self.go_on(core, p);
+                }
             }
             Pending::Status => {
                 let rows: Vec<StatusItem> = body
@@ -2104,7 +2170,9 @@ impl Claude {
             match str_of(&block, "type").unwrap_or("") {
                 "text" => {
                     let text = str_of(&block, "text").unwrap_or("").to_owned();
-                    if error {
+                    if error && (str_of(v, "error") == Some("rate_limit") || str_of(v, "apiError") == Some("usage_limit_reached") || super::pause::says_limit(&text)) {
+                        self.limit_reached(core, v, &text);
+                    } else if error {
                         self.notice(core, Level::Error, text, parent.clone());
                     } else {
                         if parent.is_none() && !text.trim().is_empty() {
@@ -2211,7 +2279,10 @@ impl Claude {
     fn user_text(&mut self, core: &mut Core, uuid: &str, text: &str, v: &Value, parent: Option<String>) {
         let t = text.trim();
         if t.starts_with("[Request interrupted by user") {
-            self.notice(core, Level::Info, "Interrupted", parent);
+            // kiln stopped it for a usage limit: the pause says so already.
+            if core.state.pause.is_none() {
+                self.notice(core, Level::Info, "Interrupted", parent);
+            }
             return;
         }
         // Context the CLI injects (reminders, command wrappers) is not something anyone said; a
@@ -2229,7 +2300,9 @@ impl Claude {
         let id = if uuid.is_empty() { format!("user-{}", Core::now()) } else { uuid.to_owned() };
         let ours = core.state.delivery.contains_key(&id);
         let human = ours || v.get("isReplay").and_then(Value::as_bool) == Some(true);
-        if human && core.state.goal.is_empty() {
+        // One of kiln's own (keeping it going) stays kiln's, and isn't what the person asked for.
+        let from = if ours { super::core::origin_of(&id) } else if human { "human" } else { "system" };
+        if human && from != "kiln" && core.state.goal.is_empty() {
             core.state.goal = clip_middle(t, 600).0;
             core.touch_state();
         }
@@ -2247,7 +2320,7 @@ impl Claude {
                 images: keep_images,
                 attachments: keep_names,
                 client_id: ours.then(|| id.clone()),
-                origin: Some(if human { "human".into() } else { "system".into() }),
+                origin: Some(from.into()),
             },
         );
     }
@@ -2414,6 +2487,7 @@ impl Claude {
 
     fn result(&mut self, core: &mut Core, v: &Value) {
         self.turn = false;
+        let started = core.state.turn_started;
         core.state.turn_started = None;
         core.state.doing = None;
         let u = &mut core.state.usage;
@@ -2453,10 +2527,27 @@ impl Claude {
                 "error_during_execution" => str_of(v, "result").map(str::to_owned).unwrap_or_else(|| "The turn ended with an error.".to_owned()),
                 other => format!("The turn ended: {other}"),
             };
-            if str_of(v, "stop_reason").is_some() || sub != "error_during_execution" {
+            if core.state.pause.is_some() && super::pause::says_limit(&msg) {
+                // The pause said it already.
+            } else if super::pause::says_limit(&msg) {
+                self.limit_reached(core, v, &msg);
+            } else if str_of(v, "stop_reason").is_some() || sub != "error_during_execution" {
                 self.notice(core, Level::Error, msg, None);
             }
         }
+        // How it ended, for kiln's keep-going: a stop sequence, running out of output or an error
+        // part-way is a turn cut short, not one that's done.
+        let stop = str_of(v, "stop_reason");
+        let aborted = matches!(str_of(v, "terminal_reason"), Some("aborted_streaming" | "aborted_tools"));
+        let (how, why) = match (sub, stop) {
+            _ if aborted => ("stopped", Some("interrupted")),
+            ("error_max_turns" | "error_max_budget_usd", _) => ("limit", Some(sub)),
+            ("success", None | Some("end_turn")) => ("done", stop),
+            ("success", Some("refusal")) => ("refused", stop),
+            ("success", Some(s)) => ("cut", Some(s)),
+            (s, _) => ("cut", Some(s)),
+        };
+        core.end_turn(started, how, why);
         // A goal it pursued: how it came out is in the transcript.
         if core.state.objective.as_ref().is_some_and(|o| o.status == "active")
             && let Some(session) = core.state.harness_session.clone()
@@ -3492,6 +3583,79 @@ mod tests {
         }
     }
 
+    /// The control request kiln last wrote with this subtype: its id.
+    fn asked(writes: &[String], subtype: &str) -> Option<Value> {
+        writes
+            .iter()
+            .rev()
+            .filter_map(|w| serde_json::from_str::<Value>(w).ok())
+            .find(|v| v.pointer("/request/subtype").and_then(Value::as_str) == Some(subtype))
+            .and_then(|v| v.get("request_id").cloned())
+    }
+
+    fn usage_answer(id: &Value, utilization: f64, resets_at: &str) -> String {
+        json!({"type": "control_response", "response": {"subtype": "success", "request_id": id, "response": {"rate_limits": {"five_hour": {"utilization": utilization, "resets_at": resets_at}}}}}).to_string()
+    }
+
+    #[test]
+    fn a_usage_limit_pauses_once_holds_the_queue_and_goes_on_at_the_reset() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/w", "session_id": "s1", "model": "m", "permissionMode": "default"}).to_string());
+        for (id, text) in [("m1", "refactor the parser"), ("m2", "then the tests"), ("m3", "then the docs")] {
+            c.command(&mut core, Command::Send { id: id.into(), text: text.into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        }
+        assert_eq!(core.state.queue.len(), 2);
+        let _ = core.take_writes();
+        // What Claude Code says when the account's 5-hour window is used up (the shape a session on
+        // this machine recorded): the window rejected, a synthetic error message, the turn's end.
+        let reset_s = Core::now() / 1000 + 3_600;
+        let said = "You've hit your session limit · resets 10:30pm (America/Los_Angeles)";
+        for l in [
+            json!({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "rateLimitType": "five_hour", "utilization": 1.0, "resetsAt": reset_s, "overageStatus": "rejected"}}),
+            json!({"type": "assistant", "message": {"id": "e1", "model": "<synthetic>", "role": "assistant", "content": [{"type": "text", "text": said}]}, "parent_tool_use_id": null, "session_id": "s1", "uuid": "e1", "error": "rate_limit"}),
+            json!({"type": "result", "subtype": "success", "is_error": true, "result": said, "session_id": "s1"}),
+            json!({"type": "command_lifecycle", "command_uuid": "m1", "state": "completed", "uuid": "x", "session_id": "s1"}),
+        ] {
+            c.line(&mut core, &l.to_string());
+        }
+        let p = core.state.pause.clone().ok_or_else(|| anyhow::anyhow!("not paused"))?;
+        assert_eq!((p.reason.as_str(), p.window.as_deref(), p.until, p.auto), ("limit", Some("five_hour"), Some(reset_s * 1000), true));
+        assert_eq!(p.cut.as_ref().and_then(|c| c.message.as_deref()), Some("m1"));
+        // The queue waits: nothing more went to the CLI, and the limit was said once.
+        assert_eq!(core.state.queue.len(), 2);
+        let writes = core.take_writes();
+        assert!(!writes.iter().any(|w| w.contains("\"type\":\"user\"")), "{writes:?}");
+        let notices: Vec<String> = core.events().filter_map(|e| if let Body::Notice { text, .. } = &e.body { Some(text.clone()) } else { None }).collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices.first().is_some_and(|n| n.contains("You've hit your session limit")));
+        assert!(core.effects.iter().any(|e| matches!(e, Effect::Checkpoint { .. })));
+        // A usage answer that isn't a check (the one the turn's end asked for) leaves it paused.
+        let early = asked(&writes, "get_usage").ok_or_else(|| anyhow::anyhow!("no usage asked at the turn's end"))?;
+        c.line(&mut core, &usage_answer(&early, 100.0, "2099-01-01T00:00:00Z"));
+        assert!(core.state.pause.is_some());
+        // At the reset kiln checks; the window started over, so the cut-off turn goes on first.
+        assert_eq!(crate::harness::pause::step(&mut core, reset_s * 1000 + 600_000, "s1"), crate::harness::pause::Step::Check);
+        c.check_limits(&mut core);
+        let check = asked(&core.take_writes(), "get_usage").ok_or_else(|| anyhow::anyhow!("no check"))?;
+        c.line(&mut core, &usage_answer(&check, 2.0, "2099-01-01T00:00:00Z"));
+        assert!(core.state.pause.is_none());
+        let sent: Vec<Value> = core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect();
+        let user = sent.iter().find(|v| v.get("type").and_then(Value::as_str) == Some("user")).ok_or_else(|| anyhow::anyhow!("nothing sent"))?;
+        assert_eq!(user.pointer("/message/content").and_then(Value::as_str), Some(crate::harness::pause::CONTINUE));
+        // Then the queue, in order, once that turn ends.
+        assert_eq!(core.state.queue.len(), 2);
+        let go_on = user.get("uuid").and_then(Value::as_str).unwrap_or_default().to_owned();
+        assert!(matches!(core.get(&go_on).map(|e| &e.body), Some(Body::User { origin: Some(o), .. }) if o == "kiln"));
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "Done.", "session_id": "s1"}).to_string());
+        c.line(&mut core, &json!({"type": "command_lifecycle", "command_uuid": go_on, "state": "completed", "uuid": "y", "session_id": "s1"}).to_string());
+        let next: Vec<Value> = core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect();
+        assert!(next.iter().any(|v| v.get("uuid").and_then(Value::as_str) == Some("m2")));
+        // The limit's window isn't shown as reached any more.
+        assert!(core.state.limits.iter().all(|l| l.status.as_deref() != Some("rejected")));
+        Ok(())
+    }
+
     #[test]
     fn a_goal_is_followed_to_the_verdict_in_the_transcript() {
         let mut c = Claude::new(false).with_config_dir("/cfg".into());
@@ -3859,6 +4023,25 @@ mod tests {
     }
 
     /// A session that has answered initialize (as a Max subscriber) and init.
+    #[test]
+    fn a_turn_ended_by_a_stop_sequence_is_cut_short() {
+        let (mut c, mut core, _) = started();
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "carry on".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+        c.line(
+            &mut core,
+            &json!({"type": "assistant", "message": {"id": "msg_9", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "No response requested."}]}, "parent_tool_use_id": null, "session_id": "s1", "uuid": "a9"}).to_string(),
+        );
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "No response requested.", "stop_reason": "stop_sequence", "session_id": "s1"}).to_string());
+        let t = core.state.last_turn.clone().unwrap_or_default();
+        assert_eq!((t.how.as_str(), t.why.as_deref()), ("cut", Some("stop_sequence")));
+        // One that ends as turns do is done; one you stopped is yours.
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "and?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None });
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "Done.", "stop_reason": "end_turn", "session_id": "s1"}).to_string());
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("done"));
+        c.line(&mut core, &json!({"type": "result", "subtype": "error_during_execution", "is_error": true, "terminal_reason": "aborted_streaming", "session_id": "s1"}).to_string());
+        assert_eq!(core.state.last_turn.as_ref().map(|t| t.how.as_str()), Some("stopped"));
+    }
+
     fn started() -> (Claude, Core, Vec<(String, String, Value)>) {
         let mut c = Claude::new(false).with_config_dir("/home/u/.claude".into());
         let mut core = Core::new();

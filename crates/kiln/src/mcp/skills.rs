@@ -26,7 +26,7 @@ macro_rules! skill {
     };
 }
 
-static SKILLS: &[Skill] = &[skill!("kiln-deploy"), skill!("kiln-diagnose"), skill!("kiln-apps"), skill!("kiln-argocd-migration")];
+static SKILLS: &[Skill] = &[skill!("kiln-deploy"), skill!("kiln-diagnose"), skill!("kiln-apps"), skill!("kiln-argocd-migration"), skill!("kiln-ci-diagnose")];
 
 /// A frontmatter field of a `SKILL.md`.
 fn field(text: &str, key: &str) -> String {

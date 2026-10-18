@@ -1,0 +1,17 @@
+cabal-version:      2.4
+name:               fixture
+version:            0.1.0.0
+build-type:         Simple
+
+library
+    exposed-modules:  Fixture
+    hs-source-dirs:   hs/src
+    build-depends:    base >=4 && <5
+    default-language: Haskell2010
+
+test-suite fixture-test
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    hs-source-dirs:   hs/test
+    build-depends:    base >=4 && <5, fixture
+    default-language: Haskell2010

@@ -9,6 +9,7 @@ import type {
   JoinInfo,
   JoinRequest,
   KilnBinary,
+  OutpostInvite,
   Me,
   MetricsHistory,
   NewRepo,
@@ -232,6 +233,8 @@ export const api = {
   drainAgent: (name: string, draining: boolean) => post<void>(`/api/agents/${enc(name)}/drain`, { draining }),
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),
   joinRequests: (signal?: AbortSignal) => get<JoinRequest[]>("/api/join-requests", signal),
+  /** A one-time invite for an outpost: kiln run on a machine without installing it there. */
+  outpostInvite: () => post<OutpostInvite>("/api/outposts/invite"),
   approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) => post<{ id: string; status: string; name: string; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
   denyJoin: (id: string) => post<{ id: string; status: string; name: string }>(`/api/join-requests/${enc(id)}/deny`),
   discovery: (signal?: AbortSignal) => get<DiscoveryInfo>("/api/discovery", signal),

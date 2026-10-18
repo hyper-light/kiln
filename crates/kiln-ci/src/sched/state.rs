@@ -149,8 +149,9 @@ pub enum WaitReason {
 pub enum Command {
     StartRun { run: String },
     CancelRun { run: String, reason: String },
-    /// `image` is the routing rule's, for container and microVM executors (W13).
-    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String> },
+    /// `image` is the routing rule's, for container and microVM executors (W13); `docker`, the
+    /// Docker access the rules give the leg (W13-R04).
+    Assign { leg: String, runner: String, attempt: u32, executor: Option<String>, image: Option<String>, docker: Option<String> },
     /// Stop a leg's attempt on its runner.
     Cancel { leg: String, attempt: u32, reason: String },
     /// A failed attempt will be retried at `at` as `attempt`.
@@ -185,6 +186,8 @@ struct Leg {
     avoid: Option<String>,
     pin: Option<String>,
     last_runner: Option<String>,
+    /// Cancelled while it ran, and why: however its attempt ends, it ends cancelled, never retried.
+    cancelling: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -356,7 +359,7 @@ impl Scheduler {
         let sig = req.signature();
         self.ensure_sig(&sig, &req);
         let group = input.group.clone();
-        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None });
+        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Pending, attempt: 1, queued_at: now, key: None, reason: None, avoid: None, pin: None, last_runner: None, cancelling: None });
         match group {
             Some((key, name, cfg)) => {
                 let actions = self.groups.arrive(&key, &name, &format!("leg:{id}"), &cfg);
@@ -383,7 +386,7 @@ impl Scheduler {
         }
         *self.in_progress.entry(input.repo.clone()).or_default() += 1;
         let request = input.request;
-        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Assigned { runner: runner.clone() }, attempt, queued_at: 0, key: None, reason: None, avoid: None, pin: None, last_runner: Some(runner.clone()) });
+        self.legs.insert(id.clone(), Leg { input, req, sig, state: State::Assigned { runner: runner.clone() }, attempt, queued_at: 0, key: None, reason: None, avoid: None, pin: None, last_runner: Some(runner.clone()), cancelling: None });
         // The runner may not have reconnected yet: keep what it runs until it does.
         let r = self.runners.entry(runner.clone()).or_insert_with(|| Runner { input: RunnerIn { id: runner.clone(), ..RunnerIn::default() }, running: Vec::new(), used: Resources::default(), connected: false, draining: false, exclusive: false });
         r.running.push(id);
@@ -540,7 +543,7 @@ impl Scheduler {
         l.last_runner = Some(runner.to_owned());
         let (attempt, request, exclusive, repo, fair) = (l.attempt, l.input.request, l.input.exclusive, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
         let executors = l.req.executors.clone();
-        let image = l.req.image.clone();
+        let (image, docker) = (l.req.image.clone(), l.req.docker.clone());
         self.vtime = self.vtime.max(fair as f64 / 1000.0);
         *self.in_progress.entry(repo).or_default() += 1;
         let mut executor = None;
@@ -550,7 +553,7 @@ impl Scheduler {
             r.exclusive = exclusive;
             executor = executors.iter().find(|e| super::routing::has_executor(&r.input.view.facts, e)).cloned();
         }
-        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image });
+        out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker });
     }
 
     fn release(&mut self, id: &str) -> Option<String> {
@@ -576,6 +579,18 @@ impl Scheduler {
             return;
         }
         let runner = self.release(id);
+        // Cancelled while it ran: a failure now (killed, its runner gone) is the cancel's doing.
+        if let Some(why) = self.legs.get(id).and_then(|l| l.cancelling.clone()) {
+            let (outcome, reason) = match outcome {
+                Outcome::Failed(_) => (Outcome::Cancelled, Some(why)),
+                o => (o, None),
+            };
+            self.settle(id, outcome, reason, now, out);
+            if let Some(r) = runner {
+                self.try_runner(&r, now, out);
+            }
+            return;
+        }
         let decision = match &outcome {
             Outcome::Failed(f) => retry::decide(self.legs.get(id).and_then(|l| l.input.retry.as_ref()), attempt, f),
             _ => None,
@@ -623,7 +638,12 @@ impl Scheduler {
     fn cancel(&mut self, id: &str, reason: String, now: i64, out: &mut Vec<Command>) {
         let Some(l) = self.legs.get(id) else { return };
         match l.state.clone() {
-            State::Assigned { .. } => out.push(Command::Cancel { leg: id.to_owned(), attempt: l.attempt, reason }),
+            State::Assigned { .. } => {
+                out.push(Command::Cancel { leg: id.to_owned(), attempt: l.attempt, reason: reason.clone() });
+                if let Some(l) = self.legs.get_mut(id) {
+                    l.cancelling = Some(reason);
+                }
+            }
             State::Queued => {
                 self.unqueue(id);
                 self.settle(id, Outcome::Cancelled, Some(reason), now, out);

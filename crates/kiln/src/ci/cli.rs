@@ -83,20 +83,49 @@ enum VarsCmd {
     },
 }
 
-struct Api {
+/// A kiln server's API, as its admin (or a personal access token).
+pub(crate) struct Api {
     client: Client,
     url: String,
     token: String,
 }
 
 impl Api {
-    async fn connect(cfg: &Config, url: Option<&str>, token: Option<&str>) -> Result<Api> {
+    pub(crate) async fn connect(cfg: &Config, url: Option<&str>, token: Option<&str>) -> Result<Api> {
         let t = crate::access::resolve(cfg, url, token).await?;
         Ok(Api { client: Client::public()?, url: t.url, token: t.token })
     }
 
-    async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
-        let mut req = self.client.request(method, &format!("{}/api/ci{path}", self.url)).bearer(&self.token).timeout(Duration::from_secs(60));
+    /// A server this process runs (`kiln workflow run`'s own).
+    pub(crate) fn local(url: &str, token: &str) -> Result<Api> {
+        Ok(Api { client: Client::public()?, url: url.trim_end_matches('/').to_owned(), token: token.to_owned() })
+    }
+
+    /// A CI route (`/api/ci<path>`).
+    pub(crate) async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        self.call_api(method, &format!("/api/ci{path}"), body).await
+    }
+
+    /// `POST /api/ci<path>` with a body streamed from `rx` (a pack, W17-R06).
+    pub(crate) async fn upload(&self, path: &str, rx: async_channel::Receiver<bytes::Bytes>) -> Result<Value> {
+        let resp = self.client.request(Method::Post, &format!("{}/api/ci{path}", self.url)).bearer(&self.token).header("content-type", "application/octet-stream").body_stream(rx).timeout(Duration::from_secs(3600)).send().await?;
+        let status = resp.status();
+        let bytes = resp.bytes(1 << 20).await?;
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        if !(200..300).contains(&status) {
+            bail!("{}", v.get("error").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("HTTP {status}")));
+        }
+        Ok(v)
+    }
+
+    /// Any route of the API (`path` from `/api`).
+    pub(crate) async fn call_api(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        self.call_for(method, path, body, Duration::from_secs(60)).await
+    }
+
+    /// [`Self::call_api`], waiting up to `wait` for the answer.
+    pub(crate) async fn call_for(&self, method: Method, path: &str, body: Option<Value>, wait: Duration) -> Result<Value> {
+        let mut req = self.client.request(method, &format!("{}{path}", self.url)).bearer(&self.token).timeout(wait);
         if let Some(b) = body {
             req = req.json(&b);
         }
@@ -139,6 +168,20 @@ enum OidcCmd {
         #[arg(long)]
         now: bool,
     },
+    /// The claims ID tokens' subjects are built from (W10-R09, GitHub's "customize subject
+    /// claims"), for the server, an organization (`org:<owner>`) or a repository
+    /// (`repo:<owner/name>`): shown, set with `--keys repo,context,kiln_trust`, GitHub's default
+    /// for a repository with `--default`, or inherited again with `--inherit`.
+    Subject {
+        #[arg(long, default_value = "server")]
+        scope: String,
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["default", "inherit"])]
+        keys: Vec<String>,
+        #[arg(long, conflicts_with = "inherit")]
+        default: bool,
+        #[arg(long)]
+        inherit: bool,
+    },
 }
 
 /// `kiln oidc`.
@@ -166,6 +209,26 @@ pub async fn oidc(args: OidcArgs, cfg: &Config) -> Result<()> {
         OidcCmd::Rotate { now } => {
             let v = api.call(Method::Post, "/oidc/rotate", Some(json!({ "now": now }))).await?;
             println!("a new signing key, signing from {}", when(v.get("sign_from").and_then(Value::as_i64)));
+        }
+        OidcCmd::Subject { scope, keys, default, inherit } => {
+            let path = format!("/oidc/subject?scope={}", enc(&scope));
+            let v = if inherit {
+                api.call(Method::Delete, &path, None).await?
+            } else if default || !keys.is_empty() {
+                api.call(Method::Put, &path, Some(json!({ "use_default": default, "include_claim_keys": keys }))).await?
+            } else {
+                api.call(Method::Get, &path, None).await?
+            };
+            let list = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            let own = if v.get("use_default").and_then(Value::as_bool) == Some(true) { "GitHub's default subject".to_owned() } else { list("include_claim_keys") };
+            println!("{}: {}", v.get("scope").and_then(Value::as_str).unwrap_or_default(), if own.is_empty() { "inherited".to_owned() } else { own });
+            match v.get("effective_claim_keys").and_then(Value::as_array) {
+                Some(_) => println!("subjects are built from: {}", list("effective_claim_keys")),
+                None => println!("subjects are GitHub's default: repo:<owner/name>:environment:<env>, :pull_request or :ref:<ref>"),
+            }
+            if let Some(e) = v.get("example_subject").and_then(Value::as_str) {
+                println!("a push to main: {e}");
+            }
         }
     }
     Ok(())
@@ -381,6 +444,62 @@ pub async fn logs(args: LogsArgs, cfg: &Config) -> Result<()> {
     }
 }
 
+/// `kiln metrics <tool> <path>` (docs/ci.md W16-R07): a benchmark tool's output as metrics, added
+/// to the step's `$KILN_METRICS` (printed when there is none).
+#[derive(clap::Args)]
+pub struct MetricsArgs {
+    /// criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest or k6.
+    tool: String,
+    /// Its output: a file (`-` for standard input), or criterion's directory (`target/criterion`).
+    path: std::path::PathBuf,
+    /// `KEY=VALUE` tags on every metric (repeatable).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+}
+
+pub fn metrics(args: MetricsArgs) -> Result<()> {
+    use kiln_ci::results::metrics::{Tool, convert};
+    use std::io::Write as _;
+    let Some(tool) = Tool::parse(&args.tool) else { bail!("`{}` isn't a tool kiln reads: criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest or k6", args.tool) };
+    let mut files: Vec<(String, String)> = Vec::new();
+    if args.path.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        files.push(("-".into(), s));
+    } else if args.path.is_dir() {
+        // criterion: every `…/new/estimates.json` and `sample.json` below.
+        let mut stack = vec![args.path.clone()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir)?.filter_map(std::result::Result::ok) {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "new") && p.file_name().is_some_and(|n| n == "estimates.json" || n == "sample.json") {
+                    files.push((p.to_string_lossy().replace('\\', "/"), std::fs::read_to_string(&p)?));
+                }
+            }
+        }
+    } else {
+        files.push((args.path.to_string_lossy().into_owned(), std::fs::read_to_string(&args.path)?));
+    }
+    let mut points = convert(tool, &files).map_err(|e| anyhow::anyhow!("{}: {e}", args.path.display()))?;
+    for t in &args.tags {
+        let Some((k, v)) = t.split_once('=') else { bail!("--tag takes KEY=VALUE, not `{t}`") };
+        for p in &mut points {
+            p.tags.insert(k.to_owned(), v.to_owned());
+        }
+    }
+    let lines: String = points.iter().filter_map(|p| serde_json::to_string(p).ok()).map(|l| l + "\n").collect();
+    match std::env::var_os("KILN_METRICS").filter(|v| !v.is_empty()) {
+        Some(file) => {
+            std::fs::OpenOptions::new().create(true).append(true).open(&file)?.write_all(lines.as_bytes())?;
+            eprintln!("{} metrics added to $KILN_METRICS", points.len());
+        }
+        None => print!("{lines}"),
+    }
+    Ok(())
+}
+
 /// `kiln dispatch`: a `workflow_dispatch` run.
 #[derive(clap::Args)]
 pub struct DispatchArgs {
@@ -435,12 +554,16 @@ pub struct RerunArgs {
     /// Resolve the actions' refs again instead of reusing the run's pins.
     #[arg(long)]
     fresh_actions: bool,
+    /// Keep a leg that fails this many minutes to look into (terminal, `kiln debug`).
+    #[arg(long, value_name = "MINUTES", num_args = 0..=1, default_missing_value = "30")]
+    keep_failed: Option<u32>,
 }
 
 pub async fn rerun(args: RerunArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     let mode = if args.failed { "failed" } else if args.job.is_some() { "job" } else { "all" };
-    let v = api.call(Method::Post, &format!("/runs/{}/rerun", enc(&args.run)), Some(json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions }))).await?;
+    let body = json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions, "keep_failed": args.keep_failed });
+    let v = api.call(Method::Post, &format!("/runs/{}/rerun", enc(&args.run)), Some(body)).await?;
     match v.get("attempt").and_then(Value::as_i64) {
         Some(a) => println!("attempt {a} of run {} started", args.run),
         None => println!("rerun of {} started", args.run),
@@ -484,6 +607,27 @@ enum RoutingCmd {
         #[arg(long = "ref")]
         git_ref: Option<String>,
     },
+    /// Where a leg with these `runs-on` labels would go now, by the rules and the runners.
+    Where {
+        #[arg(required = true)]
+        labels: Vec<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Constraints of its own (`requires:`), e.g. `"memory >= 16Gi"`.
+        #[arg(long = "require")]
+        requires: Vec<String>,
+    },
+    /// The routing rules in the order they apply, with where each comes from; `--set FILE`
+    /// replaces a scope's stored rules with the YAML list in FILE, `--clear` removes them.
+    Rules {
+        /// `server` or `org:<owner>` (a repository's rules are its `.kiln/routing.yaml`).
+        #[arg(long, default_value = "server")]
+        scope: String,
+        #[arg(long)]
+        set: Option<std::path::PathBuf>,
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 fn print_runners(runners: &[Value]) {
@@ -496,7 +640,34 @@ fn print_runners(runners: &[Value]) {
 
 pub async fn routing(args: RoutingArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
-    let RoutingCmd::Explain { target, repo, git_ref } = args.cmd;
+    let (target, repo, git_ref) = match args.cmd {
+        RoutingCmd::Explain { target, repo, git_ref } => (target, repo, git_ref),
+        RoutingCmd::Where { labels, repo, requires } => {
+            let v = api.call(Method::Post, "/routing/explain", Some(json!({ "labels": labels, "repo": repo.unwrap_or_default(), "requires": requires }))).await?;
+            let strs = |k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|x| x.as_str().map(str::to_owned)).collect::<Vec<_>>().join(", ");
+            println!("labels left for runners: [{}]; constraints: [{}]; executors: [{}]; image: {}", strs("labels"), strs("constraints"), strs("executors"), v.get("image").and_then(Value::as_str).unwrap_or("none"));
+            for r in v.get("rules").and_then(Value::as_array).cloned().unwrap_or_default() {
+                println!("  rule from {}: {}", r.get("source").and_then(Value::as_str).unwrap_or_default(), r.get("rule").map(Value::to_string).unwrap_or_default());
+            }
+            print_runners(&v.get("runners").and_then(Value::as_array).cloned().unwrap_or_default());
+            return Ok(());
+        }
+        RoutingCmd::Rules { scope, set, clear } => {
+            if set.is_some() || clear {
+                let rules: Value = match set {
+                    Some(f) => serde_yaml::from_str(&std::fs::read_to_string(&f)?)?,
+                    None => json!([]),
+                };
+                let rules = rules.get("rules").cloned().unwrap_or(rules);
+                api.call(Method::Put, &format!("/routing/rules?scope={}", enc(&scope)), Some(json!({ "rules": rules }))).await?;
+            }
+            let v = api.call(Method::Get, "/routing/rules", None).await?;
+            for r in v.get("rules").and_then(Value::as_array).cloned().unwrap_or_default() {
+                println!("{:>3}  {:<24} {}", r.get("index").and_then(Value::as_u64).unwrap_or_default(), r.get("source").and_then(Value::as_str).unwrap_or_default(), r.get("rule").map(Value::to_string).unwrap_or_default());
+            }
+            return Ok(());
+        }
+    };
     let Some(repo) = repo else {
         let v = api.call(Method::Get, &format!("/legs/{}/routing", enc(&target)), None).await?;
         if let Some(w) = v.get("wait_reason").filter(|w| !w.is_null()) {
@@ -521,11 +692,11 @@ pub async fn routing(args: RoutingArgs, cfg: &Config) -> Result<()> {
 }
 
 /// Percent-encodes a query value.
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-fn when(t: Option<i64>) -> String {
+pub(crate) fn when(t: Option<i64>) -> String {
     t.and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok()).and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()).unwrap_or_else(|| "never".into())
 }
 
@@ -622,3 +793,202 @@ mod tests {
         assert_eq!(enc("repo:acme/app"), "repo%3Aacme%2Fapp");
     }
 }
+
+#[derive(clap::Args)]
+pub struct EnvArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: EnvCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum EnvCmd {
+    /// A repository's environments, their protection and latest deployment.
+    List {
+        #[arg(long)]
+        repo: String,
+    },
+    /// Make an environment in kiln (or change one made here), with its protection rules.
+    Create {
+        name: String,
+        #[arg(long)]
+        repo: String,
+        /// A required reviewer: a person, or `team:<name>` (repeatable).
+        #[arg(long = "reviewer")]
+        reviewers: Vec<String>,
+        #[arg(long)]
+        prevent_self_review: bool,
+        /// Minutes a job waits before it deploys.
+        #[arg(long, default_value_t = 0)]
+        wait_timer: u32,
+        /// Branches that may deploy (patterns, repeatable); with none and no `--tag`, any ref.
+        #[arg(long = "branch")]
+        branches: Vec<String>,
+        /// Tags that may deploy (patterns, repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Remove an environment made in kiln.
+    Delete {
+        name: String,
+        #[arg(long)]
+        repo: String,
+    },
+    /// An environment's deployments, newest first.
+    Deployments {
+        name: String,
+        #[arg(long)]
+        repo: String,
+    },
+}
+
+/// `kiln env`.
+pub async fn env(args: EnvArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    match args.cmd {
+        EnvCmd::List { repo } => {
+            let v = api.call(Method::Get, &format!("/environments?repo={}", enc(&repo)), None).await?;
+            for e in v.get("environments").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let p = e.get("protection").cloned().unwrap_or_default();
+                let mut rules = Vec::new();
+                if let Some(r) = p.get("reviewers").and_then(Value::as_array).filter(|r| !r.is_empty()) {
+                    rules.push(format!("reviewers {}", r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")));
+                }
+                if let Some(w) = p.get("wait-timer").and_then(Value::as_u64).filter(|w| *w > 0) {
+                    rules.push(format!("waits {w}m"));
+                }
+                for k in ["branches", "tags"] {
+                    if let Some(b) = p.get(k).and_then(Value::as_array) {
+                        rules.push(format!("{k} {}", b.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")));
+                    }
+                }
+                let last = e.get("latest_deployment").filter(|d| !d.is_null()).map(|d| format!("; last: {} {} {}", s(d, "state"), s(d, "ref"), s(d, "sha").get(..8).unwrap_or_default())).unwrap_or_default();
+                println!("{:<16} ({}) {}{last}", s(&e, "name"), s(&e, "source"), if rules.is_empty() { "no protection".to_owned() } else { rules.join("; ") });
+            }
+        }
+        EnvCmd::Create { name, repo, reviewers, prevent_self_review, wait_timer, branches, tags, url } => {
+            let protection = json!({
+                "reviewers": reviewers, "prevent-self-review": prevent_self_review, "wait-timer": wait_timer,
+                "branches": (!branches.is_empty()).then_some(branches), "tags": (!tags.is_empty()).then_some(tags),
+            });
+            api.call(Method::Put, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), Some(json!({ "protection": protection, "url": url }))).await?;
+            println!("{name} saved in {repo}");
+        }
+        EnvCmd::Delete { name, repo } => {
+            api.call(Method::Delete, &format!("/environments/{}?repo={}", enc(&name), enc(&repo)), None).await?;
+            println!("removed {name} from {repo}");
+        }
+        EnvCmd::Deployments { name, repo } => {
+            let v = api.call(Method::Get, &format!("/environments/{}/deployments?repo={}", enc(&name), enc(&repo)), None).await?;
+            for d in v.get("deployments").and_then(Value::as_array).cloned().unwrap_or_default() {
+                println!("{:>6} {:<12} {:<20} {} {}  {}", d.get("id").and_then(Value::as_i64).unwrap_or_default(), s(&d, "state"), s(&d, "ref"), s(&d, "sha").get(..8).unwrap_or_default(), when(d.get("created_at").and_then(Value::as_i64)), s(&d, "url"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct ApproveArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// The run waiting for a deployment review.
+    run: String,
+    /// The environments decided (default: every one the run waits for; repeatable).
+    #[arg(long = "env")]
+    environments: Vec<String>,
+    /// Reject instead: the waiting jobs fail.
+    #[arg(long)]
+    reject: bool,
+    #[arg(long, default_value = "")]
+    comment: String,
+}
+
+/// `kiln approve`.
+pub async fn approve(args: ApproveArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let body = json!({ "environments": args.environments, "state": if args.reject { "rejected" } else { "approved" }, "comment": args.comment });
+    let v = api.call(Method::Post, &format!("/runs/{}/approve", enc(&args.run)), Some(body)).await?;
+    let envs: Vec<String> = v.get("environments").and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|e| e.as_str().map(str::to_owned)).collect();
+    println!("{} the deployments to {}", if args.reject { "rejected" } else { "approved" }, envs.join(", "));
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct DebugArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: DebugCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum DebugCmd {
+    /// Keep a kept leg longer: MINUTES from now (default 30).
+    Keep {
+        leg: String,
+        #[arg(long, default_value_t = 30)]
+        minutes: u32,
+    },
+    /// Let a kept leg go now: its workspace and containers are removed.
+    Release { leg: String },
+    /// Run a kept leg's step again in place (after fixing what made it fail, in its terminal), as
+    /// a new section of the leg's log.
+    RerunStep {
+        leg: String,
+        /// The step, from 1 as the run page numbers them.
+        step: u32,
+    },
+    /// Run a command in a running or kept leg, as its terminal would (its workspace and
+    /// environment, or its container), and exit with its exit code: `kiln debug exec LEG -- ls`.
+    Exec {
+        leg: String,
+        /// Stop it after this many seconds (at most 600).
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// The command (shell text; several words are joined with spaces).
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+}
+
+/// `kiln debug`.
+pub async fn debug(args: DebugArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    match args.cmd {
+        DebugCmd::Keep { leg, minutes } => {
+            let v = api.call(Method::Post, &format!("/legs/{}/keep", enc(&leg)), Some(json!({ "minutes": minutes }))).await?;
+            println!("{leg} kept until {}", when(v.get("kept_until").and_then(Value::as_i64)));
+        }
+        DebugCmd::Release { leg } => {
+            api.call(Method::Post, &format!("/legs/{}/release", enc(&leg)), Some(json!({}))).await?;
+            println!("released {leg}");
+        }
+        DebugCmd::Exec { leg, timeout, command } => {
+            let body = json!({ "command": command.join(" "), "timeout": timeout });
+            let v = api.call_for(Method::Post, &format!("/api/ci/legs/{}/exec", enc(&leg)), Some(body), Duration::from_secs(timeout.min(600) + 30)).await?;
+            print!("{}", v.get("output").and_then(Value::as_str).unwrap_or_default());
+            if v.get("truncated").and_then(Value::as_bool) == Some(true) {
+                eprintln!("[kiln] the output was cut at 1 MiB");
+            }
+            if v.get("timed_out").and_then(Value::as_bool) == Some(true) {
+                eprintln!("[kiln] stopped after {timeout} s");
+                return Err(anyhow::Error::new(crate::reach::cli::ExitWith(124)));
+            }
+            let code = v.get("exit_code").and_then(Value::as_i64).unwrap_or(1);
+            if code != 0 {
+                return Err(anyhow::Error::new(crate::reach::cli::ExitWith(u8::try_from(code).unwrap_or(1))));
+            }
+        }
+        DebugCmd::RerunStep { leg, step } => {
+            let v = api.call(Method::Post, &format!("/legs/{}/rerun-step", enc(&leg)), Some(json!({ "step": step }))).await?;
+            println!("step {step} of {leg} runs again as step {} of its log; `kiln logs {leg}` follows it", v.get("idx").and_then(Value::as_u64).map_or(0, |i| i + 1));
+        }
+    }
+    Ok(())
+}
+

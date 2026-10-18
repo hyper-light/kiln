@@ -369,13 +369,18 @@ function Thought({ e, more = [] }: { e: Extract<HEvent, { kind: "thinking" }>; m
   );
 }
 
-function Notice({ e }: { e: Extract<HEvent, { kind: "notice" }> }) {
+function Notice({ e, repeats }: { e: Extract<HEvent, { kind: "notice" }>; repeats?: number }) {
   const signIn = React.useContext(SignIn);
   const I = e.level === "error" ? CircleAlert : e.level === "warn" ? TriangleAlert : Info;
   return (
     <>
       <div className="hx-notice" data-level={e.level} data-ev={e.id}>
         <I size={12} /> <span>{e.text}</span>
+        {repeats && repeats > 1 && (
+          <span className="hx-notice-n" title={`Said ${repeats} times in a row`}>
+            ×{repeats}
+          </span>
+        )}
       </div>
       {signIn?.notice === e.id && (
         <div className="ac-under">
@@ -433,7 +438,7 @@ function ItemView({ item, cwd, onOpenTask }: { item: Item; cwd: string; onOpenTa
     case "thought":
       return <Thought e={item.event} more={item.more} />;
     case "notice":
-      return <Notice e={item.event} />;
+      return <Notice e={item.event} repeats={item.repeats} />;
   }
 }
 

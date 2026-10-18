@@ -7,7 +7,8 @@
 //!   - `workflow_dispatch` and `repository_dispatch` (W03-R11);
 //!   - the repository's reads from the server's mirror ([`repos`]): repository, commits,
 //!     branches, refs, contents, tarballs and zipballs, compare;
-//!   - what jobs record ([`records`]): commit statuses, check runs, releases and their assets;
+//!   - what jobs record ([`records`]): commit statuses, check runs, releases and their assets,
+//!     dependency snapshots, deployments and their statuses (and the environments they go to);
 //!   - `/user` and `/rate_limit`.
 //! - Anything else answers 501 with `{"message": "not implemented by kiln: …"}`, and the leg gets
 //!   a warning naming the route, so gaps are visible and get filled.
@@ -72,6 +73,9 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
         (&Method::GET, ["repos", _, _, "actions", ..]) => Some(("actions", Level::Read)),
         (&Method::DELETE, ["repos", _, _, "actions", ..]) | (&Method::POST, ["repos", _, _, "actions", "workflows", ..]) => Some(("actions", Level::Write)),
         (&Method::POST, ["repos", _, _, "dispatches"]) => Some(("contents", Level::Write)),
+        (&Method::POST, ["repos", _, _, "dependency-graph", "snapshots"]) => Some(("contents", Level::Write)),
+        (&Method::GET, ["repos", _, _, "deployments" | "environments", ..]) => Some(("deployments", Level::Read)),
+        (&Method::POST, ["repos", _, _, "deployments", ..]) => Some(("deployments", Level::Write)),
         _ => None,
     };
     if let Some((scope, level)) = need
@@ -110,10 +114,24 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             (&Method::PATCH, ["releases", id]) => records::save_release(&s, Some(id), &body(req).await?).await,
             (&Method::DELETE, ["releases", "assets", id]) => records::delete(&s, true, id).await,
             (&Method::DELETE, ["releases", id]) => records::delete(&s, false, id).await,
+            (&Method::POST, ["dependency-graph", "snapshots"]) => records::dependency_snapshot(&s, &body(req).await?).await,
+            (&Method::GET, ["deployments"]) => records::deployments(&s, None, &q).await,
+            (&Method::GET, ["deployments", id]) => records::deployments(&s, Some(id), &q).await,
+            (&Method::POST, ["deployments"]) => records::create_deployment(&s, &body(req).await?).await,
+            (&Method::GET, ["deployments", id, "statuses"]) => records::deployment_statuses(&s, id, None).await,
+            (&Method::POST, ["deployments", id, "statuses"]) => records::deployment_statuses(&s, id, Some(&body(req).await?)).await,
+            (&Method::GET, ["environments"]) => records::environments(&s, None).await,
+            (&Method::GET, ["environments", name]) => records::environments(&s, Some(name)).await,
             _ => not_implemented(hub, &claims, &method, &format!("/api/v3/{}", rest.join("/"))).await,
         };
     }
     match (&method, rest) {
+        // W10-R09: how the repository's ID tokens' subjects are built, GitHub's shape.
+        (&Method::GET, ["repos", owner, repo, "actions", "oidc", "customization", "sub"]) => {
+            let Some(_) = repo_of(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            let keys = super::oidc::subject_keys(hub, &format!("{owner}/{repo}")).await;
+            Ok(srv::json(StatusCode::OK, &json!({ "use_default": keys.is_none(), "include_claim_keys": keys.unwrap_or_default() })))
+        }
         (&Method::GET, ["user"]) => Ok(repos::user(&origin)),
         (&Method::GET, ["rate_limit"]) => Ok(repos::rate_limit()),
         (&Method::GET, ["repos", owner, repo, "actions", "runs", run, "artifacts"]) => {

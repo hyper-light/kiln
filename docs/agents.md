@@ -35,6 +35,8 @@ browsers watching it.
 | POST | `/api/ai-sessions/:machine/:pid/takeover` | take a found session over → `Info[]` (the new agent session); `{"stop": true}` for one running outside kiln; see below |
 | POST | `/api/ai-sessions/:machine/:pid/fork` | continue a copy of a found session, leaving it running → `Info[]`; see below |
 | GET | `/api/harness/history?target=&kind=&limit=` | a machine's past sessions to continue → `PastSession[]`, newest first; see below |
+| GET | `/api/harness/sessions/:id/events?before=&limit=` | the session's history from the conversation store, beyond what its timeline holds → `{events}`, oldest first ([conversations.md](conversations.md)) |
+| GET | `/api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=` | events across every agent's conversation, newest first → `{hits: [{agent, name, machine, event}]}` |
 
 Updates (`t`): `open {info}` (a snapshot follows), `state {state}`, `meta {meta}`,
 `events {events}` (upserts by id), `stream {id, text}` (text appended to a streaming event),
@@ -199,6 +201,10 @@ console picks) and are answered with a `reply` update to that client.
 | `skill_view` | `name, client` | `{content, path}`, `{content, builtin: true, source}` (no file), or `{error}` |
 | `skill_run` | `name, args?, id?, mode?` | delivered like `send` |
 | `skills_reload` | | `state.skills` |
+| `resume` | | ends a pause now (`state.pause`): the turn it cut off goes on, then the queue |
+| `auto_resume` | `on` | whether a pause ends by itself at its limit's reset (`state.pause.auto`, and `state.manual_resume` for later pauses) |
+| `pause_at` | `percent` (null: off) | stop between turns once a limit is this full (`state.pause_at`) |
+| `limit_hold` | `window?, label?, until?, said?` | the server's: another session on the account reached a usage limit, so this one pauses until it resets too |
 
 ### Questions
 
@@ -307,8 +313,53 @@ Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`,
   `plugins: Plugin[]` — read-only.
 - `inventory` — for `mcp`, `skills`, `plugins` and `limits`: `"loading"` (not reported yet),
   `"ready"` (an empty list means none) or `"unsupported"` (the harness cannot report it).
+- `pause?` — it waits for a usage limit to reset (below): `reason` ("limit", "threshold"),
+  `window?` and `label?` (the `Limit` reached), `said?` (the harness's words), `until?` (Unix ms
+  of the reset), `since`, `auto` (it goes on by itself at the reset), `by` ("harness": it reached
+  the limit; "account": another session on its account did; "threshold"), `cut?` (`{message?,
+  text, at}`: the turn the limit cut off), `checkpoint?` (`{git_ref, commit, at}`), `tries`,
+  `checking?`, `next_check?`. `pause_at?` — its stop point (percent). `manual_resume` — pauses end
+  only when a person resumes them.
 
-`Info` (the lists) carries `limits`, `account`, `plan` and `left_behind` too.
+`Info` (the lists) carries `limits`, `account`, `plan`, `left_behind` and `pause` too.
+
+## Usage limits: pause and resume
+
+When the account an agent runs on reaches a usage limit (Claude Code's 5-hour or weekly window,
+Codex's rate limits, an ACP agent's limit error), the agent **pauses** instead of failing turn after
+turn (`harness/pause.rs`):
+
+- **Once, in one place.** The harness's words go into one notice; the agent's state reads Paused,
+  in its head and on Mission control, with when it goes on. A turn still under way (a goal's Stop
+  hook asking again and again) is stopped.
+- **Nothing more is sent.** Its queue, goal stack and plan steps wait. A message sent meanwhile
+  (from the console, a broadcast, the API) joins the queue.
+- **Checkpoint.** Its folder, when it is a git repository, is kept as it was in a commit outside
+  every branch: `refs/kiln/checkpoints/<agent>/<unix ms>` (`state.pause.checkpoint`). A throwaway
+  index is used, so the folder, its index and its branches don't change. Untracked files are kept,
+  ignored ones aren't. `git diff <commit>` shows what changed since; `git restore --source <commit>
+  -- .` brings it back.
+- **The whole account.** The server pauses every other session on the same account, on every
+  machine (`limit_hold`), so they don't each find out by failing.
+- **Going on.** Once the window starts over (`until`, plus 30 s and a spread of up to 90 s across
+  the account's sessions), kiln asks the harness for its usage (Claude Code's `get_usage`, Codex's
+  `account/rateLimits/read`). A limit no longer reached ends the pause: the turn it cut off goes on
+  first, as kiln's own message ("Your previous turn was cut off by a usage limit, which has reset
+  now. Continue where you left off."), then the queue, then the goal stack. A limit still reached
+  waits for its next reset. With no reset time known (an ACP agent, Codex's "try again in …"
+  words aside), kiln checks after 10, 20, 40 and then every 60 minutes. A harness that can't
+  answer goes on and finds out.
+- **Your call.** `resume` ends it now (after a plan upgrade, say). Turn off "Resume by itself at the
+  reset" (`auto_resume`) to keep it paused until you do. Picking another harness's model
+  (`set_model` with `kind`) ends it too: the conversation goes on there, the cut-off turn first.
+- **Stop point.** `pause_at` (the head's usage badge → Stop between turns: 80, 90 or 95 %) pauses
+  the agent between turns once a limit is that full, before the limit cuts a turn off. Off by
+  default.
+- **Restarts.** A pause, its timer and its stop point are kept with the session on its machine
+  (the runner's `harness.json`, the server's `local.json`) and go on after a restart.
+
+Repeated identical notices in a turn (such as a limit said over and over by a build before this)
+show once in the timeline, with a count.
 
 ### Tasks: shells, monitors and other work an agent leaves running
 
@@ -422,3 +473,5 @@ shapes), not end to end · — the protocol has no way · ? not run against a re
 | catalog commands kiln runs, answered to the asking console | ✓ (/btw /cost /export /plan /permissions /memory /git-diff) | ✓ (/goal /export /rollout /pwd) | ✓ (/export) | — |
 | /branch, /fork, /undo from the catalog | ✓ (/branch) | ✓ (/fork, /undo) | — | — |
 | refuse one running outside kiln | ✓ | ✓ | — | — |
+| usage limit: pause once, queue and goals held, checkpoint | unit | unit | unit (limit words) | ? |
+| resume at the reset after a usage check | unit (`get_usage`) | unit (`account/rateLimits/read`) | — (retries on a schedule) | ? |

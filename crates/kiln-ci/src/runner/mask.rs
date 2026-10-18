@@ -12,6 +12,13 @@ use base64::Engine;
 
 /// The shortest value masked.
 pub const MIN_MASK: usize = 4;
+/// kiln's token prefixes (docs/ci.md W10-R03): a token is masked by its shape, even one no one
+/// added as a secret.
+pub const TOKEN_PREFIXES: &[&str] = &["kiln_pat_", "kiln_agt_", "kiln_job_"];
+/// What follows a prefix, at least, to be taken for a token (an id, `_`, a secret).
+const TOKEN_MIN: usize = 16;
+/// The longest token a stream holds back while it may still be arriving.
+const TOKEN_MAX: usize = 160;
 /// The shortest secret whose encoded forms are masked too.
 pub const MIN_ENCODED: usize = 8;
 
@@ -70,6 +77,53 @@ fn percent(s: &str) -> String {
     out
 }
 
+fn token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Where the token starting at `i` ends, if one does.
+fn token_at(s: &[u8], i: usize) -> Option<usize> {
+    let rest = s.get(i..)?;
+    let p = TOKEN_PREFIXES.iter().find(|p| rest.starts_with(p.as_bytes()))?;
+    let body = rest.get(p.len()..)?.iter().take_while(|b| token_char(**b)).count();
+    (body >= TOKEN_MIN).then_some(i + p.len() + body)
+}
+
+/// `s` with every kiln token in it masked.
+fn mask_tokens(s: Vec<u8>) -> Vec<u8> {
+    if !s.windows(5).any(|w| w == b"kiln_") {
+        return s;
+    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while let Some(b) = s.get(i).copied() {
+        match token_at(&s, i) {
+            Some(end) => {
+                out.extend_from_slice(b"***");
+                i = end;
+            }
+            None => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `safe`, moved back to the start of a token it would cut: a prefix (or, at the end of `held`,
+/// the start of one) whose token characters reach `safe`.
+fn token_safe(held: &[u8], safe: usize) -> usize {
+    let before = held.get(..safe).unwrap_or_default();
+    let start = safe - before.iter().rev().take(TOKEN_MAX + 9).take_while(|b| token_char(**b)).count();
+    (start..safe)
+        .find(|&p| {
+            let rest = held.get(p..).unwrap_or_default();
+            TOKEN_PREFIXES.iter().any(|t| rest.starts_with(t.as_bytes()) || t.as_bytes().starts_with(rest))
+        })
+        .unwrap_or(safe)
+}
+
 /// A masker over a stream.
 #[derive(Debug, Clone, Default)]
 pub struct Masker {
@@ -117,7 +171,8 @@ impl Masker {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.held.extend_from_slice(chunk);
         let keep = self.longest.saturating_sub(1);
-        let safe = self.held.len().saturating_sub(keep);
+        // A token is never cut: it is held back whole while it may still be arriving.
+        let safe = token_safe(&self.held, self.held.len().saturating_sub(keep));
         self.emit(safe)
     }
 
@@ -128,7 +183,10 @@ impl Masker {
     }
 
     fn emit(&mut self, safe: usize) -> Vec<u8> {
-        let Some(ac) = &self.ac else { return std::mem::take(&mut self.held) };
+        let Some(ac) = &self.ac else {
+            let cut = safe.min(self.held.len());
+            return mask_tokens(self.held.drain(..cut).collect());
+        };
         let mut out = Vec::with_capacity(safe);
         let mut last = 0usize;
         for m in ac.find_iter(&self.held) {
@@ -142,15 +200,17 @@ impl Masker {
         let cut = last.max(safe).min(self.held.len());
         out.extend_from_slice(self.held.get(last..cut).unwrap_or_default());
         self.held.drain(..cut);
-        out
+        mask_tokens(out)
     }
 
     /// A whole string, masked (annotations, outputs, step names).
     pub fn mask(&self, s: &str) -> String {
-        match &self.ac {
+        let masked = match &self.ac {
             Some(ac) => ac.replace_all(s, &vec!["***"; self.masks.len()]),
             None => s.to_owned(),
-        }
+        };
+        // Tokens are ASCII: replacing them keeps the text UTF-8.
+        String::from_utf8(mask_tokens(masked.into_bytes())).unwrap_or_default()
     }
 }
 
@@ -168,6 +228,28 @@ mod tests {
         assert_eq!(forms("abcd"), vec!["abcd"]);
         assert!(forms("line one\nline two").contains(&"line two".to_owned()));
         assert!(forms("quo\"te-secret").contains(&"quo\\\"te-secret".to_owned()));
+    }
+
+    /// W10-R03: kiln's tokens are masked by their prefix, whole, across any split of the stream.
+    #[test]
+    fn w10_r03_tokens_are_masked_by_their_prefix() {
+        let pat = "kiln_pat_0192f0c1d2e3f4a5b6c7d8e9f0a1b2c3_AbC-dEf_ghIJKLmnopQRSTuvwxyz0123456789abcd";
+        let text = format!("curl -H 'Authorization: Bearer {pat}' and kiln_job_short end é");
+        let m = Masker::new::<&str>(&[]);
+        assert_eq!(m.mask(&text), "curl -H 'Authorization: Bearer ***' and kiln_job_short end é", "a short look-alike stays");
+        for split in 0..=text.len() {
+            let mut m = Masker::new(&["unrelated-secret"]);
+            let mut out = m.push(text.as_bytes().get(..split).unwrap_or_default());
+            out.extend(m.push(text.as_bytes().get(split..).unwrap_or_default()));
+            out.extend(m.finish());
+            let out = String::from_utf8_lossy(&out);
+            assert!(!out.contains("0192f0c1") && !out.contains("abcd'") && out.contains("Bearer ***'"), "split at {split}: {out}");
+        }
+        // Nothing waits that can't be a token.
+        let mut m = Masker::new::<&str>(&[]);
+        assert_eq!(m.push(b"plain line\n"), b"plain line\n");
+        assert_eq!(m.push(b"held kil"), b"held ");
+        assert_eq!(m.push(b"ns are fine"), b"kilns are fine");
     }
 
     /// W06-S03: a secret printed in base64 is masked.

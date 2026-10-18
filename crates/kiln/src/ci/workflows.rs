@@ -44,7 +44,12 @@ struct Check {
 
 /// `POST /api/ci/validate { path, content, dialect? }` → `{ kind, dialect, diagnostics, outline? }`.
 pub async fn validate(body: Incoming) -> Result<Response, Fail> {
-    let c: Check = srv::body_json(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
+    validate_value(srv::body_json(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?).await
+}
+
+/// [`validate`], its body read (`ci.workflows.validate`, W20).
+pub async fn validate_value(body: serde_json::Value) -> Result<Response, Fail> {
+    let c: Check = serde_json::from_value(body).map_err(|e| bad(format!("{e}")))?;
     let path = if c.path.is_empty() { ".kiln/workflow.yaml".to_owned() } else { c.path };
     let checked = crate::rt::blocking(move || wf::check(&path, &c.content, c.dialect)).await.map_err(|e| internal(&e))?;
     Ok(srv::json(StatusCode::OK, &checked))

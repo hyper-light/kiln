@@ -104,8 +104,12 @@ impl CounterVec {
     }
 
     pub fn inc(&self, values: &[&str]) {
+        self.add(values, 1);
+    }
+
+    pub fn add(&self, values: &[&str], n: u64) {
         let key: Vec<String> = values.iter().map(|s| (*s).to_owned()).collect();
-        *self.series.write().entry(key).or_insert(0) += 1;
+        *self.series.write().entry(key).or_insert(0) += n;
     }
 
     fn render(&self, out: &mut String, name: &str) {
@@ -148,6 +152,13 @@ pub struct Metrics {
     pub panics_caught: Counter,
     pub quic_streams: Counter,
     pub k8s_pods_launched: CounterVec,
+    /// The CI engine's (docs/ci.md W19-R02): cache lookups by result and saves (W08-R13),
+    /// attempts by conclusion and failure class, queue seconds by wait reason, and how far
+    /// behind the rollups are.
+    pub ci_cache: CounterVec,
+    pub ci_attempts: CounterVec,
+    pub ci_wait_seconds: CounterVec,
+    pub ci_rollup_lag: Gauge,
 }
 
 pub fn global() -> &'static Metrics {
@@ -173,6 +184,10 @@ pub fn global() -> &'static Metrics {
         panics_caught: Counter::default(),
         quic_streams: Counter::default(),
         k8s_pods_launched: CounterVec::new(&["result"]),
+        ci_cache: CounterVec::new(&["result"]),
+        ci_attempts: CounterVec::new(&["conclusion", "class"]),
+        ci_wait_seconds: CounterVec::new(&["reason"]),
+        ci_rollup_lag: Gauge::default(),
     })
 }
 
@@ -233,6 +248,13 @@ pub fn render() -> String {
     m.gitops_polls.render(&mut o, "kiln_gitops_polls_total");
     help(&mut o, "kiln_k8s_pods_total", "counter", "Agent pods launched.");
     m.k8s_pods_launched.render(&mut o, "kiln_k8s_pods_total");
+    help(&mut o, "kiln_ci_cache_total", "counter", "CI cache lookups (hit, miss) and saves.");
+    m.ci_cache.render(&mut o, "kiln_ci_cache_total");
+    help(&mut o, "kiln_ci_attempts_total", "counter", "CI leg attempts by conclusion and failure class.");
+    m.ci_attempts.render(&mut o, "kiln_ci_attempts_total");
+    help(&mut o, "kiln_ci_wait_seconds_total", "counter", "Seconds CI legs waited, by wait reason.");
+    m.ci_wait_seconds.render(&mut o, "kiln_ci_wait_seconds_total");
+    scalar!("kiln_ci_rollup_lag_seconds", "gauge", "How far behind the CI insights rollups are.", m.ci_rollup_lag.get());
     help(&mut o, "kiln_job_duration_seconds", "histogram", "Job wall time.");
     m.job_duration.render(&mut o, "kiln_job_duration_seconds", "");
     help(&mut o, "kiln_queue_wait_seconds", "histogram", "Time from queued to started.");

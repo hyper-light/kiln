@@ -104,11 +104,23 @@ fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
 
 /// The cookie a sign-in sets; `Secure` when the browser reached kiln over HTTPS.
 fn session_cookie(hub: &Hub, secure: bool) -> String {
+    cookie_for(&signed_expiring(hub, "session", SESSION_TTL), secure)
+}
+
+/// The session cookie carrying `value` (the owner's, or a user's: `crate::authz::gate`).
+fn cookie_for(value: &str, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!(
-        "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}",
-        signed_expiring(hub, "session", SESSION_TTL)
-    )
+    format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}")
+}
+
+/// Who a request is: the owner (the admin token, the owner's session), else a token or a user's
+/// session (docs/ci.md W10-R01).
+async fn caller_of(hub: &Hub, headers: &HeaderMap) -> Option<crate::authz::Caller> {
+    if authed(hub, headers) {
+        return Some(crate::authz::Caller::owner());
+    }
+    let session = cookie(headers, SESSION_COOKIE);
+    crate::authz::gate::caller(hub, bearer(headers), session.as_deref()).await
 }
 
 /// A `Host` header without its port (IPv6 literals keep their brackets).
@@ -159,18 +171,27 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     // Open routes (their own auth, if any).
     match (&method, s.as_slice()) {
         (&Method::POST, ["api", "mcp"]) => {
-            let actor = crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers()));
-            return match actor {
-                Some(actor) => crate::mcp::http(&hub, actor, req.into_body()).await.map_err(|(c, m)| err(c, m)),
+            // The owner, by the admin token, its session or an MCP token kiln minted; else a
+            // user's session or token, whose operations the route table judges one by one.
+            let caller = match crate::mcp::caller(&hub, req.headers(), authed(&hub, req.headers())) {
+                Some(actor) => {
+                    let mut c = crate::authz::Caller::owner();
+                    c.name = actor;
+                    Some(c)
+                }
+                None => caller_of(&hub, req.headers()).await,
+            };
+            return match caller {
+                Some(caller) => crate::mcp::http(&hub, caller, req.into_body()).await.map_err(|(c, m)| err(c, m)),
                 None => Err(err(StatusCode::UNAUTHORIZED, "authentication required")),
             };
         }
         (&Method::POST, ["api", "auth", "login"]) => return login(&hub, req).await,
-        (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req)),
+        (&Method::GET, ["api", "auth", "otp"]) => return Ok(otp(&hub, &req).await),
         (&Method::GET, ["api", "auth", "methods"]) => return Ok(auth_methods(&hub).await),
         (&Method::POST, ["api", "auth", "password"]) => return login_password(&hub, req).await,
         (&Method::POST, ["api", "auth", "logout"]) => return Ok(logout()),
-        (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers())),
+        (&Method::GET, ["api", "me"]) => return Ok(me(&hub, req.headers()).await),
         (&Method::POST, ["api", "agents", "enroll"]) => return enroll(&hub, req).await,
         (&Method::POST, ["api", "agents", "instance"]) => return enroll_instance(&hub, req).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
@@ -236,12 +257,33 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     if !is_api {
         return Ok(crate::uiserver::serve(req).await);
     }
-    if !authed(&hub, req.headers()) {
+    let Some(caller) = caller_of(&hub, req.headers()).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
-    }
+    };
     let q = srv::query(&req);
+    // Everyone but the owner is held to the route table (W10-R05), and what they change is
+    // audited under their own name.
+    if !caller.is_owner() {
+        crate::authz::gate::check(&hub, &caller, &method, &s, &q).await.map_err(|(c, m)| err(c, m))?;
+        if method != Method::GET && method != Method::HEAD {
+            hub.store.audit(caller.name.clone(), format!("api.{}", method.as_str().to_ascii_lowercase()), path.clone()).await;
+        }
+    }
+    let mut req = req;
+    req.extensions_mut().insert(caller.clone());
+    if matches!(s.get(1), Some(&("users" | "grants" | "roles" | "tokens"))) {
+        return match crate::authz::api::route(&hub, &caller, &method, &s, &q, req).await {
+            Some(r) => r.map_err(|(c, m)| err(c, m)),
+            None => Err(err(StatusCode::NOT_FOUND, "not found")),
+        };
+    }
     match (&method, s.as_slice()) {
+        (&Method::GET, ["api", "openapi.json"]) => Ok(srv::json(StatusCode::OK, &crate::authz::openapi(env!("CARGO_PKG_VERSION")))),
         (_, ["api", "cd", rest @ ..]) => crate::cd::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
+        (&Method::GET, ["api", "ci", "legs", id, "terminal"]) => {
+            let id = (*id).to_owned();
+            leg_terminal_ws(hub.clone(), &id, q, &caller, req).await
+        }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "overview"]) => overview(&hub).await,
         (&Method::GET, ["api", "system"]) => Ok(system(&hub).await),
@@ -259,7 +301,11 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             None => Err(err(StatusCode::NOT_FOUND, "no such upgrade")),
         },
         (&Method::GET, ["api", "metrics", "history"]) => Ok(history(&hub, &q)),
-        (&Method::GET, ["api", "repos"]) => Ok(srv::json(StatusCode::OK, &hub.store.repos().await?)),
+        (&Method::GET, ["api", "repos"]) => {
+            let mut repos = hub.store.repos().await?;
+            repos.retain(|r| caller.can("runs.read", &crate::authz::Scope::Repo { repo: r.name.clone() }));
+            Ok(srv::json(StatusCode::OK, &repos))
+        }
         (&Method::POST, ["api", "repos"]) => add_repo(&hub, req).await,
         (&Method::DELETE, ["api", "repos", id]) => delete_repo(&hub, id).await,
         (&Method::POST, ["api", "repos", id, "poll"]) => poll_repo(&hub, id).await,
@@ -287,6 +333,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             reach_runners(&hub, want.as_deref())
         }
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
+        (&Method::POST, ["api", "outposts", "invite"]) => Ok(outpost_invite(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
         (&Method::POST, ["api", "discovery", "scan"]) => discovery_scan(&hub, req).await,
         (&Method::POST, ["api", "discovery", "probe"]) => discovery_probe(&hub, req).await,
@@ -436,6 +483,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             harness_terminal(&hub, &id, req).await
         }
         (&Method::GET, ["api", "harness", "history"]) => harness_history(&hub, &q).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => conversation_events(&hub, id, &q).await,
+        (&Method::GET, ["api", "conversations", "search"]) => conversation_search(&hub, &q).await,
         (&Method::GET, ["api", "harness", "sessions", id, "tasks", task, "output"]) => {
             let since = q.get("since").and_then(|s| s.parse::<u64>().ok());
             match hub.harness.task_output(&hub, id, task, since).await {
@@ -1024,9 +1073,20 @@ async fn login(hub: &Hub, req: Request) -> R {
     }
 }
 
-fn otp(hub: &Hub, req: &Request) -> Response {
+async fn otp(hub: &Hub, req: &Request) -> Response {
     let q = srv::query(req);
     let code = q.get("code").map(String::as_str).unwrap_or("");
+    // A user's link (`u.<id>.<secret>`): theirs, once.
+    if code.starts_with("u.") {
+        return match crate::authz::gate::redeem_link(hub, code).await {
+            Some((session, name)) => {
+                hub.store.audit(format!("user:{name}"), "login".into(), "sign-in link".into()).await;
+                let r = srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/");
+                srv::with_header(r, header::SET_COOKIE, &cookie_for(&session, is_secure(hub, req)))
+            }
+            None => srv::with_header(srv::status(StatusCode::SEE_OTHER), header::LOCATION, "/?signin=expired"),
+        };
+    }
     if verify_expiring(hub, "otp", code) {
         let hub_store = hub.store.clone();
         crate::rt::spawn(async move {
@@ -1129,7 +1189,8 @@ fn logout() -> Response {
     srv::with_header(srv::status(StatusCode::NO_CONTENT), header::SET_COOKIE, &format!("{SESSION_COOKIE}=; Path=/; Max-Age=0"))
 }
 
-fn me(hub: &Hub, headers: &HeaderMap) -> Response {
+async fn me(hub: &Hub, headers: &HeaderMap) -> Response {
+    let caller = caller_of(hub, headers).await;
     // What discovery announces anyway (when it does), so a probe can tell which instance answers.
     let d = &hub.discovery;
     let announced = d.announcing().then(|| {
@@ -1142,7 +1203,12 @@ fn me(hub: &Hub, headers: &HeaderMap) -> Response {
     srv::json(
         StatusCode::OK,
         &json!({
-            "authenticated": authed(hub, headers),
+            "authenticated": caller.is_some(),
+            // Who (W10-R01): `admin` for the owner, `user:<name>`, a token, a job; and what they
+            // hold, when that isn't everything.
+            "principal": caller.as_ref().map(|c| c.name.clone()),
+            "kind": caller.as_ref().map(|c| c.kind),
+            "grants": caller.as_ref().and_then(crate::authz::Caller::grants),
             "public_url": hub.cfg.server.public_url,
             // Where else browsers find this server: its runners' front doors (HTTPS).
             "origins": hub.front_doors.origins(),
@@ -1512,25 +1578,56 @@ fn join_info(hub: &Hub) -> Response {
     )
 }
 
+/// `POST /api/outposts/invite`: a one-time invite for an outpost (`kiln outpost`), and a line per
+/// OS that downloads kiln from this server into a folder of its own and runs it from there,
+/// installing nothing. The invite works once, within [`crate::hub::OUTPOST_INVITE_TTL`].
+fn outpost_invite(hub: &Hub) -> Response {
+    let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let (token, expires_at) = hub.outpost_invites.mint();
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "token": token,
+            "expires_at": expires_at,
+            "commands": {
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
+                "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost -Token '{token}'"),
+            },
+        }),
+    )
+}
+
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     let ephemeral = !persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some();
-    if !persistent && !ephemeral {
+    let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
+    if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
         return Err(err(StatusCode::UNAUTHORIZED, "invalid join token"));
     }
     let name = crate::pki::sanitize_name(&r.name);
-    let days = if ephemeral { crate::pki::EPHEMERAL_DAYS } else { 365 };
+    // An outpost never takes another machine's name: the same machine enrolling again keeps its
+    // own, another one gets `<name>-2`.
+    let name = if outpost { free_agent_name(hub, &name, &r.hostname).await } else { name };
+    let days = if ephemeral {
+        crate::pki::EPHEMERAL_DAYS
+    } else if outpost {
+        crate::pki::OUTPOST_DAYS
+    } else {
+        365
+    };
     let cert = hub.pki.sign_csr(&r.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let quic = if ephemeral {
         hub.cfg.kubernetes.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone())
     } else {
         hub.cfg.server.quic_advertise.clone()
     };
-    if persistent {
-        hub.store.audit(name.clone(), "agent.enroll".into(), String::new()).await;
-        tracing::info!(agent = %name, "agent enrolled");
+    if persistent || outpost {
+        let what = if outpost { "outpost.enroll" } else { "agent.enroll" };
+        hub.store.audit(name.clone(), what.into(), String::new()).await;
+        tracing::info!(agent = %name, outpost, "agent enrolled");
     }
     Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
 }
@@ -2339,8 +2436,51 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
     let cmd = q.get("cmd").cloned();
     crate::rt::spawn(async move {
         let Ok(socket) = upgrade.await else { return };
-        if let Err(e) = terminal_attach(hub, existing, target, cols, rows, cmd, socket).await {
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), cmd, "admin".into(), socket).await {
             tracing::debug!(error = %format!("{e:#}"), "terminal websocket ended");
+        }
+    });
+    Ok(resp)
+}
+
+/// `GET /api/ci/legs/:id/terminal` (WebSocket): a terminal inside a running or kept CI leg
+/// (docs/ci.md W17-R01), on the terminal protocol of `/api/terminal/ws`; `?session=` attaches
+/// again to one of that leg's.
+async fn leg_terminal_ws(hub: Arc<Hub>, id: &str, q: HashMap<String, String>, caller: &crate::authz::Caller, req: Request) -> R {
+    let leg = id.to_owned();
+    let row: Option<(Option<String>, Option<String>, String, Option<i64>)> = hub
+        .store
+        .call(move |c| {
+            use rusqlite::OptionalExtension as _;
+            Ok(c.query_row("SELECT agent, executor, status, kept_until FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?)
+        })
+        .await?;
+    let Some((agent, executor, status, kept_until)) = row else { return Err(err(StatusCode::NOT_FOUND, "no such leg of the CI engine")) };
+    let kept = kept_until.is_some_and(|t| t > crate::util::now_unix());
+    let Some(agent) = agent.filter(|_| status == "running" || kept) else {
+        return Err(err(StatusCode::CONFLICT, "the leg isn't running or kept: a terminal opens into a running leg, or a failed one kept with keep-on-failure"));
+    };
+    // On the host executor a terminal is a shell on the runner itself.
+    if executor.as_deref() == Some("host") && !caller.can("runners.terminal", &crate::authz::Scope::Runner { runner: agent.clone() }) {
+        return Err(err(StatusCode::FORBIDDEN, format!("{} may not open a shell on runner {agent}: a host leg's terminal needs runners.terminal there", caller.name)));
+    }
+    let existing = q.get("session").cloned();
+    if let Some(s) = &existing
+        && hub.terminals.get(s).is_some_and(|t| t.target != format!("leg:{id}"))
+    {
+        return Err(err(StatusCode::FORBIDDEN, "that terminal isn't this leg's"));
+    }
+    if existing.is_none() && hub.terminals.live() >= hub.cfg.terminal.max_sessions {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many terminal sessions"));
+    }
+    let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
+    let cols = q.get("cols").and_then(|v| v.parse().ok()).unwrap_or(120);
+    let rows = q.get("rows").and_then(|v| v.parse().ok()).unwrap_or(40);
+    let (target, actor) = (format!("leg:{id}@{agent}"), caller.name.clone());
+    crate::rt::spawn(async move {
+        let Ok(socket) = upgrade.await else { return };
+        if let Err(e) = terminal_attach(hub, existing, target, (cols, rows), None, actor, socket).await {
+            tracing::debug!(error = %format!("{e:#}"), "leg terminal websocket ended");
         }
     });
     Ok(resp)
@@ -2348,15 +2488,7 @@ async fn terminal_ws(hub: Arc<Hub>, q: HashMap<String, String>, req: Request) ->
 
 /// One browser on one session: identity, replay, then live output; input both ways. Closing the
 /// socket only detaches — the shell keeps running for the next attach.
-async fn terminal_attach(
-    hub: Arc<Hub>,
-    existing: Option<String>,
-    target: String,
-    cols: u16,
-    rows: u16,
-    cmd: Option<String>,
-    socket: ws::WebSocket,
-) -> anyhow::Result<()> {
+async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String, (cols, rows): (u16, u16), cmd: Option<String>, actor: String, socket: ws::WebSocket) -> anyhow::Result<()> {
     use crate::termsess::{Frame, Input};
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
@@ -2370,16 +2502,19 @@ async fn terminal_attach(
             }
         },
         None => {
-            hub.store.audit("admin".into(), "terminal.open".into(), target.clone()).await;
-            match target.strip_prefix("agent:") {
-                Some(machine) => crate::termsess::open_agent(&hub, machine.to_owned(), cmd, cols, rows),
-                None => match crate::termsess::open_local(&hub, cmd, cols, rows) {
+            hub.store.audit(actor, "terminal.open".into(), target.clone()).await;
+            if let Some((job, machine)) = target.strip_prefix("leg:").and_then(|t| t.split_once('@')) {
+                crate::termsess::open_leg(&hub, machine.to_owned(), job, cols, rows)
+            } else if let Some(machine) = target.strip_prefix("agent:") {
+                crate::termsess::open_agent(&hub, machine.to_owned(), cmd, cols, rows)
+            } else {
+                match crate::termsess::open_local(&hub, cmd, cols, rows) {
                     Ok(s) => s,
                     Err(e) => {
                         tx.send(ws::text(json!({"type": "error", "message": format!("{e:#}")}).to_string())).await?;
                         return Ok(());
                     }
-                },
+                }
             }
         }
     };
@@ -2471,6 +2606,51 @@ async fn harness_history(hub: &Hub, q: &HashMap<String, String>) -> R {
         Ok(None) => Err(err(StatusCode::NOT_FOUND, "that machine keeps no sessions (an ephemeral runner)")),
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("{e:#}"))),
     }
+}
+
+/// `GET /api/harness/sessions/:id/events?before=&limit=`: a session's history beyond what its
+/// timeline holds, from the server's conversation store (docs/conversations.md): `{events}`, oldest
+/// first, the newest `limit` (100, at most 1000) before event number `before`.
+async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+    let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
+    let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
+    let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
+    let id = id.to_owned();
+    let rows = crate::rt::blocking(move || store.events(&id, before, limit)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "events": events })))
+}
+
+/// `GET /api/conversations/search?q=&agent=&kind=&tool=&status=&since=&until=&limit=`: events across
+/// every agent's conversation, newest first, from the server's store: `{hits: [{agent, name, machine,
+/// event}]}`.
+async fn conversation_search(hub: &Hub, q: &HashMap<String, String>) -> R {
+    let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
+    let text = |k: &str| q.get(k).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<i64>().ok());
+    let query = crate::convo::store::Query {
+        q: text("q").unwrap_or_default(),
+        session: text("agent"),
+        kind: text("kind"),
+        tool: text("tool"),
+        status: text("status"),
+        since: num("since"),
+        until: num("until"),
+        limit: q.get("limit").and_then(|v| v.parse::<usize>().ok()),
+    };
+    let rows = crate::rt::blocking(move || store.search(query)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
+    let infos: HashMap<String, crate::harness::session::Info> = hub.harness.list().into_iter().map(|i| (i.id.clone(), i)).collect();
+    let hits: Vec<serde_json::Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let event: serde_json::Value = serde_json::from_str(&r.body).ok()?;
+            let info = infos.get(&r.session);
+            Some(json!({ "agent": r.session, "name": info.map(|i| i.name.clone()), "machine": info.map(|i| i.target.clone()), "event": event }))
+        })
+        .collect();
+    Ok(srv::json(StatusCode::OK, &json!({ "hits": hits })))
 }
 
 fn goals_err(e: crate::goals::Error) -> ApiError {
@@ -2791,5 +2971,15 @@ mod tests {
             assert!(script.contains("@@KILN_SERVER@@"));
             assert!(script.contains("/dl/kiln/"));
         }
+    }
+
+    #[test]
+    fn install_scripts_run_an_outpost_without_installing_it() {
+        let sh = include_str!("../assets/install-agent.sh");
+        assert!(sh.contains("--outpost) OUTPOST=1"));
+        assert!(sh.contains(r#"exec "$BIN_DIR/kiln" outpost --server "$SERVER" --state-dir "$BIN_DIR""#));
+        let ps1 = include_str!("../assets/install-agent.ps1");
+        assert!(ps1.contains("[switch]$Outpost"));
+        assert!(ps1.contains("@('outpost', '--server', $Server, '--state-dir', $dir)"));
     }
 }

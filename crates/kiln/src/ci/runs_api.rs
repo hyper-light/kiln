@@ -83,7 +83,8 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
     hub.store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from
+                "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from,
+                        CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END, waits
                  FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
@@ -94,6 +95,10 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
                     "executor": r.get::<_, Option<String>>(8)?, "attempt": r.get::<_, i64>(9)?, "wait_reason": json_col(10)?, "queued_at": r.get::<_, Option<i64>>(11)?,
                     "started_at": r.get::<_, Option<i64>>(12)?, "finished_at": r.get::<_, Option<i64>>(13)?, "error": r.get::<_, Option<String>>(14)?, "needs": json_col(15)?,
                     "exit_code": r.get::<_, Option<i64>>(16)?, "reused_from": r.get::<_, Option<String>>(17)?,
+                    // A failed leg kept to look into, until when (W17-R02).
+                    "kept_until": r.get::<_, Option<i64>>(18)?,
+                    // Seconds queued, by wait reason (W19-R01).
+                    "waits": json_col(19)?,
                 }))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -121,7 +126,13 @@ pub async fn get(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Res
 /// critical path, the chain of jobs that took longest end to end.
 pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     run_json(hub, id).await?;
-    let legs = legs(hub, id, attempt_of(q)).await?;
+    Ok(srv::json(StatusCode::OK, &graph_json(hub, id, attempt_of(q)).await?))
+}
+
+/// A run's graph: its jobs with their legs and spans, the edges between them, and the critical
+/// path.
+pub async fn graph_json(hub: &Hub, id: &str, attempt: Option<i64>) -> Result<Value, Fail> {
+    let legs = legs(hub, id, attempt).await?;
     let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
     // Jobs by id, in the order their first leg appeared.
     let mut order: Vec<String> = Vec::new();
@@ -153,15 +164,16 @@ pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<R
         let end = ls.iter().filter_map(|l| l.get("finished_at").and_then(Value::as_i64)).max().unwrap_or(start);
         (start, end)
     };
-    // The critical path: walk back from the job that finished last through the need that
-    // finished last.
-    let mut path: Vec<String> = Vec::new();
-    let mut cur = order.iter().max_by_key(|j| span(j).1).cloned();
-    while let Some(j) = cur {
-        path.push(j.clone());
-        cur = edges.iter().filter(|(_, to)| to == &j).map(|(from, _)| from.clone()).filter(|f| !path.contains(f)).max_by_key(|f| span(f).1);
-    }
-    path.reverse();
+    // The critical path (W19-R01): the longest path through `needs` by the jobs' spans.
+    let jobs: Vec<kiln_ci::insights::Node> = order
+        .iter()
+        .map(|j| {
+            let (start, end) = span(j);
+            let needs = edges.iter().filter(|(_, to)| to == j).map(|(from, _)| from.clone()).collect();
+            kiln_ci::insights::Node { id: j.clone(), needs, duration: if start > 0 { (end - start).max(0) as f64 } else { 0.0 } }
+        })
+        .collect();
+    let path = kiln_ci::insights::critical_path(&jobs);
     let nodes: Vec<Value> = order
         .iter()
         .map(|j| {
@@ -172,7 +184,7 @@ pub async fn graph(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<R
         })
         .collect();
     let edges: Vec<Value> = edges.iter().map(|(a, b)| json!({ "from": a, "to": b })).collect();
-    Ok(srv::json(StatusCode::OK, &json!({ "nodes": nodes, "edges": edges, "critical_path": path })))
+    Ok(json!({ "nodes": nodes, "edges": edges, "critical_path": path }))
 }
 
 /// `GET /api/ci/runs/:id/annotations`, `/summary`, `/artifacts`.
@@ -241,6 +253,12 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
         other => return Err((StatusCode::BAD_REQUEST, format!("rerun mode `{other}`: `all`, `failed` or `job`"))),
     };
     let debug = body.get("debug").and_then(Value::as_bool).unwrap_or(false);
+    // "Re-run and keep if it fails" (W17-R02): `keep_failed: true` (30 minutes) or minutes.
+    let keep_failed = match body.get("keep_failed") {
+        Some(Value::Bool(true)) => Some(30),
+        Some(Value::Number(n)) => n.as_u64().filter(|m| *m > 0).map(|m| u32::try_from(m.min(u64::from(crate::runner::kept::MAX_KEEP_MINUTES))).unwrap_or(30)),
+        _ => None,
+    };
     // "Rerun with fresh actions" (W07-R02): pinned again now, instead of the run's pins.
     let actions = if body.get("fresh_actions").and_then(Value::as_bool).unwrap_or(false) {
         let run = id.to_owned();
@@ -253,7 +271,7 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
         None
     };
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, actions, reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),
@@ -268,13 +286,13 @@ pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
         .store
         .call(move |c| {
             let Some(run) = c.query_row("SELECT run_id FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg_id], |r| r.get::<_, String>(0)).optional()? else { return Ok(None) };
-            let mut st = c.prepare("SELECT idx, name, status, kind, step_id, action, outcome, conclusion, outputs, started_at, finished_at FROM steps WHERE job_id = ?1 ORDER BY idx")?;
+            let mut st = c.prepare("SELECT idx, name, status, kind, step_id, action, outcome, conclusion, outputs, started_at, finished_at, started_seq FROM steps WHERE job_id = ?1 ORDER BY idx")?;
             let steps = st
                 .query_map([&leg_id], |r| {
                     Ok(json!({ "idx": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?, "status": r.get::<_, String>(2)?, "kind": r.get::<_, String>(3)?,
                                "id": r.get::<_, Option<String>>(4)?, "action": r.get::<_, Option<String>>(5)?, "outcome": r.get::<_, Option<String>>(6)?,
                                "conclusion": r.get::<_, Option<String>>(7)?, "outputs": r.get::<_, Option<String>>(8)?.and_then(|s| serde_json::from_str::<Value>(&s).ok()),
-                               "started_at": r.get::<_, Option<i64>>(9)?, "finished_at": r.get::<_, Option<i64>>(10)? }))
+                               "started_at": r.get::<_, Option<i64>>(9)?, "finished_at": r.get::<_, Option<i64>>(10)?, "seq": r.get::<_, Option<i64>>(11)? }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             let mut st = c.prepare("SELECT step_idx, level, title, message, file, line FROM ci_annotations WHERE leg_id = ?1 ORDER BY id")?;
@@ -293,18 +311,153 @@ pub async fn leg(hub: &Hub, id: &str) -> Result<Response, Fail> {
     Ok(srv::json(StatusCode::OK, &json!({ "run": run, "leg": me, "steps": steps, "annotations": annotations })))
 }
 
-/// `GET /api/ci/legs/:id/logs?step=`.
+/// A leg's runner, if it is kept there now.
+async fn kept_on(hub: &Hub, id: &str) -> Result<String, Fail> {
+    let leg = id.to_owned();
+    let row: Option<(Option<String>, Option<i64>)> = hub.store.call(move |c| Ok(c.query_row("SELECT agent, kept_until FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)).await.map_err(internal)?;
+    match row {
+        None => Err(missing("no such leg of the CI engine")),
+        Some((Some(agent), Some(until))) if until > crate::util::now_unix() => Ok(agent),
+        Some(_) => Err((StatusCode::CONFLICT, "the leg isn't kept (only a failed leg with keep-on-failure is)".into())),
+    }
+}
+
+/// `POST /api/ci/legs/:id/release`: a kept leg let go now (W17-R02).
+pub async fn release(hub: &Hub, id: &str, by: &str) -> Result<Response, Fail> {
+    let agent = kept_on(hub, id).await?;
+    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepRelease { job: id.to_owned() }).await;
+    super::runs::kept(hub, id, None).await.map_err(internal)?;
+    hub.ci.keep(id, None);
+    hub.store.audit(by.to_owned(), "ci.legs.release".into(), id.to_owned()).await;
+    hub.emit_job(id).await;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+/// `POST /api/ci/legs/:id/keep` with `{ minutes }` (default 30): a kept leg kept that much longer
+/// from now ("Extend", W17-R02).
+pub async fn extend(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
+    let agent = kept_on(hub, id).await?;
+    let minutes = body.get("minutes").and_then(Value::as_u64).unwrap_or(30).clamp(1, u64::from(crate::runner::kept::MAX_KEEP_MINUTES));
+    let minutes = u32::try_from(minutes).unwrap_or(30);
+    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::KeepExtend { job: id.to_owned(), minutes }).await;
+    let until = crate::util::now_unix() + i64::from(minutes) * 60;
+    super::runs::kept(hub, id, Some(until)).await.map_err(internal)?;
+    hub.ci.keep(id, Some((agent.clone(), until)));
+    hub.store.audit(by.to_owned(), "ci.legs.keep".into(), format!("{id} {minutes}m")).await;
+    hub.emit_job(id).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "leg": id, "kept_until": until })))
+}
+
+/// `POST /api/ci/legs/:id/rerun-step` with `{ step }` (from 1, or `idx` from 0): a kept leg runs
+/// that step again in place, as a new section of its log (W17-R04). Answers the section's index.
+pub async fn rerun_step(hub: &Hub, id: &str, body: &Value, by: &str) -> Result<Response, Fail> {
+    let agent = kept_on(hub, id).await?;
+    let step = match (body.get("idx").and_then(Value::as_u64), body.get("step").and_then(Value::as_u64)) {
+        (Some(i), _) => i,
+        (None, Some(n)) if n > 0 => n - 1,
+        _ => return Err((StatusCode::BAD_REQUEST, "say which step: `step` (from 1) or `idx` (from 0)".into())),
+    };
+    let step = u32::try_from(step).map_err(|_| (StatusCode::BAD_REQUEST, "no such step".to_owned()))?;
+    let leg = id.to_owned();
+    let (known, busy, next): (bool, bool, u32) = hub
+        .store
+        .call(move |c| {
+            let known: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM steps WHERE job_id = ?1 AND idx = ?2)", params![leg, step], |r| r.get(0))?;
+            let busy: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM steps WHERE job_id = ?1 AND status = 'running')", [&leg], |r| r.get(0))?;
+            let next: i64 = c.query_row("SELECT COALESCE(MAX(idx), -1) + 1 FROM steps WHERE job_id = ?1", [&leg], |r| r.get(0))?;
+            Ok((known, busy, u32::try_from(next).unwrap_or(u32::MAX)))
+        })
+        .await
+        .map_err(internal)?;
+    if !known {
+        return Err(missing("the leg has no such step"));
+    }
+    if busy {
+        return Err((StatusCode::CONFLICT, "a step of this leg is running again already; rerun once it ends".into()));
+    }
+    hub.send_to_agent(&agent, crate::proto::LANE_CONTROL, &crate::proto::ServerMsg::JobRerunStep { job: id.to_owned(), step, idx: next }).await;
+    hub.store.audit(by.to_owned(), "ci.legs.rerun_step".into(), format!("{id} step {}", step + 1)).await;
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "leg": id, "step": step, "idx": next })))
+}
+
+/// The most of a command's output `exec` answers with.
+const MAX_EXEC_OUTPUT: usize = 1 << 20;
+
+/// `POST /api/ci/legs/:id/exec` with `{ command, timeout }`: runs the command in a running or kept
+/// leg's shell, as its terminal would (W17-R05, for agents). Answers `{ output, exit_code,
+/// timed_out, truncated }`, the output masked as the leg's is. `timeout` is in seconds: 60 unless
+/// said, at most 600; past it the command is stopped.
+pub async fn exec(hub: &std::sync::Arc<Hub>, id: &str, body: &Value, caller: Option<&crate::authz::Caller>) -> Result<Response, Fail> {
+    use crate::termsess::Frame;
+    let command = body.get("command").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).ok_or_else(|| (StatusCode::BAD_REQUEST, "`command` is required".to_owned()))?.to_owned();
+    let seconds = body.get("timeout").and_then(Value::as_u64).unwrap_or(60).clamp(1, 600);
+    let leg = id.to_owned();
+    let row: Option<(Option<String>, Option<String>, String, Option<i64>)> = hub
+        .store
+        .call(move |c| Ok(c.query_row("SELECT agent, executor, status, kept_until FROM jobs WHERE id = ?1 AND job_id IS NOT NULL", [&leg], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?))
+        .await
+        .map_err(internal)?;
+    let Some((agent, executor, status, kept_until)) = row else { return Err(missing("no such leg of the CI engine")) };
+    let kept = kept_until.is_some_and(|t| t > crate::util::now_unix());
+    let Some(agent) = agent.filter(|_| status == "running" || kept) else {
+        return Err((StatusCode::CONFLICT, "the leg isn't running or kept: a command runs in a running leg, or a failed one kept with keep-on-failure".into()));
+    };
+    let by = caller.map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    // On the host executor the leg's shell is a shell on the runner itself.
+    if executor.as_deref() == Some("host") && caller.is_some_and(|c| !c.can("runners.terminal", &crate::authz::Scope::Runner { runner: agent.clone() })) {
+        return Err((StatusCode::FORBIDDEN, format!("{by} may not run commands on runner {agent}: a host leg's shell needs runners.terminal there")));
+    }
+    hub.store.audit(by, "ci.legs.exec".into(), format!("{id}: {command}")).await;
+    let (session, mut seen) = crate::termsess::exec_leg(hub, agent, id, &command);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let (mut out, mut code, mut error, mut timed_out, mut truncated) = (Vec::new(), None, None, false, false);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match crate::rt::timeout(left, seen.live.recv()).await {
+            Ok(Ok(Frame::Data(d))) => {
+                let room = MAX_EXEC_OUTPUT.saturating_sub(out.len());
+                truncated |= d.len() > room;
+                out.extend_from_slice(d.get(..d.len().min(room)).unwrap_or_default());
+            }
+            Ok(Ok(Frame::Exit { code: c, error: e })) => {
+                (code, error) = (c, e);
+                break;
+            }
+            Ok(Ok(Frame::Size { .. })) => {}
+            Ok(Err(async_broadcast::RecvError::Overflowed(_))) => truncated = true,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                timed_out = true;
+                session.close();
+                break;
+            }
+        }
+    }
+    session.detach();
+    if let (None, Some(e)) = (code, &error)
+        && out.is_empty()
+        && !timed_out
+    {
+        return Err((StatusCode::CONFLICT, e.clone()));
+    }
+    let output = String::from_utf8_lossy(&out).replace("\r\n", "\n");
+    Ok(srv::json(StatusCode::OK, &json!({ "output": output, "exit_code": code, "timed_out": timed_out, "truncated": truncated })))
+}
+
+/// `GET /api/ci/legs/:id/logs?step=&from=`: from byte `from` on, for a follower.
 pub async fn logs(hub: &Hub, id: &str, q: &HashMap<String, String>) -> Result<Response, Fail> {
     let step = q.get("step").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let from: usize = q.get("from").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut data = hub.logs.read(id, step).await;
     // A leg a rerun kept: the logs are those of the leg whose result it keeps (W05-R17).
     if data.is_empty() {
         let leg = id.to_owned();
-        let from: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&leg], |r| r.get(0)).optional()?.flatten())).await.map_err(internal)?;
-        if let Some(from) = from {
-            data = hub.logs.read(&from, step).await;
+        let from_leg: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT reused_from FROM jobs WHERE id = ?1", [&leg], |r| r.get(0)).optional()?.flatten())).await.map_err(internal)?;
+        if let Some(reused) = from_leg {
+            data = hub.logs.read(&reused, step).await;
         }
     }
+    let data = if from == 0 { data } else { data.get(from..).map(<[u8]>::to_vec).unwrap_or_default() };
     Ok(srv::response(StatusCode::OK, "text/plain; charset=utf-8", srv::full(data)))
 }
 

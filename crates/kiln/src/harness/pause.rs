@@ -1,0 +1,651 @@
+//! Pausing a session at a usage limit, and going on when the limit resets (docs/agents.md,
+//! "Usage limits: pause and resume").
+//!
+//! A session pauses when its harness says its account reached a usage limit (Claude Code's
+//! `rate_limit` error, Codex's `usageLimitExceeded`, an ACP agent's limit error), when another
+//! session on the account did (`Command::LimitHold`, from the server), or between turns once a
+//! limit is as full as `State::pause_at`. While it is paused nothing goes to the harness: kiln's
+//! queue, goals and plan steps wait, and a message sent meanwhile joins the queue. Its folder is
+//! kept as it was in a hidden git ref (`Effect::Checkpoint`).
+//!
+//! Once the window starts over (`Pause::until`, plus a margin and a spread across the account's
+//! sessions), kiln asks the harness for its usage. A limit no longer reached ends the pause: the
+//! turn the limit cut off goes on first ([`CONTINUE`]), then the queue. One still reached waits
+//! for the window's next reset. A harness that can't say goes on and finds out. A person can end
+//! the pause at any time, or keep it until they do (`Pause::auto`).
+
+use super::core::{Core, Effect};
+use super::model::{Body, Checkpoint, Command, Cut, Level, Limit, Pause, QueueItem};
+
+/// A usage limit was reached.
+pub const LIMIT: &str = "limit";
+/// A limit got as full as `State::pause_at`.
+pub const THRESHOLD: &str = "threshold";
+
+/// After a window's reset, how long before kiln checks it: the account's usage takes a moment
+/// to start over.
+const AFTER_RESET_MS: i64 = 30_000;
+/// Resumes of one account's sessions are spread over this long, so they don't all start at once.
+const SPREAD_MS: i64 = 90_000;
+/// How long a check waits for the harness's answer before going on regardless.
+const CHECK_WAIT_MS: i64 = 30_000;
+/// When the reset time isn't known: check after these delays, the last one again and again.
+const RETRY_MS: [i64; 4] = [10 * 60_000, 20 * 60_000, 40 * 60_000, 60 * 60_000];
+
+/// What the harness is told when it goes on with a turn a limit cut off.
+pub const CONTINUE: &str = "Your previous turn was cut off by a usage limit, which has reset now. Continue where you left off.";
+/// The same, for the harness the session switched to while it was paused.
+pub const CONTINUE_ELSEWHERE: &str = "The previous turn was cut off by the other model's usage limit. Continue where it left off.";
+
+/// What a harness said about a limit it reached.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Hit {
+    /// The window (`Limit::id`), when known.
+    pub window: Option<String>,
+    /// Unix ms it starts over, when known.
+    pub until: Option<i64>,
+    /// Its words.
+    pub said: String,
+}
+
+impl Hit {
+    /// The harness's words, with the window and reset taken from the session's limits: the reached
+    /// window that resets last (a weekly limit outlasts the 5-hour one). `until` (from the error
+    /// itself) is used when the limits say nothing.
+    pub fn from_limits(limits: &[Limit], said: impl Into<String>, until: Option<i64>, now: i64) -> Self {
+        let said = said.into();
+        let reached = limits
+            .iter()
+            .filter(|l| l.status.as_deref() == Some("rejected") || l.used_percent.is_some_and(|u| u >= 100.0))
+            .filter(|l| l.resets_at.is_some_and(|r| r > now))
+            .max_by_key(|l| l.resets_at.unwrap_or(0));
+        match reached {
+            Some(l) => Hit { window: Some(l.id.clone()), until: l.resets_at, said },
+            None => Hit { window: None, until: until.filter(|u| *u > now).or_else(|| try_again_in(&said, now)), said },
+        }
+    }
+}
+
+/// Whether a harness's words say its account's usage limit was reached (not an output, context
+/// or turn limit).
+pub fn says_limit(text: &str) -> bool {
+    let t = text.to_lowercase();
+    let usage = ["usage limit", "session limit", "weekly limit", "rate limit", "rate_limit", "usage_limit", "quota", "plan limit", "5-hour limit", "5 hour limit"]
+        .iter()
+        .any(|w| t.contains(w));
+    let reached = ["hit your", "reached", "exceeded", "resets", "try again", "limit_reached", "exhausted"].iter().any(|w| t.contains(w));
+    usage && reached
+}
+
+/// "… try again in 2 hours 13 minutes." → when that is (Codex's words when its limit is reached).
+pub fn try_again_in(text: &str, now: i64) -> Option<i64> {
+    let t = text.to_lowercase();
+    let rest = t.split("try again in").nth(1)?;
+    let mut total: i64 = 0;
+    let mut number: Option<i64> = None;
+    for word in rest.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()) {
+        let word = word.trim_end_matches(['.', ')', ';']);
+        if let Ok(n) = word.parse::<i64>() {
+            number = Some(n);
+            continue;
+        }
+        let unit = if word.starts_with("day") {
+            86_400_000
+        } else if word.starts_with("hour") || word == "h" || word == "hr" || word == "hrs" {
+            3_600_000
+        } else if word.starts_with("min") || word == "m" {
+            60_000
+        } else if word.starts_with("sec") || word == "s" {
+            1_000
+        } else if word == "and" {
+            continue;
+        } else {
+            break;
+        };
+        if let Some(n) = number.take() {
+            total = total.saturating_add(n.saturating_mul(unit));
+        }
+    }
+    (total > 0).then(|| now.saturating_add(total))
+}
+
+/// Start a pause, or carry on with one: nothing more goes to the harness until it ends. True when
+/// this started it. `by`: "harness", "account" or "threshold".
+pub fn hold(core: &mut Core, reason: &str, by: &str, hit: Hit, cut: Option<Cut>) -> bool {
+    let now = Core::now();
+    if let Some(p) = core.state.pause.as_mut() {
+        // Already paused: what's new about it counts (a later reset, the harness's own words).
+        let mut changed = false;
+        if let Some(u) = hit.until.filter(|u| p.until.is_none_or(|old| *u > old)) {
+            p.until = Some(u);
+            p.next_check = None;
+            changed = true;
+        }
+        if p.window.is_none() && hit.window.is_some() {
+            p.window = hit.window;
+            changed = true;
+        }
+        if p.said.is_empty() && !hit.said.is_empty() {
+            p.said = hit.said;
+            changed = true;
+        }
+        if p.cut.is_none() && cut.is_some() {
+            p.cut = cut;
+            changed = true;
+        }
+        // A limit reached outranks a stop point.
+        if reason == LIMIT && p.reason != LIMIT {
+            p.reason = LIMIT.to_owned();
+            changed = true;
+        }
+        if changed {
+            core.touch_state();
+        }
+        return false;
+    }
+    let label = hit.window.as_ref().and_then(|w| core.state.limits.iter().find(|l| &l.id == w)).map(|l| l.label.clone());
+    let auto = !core.state.manual_resume;
+    let text = pause_words(reason, by, label.as_deref(), &hit.said, auto);
+    let next_check = hit.until.is_none().then(|| now.saturating_add(retry_after(0)));
+    core.state.pause = Some(Pause {
+        reason: reason.to_owned(),
+        window: hit.window,
+        label,
+        said: hit.said,
+        until: hit.until,
+        since: now,
+        auto,
+        by: by.to_owned(),
+        cut,
+        checkpoint: None,
+        tries: 0,
+        checking: None,
+        next_check,
+    });
+    core.upsert(&format!("pause-{now}"), None, Body::Notice { level: Level::Warn, text });
+    core.effects.push(Effect::Checkpoint { at: now });
+    core.touch_state();
+    true
+}
+
+/// The timeline's one line about a pause.
+fn pause_words(reason: &str, by: &str, label: Option<&str>, said: &str, auto: bool) -> String {
+    let limit = label.map_or_else(|| "a usage limit".to_owned(), |l| format!("its {l} limit"));
+    let what = match (reason, by) {
+        (THRESHOLD, _) => format!("Paused between turns: {limit} is as full as the stop point set for it"),
+        (_, "account") => format!("Paused: another agent on this account reached {}", label.map_or_else(|| "a usage limit".to_owned(), |l| format!("the {l} limit"))),
+        _ if !said.trim().is_empty() => format!("Paused: {}", said.trim().trim_end_matches('.')),
+        _ => format!("Paused: it reached {limit}"),
+    };
+    let then = if auto { "it goes on by itself once the limit resets" } else { "it goes on when you resume it" };
+    format!("{what}. Queued messages and goals wait; {then}.")
+}
+
+/// End the pause: the timeline says why. The pause ended is returned, for the adapter to go on
+/// with what it cut off (`Pause::cut`) and then the queue.
+pub fn release(core: &mut Core, why: &str) -> Option<Pause> {
+    let p = core.state.pause.take()?;
+    let now = Core::now();
+    // A window that started over isn't reached any more, whatever an older event said.
+    for l in &mut core.state.limits {
+        if l.status.as_deref() == Some("rejected") && l.used_percent.is_none_or(|u| u < 100.0) {
+            l.status = None;
+        }
+    }
+    core.upsert(&format!("resume-{now}"), None, Body::Notice { level: Level::Info, text: why.to_owned() });
+    core.touch_state();
+    Some(p)
+}
+
+/// What the adapter does on a tick (`step`).
+#[derive(Debug, PartialEq)]
+pub enum Step {
+    Nothing,
+    /// Ask the harness for its usage (the answer goes to `checked`).
+    Check,
+    /// The pause ended: go on.
+    GoOn(Box<Pause>),
+}
+
+/// A pause's timer, every tick: time to check whether its limit reset, or to give up waiting for
+/// the answer to a check and go on. `key` spreads one account's sessions apart (its session id).
+pub fn step(core: &mut Core, now: i64, key: &str) -> Step {
+    let Some(p) = core.state.pause.as_ref() else { return Step::Nothing };
+    if !p.auto {
+        return Step::Nothing;
+    }
+    if let Some(started) = p.checking {
+        if now.saturating_sub(started) < CHECK_WAIT_MS {
+            return Step::Nothing;
+        }
+        // No answer: go on, and let the harness say.
+        return release(core, "The limit's reset time came; going on.").map_or(Step::Nothing, |p| Step::GoOn(Box::new(p)));
+    }
+    let due = match (p.next_check, p.until) {
+        (Some(at), _) => now >= at,
+        (None, Some(until)) => now >= until.saturating_add(AFTER_RESET_MS).saturating_add(spread(key)),
+        (None, None) => now >= p.since.saturating_add(retry_after(p.tries)),
+    };
+    if !due {
+        return Step::Nothing;
+    }
+    if let Some(p) = core.state.pause.as_mut() {
+        p.checking = Some(now);
+    }
+    core.touch_state();
+    Step::Check
+}
+
+/// The harness answered a check (its usage is in `State::limits` now): the pause ends when its
+/// limit isn't reached any more, else it waits for the window's next reset (or checks again
+/// later, when that isn't known). The pause ended is returned.
+pub fn checked(core: &mut Core, now: i64) -> Option<Pause> {
+    let p = core.state.pause.as_ref()?;
+    p.checking?;
+    let cap = cap_of(p, core.state.pause_at);
+    let reached = still_reached(&core.state.limits, p.window.as_deref(), cap, now);
+    if reached == Some(true) {
+        let next = reset_of(&core.state.limits, p.window.as_deref(), cap, now);
+        if let Some(p) = core.state.pause.as_mut() {
+            p.checking = None;
+            p.tries = p.tries.saturating_add(1);
+            match next {
+                Some(r) => {
+                    p.until = Some(r);
+                    p.next_check = None;
+                }
+                None => p.next_check = Some(now.saturating_add(retry_after(p.tries))),
+            }
+        }
+        core.touch_state();
+        return None;
+    }
+    let why = match core.state.pause.as_ref().and_then(|p| p.label.clone()) {
+        Some(l) => format!("The {l} limit reset; going on."),
+        None => "The limit reset; going on.".to_owned(),
+    };
+    release(core, &why)
+}
+
+/// Whether the window a pause waits for is still as full as it may get: Some(true) yes,
+/// Some(false) no, None when the limits don't say.
+fn still_reached(limits: &[Limit], window: Option<&str>, cap: f64, now: i64) -> Option<bool> {
+    let mut seen = false;
+    for l in limits.iter().filter(|l| window.is_none_or(|w| l.id == w) && l.unit.is_none()) {
+        let Some(used) = l.used_percent else { continue };
+        seen = true;
+        if used >= cap && l.resets_at.is_none_or(|r| r > now) {
+            return Some(true);
+        }
+    }
+    seen.then_some(false)
+}
+
+/// When the window a pause waits for starts over next, as the limits say.
+fn reset_of(limits: &[Limit], window: Option<&str>, cap: f64, now: i64) -> Option<i64> {
+    limits
+        .iter()
+        .filter(|l| window.is_none_or(|w| l.id == w) && l.used_percent.is_some_and(|u| u >= cap))
+        .filter_map(|l| l.resets_at)
+        .filter(|r| *r > now)
+        .max()
+}
+
+/// How full a pause's window may be for it to end: under 100 % for a limit reached, under the stop
+/// point for a threshold.
+fn cap_of(p: &Pause, pause_at: Option<u8>) -> f64 {
+    match (p.reason.as_str(), pause_at) {
+        (THRESHOLD, Some(at)) => f64::from(at),
+        _ => 100.0,
+    }
+}
+
+/// Between turns, before kiln's queue (or a goal, or a message) starts another: once a limit is
+/// as full as `State::pause_at`, a pause starts here instead. True when the session is paused.
+pub fn at_threshold(core: &mut Core) -> bool {
+    if core.state.pause.is_some() {
+        return true;
+    }
+    let Some(at) = core.state.pause_at else { return false };
+    let now = Core::now();
+    let full = core
+        .state
+        .limits
+        .iter()
+        .filter(|l| l.unit.is_none() && l.used_percent.is_some_and(|u| u >= f64::from(at)) && l.resets_at.is_some_and(|r| r > now))
+        .max_by_key(|l| l.resets_at.unwrap_or(0))
+        .map(|l| (l.id.clone(), l.resets_at, l.used_percent.unwrap_or(0.0)));
+    let Some((window, until, used)) = full else { return false };
+    let said = format!("{}% used, the stop point is {at}%", used.round());
+    hold(core, THRESHOLD, THRESHOLD, Hit { window: Some(window), until, said }, None)
+}
+
+/// A command on its way to the harness: a message sent while the session is paused (or at its
+/// stop point) joins the queue instead (None); anything else goes on.
+pub fn let_through(core: &mut Core, c: Command) -> Option<Command> {
+    if !matches!(c, Command::Send { .. }) || !at_threshold(core) {
+        return Some(c);
+    }
+    if let Command::Send { id, text, attachments, overrides, .. } = c {
+        core.state.queue.push(QueueItem { id, text, at: Core::now(), attachments, overrides });
+        core.touch_state();
+    }
+    None
+}
+
+/// Whether kiln's queue may send its next message now: not held for a switch, not paused, not at
+/// the stop point (which starts a pause).
+pub fn open(core: &mut Core) -> bool {
+    !core.hold && !at_threshold(core)
+}
+
+/// The job an `Effect::Checkpoint` comes back under (`run_done`), followed by the pause's start.
+pub const CHECKPOINT_JOB: &str = "kiln-checkpoint:";
+
+/// A checkpoint was made (code 0, output "<ref> <commit>") or couldn't be (the folder isn't a
+/// repository): the pause it was made for keeps it.
+pub fn checkpointed(core: &mut Core, at: &str, code: Option<i32>, output: &str) {
+    let Ok(at) = at.parse::<i64>() else { return };
+    if code != Some(0) {
+        return;
+    }
+    let mut words = output.split_whitespace();
+    let (Some(git_ref), Some(commit)) = (words.next(), words.next()) else { return };
+    if let Some(p) = core.state.pause.as_mut().filter(|p| p.since == at) {
+        p.checkpoint = Some(Checkpoint { git_ref: git_ref.to_owned(), commit: commit.to_owned(), at });
+        core.touch_state();
+    }
+}
+
+/// Keep `cwd`'s repository as it is now, untracked files included and ignored ones not, in the
+/// commit a hidden ref (`refs/kiln/checkpoints/<session>/<at>`) points at: (ref, commit). A
+/// throwaway index is used, so the folder, its index and its branches stay as they are. None
+/// when `cwd` isn't in a repository (or git isn't there).
+pub fn snapshot(cwd: &str, session: &str, at: i64) -> Option<(String, String)> {
+    use std::process::{Command as Proc, Stdio};
+    let index = std::env::temp_dir().join(format!("kiln-checkpoint-{}-{at}.index", session.replace(['/', '\\'], "_")));
+    let git = |args: &[&str], with_index: bool| -> Option<String> {
+        let mut c = Proc::new("git");
+        c.arg("-C").arg(cwd).args(args).stdin(Stdio::null()).stderr(Stdio::null());
+        for (k, v) in [("GIT_AUTHOR_NAME", "kiln"), ("GIT_AUTHOR_EMAIL", "kiln@localhost"), ("GIT_COMMITTER_NAME", "kiln"), ("GIT_COMMITTER_EMAIL", "kiln@localhost")] {
+            c.env(k, v);
+        }
+        if with_index {
+            c.env("GIT_INDEX_FILE", &index);
+        }
+        let o = c.output().ok().filter(|o| o.status.success())?;
+        Some(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+    };
+    let made = (|| {
+        let top = git(&["rev-parse", "--show-toplevel"], false)?;
+        let head = git(&["rev-parse", "--verify", "--quiet", "HEAD"], false).filter(|h| !h.is_empty());
+        // From HEAD's tree, so files that didn't change cost nothing; then everything not ignored.
+        if head.is_some() {
+            git(&["read-tree", "HEAD"], true)?;
+        }
+        git(&["-C", &top, "add", "--all"], true)?;
+        let tree = git(&["write-tree"], true)?;
+        let message = format!("kiln checkpoint of agent {session} at {at}");
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", message.as_str()];
+        if let Some(h) = &head {
+            args.extend(["-p", h.as_str()]);
+        }
+        let commit = git(&args, false)?;
+        let git_ref = format!("refs/kiln/checkpoints/{session}/{at}");
+        git(&["update-ref", &git_ref, &commit], false)?;
+        Some((git_ref, commit))
+    })();
+    let _ = std::fs::remove_file(&index);
+    made
+}
+
+/// Ids kiln gives the messages it queues itself (`continue_later`).
+pub const KILN_ID: &str = "kiln-";
+
+/// The cut-off turn goes on once the harness can take it (it ended, or a turn is under way): kiln's
+/// message waits at the front of the queue.
+pub fn continue_later(core: &mut Core, text: &str) {
+    core.state.queue.insert(0, QueueItem { id: format!("{KILN_ID}{}", crate::util::new_id()), text: text.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+    core.touch_state();
+}
+
+/// A queued message went out: kiln's own reads as kiln's in the timeline.
+pub fn sent_from_queue(core: &mut Core, id: &str) {
+    if id.starts_with(KILN_ID) {
+        from_kiln(core, id);
+    }
+}
+
+/// Mark a message kiln sent itself (`CONTINUE`) as kiln's in the timeline.
+pub fn from_kiln(core: &mut Core, id: &str) {
+    if let Some(e) = core.get_mut(id)
+        && let Body::User { origin, .. } = &mut e.body
+    {
+        *origin = Some("kiln".to_owned());
+    }
+}
+
+/// The turn the session is in now (or last began), for a pause that cuts it off: the latest
+/// message it was sent.
+pub fn cut_now(core: &Core) -> Cut {
+    let last = core
+        .events()
+        .filter_map(|e| match &e.body {
+            Body::User { text, client_id, .. } => Some((client_id.clone(), text.clone())),
+            _ => None,
+        })
+        .last();
+    let (message, text) = last.unwrap_or_default();
+    Cut { message, text: super::model::clip_middle(&text, 300).0, at: Core::now() }
+}
+
+/// Spread over `SPREAD_MS`, the same for the same key.
+fn spread(key: &str) -> i64 {
+    // FNV-1a: stable across runs and machines.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    i64::try_from(h % u64::try_from(SPREAD_MS).unwrap_or(1)).unwrap_or(0)
+}
+
+fn retry_after(tries: u32) -> i64 {
+    let i = usize::try_from(tries).unwrap_or(usize::MAX);
+    RETRY_MS.get(i).or(RETRY_MS.last()).copied().unwrap_or(3_600_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(id: &str, used: f64, resets_at: i64) -> Limit {
+        Limit { id: id.to_owned(), label: if id == "five_hour" { "Session".into() } else { "Weekly".into() }, used_percent: Some(used), resets_at: Some(resets_at), ..Limit::default() }
+    }
+
+    #[test]
+    fn limit_words_are_told_from_other_limits() {
+        assert!(says_limit("You've hit your session limit · resets 10:30pm (America/Los_Angeles)"));
+        assert!(says_limit("You've hit your weekly limit · resets Oct 20, 9am"));
+        assert!(says_limit("You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes."));
+        assert!(says_limit("Rate limit reached for requests"));
+        assert!(!says_limit("Stopped: the turn limit was reached."));
+        assert!(!says_limit("Stopped: the output limit was reached."));
+        assert!(!says_limit("Context limit reached"));
+    }
+
+    #[test]
+    fn try_again_in_reads_codexs_words() {
+        let now = 1_000_000;
+        assert_eq!(try_again_in("You've hit your usage limit. Try again in 2 hours 13 minutes.", now), Some(now + 2 * 3_600_000 + 13 * 60_000));
+        assert_eq!(try_again_in("try again in 1 day, 3 hours and 5 minutes", now), Some(now + 86_400_000 + 3 * 3_600_000 + 5 * 60_000));
+        assert_eq!(try_again_in("try again in 45s", now), None);
+        assert_eq!(try_again_in("try again in 45 seconds", now), Some(now + 45_000));
+        assert_eq!(try_again_in("no hint here", now), None);
+    }
+
+    #[test]
+    fn a_hit_takes_the_reached_window_that_resets_last() {
+        let now = 1_000;
+        let limits = [window("five_hour", 100.0, 5_000), window("seven_day", 100.0, 90_000), window("seven_day_opus", 40.0, 99_000)];
+        let hit = Hit::from_limits(&limits, "You've hit your weekly limit", None, now);
+        assert_eq!((hit.window.as_deref(), hit.until), (Some("seven_day"), Some(90_000)));
+        // Nothing reached in the limits: the error's own reset, else its words.
+        let hit = Hit::from_limits(&[window("five_hour", 20.0, 5_000)], "x", Some(7_000), now);
+        assert_eq!((hit.window, hit.until), (None, Some(7_000)));
+        let hit = Hit::from_limits(&[], "try again in 3 minutes", None, now);
+        assert_eq!(hit.until, Some(now + 180_000));
+    }
+
+    #[test]
+    fn a_pause_holds_once_and_says_so_once() {
+        let mut core = Core::new();
+        core.state.limits = vec![window("five_hour", 100.0, Core::now() + 3_600_000)];
+        let hit = Hit::from_limits(&core.state.limits, "You've hit your session limit · resets 10:30pm", None, Core::now());
+        assert!(hold(&mut core, LIMIT, "harness", hit.clone(), None));
+        assert!(!hold(&mut core, LIMIT, "harness", hit, None));
+        let notices = core.events().filter(|e| matches!(e.body, Body::Notice { .. })).count();
+        assert_eq!(notices, 1);
+        let p = core.state.pause.clone().unwrap_or_default();
+        assert_eq!((p.reason.as_str(), p.window.as_deref(), p.label.as_deref(), p.auto), (LIMIT, Some("five_hour"), Some("Session"), true));
+        assert!(core.effects.iter().any(|e| matches!(e, Effect::Checkpoint { .. })));
+    }
+
+    #[test]
+    fn at_the_reset_it_checks_then_goes_on_or_waits_again() {
+        let mut core = Core::new();
+        let now = Core::now();
+        let until = now + 60_000;
+        core.state.limits = vec![window("five_hour", 100.0, until)];
+        hold(&mut core, LIMIT, "harness", Hit { window: Some("five_hour".into()), until: Some(until), said: String::new() }, None);
+        // Before the reset (and its margin and spread): nothing.
+        assert_eq!(step(&mut core, now + 1_000, "s1"), Step::Nothing);
+        let due = until + AFTER_RESET_MS + SPREAD_MS;
+        assert_eq!(step(&mut core, due, "s1"), Step::Check);
+        // Still reached (it resets again later): waits for that reset.
+        core.state.limits = vec![window("five_hour", 100.0, due + 3_600_000)];
+        assert!(checked(&mut core, due).is_none());
+        let p = core.state.pause.clone().unwrap_or_default();
+        assert_eq!((p.until, p.tries, p.checking), (Some(due + 3_600_000), 1, None));
+        // Next time it isn't: the pause ends.
+        let later = due + 3_600_000 + AFTER_RESET_MS + SPREAD_MS;
+        assert_eq!(step(&mut core, later, "s1"), Step::Check);
+        core.state.limits = vec![window("five_hour", 3.0, later + 5 * 3_600_000)];
+        assert!(checked(&mut core, later).is_some());
+        assert!(core.state.pause.is_none());
+    }
+
+    #[test]
+    fn a_check_with_no_answer_goes_on() {
+        let mut core = Core::new();
+        hold(&mut core, LIMIT, "harness", Hit { window: None, until: Some(1_000), said: String::new() }, None);
+        let t = 1_000 + AFTER_RESET_MS + SPREAD_MS;
+        assert_eq!(step(&mut core, t, "k"), Step::Check);
+        assert_eq!(step(&mut core, t + 1_000, "k"), Step::Nothing);
+        assert!(matches!(step(&mut core, t + CHECK_WAIT_MS, "k"), Step::GoOn(_)));
+        assert!(core.state.pause.is_none());
+    }
+
+    #[test]
+    fn manual_resume_never_ends_by_itself() {
+        let mut core = Core::new();
+        core.state.manual_resume = true;
+        hold(&mut core, LIMIT, "harness", Hit { window: None, until: Some(1_000), said: String::new() }, None);
+        assert_eq!(step(&mut core, 10_000_000_000, "k"), Step::Nothing);
+        assert!(release(&mut core, "Resumed by you.").is_some());
+    }
+
+    #[test]
+    fn the_stop_point_pauses_between_turns() {
+        let mut core = Core::new();
+        let later = Core::now() + 3_600_000;
+        core.state.limits = vec![window("five_hour", 91.0, later)];
+        assert!(open(&mut core));
+        core.state.pause_at = Some(90);
+        assert!(!open(&mut core));
+        let p = core.state.pause.clone().unwrap_or_default();
+        assert_eq!((p.reason.as_str(), p.until), (THRESHOLD, Some(later)));
+        // It ends once the window is under the stop point again.
+        if let Some(p) = core.state.pause.as_mut() {
+            p.checking = Some(later);
+        }
+        core.state.limits = vec![window("five_hour", 2.0, later + 5 * 3_600_000)];
+        assert!(checked(&mut core, later).is_some());
+    }
+
+    #[test]
+    fn a_message_sent_while_paused_waits_in_the_queue() {
+        let mut core = Core::new();
+        let send = |id: &str| Command::Send { id: id.into(), text: "go on".into(), mode: Default::default(), attachments: vec![], overrides: None };
+        assert!(let_through(&mut core, send("m1")).is_some());
+        hold(&mut core, LIMIT, "harness", Hit::default(), None);
+        assert!(let_through(&mut core, send("m2")).is_none());
+        assert!(let_through(&mut core, Command::Interrupt).is_some());
+        assert_eq!(core.state.queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(), vec!["m2"]);
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_the_folder_without_touching_it() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("kiln-checkpoint-test-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&dir)?;
+        let git = |args: &[&str]| -> anyhow::Result<String> {
+            let o = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()?;
+            anyhow::ensure!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            Ok(String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        git(&["init", "-q"])?;
+        std::fs::write(dir.join("a.txt"), "one\n")?;
+        std::fs::write(dir.join(".gitignore"), "target/\n")?;
+        git(&["add", "-A"])?;
+        git(&["commit", "-qm", "first"])?;
+        let head = git(&["rev-parse", "HEAD"])?;
+        // Mid-work: a changed file, a new one, one ignored.
+        std::fs::write(dir.join("a.txt"), "two\n")?;
+        std::fs::write(dir.join("b.txt"), "new\n")?;
+        std::fs::create_dir_all(dir.join("target"))?;
+        std::fs::write(dir.join("target/out"), "big\n")?;
+        let status = git(&["status", "--porcelain"])?;
+        let cwd = dir.to_string_lossy().into_owned();
+        let (git_ref, commit) = snapshot(&cwd, "agent1", 42).ok_or_else(|| anyhow::anyhow!("no checkpoint"))?;
+        assert_eq!(git_ref, "refs/kiln/checkpoints/agent1/42");
+        assert_eq!(git(&["rev-parse", &git_ref])?, commit);
+        assert_eq!(git(&["show", &format!("{commit}:a.txt")])?, "two");
+        assert_eq!(git(&["show", &format!("{commit}:b.txt")])?, "new");
+        assert!(git(&["show", &format!("{commit}:target/out")]).is_err());
+        assert_eq!(git(&["rev-parse", &format!("{commit}^")])?, head);
+        // The folder, its index and its branch are as they were.
+        assert_eq!(git(&["status", "--porcelain"])?, status);
+        assert_eq!(git(&["rev-parse", "HEAD"])?, head);
+        // Not a repository: no checkpoint.
+        let plain = std::env::temp_dir().join(format!("kiln-plain-{}", crate::util::new_id()));
+        std::fs::create_dir_all(&plain)?;
+        assert!(snapshot(&plain.to_string_lossy(), "agent1", 43).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
+        Ok(())
+    }
+
+    #[test]
+    fn a_continue_that_cant_go_now_waits_first_in_the_queue() {
+        let mut core = Core::new();
+        core.state.queue.push(QueueItem { id: "m2".into(), text: "then the tests".into(), at: 1, attachments: vec![], overrides: None });
+        continue_later(&mut core, CONTINUE);
+        assert!(core.state.queue.first().is_some_and(|q| q.id.starts_with(KILN_ID) && q.text == CONTINUE));
+        assert_eq!(core.state.queue.len(), 2);
+    }
+
+    #[test]
+    fn spread_is_stable_and_bounded() {
+        assert_eq!(spread("abc"), spread("abc"));
+        assert!((0..SPREAD_MS).contains(&spread("abc")));
+        assert!((0..SPREAD_MS).contains(&spread("")));
+    }
+}

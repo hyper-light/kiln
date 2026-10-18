@@ -19,7 +19,7 @@ use std::sync::Arc;
 use http::{HeaderMap, StatusCode};
 use serde_json::{Value, json};
 
-use crate::cd::ops::{self, Cx};
+use crate::authz::Caller;
 use crate::http::server::{self as srv, Response};
 use crate::hub::Hub;
 
@@ -72,10 +72,12 @@ const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-0
 /// The skills extension's identifier (SEP-2640).
 const SKILLS_EXTENSION: &str = "io.modelcontextprotocol/skills";
 
-const INSTRUCTIONS: &str = "kiln builds, tests and deploys code. Deployments (GitOps CD) are under `kiln.cd`: apps, their \
+const INSTRUCTIONS: &str = "kiln builds, tests and deploys code. CI is under `kiln.ci`: runs, their legs and logs, \
+workflows (validate and plan before proposing), reruns, approvals, and failed legs kept to look into (`ci.legs.exec` runs \
+a command in one, `ci.legs.rerun_step` reruns a step there). Deployments (GitOps CD) are under `kiln.cd`: apps, their \
 sync and health, resources and why they differ, diffs, history, syncs, clusters. Prefer code_run: one program can list, \
 filter and act on a whole fleet and return only what matters. code_search shows the operations and their inputs. \
-The skills (kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd-migration) say how to use them.";
+The skills (kiln-ci-diagnose, kiln-deploy, kiln-diagnose, kiln-apps, kiln-argocd-migration) say how to use them.";
 
 /// An MCP token for `label` (an agent session, an attachment): `kiln_mcp_<label>_<hmac>`.
 pub fn token(admin_token: &str, label: &str) -> String {
@@ -91,8 +93,9 @@ pub fn verify(admin_token: &str, presented: &str) -> Option<String> {
     crate::util::ct_eq(want.as_bytes(), mac.as_bytes()).then(|| label.to_owned())
 }
 
-/// Who calls `/api/mcp`: `agent:<label>` for an MCP token, `admin` for the admin token or a
-/// session; `None` if neither.
+/// Who calls `/api/mcp` as the owner: `agent:<label>` for an MCP token, `admin` for the admin
+/// token or the owner's session; `None` if neither (a user's session or token is the route
+/// table's to judge).
 pub fn caller(hub: &Hub, headers: &HeaderMap, authed: bool) -> Option<String> {
     let bearer = headers.get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     if let Some(label) = bearer.and_then(|t| verify(&hub.admin_token, t.trim())) {
@@ -101,14 +104,14 @@ pub fn caller(hub: &Hub, headers: &HeaderMap, authed: bool) -> Option<String> {
     authed.then(|| "admin".to_owned())
 }
 
-/// `POST /api/mcp`: one JSON-RPC message or a batch.
-pub async fn http(hub: &Arc<Hub>, actor: String, body: hyper::body::Incoming) -> Result<Response, (StatusCode, String)> {
+/// `POST /api/mcp`: one JSON-RPC message or a batch, each operation as `caller` may (W20-R06).
+pub async fn http(hub: &Arc<Hub>, caller: Caller, body: hyper::body::Incoming) -> Result<Response, (StatusCode, String)> {
     let bytes = srv::body_bytes(body, 16 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let msg: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => return Ok(srv::json(StatusCode::OK, &rpc_error(Value::Null, -32700, &format!("parse error: {e}")))),
     };
-    let server = Server { hub: hub.clone(), actor };
+    let server = Server { hub: hub.clone(), caller };
     let answer = match msg {
         Value::Array(batch) => {
             let mut out = Vec::new();
@@ -142,12 +145,12 @@ pub fn tool_name(op: &str) -> String {
 
 struct Server {
     hub: Arc<Hub>,
-    actor: String,
+    caller: Caller,
 }
 
 impl Server {
-    fn cx(&self) -> Option<Cx> {
-        Some(Cx { hub: self.hub.clone(), cd: crate::cd::get()?, actor: self.actor.clone() })
+    fn cx(&self) -> crate::ops::Cx {
+        crate::ops::Cx { hub: self.hub.clone(), caller: self.caller.clone() }
     }
 
     async fn handle(&self, msg: Value) -> Option<Value> {
@@ -178,7 +181,7 @@ impl Server {
                 )
             }
             "ping" => rpc_ok(id, json!({})),
-            "tools/list" => rpc_ok(id, json!({"tools": tools()})),
+            "tools/list" => rpc_ok(id, json!({"tools": tools(&self.hub)})),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -207,9 +210,7 @@ impl Server {
     }
 
     async fn call_tool(&self, name: &str, args: Value) -> Value {
-        let Some(cx) = self.cx() else {
-            return tool_error("deployments are starting; try again in a moment");
-        };
+        let cx = self.cx();
         match name {
             "code_search" | "code_run" => {
                 let program = args.get("program").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -222,10 +223,10 @@ impl Server {
                 }
             }
             _ => {
-                let Some(op) = ops::ops().iter().find(|o| tool_name(o.name) == name) else {
+                let Some(op) = crate::ops::all(&self.hub).into_iter().find(|o| tool_name(o.name) == name) else {
                     return tool_error(&format!("no tool {name}"));
                 };
-                match ops::call(cx, op.name, args).await {
+                match crate::ops::call(cx, op.name, args).await {
                     Ok(v) => tool_ok(v),
                     Err((_, e)) => tool_error(&e),
                 }
@@ -249,7 +250,11 @@ fn tool_error_value(v: Value) -> Value {
 }
 
 /// Every tool: code mode's two, then each operation.
-pub fn tools() -> Vec<Value> {
+pub fn tools(hub: &Hub) -> Vec<Value> {
+    tools_of(crate::ops::all(hub))
+}
+
+fn tools_of(ops: Vec<crate::ops::Info>) -> Vec<Value> {
     let mut out = vec![
         json!({
             "name": "code_search",
@@ -267,7 +272,7 @@ pub fn tools() -> Vec<Value> {
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
         }),
     ];
-    for o in ops::ops() {
+    for o in ops {
         out.push(json!({
             "name": tool_name(o.name),
             "title": o.name,
@@ -339,7 +344,8 @@ mod tests {
 
     #[test]
     fn every_operation_is_a_tool_with_a_valid_name() {
-        let tools = tools();
+        let tools = tools_of(crate::ops::listed(true));
+        assert!(tools.iter().any(|t| t.get("name").and_then(Value::as_str) == Some("ci_legs_exec")), "CI's operations are tools (W20-R04)");
         assert!(tools.len() > 10);
         for t in &tools {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");

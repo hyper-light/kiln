@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="1" tests="3" time="0.081" timestamp="2026-10-18T05:00:00.000000-07:00" hostname="h"><testcase classname="tests.test_app" name="test_add" file="tests/test_app.py" line="3" time="0.001" /><testcase classname="tests.test_app" name="test_div[2-0]" file="tests/test_app.py" line="7" time="0.002"><failure message="ZeroDivisionError: division by zero">a = 2, b = 0
+
+    @pytest.mark.parametrize("a,b", [(2, 0)])
+    def test_div(a, b):
+&gt;       assert a / b
+E       ZeroDivisionError: division by zero
+
+tests/test_app.py:10: ZeroDivisionError</failure></testcase><testcase classname="tests.test_app" name="test_later" file="tests/test_app.py" line="12" time="0.000"><skipped type="pytest.skip" message="later">tests/test_app.py:13: later</skipped></testcase></testsuite></testsuites>

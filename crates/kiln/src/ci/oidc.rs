@@ -297,6 +297,122 @@ pub async fn admin(hub: &Hub, method: &http::Method, rest: &[&str], body: Value)
     }
 }
 
+/// A scope's subject setting (W10-R09): `use_default` (repositories only), and its claim keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubjectSetting {
+    pub use_default: bool,
+    pub keys: Vec<String>,
+}
+
+/// The claim keys that build a repository's subject, GitHub's way: the repository's own setting
+/// (`use_default` meaning GitHub's default subject), else its organization's, else the server's,
+/// else `[ci.oidc] subject_claims`; `None` for the default subject.
+pub fn subject_keys_of(repo: Option<&SubjectSetting>, org: Option<&SubjectSetting>, server: Option<&SubjectSetting>, config: &[String]) -> Option<Vec<String>> {
+    if let Some(r) = repo {
+        return (!r.use_default && !r.keys.is_empty()).then(|| r.keys.clone());
+    }
+    for s in [org, server].into_iter().flatten() {
+        if !s.keys.is_empty() {
+            return Some(s.keys.clone());
+        }
+    }
+    (!config.is_empty()).then(|| config.to_vec())
+}
+
+async fn subject_setting(hub: &Hub, scope: &str) -> anyhow::Result<Option<SubjectSetting>> {
+    let scope = scope.to_owned();
+    hub.store
+        .call(move |c| {
+            let row: Option<(bool, String)> = c.query_row("SELECT use_default, claim_keys FROM ci_oidc_subjects WHERE scope = ?1", [&scope], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            Ok(row.map(|(use_default, keys)| SubjectSetting { use_default, keys: serde_json::from_str(&keys).unwrap_or_default() }))
+        })
+        .await
+}
+
+/// The claim keys for `repo`'s tokens (`owner/name`), as [`subject_keys_of`] picks them.
+pub async fn subject_keys(hub: &Hub, repo: &str) -> Option<Vec<String>> {
+    let owner = repo.split('/').next().unwrap_or_default();
+    let (r, o, s) = (subject_setting(hub, &format!("repo:{repo}")).await.ok().flatten(), subject_setting(hub, &format!("org:{owner}")).await.ok().flatten(), subject_setting(hub, "server").await.ok().flatten());
+    subject_keys_of(r.as_ref(), o.as_ref(), s.as_ref(), &hub.cfg.ci.oidc.subject_claims)
+}
+
+/// The claim keys a subject can be built from: every claim an ID token has, and GitHub's
+/// `repo` and `context`.
+pub fn known_claim_keys() -> Vec<String> {
+    let github = json!({ "repository": "o/r", "ref": "refs/heads/main" });
+    let f = rules::Facts { github: &github, environment: Some("e"), job_workflow_ref: Some("x"), job_workflow_sha: Some("y"), trusted: true, executor: "host", runner: "r", pool: Some("p"), job: "j" };
+    let mut keys: Vec<String> = rules::claims(&f, "https://i", "a", "j", 0, 60, None).keys().cloned().collect();
+    keys.retain(|k| !matches!(k.as_str(), "iss" | "aud" | "exp" | "iat" | "nbf" | "jti" | "sub"));
+    keys.extend(["repo".to_owned(), "context".to_owned()]);
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// `GET /api/ci/oidc/subject?scope=` and `PUT` with `{ use_default, include_claim_keys }`
+/// (W10-R09): a scope's subject setting, and what its tokens' subjects look like.
+pub async fn subject(hub: &Hub, method: &http::Method, q: &std::collections::HashMap<String, String>, body: Value, by: &str) -> Result<Response, Fail> {
+    let fail = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    let scope = q.get("scope").cloned().unwrap_or_else(|| "server".into());
+    let scope = match crate::authz::Scope::parse(&scope) {
+        Ok(crate::authz::Scope::Server) => "server".to_owned(),
+        Ok(crate::authz::Scope::Org { org }) => format!("org:{org}"),
+        Ok(crate::authz::Scope::Repo { repo }) => format!("repo:{repo}"),
+        _ => return Err((StatusCode::BAD_REQUEST, format!("`{scope}` isn't a scope for subjects: server, org:<owner> or repo:<owner/name>"))),
+    };
+    if method == http::Method::PUT {
+        let use_default = body.get("use_default").and_then(Value::as_bool).unwrap_or(false);
+        if use_default && !scope.starts_with("repo:") {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "use_default is a repository's choice; an organization or the server sets include_claim_keys".into()));
+        }
+        let keys: Vec<String> = body.get("include_claim_keys").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default();
+        if !use_default && keys.is_empty() {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, "include_claim_keys is required unless use_default is true".into()));
+        }
+        let known = known_claim_keys();
+        if let Some(k) = keys.iter().find(|k| !known.contains(k)) {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, format!("`{k}` isn't a claim of kiln's ID tokens; the claim keys are {}", known.join(", "))));
+        }
+        let (s, k, who) = (scope.clone(), serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into()), by.to_owned());
+        hub.store
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO ci_oidc_subjects (scope, use_default, claim_keys, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (scope) DO UPDATE SET use_default = ?2, claim_keys = ?3, updated_at = ?4, updated_by = ?5",
+                    params![s, use_default, k, crate::util::now_unix(), who],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(fail)?;
+        hub.store.audit(by.to_owned(), "ci.oidc.subject".into(), format!("{scope}: {}", if use_default { "the default subject".to_owned() } else { keys.join(", ") })).await;
+    } else if method == http::Method::DELETE {
+        let s = scope.clone();
+        hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_oidc_subjects WHERE scope = ?1", [&s]).map(|_| ())?)).await.map_err(fail)?;
+        hub.store.audit(by.to_owned(), "ci.oidc.subject".into(), format!("{scope}: inherited again")).await;
+    }
+    let own = subject_setting(hub, &scope).await.map_err(fail)?;
+    // What a token of a job on main without an environment would say, for a repository.
+    let effective = match scope.strip_prefix("repo:") {
+        Some(repo) => subject_keys(hub, repo).await,
+        None => own.as_ref().map(|s| s.keys.clone()).filter(|k| !k.is_empty()).or_else(|| (!hub.cfg.ci.oidc.subject_claims.is_empty()).then(|| hub.cfg.ci.oidc.subject_claims.clone())),
+    };
+    // A trusted push to main's token, as the issuer would make it.
+    let example = scope.strip_prefix("repo:").map(|repo| {
+        let github = json!({ "repository": repo, "repository_owner": repo.split('/').next().unwrap_or_default(), "ref": "refs/heads/main", "ref_type": "branch", "event_name": "push", "workflow": "CI" });
+        let f = rules::Facts { github: &github, environment: None, job_workflow_ref: None, job_workflow_sha: None, trusted: true, executor: "host", runner: "", pool: None, job: "" };
+        rules::claims(&f, &issuer(hub), "example", "example", 0, 60, effective.as_deref()).get("sub").and_then(Value::as_str).unwrap_or_default().to_owned()
+    });
+    Ok(srv::json(StatusCode::OK, &json!({
+        "scope": scope,
+        "use_default": own.as_ref().is_some_and(|s| s.use_default),
+        "include_claim_keys": own.map(|s| s.keys).unwrap_or_default(),
+        "effective_claim_keys": effective,
+        "example_subject": example,
+        "claim_keys": known_claim_keys(),
+    })))
+}
+
 /// What the token endpoint needs to know about a leg.
 struct LegFacts {
     spec: Value,
@@ -344,7 +460,8 @@ pub async fn token(hub: &Arc<Hub>, req: &Request) -> Result<Response, Fail> {
     let audience = q.get("audience").filter(|a| !a.is_empty()).cloned().or_else(|| hub.cfg.ci.oidc.default_audience.clone()).unwrap_or_else(|| iss.clone());
     let environment = f.spec.pointer("/environment/name").and_then(Value::as_str).map(str::to_owned);
     let executor = f.spec.pointer("/executor").and_then(Value::as_str).unwrap_or("host").to_owned();
-    let keys = hub.cfg.ci.oidc.subject_claims.clone();
+    // The repository's subject, as it, its organization or the server customized it (W10-R09).
+    let keys = subject_keys(hub, f.github.get("repository").and_then(Value::as_str).unwrap_or_default()).await.unwrap_or_default();
     let facts = rules::Facts { github: &f.github, environment: environment.as_deref(), job_workflow_ref: None, job_workflow_sha: None, trusted: f.trusted, executor: &executor, runner: f.agent.as_deref().unwrap_or_default(), pool: None, job: &claims.sub };
     let c = rules::claims(&facts, &iss, &audience, &crate::util::new_id(), crate::util::now_unix(), rules::DEFAULT_TTL_SECS, (!keys.is_empty()).then_some(keys.as_slice()));
     let jwt = sign(hub, &c).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -354,6 +471,27 @@ pub async fn token(hub: &Arc<Hub>, req: &Request) -> Result<Response, Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W10-R09: a repository's setting, else its organization's, else the server's, else the
+    /// configuration; a repository's `use_default` is GitHub's default whatever the others say.
+    #[test]
+    fn w10_r09_subject_claims_by_scope() {
+        let keys = |k: &[&str]| SubjectSetting { use_default: false, keys: k.iter().map(|s| (*s).to_owned()).collect() };
+        let config = vec!["repo".to_owned(), "context".to_owned(), "kiln_trust".to_owned()];
+        let (repo, org, server) = (keys(&["repo", "job_workflow_ref"]), keys(&["repository_owner", "context"]), keys(&["repo", "environment"]));
+        assert_eq!(subject_keys_of(Some(&repo), Some(&org), Some(&server), &config), Some(repo.keys.clone()));
+        assert_eq!(subject_keys_of(None, Some(&org), Some(&server), &config), Some(org.keys.clone()));
+        assert_eq!(subject_keys_of(None, None, Some(&server), &config), Some(server.keys.clone()));
+        assert_eq!(subject_keys_of(None, None, None, &config), Some(config.clone()));
+        assert_eq!(subject_keys_of(None, None, None, &[]), None, "GitHub's default subject");
+        let default = SubjectSetting { use_default: true, keys: Vec::new() };
+        assert_eq!(subject_keys_of(Some(&default), Some(&org), Some(&server), &config), None, "use_default wins over the organization");
+        let known = known_claim_keys();
+        for k in ["repo", "context", "repository", "repository_owner", "environment", "job_workflow_ref", "kiln_trust", "ref", "workflow"] {
+            assert!(known.iter().any(|x| x == k), "{k} in {known:?}");
+        }
+        assert!(!known.iter().any(|x| x == "exp" || x == "sub"), "not the token's own times or its subject");
+    }
 
     #[test]
     fn w10_r06_public_keys_read_from_der_and_signatures_verify() -> anyhow::Result<()> {

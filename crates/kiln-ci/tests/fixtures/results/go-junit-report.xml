@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="2" failures="1">
+	<testsuite name="example.com/acme/calc" tests="2" failures="1" errors="0" id="0" hostname="h" time="0.003" timestamp="2026-10-18T12:00:00Z">
+		<properties>
+			<property name="go.version" value="go1.24.0"></property>
+		</properties>
+		<testcase name="TestAdd" classname="example.com/acme/calc" time="0.000"></testcase>
+		<testcase name="TestDiv" classname="example.com/acme/calc" time="0.001">
+			<failure message="Failed" type="">    calc_test.go:14: got 3, want 2</failure>
+		</testcase>
+	</testsuite>
+</testsuites>

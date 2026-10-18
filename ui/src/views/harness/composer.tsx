@@ -9,7 +9,8 @@
  */
 import * as React from "react";
 import { ArrowDown, ArrowUp, ChevronDown, CornerDownLeft, Navigation, Paperclip, Pencil, Square, X, Zap } from "lucide-react";
-import { clientId, useSession, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
+import { clientId, FORCE_STOP_AFTER_MS, useSession, useStopAt, type QueueItem, type SendMode, type SessionStore, type SlashCommand } from "@/api/harness";
+import { useNow } from "@/lib/hooks";
 import { Tip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { Attachments } from "./controls";
@@ -191,12 +192,25 @@ const SendModes = React.memo(function SendModes({ modes, mode, onMode }: { modes
   );
 });
 
+/** Stop the turn; once asked it says so, and if the turn goes on regardless, offers to force it. */
 const StopTurn = React.memo(function StopTurn({ store }: { store: SessionStore }) {
+  const stopAt = useStopAt(store);
+  const now = useNow();
+  if (stopAt != null && now - stopAt > FORCE_STOP_AFTER_MS) {
+    return (
+      <Tip content="It didn't stop when asked: force it (it starts again, the conversation going on)">
+        <button type="button" className="cp-stop" data-force onClick={() => store.stop(true)} aria-label="Force stop">
+          <Square size={10} fill="currentColor" />
+          <span className="cp-label">Force stop</span>
+        </button>
+      </Tip>
+    );
+  }
   return (
     <Tip content="Stop the current turn (Esc)">
-      <button type="button" className="cp-stop" onClick={() => store.send({ type: "interrupt" })} aria-label="Stop the current turn">
+      <button type="button" className="cp-stop" disabled={stopAt != null} onClick={() => store.stop()} aria-label={stopAt != null ? "Stopping…" : "Stop the current turn"}>
         <Square size={10} fill="currentColor" />
-        <span className="cp-label">Stop</span>
+        <span className="cp-label">{stopAt != null ? "Stopping…" : "Stop"}</span>
       </button>
     </Tip>
   );
@@ -452,7 +466,7 @@ export function Composer({
     }
     if (e.key === "Escape" && running && features.includes("interrupt") && !text) {
       e.preventDefault();
-      store.send({ type: "interrupt" });
+      store.stop();
     }
   };
 

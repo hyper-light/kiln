@@ -190,6 +190,15 @@ pub struct Info {
     /// Where its commands may run besides its machine (as `State::reach`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<String>,
+    /// It waits for a usage limit to reset (as `State::pause`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause: Option<super::model::Pause>,
+    /// How its last turn ended (as `State::last_turn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn: Option<super::model::TurnEnd>,
+    /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_off: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -240,6 +249,8 @@ impl Info {
         self.plan.clone_from(&s.plan);
         self.left_behind = s.count_left_behind();
         self.reach.clone_from(&s.reach);
+        self.pause.clone_from(&s.pause);
+        self.last_turn.clone_from(&s.last_turn);
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -277,6 +288,9 @@ pub struct Seed {
     pub picks_up: bool,
     /// Said with the move (its folder isn't here, so it works in home).
     pub note: Option<String>,
+    /// Not a move: the session is started again here after a restart, its timeline and state
+    /// taken from the conversation store (`crate::convo`).
+    pub restored: bool,
 }
 
 /// Put a message's attachments on disk, so the harness can read them: each gets a `path`;
@@ -501,7 +515,14 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
     core.state.harness_session.clone_from(&spec.resume);
     // Moved here: its timeline as it was, then the line saying so.
     let mut items = None;
-    if let Some(sd) = seed {
+    let restored = seed.as_ref().is_some_and(|sd| sd.restored);
+    if let Some(sd) = seed.as_ref().filter(|_| restored) {
+        // Restarted here: its timeline and state as the store kept them, and nothing said of it.
+        core.adopt(sd.events.clone(), sd.state.clone());
+        core.state.model = spec.model.clone().unwrap_or_default();
+        core.state.mode = spec.mode.clone().unwrap_or_default();
+        core.harness = Some(kind.name.to_owned());
+    } else if let Some(sd) = seed {
         core.adopt(sd.events, sd.state);
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
@@ -559,6 +580,9 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         plan: None,
         left_behind: 0,
         reach: spec.reach.clone(),
+        pause: None,
+        last_turn: None,
+        keep_off: false,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -628,6 +652,13 @@ enum Ev {
     Exit(Option<i32>),
     Fx(Option<Done>),
     Tick,
+}
+
+/// What of a session's pause is kept on disk (`host::Saved`): a change is written there.
+type PauseMarks = (Option<(i64, Option<i64>, bool, bool)>, Option<u8>, bool);
+
+fn pause_marks(st: &State) -> PauseMarks {
+    (st.pause.as_ref().map(|p| (p.since, p.until, p.auto, p.checkpoint.is_some())), st.pause_at, st.manual_resume)
 }
 
 /// What an effect carried out off the event loop came back with.
@@ -869,6 +900,19 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &async_ch
                 crate::rt::spawn(async move {
                     let (code, output) = crate::rt::blocking(move || fetch_loopback(&url)).await.unwrap_or_else(|e| (None, format!("{e:#}")));
                     let _ = tx.send(Done::Run { job, code, output }).await;
+                });
+            }
+            super::core::Effect::Checkpoint { at } => {
+                let cwd = s.core.lock().state.cwd.clone();
+                let id = s.id.clone();
+                let tx = done.clone();
+                crate::rt::spawn(async move {
+                    let made = if cwd.is_empty() { None } else { crate::rt::blocking(move || super::pause::snapshot(&cwd, &id, at)).await.ok().flatten() };
+                    let (code, output) = match made {
+                        Some((git_ref, commit)) => (Some(0), format!("{git_ref} {commit}")),
+                        None => (Some(1), String::new()),
+                    };
+                    let _ = tx.send(Done::Run { job: format!("{}{at}", super::pause::CHECKPOINT_JOB), code, output }).await;
                 });
             }
             super::core::Effect::Kill { job, command } => {
@@ -1174,9 +1218,18 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
         core.meta = super::model::Meta::default();
         core.hold = false;
         core.state.switching = None;
+        // A pause for the old harness's limit ends: the new one runs on its own account. The turn
+        // the limit cut off goes on first.
+        let unpaused = core.state.pause.take();
+        if unpaused.as_ref().is_some_and(|p| p.cut.is_some()) {
+            core.state.queue.insert(0, super::model::QueueItem { id: format!("{}{}", super::pause::KILN_ID, crate::util::new_id()), text: super::pause::CONTINUE_ELSEWHERE.to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None });
+        }
         let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
         if !empty {
             text.push_str(" — the conversation carried over");
+        }
+        if unpaused.is_some() {
+            text.push_str(&format!("; the pause for {}'s usage limit ended", from.name));
         }
         if dropped > 0 {
             text.push_str(&format!(" ({dropped} older messages left out to fit)"));
@@ -1405,9 +1458,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut err_open = true;
                 let mut last_session = s.core.lock().state.harness_session.clone();
                 let mut last_queue = 0usize;
+                let mut last_pause = pause_marks(&s.core.lock().state);
                 let mut next_tick = Instant::now() + TICK;
                 // It is being ended for a switch (it is idle).
                 let mut ending = false;
+                // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
+                let mut forcing = false;
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -1470,6 +1526,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                         Ev::Ctl(Some(Ctl::Cmd(c))) => match *c {
                             Command::Restart => {}
+                            Command::ForceStop => {
+                                let text = format!("Stopped by force: {} starts again, the conversation going on; what it was running stopped with it", kind.name);
+                                s.core.lock().upsert(&format!("force-stop:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                                forcing = true;
+                            }
                             Command::Snapshot => {
                                 for u in s.snapshot() {
                                     let _ = sink.send((s.id.clone(), u)).await;
@@ -1509,6 +1570,40 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 moving = Some(mv);
                             }
                             Command::Moving { text } => moving_note(&s, &text),
+                            // A pause (`harness::pause`): ended by a person, its timer set, its stop
+                            // point set, or one started because another session on the account
+                            // reached the limit.
+                            Command::Resume => {
+                                let mut core = s.core.lock();
+                                if let Some(p) = super::pause::release(&mut core, "Resumed by you.") {
+                                    adapter.go_on(&mut core, p);
+                                }
+                                drop(core);
+                                on_change();
+                            }
+                            Command::AutoResume { on } => {
+                                let mut core = s.core.lock();
+                                core.state.manual_resume = !on;
+                                if let Some(p) = core.state.pause.as_mut() {
+                                    p.auto = on;
+                                }
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
+                            Command::PauseAt { percent } => {
+                                let mut core = s.core.lock();
+                                core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
+                            Command::LimitHold { window, until, said, .. } => {
+                                let mut core = s.core.lock();
+                                super::pause::hold(&mut core, super::pause::LIMIT, "account", super::pause::Hit { window, until, said }, None);
+                                drop(core);
+                                on_change();
+                            }
                             c => {
                                 // A model of its own harness: no switch after all.
                                 if matches!(c, Command::SetModel { .. }) && switching.take().is_some() {
@@ -1522,7 +1617,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 }
                                 let c = prepare(&files, c).await;
                                 let mut core = s.core.lock();
-                                adapter.command(&mut core, c);
+                                // Paused (or at its stop point): a message waits in the queue.
+                                if let Some(c) = super::pause::let_through(&mut core, c) {
+                                    adapter.command(&mut core, c);
+                                }
                             }
                         },
                         Ev::Ctl(Some(Ctl::Close)) | Ev::Ctl(None) => {
@@ -1598,6 +1696,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
                         break;
                     }
+                    if forcing {
+                        p.terminate(Duration::from_secs(2));
+                        let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        ending = true;
+                        break;
+                    }
                     // A switch, now that nothing is under way: the harness ends by itself once its
                     // input closes (its record of the conversation complete), else it is stopped.
                     if (switching.is_some() || moving.is_some() || reloading) && settled(&s) {
@@ -1610,13 +1714,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         ending = true;
                         break;
                     }
-                    let (session, queue) = {
+                    let (session, queue, pause) = {
                         let core = s.core.lock();
-                        (core.state.harness_session.clone(), core.state.queue.len())
+                        (core.state.harness_session.clone(), core.state.queue.len(), pause_marks(&core.state))
                     };
-                    if session != last_session || queue != last_queue {
+                    if session != last_session || queue != last_queue || pause != last_pause {
                         last_session = session;
                         last_queue = queue;
+                        last_pause = pause;
                         on_change();
                     }
                 }
@@ -1787,6 +1892,9 @@ mod tests {
             plan: None,
             left_behind: 0,
             reach: None,
+            pause: None,
+            last_turn: None,
+            keep_off: false,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

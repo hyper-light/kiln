@@ -47,6 +47,12 @@
 .st-word[data-state="disconnected"] > i {
   background: #d1aaad;
 }
+.st-word[data-state="paused"] {
+  color: #b8c2d3;
+}
+.st-word[data-state="paused"] > i {
+  background: #a6b2c6;
+}
 
 
 /* ---------------------------------------------------------------- agent page head */
@@ -154,6 +160,37 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   color: #c4bde4;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* A turn under way: what it's doing, its effort while it thinks, how long it's been going. */
+.ag-state > .ag-turn {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.ag-turn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.ag-turn-what.sg-label {
+  min-width: 0;
+  max-width: 44ch;
+  overflow: hidden;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+.ag-turn-meta {
+  flex: none;
+  color: #8f929b;
+  white-space: nowrap;
+}
+/* The clock keeps its width as it ticks ("59m 59s", "1h 02m"): nothing after it moves. */
+.ag-turn-time {
+  min-width: 7ch;
+  font-variant-numeric: tabular-nums;
 }
 .ag-cwd {
   max-width: 40ch;
@@ -449,6 +486,14 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   transition:
     border-color 0.2s,
     color 0.2s;
+}
+/* A stop that didn't take, to force; one asked, waiting. */
+.cp-stop[data-force] {
+  color: var(--color-fail);
+}
+.cp-stop:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 .cp-stop:hover {
   border-color: #8a5d64;

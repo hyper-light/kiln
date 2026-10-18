@@ -46,6 +46,10 @@ enum Cmd {
     /// Ask a kiln server on this network to take this machine as an agent (an admin approves it
     /// after comparing a verification code), then install the agent to start on boot.
     Join(kiln::join::JoinArgs),
+    /// Run kiln here without installing it, as an outpost: it stays in this terminal until you stop
+    /// it (Ctrl-C), starts on nothing, and takes no jobs. The machine's terminals, AI sessions and
+    /// agents show up in kiln as a runner's do.
+    Outpost(OutpostArgs),
     /// Remove boot integration (keeps data and config).
     Uninstall {
         #[arg(long)]
@@ -116,6 +120,12 @@ enum Cmd {
     Oidc(kiln::ci::cli::OidcArgs),
     /// CI actions: the mirrored catalog, prefetching, the action policy.
     Actions(kiln::ci::cli::ActionsArgs),
+    /// A benchmark tool's output as CI metrics, added to the step's `$KILN_METRICS`
+    /// (criterion, hyperfine, gobench, pytest-benchmark, gbench, libtest, k6).
+    Metrics(kiln::ci::cli::MetricsArgs),
+    /// Workflows of this working tree: `kiln workflow run [WORKFLOW]` runs them here, or on a
+    /// server's runners (`--server`), before you push.
+    Workflow(kiln::ci::local::WorkflowArgs),
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// A CI run's or leg's logs.
@@ -128,6 +138,20 @@ enum Cmd {
     Cancel(kiln::ci::cli::CancelArgs),
     /// Where CI legs go, and why they wait.
     Routing(kiln::ci::cli::RoutingArgs),
+    /// CI environments: list, create (with protection), delete, deployments.
+    Env(kiln::ci::cli::EnvArgs),
+    /// Approve (or reject) a run's deployments waiting for review.
+    Approve(kiln::ci::cli::ApproveArgs),
+    /// A kept CI leg: keep it longer, or release it.
+    Debug(kiln::ci::cli::DebugArgs),
+    /// People who sign in: add (with a sign-in link), list, link, sign out, remove.
+    Users(kiln::authz::cli::UsersArgs),
+    /// What users may do: roles and capabilities in scopes (`developer@org:acme`).
+    Grants(kiln::authz::cli::GrantsArgs),
+    /// The built-in roles and custom ones.
+    Roles(kiln::authz::cli::RolesArgs),
+    /// Personal access tokens and agent tokens: create (shown once), list, revoke, rotate.
+    Tokens(kiln::authz::cli::TokensArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -156,6 +180,26 @@ impl ServerArgs {
     async fn resolve(&self, cfg: &config::Config) -> anyhow::Result<kiln::access::Target> {
         kiln::access::resolve(cfg, self.url.as_deref(), self.token.as_deref()).await
     }
+}
+
+/// `kiln outpost`: see [`Cmd::Outpost`].
+#[derive(clap::Args)]
+struct OutpostArgs {
+    /// The server's URL.
+    #[arg(long, env = "KILN_SERVER")]
+    server: String,
+    /// The server's one-time invite (Machines -> Add an outpost). Once the outpost has its
+    /// certificate it runs on that, and the invite isn't needed again.
+    #[arg(long, env = "KILN_JOIN_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// Its name in kiln (default: this machine's hostname).
+    #[arg(long, env = "KILN_AGENT_NAME")]
+    name: Option<String>,
+    /// Where it keeps its certificate and files (default: <data>/outpost).
+    #[arg(long, env = "KILN_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+    #[arg(long, env = "KILN_SHELL")]
+    shell: Option<String>,
 }
 
 #[derive(clap::Args, Clone)]
@@ -267,12 +311,15 @@ fn repo_path(file: &std::path::Path) -> String {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_tracing(&cli.log, cli.json);
+    // `kiln workflow run` runs a server of its own in this process: its logs are the runs', and
+    // the server says only what goes wrong unless asked for more.
+    let quiet = matches!(cli.cmd, Cmd::Workflow(_)) && cli.log == "info" && std::env::var_os("KILN_LOG").is_none();
+    init_tracing(if quiet { "warn" } else { &cli.log }, cli.json);
     install_panic_hook();
     // Everything runs on hyper-rt, hyper-raft's thread-per-core runtime, sized for the role.
     kiln::rt::configure(match &cli.cmd {
-        Cmd::Server | Cmd::Up => kiln::rt::Profile::server(),
-        Cmd::Agent(_) | Cmd::Join(_) => kiln::rt::Profile::agent(),
+        Cmd::Server | Cmd::Up | Cmd::Workflow(_) => kiln::rt::Profile::server(),
+        Cmd::Agent(_) | Cmd::Join(_) | Cmd::Outpost(_) => kiln::rt::Profile::agent(),
         _ => kiln::rt::Profile::tool(),
     });
     match kiln::rt::block_on(real_main(cli)) {
@@ -359,17 +406,47 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 ephemeral: a.ephemeral,
                 dedicated_job: a.job,
                 terminal: !a.no_terminal && !a.ephemeral,
+                job_terminal: !a.no_terminal,
                 shell: a.shell,
                 credentials: None,
                 instance: a.instance,
                 // Commands from other runners are a terminal's worth of access: not without one.
                 reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
+                outpost: false,
             };
             let result = run_agent(opts, shutdown).await;
             if let Some(ann) = announcer {
                 ann.finish().await;
             }
             result
+        }
+        Cmd::Outpost(a) => {
+            shutdown_on_signals(shutdown.clone());
+            let state_dir = a.state_dir.unwrap_or_else(|| config::default_data_dir().join("outpost"));
+            // An invite works once: with a certificate that still works, the outpost runs on it.
+            let enrolled = std::fs::read_to_string(state_dir.join("agent.pem")).is_ok_and(|c| kiln::pki::still_valid(&c));
+            tracing::info!("kiln outpost: nothing is installed; it runs in this terminal until you stop it (Ctrl-C)");
+            let opts = kiln::agent::Opts {
+                server_url: a.server,
+                quic: None,
+                name: a.name.unwrap_or_else(config::Config::hostname),
+                labels: vec![kiln::proto::OUTPOST_LABEL.to_owned()],
+                slots: 0,
+                work_dir: state_dir.join("work"),
+                state_dir,
+                join_token: a.token.filter(|_| !enrolled),
+                ephemeral: false,
+                dedicated_job: None,
+                terminal: true,
+                job_terminal: true,
+                shell: a.shell,
+                credentials: None,
+                instance: None,
+                // It runs no other machine's commands (reach), and for now sends none.
+                reach: None,
+                outpost: true,
+            };
+            run_agent(opts, shutdown).await
         }
         Cmd::Join(mut j) => {
             shutdown_on_signals(shutdown.clone());
@@ -553,11 +630,25 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             kiln::ci::cli::actions(a, &cfg).await
         }
         Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
+        Cmd::Workflow(a) => {
+            // A signal stops the runs; the server and runner this process runs for them stop after.
+            let stop = Shutdown::new();
+            shutdown_on_signals(stop.clone());
+            kiln::ci::local::workflow(a, &config::Config::load(&config_path).unwrap_or_default(), stop).await
+        }
         Cmd::Logs(a) => kiln::ci::cli::logs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Dispatch(a) => kiln::ci::cli::dispatch(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Rerun(a) => kiln::ci::cli::rerun(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Cancel(a) => kiln::ci::cli::cancel(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Env(a) => kiln::ci::cli::env(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Approve(a) => kiln::ci::cli::approve(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Debug(a) => kiln::ci::cli::debug(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Users(a) => kiln::authz::cli::users(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Grants(a) => kiln::authz::cli::grants(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Roles(a) => kiln::authz::cli::roles(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Tokens(a) => kiln::authz::cli::tokens(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;

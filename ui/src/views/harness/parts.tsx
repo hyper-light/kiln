@@ -67,9 +67,10 @@ export function StatusPill({ status, activity, className }: { status: Status; ac
 export const machineName = (target: string) => (target === "local" ? "server" : target.replace(/^agent:/, ""));
 
 /** Status as the site shows a project's: a dot and a word. Someone waiting on you outranks the rest. */
-export function StateWord({ a }: { a: { status: Status; approvals: readonly unknown[] } }) {
-  const s = a.approvals.length > 0 ? "waiting" : a.status;
-  const word = { waiting: "Needs you", running: "Working", starting: "Starting", idle: "Ready", exited: "Ended", disconnected: "Offline" }[s];
+export function StateWord({ a }: { a: { status: Status; approvals: readonly unknown[]; pause?: unknown } }) {
+  // Paused for a usage limit: once a turn under way ends, it waits for the reset.
+  const s = a.approvals.length > 0 ? "waiting" : a.pause && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected" ? "paused" : a.status;
+  const word = { waiting: "Needs you", running: "Working", starting: "Starting", idle: "Ready", exited: "Ended", disconnected: "Offline", paused: "Paused" }[s];
   return (
     <span className="st-word" data-state={s}>
       <i aria-hidden="true" />

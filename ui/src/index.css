@@ -3168,3 +3168,13 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   font-size: 14px;
   line-height: 28px;
 }
+
+/* A terminal inside a CI leg (docs/ci.md W17-R01), on the leg's panel. */
+.leg-terminal {
+  position: relative;
+  height: clamp(240px, 42vh, 480px);
+  overflow: hidden;
+  border-top: 1px solid #1d2128;
+  background: #08090a;
+}
+

@@ -48,6 +48,9 @@ pub struct AssignmentV2 {
     pub job_defaults: Defaults,
     /// The job's `outputs`, evaluated after its steps.
     pub outputs: Vec<(String, Tpl)>,
+    /// `environment.url`, evaluated after its steps too (W15-R04).
+    #[serde(default)]
+    pub environment_url: Option<Tpl>,
     pub contexts: Contexts,
     /// Secrets the leg may read (W09 narrows them to what it references).
     pub secrets: Vec<Secret>,
@@ -73,6 +76,10 @@ pub struct AssignmentV2 {
     /// kiln (W04-R21): the workflow's `run-env: true`; `$KILN_RUN_ENV` lines go into `run.env`.
     #[serde(default)]
     pub run_env: bool,
+    /// kiln (W16-R05): the job's `quarantine: enforce`: a step whose failed tests are all
+    /// quarantined passes, with a warning.
+    #[serde(default)]
+    pub quarantine: bool,
     pub debug: Debug,
     pub limits: Limits,
 }
@@ -254,12 +261,24 @@ pub enum JobEventV2 {
         secret_outputs: Vec<String>,
         #[serde(default)]
         secret_values: BTreeMap<String, String>,
+        /// `environment.url`, evaluated (W15-R04).
+        #[serde(default)]
+        environment_url: Option<String>,
     },
     TestReport { idx: u32, format: String, object: String },
-    Metrics { idx: u32, points: Vec<serde_json::Value> },
+    /// W16-R07: what the step wrote to `$KILN_METRICS`, and the runner's fingerprint (its OS and
+    /// architecture, CPU model, kernel and executor), which baselines are kept by.
+    Metrics {
+        idx: u32,
+        points: Vec<serde_json::Value>,
+        #[serde(default)]
+        fingerprint: String,
+    },
     /// Why the attempt failed (W05-R15): `runner-lost`, `infra`, `image-pull`, `oom`, `disk-full`,
     /// `timeout`, `failure`.
     FailureClass { class: String },
+    /// The failed leg is kept to look into until `until` (Unix seconds, W17-R02).
+    Kept { until: i64 },
 }
 
 #[cfg(test)]
