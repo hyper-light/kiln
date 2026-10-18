@@ -10,8 +10,10 @@ kiln run --on adacachy --no-sync -- uptime   # a runner by name, in its home fol
 kiln runners linux                           # the Linux runners, best first, and why others don't suit
 ```
 
-Agents get the same as MCP tools (`runners`, `run`, `output`, `stop`), so Claude Code, Codex or any
-harness that takes MCP servers can decide for itself to build or test elsewhere.
+Agents get the same through kiln's MCP server (§7): one command at a time (`runners`, `run`,
+`output`, `stop`), or a program that runs commands on several machines at once and returns only what
+matters (`code_run`), so Claude Code, Codex or any harness that takes MCP servers can decide for
+itself to build or test elsewhere.
 
 ## 1. Pieces
 
@@ -148,26 +150,49 @@ unchanged tree 0.5 s.
 `<runtime dir>/kiln/reach-<runner>-<hash>.sock` (`0600` in a `0700` folder), beside `kiln spawn`'s.
 Terminals and agents kiln starts get it as `KILN_REACH_SOCK`; elsewhere `kiln run` finds the only
 one on the machine. One connection is one request (`local::Req`) answered by a stream of
-`local::Ev`.
+`local::Ev`. `Req::Ask` carries an agent's question for the kiln server (kiln's operations, §7)
+over the runner's own connection (`AgentMsg::ReachAsk`), answered with `Ev::Answer`.
 
 ## 7. Agents
 
-kiln gives every agent it starts on a runner the `kiln-reach` MCP server (`kiln reach mcp`):
-Claude Code through `--mcp-config`, Codex through `-c mcp_servers.kiln_reach.*`. Its instructions
-name the kiln's machines (asked of the runner when the server starts) and tell the model when reach
-helps. When a step has to happen on another machine, such as the person's Mac, the agent runs it
-there itself rather than handing the person a command to type. When the step needs a person at that
-machine (a password, a system dialog to allow), the agent starts it and says what will appear. Reach
-also serves builds and tests that need another platform or more power. Its tools:
+kiln gives every agent it starts on a runner its own MCP server, `kiln` (`kiln reach mcp`, run by
+the runner's kiln): Claude Code through `--mcp-config` (with kiln's skills through `--plugin-dir`),
+Codex through `-c mcp_servers.kiln.*` (with a tool timeout as long as a program may run, where Codex
+otherwise gives up after 60 s), and ACP agents (Gemini CLI, opencode, Goose, Amp) through their
+session's `mcpServers`. Antigravity's headless mode takes no MCP servers; its agents use `kiln run`
+from their shell. Its instructions name the kiln's machines (asked of the runner when the server
+starts) and tell the model when reach helps. When a step has to happen on another machine, such as
+the person's Mac, the agent runs it there itself rather than handing the person a command to type.
+When the step needs a person at that machine (a password, a system dialog to allow), the agent
+starts it and says what will appear. Reach also serves builds and tests that need another platform
+or more power. Its tools:
 
 | tool | does |
 | --- | --- |
+| `code_run` | a JavaScript program against kiln (below); only what it returns comes back |
+| `code_search` | a program over the operations a program may call, and kiln's skills |
 | `runners` | the machines, best first for `want` |
 | `run` | a command on `on` (default: the session's preference, else the best), synced first; returns exit code and output (the middle cut past 30k characters), or an id with `background` |
 | `output` | a background run's new output, and whether it ended |
 | `stop` | stop a background run |
 
-The timeline shows a `run` as the command itself, with its output, its exit code and "on beta".
+**Code mode.** A program runs in the same bounded QuickJS sandbox as the server's code mode
+(`mcp/code.rs`), here on the runner. `kiln.machines.run({on, command})` runs a command as `run` does
+and resolves when it ends with `{runner, exit_code, output}` (a command that fails resolves with its
+exit code; a machine that can't be reached rejects). Calls run side by side, up to 16 at once, so
+`await Promise.all([...])` builds on the Mac and on Linux at the same time. Also
+`kiln.machines.list`, `.start` (in the background), `.output` and `.stop`. kiln's own operations
+(`kiln.ci.*`, `kiln.cd.*`, as `code_search` lists them) go to the server through the runner's own
+connection (`Req::Ask` → `AgentMsg::ReachAsk`, `mcp::runner_ask`), for the session: it must be one
+the server knows on that runner, and not a job's runner. The session acts for whoever started it
+(their rights, or the owner's), audited as `agent:<session>@<runner> for <them>`; on a kiln nobody
+but the owner signs in to, a session kiln doesn't know the starter of acts for the owner, and on
+others it can't call kiln's operations. A program has 10 minutes unless `timeout_s` says otherwise
+(at most an hour), 4 MiB per answer; runs it waited on and left behind are stopped. Its skills are
+the MCP server's resources too.
+
+The timeline shows a `run` as the command itself, with its output, its exit code and "on beta", and a
+program by its first line.
 
 Per agent (New agents → More → Commands; `Spec.reach`): any runner it needs (the default), a
 runner or platform it prefers (`run` goes there unless the agent says otherwise), or only its own
@@ -224,6 +249,9 @@ agent stays where it is.
 - A direct runner-to-runner path when two runners can reach each other (the link would move to it
   and keep its session); today every link goes through the server.
 - Pinning fingerprints from the UI (today: `kiln reach status`, `kiln reach forget`).
-- Windows runners as the doing side (the process side is there; the local socket is Unix-only).
+- Windows runners as the doing side (the process side is there; the local socket is Unix-only), and
+  so `kiln run` and the `kiln` MCP server for agents on Windows runners.
+- Agents that agents start (`kiln spawn`): kiln doesn't record whom they act for yet, so on a kiln
+  others sign in to they can't call kiln's operations (the machines they can).
 - Moving agents of ACP harnesses (Gemini, opencode, goose, amp): their sessions are the harness's own.
 - Moving the tasks an agent left running (shells, monitors): they stay, and stop, where they were.

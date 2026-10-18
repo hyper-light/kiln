@@ -102,11 +102,15 @@ kiln machines · kiln tokens create|list|revoke · kiln api GET /api/runs
   - diffs, stacks, comments and reviews;
   - asking the user (the choices dialog) and starting experiments.
   Logs and artifacts are also MCP resources (`kiln://runs/<id>/logs`).
-- **Agents kiln starts get it automatically:**
+- **Agents kiln starts get it automatically,** on every runner: the runner's own `kiln` server
+  (`kiln reach mcp`, docs/reach.md §7), with code mode over the kiln's machines and these
+  operations, which it asks of the server through the runner's own connection.
   - Claude Code through `--mcp-config`;
   - Codex through its configuration;
   - ACP agents through session parameters.
-  Each is given its own agent token, so every call is audited under the agent, on behalf of its user.
+  Each acts for whoever started it (with their rights), so every call is audited under the agent,
+  on behalf of its user (`agent:<session>@<runner> for <user>`). Agents the server itself starts get
+  `/api/mcp` with a token of their own.
 
 ## Audit
 

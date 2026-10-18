@@ -1576,6 +1576,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
             },
             None => {
                 let mut adapter = kind.adapter(&spec);
+                adapter.offer_mcp(super::kinds::acp_servers(&spec, &s.id));
                 if let Some(items) = &seed {
                     adapter.seed(items.clone());
                 }
@@ -1584,7 +1585,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // Marked as this session's, and so is everything it starts (`survivors`).
                     None => kind
-                        .launch(&spec)
+                        .launch(&spec, &s.id)
                         .map(|mut p| {
                             p.env(super::survivors::MARK, &s.id);
                             p

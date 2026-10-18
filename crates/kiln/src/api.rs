@@ -2793,6 +2793,7 @@ struct HarnessOpen {
 }
 
 async fn harness_open(hub: &Hub, req: Request) -> R {
+    let opener = caller_of(hub, req.headers()).await.and_then(|c| c.opener());
     let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // Ending a process found running is asked for with a take-over, never with a spec.
     body.spec.takeover_stop = false;
@@ -2809,6 +2810,12 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     }
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let infos = hub.harness.open(hub, &body.target, body.spec, body.count.unwrap_or(1)).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`).
+    if let Some(o) = &opener {
+        for i in &infos {
+            let _ = hub.store.kv_set(crate::mcp::opener_key(&i.id), o.clone()).await;
+        }
+    }
     Ok(srv::json(StatusCode::OK, &infos))
 }
 

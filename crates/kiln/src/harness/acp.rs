@@ -103,6 +103,9 @@ pub struct Acp {
     befores: HashMap<String, Vec<(String, Option<String>)>>,
     /// kiln's Bypass: every request to go ahead is answered yes by kiln, at once.
     bypass: bool,
+    /// The MCP servers its session is given (kiln's own, `crate::reach::mcp`).
+    #[serde(default)]
+    mcp: Vec<Value>,
 }
 
 /// kiln's own permission modes, for agents whose own all keep their checks: kiln asks you, or
@@ -137,7 +140,13 @@ impl Acp {
             notice_seq: 0,
             befores: HashMap::new(),
             bypass: false,
+            mcp: Vec::new(),
         }
+    }
+
+    /// Its session gets these MCP servers (ACP's `mcpServers`, stdio).
+    pub fn offer_mcp(&mut self, servers: Vec<Value>) {
+        self.mcp = servers;
     }
 
     /// Starts in this mode: kiln's Bypass goes on at once (the agent's own modes it is told of).
@@ -521,13 +530,13 @@ impl Acp {
                     Some(sid) => {
                         self.session = Some(sid.clone());
                         core.state.harness_session = Some(sid.clone());
-                        self.request(core, Pending::Session, "session/load", json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}));
+                        self.request(core, Pending::Session, "session/load", json!({"sessionId": sid, "cwd": cwd, "mcpServers": self.mcp}));
                     }
                     None => {
                         if self.resume.is_some() {
                             self.notice(core, Level::Warn, "This agent cannot load earlier sessions; starting a new one.");
                         }
-                        self.request(core, Pending::Session, "session/new", json!({"cwd": cwd, "mcpServers": []}));
+                        self.request(core, Pending::Session, "session/new", json!({"cwd": cwd, "mcpServers": self.mcp}));
                     }
                 }
             }

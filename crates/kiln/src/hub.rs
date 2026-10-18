@@ -1014,12 +1014,26 @@ impl Hub {
                 }
             }
             AgentMsg::ReachAsk { req, json } => {
-                let op = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v.get("op").and_then(serde_json::Value::as_str).map(str::to_owned));
-                let answer = match op.as_deref() {
-                    Some("directory") => serde_json::json!({ "runners": self.reach_directory() }),
-                    _ => serde_json::json!({ "error": "unknown reach question" }),
-                };
-                self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                let ask = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
+                match ask.get("op").and_then(serde_json::Value::as_str) {
+                    Some("directory") => {
+                        let answer = serde_json::json!({ "runners": self.reach_directory() });
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    }
+                    // An agent's MCP server on the runner asks for kiln's operations: answered on
+                    // their own, so a slow one holds up nothing else the runner says.
+                    Some("registry" | "call") => {
+                        let (hub, runner) = (Arc::clone(self), agent.clone());
+                        crate::rt::spawn(async move {
+                            let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;
+                            hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                        });
+                    }
+                    _ => {
+                        let answer = serde_json::json!({ "error": "unknown reach question" });
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    }
+                }
             }
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),

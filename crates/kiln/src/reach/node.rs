@@ -46,6 +46,8 @@ const DEAD_AFTER: Duration = Duration::from_secs(45);
 const DIRECTORY_TTL: Duration = Duration::from_secs(30);
 /// A peer with nothing to follow keeps its link this long.
 const IDLE_LINK: Duration = Duration::from_secs(300);
+/// A question for the server an agent's tools asked ([`Handle::query`]) is given up after this.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -128,6 +130,8 @@ pub enum Local {
     Forget { runner: String, reply: oneshot::Sender<bool> },
     /// Follow a hand-over to `peer` (what it says goes to `says`); answers with its id.
     AdoptFollow { peer: String, says: Says, reply: oneshot::Sender<u64> },
+    /// A question for the server (JSON), answered with its answer (JSON).
+    Query { json: String, reply: oneshot::Sender<anyhow::Result<String>> },
 }
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
@@ -219,6 +223,12 @@ impl Handle {
 
     pub async fn forget(&self, runner: &str) -> anyhow::Result<bool> {
         self.ask(|reply| Local::Forget { runner: runner.to_owned(), reply }).await
+    }
+
+    /// Ask the kiln server `json` ([`crate::proto::AgentMsg::ReachAsk`]: an agent's MCP server
+    /// asking for kiln's operations, `crate::mcp::runner_ask`), and wait for its answer.
+    pub async fn query(&self, json: String) -> anyhow::Result<String> {
+        self.ask(|reply| Local::Query { json, reply }).await?
     }
 
     /// Hand `data` to `peer` to take over (an agent session moving there), and wait until it has,
@@ -321,6 +331,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         server: false,
         directory: None,
         asked: HashMap::new(),
+        queries: HashMap::new(),
         next_req: 1,
         waiting: Vec::new(),
         links: HashMap::new(),
@@ -499,6 +510,8 @@ struct Node {
     server: bool,
     directory: Option<(Instant, Vec<RunnerInfo>)>,
     asked: HashMap<u64, Instant>,
+    /// Questions local tools asked the server, waiting for its answers.
+    queries: HashMap<u64, (Instant, oneshot::Sender<anyhow::Result<String>>)>,
     next_req: u64,
     waiting: Vec<(Instant, Waiting)>,
     links: HashMap<String, Link>,
@@ -524,6 +537,9 @@ impl Node {
                         if let Waiting::Directory(reply) = w {
                             let _ = reply.send(Err(anyhow::anyhow!("not connected to the kiln server")));
                         }
+                    }
+                    for (_, (_, reply)) in std::mem::take(&mut self.queries) {
+                        let _ = reply.send(Err(anyhow::anyhow!("the connection to the kiln server dropped before it answered")));
                     }
                 } else {
                     // Back: everyone with something to do reconnects now.
@@ -570,6 +586,10 @@ impl Node {
     }
 
     async fn on_answer(&mut self, req: u64, json: &str) {
+        if let Some((_, reply)) = self.queries.remove(&req) {
+            let _ = reply.send(Ok(json.to_owned()));
+            return;
+        }
         if self.asked.remove(&req).is_none() {
             return;
         }
@@ -1344,6 +1364,16 @@ impl Node {
 
     async fn on_local(&mut self, l: Local) {
         match l {
+            Local::Query { json, reply } => {
+                if !self.server {
+                    let _ = reply.send(Err(anyhow::anyhow!("not connected to the kiln server")));
+                    return;
+                }
+                let req = self.next_req;
+                self.next_req += 1;
+                self.queries.insert(req, (Instant::now(), reply));
+                self.send_out(AgentMsg::ReachAsk { req, json }).await;
+            }
             Local::Directory { reply } => {
                 if let Some(d) = self.fresh_directory() {
                     let _ = reply.send(Ok(d.to_vec()));
@@ -1465,6 +1495,12 @@ impl Node {
         let now = Instant::now();
         // Questions and waits that went unanswered.
         self.asked.retain(|_, at| at.elapsed() < Duration::from_secs(10));
+        let late: Vec<u64> = self.queries.iter().filter(|(_, (at, _))| at.elapsed() >= QUERY_TIMEOUT).map(|(r, _)| *r).collect();
+        for r in late {
+            if let Some((_, reply)) = self.queries.remove(&r) {
+                let _ = reply.send(Err(anyhow::anyhow!("the kiln server didn't answer in {} minutes", QUERY_TIMEOUT.as_secs() / 60)));
+            }
+        }
         let mut stale = Vec::new();
         self.waiting.retain_mut(|(at, w)| {
             if at.elapsed() < Duration::from_secs(10) {
