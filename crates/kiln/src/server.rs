@@ -138,13 +138,15 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     child!("sync", h => h.sync_loop());
     if cfg.observe.enabled {
         let days = |d: u32| std::time::Duration::from_secs(u64::from(d.max(1)) * 86_400);
-        crate::observe::api::set_global(crate::observe::Observe::start(crate::observe::Settings {
+        let obs = crate::observe::Observe::start(crate::observe::Settings {
             dir: cfg.data("observe"),
             role: crate::observe::Role::Server { key: hub.admin_token.clone() },
             metrics_retention: days(cfg.observe.metrics_retention_days),
             logs_retention: days(cfg.observe.logs_retention_days),
             max_series: cfg.observe.max_series,
-        }));
+        });
+        crate::observe::host::start(obs.clone(), crate::os::hostname(), "server", std::time::Duration::from_secs(u64::from(cfg.observe.host_seconds)));
+        crate::observe::api::set_global(obs);
         child!("observe", h => crate::observe::hub::send_loop(h));
         match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {
             Ok(t) => crate::observe::api::set_ingest_token(t),

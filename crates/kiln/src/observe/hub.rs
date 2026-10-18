@@ -83,19 +83,3 @@ pub fn host_sample(machine: &str, s: &HostSample) {
     let series: Vec<(SeriesKey, Vec<(i64, f64)>)> = points.iter().filter_map(|&(metric, kind, v)| SeriesKey::new(metric, host, kind).ok().map(|k| (k, vec![(ts, v)]))).collect();
     o.write(series);
 }
-
-/// This process's own figures (`kiln.process.*`, tagged with its machine and role): its memory,
-/// CPU time, open files and threads, written each host sample.
-pub fn process_figures(o: &super::Observe, host: &str, role: &str) {
-    let p = crate::host::process_self();
-    let ts = crate::util::now_ms();
-    let tags = [("host", host), ("role", role)];
-    #[allow(clippy::cast_precision_loss)]
-    let points: [(&str, Kind, f64); 4] = [
-        ("kiln.process.rss_bytes", Kind::Gauge, p.rss_bytes as f64),
-        ("kiln.process.cpu_seconds", Kind::Counter, p.cpu_seconds),
-        ("kiln.process.open_fds", Kind::Gauge, p.open_fds as f64),
-        ("kiln.process.threads", Kind::Gauge, p.threads as f64),
-    ];
-    o.write(points.iter().filter_map(|&(metric, kind, v)| SeriesKey::new(metric, tags, kind).ok().map(|k| (k, vec![(ts, v)]))).collect());
-}

@@ -383,11 +383,14 @@ pub struct Observe {
     pub logs_retention_days: u32,
     /// The most series the group holds (0: no bound); past it, new series are refused and counted.
     pub max_series: u64,
+    /// How often the server looks at its own host, container and process (`crate::observe::host`;
+    /// 0: never). Runners look as often as `KILN_OBSERVE_HOST_SECONDS` says, 15 unless it does.
+    pub host_seconds: u32,
 }
 
 impl Default for Observe {
     fn default() -> Self {
-        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, max_series: 0 }
+        Self { enabled: true, metrics_retention_days: 455, logs_retention_days: 15, max_series: 0, host_seconds: 15 }
     }
 }
 

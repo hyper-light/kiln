@@ -99,6 +99,9 @@ sample_seconds = 3600
 
 [observe]
 enabled = true
+# Each node looks at its host once, as it starts, and then not for an hour: the test's writes are the
+# writes.
+host_seconds = 3600
 "#,
             data = data.display()
         );
@@ -146,6 +149,7 @@ enabled = true
             .command(&dir.join("home"))?
             .args(["agent", "--server", &format!("http://127.0.0.1:{}", self.http), "--token", &join, "--name", name, "--slots", "1", "--no-terminal", "--no-reach"])
             .env("KILN_OTLP_ADDR", format!("127.0.0.1:{otlp}"))
+            .env("KILN_OBSERVE_HOST_SECONDS", "3600")
             .arg("--state-dir")
             .arg(dir.join("state"))
             .arg("--work-dir")

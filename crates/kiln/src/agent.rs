@@ -290,6 +290,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             max_series: 0,
         });
         crate::observe::api::set_global(obs.clone());
+        // This machine's own figures, as the server's are.
+        let every = std::env::var("KILN_OBSERVE_HOST_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).map_or(crate::observe::host::EVERY, Duration::from_secs);
+        crate::observe::host::start(obs.clone(), name.clone(), "runner", every);
         // Apps on this machine send OTLP here, as to a collector.
         if let Some(addr) = crate::observe::otlp::local_addr() {
             crate::rt::spawn(crate::observe::otlp::serve_local(addr, obs.clone(), shutdown.clone()));
@@ -1091,9 +1094,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     let s = sampler.sample();
                     uplink.msg(AgentMsg::Sample(s)).await;
-                    if let Some(ob) = &observe {
-                        crate::observe::hub::process_figures(ob, &name, "runner");
-                    }
                     if let Some(ai) = &ai {
                         let shells = terms.iter().filter_map(|(id, (pty, _))| Some((pty.pid()?, id.clone()))).collect();
                         ai.scan(shells, uplink.0.clone());

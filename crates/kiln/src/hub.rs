@@ -351,15 +351,10 @@ impl Hub {
         }
         if agent != "server" {
             metrics::agent_samples().write().insert(agent.to_owned(), s.clone());
-            crate::observe::hub::host_sample(agent, &s);
-        } else {
-            let host = crate::os::hostname();
-            // The server's machine, unless its own runner reports it already.
-            if !self.cfg.local_agent.enabled {
-                crate::observe::hub::host_sample(&host, &s);
-            }
-            if let Some(o) = crate::observe::api::get() {
-                crate::observe::hub::process_figures(o, &host, "server");
+            // A runner too old to report its own figures (`crate::observe::host`): its samples, as
+            // metrics. The server's own machine reports itself.
+            if self.instances.lock().newest_with(agent, proto::CAP_OBSERVE).is_none() {
+                crate::observe::hub::host_sample(agent, &s);
             }
         }
         self.emit(&serde_json::json!({"type": "sample", "agent": agent, "sample": s}));
