@@ -164,7 +164,16 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 /* The state word keeps the width of its longest ("Needs you"), so "Ready" turning "Working" as a
    turn starts doesn't move the rest of the row. */
 .ag-state > .st-word {
-  min-width: calc(14px + 9ch + 0.2em);
+  min-width: calc(22px + 9ch + 0.2em);
+}
+/* Its dot sits in a column as wide as the turn's mark above it, centred under it, so the two rows'
+   marks and words line up. */
+.ag-state > .st-word > i {
+  margin: 0 4px;
+}
+/* Between turns there's no mark: the words start where the state's do. */
+.ag-turn-row > .ag-turn-idle {
+  padding-left: 22px;
 }
 /* The turn has a row of its own above the state, there between turns too and always as tall, so
    nothing moves as a turn starts or ends; what's in it (a taller word, the offer to force a stop)
@@ -761,6 +770,22 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 }
 .hx-turn .hx-work {
   border-top: 0;
+}
+/* The end of a turn under way while nothing at its end moves: what it's doing, and for how long
+   since its last step. */
+.hx-live-tail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 2px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.hx-live-tail .sg-label {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: none;
 }
 .hx-turn .hx-note,
 .hx-turn .hx-outcome {

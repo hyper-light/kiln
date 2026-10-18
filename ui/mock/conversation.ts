@@ -232,7 +232,10 @@ const meta: Meta = {
     { id: "claude-sonnet-5", label: "claude-sonnet-5" },
   ],
   efforts: ["low", "medium", "high", "max"].map((id) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1) })),
-  commands: [{ name: "compact", description: "Summarize the conversation to free context", group: "Context", args: "optional", route: { kind: "prompt" } }],
+  commands: [
+    { name: "compact", description: "Summarize the conversation to free context", group: "Context", args: "optional", route: { kind: "prompt" } },
+    { name: "login", description: "Sign in to Claude Code on this machine", group: "Account", args: "none", route: { kind: "view", view: "login" } },
+  ],
   agents: [],
   features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments"],
 };
@@ -289,10 +292,23 @@ let step = 0;
 let timer: NodeJS.Timeout | null = null;
 
 /** While anyone watches: the reply streams, and now and then it stops to take a step and goes on after it (as a harness's turn does). */
+/** After a step it thinks a while, saying nothing (as a model does after a tool call). */
+let thinkingUntil = 0;
+
 function tick() {
   if (viewers.size === 0 || PAUSED) {
     timer = null;
     return;
+  }
+  if (Date.now() < thinkingUntil) {
+    timer = setTimeout(tick, 140);
+    return;
+  }
+  if (!live.streaming) {
+    live = add({ id: `L-a-live-${step}`, at: Date.now(), kind: "assistant", text: "", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
+    broadcast({ t: "events", events: [{ ...live }] });
+    doing = "Writing";
+    broadcast({ t: "state", state: state() });
   }
   const word = `${WORDS[w % WORDS.length]} `;
   w += 1;
@@ -317,10 +333,10 @@ function tick() {
       ended: at + 120,
     });
     const done = { ...live };
-    live = add({ id: `L-a-live-${step}`, at: at + 200, kind: "assistant", text: "", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
-    broadcast({ t: "events", events: [done, e, { ...live }] });
+    broadcast({ t: "events", events: [done, e] });
     activity = step % 2 ? "Reading files" : "Running cargo test";
-    doing = step % 2 ? "Thinking" : activity;
+    doing = "Thinking";
+    thinkingUntil = Date.now() + 4_000;
     broadcast({ t: "state", state: state() });
   }
   timer = setTimeout(tick, 140);

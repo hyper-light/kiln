@@ -15,6 +15,7 @@
 import * as React from "react";
 import { flushSync } from "react-dom";
 import { ArrowUpRight, Check, ChevronRight, Copy, TriangleAlert, X } from "lucide-react";
+import { Dialog as D } from "radix-ui";
 import { accountsApi, type Account, type AccountFlow, type AccountMethod } from "@/api/harness";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { errorMessage } from "@/lib/hooks";
@@ -947,9 +948,45 @@ export interface AccountCardProps {
   /** Shows a close button; closing stops a sign-in still under way. */
   onClose?: () => void;
   className?: string;
+  /** Closing it from outside (its dialog dismissed), and whether a step of it is open. */
+  ref?: React.Ref<AccountCardHandle>;
 }
 
-export function AccountCard({ target, kind, intent, compact = false, onClose, className }: AccountCardProps) {
+export interface AccountCardHandle {
+  close: () => void;
+  stepOpen: () => boolean;
+}
+
+/** The machine's accounts in a dialog: opened from the conversation (/login, /logout), where laid
+ *  out in it they crowded a phone's screen. Dismissing it closes the card as its own close does
+ *  (a sign-in still under way stops); Escape closes an open step first. */
+export function AccountDialog({ target, kind, intent, onClose }: { target: string; kind: string; intent?: AccountIntent; onClose: () => void }) {
+  const card = React.useRef<AccountCardHandle | null>(null);
+  return (
+    <D.Root
+      open
+      onOpenChange={(open) => {
+        if (!open) (card.current?.close ?? onClose)();
+      }}
+    >
+      <D.Portal>
+        <D.Overlay className="overlay" />
+        <D.Content
+          className="dialog ac-dialog"
+          aria-describedby={undefined}
+          onEscapeKeyDown={(e) => {
+            if (card.current?.stepOpen()) e.preventDefault();
+          }}
+        >
+          <D.Title className="sr-only">Accounts on {machineName(target)}</D.Title>
+          <AccountCard ref={card} target={target} kind={kind} intent={intent} onClose={onClose} />
+        </D.Content>
+      </D.Portal>
+    </D.Root>
+  );
+}
+
+export function AccountCard({ target, kind, intent, compact = false, onClose, className, ref }: AccountCardProps) {
   const view = useMachine(target);
   const shown = React.useCallback(
     (el: HTMLElement | null) => {
@@ -1009,10 +1046,6 @@ export function AccountCard({ target, kind, intent, compact = false, onClose, cl
   const asked = intent === "logout" ? { kind, what: "signout" as const } : intent === "login" && !(compact && signedIn) ? { kind, what: "signin" as const } : null;
   const open = chosen === undefined ? asked : chosen;
 
-  // Under a message, a card that can't read the machine's accounts says nothing (the message stands);
-  // opened with /login it says why, with a way to try again.
-  if (compact && listError) return null;
-
   const close = () => {
     for (const r of rows) {
       const e = view.flows[r.kind];
@@ -1021,6 +1054,11 @@ export function AccountCard({ target, kind, intent, compact = false, onClose, cl
     }
     onClose?.();
   };
+  React.useImperativeHandle(ref, () => ({ close, stepOpen: () => open !== null }));
+
+  // Under a message, a card that can't read the machine's accounts says nothing (the message stands);
+  // opened with /login it says why, with a way to try again.
+  if (compact && listError) return null;
 
   return (
     <section
