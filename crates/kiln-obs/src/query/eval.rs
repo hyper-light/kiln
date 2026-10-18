@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use super::calendar::{self, Calendar};
 use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, Rollup, SpaceAgg, parse};
 use crate::anomaly::{Algorithm, Scorer};
 use crate::batch::Kind;
@@ -71,17 +72,92 @@ impl<'a> Request<'a> {
     }
 }
 
-/// A time grid: `n` buckets of `step` milliseconds from `from`.
+/// A time grid: `n` buckets of `step` milliseconds from `from`; or, for a calendar rollup, `n` of a
+/// calendar's periods from its `k`th (`from` that one's start, `step` the period's usual length:
+/// the step a function goes by where it wants one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grid {
     pub from: i64,
     pub step: i64,
     pub n: usize,
+    pub calendar: Option<(Calendar, i64)>,
 }
 
 impl Grid {
+    pub fn uniform(from: i64, step: i64, n: usize) -> Self {
+        Self { from, step, n, calendar: None }
+    }
+
+    /// Bucket `i`'s start (`n`'s: the last one's end).
     pub fn time(&self, i: usize) -> i64 {
-        self.from + self.step * i as i64
+        match self.calendar {
+            None => self.from + self.step * i as i64,
+            Some((c, k)) => c.start(&c.zone.tz(), k + i as i64).unwrap_or(self.from + self.step * i as i64),
+        }
+    }
+
+    /// The grid begun `e` buckets earlier.
+    fn earlier(&self, e: usize) -> Self {
+        let n = self.n + e;
+        match self.calendar {
+            None => Self { from: self.from - self.step * e as i64, n, ..*self },
+            Some((c, k)) => {
+                let k = k - e as i64;
+                Self { from: c.start(&c.zone.tz(), k).unwrap_or(self.from - self.step * e as i64), n, calendar: Some((c, k)), ..*self }
+            }
+        }
+    }
+
+    /// A calendar grid's edges, shifted by `off`: each bucket's start and the last one's end.
+    pub fn edges(&self, off: i64) -> Option<Vec<i64>> {
+        let (c, k) = self.calendar?;
+        let tz = c.zone.tz();
+        Some((0..=self.n as i64).map(|i| c.start(&tz, k + i).map_or(i64::MAX, |t| t.saturating_add(off))).collect())
+    }
+}
+
+/// Where a time's bucket is and how wide each bucket is: a uniform grid's arithmetic, or a
+/// calendar's edges (`Grid::edges`).
+#[derive(Debug, Clone, Copy)]
+struct Spans<'a> {
+    from: i64,
+    step: i64,
+    n: usize,
+    edges: Option<&'a [i64]>,
+}
+
+impl<'a> Spans<'a> {
+    fn new(grid: Grid, off: i64, edges: Option<&'a [i64]>) -> Self {
+        Self { from: grid.from.saturating_add(off), step: grid.step.max(1), n: grid.n, edges }
+    }
+
+    /// Bucket `i`'s start (`n`'s: the end).
+    fn start(&self, i: usize) -> i64 {
+        match self.edges {
+            Some(e) => e.get(i).copied().unwrap_or(i64::MAX),
+            None => self.from.saturating_add(self.step.saturating_mul(i as i64)),
+        }
+    }
+
+    fn index(&self, t: i64) -> Option<usize> {
+        match self.edges {
+            // The last edge at or before `t` begins its bucket (an empty period's, a day a
+            // timezone skipped, is passed over), unless that edge is the end.
+            Some(e) => e.partition_point(|&x| x <= t).checked_sub(1).filter(|&i| i < self.n),
+            None if t < self.from => None,
+            None => usize::try_from((t - self.from) / self.step).ok().filter(|&i| i < self.n),
+        }
+    }
+
+    fn width_ms(&self, i: usize) -> i64 {
+        match self.edges {
+            Some(_) => self.start(i + 1).saturating_sub(self.start(i)),
+            None => self.step,
+        }
+    }
+
+    fn width_s(&self, i: usize) -> f64 {
+        self.width_ms(i) as f64 / 1000.0
     }
 }
 
@@ -97,6 +173,8 @@ pub struct Series {
     pub tags: Vec<(String, String)>,
     pub values: Vec<f64>,
     pub bounds: Option<Box<Bounds>>,
+    /// An `outliers()` series': whether it is an outlier of its group over the range.
+    pub outlier: Option<bool>,
 }
 
 /// Which side of a band is anomalous.
@@ -181,10 +259,10 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
         return Err(QueryError::EmptyRange);
     }
     let grid = grid_for(&ast, req)?;
-    let offsets = offsets(&ast)?;
+    let shifts = shifts(&ast)?;
     let ext = extensions(&ast, grid, req.now);
     // A node's grid: the answer's, begun `ext` buckets earlier beneath `anomalies()`.
-    let at = |e: usize| Grid { from: grid.from - grid.step * e as i64, step: grid.step, n: grid.n + e };
+    let at = |e: usize| grid.earlier(e);
     let mut values: Vec<Option<Value>> = vec![None; ast.nodes.len()];
     let mut scanned = (0u64, 0u64);
     let mut scratch = Scratch::default();
@@ -195,8 +273,9 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
             Node::Str(s) => Value::Str(s.clone()),
             Node::Named(k, v) => Value::Named(k.clone(), v.clone()),
             Node::Metric(q) => {
-                let off = offsets.get(id).copied().unwrap_or(0);
-                Value::Set(metric(store, q, at(ext.get(id).copied().unwrap_or(0)), off, req.max_series, &mut scratch, &mut scanned)?)
+                let g = at(ext.get(id).copied().unwrap_or(0));
+                let edges = reading(g, shifts.get(id).map_or(&[], Vec::as_slice), req.to)?;
+                Value::Set(metric(store, q, g, Spans::new(g, edges.0, edges.1.as_deref()), req.max_series, &mut scratch, &mut scanned)?)
             }
             Node::Neg(x) => match take(&mut values, *x)? {
                 Value::Scalar(a) => Value::Scalar(-a),
@@ -225,6 +304,10 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
                     anomalies(taken, inner.saturating_sub(own), at(own))?
                 } else if *f == Func::Forecast {
                     forecast(taken, at(own))?
+                } else if *f == Func::Pow {
+                    let mut it = taken.into_iter();
+                    let (Some(a), Some(b)) = (it.next(), it.next()) else { return Err(QueryError::Invalid("pow(a, b)".into())) };
+                    binary(BinOp::Pow, a, b)?
                 } else {
                     if taken.iter().any(|v| matches!(v, Value::Named(..))) {
                         return Err(QueryError::Invalid(format!("{f:?} takes no named arguments (forecast() does)")));
@@ -252,6 +335,29 @@ pub fn eval(store: &Store, req: &Request<'_>) -> Result<Answer, QueryError> {
 /// The grid: the step asked, or the smallest nice step that fits the range in the points asked,
 /// and never finer than a rollup the query names; `from` aligned down to it.
 fn grid_for(ast: &Ast, req: &Request<'_>) -> Result<Grid, QueryError> {
+    let mut calendars = ast.nodes.iter().filter_map(|n| match n {
+        Node::Metric(m) => m.calendar,
+        _ => None,
+    });
+    if let Some(c) = calendars.next() {
+        // A calendar's periods are the grid: every calendar rollup the query names, the same one.
+        if calendars.any(|o| o != c) {
+            return Err(QueryError::Invalid("a query's calendar rollups must agree: one period, start and timezone".into()));
+        }
+        if ast.nodes.iter().any(|n| matches!(n, Node::Metric(m) if m.rollup.is_some_and(|r| r.1.is_some()))) {
+            return Err(QueryError::Invalid("a query with a calendar rollup takes no rollup in seconds".into()));
+        }
+        let tz = c.zone.tz();
+        let past = || QueryError::Invalid("a range past the calendar's years (±9999)".into());
+        let first = c.period(&tz, req.from).ok_or_else(past)?;
+        let last = c.period(&tz, req.to - 1).ok_or_else(past)?;
+        let n = usize::try_from(last - first + 1).unwrap_or(usize::MAX);
+        if n > MAX_POINTS {
+            return Err(QueryError::TooManyPoints(n));
+        }
+        c.start(&tz, last + 1).ok_or_else(past)?;
+        return Ok(Grid { from: c.start(&tz, first).ok_or_else(past)?, step: c.unit.nominal_ms(), n, calendar: Some((c, first)) });
+    }
     let range = req.to.saturating_sub(req.from);
     let rollup_ms = ast
         .nodes
@@ -277,38 +383,126 @@ fn grid_for(ast: &Ast, req: &Request<'_>) -> Result<Grid, QueryError> {
     if n > MAX_POINTS {
         return Err(QueryError::TooManyPoints(n));
     }
-    Ok(Grid { from, step, n })
+    Ok(Grid::uniform(from, step, n))
 }
 
-/// Each node's time offset in milliseconds: a `timeshift`'s, added to everything beneath it.
+/// A shift of the reading beneath a function: fixed (`timeshift`, `hour_before` …), or a calendar's
+/// (`calendar_shift`: the same local time some days or months before, in a timezone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shift {
+    Ms(i64),
+    Calendar { days: i64, months: i64, zone: calendar::Zone },
+}
+
+/// Each node's shifts, outermost first: a shifting function's, passed to everything beneath it.
 /// Parents come after their children in the arena, so one pass from the end visits a parent
 /// before its children.
-fn offsets(ast: &Ast) -> Result<Vec<i64>, QueryError> {
-    let mut off = vec![0i64; ast.nodes.len()];
+fn shifts(ast: &Ast) -> Result<Vec<Vec<Shift>>, QueryError> {
+    let mut all: Vec<Vec<Shift>> = vec![Vec::new(); ast.nodes.len()];
     for id in (0..ast.nodes.len()).rev() {
-        let here = off.get(id).copied().unwrap_or(0);
-        let (children, shift): (&[usize], i64) = match ast.nodes.get(id) {
-            Some(Node::Neg(x)) => (std::slice::from_ref(x), 0),
+        let here = all.get(id).cloned().unwrap_or_default();
+        let (children, shift): (&[usize], Option<Shift>) = match ast.nodes.get(id) {
+            Some(Node::Neg(x)) => (std::slice::from_ref(x), None),
             Some(Node::Bin(_, l, r)) => {
-                if let Some(o) = off.get_mut(*l) {
-                    *o = here;
+                if let Some(o) = all.get_mut(*l) {
+                    o.clone_from(&here);
                 }
-                (std::slice::from_ref(r), 0)
+                (std::slice::from_ref(r), None)
             }
             Some(Node::Call(Func::Timeshift, args)) => {
                 let secs = args.get(1).and_then(|&a| constant(ast, a)).ok_or_else(|| QueryError::Invalid("timeshift(query, seconds): the seconds a number".into()))?;
-                (args.get(..1).unwrap_or(&[]), (secs * 1000.0) as i64)
+                (args.get(..1).unwrap_or(&[]), Some(Shift::Ms((secs * 1000.0) as i64)))
             }
-            Some(Node::Call(_, args)) => (args.as_slice(), 0),
-            _ => (&[], 0),
+            // Datadog's: an hour, a day, a week, 28 days before.
+            Some(Node::Call(f @ (Func::HourBefore | Func::DayBefore | Func::WeekBefore | Func::MonthBefore), args)) => {
+                let back: i64 = match f {
+                    Func::HourBefore => 3_600_000,
+                    Func::DayBefore => 86_400_000,
+                    Func::WeekBefore => 7 * 86_400_000,
+                    _ => 28 * 86_400_000,
+                };
+                (args.get(..1).unwrap_or(&[]), Some(Shift::Ms(-back)))
+            }
+            Some(Node::Call(Func::CalendarShift, args)) => {
+                let text = |i: usize| match args.get(i).and_then(|&a| ast.nodes.get(a)) {
+                    Some(Node::Str(v)) => Some(v.as_str()),
+                    _ => None,
+                };
+                let zone = match text(2) {
+                    Some(tz) => calendar::Zone::named(tz).map_err(QueryError::Invalid)?,
+                    None => calendar::Zone::UTC,
+                };
+                let shift = text(1).ok_or_else(|| QueryError::Invalid("calendar_shift(query, '-1d'|'-2w'|'-1mo'[, 'America/New_York'])".into()))?;
+                let (days, months) = calendar_shift(shift)?;
+                (args.get(..1).unwrap_or(&[]), Some(Shift::Calendar { days, months, zone }))
+            }
+            Some(Node::Call(_, args)) => (args.as_slice(), None),
+            _ => (&[], None),
         };
         for &c in children {
-            if let Some(o) = off.get_mut(c) {
-                *o = here.saturating_add(shift);
+            if let Some(o) = all.get_mut(c) {
+                o.clone_from(&here);
+                o.extend(shift);
             }
         }
     }
-    Ok(off)
+    Ok(all)
+}
+
+/// Where a metric query beneath `shifts` reads on `grid`: a fixed offset (and a calendar grid's
+/// edges at it), or every bucket's edges shifted one by one.
+///
+/// A calendar shift on a calendar grid of its timezone, by whole periods of it (`-1d` of days,
+/// `-2w` of days or weeks, `-1mo` of months), reads the periods that many before: yesterday's
+/// local day, 23 hours or 25. Otherwise each edge moves to the same local time the days or months
+/// before; a month back from a month's last days lands on a shorter month's last more than once,
+/// out of order, so a shift of months that would is the one at the range's end (`to`), throughout.
+fn reading(grid: Grid, shifts: &[Shift], to: i64) -> Result<(i64, Option<Vec<i64>>), QueryError> {
+    if shifts.iter().all(|s| matches!(s, Shift::Ms(_))) {
+        let off = shifts.iter().map(|s| if let Shift::Ms(ms) = s { *ms } else { 0 }).fold(0i64, i64::saturating_add);
+        return Ok((off, grid.edges(off)));
+    }
+    let past = || QueryError::Invalid("a shift past the calendar's years (±9999)".into());
+    let mut edges = grid.edges(0).unwrap_or_else(|| (0..=grid.n).map(|i| grid.time(i)).collect());
+    // Whether the edges are still the grid's calendar's periods.
+    let mut periods = grid.calendar;
+    for &shift in shifts {
+        match shift {
+            Shift::Ms(ms) => {
+                edges.iter_mut().for_each(|e| *e = e.saturating_add(ms));
+                periods = None;
+            }
+            Shift::Calendar { days, months, zone } => {
+                let tz = zone.tz();
+                let whole = periods.filter(|(c, _)| c.zone == zone).and_then(|(c, k)| {
+                    let n = match (c.unit, days, months) {
+                        (calendar::Unit::Daily, d, 0) => d,
+                        (calendar::Unit::Weekly, d, 0) if d % 7 == 0 => d / 7,
+                        (calendar::Unit::Monthly, 0, m) => m,
+                        _ => return None,
+                    };
+                    Some((c, k - n))
+                });
+                if let Some((c, k)) = whole {
+                    for (i, e) in edges.iter_mut().enumerate() {
+                        *e = c.start(&tz, k + i as i64).ok_or_else(past)?;
+                    }
+                    periods = Some((c, k));
+                    continue;
+                }
+                periods = None;
+                let moved: Option<Vec<i64>> = edges.iter().map(|&e| calendar::shift_back(&tz, e, days, months).map(|d| e + d)).collect();
+                match moved {
+                    Some(m) if m.windows(2).all(|w| w.first() <= w.get(1)) => edges = m,
+                    _ => {
+                        let d = calendar::shift_back(&tz, to, days, months).ok_or_else(past)?;
+                        edges.iter_mut().for_each(|e| *e = e.saturating_add(d));
+                    }
+                }
+            }
+        }
+    }
+    Ok((0, Some(edges)))
 }
 
 /// Each node's history in buckets: beneath an `anomalies()`, the buckets of
@@ -399,7 +593,7 @@ fn anomalies(mut args: Vec<Value>, history: usize, grid: Grid) -> Result<Value, 
                 }
             }
         }
-        out.push(Series { tags: s.tags, values: now.to_vec(), bounds: Some(Box::new(Bounds { lower, upper, score, k, direction, algorithm: algorithm.as_str(), forecast_from: None })) });
+        out.push(Series { tags: s.tags, values: now.to_vec(), bounds: Some(Box::new(Bounds { lower, upper, score, k, direction, algorithm: algorithm.as_str(), forecast_from: None })) , outlier: None });
     }
     Ok(Value::Set(out))
 }
@@ -485,7 +679,7 @@ fn forecast_history(ast: &Ast, args: &[usize], grid: Grid, now: Option<i64>) -> 
     });
     let Ok(a) = forecast_args(positional, deviations, named) else { return 0 };
     let ahead = now.map_or(1, |now| {
-        let end = grid.from + grid.step * grid.n as i64;
+        let end = grid.time(grid.n);
         usize::try_from((end - now).max(0) / step).unwrap_or(0).max(1)
     });
     let buckets = if a.linear {
@@ -542,14 +736,14 @@ fn forecast(mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> {
         let total = s.values.len();
         let start = total.saturating_sub(grid.n);
         let Some(last) = s.values.iter().rposition(|v| v.is_finite()) else {
-            out.push(Series { tags: s.tags, values: s.values.get(start..).unwrap_or(&[]).to_vec(), bounds: None });
+            out.push(Series { tags: s.tags, values: s.values.get(start..).unwrap_or(&[]).to_vec(), bounds: None , outlier: None });
             continue;
         };
         let ahead = total - 1 - last;
         let fc = if ahead > 0 { s.values.get(..=last).and_then(|h| crate::forecast::forecast(h, algo, ahead)) } else { None };
         let mut values: Vec<f64> = s.values.get(start..).unwrap_or(&[]).to_vec();
         let Some(fc) = fc else {
-            out.push(Series { tags: s.tags, values, bounds: None });
+            out.push(Series { tags: s.tags, values, bounds: None , outlier: None });
             continue;
         };
         let (mut lower, mut upper) = (vec![f64::NAN; values.len()], vec![f64::NAN; values.len()]);
@@ -568,9 +762,258 @@ fn forecast(mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> {
         }
         let forecast_from = Some((last + 1).saturating_sub(start).min(values.len()));
         let score = vec![f64::NAN; values.len()];
-        out.push(Series { tags: s.tags, values, bounds: Some(Box::new(Bounds { lower, upper, score, k: a.deviations, direction: Direction::Both, algorithm, forecast_from })) });
+        out.push(Series { tags: s.tags, values, bounds: Some(Box::new(Bounds { lower, upper, score, k: a.deviations, direction: Direction::Both, algorithm, forecast_from })) , outlier: None });
     }
     Ok(Value::Set(out))
+}
+
+/// `top`'s ranking: each series by `by` (Datadog's: "area" the signed area, "l2norm" the norm), the
+/// first `n` in that order (`desc` the greatest first); a series with nothing to rank left out.
+fn ranked(set: Vec<Series>, n: usize, by: crate::query::parse::Rank, desc: bool) -> Vec<Series> {
+    use crate::query::parse::Rank;
+    let score = |s: &Series| -> f64 {
+        let vals = s.values.iter().copied().filter(|v| !v.is_nan());
+        match by {
+            Rank::Max => vals.reduce(f64::max).unwrap_or(f64::NAN),
+            Rank::Min => vals.reduce(f64::min).unwrap_or(f64::NAN),
+            Rank::Last => s.values.iter().rev().copied().find(|v| !v.is_nan()).unwrap_or(f64::NAN),
+            Rank::Sum | Rank::Area => vals.fold(None, |a: Option<f64>, v| Some(a.unwrap_or(0.0) + v)).unwrap_or(f64::NAN),
+            Rank::Norm => vals.fold(None, |a: Option<f64>, v| Some(a.unwrap_or(0.0) + v * v)).map_or(f64::NAN, f64::sqrt),
+            Rank::Mean => {
+                let (s, c) = vals.fold((0.0, 0u32), |(s, c), v| (s + v, c + 1));
+                if c == 0 { f64::NAN } else { s / f64::from(c) }
+            }
+        }
+    };
+    let mut scored: Vec<(f64, Series)> = set.into_iter().map(|s| (score(&s), s)).collect();
+    scored.sort_by(|a, b| {
+        let o = a.0.total_cmp(&b.0);
+        if desc { o.reverse() } else { o }
+    });
+    scored.into_iter().filter(|(s, _)| !s.is_nan()).take(n).map(|(_, s)| s).collect()
+}
+
+/// An exponentially weighted moving average, α = 2 / (span + 1): the span "twice the weighted
+/// average age" (Datadog's words; Hunter, J. Quality Technology 1986; pandas' `span`).
+fn ewma(set: &mut [Series], span: f64) {
+    let alpha = 2.0 / (span + 1.0);
+    for s in set {
+        let mut m = f64::NAN;
+        for v in &mut s.values {
+            if !v.is_nan() {
+                m = if m.is_nan() { *v } else { alpha * *v + (1.0 - alpha) * m };
+                *v = m;
+            }
+        }
+    }
+}
+
+/// A rolling function of the last `n` points (finite ones; a bucket without one stays without),
+/// as Datadog's smoothing functions read "the last 5 data points".
+fn rolling(values: &[f64], n: usize, mut f: impl FnMut(&mut Vec<f64>) -> f64) -> Vec<f64> {
+    let n = n.max(1);
+    let mut last: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(n);
+    let mut win: Vec<f64> = Vec::with_capacity(n);
+    values
+        .iter()
+        .map(|&v| {
+            if !v.is_finite() {
+                return f64::NAN;
+            }
+            if last.len() == n {
+                last.pop_front();
+            }
+            last.push_back(v);
+            win.clear();
+            win.extend(last.iter().copied());
+            f(&mut win)
+        })
+        .collect()
+}
+
+/// A line through the finite points, by bucket (`a + b·i`): least squares, or Huber's robust
+/// regression (`robust`: the loss quadratic within 1.345 of the residuals' scale and linear past it,
+/// 95% as efficient as least squares on normal errors; Huber, "Robust Statistics", 1981), fitted
+/// by iteratively reweighted least squares from the least-squares line, the scale the residuals'
+/// MAD (1.4826 of it).
+fn line(values: &[f64], robust: bool) -> Option<(f64, f64)> {
+    let pts: Vec<(f64, f64)> = values.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, &v)| (i as f64, v)).collect();
+    let fit = |w: &dyn Fn(usize) -> f64| -> Option<(f64, f64)> {
+        let (mut sw, mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (k, &(x, y)) in pts.iter().enumerate() {
+            let wk = w(k);
+            sw += wk;
+            sx += wk * x;
+            sy += wk * y;
+            sxx += wk * x * x;
+            sxy += wk * x * y;
+        }
+        let den = sw * sxx - sx * sx;
+        if sw <= 0.0 {
+            return None;
+        }
+        if den.abs() < f64::EPSILON * sw * sxx.max(1.0) {
+            return Some((sy / sw, 0.0));
+        }
+        let b = (sw * sxy - sx * sy) / den;
+        Some(((sy - b * sx) / sw, b))
+    };
+    let (mut a, mut b) = fit(&|_| 1.0)?;
+    if !robust || pts.len() < 3 {
+        return Some((a, b));
+    }
+    const HUBER_K: f64 = 1.345;
+    for _ in 0..50 {
+        let resid: Vec<f64> = pts.iter().map(|&(x, y)| y - a - b * x).collect();
+        let mut abs: Vec<f64> = resid.iter().map(|r| r.abs()).collect();
+        abs.sort_unstable_by(f64::total_cmp);
+        let mad = abs.get(abs.len() / 2).copied().unwrap_or(0.0);
+        let scale = crate::anomaly::MAD_NORMAL * mad;
+        if scale <= 0.0 {
+            break;
+        }
+        let w = |k: usize| resid.get(k).map_or(1.0, |r| (HUBER_K * scale / r.abs()).min(1.0));
+        let Some((na, nb)) = fit(&w) else { break };
+        let done = (na - a).abs() <= 1e-10 * (1.0 + a.abs()) && (nb - b).abs() <= 1e-10 * (1.0 + b.abs());
+        (a, b) = (na, nb);
+        if done {
+            break;
+        }
+    }
+    Some((a, b))
+}
+
+/// The series as constant segments: PELT's exact optimum of the squared error plus a penalty a
+/// change (Killick, Fearnhead and Eckley, "Optimal detection of changepoints with a linear
+/// computational cost", JASA 2012), the penalty BIC's, 2σ² ln n, σ from the first differences'
+/// MAD (√2 of a point's noise); each segment its mean, a bucket without a point left without.
+fn piecewise_constant(values: &[f64]) -> Vec<f64> {
+    let at: Vec<usize> = values.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, _)| i).collect();
+    let y: Vec<f64> = at.iter().filter_map(|&i| values.get(i).copied()).collect();
+    let n = y.len();
+    let mut out = vec![f64::NAN; values.len()];
+    if n == 0 {
+        return out;
+    }
+    let mut d: Vec<f64> = y.windows(2).filter_map(|w| Some((w.get(1)? - w.first()?).abs())).collect();
+    d.sort_unstable_by(f64::total_cmp);
+    let sigma = crate::anomaly::MAD_NORMAL * d.get(d.len() / 2).copied().unwrap_or(0.0) / std::f64::consts::SQRT_2;
+    let beta = 2.0 * sigma * sigma * (n.max(2) as f64).ln();
+    // Prefix sums: a segment's cost is its squared error about its mean.
+    let (mut s1, mut s2) = (Vec::with_capacity(n + 1), Vec::with_capacity(n + 1));
+    let (mut a1, mut a2) = (0.0, 0.0);
+    s1.push(0.0);
+    s2.push(0.0);
+    for &v in &y {
+        a1 += v;
+        a2 += v * v;
+        s1.push(a1);
+        s2.push(a2);
+    }
+    let cost = |a: usize, b: usize| -> f64 {
+        let (sum, sq) = (s1.get(b).copied().unwrap_or(0.0) - s1.get(a).copied().unwrap_or(0.0), s2.get(b).copied().unwrap_or(0.0) - s2.get(a).copied().unwrap_or(0.0));
+        (sq - sum * sum / (b - a) as f64).max(0.0)
+    };
+    let mut f = vec![0.0; n + 1];
+    if let Some(f0) = f.get_mut(0) {
+        *f0 = -beta;
+    }
+    let mut last = vec![0usize; n + 1];
+    let mut candidates: Vec<usize> = vec![0];
+    for t in 1..=n {
+        let (mut best, mut arg) = (f64::INFINITY, 0usize);
+        for &c in &candidates {
+            let v = f.get(c).copied().unwrap_or(0.0) + cost(c, t) + beta;
+            if v < best {
+                (best, arg) = (v, c);
+            }
+        }
+        if let (Some(ft), Some(lt)) = (f.get_mut(t), last.get_mut(t)) {
+            (*ft, *lt) = (best, arg);
+        }
+        // Pruning: a start that can no longer be optimal is dropped.
+        candidates.retain(|&c| f.get(c).copied().unwrap_or(0.0) + cost(c, t) <= best);
+        candidates.push(t);
+    }
+    let mut end = n;
+    while end > 0 {
+        let start = last.get(end).copied().unwrap_or(0);
+        let mean = (s1.get(end).copied().unwrap_or(0.0) - s1.get(start).copied().unwrap_or(0.0)) / (end - start) as f64;
+        for &i in at.get(start..end).unwrap_or(&[]) {
+            if let Some(o) = out.get_mut(i) {
+                *o = mean;
+            }
+        }
+        end = start;
+    }
+    out
+}
+
+/// ASAP's span for a moving average (Rong and Bailis, "ASAP: Prioritizing Attention via Time Series
+/// Smoothing", VLDB 2017): of spans 1 to a tenth of the series, the one whose average is smoothest
+/// (least standard deviation of its first differences) while its kurtosis stays at least the
+/// series' own (its trends and outlying swings kept).
+fn asap_span(values: &[f64]) -> usize {
+    let y: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    let n = y.len();
+    if n < 10 {
+        return 1;
+    }
+    let kurtosis = |x: &[f64]| -> f64 {
+        let m = x.iter().sum::<f64>() / x.len() as f64;
+        let (m2, m4) = x.iter().fold((0.0, 0.0), |(a, b), v| {
+            let d = (v - m) * (v - m);
+            (a + d, b + d * d)
+        });
+        let (m2, m4) = (m2 / x.len() as f64, m4 / x.len() as f64);
+        if m2 > 0.0 { m4 / (m2 * m2) } else { 0.0 }
+    };
+    let roughness = |x: &[f64]| -> f64 {
+        let d: Vec<f64> = x.windows(2).filter_map(|w| Some(w.get(1)? - w.first()?)).collect();
+        if d.is_empty() {
+            return 0.0;
+        }
+        let m = d.iter().sum::<f64>() / d.len() as f64;
+        (d.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / d.len() as f64).sqrt()
+    };
+    let k0 = kurtosis(&y);
+    let mut prefix = Vec::with_capacity(n + 1);
+    let mut acc = 0.0;
+    prefix.push(0.0);
+    for &v in &y {
+        acc += v;
+        prefix.push(acc);
+    }
+    let mut best = (roughness(&y), 1usize);
+    for w in 2..=n / 10 {
+        let sma: Vec<f64> = (w..=n).map(|e| (prefix.get(e).copied().unwrap_or(0.0) - prefix.get(e - w).copied().unwrap_or(0.0)) / w as f64).collect();
+        if kurtosis(&sma) < k0 {
+            continue;
+        }
+        let r = roughness(&sma);
+        if r < best.0 {
+            best = (r, w);
+        }
+    }
+    best.1
+}
+
+/// `calendar_shift`'s shift as (days, months) back: `-Nd`, `-Nw` (7N days), `-Nmo`.
+fn calendar_shift(shift: &str) -> Result<(i64, i64), QueryError> {
+    let bad = || QueryError::Invalid(format!("calendar_shift's shift: {shift} (a negative count of d, w or mo: -1d, -2w, -1mo)"));
+    let s = shift.trim().strip_prefix('-').ok_or_else(bad)?;
+    let digits = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+    let (n, unit) = s.split_at(digits);
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    if n <= 0 {
+        return Err(bad());
+    }
+    match unit {
+        "d" => Ok((n, 0)),
+        "w" => Ok((n.checked_mul(7).ok_or_else(bad)?, 0)),
+        "mo" => Ok((0, n)),
+        _ => Err(bad()),
+    }
 }
 
 /// A node's value when it is a constant: a number, or a signed one.
@@ -586,7 +1029,7 @@ fn constant(ast: &Ast, id: usize) -> Option<f64> {
 }
 
 /// A metric query's series on the grid.
-fn metric(store: &Store, q: &MetricQuery, grid: Grid, off: i64, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     let mut ids = Vec::new();
     store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone() }, &mut ids);
     // In the order of the series' fingerprints, the same on every replica (ids are each one's
@@ -600,8 +1043,14 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, off: i64, max_series: usiz
     let mut acc: Vec<Acc> = Vec::new();
     let (mut ts, mut vs) = (Vec::new(), Vec::new());
     let mut buckets = vec![f64::NAN; grid.n];
-    let from = grid.from.saturating_add(off);
-    let end = from.saturating_add(grid.step.saturating_mul(grid.n as i64));
+    let (from, end) = (spans.start(0), spans.start(grid.n));
+    // `.weighted()`: a gauge series' samples a bucket, then its weights; its interval, the median
+    // gap between its samples (learned, so a series reporting every 10 s and one every 60 s weigh
+    // alike over a bucket they both covered). One with too few samples to tell takes the query's,
+    // the median of the others', once they are known.
+    let mut counts = if q.weighted { vec![0.0; grid.n] } else { Vec::new() };
+    let (mut gaps, mut intervals) = (Vec::new(), Vec::new());
+    let mut pending: Vec<(usize, usize, f64, f64)> = Vec::new();
     for &id in &ids {
         let Some(s) = store.series(id) else { continue };
         key.clear();
@@ -626,9 +1075,36 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, off: i64, max_series: usiz
         store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
         scanned.0 += 1;
         scanned.1 += ts.len() as u64;
-        rollup(s.kind(), q, grid, from, &ts, &vs, &mut buckets);
-        if let Some(a) = acc.get_mut(g) {
-            a.add(&buckets);
+        let weighted = q.weighted && s.kind() == Kind::Gauge;
+        rollup(s.kind(), q, spans, &ts, &vs, &mut buckets, if weighted { Some(&mut counts) } else { None });
+        let Some(a) = acc.get_mut(g) else { continue };
+        if !weighted {
+            a.add(&buckets, None);
+            continue;
+        }
+        match interval_ms(&ts, &vs, &mut gaps) {
+            Some(d) => {
+                intervals.push(d);
+                weigh(&mut counts, d, spans);
+                a.add(&buckets, Some(&counts));
+            }
+            // Under two samples: one bucket at the most.
+            None => pending.extend(buckets.iter().zip(&counts).enumerate().filter(|(_, (v, _))| !v.is_nan()).map(|(i, (&v, &c))| (g, i, v, c))),
+        }
+    }
+    if !pending.is_empty() {
+        let d = if intervals.is_empty() {
+            None
+        } else {
+            let mid = intervals.len() / 2;
+            Some(*intervals.select_nth_unstable(mid).1)
+        };
+        for (g, i, v, c) in pending {
+            // Not knowing the interval, a series counts whole.
+            let w = d.map_or(1.0, |d| weight(c, d, spans.width_ms(i)));
+            if let Some(a) = acc.get_mut(g) {
+                a.put(i, v, w);
+            }
         }
     }
     let mut out = Vec::with_capacity(acc.len());
@@ -637,25 +1113,61 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, off: i64, max_series: usiz
         if let Some(fill) = q.fill {
             apply_fill(fill, grid, &mut values);
         }
-        out.push(Series { tags, values, bounds: None });
+        out.push(Series { tags, values, bounds: None , outlier: None });
     }
     out.sort_by(|a, b| a.tags.cmp(&b.tags));
     Ok(out)
 }
 
+/// A series' submission interval (ms): the median gap between its finite samples; none under two.
+fn interval_ms(ts: &[i64], vs: &[f64], gaps: &mut Vec<i64>) -> Option<i64> {
+    gaps.clear();
+    let mut prev: Option<i64> = None;
+    for (&t, v) in ts.iter().zip(vs) {
+        if !v.is_finite() {
+            continue;
+        }
+        if let Some(p) = prev
+            && t > p
+        {
+            gaps.push(t - p);
+        }
+        prev = Some(t);
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    let mid = gaps.len() / 2;
+    Some(*gaps.select_nth_unstable(mid).1)
+}
+
+/// A bucket's weight for a series with `count` samples in it at an interval of `d` ms: the share of
+/// the bucket they cover (Datadog's `weighted()`: a pod that lived 10 s of a minute counts a sixth).
+fn weight(count: f64, d: i64, width_ms: i64) -> f64 {
+    if count <= 0.0 || width_ms <= 0 {
+        return 0.0;
+    }
+    (count * d as f64 / width_ms as f64).min(1.0)
+}
+
+/// Sample counts a bucket into weights, in place.
+fn weigh(counts: &mut [f64], d: i64, spans: Spans<'_>) {
+    for (i, c) in counts.iter_mut().enumerate() {
+        *c = weight(*c, d, spans.width_ms(i));
+    }
+}
+
 /// One series' samples into `buckets` (NaN where none): its rollup function, by its kind unless
-/// the query names one; for counts and counters, a total a bucket or a rate a second.
-fn rollup(kind: Kind, q: &MetricQuery, grid: Grid, from: i64, ts: &[i64], vs: &[f64], buckets: &mut [f64]) {
+/// the query names one; for counts and counters, a total a bucket or a rate a second. `counts`:
+/// each bucket's finite samples, for `.weighted()`.
+fn rollup(kind: Kind, q: &MetricQuery, spans: Spans<'_>, ts: &[i64], vs: &[f64], buckets: &mut [f64], mut counts: Option<&mut Vec<f64>>) {
     for b in buckets.iter_mut() {
         *b = f64::NAN;
     }
-    let step_s = grid.step as f64 / 1000.0;
-    let bucket_of = |t: i64| -> Option<usize> {
-        if t < from {
-            return None;
-        }
-        usize::try_from((t - from) / grid.step).ok().filter(|&i| i < grid.n)
-    };
+    if let Some(c) = counts.as_deref_mut() {
+        c.iter_mut().for_each(|c| *c = 0.0);
+    }
+    let bucket_of = |t: i64| spans.index(t);
     match kind {
         Kind::Counter => {
             // Increases between consecutive samples, each in the later one's bucket; a fall is a
@@ -673,8 +1185,8 @@ fn rollup(kind: Kind, q: &MetricQuery, grid: Grid, from: i64, ts: &[i64], vs: &[
                 }
             }
             if q.mode != Some(CountMode::Count) {
-                for b in buckets.iter_mut() {
-                    *b /= step_s;
+                for (i, b) in buckets.iter_mut().enumerate() {
+                    *b /= spans.width_s(i);
                 }
             }
         }
@@ -689,12 +1201,16 @@ fn rollup(kind: Kind, q: &MetricQuery, grid: Grid, from: i64, ts: &[i64], vs: &[
                     i += 1;
                     continue;
                 };
-                // The run of samples in bucket b.
+                // The run of samples in bucket b (the samples come in time order).
                 let start = i;
-                while ts.get(i).is_some_and(|&t2| bucket_of(t2) == Some(b)) {
+                let next = spans.start(b + 1);
+                while ts.get(i).is_some_and(|&t2| t2 < next) {
                     i += 1;
                 }
                 let run = vs.get(start..i).unwrap_or(&[]);
+                if let Some(c) = counts.as_deref_mut().and_then(|c| c.get_mut(b)) {
+                    *c = run.iter().filter(|v| v.is_finite()).count() as f64;
+                }
                 let finite = run.iter().copied().filter(|v| v.is_finite());
                 let v = match f {
                     Rollup::Avg => {
@@ -712,8 +1228,8 @@ fn rollup(kind: Kind, q: &MetricQuery, grid: Grid, from: i64, ts: &[i64], vs: &[
                 }
             }
             if kind == Kind::Count && q.mode == Some(CountMode::Rate) {
-                for b in buckets.iter_mut() {
-                    *b /= step_s;
+                for (i, b) in buckets.iter_mut().enumerate() {
+                    *b /= spans.width_s(i);
                 }
             }
         }
@@ -722,8 +1238,9 @@ fn rollup(kind: Kind, q: &MetricQuery, grid: Grid, from: i64, ts: &[i64], vs: &[
 
 /// A group's space aggregation, a bucket at a time.
 enum Acc {
-    /// Sum and count for avg, sum and count; min and max as their own.
-    Moments { kind: SpaceAgg, a: Vec<f64>, n: Vec<u32> },
+    /// Sum and count for avg, sum and count (each series' value times its weight, and the weights:
+    /// one a series, unless `.weighted()`); min and max as their own.
+    Moments { kind: SpaceAgg, a: Vec<f64>, n: Vec<f64> },
     /// Every series' value a bucket, as (bucket, value), for a percentile.
     Values { pct: f64, n: usize, v: Vec<(u32, f64)> },
 }
@@ -732,48 +1249,37 @@ impl Acc {
     fn new(kind: SpaceAgg, n: usize) -> Self {
         match kind {
             SpaceAgg::Pct(p) => Self::Values { pct: p, n, v: Vec::new() },
-            k => Self::Moments { kind: k, a: vec![f64::NAN; n], n: vec![0; n] },
+            k => Self::Moments { kind: k, a: vec![f64::NAN; n], n: vec![0.0; n] },
         }
     }
 
-    fn add(&mut self, buckets: &[f64]) {
+    /// A series' values, each weighing its weight (one unless given).
+    fn add(&mut self, buckets: &[f64], weights: Option<&[f64]>) {
+        for (i, &v) in buckets.iter().enumerate() {
+            if !v.is_nan() {
+                self.put(i, v, weights.and_then(|w| w.get(i)).copied().unwrap_or(1.0));
+            }
+        }
+    }
+
+    /// A series' value in bucket `i`, weighing `w`: a sum's and an average's share, a count's;
+    /// a minimum, a maximum and a percentile take the values as they are.
+    fn put(&mut self, i: usize, v: f64, w: f64) {
         match self {
             Self::Moments { kind, a, n } => {
-                for ((x, c), &v) in a.iter_mut().zip(n.iter_mut()).zip(buckets) {
-                    if v.is_nan() {
-                        continue;
-                    }
-                    *c += 1;
-                    *x = match kind {
-                        SpaceAgg::Min => {
-                            if x.is_nan() {
-                                v
-                            } else {
-                                x.min(v)
-                            }
-                        }
-                        SpaceAgg::Max => {
-                            if x.is_nan() {
-                                v
-                            } else {
-                                x.max(v)
-                            }
-                        }
-                        _ => {
-                            if x.is_nan() {
-                                v
-                            } else {
-                                *x + v
-                            }
-                        }
-                    };
-                }
+                let (Some(x), Some(c)) = (a.get_mut(i), n.get_mut(i)) else { return };
+                *c += w;
+                *x = match kind {
+                    SpaceAgg::Min if !x.is_nan() => x.min(v),
+                    SpaceAgg::Max if !x.is_nan() => x.max(v),
+                    SpaceAgg::Min | SpaceAgg::Max => v,
+                    _ if x.is_nan() => v * w,
+                    _ => *x + v * w,
+                };
             }
-            Self::Values { v, .. } => {
-                for (i, &x) in buckets.iter().enumerate() {
-                    if !x.is_nan() {
-                        v.push((i as u32, x));
-                    }
+            Self::Values { v: vals, n, .. } => {
+                if i < *n {
+                    vals.push((i as u32, v));
                 }
             }
         }
@@ -785,10 +1291,10 @@ impl Acc {
                 .into_iter()
                 .zip(n)
                 .map(|(x, c)| match kind {
-                    SpaceAgg::Avg if c > 0 => x / f64::from(c),
+                    SpaceAgg::Avg if c > 0.0 => x / c,
                     SpaceAgg::Count => {
-                        if c > 0 {
-                            f64::from(c)
+                        if c > 0.0 {
+                            c
                         } else {
                             f64::NAN
                         }
@@ -894,6 +1400,7 @@ fn apply_fill(fill: Fill, grid: Grid, v: &mut [f64]) {
 
 fn binary(op: BinOp, a: Value, b: Value) -> Result<Value, QueryError> {
     let f = |x: f64, y: f64| match op {
+        BinOp::Pow => x.powf(y),
         BinOp::Add => x + y,
         BinOp::Sub => x - y,
         BinOp::Mul => x * y,
@@ -961,7 +1468,10 @@ fn binary(op: BinOp, a: Value, b: Value) -> Result<Value, QueryError> {
 }
 
 fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> {
-    let step_s = grid.step as f64 / 1000.0;
+    // A bucket's width: the step's, or a calendar period's own (a month's days, a day's hours where
+    // the clocks change).
+    let edges = grid.edges(0);
+    let spans = Spans::new(grid, 0, edges.as_deref());
     let num = |v: Option<&Value>, what: &str| -> Result<f64, QueryError> {
         match v {
             Some(Value::Scalar(x)) => Ok(*x),
@@ -990,10 +1500,10 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
             }
         }
         Func::Diff | Func::Derivative | Func::Rate => {
-            let per = if f == Func::Diff { 1.0 } else { step_s };
             for s in &mut set {
                 let mut prev = f64::NAN;
-                for v in &mut s.values {
+                for (i, v) in s.values.iter_mut().enumerate() {
+                    let per = if f == Func::Diff { 1.0 } else { spans.width_s(i.saturating_sub(1)) };
                     let cur = *v;
                     *v = (cur - prev) / per;
                     if !cur.is_nan() {
@@ -1009,18 +1519,17 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
                 _ => 3600.0,
             };
             for s in &mut set {
-                for v in &mut s.values {
-                    *v = *v / step_s * unit;
+                for (i, v) in s.values.iter_mut().enumerate() {
+                    *v = *v / spans.width_s(i) * unit;
                 }
             }
         }
         Func::Cumsum | Func::Integral => {
-            let k = if f == Func::Integral { step_s } else { 1.0 };
             for s in &mut set {
                 let mut sum = 0.0;
-                for v in &mut s.values {
+                for (i, v) in s.values.iter_mut().enumerate() {
                     if !v.is_nan() {
-                        sum += *v * k;
+                        sum += *v * if f == Func::Integral { spans.width_s(i) } else { 1.0 };
                         *v = sum;
                     }
                 }
@@ -1031,61 +1540,205 @@ fn call(f: Func, mut args: Vec<Value>, grid: Grid) -> Result<Value, QueryError> 
                 Some(v) => num(Some(v), "the count")?.max(0.0) as usize,
                 None => 10,
             };
-            let reducer = text(args.get(1), "mean");
+            let measure = text(args.get(1), "mean");
+            let by = crate::query::parse::Rank::parse(&measure).ok_or_else(|| QueryError::Invalid(format!("top's measure: {measure} (mean, min, max, last, sum, area, l2norm)")))?;
             let desc = text(args.get(2), if f == Func::Top { "desc" } else { "asc" }) == "desc";
-            let score = |s: &Series| -> f64 {
-                let vals = s.values.iter().copied().filter(|v| !v.is_nan());
-                match reducer.as_str() {
-                    "max" => vals.fold(f64::NEG_INFINITY, f64::max),
-                    "min" => vals.fold(f64::INFINITY, f64::min),
-                    "last" => s.values.iter().rev().copied().find(|v| !v.is_nan()).unwrap_or(f64::NAN),
-                    "sum" => vals.sum(),
-                    "area" => vals.map(f64::abs).sum(),
-                    "norm" => vals.map(|v| v * v).sum::<f64>().sqrt(),
-                    _ => {
-                        let (s, c) = vals.fold((0.0, 0u32), |(s, c), v| (s + v, c + 1));
-                        if c == 0 { f64::NAN } else { s / f64::from(c) }
+            set = ranked(set, n, by, desc);
+        }
+        // Evaluated apart (`anomalies`, `forecast`: they read their query's history; the shifts:
+        // they move their query's reading; `pow`: either side a query or a number).
+        Func::Timeshift | Func::Anomalies | Func::Forecast | Func::Pow | Func::HourBefore | Func::DayBefore | Func::WeekBefore | Func::MonthBefore | Func::CalendarShift => {}
+        Func::Round => {
+            let places = match args.first() {
+                Some(v) => num(Some(v), "the decimal places")?,
+                None => 0.0,
+            };
+            let k = 10f64.powi(places.round().clamp(-15.0, 15.0) as i32);
+            for s in &mut set {
+                for v in &mut s.values {
+                    *v = (*v * k).round() / k;
+                }
+            }
+        }
+        Func::Ceil | Func::Floor => {
+            for s in &mut set {
+                for v in &mut s.values {
+                    *v = if f == Func::Ceil { v.ceil() } else { v.floor() };
+                }
+            }
+        }
+        Func::CountNonzero | Func::CountNotNull => {
+            // At each point, how many of the group's series are (non-zero and) finite: one series.
+            let mut counts = vec![0.0; grid.n];
+            for s in &set {
+                for (c, v) in counts.iter_mut().zip(&s.values) {
+                    if v.is_finite() && (f == Func::CountNotNull || *v != 0.0) {
+                        *c += 1.0;
                     }
                 }
-            };
-            let mut scored: Vec<(f64, Series)> = set.into_iter().map(|s| (score(&s), s)).collect();
-            scored.sort_by(|a, b| {
-                let o = a.0.total_cmp(&b.0);
-                if desc { o.reverse() } else { o }
-            });
-            set = scored.into_iter().filter(|(s, _)| !s.is_nan()).take(n).map(|(_, s)| s).collect();
+            }
+            set = vec![Series { tags: Vec::new(), values: counts, bounds: None, outlier: None }];
         }
-        // Evaluated apart (`anomalies`): it reads its query's history.
-        Func::Timeshift | Func::Anomalies | Func::Forecast => {}
+        Func::ExcludeNull => set.retain(|s| s.tags.iter().all(|(_, v)| v != "N/A")),
+        Func::ClampMin | Func::ClampMax | Func::CutoffMin | Func::CutoffMax => {
+            let t = num(args.first(), "the threshold")?;
+            for s in &mut set {
+                for v in &mut s.values {
+                    *v = match f {
+                        // A missing value is the bound too, as Datadog's page says.
+                        Func::ClampMin => if v.is_nan() || *v < t { t } else { *v },
+                        Func::ClampMax => if v.is_nan() || *v > t { t } else { *v },
+                        Func::CutoffMin => if *v < t { f64::NAN } else { *v },
+                        _ => if *v > t { f64::NAN } else { *v },
+                    };
+                }
+            }
+        }
+        Func::DefaultZero => {
+            for s in &mut set {
+                for v in &mut s.values {
+                    if v.is_nan() {
+                        *v = 0.0;
+                    }
+                }
+            }
+        }
+        Func::Dt => {
+            // The seconds since the point before, of any of the group's series: one series.
+            let mut dt = vec![f64::NAN; grid.n];
+            let mut prev: Option<usize> = None;
+            for (i, d) in dt.iter_mut().enumerate() {
+                if set.iter().any(|s| s.values.get(i).is_some_and(|v| v.is_finite())) {
+                    if let Some(p) = prev {
+                        *d = spans.start(i).saturating_sub(spans.start(p)) as f64 / 1000.0;
+                    }
+                    prev = Some(i);
+                }
+            }
+            set = vec![Series { tags: Vec::new(), values: dt, bounds: None, outlier: None }];
+        }
+        Func::MonotonicDiff => {
+            for s in &mut set {
+                let mut prev = f64::NAN;
+                for v in &mut s.values {
+                    let cur = *v;
+                    let d = cur - prev;
+                    // A fall (a counter's reset) is no delta.
+                    *v = if d >= 0.0 { d } else { f64::NAN };
+                    if !cur.is_nan() {
+                        prev = cur;
+                    }
+                }
+            }
+        }
+        Func::Throughput => {
+            for s in &mut set {
+                for (i, v) in s.values.iter_mut().enumerate() {
+                    *v /= spans.width_s(i);
+                }
+            }
+        }
+        Func::RobustTrend | Func::TrendLine => {
+            for s in &mut set {
+                if let Some((a, b)) = line(&s.values, f == Func::RobustTrend) {
+                    for (i, v) in s.values.iter_mut().enumerate() {
+                        *v = a + b * i as f64;
+                    }
+                }
+            }
+        }
+        Func::PiecewiseConstant => {
+            for s in &mut set {
+                s.values = piecewise_constant(&s.values);
+            }
+        }
+        Func::Autosmooth => {
+            // One span for the group (Datadog's), ASAP's for the group's mean series.
+            let mean: Vec<f64> = (0..grid.n)
+                .map(|i| {
+                    let (sum, c) = set.iter().filter_map(|s| s.values.get(i)).filter(|v| v.is_finite()).fold((0.0, 0u32), |(a, c), v| (a + v, c + 1));
+                    if c == 0 { f64::NAN } else { sum / f64::from(c) }
+                })
+                .collect();
+            let w = asap_span(&mean);
+            for s in &mut set {
+                s.values = rolling(&s.values, w, |win| win.iter().sum::<f64>() / win.len() as f64);
+            }
+        }
+        Func::Median(n) => {
+            for s in &mut set {
+                s.values = rolling(&s.values, usize::from(n), |win| {
+                    win.sort_unstable_by(f64::total_cmp);
+                    let m = win.len() / 2;
+                    if win.len() % 2 == 1 { win.get(m).copied().unwrap_or(f64::NAN) } else { (win.get(m - 1).copied().unwrap_or(f64::NAN) + win.get(m).copied().unwrap_or(f64::NAN)) / 2.0 }
+                });
+            }
+        }
+        Func::RollingAvg(n) => {
+            for s in &mut set {
+                s.values = rolling(&s.values, usize::from(n), |win| win.iter().sum::<f64>() / win.len() as f64);
+            }
+        }
+        Func::EwmaSpan(n) => ewma(&mut set, f64::from(n)),
+        Func::Ranked { n, bottom, by } => set = ranked(set, usize::from(n), by, !bottom),
+        Func::Outliers => {
+            let usage = || QueryError::Invalid("outliers(query, 'dbscan'|'mad'|'scaleddbscan'|'scaledmad', tolerance, pct)".into());
+            let algo = match args.first() {
+                Some(Value::Str(a)) => crate::outlier::Algorithm::parse(a).ok_or_else(usage)?,
+                None => crate::outlier::Algorithm::Dbscan,
+                _ => return Err(usage()),
+            };
+            let tolerance = match args.get(1) {
+                Some(Value::Scalar(t)) if t.is_finite() && *t > 0.0 => *t,
+                None => 3.0,
+                _ => return Err(usage()),
+            };
+            let pct = match args.get(2) {
+                Some(Value::Scalar(p)) if (0.0..=100.0).contains(p) => *p,
+                None => 20.0,
+                _ => return Err(usage()),
+            };
+            let rows: Vec<&[f64]> = set.iter().map(|s| s.values.as_slice()).collect();
+            let flags = crate::outlier::outliers(&rows, algo, tolerance, pct);
+            for (s, f) in set.iter_mut().zip(flags) {
+                s.outlier = Some(f);
+            }
+        }
         Func::MovingAvg => {
+            // `moving_rollup(query, seconds, aggregator)`: the last seconds' points combined.
             let secs = num(args.first(), "the window's seconds")?;
+            let how = text(args.get(1), "avg");
+            if !matches!(how.as_str(), "avg" | "sum" | "min" | "max" | "count") {
+                return Err(QueryError::Invalid(format!("moving_rollup's aggregator: {how} (avg, sum, min, max, count)")));
+            }
             let k = ((secs * 1000.0 / grid.step as f64).round() as usize).max(1);
             for s in &mut set {
                 let src = s.values.clone();
                 for (i, v) in s.values.iter_mut().enumerate() {
-                    let win = src.get(i.saturating_sub(k - 1)..=i).unwrap_or(&[]);
-                    let (sum, c) = win.iter().filter(|x| !x.is_nan()).fold((0.0, 0u32), |(s, c), x| (s + x, c + 1));
-                    *v = if c == 0 { f64::NAN } else { sum / f64::from(c) };
+                    let win = src.get(i.saturating_sub(k - 1)..=i).unwrap_or(&[]).iter().copied().filter(|x| !x.is_nan());
+                    *v = match how.as_str() {
+                        "sum" => win.fold(None, |a: Option<f64>, x| Some(a.unwrap_or(0.0) + x)).unwrap_or(f64::NAN),
+                        "min" => win.reduce(f64::min).unwrap_or(f64::NAN),
+                        "max" => win.reduce(f64::max).unwrap_or(f64::NAN),
+                        "count" => win.count() as f64,
+                        _ => {
+                            let (sum, c) = win.fold((0.0, 0u32), |(s, c), x| (s + x, c + 1));
+                            if c == 0 { f64::NAN } else { sum / f64::from(c) }
+                        }
+                    };
                 }
             }
         }
         Func::Ewma => {
-            // α = 2 / (span + 1), the span convention (Hunter, "The exponentially weighted moving
-            // average", J. Quality Technology 1986; pandas' `span`).
-            let span = num(args.first(), "the span")?;
+            // `ewma(query)`: Datadog's default span, 20.
+            let span = match args.first() {
+                Some(v) => num(Some(v), "the span")?,
+                None => 20.0,
+            };
             if span < 1.0 {
                 return Err(QueryError::Invalid("ewma: a span of at least 1".into()));
             }
-            let alpha = 2.0 / (span + 1.0);
-            for s in &mut set {
-                let mut m = f64::NAN;
-                for v in &mut s.values {
-                    if !v.is_nan() {
-                        m = if m.is_nan() { *v } else { alpha * *v + (1.0 - alpha) * m };
-                        *v = m;
-                    }
-                }
-            }
+            ewma(&mut set, span);
         }
         Func::Clamp => {
             let lo = num(args.first(), "the lower bound")?;
@@ -1127,6 +1780,7 @@ fn pointwise(f: Func, x: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::batch::{Builder, SeriesKey};
+    use crate::query::calendar::{civil_from_days, days_from_civil};
     use crate::hash::Keyed;
 
     /// Hosts a, b, c: cpu gauges (a constant per host), a request counter, an error count.
@@ -1218,7 +1872,7 @@ mod tests {
     fn space_aggregation_by_groups() {
         let s = store();
         let a = q(&s, "avg:cpu{*}");
-        assert_eq!(a.grid, Grid { from: 0, step: 60_000, n: 10 });
+        assert_eq!(a.grid, Grid::uniform(0, 60_000, 10));
         assert_eq!(a.series.len(), 1);
         assert!(a.series[0].values.iter().all(|&v| (v - 30.0).abs() < 1e-9));
         let a = q(&s, "sum:cpu{*} by {env}");
@@ -1429,5 +2083,307 @@ mod tests {
         let mut coarse = Request::new("forecast(cpu{*}, 'seasonal', 2, seasonality='hourly')", 0, 86_400_000 * 2);
         coarse.step = Some(3_600_000);
         assert!(eval(&s, &coarse).is_err(), "an hourly season at an hour's step");
+    }
+
+    /// Five hosts, one running hot: `outliers()` returns every series, the hot one alone said an
+    /// outlier, by DBSCAN and by MAD; a wrong algorithm or tolerance is refused.
+    #[test]
+    fn outliers_says_which_member_is_unlike_its_peers() {
+        let mut s = Store::new(Keyed::with_keys(7, 8));
+        let mut b = Builder::new();
+        let mut seed = 13u64;
+        let mut noise = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        for (host, level) in [("a", 40.0), ("b", 40.0), ("c", 40.0), ("d", 40.0), ("hot", 70.0)] {
+            let k = SeriesKey::new("cpu", [("host", host)], Kind::Gauge).unwrap();
+            b.define(&k);
+            let pts: Vec<(i64, f64)> = (0..60).map(|i| (i * 60_000, level + 4.0 * noise())).collect();
+            b.run(k.fp, pts);
+        }
+        s.apply(&b.finish()).unwrap();
+        for q in ["outliers(avg:cpu{*} by {host}, 'dbscan', 1)", "outliers(avg:cpu{*} by {host}, 'MAD', 3, 20)", "outliers(avg:cpu{*} by {host}, 'scaledMAD', 3, 20)"] {
+            let mut r = Request::new(q, 0, 3_600_000);
+            r.step = Some(60_000);
+            let a = eval(&s, &r).unwrap();
+            assert_eq!(a.series.len(), 5, "{q}");
+            let flagged: Vec<&str> = a.series.iter().filter(|x| x.outlier == Some(true)).filter_map(|x| x.tags.iter().find(|(k, _)| k == "host").map(|(_, v)| v.as_str())).collect();
+            assert_eq!(flagged, ["hot"], "{q}");
+        }
+        for bad in ["outliers(avg:cpu{*} by {host}, 'kmeans', 1)", "outliers(avg:cpu{*} by {host}, 'dbscan', 0)", "outliers(avg:cpu{*} by {host}, 'mad', 3, 150)"] {
+            let r = Request::new(bad, 0, 3_600_000);
+            assert!(eval(&s, &r).is_err(), "{bad} was taken");
+        }
+    }
+
+    /// Datadog's function catalog, each function as its page says, on series whose answers are
+    /// known: a ramp, one alternating with zeros, one with gaps, a counter that resets, a step, a
+    /// line with one wild point.
+    #[test]
+    fn datadog_s_functions_do_what_their_pages_say() {
+        let mut s = Store::new(Keyed::with_keys(9, 10));
+        let mut b = Builder::new();
+        let nan = f64::NAN;
+        let series: [(&str, &[(&str, &str)], Vec<f64>); 7] = [
+            ("ramp", &[("host", "a")], (1..=10).map(f64::from).collect()),
+            ("ramp", &[("host", "b")], (0..10).map(|i| if i % 2 == 0 { 10.0 } else { 0.0 }).collect()),
+            ("ramp", &[("host", "c"), ("zone", "z1")], vec![2.0, nan, nan, 5.0, 6.0, nan, 8.0, 9.0, 10.0, 11.0]),
+            ("ctr", &[("host", "a")], vec![5.0, 10.0, 15.0, 3.0, 8.0, 13.0, 18.0, 23.0, 28.0, 33.0]),
+            ("step", &[("host", "a")], vec![1.0, 1.1, 0.9, 1.0, 1.05, 5.0, 5.1, 4.9, 5.0, 5.05]),
+            ("wild", &[("host", "a")], (0..10).map(|i| if i == 7 { 100.0 } else { 2.0 * f64::from(i) + 1.0 }).collect()),
+            ("long", &[("host", "a")], (0..240).map(f64::from).collect()),
+        ];
+        for (metric, tags, values) in &series {
+            let k = SeriesKey::new(metric, tags.iter().copied(), Kind::Gauge).unwrap();
+            b.define(&k);
+            let pts: Vec<(i64, f64)> = values.iter().enumerate().filter(|(_, v)| v.is_finite()).map(|(i, &v)| (i as i64 * 60_000, v)).collect();
+            b.run(k.fp, pts);
+        }
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str, to: i64| -> Vec<(String, Vec<f64>)> {
+            let mut r = Request::new(q, 0, to);
+            r.step = Some(60_000);
+            let a = eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let mut out: Vec<(String, Vec<f64>)> = a.series.into_iter().map(|x| (x.tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","), x.values)).collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        };
+        let one = |q: &str| -> Vec<f64> {
+            let r = ask(q, 600_000);
+            assert_eq!(r.len(), 1, "{q}: {r:?}");
+            r.into_iter().next().unwrap().1
+        };
+        let same = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x.is_nan() && y.is_nan()) || (x - y).abs() < 1e-9);
+        let a = "avg:ramp{host:a}";
+        // Arithmetic.
+        assert!(same(&one(&format!("round({a} / 3, 1)")), &[0.3, 0.7, 1.0, 1.3, 1.7, 2.0, 2.3, 2.7, 3.0, 3.3]));
+        assert!(same(&one(&format!("ceil({a} / 3)")), &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0]));
+        assert!(same(&one(&format!("floor({a} / 3)")), &[0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0]));
+        assert!(same(&one(&format!("pow({a}, 2)")), &(1..=10).map(|i| f64::from(i * i)).collect::<Vec<_>>()));
+        assert!(same(&one(&format!("pow(2, {a})")), &(1..=10).map(|i| 2f64.powi(i)).collect::<Vec<_>>()));
+        // Count: across the group, at each point.
+        assert!(same(&one("count_nonzero(avg:ramp{*} by {host})"), &[3.0, 1.0, 2.0, 2.0, 3.0, 1.0, 3.0, 2.0, 3.0, 2.0]));
+        assert!(same(&one("count_not_null(avg:ramp{*} by {host})"), &[3.0, 2.0, 2.0, 3.0, 3.0, 2.0, 3.0, 3.0, 3.0, 3.0]));
+        // Exclusion: missing values are the bound to a clamp; equal ones survive a cutoff.
+        let c = "avg:ramp{host:c}";
+        assert!(same(&one(&format!("clamp_min({c}, 6)")), &[6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 8.0, 9.0, 10.0, 11.0]));
+        assert!(same(&one(&format!("clamp_max({c}, 6)")), &[2.0, 6.0, 6.0, 5.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0]));
+        assert!(same(&one(&format!("cutoff_min({c}, 6)")), &[nan, nan, nan, nan, 6.0, nan, 8.0, 9.0, 10.0, 11.0]));
+        assert!(same(&one(&format!("cutoff_max({c}, 6)")), &[2.0, nan, nan, 5.0, 6.0, nan, nan, nan, nan, nan]));
+        let by_zone = ask("exclude_null(avg:ramp{*} by {zone})", 600_000);
+        assert_eq!(by_zone.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["zone:z1"], "the N/A group left out");
+        // Interpolation.
+        assert!(same(&one(&format!("default_zero({c})")), &[2.0, 0.0, 0.0, 5.0, 6.0, 0.0, 8.0, 9.0, 10.0, 11.0]));
+        // Rate.
+        assert!(same(&one(&format!("dt({c})")), &[nan, nan, nan, 180.0, 60.0, nan, 120.0, 60.0, 60.0, 60.0]));
+        assert!(same(&one("monotonic_diff(avg:ctr{*})"), &[nan, 5.0, 5.0, nan, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0]));
+        assert!(same(&one(&format!("throughput({a})")), &(1..=10).map(|i| f64::from(i) / 60.0).collect::<Vec<_>>()));
+        // Regression: least squares through the line exactly; Huber's barely moved by a wild point,
+        // least squares pulled up by it.
+        assert!(same(&one(&format!("trend_line({a})")), &(1..=10).map(f64::from).collect::<Vec<_>>()));
+        let robust = one("robust_trend(avg:wild{*})");
+        let ols = one("trend_line(avg:wild{*})");
+        let truth: Vec<f64> = (0..10).map(|i| 2.0 * f64::from(i) + 1.0).collect();
+        let err = |fit: &[f64]| fit.iter().zip(&truth).map(|(f, t)| (f - t).abs()).fold(0.0, f64::max);
+        assert!(err(&robust) < 0.5 && err(&ols) > 3.0, "Huber {} off, least squares {}", err(&robust), err(&ols));
+        // A step, as two levels.
+        let pc = one("piecewise_constant(avg:step{*})");
+        assert!(pc[..5].iter().all(|v| (v - 1.01).abs() < 1e-9) && pc[5..].iter().all(|v| (v - 5.01).abs() < 1e-9), "{pc:?}");
+        // Smoothing: the last n points.
+        let m3 = one("median_3(avg:ramp{host:b})");
+        assert!(same(&m3, &[10.0, 5.0, 10.0, 0.0, 10.0, 0.0, 10.0, 0.0, 10.0, 0.0]), "{m3:?}");
+        assert!(same(&one(&format!("median({a})")), &one(&format!("median_3({a})"))));
+        assert!(same(&one(&format!("rollingavg_5({a})")), &[1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
+        assert!(same(&one(&format!("ewma_3({a})")), &one(&format!("ewma({a}, 3)"))));
+        assert!(same(&one(&format!("ewma({a})")), &one(&format!("ewma_20({a})"))));
+        assert!(same(&one(&format!("ewma_1({a})")), &(1..=10).map(f64::from).collect::<Vec<_>>()));
+        assert!(same(&one(&format!("moving_rollup({a}, 180, 'max')")), &(1..=10).map(f64::from).collect::<Vec<_>>()));
+        assert!(same(&one(&format!("moving_rollup({a}, 180, 'sum')")), &[1.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0]));
+        // Timeshift: the query as it was before, on this range's grid.
+        let long = |q: &str| -> Vec<f64> { ask(q, 240 * 60_000).into_iter().next().map(|x| x.1).unwrap_or_default() };
+        let shifted = long("hour_before(avg:long{*})");
+        assert!(shifted[..60].iter().all(|v| v.is_nan()) && (60..240).all(|i| (shifted[i] - (i as f64 - 60.0)).abs() < 1e-9), "{:?}", &shifted[55..65]);
+        assert!(same(&long("calendar_shift(avg:long{*}, '-1d', 'UTC')"), &long("day_before(avg:long{*})")));
+        assert!(same(&long("timeshift(avg:long{*}, -3600)"), &shifted));
+        // Rank: the shortcuts are top and bottom.
+        let alike = |x: &[(String, Vec<f64>)], y: &[(String, Vec<f64>)]| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.0 == q.0 && same(&p.1, &q.1));
+        assert!(alike(&ask("top5_max(avg:ramp{*} by {host})", 600_000), &ask("top(avg:ramp{*} by {host}, 5, 'max', 'desc')", 600_000)));
+        assert!(alike(&ask("bottom5(avg:ramp{*} by {host})", 600_000), &ask("top(avg:ramp{*} by {host}, 5, 'mean', 'asc')", 600_000)));
+        // In rank order: means b 5, a 5.5, c 51/7.
+        let order = |q: &str| -> Vec<String> {
+            let mut r = Request::new(q, 0, 600_000);
+            r.step = Some(60_000);
+            eval(&s, &r).unwrap().series.into_iter().map(|x| x.tags.iter().map(|(k, v)| format!("{k}:{v}")).collect()).collect()
+        };
+        assert_eq!(order("bottom5(avg:ramp{*} by {host})"), ["host:b", "host:a", "host:c"]);
+        assert_eq!(order("top10_mean(avg:ramp{*} by {host})"), ["host:c", "host:a", "host:b"]);
+        assert_eq!(order("top(avg:ramp{*} by {host}, 1, 'l2norm', 'desc')"), ["host:b"]);
+        // autosmooth: a noisy series is smoothed (a span above one), its trend kept.
+        let smooth = ask("autosmooth(avg:long{*})", 240 * 60_000);
+        assert_eq!(smooth.len(), 1);
+    }
+
+    /// Calendar rollups: a count of one an hour through 2026, rolled up by days, weeks and months,
+    /// in UTC and in New York (whose days are 23 and 25 hours where its clocks change).
+    #[test]
+    fn calendar_rollups_follow_the_calendar_and_its_clocks() {
+        const H: i64 = 3_600_000;
+        let day = |y, m, d| days_from_civil(y, m, d) * 86_400_000;
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let k = SeriesKey::new("hits", [], Kind::Count).unwrap();
+        let mut b = Builder::new();
+        b.define(&k);
+        b.run(k.fp, (0..366 * 24).map(|h| (day(2026, 1, 1) + h * H, 1.0)));
+        // And the hour itself, from 2026's first.
+        let k = SeriesKey::new("hour", [], Kind::Gauge).unwrap();
+        b.define(&k);
+        b.run(k.fp, (0..366 * 24).map(|h| (day(2026, 1, 1) + h * H, h as f64)));
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str, from: i64, to: i64| -> Answer {
+            let r = Request::new(q, from, to);
+            eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}"))
+        };
+        let values = |a: &Answer| a.series.first().map(|x| x.values.clone()).unwrap_or_default();
+        // UTC days: 24 each, the grid the calendar's.
+        let a = ask("sum:hits{*}.rollup(sum, daily)", day(2026, 3, 7), day(2026, 3, 10));
+        assert_eq!(values(&a), [24.0, 24.0, 24.0]);
+        assert_eq!((a.grid.from, a.grid.n, a.grid.time(3)), (day(2026, 3, 7), 3, day(2026, 3, 10)));
+        // New York's: the range's first and last instants are in its 6th and 9th of March (UTC's
+        // 7th begins on its 6th); its 8th is 23 hours.
+        for q in ["sum:hits{*}.rollup(sum, daily, 'America/New_York')", "sum:hits{*}.rollup(sum, daily, 12am, 'America/New_York')"] {
+            let a = ask(q, day(2026, 3, 7), day(2026, 3, 10));
+            assert_eq!(values(&a), [24.0, 24.0, 23.0, 24.0], "{q}");
+            assert_eq!(a.grid.from, day(2026, 3, 6) + 5 * H, "midnight EST");
+            assert_eq!(a.grid.time(4), day(2026, 3, 10) + 4 * H, "midnight EDT");
+        }
+        let a = ask("sum:hits{*}.rollup(sum, daily, 'America/New_York')", day(2026, 11, 1) + 12 * H, day(2026, 11, 2) + 12 * H);
+        assert_eq!(values(&a), [25.0, 24.0]);
+        // A rate a second divides by each period's own length: an hour's one whatever the day.
+        let a = ask("sum:hits{*}.rollup(sum, daily, 'America/New_York').as_rate()", day(2026, 3, 7), day(2026, 3, 10));
+        assert!(values(&a).iter().all(|v| (v * 3600.0 - 1.0).abs() < 1e-12), "{:?}", values(&a));
+        // Days begun at 9am: 2026-03-07 00:00 is in the 6th's.
+        let a = ask("sum:hits{*}.rollup(sum, daily, 9am)", day(2026, 3, 7), day(2026, 3, 8));
+        assert_eq!(a.grid.from, day(2026, 3, 6) + 9 * H);
+        assert_eq!(values(&a), [24.0, 24.0]);
+        // Weeks begun on Monday; 2026-03-09 is one.
+        let a = ask("sum:hits{*}.rollup(sum, weekly, monday)", day(2026, 3, 9), day(2026, 3, 23));
+        assert_eq!((a.grid.from, values(&a)), (day(2026, 3, 9), vec![168.0, 168.0]));
+        // Sunday's by default; New York's week of the 8th is an hour short.
+        let a = ask("sum:hits{*}.rollup(sum, weekly, 'America/New_York')", day(2026, 3, 9), day(2026, 3, 10));
+        assert_eq!(values(&a), [167.0]);
+        // Months: their own days; per_hour divides each by its own hours.
+        let a = ask("sum:hits{*}.rollup(sum, monthly)", day(2026, 1, 1), day(2026, 4, 1));
+        assert_eq!(values(&a), [744.0, 672.0, 744.0]);
+        assert_eq!(a.grid.step, 2_629_746_000);
+        let a = ask("per_hour(sum:hits{*}.rollup(sum, monthly))", day(2026, 1, 1), day(2026, 4, 1));
+        assert!(values(&a).iter().all(|v| (v - 1.0).abs() < 1e-12), "{:?}", values(&a));
+        // Months begun on the 15th: 2026-01-01 is in December's.
+        let a = ask("sum:hits{*}.rollup(sum, monthly, 15th)", day(2026, 1, 1), day(2026, 1, 20));
+        assert_eq!(a.grid.from, day(2025, 12, 15));
+        assert_eq!(values(&a), [14.0 * 24.0, 31.0 * 24.0]);
+        // Every rollup in a query, the same calendar.
+        let r = Request::new("sum:hits{*}.rollup(sum, daily) + sum:hits{*}.rollup(sum, weekly)", 0, 86_400_000);
+        assert!(eval(&s, &r).is_err());
+        let r = Request::new("sum:hits{*}.rollup(sum, daily) + sum:hits{*}.rollup(sum, 60)", 0, 86_400_000);
+        assert!(eval(&s, &r).is_err());
+        // A year of days fits; a calendar_shift in a timezone moves by its local days.
+        assert_eq!(ask("sum:hits{*}.rollup(sum, daily)", day(2026, 1, 1), day(2027, 1, 1)).grid.n, 365);
+        let a = ask("calendar_shift(sum:hits{*}.rollup(sum, daily, 'America/New_York'), '-1d', 'America/New_York')", day(2026, 3, 10), day(2026, 3, 10) + H);
+        assert_eq!(values(&a), [23.0], "the day before New York's 9th: its 8th");
+        // On a grid of hours, each hour reads the same local hour the day before: New York's 9th's
+        // 2am reads an hour its 8th never had; its 1am, 25 hours back (EST then), its 3am, 24.
+        let hour = |t: i64| ((t - day(2026, 1, 1)) / H) as f64;
+        let mut r = Request::new("calendar_shift(avg:hour{*}, '-1d', 'America/New_York')", day(2026, 3, 9) + 5 * H, day(2026, 3, 9) + 8 * H);
+        r.step = Some(3_600_000);
+        let v = values(&eval(&s, &r).unwrap());
+        assert_eq!(v[0], hour(day(2026, 3, 8) + 6 * H), "1am EDT, a day back: 1am EST");
+        assert!(v[1].is_nan(), "2am: none the day before");
+        assert_eq!(v[2], hour(day(2026, 3, 8) + 7 * H), "3am EDT, a day back: 3am EDT");
+        // A month back from a month's last days would read February's 28th thrice: the range's end's
+        // shift instead, 31 days, throughout.
+        let mut r = Request::new("calendar_shift(avg:hour{*}, '-1mo')", day(2026, 3, 29), day(2026, 4, 1));
+        r.step = Some(3_600_000);
+        let v = values(&eval(&s, &r).unwrap());
+        assert!(v.iter().enumerate().all(|(i, &x)| x == hour(day(2026, 3, 29) + i as i64 * H) - 31.0 * 24.0), "{v:?}");
+    }
+
+    /// `weighted()`, Datadog's worked example: pods reporting every 10 s, each living part of a
+    /// minute, summed by version, count for the share of the minute they lived.
+    #[test]
+    fn weighted_counts_a_short_lived_series_for_its_share() {
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        // (version, value, samples in the minute)
+        for (i, (version, value, n)) in [("1", 12.0, 1), ("1", 12.0, 3), ("1", 12.0, 2), ("2", 12.0, 1), ("2", 16.0, 3), ("2", 18.0, 2)].into_iter().enumerate() {
+            let app = format!("app{i}");
+            let k = SeriesKey::new("pod.uptime", [("version", version), ("app", app.as_str())], Kind::Gauge).unwrap();
+            b.define(&k);
+            b.run(k.fp, (0..n).map(|j| (i64::from(j) * 10_000, value)));
+        }
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str| -> Vec<f64> {
+            let mut r = Request::new(q, 0, 60_000);
+            r.step = Some(60_000);
+            eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}")).series.iter().map(|x| x.values[0]).collect()
+        };
+        assert_eq!(ask("sum:pod.uptime{*} by {version}"), [36.0, 46.0]);
+        assert_eq!(ask("sum:pod.uptime{*} by {version}.weighted()"), [12.0, 16.0]);
+        // An average weighs each pod by its share: version 2's 16 (its pods' 12, 16, 18 for a
+        // sixth, a half, a third), not their plain mean.
+        let avg = ask("avg:pod.uptime{*} by {version}.weighted()");
+        assert!((avg[0] - 12.0).abs() < 1e-12 && (avg[1] - 16.0).abs() < 1e-12, "{avg:?}");
+        assert!((ask("avg:pod.uptime{*} by {version}")[1] - 46.0 / 3.0).abs() < 1e-12);
+        // A count: pods alive on average over the minute.
+        let n = ask("count:pod.uptime{*} by {version}.weighted()");
+        assert!((n[0] - 1.0).abs() < 1e-12 && (n[1] - 1.0).abs() < 1e-12, "{n:?}");
+        assert_eq!(ask("max:pod.uptime{*} by {version}.weighted()"), [12.0, 18.0]);
+        for bad in ["sum:pod.uptime{*}.rollup(sum).weighted()", "sum:pod.uptime{*}.weighted().rollup(max, 60)"] {
+            assert!(eval(&s, &Request::new(bad, 0, 60_000)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_calendar_month_back_is_the_same_day_or_the_month_s_last() {
+        // 2026-03-31 12:00 UTC, a month back: February has no 31st, so 2026-02-28 12:00.
+        let to = days_from_civil(2026, 3, 31) * 86_400_000 + 12 * 3_600_000;
+        let calendar_shift_ms = |shift: &str, to: i64| -> Result<i64, QueryError> {
+            let (days, months) = calendar_shift(shift)?;
+            calendar::shift_back(&calendar::Zone::UTC.tz(), to, days, months).ok_or_else(|| QueryError::Invalid("past".into()))
+        };
+        assert_eq!(calendar_shift_ms("-1mo", to).unwrap(), -31 * 86_400_000);
+        // 2026-05-15, two months back: 2026-03-15 (61 days).
+        let to = days_from_civil(2026, 5, 15) * 86_400_000;
+        assert_eq!(calendar_shift_ms("-2mo", to).unwrap(), -61 * 86_400_000);
+        assert_eq!(calendar_shift_ms("-2w", to).unwrap(), -14 * 86_400_000);
+        for bad in ["1d", "-0d", "-1y", "-d", ""] {
+            assert!(calendar_shift_ms(bad, to).is_err(), "{bad}");
+        }
+        assert_eq!(civil_from_days(days_from_civil(2024, 2, 29)), (2024, 2, 29));
+    }
+
+    /// ASAP's span: noise about a level with a sustained dip is smoothed (a span above one: the
+    /// noise goes, the dip stands out, its kurtosis kept); a clean ramp is left as it is; and a
+    /// noisy wave too, as ASAP means (smoothed, it would read flatter than it is: a sine's kurtosis,
+    /// 1.5, is under the noisy wave's).
+    #[test]
+    fn autosmooth_smooths_noise_and_keeps_what_stands_out() {
+        let mut seed = 23u64;
+        let mut noise = || {
+            // Near normal: the sum of four uniforms.
+            (0..4)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                    ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+                })
+                .sum::<f64>()
+        };
+        let dip: Vec<f64> = (0..300).map(|i| noise() + if (150..180).contains(&i) { -4.0 } else { 0.0 }).collect();
+        let w = asap_span(&dip);
+        assert!(w > 1, "{w}");
+        let clean: Vec<f64> = (0..300).map(|i| f64::from(i) * 0.1).collect();
+        assert_eq!(asap_span(&clean), 1);
+        let wave: Vec<f64> = (0..300).map(|i| (f64::from(i) / 50.0).sin() * 5.0 + noise()).collect();
+        assert_eq!(asap_span(&wave), 1);
     }
 }

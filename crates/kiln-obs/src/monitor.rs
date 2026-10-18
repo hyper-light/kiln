@@ -372,6 +372,8 @@ fn metric_values(store: &Store, query: &str, aggr: TimeAggr, window_ms: i64, to:
         // An `anomalies()` series: the share of its window's buckets past its band, as Datadog's
         // anomaly monitors compare it (`>= 1`: all of them); buckets it could not score left out.
         let v = match &s.bounds {
+            // An `outliers()` series: 1 an outlier over the window, 0 not (Datadog's `> 0`).
+            _ if s.outlier.is_some() => s.outlier.map(|o| f64::from(u8::from(o))),
             Some(b) if b.forecast_from.is_none() => {
                 let read: Vec<bool> = (0..s.values.len()).filter_map(|i| b.anomalous(i)).collect();
                 (!read.is_empty()).then(|| read.iter().filter(|&&x| x).count() as f64 / read.len() as f64)
@@ -787,6 +789,34 @@ mod tests {
         assert!(got.iter().all(|v| v.value > 40.0), "{got:?}");
         for bad in ["max(next_10m):forecast(avg:disk{*}, 'linear', 2) >= 95", "max(next_1y):forecast(avg:disk{*}, 'linear', 2) >= 95", "avg(next_1d):forecast(avg:disk{*}, 'linear', 2) >= 95", "max(next_1d):avg:disk{*} >= 95"] {
             assert!(parse(bad).is_err(), "{bad} parsed");
+        }
+    }
+
+    /// Datadog's outlier monitor, `avg(last_1h):outliers(..., 'dbscan', 1) > 0`: each host's value 1
+    /// if it is an outlier of its group over the window, 0 if not.
+    #[test]
+    fn an_outlier_monitor_reads_one_for_the_member_unlike_its_peers() {
+        let mut s = Store::new(Keyed::new());
+        let mut b = Builder::new();
+        let now: i64 = 1_800_000_000_000;
+        let mut seed = 17u64;
+        let mut noise = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        for (host, level) in [("a", 40.0), ("b", 41.0), ("c", 39.0), ("d", 40.0), ("odd", 80.0)] {
+            let k = SeriesKey::new("cpu", [("host", host)], SKind::Gauge).unwrap();
+            b.define(&k);
+            let points: Vec<(i64, f64)> = (0..60).map(|i| (now - (60 - i) * 60_000, level + 3.0 * noise())).collect();
+            b.run(k.fp, points.iter().copied());
+        }
+        s.apply(&b.finish()).unwrap();
+        let q = parse("avg(last_1h):outliers(avg:cpu{*} by {host}, 'dbscan', 1) > 0").unwrap();
+        let got = evaluate(&s, &q, now, 0).unwrap();
+        assert_eq!(got.len(), 5, "{got:?}");
+        for v in &got {
+            let odd = v.group.iter().any(|(_, h)| h == "odd");
+            assert_eq!(v.value, if odd { 1.0 } else { 0.0 }, "{v:?}");
         }
     }
 }

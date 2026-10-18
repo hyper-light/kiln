@@ -913,3 +913,149 @@ fn observe_s_routes_are_each_role_s_as_its_capabilities_say() -> anyhow::Result<
     anyhow::ensure!(needs("/api/observe/v1/query", "post") == "observe.read" && needs("/api/observe/v1/compact", "post") == "observe.manage", "the OpenAPI document: {}", at(&doc, &["paths"]).as_object().map(|p| p.keys().filter(|k| k.contains("observe")).cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
     Ok(())
 }
+
+/// Five hosts' CPU over an hour, one running hot: `outliers()` says it alone is one (DBSCAN, MAD),
+/// and Datadog's outlier monitor, `avg(last_30m):outliers(..., 'dbscan', 1) > 0`, alerts it alone
+/// and a webhook hears of it.
+#[test]
+#[ignore = "starts a kiln server as a process, and a service for it to notify"]
+fn an_outlier_monitor_alerts_the_host_unlike_its_peers() -> anyhow::Result<()> {
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let mock = Mock::start(&[])?;
+    let (code, _) = f.request("PUT", "/api/observe/v1/integrations/peers", Some(&json!({ "kind": "webhook", "url": mock.url("/peers") })))?;
+    anyhow::ensure!(code == 204);
+    let now = crate_now() / 60_000 * 60_000;
+    let mut seed = 41u64;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        ((seed >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let mut series = Vec::new();
+    for (host, level) in [("web-1", 40.0), ("web-2", 42.0), ("web-3", 39.0), ("web-4", 41.0), ("web-5", 80.0)] {
+        let points: Vec<Value> = (0..60).map(|i| json!([(now - (59 - i) * 60_000) as f64 / 1000.0, level + 4.0 * noise()])).collect();
+        series.push(json!({ "metric": "e2e.cpu", "type": "gauge", "tags": [format!("host:{host}")], "points": points }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    for algo in ["dbscan', 1", "mad', 3, 20"] {
+        let q = json!({ "query": format!("outliers(avg:e2e.cpu{{*}} by {{host}}, '{algo})"), "from": now - 3_600_000, "to": now, "step": 60_000 });
+        let start = Instant::now();
+        loop {
+            let a = f.call("POST", "/api/observe/v1/query", Some(&q))?;
+            let flagged: Vec<String> = at(&a, &["series"]).as_array().into_iter().flatten().filter(|s| at(s, &["outlier"]).as_bool() == Some(true)).filter_map(|s| at(s, &["tags", "host"]).as_str().map(str::to_owned)).collect();
+            if at(&a, &["series"]).as_array().is_some_and(|s| s.len() == 5) {
+                anyhow::ensure!(flagged == ["web-5"], "{algo}: {flagged:?}");
+                break;
+            }
+            anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "five series: {a}");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    let m = f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({
+            "name": "e2e unlike its peers",
+            "query": "avg(last_30m):outliers(avg:e2e.cpu{*} by {host}, 'dbscan', 1) > 0",
+            "message": "{{#is_alert}}{{host.name}} is unlike its peers @webhook-peers{{/is_alert}}",
+            "options": { "every": 10, "thresholds": { "critical": 0 } },
+        })),
+    )?;
+    let id = at(&m, &["id"]).as_str().unwrap_or("").to_owned();
+    let start = Instant::now();
+    loop {
+        let m = f.call("GET", &format!("/api/observe/v1/monitors/{id}"), None)?;
+        let states: BTreeMap<String, String> = at(&m, &["groups"])
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|g| (at(g, &["group"]).as_array().and_then(|kv| kv.first()).and_then(Value::as_array).and_then(|kv| kv.get(1)).and_then(Value::as_str).unwrap_or("").to_owned(), at(g, &["state"]).as_str().unwrap_or("").to_owned()))
+            .collect();
+        if states.len() == 5 && states.get("web-5").map(String::as_str) == Some("ALERT") && states.iter().filter(|(h, _)| *h != "web-5").all(|(_, s)| s == "OK") {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(60), "the monitor's groups: {states:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let start = Instant::now();
+    while mock.at("/peers").is_empty() {
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "the webhook heard nothing");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let heard: Vec<Value> = mock.at("/peers").iter().map(Got::json).collect();
+    let [one] = heard.as_slice() else { anyhow::bail!("the webhook heard {} notices: {heard:?}", heard.len()) };
+    anyhow::ensure!(at(one, &["notice", "message"]).as_str().is_some_and(|m| m.contains("web-5 is unlike its peers")), "{one}");
+    Ok(())
+}
+
+/// Calendar rollups and `weighted()` through the API: three days of a count of one an hour, summed
+/// by UTC days begun at 9am and by New York's days (each a local midnight, 4am or 5am UTC, and as
+/// many ones as the day has hours); and Datadog's pods, a minute's share each.
+#[test]
+#[ignore = "starts a kiln server as a process"]
+fn calendar_rollups_and_weights_read_as_the_calendar_and_the_pods_say() -> anyhow::Result<()> {
+    const H: i64 = 3_600_000;
+    let f = Fleet::new()?;
+    f.until(Duration::from_secs(30), "the server leads", |s| at(s, &["leader"]).as_u64() == Some(1))?;
+    let now = crate_now() / H * H;
+    let first = now - 72 * H;
+    let points: Vec<Value> = (0..72).map(|i| json!([(first + i * H) as f64 / 1000.0, 1.0])).collect();
+    // Datadog's pods: a 12, 16 or 18 for one, two or three 10 s samples of a past minute.
+    let minute = (crate_now() / 60_000 - 10) * 60_000;
+    let mut series = vec![json!({ "metric": "e2e.hits", "type": "count", "tags": [], "points": points })];
+    for (i, (version, value, n)) in [("1", 12.0, 1), ("1", 12.0, 3), ("1", 12.0, 2), ("2", 12.0, 1), ("2", 16.0, 3), ("2", 18.0, 2)].into_iter().enumerate() {
+        let pts: Vec<Value> = (0..n).map(|j| json!([(minute + j * 10_000) as f64 / 1000.0, value])).collect();
+        series.push(json!({ "metric": "e2e.pod.uptime", "type": "gauge", "tags": [format!("version:{version}"), format!("app:app{i}")], "points": pts }));
+    }
+    f.call("POST", "/api/observe/v1/series", Some(&json!({ "series": series })))?;
+    let ask = |q: &str, from: i64, to: i64, step: Option<i64>| -> anyhow::Result<Value> {
+        let start = Instant::now();
+        loop {
+            let a = f.call("POST", "/api/observe/v1/query", Some(&json!({ "query": q, "from": from, "to": to, "step": step })))?;
+            let total: f64 = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
+            if total > 0.0 {
+                return Ok(a);
+            }
+            anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "{q}: no data: {a}");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
+    let numbers = |a: &Value, path: &[&str]| -> Vec<f64> { at(a, path).as_array().into_iter().flatten().map(|v| v.as_f64().unwrap_or(f64::NAN)).collect() };
+    // UTC days begun at 9am: every bucket's start a 9am, a day apart; the sum, every hour written.
+    let a = ask("sum:e2e.hits{*}.rollup(sum, daily, 9am)", first, now, None)?;
+    anyhow::ensure!(at(&a, &["grid", "calendar"]).as_str() == Some("daily"), "{a}");
+    let times: Vec<i64> = numbers(&a, &["grid", "times"]).into_iter().map(|t| t as i64).collect();
+    anyhow::ensure!(!times.is_empty() && times.iter().all(|t| t.rem_euclid(86_400_000) == 9 * H) && times.windows(2).all(|w| matches!(w, [a, b] if b - a == 86_400_000)), "{times:?}");
+    let values = numbers(at(&a, &["series"]).get(0).unwrap_or(&Value::Null), &["values"]);
+    anyhow::ensure!(values.iter().filter(|v| v.is_finite()).sum::<f64>() == 72.0, "{values:?}");
+    // New York's days: a local midnight each (4am UTC in summer time, 5am in winter's), and each
+    // whole day as many ones as its hours.
+    let a = ask("sum:e2e.hits{*}.rollup(sum, daily, 'America/New_York')", first, now, None)?;
+    let times: Vec<i64> = numbers(&a, &["grid", "times"]).into_iter().map(|t| t as i64).collect();
+    let values = numbers(at(&a, &["series"]).get(0).unwrap_or(&Value::Null), &["values"]);
+    anyhow::ensure!(times.iter().all(|t| [4 * H, 5 * H].contains(&t.rem_euclid(86_400_000))), "{times:?}");
+    for (i, w) in times.windows(2).enumerate() {
+        let &[start, end] = w else { continue };
+        let hours = (end - start) / H;
+        anyhow::ensure!([23, 24, 25].contains(&hours), "{times:?}");
+        // A day wholly inside the three written: one an hour.
+        if start >= first && end <= now {
+            anyhow::ensure!(values.get(i) == Some(&(hours as f64)), "day {i}: {values:?} of {times:?}");
+        }
+    }
+    anyhow::ensure!(values.iter().filter(|v| v.is_finite()).sum::<f64>() == 72.0, "{values:?}");
+    // The pods: plain, 36 and 46; weighted, 12 and 16.
+    let sums = |q: &str| -> anyhow::Result<Vec<f64>> {
+        let a = ask(q, minute, minute + 60_000, Some(60_000))?;
+        Ok(at(&a, &["series"]).as_array().into_iter().flatten().map(|s| at(s, &["values"]).get(0).and_then(Value::as_f64).unwrap_or(f64::NAN)).collect())
+    };
+    anyhow::ensure!(sums("sum:e2e.pod.uptime{*} by {version}")? == [36.0, 46.0]);
+    let w = sums("sum:e2e.pod.uptime{*} by {version}.weighted()")?;
+    anyhow::ensure!(matches!(w.as_slice(), [a, b] if (a - 12.0).abs() < 1e-9 && (b - 16.0).abs() < 1e-9), "{w:?}");
+    // What the calendar refuses, it says.
+    let (code, body) = f.request("POST", "/api/observe/v1/query", Some(&json!({ "query": "sum:e2e.hits{*}.rollup(sum, weekly, 'Mars/Olympus_Mons')", "from": first, "to": now })))?;
+    let body = String::from_utf8_lossy(&body);
+    anyhow::ensure!(code == 400 && body.contains("Mars/Olympus_Mons"), "{code} {body}");
+    Ok(())
+}

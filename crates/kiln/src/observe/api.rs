@@ -428,13 +428,23 @@ async fn query(body: QueryBody) -> Result<Response, Fail> {
                 if let Some(b) = &x.bounds {
                     o.insert("bounds".into(), json!({ "lower": b.lower, "upper": b.upper, "score": b.score, "k": b.k, "direction": b.direction.as_str(), "algorithm": b.algorithm, "forecast_from": b.forecast_from }));
                 }
+                // An `outliers()` series': whether it is one.
+                if let Some(out) = x.outlier {
+                    o.insert("outlier".into(), Value::Bool(out));
+                }
                 Value::Object(o)
             })
             .collect();
+        let mut grid = json!({ "from": a.grid.from, "step": a.grid.step, "n": a.grid.n });
+        // A calendar rollup's buckets: each one's start (a month's days, a local day's hours, its own).
+        if let (Some(edges), Some((c, _)), Some(o)) = (a.grid.edges(0), a.grid.calendar, grid.as_object_mut()) {
+            o.insert("times".into(), json!(edges.get(..a.grid.n).unwrap_or(&[])));
+            o.insert("calendar".into(), json!(c.unit.as_str()));
+        }
         Ok(srv::json(
             StatusCode::OK,
             &json!({
-                "grid": { "from": a.grid.from, "step": a.grid.step, "n": a.grid.n },
+                "grid": grid,
                 "series": series,
                 "scalar": a.scalar,
                 "scanned": { "series": a.scanned_series, "samples": a.scanned_samples },

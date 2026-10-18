@@ -2110,6 +2110,7 @@ dependencies = [
  "hyper-log",
  "hyper-measure",
  "hyper-raft",
+ "jiff",
  "regex",
  "serde_json",
  "sha2",

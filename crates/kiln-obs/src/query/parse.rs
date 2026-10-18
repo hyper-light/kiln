@@ -3,6 +3,7 @@
 //! their parents. Nothing here recurses: a query's depth costs no stack, and every pass over the
 //! tree is a loop over the arena.
 
+use super::calendar::{self, Calendar};
 use super::lex::{LexError, Spanned, Tok, lex};
 use crate::index::{Clause, NameMatch, ValueMatch};
 
@@ -57,8 +58,12 @@ pub struct MetricQuery {
     pub filters: Vec<Clause>,
     pub by: Vec<String>,
     pub rollup: Option<(Rollup, Option<i64>)>,
+    /// A calendar rollup's periods (`.rollup(sum, daily|weekly|monthly[, alignment][, 'tz'])`).
+    pub calendar: Option<Calendar>,
     pub mode: Option<CountMode>,
     pub fill: Option<Fill>,
+    /// `.weighted()`: a gauge's series counts in a bucket for the share of it it reported over.
+    pub weighted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +72,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// `pow(a, b)`'s: no operator writes it.
+    Pow,
 }
 
 /// The functions, by name.
@@ -96,6 +103,83 @@ pub enum Func {
     /// interval=)`: the series, and past its last point what it will do and its bounds
     /// (`crate::forecast`).
     Forecast,
+    /// `outliers(query, 'dbscan'|'mad'|'scaleddbscan'|'scaledmad', tolerance, pct)`: the series,
+    /// each said an outlier of its group over the range or not (`crate::outlier`).
+    Outliers,
+    // Datadog's function catalog (docs.datadoghq.com/dashboards/functions), each as its page says.
+    /// `round(query[, decimals])`, `ceil`, `floor`, `pow(a, b)`: arithmetic.
+    Round,
+    Ceil,
+    Floor,
+    Pow,
+    /// `count_nonzero` (and `count_nonzero_finite`), `count_not_null`: how many of the group's series
+    /// are non-zero, or have a value, at each point.
+    CountNonzero,
+    CountNotNull,
+    /// `exclude_null`: the groups with an `N/A` tag value left out; `clamp_min`, `clamp_max`
+    /// (values past the bound, and missing ones, the bound); `cutoff_min`, `cutoff_max` (values
+    /// past it none).
+    ExcludeNull,
+    ClampMin,
+    ClampMax,
+    CutoffMin,
+    CutoffMax,
+    /// `default_zero`: a missing value 0.
+    DefaultZero,
+    /// `dt`: the seconds between points (of the whole group); `monotonic_diff`: `diff`, rises only;
+    /// `throughput`: a value per second of its bucket.
+    Dt,
+    MonotonicDiff,
+    Throughput,
+    /// `robust_trend` (Huber), `trend_line` (least squares), `piecewise_constant` (PELT).
+    RobustTrend,
+    TrendLine,
+    PiecewiseConstant,
+    /// `autosmooth`: a moving average of a span chosen by ASAP.
+    Autosmooth,
+    /// `median`, `median_3`, `_5`, `_7`, `_9`: the median of the last `n` points.
+    Median(u8),
+    /// `ewma_1`, `_3`, `_5`, `_7`, `_10`, `_20`: `ewma` at that span.
+    EwmaSpan(u8),
+    /// `rollingavg_5`, `_13`, `_21`, `_29`: the mean of the last `n` points.
+    RollingAvg(u8),
+    /// `hour_before`, `day_before`, `week_before`, `month_before` (28 days), and
+    /// `calendar_shift(query, '-1d'|'-2w'|'-1mo', 'UTC')`: the query as it was that long before.
+    HourBefore,
+    DayBefore,
+    WeekBefore,
+    MonthBefore,
+    CalendarShift,
+    /// `top5`, `bottom10_max`, ... (`[top|bottom][5|10|15|20][_measure]`): `top` and `bottom` in one.
+    Ranked { n: u8, bottom: bool, by: Rank },
+}
+
+/// How `top` and `bottom` rank series: by their mean (Datadog's unless said), least, most, last,
+/// sum, signed area, or L2 norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rank {
+    Mean,
+    Min,
+    Max,
+    Last,
+    Sum,
+    Area,
+    Norm,
+}
+
+impl Rank {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "mean" | "avg" => Self::Mean,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            "last" => Self::Last,
+            "sum" => Self::Sum,
+            "area" => Self::Area,
+            "norm" | "l2norm" => Self::Norm,
+            _ => return None,
+        })
+    }
 }
 
 impl Func {
@@ -120,19 +204,77 @@ impl Func {
             "clamp" => Self::Clamp,
             "anomalies" => Self::Anomalies,
             "forecast" => Self::Forecast,
-            _ => return None,
+            "outliers" => Self::Outliers,
+            "round" => Self::Round,
+            "ceil" => Self::Ceil,
+            "floor" => Self::Floor,
+            "pow" => Self::Pow,
+            "count_nonzero" | "count_nonzero_finite" => Self::CountNonzero,
+            "count_not_null" => Self::CountNotNull,
+            "exclude_null" => Self::ExcludeNull,
+            "clamp_min" => Self::ClampMin,
+            "clamp_max" => Self::ClampMax,
+            "cutoff_min" => Self::CutoffMin,
+            "cutoff_max" => Self::CutoffMax,
+            "default_zero" => Self::DefaultZero,
+            "dt" => Self::Dt,
+            "monotonic_diff" => Self::MonotonicDiff,
+            "throughput" => Self::Throughput,
+            "robust_trend" => Self::RobustTrend,
+            "trend_line" => Self::TrendLine,
+            "piecewise_constant" => Self::PiecewiseConstant,
+            "autosmooth" => Self::Autosmooth,
+            "median" => Self::Median(3),
+            "hour_before" => Self::HourBefore,
+            "day_before" => Self::DayBefore,
+            "week_before" => Self::WeekBefore,
+            "month_before" => Self::MonthBefore,
+            "calendar_shift" => Self::CalendarShift,
+            other => return Self::spanned(other),
         })
+    }
+
+    /// The functions a number in their name says the span of: `median_5`, `ewma_10`,
+    /// `rollingavg_13`, `top10_max`.
+    fn spanned(n: &str) -> Option<Self> {
+        let num = |s: &str, allowed: &[u8]| s.parse::<u8>().ok().filter(|v| allowed.contains(v));
+        if let Some(k) = n.strip_prefix("median_") {
+            return num(k, &[3, 5, 7, 9]).map(Self::Median);
+        }
+        if let Some(k) = n.strip_prefix("ewma_") {
+            return num(k, &[1, 3, 5, 7, 10, 20]).map(Self::EwmaSpan);
+        }
+        if let Some(k) = n.strip_prefix("rollingavg_") {
+            return num(k, &[5, 13, 21, 29]).map(Self::RollingAvg);
+        }
+        let (bottom, rest) = match (n.strip_prefix("top"), n.strip_prefix("bottom")) {
+            (Some(r), _) => (false, r),
+            (_, Some(r)) => (true, r),
+            _ => return None,
+        };
+        let (count, by) = rest.split_once('_').map_or((rest, Rank::Mean), |(c, m)| (c, Rank::parse(m).unwrap_or(Rank::Mean)));
+        if rest.split_once('_').is_some_and(|(_, m)| Rank::parse(m).is_none()) {
+            return None;
+        }
+        num(count, &[5, 10, 15, 20]).map(|n| Self::Ranked { n, bottom, by })
     }
 
     /// The fewest and most arguments.
     pub fn arity(self) -> (usize, usize) {
         match self {
             Self::Top | Self::Bottom => (1, 4),
-            Self::Timeshift | Self::MovingAvg | Self::Ewma => (2, 2),
+            Self::Timeshift => (2, 2),
+            // `moving_rollup(query, seconds[, aggregator])`; `ewma(query[, span])`, 20 unless said.
+            Self::MovingAvg => (2, 3),
+            Self::Ewma => (1, 2),
+            Self::Round => (1, 2),
+            Self::Pow | Self::ClampMin | Self::ClampMax | Self::CutoffMin | Self::CutoffMax => (2, 2),
+            Self::CalendarShift => (2, 3),
             Self::Clamp => (3, 3),
             Self::Anomalies => (1, 4),
             // The query and its algorithm; deviations; then named arguments.
             Self::Forecast => (2, 8),
+            Self::Outliers => (1, 4),
             _ => (1, 1),
         }
     }
@@ -187,6 +329,7 @@ fn precedence(op: BinOp) -> u8 {
     match op {
         BinOp::Add | BinOp::Sub => 1,
         BinOp::Mul | BinOp::Div => 2,
+        BinOp::Pow => 3,
     }
 }
 
@@ -425,7 +568,7 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
         return Err(syntax(at, "a metric's name"));
     }
     let metric = if metric.contains(['*', '?']) { NameMatch::Glob(metric.to_owned()) } else { NameMatch::Exact(metric.to_owned()) };
-    let mut q = MetricQuery { space, metric, filters: Vec::new(), by: Vec::new(), rollup: None, mode: None, fill: None };
+    let mut q = MetricQuery { space, metric, filters: Vec::new(), by: Vec::new(), rollup: None, calendar: None, mode: None, fill: None, weighted: false };
     i += 1;
     if let Some((_, Tok::LBrace)) = toks.get(i) {
         i = filters(toks, i + 1, &mut q.filters)?;
@@ -485,16 +628,21 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
         };
         match *m {
             "rollup" => {
-                let f = name_arg(args.first()).and_then(|n| rollup_fn(&n)).ok_or_else(|| syntax(m_at, "rollup(avg|sum|min|max|count|last[, seconds])"))?;
+                let f = name_arg(args.first()).and_then(|n| rollup_fn(&n)).ok_or_else(|| syntax(m_at, "rollup(avg|sum|min|max|count|last[, seconds | daily|weekly|monthly[, alignment][, 'timezone']])"))?;
                 let secs = match args.get(1) {
                     None => None,
-                    a => Some(num_arg(a).filter(|&s| s > 0).ok_or_else(|| syntax(m_at, "a rollup's seconds"))?),
+                    Some(Tok::Number(_)) => Some(num_arg(args.get(1)).filter(|&s| s > 0).ok_or_else(|| syntax(m_at, "a rollup's seconds"))?),
+                    Some(t) => {
+                        q.calendar = Some(calendar(t, args.get(2..).unwrap_or(&[])).map_err(|e| syntax(m_at, e))?);
+                        None
+                    }
                 };
-                if args.len() > 2 {
-                    return Err(syntax(m_at, "rollup takes at most two arguments"));
+                if secs.is_some() && args.len() > 2 {
+                    return Err(syntax(m_at, "a rollup in seconds takes no alignment: rollup(sum, 60)"));
                 }
                 q.rollup = Some((f, secs));
             }
+            "weighted" if args.is_empty() => q.weighted = true,
             "as_count" if args.is_empty() => q.mode = Some(CountMode::Count),
             "as_rate" if args.is_empty() => q.mode = Some(CountMode::Rate),
             "fill" => {
@@ -514,7 +662,47 @@ fn metric_query(toks: &[Spanned<'_>], mut i: usize) -> Result<(MetricQuery, usiz
             other => return Err(syntax(m_at, format!("no modifier .{other}()"))),
         }
     }
+    // A gauge's weight is its average's share of a bucket: a sum, a count, an extreme of its
+    // samples has no share to weigh.
+    if q.weighted && q.rollup.is_some_and(|r| r.0 != Rollup::Avg) {
+        return Err(syntax(at, "weighted() weighs a gauge's averages: rollup(avg), or no rollup"));
+    }
     Ok((q, i))
+}
+
+/// A calendar rollup's periods from its unit and what follows it: an alignment, a timezone, or
+/// both in that order (Datadog's `.rollup(sum, weekly, monday, 'America/New_York')`).
+fn calendar(unit: &Tok<'_>, rest: &[&Tok<'_>]) -> Result<Calendar, String> {
+    let word = |t: &Tok<'_>| match t {
+        Tok::Name(n) => Some((*n).to_owned()),
+        Tok::Str(s) => Some(s.clone()),
+        Tok::Number(n) if n.fract() == 0.0 && (1.0..=31.0).contains(n) => Some(format!("{n}")),
+        _ => None,
+    };
+    let unit = word(unit).and_then(|u| calendar::Unit::parse(&u)).ok_or("a rollup's interval: seconds, or daily, weekly or monthly")?;
+    let how = match unit {
+        calendar::Unit::Daily => "a daily rollup's start: a time of day (12am, 9:30am, 21:30)",
+        calendar::Unit::Weekly => "a weekly rollup's start: a day (monday … sunday)",
+        calendar::Unit::Monthly => "a monthly rollup's start: a day of the month (1 to 31, 1st, 15th)",
+    };
+    let (mut align, mut zone) = (unit.default_alignment(), calendar::Zone::UTC);
+    match rest {
+        [] => {}
+        [one] => {
+            let w = word(one).ok_or(how)?;
+            match unit.alignment(&w) {
+                Some(a) => align = a,
+                // One argument that is no alignment: a timezone, or neither.
+                None => zone = calendar::Zone::named(&w).map_err(|e| if matches!(one, Tok::Str(_)) { e } else { how.to_owned() })?,
+            }
+        }
+        [a, z] => {
+            align = word(a).and_then(|w| unit.alignment(&w)).ok_or(how)?;
+            zone = calendar::Zone::named(&word(z).ok_or("a rollup's timezone: an IANA name, quoted ('America/New_York')")?)?;
+        }
+        _ => return Err("a calendar rollup takes at most four arguments: rollup(sum, weekly, monday, 'America/New_York')".into()),
+    }
+    Ok(Calendar { unit, align, zone })
 }
 
 /// Filters after `{`: `*`, `key:value`, `!key:value`, `key:*`, `key:(a OR b)`, `key IN (a, b)`,

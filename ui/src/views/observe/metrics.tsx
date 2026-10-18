@@ -17,7 +17,7 @@ import { toast } from "@/components/ui/toast";
 import { useRes, type Res } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
-import { ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, dataOf, formatValue, queriesRes, useParam, useRange, type Range } from "./parts";
+import { ObserveNav, PALETTE, RangePicker, aggregate, chartData, dashboardsRes, dataOf, drawnColor, formatValue, queriesRes, useParam, useRange, type Range } from "./parts";
 
 const namesRes: Res<string[]> = { key: "observe/metric-names", fetch: (s) => observeApi.metrics(undefined, s).then((r) => r.metrics), opts: { pollMs: 300_000 } };
 
@@ -154,7 +154,7 @@ function Answer({ query, range }: { query: string; range: Range }) {
   // Each series' figures are of its data: a forecast's values are not its last, nor its most.
   const rows = a.series.map((s, i) => ({
     label: drawn.find((d) => d.source === i && !d.forecast)?.label ?? "",
-    color: PALETTE[i % PALETTE.length] ?? SERIES.grey,
+    color: s.outlier === false ? SERIES.grey : (PALETTE[i % PALETTE.length] ?? SERIES.grey),
     last: aggregate(dataOf(s), "last"),
     avg: aggregate(dataOf(s), "avg"),
     min: aggregate(dataOf(s), "min"),
@@ -172,13 +172,13 @@ function Answer({ query, range }: { query: string; range: Range }) {
           legend={false}
           timeFormat={range === "7d" || range === "30d" ? "day" : "time"}
           yFormat={(v) => formatValue(v)}
-          series={drawn.map((d) => ({ label: d.label, color: PALETTE[d.source % PALETTE.length] ?? SERIES.grey, ...(d.forecast ? { dash: [6, 4] } : {}) }))}
+          series={drawn.map((d) => ({ label: d.label, color: drawnColor(d), ...(d.forecast ? { dash: [6, 4] } : {}) }))}
           bands={bands}
         />
       )}
       <p className="mt-3 font-mono text-[10px] text-[#7b7e88]">
-        {a.series.length.toLocaleString()} series · {a.scanned.series.toLocaleString()} read, {a.scanned.samples.toLocaleString()} samples · {a.took_ms.toFixed(1)} ms · every {formatStep(a.grid.step)}{" "}
-        · as of entry {a.applied.toLocaleString()}
+        {a.series.length.toLocaleString()} series · {a.scanned.series.toLocaleString()} read, {a.scanned.samples.toLocaleString()} samples · {a.took_ms.toFixed(1)} ms · every{" "}
+        {a.grid.calendar ? PERIOD[a.grid.calendar] : formatStep(a.grid.step)} · as of entry {a.applied.toLocaleString()}
       </p>
       {rows.length > 0 && (
         <div className="table-wrap mt-6">
@@ -212,6 +212,8 @@ function Answer({ query, range }: { query: string; range: Range }) {
     </>
   );
 }
+
+const PERIOD = { daily: "day", weekly: "week", monthly: "month" } as const;
 
 const formatStep = (ms: number) => (ms % 86_400_000 === 0 ? `${ms / 86_400_000} d` : ms % 3_600_000 === 0 ? `${ms / 3_600_000} h` : ms % 60_000 === 0 ? `${ms / 60_000} min` : `${ms / 1000} s`);
 

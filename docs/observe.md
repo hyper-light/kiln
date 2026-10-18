@@ -16,10 +16,10 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-1 | Engine core: Gorilla chunks, symbols, series index and selection, head with late writes, write batches; measured (§12.1–12.3) | done |
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
-| O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
+| O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7); Datadog's whole function catalog, calendar rollups in any timezone (the tz database in the binary), `weighted()` (§6) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
-| O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15) | done |
+| O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
@@ -258,9 +258,10 @@ agg        := avg | sum | min | max | count | p50 | p75 | p90 | p95 | p99 | pNN.
 filters    := filter ("," filter)*            // AND; "*" = all
 filter     := ["!"] key ":" value             // value: exact, wildcard "web-*", (a OR b), or
                                               // "quoted" (any characters, exactly; \" and \\ within)
-modifier   := ".rollup(" fn ["," seconds] ")" | ".as_count()" | ".as_rate()" | ".fill(" how ")"
-function   := rate | per_second | per_minute | derivative | diff | abs | log2 | log10 | cumsum
-            | integral | top | bottom | timeshift | moving_avg | ewma | clamp | anomalies
+modifier   := ".rollup(" fn ["," seconds | "," calendar] ")" | ".as_count()" | ".as_rate()"
+            | ".fill(" how ["," seconds] ")" | ".weighted()"
+calendar   := ("daily" | "weekly" | "monthly") ["," alignment] ["," timezone]
+function   := name "(" expr ("," arg)* ")"        // Datadog's catalog, below
 ```
 
 Examples:
@@ -270,8 +271,73 @@ avg:system.cpu.user{host:web-*} by {host}
 sum:kiln.ci.job.finished{status:failure}.as_count().rollup(sum, 3600)
 p99:kiln.http.request.duration{route:/api/*} by {route}
 100 * sum:kiln.ci.job.finished{status:failure}.as_count() / sum:kiln.ci.job.finished{*}.as_count()
-anomalies(avg:system.load.1{host:adacachy}, 'robust', 3)
+anomalies(avg:system.load.1{host:web-1}, 'robust', 3)
+sum:kiln.ci.job.finished{*}.as_count().rollup(sum, weekly, monday, 'America/New_York')
 ```
+
+The functions are Datadog's, every one its pages list, by its categories:
+
+| Category | Functions |
+| --- | --- |
+| Algorithmic | `anomalies`, `forecast`, `outliers` (below; §9.1) |
+| Arithmetic | `abs`, `round(q[, places])`, `ceil`, `floor`, `pow(a, b)` (each a query or a number), `log2`, `log10`, `cumsum`, `integral`; `+ - * /` between queries and numbers |
+| Count | `count_nonzero`, `count_not_null` |
+| Exclusion | `exclude_null`, `clamp_min(q, n)`, `clamp_max(q, n)`, `cutoff_min(q, n)`, `cutoff_max(q, n)`; kiln's `clamp(q, lo, hi)` |
+| Interpolation | `.fill(null\|zero\|linear\|last[, seconds])`, `default_zero` |
+| Rank | `top(q, n, 'mean'\|'min'\|'max'\|'sum'\|'last'\|'area'\|'l2norm', 'desc'\|'asc')`, `bottom`; the shortcuts `[top\|bottom][5\|10\|15\|20][_mean\|_min\|_max\|_last\|_area\|_l2norm]` |
+| Rate | `per_second`, `per_minute`, `per_hour`, `dt`, `diff`, `monotonic_diff`, `derivative`, `rate`, `throughput` |
+| Regression | `robust_trend`, `trend_line`, `piecewise_constant` |
+| Rollup | `.rollup(…)`, `moving_rollup(q, seconds[, 'avg'\|'sum'\|'min'\|'max'\|'count'])` |
+| Smoothing | `autosmooth`, `ewma(q[, span])` and `ewma_3\|5\|10\|20` (and 1, 7), `median_3\|5\|7\|9`, `rollingavg_5\|13\|21\|29` (Datadog's beta) |
+| Timeshift | `hour_before`, `day_before`, `week_before`, `month_before`, `timeshift(q, seconds)`, `calendar_shift(q, '-1d'\|'-2w'\|'-1mo'[, timezone])` |
+
+Where a page says what a function does, it does that, each such sentence a test
+(`datadog_s_functions_do_what_their_pages_say`): a clamp makes a missing point its bound, a cutoff
+makes a point past its bound missing; the counts are across a group's series at each point, one
+series; `exclude_null` drops a group whose tag value is missing (`N/A`); `median_N` and
+`rollingavg_N` are of the last N points; `ewma`'s weight is 2 / (span + 1), span 20 unless said;
+`month_before` is 28 days; `area` is signed. Where a page names a method and not its workings, the
+method is the literature's: `robust_trend` fits Huber's line (k = 1.345, iteratively reweighted,
+the scale the residuals' MAD); `piecewise_constant` finds its steps by PELT (Killick et al. 2012),
+the penalty BIC's 2σ² ln n, σ from the MAD of first differences over √2; `autosmooth` is ASAP (Rong
+and Bailis, VLDB 2017): the moving average's span that is smoothest while its kurtosis stays at
+least the series' own, so noise goes and what stands out stays (a wave without spikes is left as
+it is: smoothed, it would read flatter than it is).
+
+**Rollups.** `.rollup(fn, seconds)` sets a bucket's width (never finer than asked); a query's grid is
+otherwise the smallest nice step that fits the range in the points asked. `.fill(how, seconds)`
+fills gaps of at most `seconds` (300 unless said, Datadog's default; larger is allowed).
+**Calendar rollups**, `.rollup(sum, daily|weekly|monthly[, alignment][, 'timezone'])`, are
+Datadog's: a day begins at a time of day (`12am` unless said; `9:30am`, `21:30`), a week on a day
+(`sunday` unless said; `monday`), a month on a day of it (the `1st` unless said; a month without the
+day begins on its last), in an IANA timezone (UTC unless said). The grid is then the calendar's
+periods, each from its own start to the next: a month its days, a local day 23 or 25 hours where
+the clocks change (a local start a clock skips is the instant after the gap; one it repeats, the
+first); the answer says each bucket's start (`grid.times`) and the period. Rates divide by each
+period's own length. Every rollup of a query names the same calendar. The timezones are the tz
+database's, carried in kiln's binary (jiff's copy, already kiln's), never the machine's: every
+machine answers alike, Windows and containers without a zoneinfo too.
+
+`calendar_shift(q, '-1d', 'America/New_York')` reads the same local time a day (or weeks, or
+months) before: on a calendar grid of its timezone shifted by whole periods (`-1d` of days, `-1w` of
+days or weeks, `-1mo` of months) the periods that many before, a 23-hour day included; otherwise
+each bucket's edges, each moved to its own local time the days before (an hour that day did not
+have reads nothing). A month back from a month's last days would land on a shorter month's last more
+than once, so a shift of months that would is the range's end's, throughout.
+
+**`weighted()`** (Datadog's, for gauges whose tag values come and go, a pod's or a container's): a
+series counts in a bucket for the share of it its samples cover, their count times its submission
+interval over the bucket's width (a pod that lived 10 s of a minute counts a sixth). The interval is
+learned: the median gap between the series' own samples (a series with too few to tell takes the
+median of the others'). A sum adds each series' value times its share, an average divides that by
+the shares (each pod weighed by its time), a count is the shares (pods alive on average); a minimum,
+a maximum and a percentile take the values as they are. It weighs averages: with `rollup(avg)` or
+none. Datadog's own worked example (six pods, two versions) is a test: 36 and 46 plain, 12 and 16
+weighted.
+
+`outliers(query, 'dbscan'|'mad'|'scaleddbscan'|'scaledmad', tolerance, pct)` (§9.1): which of each
+group's series behave unlike their peers over the range, each series marked (`outlier`), its values
+as they are; tolerance 3 and pct 20 unless said; a group of under three members has none.
 
 `anomalies(query, algorithm, bounds, direction)` (§9.1): each series of the query and its band of
 `bounds` deviations (2 unless said) about what `algorithm` (`basic`, `agile`, `robust`; `basic` unless
@@ -456,9 +522,11 @@ options, so a monitor written for Datadog reads here.
   reads, and at its own interval besides; a monitor a composite reads is not deleted while it does
   (409, naming the composites), nor made a composite itself.
 
-To come: outlier monitors.
+- **Outliers**: Datadog's `avg(last_1h):outliers(<metric query> by {host}, 'dbscan', 1) > 0`: a
+  group's value is 1 if its series is an outlier of the query's groups over the window, 0 if not;
+  each outlier alerts on its own.
 
-### 9.1 Anomalies and forecasts
+### 9.1 Anomalies, forecasts and outliers
 
 `kiln_obs::anomaly`: Datadog's three algorithms, each giving, before it sees a point, its expected
 value and its scale (the robust spread of its own one-step errors: 1.4826 × their median absolute
@@ -525,7 +593,25 @@ smoothings 0.978), 93.3% held, MSIS 28.9 (ETS 29.7, Naive 32.6). A series foreca
 (hourly) or 0.2 ms (daily) with ten allocations.
 
 Built on it: `forecast()` in queries (§6), drawn past now with its band (§11), and forecast monitors
-(§9). To come: outlier monitors.
+(§9).
+
+**Outliers** (`kiln_obs::outlier`) are Datadog's four, as its engineers described them ("Introducing
+Outlier Detection in Datadog", 2015): DBSCAN over the members as points, a coordinate a bucket, ε
+the median member's distance to the median series times a normalizing constant times the tolerance,
+every member outside the largest cluster an outlier; MAD over every point of every member, a point
+past the median by the tolerance times 1.4826 MADs an outlier, a member one when more than pct% of
+its points are; and each scaled, every bucket first divided by the group's median magnitude, so a
+level all share moves no one. A distance between members with gaps is over the buckets both have,
+scaled up to all of them. Datadog leaves DBSCAN's constant unsaid; kiln's is the smallest of 1.414,
+1.6, 1.8, 2, 2.2, 2.5 and 3 with which a tolerance of 1 flags a member of noise alone at most 1% of
+the time, in the worst of groups of 3, 5, 10 and 20 members over 10, 30, 60 and 120 buckets (400
+groups each; `normalizer_study`): 2.5, at 1.0%, still catching 92% of members off by three
+deviations everywhere and 99.9% of those off by five. √2, which makes ε the distance between two
+ordinary members, flagged 66% of them in the worst group; 2, 5%; 3, 0.2%, but caught only 65% of
+those off by three.
+
+Built on it: `outliers()` in queries (§6), drawn with every member that is not one grey (§11), and
+outlier monitors (§9).
 
 ## 10. Integrations
 
@@ -607,7 +693,8 @@ time range and the search in the address (a page is a link).
   its points past the band marked (every chart: a dashboard's, a monitor's). A chart of a
   `forecast()` reaches half its range past now (a forecast monitor's, its horizon): each series
   solid to its last point, then dashed in its color with its band; its figures (last, average, least,
-  most; a widget's value) are its data's alone.
+  most; a widget's value) are its data's alone. An `outliers()` chart draws its outliers in their
+  colors and every other member grey. A calendar rollup's buckets are drawn at their own starts.
 - **Patterns** (the logs explorer's and the event stream's other view, `?view=patterns`): the
   search's records grouped by their template (Drain), the most common first, each its count, its
   worst status, its template (variables a quiet `*`) and when last seen; a click narrows the search
@@ -1197,6 +1284,18 @@ a check) and is refused (403) a monitor, a dashboard, data posted, an integratio
 the developer makes a monitor and a dashboard and posts data, and is refused an integration, a
 cloud and a check of the replicas; the maintainer adds an integration and removes it; the OpenAPI
 document says what each route needs. 2026-10-18: passes (18 s).
+
+**Outliers** (`observe_live.rs`): five hosts' CPU, four near 40 and one at 80, an hour of noise:
+`outliers(…, 'dbscan', 1)` and `outliers(…, 'mad', 3, 20)` mark the fifth alone; an outlier monitor
+alerts its group alone, the four others OK, and a webhook hears it once. In a browser, the explorer
+draws the outlier in its color and the others grey; in Chromium and WebKit as a phone. 2026-10-18:
+passes.
+
+**Calendar rollups and weights** (`observe_live.rs`): three days of a count of one an hour, through
+the API: by UTC days begun at 9am, every bucket a 9am a day apart and every hour counted; by New
+York's days, each bucket a local midnight (4am or 5am UTC), 23 to 25 hours long, each whole day as
+many as its hours; Datadog's six pods, 36 and 46 summed by version and 12 and 16 weighted; a
+timezone that is none refused, naming it. 2026-10-18: passes (17 s).
 
 **Composites** (`observe_live.rs`): two monitors grouped by host, one alerting web01–05 and the
 other web04–09, and their composite `a && b`: it alerts web04 and web05 and no other host, a webhook

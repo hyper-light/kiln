@@ -135,6 +135,52 @@ const scenarios = {
     expect(Math.abs(end - 74) < 2 && s.bounds.lower.at(-1) < end && end < s.bounds.upper.at(-1), `carried on to ${end} in its band`);
   },
 
+  /** Outliers in the explorer: five hosts, one running hot; `outliers()` keeps its color and greys
+   * its peers (the table's dots say so), as the API's answer flags it alone. */
+  async "an outlier keeps its color in the explorer, its peers greyed"() {
+    const metric = `e2e.outlier.cpu.${run}`;
+    const now = Math.floor(Date.now() / 60_000) * 60_000;
+    const series = [40, 42, 39, 41, 85].map((level, h) => ({
+      metric,
+      type: "gauge",
+      tags: [`host:web-${h + 1}`],
+      points: Array.from({ length: 60 }, (_, i) => [(now - (59 - i) * 60_000) / 1000, level + ((i * 7 + h * 3) % 5) - 2]),
+    }));
+    expect((await api("POST", "/api/observe/v1/series", { series })).status === 202, "writing the points");
+    const query = `outliers(avg:${metric}{*} by {host}, 'dbscan', 1)`;
+    await until("the points stored", async () => (await api("POST", "/api/observe/v1/query", { query, from: now - 3_600_000, to: now + 60_000 })).body?.series?.length === 5);
+    const a = await api("POST", "/api/observe/v1/query", { query, from: now - 3_600_000, to: now + 60_000 });
+    const flagged = a.body.series.filter((s) => s.outlier).map((s) => s.tags.host);
+    expect(JSON.stringify(flagged) === JSON.stringify(["web-5"]), `the API flags web-5 alone: ${flagged}`);
+    await page.goto(`${BASE}/observe/metrics?range=1h&q=${encodeURIComponent(query)}`);
+    const rows = page.locator("table.data-table tbody tr");
+    await until("five rows", async () => (await rows.count()) === 5, 20_000);
+    const dots = await rows.evaluateAll((trs) => trs.map((tr) => [tr.querySelector("td")?.textContent?.trim() ?? "", getComputedStyle(tr.querySelector("td span") ?? tr).backgroundColor]));
+    const grey = dots.filter(([label]) => !label.includes("web-5")).map(([, c]) => c);
+    const hot = dots.find(([label]) => label.includes("web-5"))?.[1];
+    expect(new Set(grey).size === 1 && hot && !grey.includes(hot), `web-5 in its color, its peers alike in grey: ${JSON.stringify(dots)}`);
+  },
+
+  /** A calendar rollup in the explorer: three days of a count of one an hour, summed by New York's
+   * days; the API's buckets are local midnights, and the page says it is a day a bucket, its most a
+   * whole day's hours. */
+  async "a calendar rollup is drawn by the days of its timezone"() {
+    const metric = `e2e.calendar.hits.${run}`;
+    const now = Math.floor(Date.now() / 3_600_000) * 3_600_000;
+    const points = Array.from({ length: 72 }, (_, i) => [(now - (71 - i) * 3_600_000) / 1000, 1]);
+    expect((await api("POST", "/api/observe/v1/series", { series: [{ metric, type: "count", tags: [], points }] })).status === 202, "writing the points");
+    const query = `sum:${metric}{*}.rollup(sum, daily, 'America/New_York')`;
+    const ask = () => api("POST", "/api/observe/v1/query", { query, from: now - 7 * 86_400_000, to: now + 3_600_000 });
+    await until("the points stored", async () => ((await ask()).body?.series?.[0]?.values ?? []).reduce((a, v) => a + (v ?? 0), 0) === 72);
+    const { grid } = (await ask()).body;
+    const local = grid.times.map((t) => (t % 86_400_000) / 3_600_000);
+    expect(grid.calendar === "daily" && grid.times.length === grid.n && local.every((h) => h === 4 || h === 5), `New York's midnights: ${local}`);
+    await page.goto(`${BASE}/observe/metrics?range=7d&q=${encodeURIComponent(query)}`);
+    await page.getByText("every day", { exact: false }).first().waitFor({ timeout: 20_000 });
+    const max = Number((await page.locator("table.data-table tbody tr td").nth(4).textContent()).trim());
+    expect([23, 24, 25].includes(max), `a whole day's hours at the most: ${max}`);
+  },
+
   /** kiln's own dashboard narrowed to one host by its template variable. */
   async "a template variable narrows every widget to its value"() {
     const hosts = (await api("GET", "/api/observe/v1/tags?key=host")).body.values;

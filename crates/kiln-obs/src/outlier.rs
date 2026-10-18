@@ -20,14 +20,19 @@
 //!   magnitude there, so that a level every member shares (a daily rise, a deploy's step) moves no
 //!   one: outliers "scale with the overall metric magnitude" (Datadog's "Outlier Monitor").
 //!
-//! Datadog leaves DBSCAN's normalizing constant unsaid; kiln's is √2: with noise independent across
-//! d buckets, a member is some σ√d from the median series and two members σ√(2d) from each other, so
-//! at a tolerance of 1, ε is the distance between two ordinary members (they join), and a member off
-//! by two deviations everywhere stands apart (the tests).
+//! Datadog leaves DBSCAN's normalizing constant unsaid. kiln's is chosen so that a tolerance of 1
+//! flags a member of noise alone at most 1% of the time in any group of 3 to 20 members over 10 to
+//! 120 buckets ([`DBSCAN_NORMALIZER`], the study in the tests): √2, which makes ε the distance
+//! between two ordinary members (a member is some σ√d from the median series, two members σ√(2d)
+//! from each other), flagged 66% of them in the worst of those groups (two ordinary members are as
+//! often a little further apart than that as nearer); 2.5 flags 1.0%, and still catches 92% of
+//! members off by three deviations everywhere and 99.9% of those off by five.
 
-/// DBSCAN's normalizing constant: the distance between two members over that from each to the
-/// median series, √2 for noise independent across buckets.
-pub const DBSCAN_NORMALIZER: f64 = std::f64::consts::SQRT_2;
+/// DBSCAN's normalizing constant: the smallest of 1.414 (√2), 1.6, 1.8, 2, 2.2, 2.5 and 3 for which a
+/// tolerance of 1 flags a member of noise alone at most 1% of the time, in the worst of groups of 3,
+/// 5, 10 and 20 members over 10, 30, 60 and 120 buckets (400 groups each): 1.0%; √2's worst was
+/// 66%, 2's 5%, 3's 0.2% (catching only 65% of members off by three deviations, against 2.5's 92%).
+pub const DBSCAN_NORMALIZER: f64 = 2.5;
 /// The MAD's consistency constant: a normal law's standard deviation over its MAD.
 pub const MAD_NORMALIZER: f64 = crate::anomaly::MAD_NORMAL;
 /// Members a group needs for any to be an outlier (Datadog's "three or more").
@@ -133,6 +138,10 @@ fn distance(a: &[f64], b: &[f64], d: usize) -> Option<f64> {
 }
 
 fn dbscan(rows: &[Vec<f64>], d: usize, tolerance: f64) -> Vec<bool> {
+    dbscan_with(rows, d, tolerance, DBSCAN_NORMALIZER)
+}
+
+fn dbscan_with(rows: &[Vec<f64>], d: usize, tolerance: f64, normalizer: f64) -> Vec<bool> {
     let n = rows.len();
     // The median series: each bucket's median over the members that have it.
     let mut col = Vec::with_capacity(n);
@@ -145,7 +154,7 @@ fn dbscan(rows: &[Vec<f64>], d: usize, tolerance: f64) -> Vec<bool> {
         .collect();
     let mut to_median: Vec<f64> = rows.iter().filter_map(|r| distance(r, &med, d)).collect();
     let Some(typical) = median(&mut to_median) else { return vec![false; n] };
-    let eps = typical * DBSCAN_NORMALIZER * tolerance;
+    let eps = typical * normalizer * tolerance;
     // Clusters: what is within ε of a member, again and again (every point a core point).
     let mut cluster = vec![usize::MAX; n];
     let mut sizes: Vec<usize> = Vec::new();
@@ -239,8 +248,8 @@ mod tests {
     #[test]
     fn the_member_unlike_its_peers_is_the_outlier_and_noise_alone_has_none() {
         for (algo, rising, off, tol, pct) in [
-            (Algorithm::Dbscan, true, 2.0, 1.0, 0.0),
-            (Algorithm::ScaledDbscan, true, 2.0, 1.0, 0.0),
+            (Algorithm::Dbscan, true, 4.0, 1.0, 0.0),
+            (Algorithm::ScaledDbscan, true, 4.0, 1.0, 0.0),
             (Algorithm::Mad, false, 3.0, 1.5, 50.0),
             (Algorithm::ScaledMad, true, 3.0, 1.5, 50.0),
         ] {
@@ -256,11 +265,12 @@ mod tests {
     }
 
     /// More tolerance lets more deviation pass: DBSCAN at 3 keeps a member two deviations off, and
-    /// still flags one ten off.
+    /// still flags one ten off (at 1, four off).
     #[test]
     fn tolerance_says_how_far_is_too_far() {
         assert!(!run(&group(20, 60, 2.0, 7, true), Algorithm::Dbscan, 3.0, 0.0)[0]);
         assert!(run(&group(20, 60, 10.0, 7, true), Algorithm::Dbscan, 3.0, 0.0)[0]);
+        assert!(run(&group(20, 60, 4.0, 7, true), Algorithm::Dbscan, 1.0, 0.0)[0]);
     }
 
     /// MAD's pct: a member off for a fifth of the window is an outlier under 10% and not under 30%.
@@ -295,5 +305,41 @@ mod tests {
         g.push(vec![f64::NAN; 30]);
         let flagged = run(&g, Algorithm::Dbscan, 1.0, 0.0);
         assert_eq!(flagged, [true, false, false, false, false, false, false]);
+    }
+
+    /// The study of DBSCAN's normalizer (`cargo test -p kiln-obs --lib outlier::tests::normalizer_study
+    /// -- --ignored --nocapture`): for groups of 3 to 20 members over 10 to 120 buckets of noise,
+    /// how often a member of noise alone is flagged at a tolerance of 1, and how often one off by 3
+    /// and 5 deviations is caught at 1 and at 3, for each normalizer.
+    #[test]
+    #[ignore = "a study: prints its table"]
+    fn normalizer_study() {
+        let trials = 400;
+        println!("{:>6} | {:>18} | {:>18} | {:>18} | {:>18}", "c", "false at 1 (worst)", "3σ caught at 1", "5σ caught at 1", "5σ caught at 3");
+        for c in [1.414, 1.6, 1.8, 2.0, 2.2, 2.5, 3.0] {
+            let (mut worst_false, mut caught3, mut caught5, mut caught5_3, mut cases) = (0.0_f64, 0.0, 0.0, 0.0, 0.0);
+            for n in [3usize, 5, 10, 20] {
+                for d in [10usize, 30, 60, 120] {
+                    let (mut fp, mut c3, mut c5, mut c53) = (0usize, 0usize, 0usize, 0usize);
+                    for t in 0..trials {
+                        let seed = (n * 1_000_003 + d * 1009 + t) as u64;
+                        let flagged = |off: f64, tol: f64| {
+                            let g = group(n, d, off, seed, false);
+                            dbscan_with(&g, d, tol, c)
+                        };
+                        fp += flagged(0.0, 1.0).iter().filter(|&&o| o).count();
+                        c3 += usize::from(flagged(3.0, 1.0)[0]);
+                        c5 += usize::from(flagged(5.0, 1.0)[0]);
+                        c53 += usize::from(flagged(5.0, 3.0)[0]);
+                    }
+                    worst_false = worst_false.max(fp as f64 / (trials * n) as f64);
+                    caught3 += c3 as f64 / trials as f64;
+                    caught5 += c5 as f64 / trials as f64;
+                    caught5_3 += c53 as f64 / trials as f64;
+                    cases += 1.0;
+                }
+            }
+            println!("{c:>6.3} | {:>18.4} | {:>18.3} | {:>18.3} | {:>18.3}", worst_false, caught3 / cases, caught5 / cases, caught5_3 / cases);
+        }
     }
 }

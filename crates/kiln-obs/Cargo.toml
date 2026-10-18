@@ -19,6 +19,9 @@ hyper-raft = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627f
 hyper-durable = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 hyper-log = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+# Calendar rollups' and calendar_shift's timezones (`query::calendar`): the tz database bundled in
+# the binary, not the machine's, so every machine answers alike; kiln-ci's, already in kiln's tree.
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-bundle-always"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

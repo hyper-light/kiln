@@ -219,26 +219,36 @@ function past(score: number | null, k: number, direction: Bounds["direction"]) {
   return direction === "above" ? score > k : direction === "below" ? score < -k : Math.abs(score) > k;
 }
 
-/** A drawn series: its label, its source series' place (its color), and whether it is a forecast. */
+/** A drawn series: its label, its source series' place (its color), whether it is a forecast, and,
+ * an `outliers()` series', whether it is an outlier (one that is not is drawn grey). */
 export interface Drawn {
   label: string;
   source: number;
   forecast: boolean;
+  outlier?: boolean;
 }
+
+/** A drawn series' color: its palette color, or grey for an `outliers()` series that is not one. */
+export function drawnColor(d: Drawn): string {
+  return d.outlier === false ? SERIES.grey : (PALETTE[d.source % PALETTE.length] ?? SERIES.grey);
+}
+
+/** Bucket `i`'s start (ms): a calendar rollup's own, or the step's. */
+const bucketTime = (g: QueryAnswer["grid"], i: number) => g.times?.[i] ?? g.from + i * g.step;
 
 /** Answers as a chart's columns: each series as a line; a `forecast()` series as two, its data
  * and, from its last point on, its forecast (drawn dashed, its band about it). */
 export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; labels: string[]; bands: Band[]; drawn: Drawn[] } {
   const first = answers[0];
   if (!first) return { data: [[]], labels: [], bands: [], drawn: [] };
-  const xs = Array.from({ length: first.grid.n }, (_, i) => (first.grid.from + i * first.grid.step) / 1000);
+  const xs = Array.from({ length: first.grid.n }, (_, i) => bucketTime(first.grid, i) / 1000);
   const ys: (number | null)[][] = [];
   const labels: string[] = [];
   const bands: Band[] = [];
   const drawn: Drawn[] = [];
   let source = 0;
   answers.forEach((a, qi) => {
-    const same = a.grid.from === first.grid.from && a.grid.step === first.grid.step;
+    const same = a.grid.from === first.grid.from && a.grid.step === first.grid.step && a.grid.calendar === first.grid.calendar;
     for (const s of a.series) {
       const label = answers.length > 1 ? `${qi + 1}: ${seriesLabel(s.tags)}` : seriesLabel(s.tags);
       const b = s.bounds;
@@ -247,7 +257,7 @@ export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; 
       else {
         // Another grid (its read came a bucket later): each bucket at its time on the first's.
         const at = new Map<number, number | null>();
-        s.values.forEach((v, i) => at.set((a.grid.from + i * a.grid.step) / 1000, v));
+        s.values.forEach((v, i) => at.set(bucketTime(a.grid, i) / 1000, v));
         values = xs.map((x) => at.get(x) ?? null);
       }
       const from = b?.forecast_from;
@@ -265,7 +275,7 @@ export function chartData(answers: QueryAnswer[]): { data: (number | null)[][]; 
           bands.push({ series: ys.length, lower: b.lower.slice(0, xs.length), upper: b.upper.slice(0, xs.length), anomalous: b.score.slice(0, xs.length).map((v) => past(v, b.k, b.direction)) });
         ys.push(values);
         labels.push(label);
-        drawn.push({ label, source, forecast: false });
+        drawn.push({ label, source, forecast: false, outlier: s.outlier });
       }
       source += 1;
     }
@@ -322,7 +332,7 @@ export function QueryChart({
       series={[
         ...drawn.map((d) => ({
           label: d.label,
-          color: PALETTE[d.source % PALETTE.length] ?? SERIES.grey,
+          color: drawnColor(d),
           bars: display === "bars" && !d.forecast,
           fill: display === "area" && !d.forecast,
           ...(d.forecast ? { dash: [6, 4] } : {}),

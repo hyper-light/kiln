@@ -22,8 +22,10 @@ export interface Bounds {
 }
 
 export interface QueryAnswer {
-  grid: { from: number; step: number; n: number };
-  series: { tags: Record<string, string>; values: (number | null)[]; bounds?: Bounds }[];
+  /** `times`, `calendar`: a calendar rollup's, each bucket's start (ms) and the period. */
+  grid: { from: number; step: number; n: number; times?: number[]; calendar?: "daily" | "weekly" | "monthly" };
+  /** `outlier`: an `outliers()` series', whether it is one of its group over the range. */
+  series: { tags: Record<string, string>; values: (number | null)[]; bounds?: Bounds; outlier?: boolean }[];
   scalar: number | null;
   scanned: { series: number; samples: number };
   applied: number;
