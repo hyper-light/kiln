@@ -22,6 +22,18 @@ export function parseSlash(text: string): { name: string; args: string; typingNa
   return { name: m[1] ?? "", args: (m[3] ?? "").trim(), typingName: m[2] === undefined };
 }
 
+/**
+ * The "/name" being typed at the caret, anywhere in the field (at its start or after a space):
+ * where it starts and ends, and the name typed so far.
+ */
+export function slashAt(text: string, caret: number): { start: number; end: number; name: string } | null {
+  const m = text.slice(0, caret).match(/(?:^|\s)\/([^\s/]*)$/);
+  if (!m) return null;
+  const name = m[1] ?? "";
+  const after = text.slice(caret).match(/^\S*/)?.[0] ?? "";
+  return { start: caret - name.length - 1, end: caret + after.length, name };
+}
+
 /** The entry a typed name means: names first, then aliases. */
 export function findCommand(commands: SlashCommand[], name: string): SlashCommand | undefined {
   const n = name.toLowerCase();

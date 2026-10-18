@@ -370,7 +370,9 @@ impl Registry {
                 if let Some(o) = m.state.as_object_mut() {
                     o.insert("status".into(), json!("disconnected"));
                 }
-                for e in events {
+                // A conversation cleared since: what came before it is history, not its timeline.
+                let cleared = m.state.get("cleared").and_then(Value::as_u64).unwrap_or(0);
+                for e in events.into_iter().filter(|e| e.seq >= cleared) {
                     if let Ok(v) = serde_json::from_str::<Value>(&e.body) {
                         m.upsert(v);
                     }
@@ -969,6 +971,16 @@ impl Registry {
             out.push(a);
         }
         Ok(Command::Send { id: mid, text, mode, attachments: out, overrides })
+    }
+
+    /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is
+    /// told, to take up the account (Claude Code starts again with it once its turn ends; Codex reads
+    /// it again).
+    pub async fn signed_in(&self, hub: &Hub, target: &str, kind: &str) {
+        let ids: Vec<String> = self.list().into_iter().filter(|i| i.target == target && i.kind == kind).map(|i| i.id).collect();
+        for id in ids {
+            let _ = self.command(hub, &id, Command::Control { id: "account".into(), value: None }).await;
+        }
     }
 
     /// A command for a session, from any device.

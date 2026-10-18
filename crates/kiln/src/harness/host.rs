@@ -56,10 +56,17 @@ struct Saved {
     /// is told to go on with it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     cut: bool,
+    /// Its harness's process, and what it started, as last seen (`survivors`): after a restart, a
+    /// harness that outlived its runner is stopped before another resumes the conversation, and
+    /// what it started that still runs is taken back over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    harness: Option<super::survivors::Ran>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ran: Vec<super::survivors::Ran>,
 }
 
 /// What kiln says first to a session whose turn its restart cut short.
-const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it and anything it was running. Pick up where you left off.";
+const CUT_BY_RESTART: &str = "kiln restarted on this machine part-way through your last turn, which stopped it. Pick up where you left off.";
 
 pub struct Host {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -67,6 +74,8 @@ pub struct Host {
     pub limits: Limits,
     file: Option<PathBuf>,
     dirty: AtomicBool,
+    /// What the sessions' harnesses run is being looked at (`watch`).
+    watching: AtomicBool,
     me: Weak<Host>,
     /// Where files attached to messages are kept, one directory per session.
     files_dir: PathBuf,
@@ -95,6 +104,7 @@ impl Host {
             limits,
             file,
             dirty: AtomicBool::new(false),
+            watching: AtomicBool::new(false),
             me: me.clone(),
             files_dir,
             received: Mutex::new(HashMap::new()),
@@ -284,6 +294,7 @@ impl Host {
         let s = session::start_seeded(id.clone(), spec, self.sink.clone(), on_change, files, seed)?;
         self.sessions.lock().insert(id, Arc::clone(&s));
         self.mark_dirty();
+        self.watch();
         Ok(s)
     }
 
@@ -337,14 +348,43 @@ impl Host {
                 return;
             }
         };
+        // A harness that outlived the runner it ran under (a crash, the system stopping only the
+        // runner) is stopped first, so no second one resumes its conversation beside it; what it
+        // started is kept, and taken back over with the rest.
+        let outlived: Vec<super::survivors::Ran> = super::survivors::alive(&saved.iter().filter_map(|s| s.harness.clone()).collect::<Vec<_>>());
+        if !outlived.is_empty() {
+            tracing::info!(processes = ?outlived.iter().map(|r| r.pid).collect::<Vec<_>>(), "agent harnesses outlived their runner: stopped before their sessions resume");
+            super::survivors::stop(&outlived.iter().map(|r| r.pid).collect::<Vec<_>>());
+        }
+        let now_s = u64::try_from(crate::util::now_unix()).unwrap_or(0);
+        // What the sessions started that still runs: found by their mark, and as recorded.
+        let found = super::survivors::scan(&saved.iter().map(|s| (s.id.clone(), None)).collect::<Vec<_>>());
         for s in saved {
             let id = s.id.clone();
             let seed = store.and_then(|st| kept_seed(st, &id));
             let from_store = seed.is_some();
             let cut = s.cut;
+            // What it started that still runs, taken back over (its stopped harness not among it).
+            let mut alive = found.get(&id).map(|f| f.apart.clone()).unwrap_or_default();
+            for r in super::survivors::alive(&s.ran) {
+                if !alive.iter().any(|a| a.pid == r.pid) {
+                    alive.push(r);
+                }
+            }
+            if let Some(h) = &s.harness {
+                alive.retain(|r| r.pid != h.pid);
+            }
+            let trees = super::survivors::trees(&alive);
             match self.open_seeded(Some(s.id), s.spec, seed) {
                 Ok(session) => {
                     let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume;
+                    if !trees.is_empty() {
+                        session.ran.lock().1.clone_from(&alive);
+                        *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
+                        let mut core = session.core.lock();
+                        core.state.tasks.extend(trees.iter().map(|(root, _)| super::survivors::task(root)));
+                        core.touch_state();
+                    }
                     if !s.queue.is_empty() || paused || cut {
                         let mut core = session.core.lock();
                         core.state.queue = s.queue;
@@ -352,17 +392,97 @@ impl Host {
                         core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
                         core.state.pause_at = s.pause_at;
                         core.state.manual_resume = s.manual_resume;
-                        // The turn the restart cut short goes on first, in kiln's words.
+                        // The turn the restart cut short goes on first, in kiln's words, with what
+                        // it started that still runs.
                         if cut {
-                            picks_up(&mut core.state.queue);
+                            picks_up(&mut core.state.queue, &super::survivors::said(&trees, now_s));
                         }
                         core.touch_state();
                     }
-                    tracing::info!(session = %id, from_store, cut, "agent session continued after a restart");
+                    tracing::info!(session = %id, from_store, cut, left_running = trees.len(), "agent session continued after a restart");
                 }
                 Err(e) => tracing::warn!(session = %id, error = %format!("{e:#}"), "could not continue an agent session"),
             }
         }
+    }
+
+    /// Every few seconds, what each session's harness runs: noted (and kept in the record when it
+    /// changes), and what it started that runs on once no longer under it (a command that
+    /// daemonized, a harness started again) taken over as left running, until it ends.
+    fn watch(&self) {
+        if self.watching.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = self.me.clone();
+        crate::rt::spawn(async move {
+            loop {
+                crate::rt::sleep(WATCH_EVERY).await;
+                let Some(h) = me.upgrade() else { return };
+                let sessions: Vec<Arc<Session>> = h.sessions.lock().values().cloned().collect();
+                let which: Vec<(String, Option<u32>)> = sessions.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect();
+                let known: Vec<super::survivors::Ran> = sessions.iter().flat_map(|s| s.ran.lock().1.clone()).collect();
+                let Ok((seen, alive)) = crate::rt::blocking(move || (super::survivors::scan(&which), super::survivors::alive(&known))).await else { continue };
+                let alive: HashMap<u32, u64> = alive.into_iter().map(|r| (r.pid, r.started)).collect();
+                let now_s = u64::try_from(crate::util::now_unix()).unwrap_or(0);
+                let mut changed = false;
+                for s in &sessions {
+                    if h.note(s, seen.get(&s.id).cloned().unwrap_or_default(), &alive, now_s) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    h.mark_dirty();
+                }
+            }
+        });
+    }
+
+    /// One session's look (`watch`): whether what's kept of it changed. What it started that runs
+    /// apart from its harness (marked as its, or as recorded and still running) is left running.
+    fn note(&self, s: &Session, seen: super::survivors::Seen, alive: &HashMap<u32, u64>, now_s: u64) -> bool {
+        let running = s.pid.lock().is_some();
+        let mut ran = s.ran.lock();
+        let still = |r: &super::survivors::Ran| alive.get(&r.pid) == Some(&r.started);
+        let under: std::collections::HashSet<u32> = seen.under.iter().map(|r| r.pid).collect();
+        let mut apart = seen.apart;
+        // As recorded, still running, neither under it nor marked (it cleared its environment).
+        for r in ran.1.iter().filter(|r| !under.contains(&r.pid) && still(r)) {
+            if !apart.iter().any(|a| a.pid == r.pid) {
+                apart.push(r.clone());
+            }
+        }
+        let now_apart: std::collections::HashSet<u32> = apart.iter().map(|r| r.pid).collect();
+        let mut left = s.left.lock();
+        let mut new_left = Vec::new();
+        for (root, _) in super::survivors::trees(&apart) {
+            if !left.iter().any(|l| l.pid == root.pid) {
+                new_left.push(root.clone());
+                left.push(root);
+            }
+        }
+        // Left running that ended.
+        let ended: Vec<u32> = left.iter().filter(|l| !now_apart.contains(&l.pid)).map(|l| l.pid).collect();
+        left.retain(|l| now_apart.contains(&l.pid));
+        let mut next = (if running { seen.harness } else { ran.0.clone() }, seen.under);
+        next.1.extend(apart);
+        let changed = *ran != next;
+        *ran = next;
+        drop((ran, left));
+        if !new_left.is_empty() || !ended.is_empty() {
+            let mut core = s.core.lock();
+            for root in &new_left {
+                let mut t = super::survivors::task(root);
+                t.summary = Some(format!("Left running, apart from the agent (process {})", root.pid));
+                core.state.tasks.push(t);
+            }
+            let gone: std::collections::HashSet<u32> = ended.into_iter().collect();
+            for t in core.state.tasks.iter_mut().filter(|t| t.live() && t.id.strip_prefix(super::survivors::LEFT).and_then(|p| p.parse::<u32>().ok()).is_some_and(|p| gone.contains(&p))) {
+                t.status = "completed".to_owned();
+                t.ended = Some(i64::try_from(now_s).unwrap_or(0).saturating_mul(1000));
+            }
+            core.touch_state();
+        }
+        changed
     }
 
     fn mark_dirty(&self) {
@@ -389,9 +509,10 @@ impl Host {
             .map(|s| {
                 // resume_spec takes the session's lock itself: before this one, never inside it.
                 let spec = s.resume_spec();
+                let ran = s.ran.lock().clone();
                 let core = s.core.lock();
                 let st = &core.state;
-                Saved { id: s.id.clone(), spec, queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume, cut: s.turn_open.load(Ordering::Relaxed) }
+                Saved { id: s.id.clone(), spec, queue: st.queue.clone(), pause: st.pause.clone(), pause_at: st.pause_at, manual_resume: st.manual_resume, cut: s.turn_open.load(Ordering::Relaxed), harness: ran.0, ran: ran.1 }
             })
             .collect();
         let Ok(json) = serde_json::to_vec_pretty(&saved) else { return };
@@ -404,14 +525,18 @@ impl Host {
 }
 
 /// The turn a restart cut short goes on first: kiln's word (shown as kiln's), ahead of what was
-/// already queued, unless it's waiting there already (a restart before it went out).
-fn picks_up(queue: &mut Vec<QueueItem>) {
-    if queue.first().is_some_and(|q| q.text == CUT_BY_RESTART) {
+/// already queued, with what it started that still runs (`also`), unless it's waiting there
+/// already (a restart before it went out).
+fn picks_up(queue: &mut Vec<QueueItem>, also: &str) {
+    if queue.first().is_some_and(|q| q.text.starts_with(CUT_BY_RESTART)) {
         return;
     }
     let now = super::core::Core::now();
-    queue.insert(0, QueueItem { id: format!("{}restart-{now}", super::core::KEEP_ID), text: CUT_BY_RESTART.to_owned(), at: now, attachments: Vec::new(), overrides: None });
+    queue.insert(0, QueueItem { id: format!("{}restart-{now}", super::core::KEEP_ID), text: format!("{CUT_BY_RESTART}{also}"), at: now, attachments: Vec::new(), overrides: None });
 }
+
+/// How often what the harnesses run is looked at.
+const WATCH_EVERY: Duration = Duration::from_secs(10);
 
 /// A session's timeline and state as the conversation store kept them, for its restart: None when
 /// the store kept nothing of it (or can't say in time), and the session starts as it always did.
@@ -651,6 +776,71 @@ mod tests {
             }
             again.save_now();
             assert!(cut(&file)?.is_empty());
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_session_left_running_is_taken_back_over_after_a_restart() -> anyhow::Result<()> {
+        use super::super::survivors::{self, Ran};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("harness.json");
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().to_string_lossy().into_owned()),
+                program: Some(dir.path().join("no-such-claude").to_string_lossy().into_owned()),
+                ..Spec::default()
+            };
+            // A harness that outlived its runner (a sleep stands in for it), what it left running
+            // that the record has, and one only its mark says is its.
+            let mut harness = std::process::Command::new("sleep").arg("60").spawn()?;
+            let mut recorded = std::process::Command::new("sleep").arg("61").spawn()?;
+            let out = std::process::Command::new("sh").arg("-c").arg("sleep 62 >/dev/null 2>&1 & echo $!").env(survivors::MARK, "a").output()?;
+            let marked: u32 = String::from_utf8_lossy(&out.stdout).trim().parse()?;
+            let mine = survivors::scan(&[("me".to_owned(), Some(std::process::id()))]).remove("me").unwrap_or_default().under;
+            let ran = |pid: u32| -> anyhow::Result<Ran> { mine.iter().find(|r| r.pid == pid).cloned().ok_or_else(|| anyhow::anyhow!("{pid} not seen")) };
+            let (h, r) = (ran(harness.id())?, ran(recorded.id())?);
+            {
+                let (tx, _rx) = async_channel::unbounded();
+                let host = Host::new(tx, Some(file.clone()), Limits::default());
+                let s = host.open(Some("a".into()), spec.clone())?;
+                s.turn_open.store(true, Ordering::Relaxed);
+                *s.ran.lock() = (Some(h.clone()), vec![r.clone()]);
+                host.save_now();
+            }
+            let (tx, _rx) = async_channel::unbounded();
+            let again = Host::new(tx, Some(file.clone()), Limits::default());
+            again.restore();
+            // The harness was stopped; what it started wasn't.
+            let _ = harness.wait();
+            assert!(survivors::alive(std::slice::from_ref(&h)).is_empty(), "the harness that outlived its runner is stopped");
+            assert_eq!(survivors::alive(std::slice::from_ref(&r)).len(), 1);
+            let s = again.sessions.lock().get("a").cloned().ok_or_else(|| anyhow::anyhow!("not restored"))?;
+            let (tasks, queue) = {
+                let core = s.core.lock();
+                (core.state.tasks.clone(), core.state.queue.clone())
+            };
+            for pid in [recorded.id(), marked] {
+                assert!(tasks.iter().any(|t| t.id == format!("left-{pid}") && t.status == "running" && t.left_running()), "{pid} taken back over: {tasks:?}");
+            }
+            let said = queue.first().map(|q| q.text.clone()).unwrap_or_default();
+            assert!(said.contains("Pick up where you left off") && said.contains("sleep 61") && said.contains("sleep 62"), "{said}");
+            // Stopped from kiln, it ends (waited for without holding up the session doing it).
+            s.command(Command::StopTask { task: format!("left-{}", recorded.id()) });
+            let mut stopped = false;
+            for _ in 0..80 {
+                if s.core.lock().state.tasks.iter().any(|t| t.id == format!("left-{}", recorded.id()) && t.status == "stopped") {
+                    stopped = true;
+                    break;
+                }
+                crate::rt::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(stopped, "its task says it stopped");
+            assert!(survivors::alive(std::slice::from_ref(&r)).is_empty(), "and it ended");
+            let _ = recorded.wait();
+            survivors::stop(&[marked]);
             Ok(())
         })
     }
