@@ -280,11 +280,14 @@ for apps' source repositories.
 | Create repositories | yes | from template repositories | from project templates | yes |
 | Pull request heads for CI | — | `refs/pull/<n>/head` (as today) | `refs/merge-requests/<iid>/head` | Data Center: `refs/pull-requests/<id>/from`; Cloud: read from the API |
 
-- **kiln's own git server** keeps bare repositories in the data directory and writes them in
-  process under a per-repository lock. It serves them read-only over git's smart HTTP at
-  `/_kiln/git/<owner>/<repo>.git`, the endpoint CI checkouts already use, to readers holding a token
-  for that repository: each Argo CD instance gets a read token for its environment's release
-  repository. Its repositories replicate with kiln's state once servers do (§14).
+- **kiln's own git server** is CI's native hosting (ci.md W14), one server for both: release
+  repositories are native repositories (`kiln/releases` by default, or a project's own). kiln writes
+  a release in process, with git's plumbing against a scratch index and a compare-and-swap of the
+  branch, so a commit is never lost to one made beside it. Readers fetch over HTTPS through the
+  hosting's endpoint: each Argo CD instance gets a read-only token for its environment's release
+  repository, which reads that repository and nothing else. People change a release repository
+  through reviewed change requests, and what lands is a release of origin `git`. Its repositories
+  replicate with kiln's state once servers do (§14).
 - **GitHub stays as it is**: discovery, `ls-remote` polling, webhook hints, mirrors, pull request
   heads, the Actions-compatible CI. A GitHub App joins the token kiln reads today, for writes,
   statuses and repository creation.
@@ -292,9 +295,10 @@ for apps' source repositories.
   and statuses for CI, and everything above for release repositories. GitLab.com and self-managed
   GitLab; Bitbucket Cloud and Data Center.
 
-Inside kiln, one interface covers all four: read (a mirror URL and credentials), commit (files, a
-message and trailers, against an expected head), open a change and follow its state, report a
-status, create a repository, and read a webhook.
+Inside kiln, one module (`crate::githost`, shared with CI's providers, ci.md W23) covers all four:
+read (a mirror URL and credentials), commit (files, a message and trailers, against an expected
+head), push a commit made here, open a change and follow its state, report a status or a
+deployment, read a push webhook, and create a repository from a template.
 
 ## 8. CD providers
 
@@ -475,8 +479,11 @@ kiln deploy status web --env production
 kiln deploy history web --env production
 kiln deploy rollback web --env production [--to 1040]
 kiln deploy approve 1042
-kiln env add production --provider argocd/prod-argo --repo github:acme/releases
+kiln deploy env add production --provider argocd/prod-argo --repo github:acme/releases
 ```
+
+Environments are `kiln deploy env …`: `kiln env` is CI's (a repository's environments, ci.md W15)
+until the two become one.
 
 ### 12.3 UI, chat and MCP
 
@@ -530,14 +537,15 @@ behind the same interface.
 
 ## 15. Security, permissions and audit
 
+kiln's existing capabilities (authz, W10) cover these, as they do KilnCD's routes:
+
 | Capability | Lets |
 | --- | --- |
-| `deploy.read` | see apps, environments and releases |
-| `apps.create` | create apps (for a team the caller belongs to) |
-| `apps.manage` | change an app's owners, template, properties and registrations (owners, and admins) |
-| `deploy.release` | release an app in an environment (its owners, where the environment allows them) |
-| `deploy.approve` | approve releases in an environment |
-| `deploy.admin` | git hosts, providers, templates and environments |
+| `runs.read` | see apps, environments and releases |
+| `environments.deploy` | release an app in an environment: deploy, config, rollback, enable, disable, cancel |
+| `runs.approve` | approve releases in an environment |
+| `environments.manage` | create and change apps, environments and registrations |
+| `integrations.manage` | git hosts and providers, and their credentials |
 
 - Ownership is checked on every release: the caller belongs to one of the app's owner teams (txst's
   rule), or holds `deploy.release` on the environment for every app.
@@ -620,5 +628,6 @@ deployments, and aren't carried over.
 | Part | State |
 | --- | --- |
 | This design | agreed 2026-10-18 |
-| P1 | being built |
+| P1: `/api/deploy`, `kiln deploy` and `kiln app`; environments, apps, registrations; deploy, config, rollback, enable, disable, cancel, candidates, history; releases committed in process with their trailers, delivered through KilnCD, followed to landed across restarts; commits kiln didn't make recorded as releases | built. On a live cluster (minikube): a deploy, a config release, a second version and a rollback each landed, the rolled-back release marked so; a server killed mid-release finished it after its restart with one commit; a hand commit pushed to the release repository became a release and landed; disable removed what ran and enable brought it back |
+| P1: release repositories as W14 native repositories, read by token through its endpoint | with CI's native hosting (W14); until then in `<data>/deploy/repos` |
 | P2 to P8 | not yet |
