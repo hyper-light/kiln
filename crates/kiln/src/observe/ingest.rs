@@ -113,6 +113,17 @@ impl Batcher {
         ((self.waiting_points + self.logs.len()) as u64, self.out.is_some())
     }
 
+    /// When [`Batcher::poll`] next has a write to give: the write out's resend, or the flush of
+    /// what waits (at once when it fills a write); none when nothing waits.
+    pub fn next_due(&self) -> Option<Instant> {
+        if let Some(out) = &self.out {
+            return Some(out.sent.map_or_else(Instant::now, |t| t + RESEND));
+        }
+        let first = self.first_waiting?;
+        let full = self.waiting_points * 16 + self.log_bytes >= ENTRY_BUDGET;
+        Some(if full { first } else { first + FLUSH })
+    }
+
     /// The write to send now, if any: the one out again once [`RESEND`] passed since it went, or
     /// the next once the last was answered and points have waited [`FLUSH`] (or fill a write).
     pub fn poll(&mut self, now: Instant, now_ms: i64) -> Option<(u64, Vec<u8>)> {

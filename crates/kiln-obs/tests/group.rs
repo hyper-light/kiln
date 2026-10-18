@@ -199,7 +199,7 @@ impl Cluster {
         for &id in &ids {
             let Some(live) = self.nodes.get_mut(&id).and_then(|n| n.live.as_mut()) else { continue };
             let mut answers = Vec::new();
-            group::pump(&mut live.replica, now, &self.waker, &mut live.out, &mut messages, &mut answers).unwrap_or_else(|e| panic!("member {id}: {e:?} ({:?})", live.replica.machine().fault));
+            let _ = group::pump(&mut live.replica, now, &self.waker, &mut live.out, &mut messages, &mut answers).unwrap_or_else(|e| panic!("member {id}: {e:?} ({:?})", live.replica.machine().fault));
             let seen = self.answers.entry(id).or_default();
             if live.replica.is_leader() {
                 self.leaders.insert((live.replica.term(), id));

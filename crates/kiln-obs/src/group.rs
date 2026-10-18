@@ -21,6 +21,13 @@ pub const GROUP: u128 = 1;
 /// The log's id, the same in every kiln's file: "kiln-observe-v1." in ASCII.
 pub const LOG_ID: u128 = u128::from_be_bytes(*b"kiln-observe-v1.");
 
+/// Bytes one frame of the log holds, at the least: what one flush carries when writes queue
+/// behind a flush. Measured (`docs/observe.md` §12.9: 64 senders of the corpus's 10 s batches on
+/// NVMe, three runs each), the median ingest climbs from 3.8 M samples/s at 1 MiB to 7.4 M at
+/// 8 MiB with commit p50 steady near 14 ms, and falls back at 16 MiB; below some 16 writes in
+/// flight the frame makes no difference. Its cost is the log's frame buffers, 8 MiB each.
+pub const FRAME_BYTES: usize = 8 << 20;
+
 /// The largest entry: kiln's sync log's (1 MiB), which holds a batch of some 67,000 samples at the
 /// 15.5 bytes a sample batches take (§12.3) or a few MiB of log lines at LZ4's ratio on them (§12.6).
 pub const ENTRY_BYTES: usize = 1 << 20;
@@ -72,10 +79,18 @@ pub fn settings(id: u64, depth: usize) -> Result<Settings, hyper_raft::Error> {
 
 /// The log's layout, from the facts above. Fixed: a log reopens with the facts it was made with.
 pub fn log_config(align: Alignment) -> Result<LogConfig, hyper_log::LogError> {
+    log_config_framed(align, FRAME_BYTES)
+}
+
+/// The log's layout with frames of `frame` bytes at least: hyper-log lays every update that came
+/// while it flushed into one frame and flushes once a frame, so a frame is what one flush carries.
+pub fn log_config_framed(align: Alignment, frame: usize) -> Result<LogConfig, hyper_log::LogError> {
     LogConfig::derive(&Facts {
         align,
         sealed: false,
-        largest_entry: ENTRY_BYTES + crate::command::WRITE_HEADER,
+        // The frame holds the largest entry in a record of its own (hyper-log's rule), so stating
+        // the frame as the largest entry sizes it; no entry is larger than ENTRY_BYTES.
+        largest_entry: frame.max(ENTRY_BYTES + crate::command::WRITE_HEADER),
         disk_bytes: DISK_BYTES,
         max_groups: 1,
         cadence_entries: CADENCE_ENTRIES,
@@ -88,13 +103,18 @@ pub fn log_config(align: Alignment) -> Result<LogConfig, hyper_log::LogError> {
 
 /// The group's log at `path`, made there if new, and the group's part of it.
 pub fn open_log(path: &Path) -> Result<(Log<DeviceFile>, GroupStore<DeviceFile>), String> {
+    open_log_framed(path, FRAME_BYTES)
+}
+
+/// [`open_log`] with frames of `frame` bytes at least.
+pub fn open_log_framed(path: &Path, frame: usize) -> Result<(Log<DeviceFile>, GroupStore<DeviceFile>), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let fresh = std::fs::metadata(path).map_or(true, |m| m.len() == 0);
     let align = Alignment::new(BLOCK).map_err(|e| format!("{e:?}"))?;
     let file = DeviceFile::open(path, true, CachingRequest::PreferDirect, align).map_err(|e| format!("{}: {e:?}", path.display()))?;
-    let config = log_config(file.layout_block()).map_err(|e| format!("the observe log's layout: {e:?}"))?;
+    let config = log_config_framed(file.layout_block(), frame).map_err(|e| format!("the observe log's layout: {e:?}"))?;
     let log = if fresh {
         Log::create(file, config, LOG_ID).map_err(|e| format!("making the observe log at {}: {e:?}", path.display()))?
     } else {
@@ -135,18 +155,21 @@ pub fn keep<L: LogStore, M: StateMachine>(r: &Replica<L, M>, since: u64) -> u64 
 }
 
 /// Drives `r` until it has nothing more to do now, keeping the messages it sends and what it
-/// answers.
-pub fn pump<L: LogStore, M: StateMachine>(r: &mut Replica<L, M>, now: u64, waker: &Waker, out: &mut Output<M::Answer>, messages: &mut Vec<Message>, answers: &mut Vec<M::Answer>) -> Result<(), ReplicaError> {
+/// answers; when to drive it again though nothing arrives (hyper-durable's `Driven::wake`), if
+/// ever.
+pub fn pump<L: LogStore, M: StateMachine>(r: &mut Replica<L, M>, now: u64, waker: &Waker, out: &mut Output<M::Answer>, messages: &mut Vec<Message>, answers: &mut Vec<M::Answer>) -> Result<Option<u64>, ReplicaError> {
     // Each drive gives what it can without waiting: a bound on rounds keeps a replica that always
     // has more from holding its owner's thread.
+    let mut wake = None;
     for _ in 0..1024 {
         out.clear();
         let driven = r.drive(now, waker, out)?;
         messages.append(&mut out.messages);
         answers.append(&mut out.answers);
+        wake = driven.wake;
         if !driven.more {
             break;
         }
     }
-    Ok(())
+    Ok(wake)
 }

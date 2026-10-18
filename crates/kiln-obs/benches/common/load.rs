@@ -84,3 +84,57 @@ pub fn store_of(series: &[Series]) -> Store {
     }
     s
 }
+
+/// The corpus's batches, a `window_ms` window a batch.
+pub fn batches_of(series: &[Series], window_ms: i64) -> Vec<Vec<u8>> {
+    let parsed: Vec<(String, Vec<(String, String)>)> = series.iter().map(|s| parse_series(&s.name)).collect();
+    let keys: Vec<SeriesKey> = series
+        .iter()
+        .zip(&parsed)
+        .map(|(s, (m, tags))| SeriesKey::new(m, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), if s.kind == 1 { Kind::Counter } else { Kind::Gauge }).unwrap())
+        .collect();
+    let t_min = series.iter().filter_map(|s| s.ts.first()).min().copied().unwrap_or(0);
+    let t_max = series.iter().filter_map(|s| s.ts.last()).max().copied().unwrap_or(0);
+    let mut cursors = vec![0usize; series.len()];
+    let mut defined = vec![false; series.len()];
+    let mut out = Vec::new();
+    let mut b = Builder::new();
+    let mut w = t_min;
+    while w <= t_max {
+        let end = w + window_ms;
+        for (i, s) in series.iter().enumerate() {
+            let c = cursors[i];
+            let n = s.ts[c..].partition_point(|&t| t < end);
+            if n == 0 {
+                continue;
+            }
+            if !defined[i] {
+                b.define(&keys[i]);
+                defined[i] = true;
+            }
+            b.run(keys[i].fp, s.ts[c..c + n].iter().copied().zip(s.values[c..c + n].iter().copied()));
+            cursors[i] = c + n;
+        }
+        let batch = b.finish();
+        if !batch.is_empty() {
+            out.push(batch);
+        }
+        w = end;
+    }
+    out
+}
+
+/// Samples a batch's runs hold.
+pub fn samples_in(batch: &[u8]) -> u64 {
+    let mut r = kiln_obs::batch::Reader::new(batch).unwrap();
+    let mut n = 0u64;
+    while let Some(item) = r.next_item().unwrap() {
+        if let kiln_obs::batch::Item::Run { samples, .. } = item {
+            let mut d = samples.iter();
+            while d.next_sample().unwrap().is_some() {
+                n += 1;
+            }
+        }
+    }
+    n
+}

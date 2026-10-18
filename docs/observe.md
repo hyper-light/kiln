@@ -15,8 +15,8 @@ is what it is. A change in behaviour updates it in the same commit.
 | --- | --- | --- |
 | O-1 | Engine core: Gorilla chunks, symbols, series index and selection, head with late writes, write batches; measured (§12.1–12.3) | done |
 | O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
-| O-3 | Replication: the store as a hyper-durable state machine; kiln carries Raft between nodes | planned |
-| O-4 | Query language: metrics done (parser without recursion, evaluator, §12.5); logs and events with O-6; the HTTP API with O-3 | in progress |
+| O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
+| O-4 | Query language: metrics done (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica); the HTTP API's first routes (§7); logs and events with O-6 | in progress |
 | O-5 | Ingestion: kiln itself, runners' hosts, OTLP/HTTP (protobuf and JSON), kiln CI and CD | planned |
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax; next: the store's log head, persistence, OTLP logs, facets, live tail, patterns | in progress |
 | O-7 | Monitors: threshold, change, anomaly, forecast, logs, events, CI/CD, composite; notifications | planned |
@@ -47,10 +47,10 @@ The engine is held to hyper-raft's law (`hyper-raft/CLAUDE.md` §1, §1a) within
             OTLP/HTTP  kiln CI/CD  runners' hosts  GitHub  AWS/GCP/Azure  Prometheus text
                  \         |            |            |          |            /
                   ------------------ ingest (any node) ------------------------
-                                        |  write batch (postcard)
+                                        |  a write: an entry of the group's log
                                         v
-                       obs group: hyper-durable replica on each member
-                       (Raft log = the write-ahead log; leader orders writes)
+          observe group: the server leads (its one voter), runners learn
+          (Raft log = the write-ahead log; hyper-durable on hyper-log)
                                         |  apply
                                         v
               per replica: symbols, series index, head (Gorilla), blocks on disk,
@@ -151,21 +151,66 @@ small log of their own, kept whole.
 
 ## 5. Replication
 
-The store on each member is a `hyper_durable::StateMachine`. The Raft log is its write-ahead log:
+The store on each member is a `hyper_durable::StateMachine` (`kiln_obs::machine`). The Raft log is
+its write-ahead log; an entry holds one command (`kiln_obs::command`): a write (a batch, its sender
+and its place in the sender's order), a retention (the cutoffs for samples and for log records), or
+a bound on series.
 
-- **apply** decodes a write batch and appends it to the head;
-- **persist** cuts the head into a block, fsyncs it and the manifest, and moves **durable** to the
-  batch it was cut at; the log is compacted behind it;
-- **image** and **install** carry the manifest and the blocks to a member that lacks the log;
-- **acts_at_start** is false for every entry: a replica acts on nothing at start before its group.
+**Members.** The server's member (1) is the group's one voter, and so its leader: it commits alone,
+so no runner holds a write up and a runner that sleeps costs nothing. Every runner that replicates
+(all but job pods, the server's in-process agent, and those started with `--no-observe`) is a
+learner, which takes the log, or an image and its files, and answers queries on its own machine.
+Runners reach each other only through the server, so a quorum of runners could never stand without
+it: a voter on a runner would add a wait to every write and no availability. The newest
+replicating runner process of a machine replicates; another of the machine lets go of the folder
+(a file lock, as sync's).
 
-Members are kiln nodes (the server and runners that keep state). The server names the voters
-(itself and up to two runners, so one may fail) and the learners (every other runner that wants a
-local copy for fast queries). Raft's messages travel on kiln's QUIC links: a runner's to another
-runner through the server, as reach's frames do. Writes go to the leader (a node that is not
-forwards its batch). Reads are local: a query answers from the replica it runs on, as fresh as its
-applied index, which the response states; `consistency: "leader"` waits for a ReadIndex
-(Ongaro, thesis §6.4) first.
+**Determinism.** Replicas that apply the same entries answer every query alike, whenever each cut,
+compacted, retained or restarted (§13):
+- a series is defined with the first of its samples kept, never alone, so every series is in a
+  head or a block and a replica that opens from its blocks holds the series the others hold;
+- retention is an entry: the cutoffs move at one point of the log everywhere, a series goes once
+  its newest sample is older, and files are deleted only behind the cutoffs that are durable;
+- nothing older than a cutoff is kept by an entry or read by a query;
+- each sender's last place is kept (client sessions, Ongaro's thesis §6.3), so a write sent twice
+  (its answer lost, its leader gone) is applied once; a session goes once its last write is older
+  than the later cutoff, or past `MAX_SESSIONS`, the oldest first;
+- queries visit series in fingerprint order (floating-point addition does not associate) and order
+  groups by their tags; log search breaks time ties by the record's contents.
+
+An entry of a command or batch format this build does not know stops the replica (a newer build
+applies it; skipping it would leave another state), and the owner says why.
+
+**Persist, image, install.** `persist` cuts the store at the last entry applied and records the
+point with the replicated state there (the manifest: cutoffs, bound, sessions, configuration).
+An image is small whatever the store holds: that state and the store's files by name, size and
+footer checksum; the files themselves are hard-linked into a snapshot of their own (copied where
+links are refused), so compaction and retention cannot take them from a member fetching them, and
+the newest two snapshots are kept. A runner that is sent a snapshot fetches its files over HTTP
+(`GET /api/observe/v1/snapshot/{point}/{file}`, the machine's token), checks each whole (every
+series' and text's checksum, every sample decoded) into a staging folder, and only then steps the
+snapshot, as TiKV sends a region's SST files beside the Raft message that names them. `install`
+moves the staged files in under names of the store's own, saves the manifest (the point the
+install turns on: a crash before it leaves the old store and orphans that are deleted at open), and
+opens the store again.
+
+**Maintenance** (merges, retention's rewrites) runs on a thread of its own: a rewrite is planned
+under the store's lock with its file's name reserved, built from the immutable files with no lock
+held, and taken in under the lock only if the store still holds every input (an install bumps an
+epoch). The thread is joined before a store is opened again on its folder. Queries share the store
+under a read lock; std's lock prefers a waiting writer, so a query holds applying off for no longer
+than one query takes.
+
+**Writes.** A node gathers its points by series (`crate::observe::ingest`) and sends one write at a
+time, as the sessions assume, again and again until it is answered: a runner's go on the lane to the
+server, which proposes them and routes their answers back. A series is defined in a write until a
+write of the sender defining it is applied (and again an hour after); one the group does not know
+is sent again with its definition. Gathering follows the OpenTelemetry Collector's batch processor
+(200 ms); a write is never larger than the group's entry (1 MiB).
+
+**The lane.** `LANE_OBSERVE` (5) carries the group's messages and writes as JSON beside their bytes,
+payloads past 512 KiB in parts put back together under bounds (16 MiB, four a side, a minute).
+Snapshot files go over HTTP so that a big image never waits ahead of a heartbeat.
 
 ## 6. Query language
 
@@ -202,23 +247,24 @@ log analytics `count() by {service}` over a search. Events take the same search 
 
 ## 7. API
 
-Under `/api/observe/v1/` (all JSON; the UI uses nothing else):
+Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 
 | | |
 | --- | --- |
-| `POST query` | metric query → series (`from`, `to`, `step` or a point budget) |
-| `POST series` | ingest points (JSON) |
-| `POST logs/search`, `GET logs/tail` (websocket) | log search, facets, live tail |
-| `POST events`, `POST events/search` | post and search events |
-| `GET/POST/PUT/DELETE monitors[/id]`, `POST monitors/{id}/mute` | monitors |
-| `GET/POST/PUT/DELETE dashboards[/id]` | dashboards |
-| `GET/POST/PUT/DELETE integrations[/id]`, `POST integrations/{id}/test` | notification and source integrations |
-| `GET metrics`, `GET tags` | metric names, tag keys and values (autocomplete) |
-| `GET status` | the group: members, leader, lag, block counts, sizes |
+| `POST query` (or `GET query?query=&from=&to=&step=`) | metric query → series on a grid (`from`, `to` in ms, `step` or `points`); NaN is null; the answer states the index it was read at |
+| `GET metrics?match=` , `GET tags?key=&match=` | metric names and tag values, sorted (autocomplete) |
+| `POST logs/search` | `{query, from, to, limit}` → records newest first, with the blocks pruned |
+| `POST series` | ingest points as Datadog's v1 series API takes them (`metric`, `type`, `tags`, `points` of `[seconds, value]`) |
+| `POST logs` | ingest records as Datadog's log intake takes them (`message`, `timestamp`, `status`, `service`, `hostname`, `ddsource`, `attributes`) |
+| `GET status` | the group: members, leader, term, applied and durable index, series, blocks, bytes, cutoff, this node's writes, each machine's replica, digests |
+| `POST compact`, `POST verify` | cut and compact the log now; take every replica's full digest (an operator's, or a test's, check that replicas agree) |
+| `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
+
+To come: `GET logs/tail` (websocket), events, monitors, dashboards, integrations.
 
 OTLP/HTTP at its standard paths, `/v1/metrics` and `/v1/logs` (protobuf and JSON), on the server and
 on every runner at `127.0.0.1:4318`, so an app on a runner sends to its local runner as it would to
-a collector.
+a collector (O-5).
 
 ## 8. Ingestion
 
@@ -432,11 +478,69 @@ store on disk, then searched for the newest 100 over the whole range, nine runs 
 The absent word's one unpruned block is the token filter's false positive, as its 1% rate predicts
 for 111 blocks.
 
+### 12.9 The group: writes through the replicated log
+
+2026-10-18, same machine, NVMe under btrfs (a raw `write` + `fdatasync` there: 2.8 ms for 4 KiB,
+4.2 ms for 4 MiB): `KOBS_CORPUS=<corpus> KOBS_DIR=<a folder on that disk> cargo bench -p kiln-obs
+--bench group`. The corpus as 10 s windows across every series (1,883 samples, 52 KB a write), `S`
+senders each with one write out, proposed at the leader, done when the leader applied it.
+
+hyper-log answers a write once a later durable record confirms its flush (the next frame's persist
+record, or a confirmation of its own), so a write alone costs two flushes: 6.0 ms at the median
+for one sender. Writes that arrive while a flush runs share the next one (16 senders: 16 writes a
+log write; 64: 62.5), and the frame bounds what one flush carries:
+
+| frame | 64 senders, M samples/s (3 runs) | median | commit p50 (median) |
+| --- | --- | --- | --- |
+| 1 MiB | 1.95, 3.77, 3.99 | 3.77 | 30 ms |
+| 2 MiB | 5.36, 3.51, 5.78 | 5.36 | 19 ms |
+| 4 MiB | 6.11, 6.48, 8.75 | 6.48 | 14 ms |
+| 8 MiB | 8.04, 7.38, 7.35 | 7.38 | 14 ms |
+| 16 MiB | 7.31, 5.84, 5.81 | 5.84 | 15 ms |
+
+At 16 senders every frame gives some 3 M samples/s. The group's frames are 8 MiB
+(`kiln_obs::group::FRAME_BYTES`). With them: one sender 145 writes/s (0.27 M samples/s), commit p50
+6.0 ms [5.9–6.0], p99 21 ms; 0.032 allocations and 0.0015 page faults a sample, every thread of the
+process counted. Two learners in the same process on the same disk (three logs flushing, one thread
+driving them all) take everything 11–13 ms after the leader, and cost the leader's commit about as
+much again.
+
+Two waits found and removed on the way: the bench, and kiln's owner the same way, waited out a
+timeout after a write was answered before sending the next (up to the owner's 100 ms tick); the
+owner now waits exactly until the earliest of its tick, the batcher's next write and the replica's
+own wake.
+
 ## 13. Scenarios
 
-Live, end to end: a kiln server and runners as separate processes, OTLP senders, mock Slack and
-Discord endpoints, and faults (killed members, partitions, full disks, clock skew). Each scenario
-states what a user would see and checks that, not the code's internals. (Listed as built.)
+What a user would see, checked end to end; not the code's internals.
+
+**Live** (`crates/kiln/tests/observe_live.rs`, `cargo test -p kiln --test observe_live -- --ignored`):
+a kiln server and two runners as processes of their own, each with a home of its own and a clean
+environment, on real sockets and disks. Points and log records are written through the API and read
+back exactly; the runners join as learners and catch up; their own figures arrive through their own
+writes; a runner killed (SIGKILL) while the leader compacts its log past it comes back by an image
+whose files it fetches over HTTP; the server killed and started again answers what it answered. At
+each stage every replica's full digest (every sample, every record) agrees at one index. 2026-10-18:
+passes, agreeing at indexes 10, 14 and 22.
+
+**A group on real logs** (`crates/kiln-obs/tests/group.rs`): replicas on hyper-log files in one
+process, messages carried as the lane does, snapshots' files fetched before they are stepped,
+senders that hear only the member they wrote to:
+- three voters through a leader crash, restarts and a partition;
+- the leader killed six times the moment a follower takes its entries: 18 writes sent again, every
+  one found applied by its session, so applied once;
+- a voter away past two compactions, back by an image, then leading;
+- kiln's shape: one voter and a learner that joins after compaction.
+Each checked against a store that applied the committed log.
+
+**Replicas alike** (`kiln_obs::store` tests): one random stream (writes sent twice, late writes,
+corrections, logs several to a time, retention, a bound on series, a series that expires and comes
+back as another kind) applied to an in-memory store and to two on disk that cut, compact, retain and
+restart on schedules of their own, and to rewrites built apart while the store goes on (planned,
+held across entries, taken in later; a real maintenance thread beside the applying one): all agree
+at every checkpoint, over 1,000 seeds (`KILN_OBS_SEEDS=1000`), digests included.
+
+To come: OTLP senders, mock Slack and Discord endpoints, full disks, clock skew, load and soak.
 
 ## 14. References
 
@@ -451,7 +555,11 @@ states what a user would see and checks that, not the code's internals. (Listed 
 - Abadi, Madden, Ferreira. Integrating compression and execution in column-oriented database
   systems. SIGMOD 2006.
 - Ongaro, Ousterhout. In search of an understandable consensus algorithm. USENIX ATC 2014; Ongaro,
-  Consensus: bridging theory and practice (thesis), 2014.
+  Consensus: bridging theory and practice (thesis), 2014 (§6.3 client sessions, §6.4 ReadIndex).
+- TiKV, `components/raftstore/src/store/snap.rs`: a region's snapshot files sent apart from the
+  Raft message that names them, which is stepped once they are received.
+- OpenTelemetry Collector, `processor/batchprocessor`: batches sent at 200 ms or when full.
+- Steele, Lea, Flood. Fast splittable pseudorandom number generators. OOPSLA 2014 (SplitMix64).
 - Iglewicz, Hoaglin. How to detect and handle outliers. ASQC 1993.
 - Hochenbaum, Vallis, Kejariwal. Automatic anomaly detection in the cloud via statistical learning.
   arXiv 1704.07706, 2017.

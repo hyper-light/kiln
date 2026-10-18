@@ -312,6 +312,8 @@ struct Owner {
     tried: Option<Instant>,
     compact_asked: bool,
     verified: Option<(u64, u64)>,
+    /// When the replica asks to be driven again though nothing arrives (ns since `start`).
+    wake_at: Option<u64>,
     // The server's.
     members: Members,
     up: HashSet<String>,
@@ -360,6 +362,7 @@ impl Owner {
             tried: None,
             compact_asked: false,
             verified: None,
+            wake_at: None,
             members: Members::default(),
             up: HashSet::new(),
             statuses: HashMap::new(),
@@ -464,8 +467,17 @@ impl Owner {
     fn run(&mut self, rx: &Receiver<Input>) {
         let mut tick = Instant::now() + TICK;
         loop {
-            let wait = tick.saturating_duration_since(Instant::now()).min(super::ingest::FLUSH);
-            match rx.recv_timeout(wait) {
+            // Until the next tick, the next write this node owes (a write freed by an answer goes
+            // at once), or the replica's own next wake, whichever comes first.
+            let now = Instant::now();
+            let mut until = tick;
+            if let Some(due) = self.batcher.next_due() {
+                until = until.min(due);
+            }
+            if let Some(at) = self.wake_at {
+                until = until.min(self.start + Duration::from_nanos(at));
+            }
+            match rx.recv_timeout(until.saturating_duration_since(now)) {
                 Ok(input) => self.input(input),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -757,7 +769,9 @@ impl Owner {
         let mut messages = Vec::new();
         let mut answers = Vec::new();
         let Some(rep) = &mut self.rep else { return };
-        if let Err(e) = group::pump(&mut rep.r, now, &self.waker, &mut rep.out, &mut messages, &mut answers) {
+        let pumped = group::pump(&mut rep.r, now, &self.waker, &mut rep.out, &mut messages, &mut answers);
+        self.wake_at = pumped.as_ref().ok().copied().flatten().into_iter().chain(rep.r.deadline()).min();
+        if let Err(e) = &pumped {
             let why = format!("{e:?}: {}", rep.r.machine().fault.clone().unwrap_or_default());
             tracing::warn!(error = %why, "observe's replica stopped; it opens again");
             self.error = Some(why);
