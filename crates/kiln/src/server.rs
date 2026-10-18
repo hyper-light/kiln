@@ -197,10 +197,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
                             let remote = stream.peer_addr().ok();
                             let tls = tls.clone();
                             crate::rt::spawn_spread(async move {
-                                match &tls {
-                                    Some(tls) => crate::http::server::serve_tls_or_plain(stream, api, remote, tls).await,
-                                    None => crate::http::server::serve_connection(crate::http::io::RtIo::new(stream), api, remote).await,
-                                }
+                                crate::http::server::serve_accepted(stream, api, remote, tls.as_ref()).await;
                             });
                         }
                         Err(e) => {

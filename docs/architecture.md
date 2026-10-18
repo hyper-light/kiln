@@ -50,9 +50,14 @@ The UI (`ui/`) is a TanStack Start app with React Server Components.
   the visitor's cookie.
 - **Where it looks:** `KILN_UI_DIR` (default `/usr/local/lib/kiln/ui`) and `KILN_BUN` (default:
   `bun` on the PATH).
+- **HTTP/1.1 and HTTP/2:** the kiln server's listener speaks both (`crate::http::server`). Over TLS
+  (`server.https`) the browser picks by ALPN. In the clear, HTTP/2 opens with its preface, which is
+  how the front door passes a browser's HTTP/2 on. Handlers see every request shaped as HTTP/1.1's:
+  `Host` from `:authority`, one `Cookie`, the target as a path. WebSockets stay on HTTP/1.1.
 
-Pages move from the app the UI still hosts client-side (`ui/src/routes/$.tsx`) into routes of their
-own one at a time, becoming server components where that keeps JavaScript out of the browser.
+Every page is a route of its own (`ui/src/routes/_app.*.tsx`), rendered in the browser for now.
+Pages become server components where that keeps JavaScript out of the browser; the shared plan page
+(`routes/shared.plans.$token.tsx`) is the first.
 
 ### Pipeline definition (`.kiln/*.yaml`)
 

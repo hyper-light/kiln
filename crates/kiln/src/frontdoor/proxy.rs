@@ -1,5 +1,8 @@
 //! The front door's HTTPS: TLS terminated here, then the bytes piped both ways to the kiln server
 //! (HTTP, or HTTPS trusting kiln's CA), so WebSockets, streamed logs and uploads work unchanged.
+//! HTTP/2 passes through the same way, offered to browsers while the upstream is found to speak
+//! it ([`speaks_h2`], asked every [`PROBE_EVERY`]): a browser then makes one connection for a
+//! page's requests, not six.
 //! And plain HTTP on another port, answered with a redirect to it, except for what a device needs
 //! before it can trust that HTTPS: kiln's CA (`/ca.mobileconfig`, `/ca.crt`, `/ca.pem`), and, at an
 //! address rather than a name, a short page saying how to trust it.
@@ -17,25 +20,28 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures::FutureExt as _;
-use futures::io::{AsyncRead, AsyncWrite};
+use futures::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use http::{StatusCode, header};
 use parking_lot::RwLock;
 
 use crate::http::io::RtFuturesIo;
 use crate::http::server::{self as srv, Request, Response};
-use crate::http::tls::{ClientTls, ServerTls, ServerTlsStream, TlsStream};
+use crate::http::tls::{ClientTls, H2, HTTP11, ServerTls, ServerTlsStream, TlsStream};
 use crate::rt::Shutdown;
 
 pub const MAX_CONNECTIONS: usize = 512;
 pub const HANDSHAKE: Duration = Duration::from_secs(10);
 pub const CONNECT: Duration = Duration::from_secs(5);
 const BUFFER: usize = 32 * 1024;
+/// How often the front door asks its upstream whether it speaks HTTP/2, and how long it waits.
+pub const PROBE_EVERY: Duration = Duration::from_secs(30);
+const PROBE_WAIT: Duration = Duration::from_secs(5);
 
 /// Where the front door forwards to.
 #[derive(Clone)]
@@ -84,6 +90,8 @@ pub struct Shared {
     /// Connections that completed the TLS handshake.
     pub served: AtomicU64,
     pub open: AtomicUsize,
+    /// The upstream speaks HTTP/2 (last asked): browsers are offered it.
+    pub h2: AtomicBool,
 }
 
 /// A running listener: it stops, with its connections, when dropped.
@@ -133,6 +141,7 @@ fn adopt(l: std::net::TcpListener) -> io::Result<hyper_rt::tcp::TcpListener> {
 pub fn listen_https(port: u16, shared: &Arc<Shared>) -> io::Result<Listening> {
     let (std_listener, bound) = bind(port)?;
     let stop = Shutdown::new();
+    crate::rt::spawn(follow_h2(Arc::clone(shared), stop.clone()));
     let (sh, sd) = (Arc::clone(shared), stop.clone());
     crate::rt::spawn(async move {
         let listener = match adopt(std_listener) {
@@ -174,14 +183,77 @@ pub fn listen_https(port: u16, shared: &Arc<Shared>) -> io::Result<Listening> {
     Ok(Listening { stop, bound })
 }
 
+/// Keeps [`Shared::h2`] saying whether the upstream speaks HTTP/2: asked at once when the upstream
+/// changes (not offered until it answers), and every [`PROBE_EVERY`] (it may be upgraded, or
+/// rolled back), until `stop`.
+async fn follow_h2(shared: Arc<Shared>, stop: Shutdown) {
+    let mut asked: Option<(String, Instant)> = None;
+    loop {
+        let upstream = shared.upstream.read().clone();
+        match upstream {
+            None => {
+                shared.h2.store(false, Ordering::Relaxed);
+                asked = None;
+            }
+            Some(u) => {
+                let moved = asked.as_ref().is_some_and(|(url, _)| *url != u.url);
+                if moved {
+                    shared.h2.store(false, Ordering::Relaxed);
+                }
+                if moved || asked.as_ref().is_none_or(|(_, at)| at.elapsed() >= PROBE_EVERY) {
+                    let h2 = speaks_h2(&u).await;
+                    if shared.h2.swap(h2, Ordering::Relaxed) != h2 {
+                        tracing::info!(upstream = %u.url, h2, "front door: HTTP/2 to browsers {}", if h2 { "on" } else { "off" });
+                    }
+                    asked = Some((u.url, Instant::now()));
+                }
+            }
+        }
+        if !stop.sleep(Duration::from_secs(1)).await {
+            return;
+        }
+    }
+}
+
+/// Whether `upstream` speaks HTTP/2. Over TLS: whether it agrees to `h2`. In the clear: whether it
+/// answers HTTP/2's preface with its settings (a server speaking only HTTP/1.1 answers with an
+/// error, or closes). Not within [`PROBE_WAIT`]: no.
+pub async fn speaks_h2(upstream: &Upstream) -> bool {
+    let ask = async {
+        let tcp = crate::http::io::connect(&upstream.host, upstream.port).await?;
+        match &upstream.tls {
+            Some(ct) => {
+                let name = crate::http::tls::server_name(&upstream.host)?;
+                let s = TlsStream::connect(RtFuturesIo::new(tcp), ct.config_alpn(&[H2, HTTP11])?, name).await?;
+                Ok::<_, anyhow::Error>(s.alpn_protocol() == Some(H2))
+            }
+            None => {
+                let mut io = RtFuturesIo::new(tcp);
+                io.write_all(srv::H2_PREFACE).await?;
+                // An empty SETTINGS frame: length 0, type 4, no flags, stream 0.
+                io.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await?;
+                io.flush().await?;
+                let mut frame = [0u8; 9];
+                io.read_exact(&mut frame).await?;
+                // The server's SETTINGS (type 4, on stream 0, not an acknowledgement) come first.
+                Ok(matches!(frame, [_, _, _, 4, flags, 0, 0, 0, 0] if flags & 1 == 0))
+            }
+        }
+    };
+    matches!(crate::rt::timeout(PROBE_WAIT, ask).await, Ok(Ok(true)))
+}
+
 /// One connection: the TLS handshake, the upstream connection, then the pipe.
 async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result<()> {
     let tls = shared.tls.read().clone().context("no certificate yet")?;
     let upstream = shared.upstream.read().clone().context("no upstream")?;
-    let client = crate::rt::timeout(HANDSHAKE, ServerTlsStream::accept(RtFuturesIo::new(tcp), tls.config()?))
+    let offer: &[&[u8]] = if shared.h2.load(Ordering::Relaxed) { &[H2, HTTP11] } else { &[HTTP11] };
+    let client = crate::rt::timeout(HANDSHAKE, ServerTlsStream::accept(RtFuturesIo::new(tcp), tls.config_alpn(offer)?))
         .await
         .context("TLS handshake timed out")?
         .context("TLS handshake")?;
+    // The browser's protocol passes through as it is: HTTP/2 needs an upstream that speaks it.
+    let h2 = client.alpn_protocol() == Some(H2);
     shared.served.fetch_add(1, Ordering::Relaxed);
     let up = crate::rt::timeout(CONNECT, crate::http::io::connect(&upstream.host, upstream.port))
         .await
@@ -190,10 +262,16 @@ async fn proxy(tcp: hyper_rt::tcp::TcpStream, shared: &Shared) -> anyhow::Result
         None => pipe(client, RtFuturesIo::new(up)).await?,
         Some(ct) => {
             let name = crate::http::tls::server_name(&upstream.host)?;
-            let up = crate::rt::timeout(HANDSHAKE, TlsStream::connect(RtFuturesIo::new(up), ct.config()?, name))
+            let ask: &[&[u8]] = if h2 { &[H2, HTTP11] } else { &[HTTP11] };
+            let up = crate::rt::timeout(HANDSHAKE, TlsStream::connect(RtFuturesIo::new(up), ct.config_alpn(ask)?, name))
                 .await
                 .context("TLS to the upstream timed out")?
                 .with_context(|| format!("TLS to {}", upstream.url))?;
+            if h2 && up.alpn_protocol() != Some(H2) {
+                // It no longer speaks HTTP/2: this connection can't be carried; the next get HTTP/1.1.
+                shared.h2.store(false, Ordering::Relaxed);
+                anyhow::bail!("{} no longer speaks HTTP/2", upstream.url);
+            }
             pipe(client, up).await?
         }
     };
@@ -455,8 +533,6 @@ pub fn listen_redirect(port: u16, redirect: &Arc<Redirect>) -> io::Result<Listen
 
 #[cfg(test)]
 mod tests {
-    use futures::{AsyncReadExt as _, AsyncWriteExt as _};
-
     use super::*;
 
     #[test]
@@ -581,6 +657,93 @@ mod tests {
             assert!(back.iter().zip(&big).all(|(b, a)| *b == a.to_ascii_uppercase()));
             let (there, here) = piped.await.map_err(|_| anyhow::anyhow!("pipe task"))??;
             assert_eq!((there, here), (200_000, 200_000));
+            Ok(())
+        })
+    }
+
+    /// Says which protocol carried the request.
+    struct Said;
+
+    impl srv::Handler for Said {
+        async fn handle(self: Arc<Self>, req: Request) -> Response {
+            srv::text(StatusCode::OK, &format!("{:?} {}", req.version(), srv::header_str(&req, &header::HOST).unwrap_or("-")))
+        }
+    }
+
+    /// A kiln-like upstream on a free port: speaking HTTP/2 too (kiln's own listener) or only HTTP/1.1.
+    fn upstream(h2: bool) -> anyhow::Result<SocketAddr> {
+        let tcp = hyper_rt::tcp::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 16).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::rt::spawn(async move {
+            while let Ok(stream) = tcp.accept().await {
+                let remote = stream.peer_addr().ok();
+                if h2 {
+                    crate::rt::spawn(srv::serve_accepted(stream, Arc::new(Said), remote, None));
+                } else {
+                    crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(stream), Arc::new(Said), remote));
+                }
+            }
+        });
+        Ok(addr)
+    }
+
+    #[test]
+    fn the_upstream_is_asked_whether_it_speaks_http2() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            assert!(speaks_h2(&Upstream::parse(&format!("http://{}", upstream(true)?), &[])?).await);
+            assert!(!speaks_h2(&Upstream::parse(&format!("http://{}", upstream(false)?), &[])?).await);
+            let closed = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?;
+            assert!(!speaks_h2(&Upstream::parse(&format!("http://{closed}"), &[])?).await);
+            Ok(())
+        })
+    }
+
+    /// A browser's HTTP/2 goes through the front door to an upstream that speaks it; to one that
+    /// doesn't, the front door offers only HTTP/1.1, and that goes through.
+    #[test]
+    fn http2_passes_through_when_the_upstream_speaks_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open(dir.path())?;
+            let key = crate::pki::new_key_pem()?;
+            let csr = crate::pki::front_door_csr(&["kiln.test".to_owned()], &key)?;
+            let cert = pki.sign_front_door(&csr, &["kiln.test".to_owned()], 30)?;
+            let roots = ClientTls::new(crate::http::client::Roots::Pem(pki.ca_pem.clone().into_bytes()), None)?;
+            for h2_upstream in [true, false] {
+                let shared = Arc::new(Shared::default());
+                *shared.tls.write() = Some(ServerTls::from_pem(&cert, &key)?);
+                *shared.upstream.write() = Some(Upstream::parse(&format!("http://{}", upstream(h2_upstream)?), &[])?);
+                let port = std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
+                let _l = listen_https(port, &shared)?;
+                // Asked at once.
+                let until = Instant::now() + Duration::from_secs(5);
+                while shared.h2.load(Ordering::Relaxed) != h2_upstream && Instant::now() < until {
+                    crate::rt::sleep(Duration::from_millis(20)).await;
+                }
+                assert_eq!(shared.h2.load(Ordering::Relaxed), h2_upstream);
+                // A browser asks for HTTP/2 first.
+                let tcp = hyper_rt::tcp::TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                let tls = TlsStream::connect(RtFuturesIo::new(tcp), roots.config_alpn(&[H2, HTTP11])?, crate::http::tls::server_name("kiln.test")?).await?;
+                let body = |r: http::Response<hyper::body::Incoming>| async move {
+                    use http_body_util::BodyExt as _;
+                    Ok::<_, anyhow::Error>(String::from_utf8_lossy(&r.into_body().collect().await?.to_bytes()).into_owned())
+                };
+                let req = || http::Request::builder().uri("https://kiln.test/").header(header::HOST, "kiln.test").body(http_body_util::Empty::<bytes::Bytes>::new());
+                if h2_upstream {
+                    assert_eq!(tls.alpn_protocol(), Some(H2));
+                    let (mut send, conn) = hyper::client::conn::http2::handshake(crate::http::io::RtExec, tls).await?;
+                    crate::rt::spawn(conn);
+                    assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/2.0 kiln.test");
+                    // Many at once, over the one connection.
+                    let many = futures::future::join_all((0..8).map(|_| send.send_request(req().unwrap_or_default()))).await;
+                    assert!(many.iter().all(|r| r.as_ref().is_ok_and(|r| r.status() == StatusCode::OK)));
+                } else {
+                    assert_eq!(tls.alpn_protocol(), Some(HTTP11));
+                    let (mut send, conn) = hyper::client::conn::http1::handshake(tls).await?;
+                    crate::rt::spawn(conn);
+                    assert_eq!(body(send.send_request(req()?).await?).await?, "HTTP/1.1 kiln.test");
+                }
+            }
             Ok(())
         })
     }
