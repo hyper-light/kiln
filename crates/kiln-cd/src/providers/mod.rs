@@ -16,6 +16,7 @@
 
 pub mod aws_ecs;
 pub mod aws_lambda;
+pub mod cloudflare_workers;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -330,7 +331,7 @@ pub const CATALOG: &[ProviderDef] = &[
         ],
         capabilities: &[Traffic, Versions, Previews, Logs, Drift, Adopt],
         reads: &["wrangler.toml", "wrangler.jsonc"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "cloudflare-pages",
@@ -625,6 +626,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
     match provider {
         "aws-ecs" => aws_ecs::render(input),
         "aws-lambda" => aws_lambda::render(input),
+        "cloudflare-workers" => cloudflare_workers::render(input),
         other => match get(other) {
             Some(p) => Err(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", p.title)),
             None => Err(format!("no provider {other}")),
@@ -638,6 +640,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
     match provider {
         "aws-ecs" => aws_ecs::files(spec),
         "aws-lambda" => aws_lambda::files(spec),
+        "cloudflare-workers" => cloudflare_workers::files(spec),
         _ => Vec::new(),
     }
 }
@@ -648,6 +651,7 @@ pub fn health(obj: &Value) -> Option<Status> {
     match for_group(group)?.name {
         "aws-ecs" => aws_ecs::health(obj),
         "aws-lambda" => aws_lambda::health(obj),
+        "cloudflare-workers" => cloudflare_workers::health(obj),
         _ => None,
     }
 }

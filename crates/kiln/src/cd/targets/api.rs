@@ -94,6 +94,8 @@ pub async fn discover(cx: Cx, v: Value) -> Out {
         ("aws-lambda", Some(n)) => super::aws_lambda::adopt(&tcx, n).await,
         ("aws-ecs", None) => super::aws_ecs::discover(&tcx, scope.as_deref()).await,
         ("aws-ecs", Some(n)) => super::aws_ecs::adopt(&tcx, scope.as_deref().unwrap_or_default(), n).await,
+        ("cloudflare-workers", None) => super::cloudflare_workers::discover(&tcx).await,
+        ("cloudflare-workers", Some(n)) => super::cloudflare_workers::adopt(&tcx, n).await,
         (other, _) => return Err(bad(format!("no discovery for {other} yet"))),
     };
     r.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))

@@ -23,6 +23,7 @@ pub mod api;
 pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod aws_s3;
+pub mod cloudflare_workers;
 #[cfg(test)]
 pub mod fake;
 
@@ -114,8 +115,10 @@ impl Conn {
 /// What a provider's calls go with.
 pub enum Creds {
     Aws(aws::Aws),
-    /// A bearer token (a Google Cloud or Azure access token, or a stored API token).
+    /// A bearer token: a Google Cloud or Azure access token.
     Bearer(String),
+    /// A token platform's stored token, with its integration's configuration (an account id).
+    Token { token: String, config: Value },
 }
 
 /// Where what kiln applied is kept: the CD store ([`Cd`]), or memory in tests.
@@ -156,7 +159,15 @@ impl Cx<'_> {
     pub fn aws(&self) -> Result<&aws::Aws> {
         match &self.creds {
             Creds::Aws(a) => Ok(a),
-            Creds::Bearer(_) => bail!("{} isn't an AWS target", self.conn.target.name()),
+            _ => bail!("{} isn't an AWS target", self.conn.target.name()),
+        }
+    }
+
+    /// A token platform's token and its integration's configuration.
+    pub fn token(&self) -> Result<(&str, &Value)> {
+        match &self.creds {
+            Creds::Token { token, config } => Ok((token, config)),
+            _ => bail!("{} takes no stored token", self.conn.target.name()),
         }
     }
 
@@ -293,7 +304,7 @@ impl Cd {
             }
             "gcp" => Ok(Creds::Bearer(integrations::gcp::token(&self.hub, &i, &w).await?.access_token)),
             "azure" => Ok(Creds::Bearer(integrations::azure::token(&self.hub, &i, &w, None).await?.access_token)),
-            _ => Ok(Creds::Bearer(integrations::token(&self.hub, &i).await?.ok_or_else(|| anyhow::anyhow!("integration `{}` holds no token", i.name))?)),
+            _ => Ok(Creds::Token { token: integrations::token(&self.hub, &i).await?.ok_or_else(|| anyhow::anyhow!("integration `{}` holds no token", i.name))?, config: i.config.clone() }),
         }
     }
 
@@ -452,6 +463,7 @@ async fn list(cx: &Cx<'_>, kind: &str, names: &[(String, String)]) -> Result<Vec
     let objects = match cx.conn.def.name {
         "aws-lambda" => aws_lambda::list(cx, kind, names).await?,
         "aws-ecs" => aws_ecs::list(cx, kind, names).await?,
+        "cloudflare-workers" => cloudflare_workers::list(cx, kind, names).await?,
         other => bail!("no reading {other} yet"),
     };
     Ok(objects.into_iter().map(|o| cx.with_applied(o)).collect())
@@ -462,6 +474,7 @@ async fn apply(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     let live = match cx.conn.def.name {
         "aws-lambda" => aws_lambda::apply(cx, desired).await,
         "aws-ecs" => aws_ecs::apply(cx, desired).await,
+        "cloudflare-workers" => cloudflare_workers::apply(cx, desired).await,
         other => bail!("no applying to {other} yet"),
     }
     .with_context(|| format!("{} {}", obj::kind(desired), obj::name(desired)))?;
@@ -472,6 +485,7 @@ async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
     match cx.conn.def.name {
         "aws-lambda" => aws_lambda::delete(cx, key).await,
         "aws-ecs" => aws_ecs::delete(cx, key).await,
+        "cloudflare-workers" => cloudflare_workers::delete(cx, key).await,
         other => bail!("no deleting from {other} yet"),
     }
     .with_context(|| format!("{} {}", key.kind, key.name))

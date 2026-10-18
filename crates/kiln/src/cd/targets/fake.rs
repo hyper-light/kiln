@@ -560,3 +560,206 @@ pub fn tracked(mut o: Value, app: &str) -> Value {
     }
     o
 }
+
+// ------------------------------------------------------------------ Cloudflare
+
+/// A Worker on the fake Cloudflare.
+#[derive(Default, Clone)]
+pub struct Script {
+    pub settings: Value,
+    pub tags: Vec<String>,
+    pub migration_tag: Option<String>,
+    pub versions: u32,
+    pub serving: String,
+}
+
+/// The parts of Cloudflare's API the Workers provider calls, in memory.
+#[derive(Default)]
+pub struct CfState {
+    pub scripts: BTreeMap<String, Script>,
+    pub schedules: BTreeMap<String, Value>,
+    pub subdomains: BTreeMap<String, bool>,
+    /// Routes: (id, zone id, pattern, script).
+    pub routes: Vec<(String, String, String, String)>,
+    pub domains: Vec<Value>,
+    /// Each upload: its metadata and its modules' names.
+    pub uploads: Vec<Value>,
+    next: u32,
+}
+
+impl CfState {
+    /// Someone deploys a version of `name` outside kiln.
+    pub fn foreign_deploy(&mut self, name: &str) {
+        self.next += 1;
+        let id = format!("ver-foreign-{}", self.next);
+        if let Some(s) = self.scripts.get_mut(name) {
+            s.serving = id;
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct FakeCf {
+    pub state: Mutex<CfState>,
+}
+
+fn cf_ok(result: Value) -> Response {
+    srv::json(http::StatusCode::OK, &json!({ "success": true, "errors": [], "messages": [], "result": result }))
+}
+
+fn cf_err(status: u16, code: i64, message: &str) -> Response {
+    srv::json(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST), &json!({ "success": false, "errors": [{ "code": code, "message": message }], "messages": [], "result": null }))
+}
+
+/// A multipart form's parts: (name, filename, data).
+fn parts(content_type: &str, body: &[u8]) -> Vec<(String, Option<String>, Vec<u8>)> {
+    let Some(boundary) = content_type.split("boundary=").nth(1) else { return Vec::new() };
+    let delim = format!("--{boundary}");
+    let text = body.to_vec();
+    let mut out = Vec::new();
+    let mut rest: &[u8] = &text;
+    while let Some(i) = find(rest, delim.as_bytes()) {
+        rest = rest.get(i + delim.len()..).unwrap_or_default();
+        if rest.starts_with(b"--") {
+            break;
+        }
+        let Some(h) = find(rest, b"\r\n\r\n") else { break };
+        let head = String::from_utf8_lossy(rest.get(..h).unwrap_or_default()).into_owned();
+        let after = rest.get(h + 4..).unwrap_or_default();
+        let end = find(after, format!("\r\n{delim}").as_bytes()).unwrap_or(after.len());
+        let field = |k: &str| head.split(&format!("{k}=\"")).nth(1).and_then(|r| r.split('"').next()).map(str::to_owned);
+        out.push((field("name").unwrap_or_default(), field("filename"), after.get(..end).unwrap_or_default().to_vec()));
+        rest = after.get(end..).unwrap_or_default();
+    }
+    out
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+impl srv::Handler for FakeCf {
+    async fn handle(self: Arc<Self>, req: Request) -> Response {
+        if srv::header_str(&req, &http::header::AUTHORIZATION) != Some("Bearer cf-token") {
+            return cf_err(403, 10000, "Authentication error");
+        }
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+        let query = srv::query(&req);
+        let ct = srv::header_str(&req, &http::header::CONTENT_TYPE).unwrap_or("").to_owned();
+        let raw = srv::body_bytes(req.into_body(), 8 << 20).await.unwrap_or_default();
+        let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+        let mut st = self.state.lock();
+        let segs: Vec<String> = path.trim_start_matches('/').split('/').map(srv::decode).collect();
+        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        match (method.as_str(), segs.as_slice()) {
+            ("GET", ["accounts", "acct1", "workers", "scripts"]) => {
+                cf_ok(Value::Array(st.scripts.iter().map(|(n, s)| json!({ "id": n, "tags": s.tags, "migration_tag": s.migration_tag, "modified_on": "2026-10-18T00:00:00Z", "etag": format!("e{}", s.versions) })).collect()))
+            }
+            ("PUT", ["accounts", "acct1", "workers", "scripts", name]) => {
+                let ps = parts(&ct, &raw);
+                let Some(meta) = ps.iter().find(|p| p.0 == "metadata").and_then(|p| serde_json::from_slice::<Value>(&p.2).ok()) else { return cf_err(400, 10021, "no metadata") };
+                let main = meta.get("main_module").and_then(Value::as_str).unwrap_or_default();
+                if !ps.iter().any(|p| p.0 == main) {
+                    return cf_err(400, 10021, "main_module isn't among the modules");
+                }
+                let mut s = st.scripts.get(*name).cloned().unwrap_or_default();
+                if let Some(m) = meta.get("migrations") {
+                    let old = m.get("old_tag").and_then(Value::as_str);
+                    if old != s.migration_tag.as_deref() {
+                        return cf_err(400, 10074, "migration old_tag doesn't match the Worker's");
+                    }
+                    s.migration_tag = m.get("new_tag").and_then(Value::as_str).map(str::to_owned);
+                }
+                let mut settings = meta.as_object().cloned().unwrap_or_default();
+                for k in ["main_module", "migrations", "tags", "keep_bindings"] {
+                    settings.remove(k);
+                }
+                s.settings = Value::Object(settings);
+                s.tags = meta.get("tags").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+                s.versions += 1;
+                st.next += 1;
+                s.serving = format!("ver-{}", st.next);
+                st.scripts.insert((*name).to_owned(), s);
+                let modules: Vec<String> = ps.iter().filter(|p| p.1.is_some()).map(|p| p.0.clone()).collect();
+                st.uploads.push(json!({ "metadata": meta, "modules": modules }));
+                cf_ok(json!({ "id": name }))
+            }
+            ("GET", ["accounts", "acct1", "workers", "scripts", name, what]) => match (st.scripts.get(*name), *what) {
+                (None, _) => cf_err(404, 10007, "workers.api.error.script_not_found"),
+                (Some(s), "settings") => {
+                    let mut v = s.settings.clone();
+                    if let Value::Object(m) = &mut v {
+                        m.insert("tags".into(), json!(s.tags));
+                    }
+                    cf_ok(v)
+                }
+                (Some(s), "deployments") => cf_ok(json!({ "deployments": [{ "id": format!("dep-{}", s.serving), "versions": [{ "version_id": s.serving, "percentage": 100.0 }] }] })),
+                (Some(_), "schedules") => cf_ok(json!({ "schedules": st.schedules.get(*name).cloned().unwrap_or(json!([])).as_array().into_iter().flatten().map(|c| json!({ "cron": c })).collect::<Vec<_>>() })),
+                (Some(_), "subdomain") => cf_ok(json!({ "enabled": st.subdomains.get(*name).copied().unwrap_or(false) })),
+                _ => cf_err(404, 7003, "no route"),
+            },
+            ("PUT", ["accounts", "acct1", "workers", "scripts", name, "schedules"]) => {
+                st.schedules.insert((*name).to_owned(), Value::Array(body.as_array().into_iter().flatten().filter_map(|c| c.get("cron").cloned()).collect()));
+                cf_ok(json!({}))
+            }
+            ("POST", ["accounts", "acct1", "workers", "scripts", name, "subdomain"]) => {
+                st.subdomains.insert((*name).to_owned(), body.get("enabled").and_then(Value::as_bool).unwrap_or(false));
+                cf_ok(json!({}))
+            }
+            ("DELETE", ["accounts", "acct1", "workers", "scripts", name]) => match st.scripts.remove(*name) {
+                Some(_) => cf_ok(Value::Null),
+                None => cf_err(404, 10007, "workers.api.error.script_not_found"),
+            },
+            ("GET", ["zones"]) => cf_ok(if query.get("name").map(String::as_str) == Some("example.com") { json!([{ "id": "zone1", "name": "example.com" }]) } else { json!([]) }),
+            ("GET", ["zones", zone, "workers", "routes"]) => cf_ok(Value::Array(st.routes.iter().filter(|r| r.1 == *zone).map(|r| json!({ "id": r.0, "pattern": r.2, "script": r.3 })).collect())),
+            ("POST", ["zones", zone, "workers", "routes"]) => {
+                st.next += 1;
+                let id = format!("route-{}", st.next);
+                let (pattern, script) = (body.get("pattern").and_then(Value::as_str).unwrap_or_default().to_owned(), body.get("script").and_then(Value::as_str).unwrap_or_default().to_owned());
+                st.routes.push((id.clone(), (*zone).to_owned(), pattern, script));
+                cf_ok(json!({ "id": id }))
+            }
+            ("PUT", ["zones", _zone, "workers", "routes", id]) => {
+                if let Some(r) = st.routes.iter_mut().find(|r| r.0 == *id) {
+                    r.3 = body.get("script").and_then(Value::as_str).unwrap_or_default().to_owned();
+                }
+                cf_ok(json!({ "id": id }))
+            }
+            ("DELETE", ["zones", _zone, "workers", "routes", id]) => {
+                st.routes.retain(|r| r.0 != *id);
+                cf_ok(Value::Null)
+            }
+            ("GET", ["accounts", "acct1", "workers", "domains"]) => {
+                let host = query.get("hostname").cloned().unwrap_or_default();
+                cf_ok(Value::Array(st.domains.iter().filter(|d| host.is_empty() || d.get("hostname").and_then(Value::as_str) == Some(&host)).cloned().collect()))
+            }
+            ("PUT", ["accounts", "acct1", "workers", "domains"]) => {
+                let host = body.get("hostname").and_then(Value::as_str).unwrap_or_default().to_owned();
+                st.domains.retain(|d| d.get("hostname").and_then(Value::as_str) != Some(&host));
+                st.next += 1;
+                let d = json!({ "id": format!("dom-{}", st.next), "hostname": host, "service": body.get("service"), "environment": "production", "zone_id": body.get("zone_id"), "zone_name": "example.com" });
+                st.domains.push(d.clone());
+                cf_ok(d)
+            }
+            ("DELETE", ["accounts", "acct1", "workers", "domains", id]) => {
+                st.domains.retain(|d| d.get("id").and_then(Value::as_str) != Some(*id));
+                cf_ok(Value::Null)
+            }
+            _ => cf_err(400, 7000, &format!("the fake has no {method} {path}")),
+        }
+    }
+}
+
+/// Starts the fake Cloudflare on a free port: its base URL.
+pub async fn start_cf(fake: Arc<FakeCf>) -> anyhow::Result<String> {
+    let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 64).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::rt::spawn(async move {
+        while let Ok(s) = tcp.accept().await {
+            let (h, r) = (Arc::clone(&fake), s.peer_addr().ok());
+            crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(s), h, r));
+        }
+    });
+    Ok(format!("http://{addr}"))
+}
