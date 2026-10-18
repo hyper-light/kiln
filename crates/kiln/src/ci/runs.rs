@@ -62,6 +62,23 @@ pub async fn set_run_name(hub: &Hub, run: &str, name: Option<String>) -> anyhow:
     hub.store.call(move |c| Ok(c.execute("UPDATE runs SET run_name = ?2 WHERE id = ?1", params![run, name]).map(|_| ())?)).await
 }
 
+/// A run's approval (W18-R06): `required`, then `approved` or `rejected` by `by`.
+pub async fn set_approval(hub: &Hub, run: &str, state: &str, by: Option<&str>) -> anyhow::Result<()> {
+    let (run, state, by) = (run.to_owned(), state.to_owned(), by.map(str::to_owned));
+    hub.store
+        .call(move |c| {
+            let at = by.as_ref().map(|_| crate::util::now_unix());
+            Ok(c.execute("UPDATE runs SET approval = ?2, approved_by = ?3, approved_at = ?4 WHERE id = ?1", params![run, state, by, at]).map(|_| ())?)
+        })
+        .await
+}
+
+/// A run's approval, when it needed one.
+pub async fn approval(hub: &Hub, run: &str) -> anyhow::Result<Option<String>> {
+    let run = run.to_owned();
+    hub.store.call(move |c| Ok(c.query_row("SELECT approval FROM runs WHERE id = ?1", [&run], |r| r.get::<_, Option<String>>(0)).optional()?.flatten())).await
+}
+
 /// The v1-shaped job spec the run pages read, for a leg.
 fn planned_json(spec: &LegSpec) -> serde_json::Value {
     let steps: Vec<serde_json::Value> = spec

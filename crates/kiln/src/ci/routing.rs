@@ -275,6 +275,8 @@ pub async fn explain(hub: &Hub, body: Value) -> Result<Response, Fail> {
         group: body.get("group").and_then(Value::as_str).map(str::to_owned),
         requires: list("requires"),
         caps: u64::from(crate::proto::CAP_CI2),
+        // `untrusted: true`: where an untrusted leg would go (W18-R07).
+        untrusted: body.get("untrusted").and_then(Value::as_bool).unwrap_or(false).then(|| hub.cfg.ci.untrusted.route()),
     };
     let (tx, rx) = async_channel::bounded(1);
     hub.ci.send(super::dispatch::Msg::ExplainRoute { route: Box::new(route), reply: tx });

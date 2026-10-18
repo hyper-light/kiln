@@ -108,6 +108,9 @@ pub struct AgentLive {
     pub exclusive: bool,
     #[serde(skip)]
     pub lost_at: Option<Instant>,
+    /// What the runner's probes found and its administrator declared (docs/ci.md W13-R01, R02).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts: Option<Box<kiln_ci::facts::RunnerFacts>>,
     /// The machine's runner processes, while it has more than one (a runner replaced without a
     /// restart: the old one keeps its terminals until they end). See `crate::instances`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -306,17 +309,22 @@ impl Hub {
     /// mirrors are picked again from them, and fed (`crate::convo::mirror`).
     fn mirrors_seen(&self) {
         let Some(m) = &self.harness.copies else { return };
+        // One lock at a time: the machines first, then their runner processes.
+        let machines: Vec<(String, u64)> = self
+            .agents
+            .lock()
+            .values()
+            .filter(|a| a.connected && !a.ephemeral && !a.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
+            .map(|a| (a.name.clone(), a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used))))
+            .collect();
         let candidates: Vec<crate::convo::mirror::Candidate> = {
-            let agents = self.agents.lock();
             let inst = self.instances.lock();
-            agents
-                .values()
-                .filter(|a| a.connected && !a.ephemeral && !a.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
-                .filter_map(|a| {
-                    let peer = inst.newest_with(&a.name, proto::CAP_CONVO)?;
+            machines
+                .into_iter()
+                .filter_map(|(machine, disk_free)| {
+                    let peer = inst.newest_with(&machine, proto::CAP_CONVO)?;
                     let connected_at = inst.get(peer).map_or(0, |i| i.connected_at);
-                    let disk_free = a.sample.as_ref().map_or(0, |s| s.disk_total.saturating_sub(s.disk_used));
-                    Some(crate::convo::mirror::Candidate { machine: a.name.clone(), peer, connected_at, disk_free })
+                    Some(crate::convo::mirror::Candidate { machine, peer, connected_at, disk_free })
                 })
                 .collect()
         };
@@ -454,6 +462,7 @@ impl Hub {
                     dedicated_job: None,
                     exclusive: false,
                     lost_at: None,
+                    facts: None,
                     instances: vec![],
                     transport: None,
                 },
@@ -969,10 +978,18 @@ impl Hub {
             // The kiln it runs (`crate::fleet`); the rest is W13's.
             AgentMsg::Facts { json } => match serde_json::from_str::<kiln_ci::facts::RunnerFacts>(&json) {
                 Ok(f) => {
-                    if let Some(k) = f.kiln {
+                    if let Some(k) = f.kiln.clone() {
                         crate::fleet::remember(self, &k.build, &k.target, &k.commit);
                         self.instances.lock().set_kiln(peer, k);
                         self.updates.fleet.wake();
+                    }
+                    // A probe's whole report (a runner that only said its kiln has no CPU count):
+                    // routing decides over it from now on (docs/ci.md W13-R01).
+                    if f.cpu.threads > 0
+                        && let Some(a) = self.agents.lock().get_mut(&agent)
+                    {
+                        a.facts = Some(Box::new(f));
+                        self.ci.send(crate::ci::dispatch::Msg::RunnerFacts { agent: agent.clone() });
                     }
                 }
                 Err(e) => tracing::debug!(agent = %agent, error = %e, "unreadable runner facts"),
@@ -1193,10 +1210,13 @@ impl Hub {
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
             lost_at: None,
+            facts: None,
             instances: Vec::new(),
             transport: None,
         };
         let prev = self.agents.lock().get(&name).cloned();
+        // Its facts stay until its new connection's probe reports.
+        let prev_facts = prev.as_ref().and_then(|a| a.facts.clone());
         let draining = prev.as_ref().is_some_and(|a| a.draining);
         {
             let mut inst = self.instances.lock();
@@ -1214,7 +1234,7 @@ impl Hub {
         let busy = u32::try_from(running.len()).unwrap_or(u32::MAX);
         let live = match prev {
             Some(prev) if !joined.newest => AgentLive { connected: true, last_seen: now, running, busy, lost_at: None, ..prev },
-            _ => AgentLive { draining, running, busy, ..live },
+            _ => AgentLive { draining, running, busy, facts: prev_facts, ..live },
         };
         self.store
             .upsert_agent(AgentRow {

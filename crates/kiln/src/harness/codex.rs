@@ -553,7 +553,8 @@ impl Codex {
     }
 
     pub fn exited(&mut self, core: &mut Core, code: Option<i32>, error: Option<String>) {
-        for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+        // What kiln took back over runs apart from it (`survivors`).
+        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }

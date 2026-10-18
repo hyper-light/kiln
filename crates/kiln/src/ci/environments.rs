@@ -362,6 +362,23 @@ pub async fn approve(hub: &Hub, run: &str, body: Value, caller: Option<&Caller>)
         .map_err(internal)?;
     let Some((repo_id, actor)) = row else { return Err((StatusCode::NOT_FOUND, "no such run".into())) };
     let repo = hub.store.repos().await.map_err(internal)?.into_iter().find(|r| r.id == repo_id).ok_or_else(|| (StatusCode::NOT_FOUND, "no such run".into()))?;
+    // An outside contributor's run waiting to start (W18-R06): approved (or not) in one step.
+    if b.environments.is_empty() && super::runs::approval(hub, run).await.map_err(internal)?.as_deref() == Some("required") {
+        let owner = Caller::owner();
+        let who = caller.unwrap_or(&owner);
+        if !who.is_owner() && !who.can("runs.approve", &Scope::Repo { repo: repo.name.clone() }) {
+            return Err((StatusCode::FORBIDDEN, format!("{} may not approve runs of {}: that needs runs.approve there", who.name, repo.name)));
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        hub.ci.send(super::dispatch::Msg::ApproveRun { run: run.to_owned(), by: who.name.clone(), approve: approved, reply: tx });
+        let late = || (StatusCode::GATEWAY_TIMEOUT, "the dispatcher didn't answer".to_owned());
+        let decided = crate::rt::timeout(Duration::from_secs(10), rx.recv()).await.map_err(|_| late())?.map_err(|_| late())?;
+        if !decided {
+            return Err((StatusCode::CONFLICT, "the run waits for no approval".into()));
+        }
+        hub.store.audit(who.name.clone(), if approved { "ci.runs.approve".into() } else { "ci.runs.reject".into() }, format!("{run} (an outside contributor's run, by {actor})")).await;
+        return Ok(srv::json(StatusCode::OK, &json!({ "run": run, "approval": "run", "state": if approved { "approved" } else { "rejected" } })));
+    }
     // The environments the run waits for, unless the body names them.
     let waiting = waiting_envs(hub, run).await.map_err(internal)?;
     let named: Vec<String> = if b.environments.is_empty() { waiting.clone() } else { b.environments.clone() };

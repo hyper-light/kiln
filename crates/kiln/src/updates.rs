@@ -1624,7 +1624,9 @@ pub fn runner_service(state_dir: &Path, instance: Option<&str>) -> String {
 /// `CAP_DOCKER` when a container CLI works here (docs/ci.md W13-R01, probed once).
 pub fn runner_build() -> AgentMsg {
     let docker = if crate::runner::docker::available() { crate::proto::CAP_DOCKER } else { 0 };
-    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker }
+    // Rootless engines are where untrusted legs may run (docs/ci.md W18-R07).
+    let rootless = if docker != 0 && crate::runner::docker::rootless_engine() { crate::proto::CAP_DOCKER_ROOTLESS } else { 0 };
+    AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS | docker | rootless }
 }
 
 /// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
@@ -1633,17 +1635,22 @@ pub fn runner_facts() -> AgentMsg {
     let facts = kiln_ci::facts::RunnerFacts {
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
-        kiln: Some(kiln_ci::facts::KilnFacts {
-            commit: crate::api::COMMIT.to_owned(),
-            build: own_build(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            target: crate::api::TARGET.to_owned(),
-            checkout: kiln_checkout().map(|p| p.to_string_lossy().into_owned()),
-        }),
+        kiln: Some(kiln_facts()),
         probed_at: crate::util::now_unix(),
         ..kiln_ci::facts::RunnerFacts::default()
     };
     AgentMsg::Facts { json: serde_json::to_string(&facts).unwrap_or_default() }
+}
+
+/// The kiln this runner runs, and where kiln's source is on its machine.
+pub fn kiln_facts() -> kiln_ci::facts::KilnFacts {
+    kiln_ci::facts::KilnFacts {
+        commit: crate::api::COMMIT.to_owned(),
+        build: own_build(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        target: crate::api::TARGET.to_owned(),
+        checkout: kiln_checkout().map(|p| p.to_string_lossy().into_owned()),
+    }
 }
 
 /// A checkout of kiln on this machine: `KILN_SOURCE`, else one of the usual places in the home

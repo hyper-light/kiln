@@ -421,6 +421,12 @@ pub struct Session {
     /// A turn of its is under way: set as one starts, cleared only as one ends (its harness ending
     /// leaves it set), so the record a restart reads says which turns it cut short.
     pub turn_open: std::sync::atomic::AtomicBool,
+    /// What its harness runs, as last seen (`survivors`): the harness process, and what's under it
+    /// with what it left running.
+    pub ran: Mutex<(Option<super::survivors::Ran>, Vec<super::survivors::Ran>)>,
+    /// What it started that still runs once what started it is gone, each shown as a task
+    /// (`left-<pid>`) and stoppable from kiln.
+    pub left: Mutex<Vec<super::survivors::Ran>>,
 }
 
 impl Session {
@@ -521,6 +527,26 @@ impl Session {
         }
         s
     }
+}
+
+/// Stop what it left running that kiln took back over: one (its task id), or all of them.
+async fn stop_left(s: &Arc<Session>, task: Option<&str>) {
+    let pid: Option<u32> = task.and_then(|t| t.strip_prefix(super::survivors::LEFT)).and_then(|p| p.parse().ok());
+    let roots: Vec<super::survivors::Ran> = s.left.lock().iter().filter(|r| task.is_none() || Some(r.pid) == pid).cloned().collect();
+    if roots.is_empty() {
+        return;
+    }
+    let stopping = roots.clone();
+    let _ = crate::rt::blocking(move || stopping.iter().for_each(super::survivors::stop_tree)).await;
+    let gone: std::collections::HashSet<u32> = roots.iter().map(|r| r.pid).collect();
+    s.left.lock().retain(|r| !gone.contains(&r.pid));
+    s.ran.lock().1.retain(|r| !gone.contains(&r.pid));
+    let mut core = s.core.lock();
+    for t in core.state.tasks.iter_mut().filter(|t| t.id.strip_prefix(super::survivors::LEFT).and_then(|p| p.parse::<u32>().ok()).is_some_and(|p| gone.contains(&p))) {
+        t.status = "stopped".to_owned();
+        t.ended = Some(Core::now());
+    }
+    core.touch_state();
 }
 
 /// Whether a turn is under way once a session's status is `status`: one starts it, its end ends it,
@@ -645,6 +671,8 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         ctl,
         pid: Mutex::new(None),
         turn_open: std::sync::atomic::AtomicBool::new(false),
+        ran: Mutex::new((None, Vec::new())),
+        left: Mutex::new(Vec::new()),
     });
     let run = Arc::clone(&s);
     crate::rt::spawn(async move {
@@ -1481,7 +1509,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
         let spawned = match blocked {
             Some(why) => Err(anyhow::anyhow!(why)),
-            None => kind.launch(&spec).and_then(crate::proc::spawn_duplex),
+            // Marked as this session's, and so is everything it starts (`survivors`).
+            None => kind
+                .launch(&spec)
+                .map(|mut p| {
+                    p.env(super::survivors::MARK, &s.id);
+                    p
+                })
+                .and_then(crate::proc::spawn_duplex),
         };
         let mut code = None;
         let mut error = None;
@@ -1624,6 +1659,16 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 moving = Some(mv);
                             }
                             Command::Moving { text } => moving_note(&s, &text),
+                            // What it left running that kiln took back over: kiln stops it.
+                            Command::StopTask { task } if task.starts_with(super::survivors::LEFT) => {
+                                stop_left(&s, Some(&task)).await;
+                                on_change();
+                            }
+                            Command::StopTasks => {
+                                stop_left(&s, None).await;
+                                adapter.command(&mut s.core.lock(), Command::StopTasks);
+                                on_change();
+                            }
                             // A pause (`harness::pause`): ended by a person, its timer set, its stop
                             // point set, or one started because another session on the account
                             // reached the limit.
@@ -1688,9 +1733,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 crate::rt::sleep(Duration::from_millis(1500)).await;
                             }
                             let root = p.pid;
+                            let left = std::mem::take(&mut *s.left.lock());
                             let _ = crate::rt::blocking(move || {
                                 let pids: Vec<u32> = descendants(root).into_iter().map(|(pid, _)| pid).collect();
                                 crate::os::stop_processes(&pids, Some(root), Duration::from_secs(2));
+                                for r in &left {
+                                    super::survivors::stop_tree(r);
+                                }
                             })
                             .await;
                             p.terminate(Duration::from_secs(3));
@@ -1863,6 +1912,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),
+                    Command::StopTask { task } if task.starts_with(super::survivors::LEFT) => {
+                        stop_left(&s, Some(&task)).await;
+                        on_change();
+                    }
+                    Command::StopTasks => {
+                        stop_left(&s, None).await;
+                        on_change();
+                    }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
                         carry.push(prepare(&files, c).await);
                         break;
@@ -1886,6 +1943,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     c => adapter.command(&mut s.core.lock(), c),
                 },
                 Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
+                    // Ending the agent ends what it left running that kiln took back over.
+                    let left = std::mem::take(&mut *s.left.lock());
+                    if !left.is_empty() {
+                        let _ = crate::rt::blocking(move || left.iter().for_each(super::survivors::stop_tree)).await;
+                    }
                     if matches!(ctl, Some(Ctl::LetGo)) {
                         tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
                         (files.release)(&s.id);

@@ -33,5 +33,6 @@ pub mod registry;
 pub mod relocate;
 pub mod screen;
 pub mod session;
+pub mod survivors;
 pub mod socket;
 pub mod transcript;

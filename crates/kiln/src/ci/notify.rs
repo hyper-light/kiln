@@ -165,6 +165,7 @@ fn message(event: &str, s: &Subject) -> (String, String) {
         "run.fixed" => format!("✓ {what} #{} is fixed on {}", s.number, s.branch),
         "run.succeeded" => format!("✓ {what} #{} succeeded on {}", s.number, s.branch),
         "run.cancelled" => format!("◌ {what} #{} was cancelled on {}", s.number, s.branch),
+        "approval.waiting" if s.environments.is_empty() => format!("⏸ {what} #{} waits for a maintainer's approval to run (an outside contributor's)", s.number),
         "approval.waiting" => format!("⏸ {what} #{} waits for approval to deploy to {}", s.number, s.environments.join(", ")),
         other => format!("{other}: {what} #{}", s.number),
     };

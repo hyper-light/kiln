@@ -48,6 +48,7 @@ pub struct Ci {
     pub scheduler: Scheduler,
     pub fairness: Fairness,
     pub insights: Insights,
+    pub untrusted: Untrusted,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
@@ -98,6 +99,59 @@ pub struct Fairness {
 pub struct Insights {
     pub cost_per_minute: std::collections::HashMap<String, f64>,
     pub currency: String,
+}
+
+/// `[ci.untrusted]`: runs of code from outside a repository's trust (docs/ci.md W18-R05..R08):
+/// fork pull requests, other people's local runs, and what this marks.
+///
+/// ```toml
+/// [ci.untrusted]
+/// require_approval = "first-time"   # or "all-external", "none"
+/// executors = ["firecracker", "shards", "docker"]
+/// allow_hosts = ["registry.npmjs.org", "*.pypi.org", "files.pythonhosted.org"]
+/// repos = ["acme/sandbox-*"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Untrusted {
+    /// Which untrusted runs wait for a maintainer before any job starts (W18-R06).
+    pub require_approval: kiln_ci::trust::Approval,
+    /// The executors untrusted legs may run on, in order (W18-R07). The host only when listed.
+    pub executors: Vec<String>,
+    /// Docker for untrusted legs even when its engine runs as root (rootless only by default).
+    pub rootful_docker: bool,
+    /// Hosts (`*.example.com` for those under it, `:port` to narrow) untrusted legs may reach
+    /// besides kiln's own server (W18-R08).
+    pub allow_hosts: Vec<String>,
+    /// Repositories (globs, `owner/name`) whose runs are all untrusted.
+    pub repos: Vec<String>,
+    /// People whose runs are untrusted wherever they run.
+    pub actors: Vec<String>,
+}
+
+impl Default for Untrusted {
+    fn default() -> Self {
+        Untrusted {
+            require_approval: kiln_ci::trust::Approval::FirstTime,
+            executors: vec!["firecracker".into(), "shards".into(), "docker".into()],
+            rootful_docker: false,
+            allow_hosts: Vec::new(),
+            repos: Vec::new(),
+            actors: Vec::new(),
+        }
+    }
+}
+
+impl Untrusted {
+    /// Whether an administrator marked runs of `repo` by `actor` untrusted.
+    pub fn marks(&self, repo: &str, actor: &str) -> bool {
+        self.repos.iter().any(|g| crate::pipeline::glob_match(&g.to_ascii_lowercase(), &repo.to_ascii_lowercase())) || self.actors.iter().any(|a| a.eq_ignore_ascii_case(actor))
+    }
+
+    /// What routing needs of it.
+    pub fn route(&self) -> kiln_ci::sched::routing::Untrusted {
+        kiln_ci::sched::routing::Untrusted { executors: self.executors.clone(), rootful_docker: self.rootful_docker }
+    }
 }
 
 /// `[ci.actions]`: which remote actions runs may use, and what to mirror ahead (docs/ci.md
