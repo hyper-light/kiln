@@ -8,9 +8,11 @@
 pub mod batch;
 pub mod bits;
 pub mod block;
+pub mod command;
 pub mod crc32c;
 pub mod hash;
 pub mod head;
+pub mod image;
 pub mod index;
 pub mod logs;
 pub mod lz4;

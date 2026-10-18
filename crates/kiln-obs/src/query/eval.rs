@@ -242,6 +242,10 @@ fn constant(ast: &Ast, id: usize) -> Option<f64> {
 fn metric(store: &Store, q: &MetricQuery, grid: Grid, off: i64, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
     let mut ids = Vec::new();
     store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone() }, &mut ids);
+    // In the order of the series' fingerprints, the same on every replica (ids are each one's
+    // own), so a group's values are summed in one order everywhere: floating-point addition does
+    // not associate, and every replica answers to the bit.
+    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
     // Groups: by-tag values → index; the key built in one buffer, copied only for a new group.
     let mut groups: HashMap<Vec<&str>, usize> = HashMap::new();
     let mut key: Vec<&str> = Vec::with_capacity(q.by.len());
@@ -288,6 +292,7 @@ fn metric(store: &Store, q: &MetricQuery, grid: Grid, off: i64, max_series: usiz
         }
         out.push(Series { tags, values });
     }
+    out.sort_by(|a, b| a.tags.cmp(&b.tags));
     Ok(out)
 }
 

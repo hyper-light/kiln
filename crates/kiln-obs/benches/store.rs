@@ -162,7 +162,7 @@ fn main() {
 
     // Selection: by metric, by metric and tag, by wildcard, with a negation.
     let mut ids = Vec::new();
-    let names: Vec<String> = store.metric_names().map(str::to_owned).collect();
+    let names: Vec<String> = store.metric_names().into_iter().map(str::to_owned).collect();
     let mut sel_ns = Vec::new();
     for name in &names {
         let s = Instant::now();

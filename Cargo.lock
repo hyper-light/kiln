@@ -1577,7 +1577,11 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "hashbrown 0.17.1",
+ "hyper-block",
+ "hyper-durable",
+ "hyper-log",
  "hyper-measure",
+ "hyper-raft",
  "sha2",
  "tempfile",
  "thiserror 2.0.21",

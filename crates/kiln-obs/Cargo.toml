@@ -13,6 +13,12 @@ thiserror = "2.0.21"
 hashbrown = { version = "0.17.1", default-features = false }
 # Series fingerprints (`batch::fingerprint`): stable across builds and nodes, already in kiln's tree.
 sha2 = "0.11.1"
+# Replication (`docs/observe.md` §5): the store is a hyper-durable state machine on a hyper-log
+# group, at the revision the rest of kiln pins.
+hyper-raft = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-durable = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-log = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
+hyper-block = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

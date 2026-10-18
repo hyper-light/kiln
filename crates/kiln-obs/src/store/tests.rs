@@ -1,0 +1,628 @@
+use super::*;
+use crate::batch::{Builder, SeriesKey};
+use crate::logs::record::Record;
+use crate::testkit::Rng;
+
+fn read_all(s: &Store, sel: &Selector) -> Vec<(String, Vec<(i64, u64)>)> {
+    let mut ids = Vec::new();
+    s.select(sel, &mut ids);
+    let mut out: Vec<(String, Vec<(i64, u64)>)> = ids
+        .iter()
+        .map(|&id| {
+            let r = s.series(id).unwrap();
+            let name = format!("{}{:?}{:?}", r.metric(), r.tags().collect::<Vec<_>>(), r.kind());
+            let (mut ts, mut vs) = (Vec::new(), Vec::new());
+            s.read(id, i64::MIN, i64::MAX, &mut ts, &mut vs).unwrap();
+            (name, ts.into_iter().zip(vs.into_iter().map(f64::to_bits)).collect())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn gauge(metric: &str, host: &str) -> SeriesKey {
+    SeriesKey::new(metric, [("host", host)], Kind::Gauge).unwrap()
+}
+
+#[test]
+fn written_samples_are_selected_and_read_back() {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    let a = SeriesKey::new("system.cpu.user", [("host", "a"), ("env", "prod")], Kind::Gauge).unwrap();
+    let b_key = SeriesKey::new("system.cpu.user", [("host", "b"), ("env", "prod")], Kind::Gauge).unwrap();
+    let m = SeriesKey::new("system.mem.used", [("host", "a")], Kind::Gauge).unwrap();
+    let mut b = Builder::new();
+    for k in [&a, &b_key, &m] {
+        b.define(k);
+    }
+    b.run(a.fp, (0..10).map(|i| (i * 1000, i as f64)));
+    b.run(b_key.fp, (0..10).map(|i| (i * 1000, 100.0 + i as f64)));
+    b.run(m.fp, [(0, 1e9)]);
+    let applied = s.apply(&b.finish()).unwrap();
+    assert_eq!(applied.counts, Counts { runs: 3, new_series: 3, samples: 21, ..Counts::default() });
+    let mut ids = Vec::new();
+    s.select(&Selector::metric("system.cpu.user").tag("env", "prod"), &mut ids);
+    assert_eq!(ids.len(), 2);
+    let b_id = ids.iter().copied().find(|&id| s.series(id).and_then(|r| r.tag("host")) == Some("b")).unwrap();
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    s.read(b_id, 2000, 4000, &mut ts, &mut vs).unwrap();
+    assert_eq!((ts.clone(), vs.clone()), (vec![2000, 3000, 4000], vec![102.0, 103.0, 104.0]));
+    let mut b = Builder::new();
+    b.run(b_key.fp, [(10_000, 110.0), (500, 0.5)]);
+    let applied = s.apply(&b.finish()).unwrap();
+    assert_eq!((applied.counts.new_series, applied.counts.late), (0, 1));
+    ts.clear();
+    vs.clear();
+    s.read(b_id, 0, 1000, &mut ts, &mut vs).unwrap();
+    assert_eq!(ts, vec![0, 500, 1000]);
+    assert_eq!(s.metric_names(), vec!["system.cpu.user", "system.mem.used"]);
+    assert_eq!(s.tag_values("host"), vec!["a", "b"]);
+}
+
+#[test]
+fn a_run_of_an_unknown_series_is_reported_and_a_bad_definition_refused() {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    let a = gauge("m", "a");
+    let mut b = Builder::new();
+    b.run(a.fp, [(1, 1.0)]);
+    let applied = s.apply(&b.finish()).unwrap();
+    assert_eq!(applied.unknown, vec![a.fp]);
+    assert_eq!(s.series_count(), 0);
+    b.define(&a);
+    b.run(a.fp, [(1, 1.0)]);
+    let applied = s.apply(&b.finish()).unwrap();
+    assert!(applied.unknown.is_empty());
+    assert_eq!(applied.counts.samples, 1);
+    let mut forged = gauge("m", "evil");
+    forged.fp = a.fp;
+    b.define(&forged);
+    let applied = s.apply(&b.finish()).unwrap();
+    assert_eq!(applied.refused, vec![a.fp]);
+    assert_eq!(s.series_count(), 1);
+    // A new series whose fingerprint is not its key's is refused when its samples come.
+    let mut wrong = gauge("m", "b");
+    wrong.fp ^= 1;
+    b.define(&wrong);
+    b.run(wrong.fp, [(1, 1.0)]);
+    let applied = s.apply(&b.finish()).unwrap();
+    assert_eq!(applied.refused, vec![wrong.fp]);
+    assert_eq!(s.series_count(), 1);
+}
+
+#[test]
+fn a_definition_takes_effect_with_its_first_sample_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let (alone, expired, kept) = (gauge("m", "alone"), gauge("m", "expired"), gauge("m", "kept"));
+    s.retain_logical(1_000);
+    let mut b = Builder::new();
+    b.define(&alone);
+    b.define(&expired);
+    b.run(expired.fp, [(10, 1.0), (999, 2.0)]);
+    b.define(&kept);
+    b.run(kept.fp, [(500, 1.0), (1_000, 2.0)]);
+    let applied = s.apply(&b.finish()).unwrap();
+    assert_eq!((applied.counts.new_series, applied.counts.samples, applied.counts.expired), (1, 1, 3));
+    assert_eq!(s.tag_values("host"), vec!["kept"]);
+    // A run of a series defined alone in an earlier batch: unknown, as on a replica that cut
+    // between the two and opened again.
+    b.run(alone.fp, [(2_000, 1.0)]);
+    assert_eq!(s.apply(&b.finish()).unwrap().unknown, vec![alone.fp]);
+    s.cut(Point { index: 1, term: 1 }).unwrap();
+    drop(s);
+    let s = Store::open(dir.path(), Keyed::with_keys(3, 4)).unwrap();
+    assert_eq!(s.tag_values("host"), vec!["kept"]);
+    assert_eq!(read_all(&s, &Selector::metric("m")), vec![(format!("m{:?}{:?}", vec![("host", "kept")], Kind::Gauge), vec![(1_000, 2f64.to_bits())])]);
+}
+
+#[test]
+fn a_write_sent_twice_is_applied_once() {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    let k = gauge("m", "a");
+    let mut b = Builder::new();
+    b.define(&k);
+    b.run(k.fp, [(1, 1.0)]);
+    b.logs(&[Record { ts: 5, message: "once".into(), ..Record::default() }]);
+    let first = b.finish_write(77, 1, 1_000);
+    let applied = |a: Answer| matches!(a, Answer::Write { outcome: Written::Applied(_), .. });
+    assert!(applied(s.apply_entry(1, &first).unwrap()));
+    // Again, after a leader changed: nothing again.
+    assert_eq!(s.apply_entry(2, &first), Ok(Answer::Write { sender: 77, seq: 1, outcome: Written::Duplicate }));
+    let all = crate::logs::search::parse("*").unwrap();
+    assert_eq!(s.search_logs(&all, i64::MIN, i64::MAX, 10).unwrap().records.len(), 1);
+    // The sender's next, and another sender's first, are applied.
+    b.run(k.fp, [(2, 2.0)]);
+    assert!(applied(s.apply_entry(3, &b.finish_write(77, 2, 1_001)).unwrap()));
+    b.run(k.fp, [(3, 3.0)]);
+    assert!(applied(s.apply_entry(4, &b.finish_write(78, 1, 1_002)).unwrap()));
+    assert_eq!(s.sessions().get(&77), Some(&Session { seq: 2, at: 1_001, index: 3 }));
+    // A session goes once its last write is older than the cutoff.
+    s.retain_logical(1_002);
+    assert_eq!(s.sessions().keys().copied().collect::<Vec<_>>(), vec![78]);
+    // An entry of a command this build does not know is never skipped.
+    assert_eq!(s.apply_entry(5, &[200, 1, 2, 3]), Err(Newer::Command(200)));
+    let mut newer = crate::command::write(9, 1, 0, &[]);
+    newer.push(crate::batch::VERSION + 1);
+    assert_eq!(s.apply_entry(5, &newer), Err(Newer::Batch(crate::batch::VERSION + 1)));
+    assert_eq!(s.apply_entry(5, &[crate::command::RETAIN, 1]), Ok(Answer::Malformed(CommandError::Short)));
+}
+
+#[test]
+fn a_bound_on_series_refuses_new_series_past_it() {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    assert_eq!(s.apply_entry(1, &crate::command::limits(2)), Ok(Answer::Limits { max_series: 2 }));
+    let mut b = Builder::new();
+    for h in ["a", "b", "c"] {
+        let k = gauge("m", h);
+        b.define(&k);
+        b.run(k.fp, [(1, 1.0)]);
+    }
+    let Ok(Answer::Write { outcome: Written::Applied(a), .. }) = s.apply_entry(2, &b.finish_write(1, 1, 0)) else { panic!() };
+    assert_eq!(a.over_limit, vec![gauge("m", "c").fp]);
+    assert_eq!(s.series_count(), 2);
+    // Known series still take samples.
+    b.run(gauge("m", "a").fp, [(2, 2.0)]);
+    let Ok(Answer::Write { outcome: Written::Applied(a), .. }) = s.apply_entry(3, &b.finish_write(1, 2, 0)) else { panic!() };
+    assert_eq!(a.counts.samples, 1);
+}
+
+/// Batches of random series, times and late writes, with the model of what a read must give.
+fn random_batches(seed: u64, rounds: usize) -> (Vec<Vec<u8>>, BTreeMap<(String, i64), u64>) {
+    let mut rng = Rng::new(seed);
+    let mut model = BTreeMap::new();
+    let mut batches = Vec::new();
+    let mut b = Builder::new();
+    for round in 0..rounds {
+        for _ in 0..20 {
+            let host = format!("h{}", rng.below(15));
+            let k = gauge("m", &host);
+            b.define(&k);
+            let samples: Vec<(i64, f64)> = (0..4)
+                .map(|i| {
+                    let late = rng.below(8) == 0;
+                    let t = if late { rng.below(round as u64 * 1000 + 1) as i64 } else { round as i64 * 1000 + i * 100 + rng.below(50) as i64 };
+                    (t, rng.f64())
+                })
+                .collect();
+            // Within a run, the last given at a time wins.
+            let mut dedup: BTreeMap<i64, f64> = BTreeMap::new();
+            for (t, v) in &samples {
+                dedup.insert(*t, *v);
+            }
+            for (t, v) in dedup {
+                model.insert((format!("m{:?}{:?}", vec![("host", host.as_str())], Kind::Gauge), t), v.to_bits());
+            }
+            b.run(k.fp, samples);
+        }
+        batches.push(b.finish());
+    }
+    (batches, model)
+}
+
+fn model_view(model: &BTreeMap<(String, i64), u64>) -> Vec<(String, Vec<(i64, u64)>)> {
+    let mut out: BTreeMap<String, Vec<(i64, u64)>> = BTreeMap::new();
+    for ((name, t), v) in model {
+        out.entry(name.clone()).or_default().push((*t, *v));
+    }
+    out.into_iter().collect()
+}
+
+#[test]
+fn cuts_compactions_and_a_reopen_keep_exactly_what_was_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (batches, model) = random_batches(7, 60);
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    for (i, batch) in batches.iter().enumerate() {
+        s.apply(batch).unwrap();
+        if i % 7 == 6 {
+            s.cut(Point { index: i as u64 + 1, term: 1 }).unwrap();
+            s.compact().unwrap();
+        }
+    }
+    let sel = Selector::metric("m");
+    assert_eq!(read_all(&s, &sel), model_view(&model), "live");
+    // Blocks stay logarithmic in what they hold.
+    assert!(s.block_count() <= 1 + (batches.len() / 7).ilog2() as usize + 1, "{} blocks", s.block_count());
+    let durable = s.durable();
+    assert_eq!(durable.index, 56);
+    // A restart: blocks reopen, and the log is replayed from the durable point.
+    drop(s);
+    let mut s = Store::open(dir.path(), Keyed::with_keys(5, 6)).unwrap();
+    assert_eq!(s.durable(), durable);
+    for batch in batches.iter().skip(durable.index as usize) {
+        s.apply(batch).unwrap();
+    }
+    assert_eq!(read_all(&s, &sel), model_view(&model), "after a restart");
+}
+
+#[test]
+fn a_crash_between_a_block_and_its_manifest_leaves_no_trace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (batches, model) = random_batches(9, 20);
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    for batch in batches.iter().take(10) {
+        s.apply(batch).unwrap();
+    }
+    s.cut(Point { index: 10, term: 1 }).unwrap();
+    for batch in batches.iter().skip(10) {
+        s.apply(batch).unwrap();
+    }
+    // A block written whole whose manifest never was (the crash after the block's sync): the
+    // block is an orphan, deleted at open; its samples come back from the log.
+    let orphan = dir.path().join(manifest::block_file(99));
+    std::fs::copy(dir.path().join(manifest::block_file(0)), &orphan).unwrap();
+    std::fs::write(dir.path().join("MANIFEST.tmp"), b"half a manifest").unwrap();
+    drop(s);
+    let mut s = Store::open(dir.path(), Keyed::with_keys(3, 4)).unwrap();
+    assert!(!orphan.exists() && !dir.path().join("MANIFEST.tmp").exists());
+    assert_eq!(s.durable().index, 10);
+    for batch in batches.iter().skip(10) {
+        s.apply(batch).unwrap();
+    }
+    assert_eq!(read_all(&s, &Selector::metric("m")), model_view(&model));
+}
+
+#[test]
+fn a_correction_after_a_cut_wins_over_the_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let k = SeriesKey::new("m", [], Kind::Gauge).unwrap();
+    let mut b = Builder::new();
+    b.define(&k);
+    b.run(k.fp, (0..10).map(|i| (i * 10, i as f64)));
+    s.apply(&b.finish()).unwrap();
+    s.cut(Point { index: 1, term: 1 }).unwrap();
+    b.run(k.fp, [(50, -5.0), (55, 5.5), (200, 20.0)]);
+    s.apply(&b.finish()).unwrap();
+    let mut ids = Vec::new();
+    s.select(&Selector::metric("m"), &mut ids);
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    s.read(ids[0], 40, 60, &mut ts, &mut vs).unwrap();
+    assert_eq!(ts, vec![40, 50, 55, 60]);
+    assert_eq!(vs, vec![4.0, -5.0, 5.5, 6.0]);
+    // Cut again: two blocks overlap in time, the later wins; compacted into one, the same.
+    s.cut(Point { index: 2, term: 1 }).unwrap();
+    ts.clear();
+    vs.clear();
+    s.read(ids[0], 40, 60, &mut ts, &mut vs).unwrap();
+    assert_eq!(vs, vec![4.0, -5.0, 5.5, 6.0]);
+    s.compact().unwrap();
+    assert_eq!(s.block_count(), 1);
+    ts.clear();
+    vs.clear();
+    s.read(ids[0], 40, 60, &mut ts, &mut vs).unwrap();
+    assert_eq!(vs, vec![4.0, -5.0, 5.5, 6.0]);
+}
+
+#[test]
+fn retention_drops_series_at_its_entry_and_files_once_it_is_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let (old, live) = (gauge("m", "old"), gauge("m", "live"));
+    let mut b = Builder::new();
+    b.define(&old);
+    b.define(&live);
+    b.run(old.fp, (0..10).map(|i| (i * 10, 1.0)));
+    b.run(live.fp, (0..10).map(|i| (i * 10, 2.0)));
+    s.apply(&b.finish()).unwrap();
+    s.cut(Point { index: 1, term: 1 }).unwrap();
+    b.run(live.fp, (100..110).map(|i| (i * 10, 3.0)));
+    s.apply(&b.finish()).unwrap();
+    s.cut(Point { index: 2, term: 1 }).unwrap();
+    // The entry: the series goes at once, and nothing older is read; the files stay.
+    assert_eq!(s.retain_logical(1000), 1);
+    assert_eq!(s.tag_values("host"), vec!["live"]);
+    let mut ids = Vec::new();
+    s.select(&Selector::metric("m"), &mut ids);
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    s.read(ids[0], i64::MIN, i64::MAX, &mut ts, &mut vs).unwrap();
+    assert_eq!(ts.first(), Some(&1000));
+    assert_eq!(s.retain_files().unwrap().blocks_removed, 0, "the cutoff is not durable yet");
+    // Once a cut made it durable, the block wholly older goes.
+    s.cut(Point { index: 3, term: 1 }).unwrap();
+    assert_eq!(s.retain_files().unwrap().blocks_removed, 1);
+    drop(s);
+    let s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    assert_eq!(s.series_count(), 1);
+    assert_eq!(s.cutoff(), 1000);
+}
+
+#[test]
+fn logs_ride_batches_through_cuts_a_reopen_and_retention() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    let rec = |i: i64| Record { ts: i * 1_000_000_000, severity: if i % 7 == 0 { 17 } else { 9 }, service: "api".into(), host: "h".into(), source: "kiln".into(), message: format!("event {i} {}", if i % 7 == 0 { "boom" } else { "fine" }), ..Record::default() };
+    let mut b = Builder::new();
+    for batch in 0..20 {
+        let recs: Vec<Record> = (batch * 1000..(batch + 1) * 1000).map(rec).collect();
+        b.logs(&recs);
+        let applied = s.apply(&b.finish()).unwrap();
+        assert_eq!(applied.counts.logs, 1000);
+        if batch % 6 == 5 {
+            s.cut(Point { index: batch as u64 + 1, term: 1 }).unwrap();
+        }
+    }
+    let q = crate::logs::search::parse("status:error boom").unwrap();
+    let newest = |s: &Store| s.search_logs(&q, 0, i64::MAX, 3).unwrap().records.iter().map(|r| r.ts / 1_000_000_000).collect::<Vec<_>>();
+    assert_eq!(newest(&s), vec![19_999, 19_992, 19_985]);
+    // After a restart: the files reopen; the batches past the durable point come again.
+    let durable = s.durable();
+    drop(s);
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    for batch in (durable.index as i64)..20 {
+        let recs: Vec<Record> = (batch * 1000..(batch + 1) * 1000).map(rec).collect();
+        b.logs(&recs);
+        s.apply(&b.finish()).unwrap();
+    }
+    assert_eq!(newest(&s), vec![19_999, 19_992, 19_985]);
+    assert!(s.log_bytes() > 0);
+    // Retention: nothing before the cutoff is found at once; files wholly before it (0–5,999 and
+    // 6,000–11,999 s) go once it is durable, and the one holding 12,000–17,999 stays whole.
+    s.retain_logical(13_000_000);
+    let all = crate::logs::search::parse("*").unwrap();
+    assert!(s.search_logs(&all, 0, 12_999_999_999_999, 1).unwrap().records.is_empty());
+    assert_eq!(s.search_logs(&all, 0, 13_000_000_000_000, 1).unwrap().records.len(), 1);
+    s.cut(Point { index: 20, term: 1 }).unwrap();
+    let before = s.log_bytes();
+    s.retain_files().unwrap();
+    assert!(s.log_bytes() < before);
+    assert_eq!(s.search_logs(&all, 0, 13_000_000_000_000, 1).unwrap().records.len(), 1);
+}
+
+/// Everything a replica answers, by the series' own keys: every series' samples, the names and
+/// values autocomplete gives, the replicated state, every log record in search order, and the
+/// answers to queries, to the bit.
+#[derive(Debug, PartialEq)]
+struct View {
+    series: Vec<(String, Vec<(i64, u64)>)>,
+    names: Vec<String>,
+    hosts: Vec<String>,
+    cutoff: i64,
+    max_series: u64,
+    sessions: BTreeMap<u64, Session>,
+    logs: Vec<Record>,
+    queries: Vec<Vec<(Vec<(String, String)>, Vec<u64>)>>,
+}
+
+const QUERIES: [&str; 4] = ["avg:m0{*} by {host}", "sum:m1{*}", "p90:m2{*} by {host}", "sum:flip{*}.as_count()"];
+
+fn view(s: &Store) -> View {
+    let mut series = Vec::new();
+    for name in s.metric_names() {
+        series.extend(read_all(s, &Selector::metric(name)));
+    }
+    series.sort();
+    let all = crate::logs::search::parse("*").unwrap();
+    let queries = QUERIES
+        .iter()
+        .map(|q| {
+            let a = crate::query::eval::eval(s, &crate::query::eval::Request::new(q, 0, 400_000)).unwrap();
+            a.series.into_iter().map(|x| (x.tags, x.values.into_iter().map(f64::to_bits).collect())).collect()
+        })
+        .collect();
+    View {
+        series,
+        names: s.metric_names().into_iter().map(str::to_owned).collect(),
+        hosts: s.tag_values("host").into_iter().map(str::to_owned).collect(),
+        cutoff: s.cutoff(),
+        max_series: s.max_series(),
+        sessions: s.sessions().clone(),
+        logs: s.search_logs(&all, i64::MIN, i64::MAX, usize::MAX).unwrap().records,
+        queries,
+    }
+}
+
+/// A stream of entries: writes from three senders (some sent twice, as by a sender whose answer
+/// was lost), late samples and corrections, log records several to a time, empty entries,
+/// retention moving forward, a bound on series, and a series that expires and comes back of
+/// another kind.
+fn stream(seed: u64, n: usize) -> Vec<Vec<u8>> {
+    let mut rng = Rng::new(seed);
+    let mut out = Vec::new();
+    let mut seqs = [0u64; 3];
+    let mut sent: [Option<Vec<u8>>; 3] = [None, None, None];
+    let mut b = Builder::new();
+    for round in 0..n {
+        let now = round as i64 * 1000;
+        // A bound on series for a while, lifted before the flipped series comes back.
+        if round == n / 2 {
+            out.push(crate::command::limits(45));
+        }
+        if round == n * 3 / 4 - 10 {
+            out.push(crate::command::limits(0));
+        }
+        match rng.below(25) {
+            0 => out.push(crate::command::retain(now - 60_000 + rng.below(10_000) as i64, now)),
+            1 => {
+                let i = rng.below(3) as usize;
+                if let Some(e) = &sent[i] {
+                    out.push(e.clone());
+                }
+            }
+            2 => out.push(Vec::new()),
+            _ => {
+                let sender = rng.below(3) as usize;
+                for _ in 0..1 + rng.below(6) {
+                    let k = gauge(&format!("m{}", rng.below(3)), &format!("h{}", rng.below(20)));
+                    if rng.below(5) != 0 {
+                        b.define(&k);
+                    }
+                    let samples: Vec<(i64, f64)> = (0..1 + rng.below(5) as i64)
+                        .map(|i| {
+                            let t = match rng.below(10) {
+                                // Late, some past the cutoff.
+                                0 => now - rng.below(90_000) as i64,
+                                // A correction of a recent time.
+                                1 => now - (rng.below(10) as i64) * 1000,
+                                _ => now + i * 100,
+                            };
+                            (t, (rng.below(1000) as f64) / 8.0)
+                        })
+                        .collect();
+                    b.run(k.fp, samples);
+                }
+                // A series written early, then never until retention takes it, then again as a
+                // count: the store must hold it as the count, however its blocks fell.
+                if round < 20 || round > n * 3 / 4 {
+                    let kind = if round < 20 { Kind::Gauge } else { Kind::Count };
+                    let k = SeriesKey::new("flip", [("host", "x")], kind).unwrap();
+                    b.define(&k);
+                    b.run(k.fp, [(now, 1.0)]);
+                }
+                if rng.below(3) == 0 {
+                    let recs: Vec<Record> = (0..1 + rng.below(30))
+                        .map(|i| Record {
+                            // Several records to a time: the search's order among them is the store's.
+                            ts: (now + (i as i64 / 3)) * 1_000_000,
+                            severity: [9, 13, 17][rng.below(3) as usize],
+                            service: ["api", "web"][rng.below(2) as usize].into(),
+                            host: format!("h{}", rng.below(4)),
+                            source: "kiln".into(),
+                            message: format!("event {} {}", rng.below(50), ["ok", "failed", "slow"][rng.below(3) as usize]),
+                            ..Record::default()
+                        })
+                        .collect();
+                    b.logs(&recs);
+                }
+                seqs[sender] += 1;
+                let e = b.finish_write(0x5e4d_0000 + sender as u64, seqs[sender], now);
+                sent[sender] = Some(e.clone());
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// Applies entries `from..to`; the series their bound refused.
+fn apply_at(s: &mut Store, entries: &[Vec<u8>], from: usize, to: usize) -> usize {
+    let mut over = 0;
+    for (i, e) in entries.iter().enumerate().take(to).skip(from) {
+        if let Answer::Write { outcome: Written::Applied(a), .. } = s.apply_entry(i as u64 + 1, e).unwrap() {
+            over += a.over_limit.len();
+        }
+    }
+    over
+}
+
+#[test]
+fn replicas_that_cut_compact_retain_and_restart_differently_answer_alike() {
+    // `KILN_OBS_SEEDS=n` runs n seeds (a soak); three by default.
+    let seeds: u64 = std::env::var("KILN_OBS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let mut refused_in_all = 0;
+    for seed in 1..=seeds {
+        let entries = stream(seed, 400);
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // C: in memory, never cut. A: cut every 7 entries, compacted and retained each time.
+        // B: cut, compacted, retained and restarted at random.
+        let mut c = Store::new(Keyed::with_keys(1, 1));
+        let mut a = Store::open(da.path(), Keyed::with_keys(2, 2)).unwrap();
+        let mut b = Store::open(db.path(), Keyed::with_keys(3, 3)).unwrap();
+        let mut rng = Rng::new(seed ^ 0xb);
+        let (mut restarts, mut over) = (0, 0);
+        for i in 0..entries.len() {
+            over += apply_at(&mut c, &entries, i, i + 1);
+            apply_at(&mut a, &entries, i, i + 1);
+            apply_at(&mut b, &entries, i, i + 1);
+            let at = Point { index: i as u64 + 1, term: 1 };
+            if i % 7 == 6 {
+                a.cut(at).unwrap();
+                a.compact().unwrap();
+                a.retain_files().unwrap();
+            }
+            if rng.below(10) == 0 {
+                b.cut(at).unwrap();
+                if rng.below(3) == 0 {
+                    b.compact().unwrap();
+                }
+                if rng.below(3) == 0 {
+                    b.retain_files().unwrap();
+                }
+            }
+            if rng.below(20) == 0 {
+                // B's process starts again: it opens what is durable and the log brings the rest.
+                drop(b);
+                b = Store::open(db.path(), Keyed::with_keys(rng.next_u64(), 7)).unwrap();
+                let durable = b.durable().index as usize;
+                apply_at(&mut b, &entries, durable, i + 1);
+                restarts += 1;
+            }
+            if i % 25 == 24 || i + 1 == entries.len() {
+                let want = view(&c);
+                assert_eq!(view(&a), want, "seed {seed}: A after entry {}", i + 1);
+                assert_eq!(view(&b), want, "seed {seed}: B after entry {}", i + 1);
+            }
+        }
+        let v = view(&c);
+        assert!(restarts > 5 && v.cutoff > 0 && !v.logs.is_empty(), "seed {seed}: the stream exercised too little ({restarts} restarts)");
+        refused_in_all += over;
+        assert!(v.series.iter().any(|(name, _)| name.starts_with("flip") && name.ends_with("Count")), "seed {seed}: the flipped series is the count");
+    }
+    assert!(refused_in_all > 0, "the bound on series never refused one");
+}
+
+#[test]
+fn an_image_installed_elsewhere_answers_as_its_source() {
+    let entries = stream(11, 300);
+    let (ds, dt, staging, snaps) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut source = Store::open(ds.path(), Keyed::with_keys(1, 2)).unwrap();
+    let mut target = Store::open(dt.path(), Keyed::with_keys(3, 4)).unwrap();
+    // The target holds state of its own, which the image replaces.
+    apply_at(&mut target, &entries, 0, 40);
+    target.cut(Point { index: 40, term: 1 }).unwrap();
+    for i in 0..200 {
+        apply_at(&mut source, &entries, i, i + 1);
+        if i % 30 == 29 {
+            source.cut(Point { index: i as u64 + 1, term: 1 }).unwrap();
+            source.compact().unwrap();
+        }
+    }
+    source.cut(Point { index: 200, term: 1 }).unwrap();
+    let image = source.image();
+    let snap = source.link_snapshot(snaps.path()).unwrap();
+    // The source compacts and retains after imaging: the snapshot keeps the files it names.
+    apply_at(&mut source, &entries, 200, 260);
+    source.cut(Point { index: 260, term: 1 }).unwrap();
+    source.compact().unwrap();
+    source.retain_files().unwrap();
+    let mut bytes = Vec::new();
+    image.encode(&mut bytes);
+    let image = Image::decode(&bytes).unwrap();
+    // What a member fetching the image does: each file to the staging folder, checked whole.
+    for f in &image.files {
+        let to = staging.path().join(&f.name);
+        std::fs::copy(snap.join(&f.name), &to).unwrap();
+        match f.kind {
+            FileKind::Block => Block::open(&to).unwrap().verify().unwrap(),
+            FileKind::Logs => LogFile::open(&to).unwrap().verify().unwrap(),
+        }
+    }
+    // A file missing or not the image's is refused, and the target is as it was.
+    let first = image.files.first().unwrap();
+    std::fs::rename(staging.path().join(&first.name), staging.path().join("aside")).unwrap();
+    let conf = Membership { voters: vec![1], learners: vec![2], ..Membership::default() };
+    assert!(matches!(target.install(staging.path(), &image, Point { index: 200, term: 1 }, conf.clone()), Err(StoreError::Staged(_))));
+    assert_eq!(target.durable().index, 40);
+    std::fs::rename(staging.path().join("aside"), staging.path().join(&first.name)).unwrap();
+    target.install(staging.path(), &image, Point { index: 200, term: 1 }, conf.clone()).unwrap();
+    assert_eq!((target.durable(), target.durable_membership()), (Point { index: 200, term: 1 }, &conf));
+    // The reference: every entry through 200, then on to the end, alike.
+    let mut reference = Store::new(Keyed::with_keys(9, 9));
+    apply_at(&mut reference, &entries, 0, 200);
+    assert_eq!(view(&target), view(&reference), "as installed");
+    apply_at(&mut target, &entries, 200, entries.len());
+    apply_at(&mut reference, &entries, 200, entries.len());
+    apply_at(&mut source, &entries, 260, entries.len());
+    assert_eq!(view(&target), view(&reference), "after the rest of the log");
+    assert_eq!(view(&source), view(&reference), "the source too");
+    // And after the target restarts.
+    target.cut(Point { index: entries.len() as u64, term: 1 }).unwrap();
+    drop(target);
+    let target = Store::open(dt.path(), Keyed::with_keys(5, 5)).unwrap();
+    assert_eq!(view(&target), view(&reference), "reopened");
+    // Snapshots are pruned to the newest two.
+    for i in 0..3 {
+        source.cut(Point { index: 1000 + i, term: 2 }).unwrap();
+        source.link_snapshot(snaps.path()).unwrap();
+    }
+    assert_eq!(std::fs::read_dir(snaps.path()).unwrap().count(), KEEP_SNAPSHOTS);
+}

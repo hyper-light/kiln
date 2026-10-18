@@ -50,6 +50,8 @@ pub struct LogFile {
     pub min_ts: i64,
     pub max_ts: i64,
     pub bytes: u64,
+    /// The footer's checksum: with `bytes`, what names this file's contents.
+    pub crc: u32,
     /// Summaries: each block with its `text` empty.
     pub blocks: Vec<LogBlock>,
     texts: Vec<TextAt>,
@@ -183,7 +185,7 @@ impl LogFile {
             blocks.push(b);
             texts.push(TextAt { off: t_off, len: u32::try_from(t_len).map_err(|_| damaged("text length"))?, crc: u32::from_le_bytes(*tcrc) });
         }
-        Ok(Self { path: path.to_owned(), file, min_ts, max_ts, bytes, blocks, texts })
+        Ok(Self { path: path.to_owned(), file, min_ts, max_ts, bytes, crc, blocks, texts })
     }
 
     /// Block `i` whole: its summary with its text read and checked.
@@ -202,6 +204,20 @@ impl LogFile {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Reads every block's text whole, checked against its checksum and decompressed, and its rows
+    /// read: what a file fetched from another replica is put through before it is taken.
+    pub fn verify(&self) -> Result<(), LogFileError> {
+        let mut whole = LogBlock::seal_owned(&[]);
+        let mut raw = Vec::new();
+        for i in 0..self.blocks.len() {
+            self.load(i, &mut whole)?;
+            whole.decompress(&mut raw).map_err(|_| LogFileError::Damaged(self.path.clone(), "a block's text"))?;
+            let mut rows = whole.rows(&raw);
+            while rows.next_row().map_err(|_| LogFileError::Damaged(self.path.clone(), "a block's rows"))?.is_some() {}
+        }
+        Ok(())
     }
 
     /// Bytes held in memory: the summaries.

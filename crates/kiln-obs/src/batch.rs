@@ -13,9 +13,11 @@
 //! key   := metric | tags varint | (tag-key, tag-value)*          (each varint-length bytes)
 //! ```
 //!
-//! A run names a series defined in its batch (earlier) or in an earlier batch. A replica that does
-//! not know a fingerprint says so in its answer ([`crate::store::Applied::unknown`]), and the
-//! sending node defines the series again.
+//! A run names a series defined in its batch (earlier) or in an earlier batch. A definition takes
+//! effect with the first of its series' samples a replica keeps, never alone: no replica holds a
+//! series without samples, so one that opens from its blocks holds every series the others hold
+//! (`crate::store`). A replica that does not know a fingerprint says so in its answer
+//! ([`crate::store::Applied::unknown`]), and the sending node defines the series again.
 
 use sha2::{Digest, Sha256};
 
@@ -266,13 +268,28 @@ impl Builder {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(1 + varint::MAX_LEN + self.body.len());
+        self.finish_into(&mut out);
+        out
+    }
+
+    /// The batch as the entry that writes it ([`crate::command`]), in one allocation; the builder
+    /// starts over.
+    pub fn finish_write(&mut self, sender: u64, seq: u64, at: i64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(crate::command::WRITE_HEADER + 1 + varint::MAX_LEN + self.body.len());
+        crate::command::put_write(&mut out, sender, seq, at);
+        if self.items > 0 {
+            self.finish_into(&mut out);
+        }
+        out
+    }
+
+    fn finish_into(&mut self, out: &mut Vec<u8>) {
         out.push(VERSION);
-        varint::put(&mut out, self.items);
+        varint::put(out, self.items);
         out.extend_from_slice(&self.body);
         self.body.clear();
         self.items = 0;
         self.samples = 0;
-        out
     }
 }
 

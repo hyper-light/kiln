@@ -138,15 +138,18 @@ impl LogStore {
         let mut scratch = RowScratch::default();
         let mut raw = Vec::new();
         let mut whole = LogBlock::seal(&[]);
+        // Newest first; records of one time by their contents, so that which of them a limit keeps
+        // is the same on every replica, however its blocks fell.
+        let before = |x: &(i64, Record), r: &RecordRef<'_>| x.0 > r.ts || (x.0 == r.ts && cmp_contents(r, &x.1) != std::cmp::Ordering::Less);
         let consider = |r: &RecordRef<'_>, best: &mut Vec<(i64, Record)>, scratch: &mut RowScratch, found: &mut Found| {
             found.rows_scanned += 1;
             if r.ts < from || r.ts > to || !search.row(r, scratch) {
                 return;
             }
-            if best.len() >= limit && best.last().is_some_and(|w| w.0 >= r.ts) {
+            if best.len() >= limit && best.last().is_some_and(|w| before(w, r)) {
                 return;
             }
-            let at = best.partition_point(|x| x.0 >= r.ts);
+            let at = best.partition_point(|x| before(x, r));
             best.insert(at, (r.ts, r.to_owned()));
             best.truncate(limit);
         };
@@ -190,6 +193,20 @@ impl LogStore {
         found.records = best.into_iter().map(|(_, r)| r).collect();
         Ok(found)
     }
+}
+
+/// Two records of one time, by their contents: severity, service, host, source, message,
+/// attributes, trace and span.
+fn cmp_contents(a: &RecordRef<'_>, b: &Record) -> std::cmp::Ordering {
+    a.severity
+        .cmp(&b.severity)
+        .then_with(|| a.service.cmp(b.service.as_str()))
+        .then_with(|| a.host.cmp(b.host.as_str()))
+        .then_with(|| a.source.cmp(b.source.as_str()))
+        .then_with(|| a.message.cmp(b.message.as_str()))
+        .then_with(|| a.attrs().cmp(b.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str()))))
+        .then_with(|| a.trace_id.cmp(&b.trace_id))
+        .then_with(|| a.span_id.cmp(&b.span_id))
 }
 
 #[cfg(test)]

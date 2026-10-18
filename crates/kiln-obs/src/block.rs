@@ -74,6 +74,8 @@ pub struct Block {
     pub min_ts: i64,
     pub max_ts: i64,
     pub bytes: u64,
+    /// The footer's checksum: with `bytes`, what names this block's contents.
+    pub crc: u32,
     fps: Vec<u64>,
     series: Vec<SeriesMeta>,
     keys: Vec<u8>,
@@ -204,7 +206,7 @@ impl Block {
         if crc32c::update(crc32c::checksum(&index), foot.get(..32).unwrap_or(&[])) != crc {
             return Err(damaged("index checksum"));
         }
-        let mut b = Self { path: path.to_owned(), file, min_ts, max_ts, bytes, fps: Vec::new(), series: Vec::new(), keys: Vec::new(), chunks: Vec::new() };
+        let mut b = Self { path: path.to_owned(), file, min_ts, max_ts, bytes, crc, fps: Vec::new(), series: Vec::new(), keys: Vec::new(), chunks: Vec::new() };
         b.parse_index(&index, index_off).ok_or_else(|| damaged("index"))?;
         Ok(b)
     }
@@ -341,6 +343,21 @@ impl Block {
 
     pub fn kind(&self, i: usize) -> Option<Kind> {
         self.series.get(i).map(|s| s.kind)
+    }
+
+    /// Reads every series' data whole, checked against its checksum and decoded: what a block
+    /// fetched from another replica is put through before it is taken.
+    pub fn verify(&self) -> Result<(), BlockError> {
+        let mut buf = Vec::new();
+        for (i, s) in self.series().enumerate() {
+            s?;
+            self.load(i, &mut buf)?;
+            for c in self.chunks_in(i, &buf, i64::MIN, i64::MAX) {
+                let mut d = c.iter();
+                while d.next_sample().map_err(|e| BlockError::Decode(self.path.clone(), e))?.is_some() {}
+            }
+        }
+        Ok(())
     }
 
     /// Bytes the open block holds in memory: its index.
