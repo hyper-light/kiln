@@ -673,7 +673,7 @@ pub struct ModeOption {
     pub dangerous: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelOption {
     pub id: String,
     pub label: String,
@@ -682,6 +682,20 @@ pub struct ModelOption {
     /// The effort levels it takes, lowest first, when the harness says.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub efforts: Vec<String>,
+    /// The harness's default model: what a session started without one runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+}
+
+/// An effort level as people read it: "xhigh" is "Extra high", the rest as they are, capitalized.
+pub fn effort_label(id: &str) -> String {
+    match id {
+        "xhigh" => "Extra high".to_owned(),
+        _ => {
+            let mut c = id.chars();
+            c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+        }
+    }
 }
 
 /// One entry of a harness's command catalog (`Meta::commands`): every slash command it has, and
@@ -1295,6 +1309,12 @@ pub enum Command {
         /// Not waiting for the turn under way: it is interrupted, and picked up over there.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         now: bool,
+        /// It goes on there in another harness (`Kind::id`), its conversation carried over, with
+        /// this model (None: that harness's default).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {

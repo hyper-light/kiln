@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::core::{Core, Effect, PreviewJob};
@@ -85,7 +86,7 @@ pub fn args(spec: &super::session::Spec, session_id: Option<&str>) -> Vec<String
 }
 
 /// What one of our control requests was for.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
     SetMode(String),
@@ -115,13 +116,13 @@ enum Pending {
     McpAuth { client: String, name: String },
     McpCallback { client: String, name: String },
     /// A request whose answer is shown to one client as `{title, text}` (what it was for).
-    Info { client: String, what: &'static str },
+    Info { client: String, what: String },
     /// reload_plugins: its commands, plugins and servers.
     Plugins,
 }
 
 /// A run of the CLI kiln is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Run {
     McpAdd { name: String, client: Option<String> },
     McpRemove { name: String, client: Option<String> },
@@ -139,7 +140,7 @@ pub(super) const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// A permission request we are holding for a person: the input exactly as the CLI sent it (the
 /// approval's copy is shortened for display; the answer must carry the original).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ask {
     input: Value,
     /// An MCP server's request for input (MCP elicitation), not a tool's.
@@ -147,7 +148,7 @@ struct Ask {
 }
 
 /// The streaming state of one API message: which event each content block index became.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Streamed {
     /// Event id per block index (text/thinking blocks).
     blocks: HashMap<u64, String>,
@@ -155,6 +156,9 @@ struct Streamed {
     finals: u64,
 }
 
+/// Its whole state is plain data, written out when this process re-executes itself (an in-place
+/// upgrade) and read back by the next image, which goes on with the same CLI process.
+#[derive(Serialize, Deserialize)]
 pub struct Claude {
     next_req: u64,
     pending: HashMap<String, Pending>,
@@ -453,7 +457,7 @@ impl Claude {
                     core.reply(client, json!({"error": "Ask something after /btw."}));
                     return;
                 }
-                self.request(core, Pending::Info { client, what }, body);
+                self.request(core, Pending::Info { client, what: what.to_owned() }, body);
             }
             "reload_plugins" => self.request(core, Pending::Plugins, json!({"subtype": "reload_plugins"})),
             "task_output" => {
@@ -1560,6 +1564,7 @@ impl Claude {
                                 label: str_of(m, "displayName").unwrap_or("").to_owned(),
                                 description: str_of(m, "description").unwrap_or("").to_owned(),
                                 efforts: m.get("supportedEffortLevels").and_then(Value::as_array).map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+                                default: false,
                             })
                         })
                         .collect();
@@ -1678,7 +1683,7 @@ impl Claude {
                 // Signed in through kiln, the CLI does not connect by itself: it is asked to.
                 self.request(core, Pending::McpChange(format!("Reconnect {name}")), json!({"subtype": "mcp_reconnect", "serverName": name}));
             }
-            Pending::Info { client, what } => core.reply(client, info_reply(what, &body)),
+            Pending::Info { client, what } => core.reply(client, info_reply(&what, &body)),
             Pending::Plugins => {
                 if let Some(list) = body.get("mcpServers").and_then(Value::as_array) {
                     core.state.mcp = list.iter().filter_map(claude_server).collect();
@@ -2355,16 +2360,25 @@ impl Claude {
         let id = if uuid.is_empty() { format!("user-{}", Core::now()) } else { uuid.to_owned() };
         let ours = core.state.delivery.contains_key(&id);
         let human = ours || v.get("isReplay").and_then(Value::as_bool) == Some(true);
-        // One of kiln's own (keeping it going) stays kiln's, and isn't what the person asked for.
-        let from = if ours { super::core::origin_of(&id) } else if human { "human" } else { "system" };
+        let (keep_images, keep_names, was) = match core.get(&id).map(|e| &e.body) {
+            Some(Body::User { images, attachments, origin, .. }) => (*images, attachments.clone(), origin.clone()),
+            _ => (0, Vec::new(), None),
+        };
+        // One of kiln's own (keeping it going, going on after a pause: `pause::from_kiln`) stays
+        // kiln's when the CLI says it back, and isn't what the person asked for.
+        let from = if was.as_deref() == Some("kiln") {
+            "kiln"
+        } else if ours {
+            super::core::origin_of(&id)
+        } else if human {
+            "human"
+        } else {
+            "system"
+        };
         if human && from != "kiln" && core.state.goal.is_empty() {
             core.state.goal = clip_middle(t, 600).0;
             core.touch_state();
         }
-        let (keep_images, keep_names) = match core.get(&id).map(|e| &e.body) {
-            Some(Body::User { images, attachments, .. }) => (*images, attachments.clone()),
-            _ => (0, Vec::new()),
-        };
         // The replay of our own message: its words without the attached-files list we added.
         let t = t.split("\n\nAttached files:\n").next().unwrap_or(t);
         core.upsert(
@@ -3604,6 +3618,24 @@ pub fn preview(tool: &str, input: &Value, cwd: &str) -> Vec<FileDiff> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_streaming_as_its_runner_is_upgraded_goes_over_whole() -> anyhow::Result<()> {
+        // Mid-reply its content blocks are kept by index: a map keyed by numbers, carried in a
+        // blue/green handover frame (`crate::bluegreen`).
+        let mut c = Claude::new(false);
+        c.streams.insert("msg_1".into(), Streamed { blocks: HashMap::from([(0, "e1".to_owned()), (2, "e2".to_owned())]), finals: 1 });
+        let process = crate::proc::Detached { pid: 1, stdin: 10, stdout: 11, stderr: 12, foreign: false };
+        let handed = crate::harness::session::Handed { kind: "claude".into(), process, core: crate::harness::core::Core::new().freeze(), adapter: crate::harness::kinds::Frozen::Claude(Box::new(c)), partial: String::new() };
+        let record: crate::harness::host::Saved = serde_json::from_str(r#"{"id":"s","spec":{"kind":"claude"}}"#)?;
+        let frame = crate::bluegreen::Frame::Session { id: "s".into(), record: Box::new(record), handed: Some(Box::new(handed)) };
+        let back: crate::bluegreen::Frame = serde_json::from_slice(&serde_json::to_vec(&frame)?)?;
+        let crate::bluegreen::Frame::Session { handed: Some(h), .. } = back else { anyhow::bail!("not a session") };
+        let crate::harness::kinds::Frozen::Claude(c) = h.adapter else { anyhow::bail!("not Claude Code's") };
+        assert_eq!(c.streams.get("msg_1").map(|s| s.blocks.len()), Some(2));
+        Ok(())
+    }
     use crate::harness::core::Update;
 
     /// Lines Claude Code 2.1.296 printed in a session against a scripted API (paths shortened).
@@ -3707,6 +3739,9 @@ mod tests {
         assert_eq!(core.state.queue.len(), 2);
         let go_on = user.get("uuid").and_then(Value::as_str).unwrap_or_default().to_owned();
         assert!(matches!(core.get(&go_on).map(|e| &e.body), Some(Body::User { origin: Some(o), .. }) if o == "kiln"));
+        // Claude Code says it back (it replays what it's sent): it stays kiln's, not yours.
+        c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": crate::harness::pause::CONTINUE}, "session_id": "s1", "parent_tool_use_id": null, "uuid": go_on, "isReplay": true}).to_string());
+        assert!(matches!(core.get(&go_on).map(|e| &e.body), Some(Body::User { origin: Some(o), .. }) if o == "kiln"), "the replay made kiln's message someone else's");
         c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "Done.", "session_id": "s1"}).to_string());
         c.line(&mut core, &json!({"type": "command_lifecycle", "command_uuid": go_on, "state": "completed", "uuid": "y", "session_id": "s1"}).to_string());
         let next: Vec<Value> = core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect();
@@ -3951,6 +3986,35 @@ mod tests {
         assert!(core.take_writes().first().is_some_and(|l| l.contains("\"subtype\":\"interrupt\"")));
         c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null}"#);
         assert!(core.events().any(|e| matches!(&e.body, Body::Notice { text, .. } if text == "Interrupted")));
+        Ok(())
+    }
+
+    #[test]
+    fn mid_turn_it_goes_on_in_the_next_image_as_it_was() -> anyhow::Result<()> {
+        // An in-place upgrade: the adapter and the core, written out mid-turn with a permission
+        // request waiting and a tool call under way, read back by the next image.
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"t9","name":"Write","input":{"file_path":"/work/a.txt","content":"x\n"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"control_request","request_id":"r9","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/work/a.txt","content":"x\n"},"tool_use_id":"t9"}}"#);
+        core.take_writes();
+        let events = core.events().count();
+        let adapter = serde_json::to_vec(&super::super::kinds::Adapter::Claude(Box::new(c)).freeze())?;
+        let frozen = serde_json::to_vec(&core.freeze())?;
+        let mut a = super::super::kinds::Adapter::thaw(serde_json::from_slice(&adapter)?);
+        let mut core = Core::thaw(serde_json::from_slice(&frozen)?);
+        assert_eq!(core.events().count(), events);
+        assert_eq!(core.state.approvals.len(), 1);
+        // The person's answer reaches the CLI under its request id, with the input as it sent it.
+        a.command(&mut core, Command::Approve { id: "r9".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: None });
+        let resp: Value = serde_json::from_str(core.take_writes().first().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(resp.pointer("/response/request_id").and_then(Value::as_str), Some("r9"));
+        assert_eq!(resp.pointer("/response/response/behavior").and_then(Value::as_str), Some("allow"));
+        assert_eq!(resp.pointer("/response/response/updatedInput/file_path").and_then(Value::as_str), Some("/work/a.txt"));
+        // The tool call's result, when it comes, lands on the call it was for.
+        a.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t9","type":"tool_result","content":"written"}]},"parent_tool_use_id":null}"#);
+        assert!(core.state.approvals.is_empty());
+        assert_eq!(core.events().count(), events);
         Ok(())
     }
 

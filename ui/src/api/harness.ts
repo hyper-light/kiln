@@ -765,6 +765,9 @@ export const harnessApi = {
   /** Move an agent to another runner (`agent:<name>`): it goes on there once its turn is over. */
   /** Move an agent to runner `to`: once its turn is over, or `now` (the turn stops here and goes on there). */
   move: (id: string, to: string, now = false) => call<{ moving: string }>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/move`, { to, now }),
+  /** Every agent of `machine`, which is gone, goes on elsewhere from the server's copy of its conversation: each on the machine that suits it, or all on `to`. */
+  recover: (machine: string, to?: string) =>
+    call<{ moved: { id: string; name: string; to?: string; error?: string }[] }>("POST", `/api/harness/machines/${encodeURIComponent(machine)}/recover`, to ? { to } : {}),
   /** A command without opening the session's socket (inbox answers). */
   command: (id: string, c: Command) => call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */

@@ -23,6 +23,7 @@ import { HostCharts } from "./host-charts";
 import { discoveryRes, joinRequestsRes } from "./add-machines/data";
 import { JoinNotice } from "./add-machines/notice";
 import { AgentMiniCard, LiveDuration, RelTime, diskPct, memPct } from "./shared";
+import { BatteryLine, LowBattery } from "./battery";
 
 /** The facets runners are filtered by, with each runner's values. */
 function facetValues(a: Agent): Record<string, string[]> {
@@ -154,6 +155,10 @@ function RunnersBody() {
       />
 
       <JoinNotice requests={joinRequests} discovery={discovery} />
+      <LowBattery agents={all} what={(m) => {
+        const n = all.find((a) => a.name === m)?.running.length ?? 0;
+        return n > 0 ? `its ${n} job${n === 1 ? "" : "s"}` : "";
+      }} />
       <Upgrades />
 
       <RunnersTools q={q} onQ={setQ} facets={facets} chosen={chosen} onChosen={setChosen} view={view} onView={setView} />
@@ -228,6 +233,7 @@ function RunnersBody() {
                             </>
                           )}
                         </div>
+                        {a.connected && <BatteryLine battery={a.battery} />}
                         <UpgradeNote agent={a} />
                       </td>
                       <td className="hidden md:table-cell">

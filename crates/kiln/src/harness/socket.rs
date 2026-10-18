@@ -66,15 +66,23 @@ pub enum Request {
 }
 
 /// Where this process's socket lives: the user's runtime directory (else a private one in /tmp),
-/// named after the agent so a server and runners on one machine do not collide.
+/// named after the agent so a server and runners on one machine do not collide. `home` is the
+/// runner's state directory: every runner process of a machine (an upgrade's new build beside
+/// the old one) has the same socket, served by the one that runs the machine's sessions, so the
+/// path a terminal was given goes on working after an upgrade.
 pub fn path(name: &str, home: &std::path::Path) -> PathBuf {
     let safe: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).take(32).collect();
     // Two kiln processes on one machine (a server and runners, or test instances) never share one.
     let tag = crate::util::sha256_hex(home.to_string_lossy().as_bytes());
-    let file = format!("harness-{safe}-{}.sock", tag.get(..8).unwrap_or("0"));
-    let private = std::env::temp_dir().join(format!("kiln-{}", crate::os::uid())).join(&file);
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).map(|d| d.join("kiln").join(&file));
-    // Unix socket paths are short (108 bytes with the terminator): a long runtime dir falls back.
+    runtime_path(&format!("harness-{safe}-{}.sock", tag.get(..8).unwrap_or("0")))
+}
+
+/// `file` in the user's runtime directory for sockets (else a private one in /tmp).
+pub fn runtime_path(file: &str) -> PathBuf {
+    let private = std::env::temp_dir().join(format!("kiln-{}", crate::os::uid())).join(file);
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()).map(|d| d.join("kiln").join(file));
+    // Unix socket paths are short (104 bytes on macOS with the terminator): a long runtime dir
+    // falls back.
     match runtime {
         Some(p) if p.as_os_str().len() < 100 => p,
         _ => private,

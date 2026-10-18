@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::core::{Baseline, Core, Effect};
@@ -48,7 +49,7 @@ fn policy(mode: &str) -> (&'static str, &'static str, Value) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Pending {
     Initialize,
     Thread,
@@ -87,7 +88,7 @@ enum Pending {
 }
 
 /// A run of the CLI (or a fetch) kiln is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum Run {
     McpAdd { name: String, client: Option<String> },
     McpRemove { name: String, client: Option<String> },
@@ -135,12 +136,20 @@ fn not_yet(msg: &str) -> Option<&'static str> {
     }
 }
 
-/// Reasoning efforts every Codex reasoning model takes, offered until model/list says which the
-/// model in use has, and for a model it does not list.
+/// Reasoning efforts every Codex reasoning model takes, offered for a model model/list doesn't
+/// list.
 pub(super) const EFFORTS: &[&str] = &["low", "medium", "high"];
 
+/// The efforts a new Codex session can start at, before its model/list answers: its default
+/// model's, as Codex on this machine last listed them, else the newest model kiln knows of
+/// (`kinds::models_of`).
+pub(super) fn default_efforts() -> Vec<String> {
+    let models = super::kinds::models_of("codex");
+    models.iter().find(|m| m.default).or_else(|| models.first()).map(|m| m.efforts.clone()).filter(|e| !e.is_empty()).unwrap_or_else(|| EFFORTS.iter().map(|e| (*e).to_owned()).collect())
+}
+
 /// An approval request Codex is waiting on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ask {
     /// The JSON-RPC id to answer under.
     rpc: Value,
@@ -151,7 +160,7 @@ struct Ask {
     can_decline: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum AskKind {
     Command,
     FileChange,
@@ -163,6 +172,9 @@ enum AskKind {
     Elicitation,
 }
 
+/// Its whole state is plain data, written out when this process re-executes itself (an in-place
+/// upgrade) and read back by the next image, which goes on with the same process.
+#[derive(Serialize, Deserialize)]
 pub struct Codex {
     next_id: u64,
     pending: HashMap<u64, Pending>,
@@ -227,7 +239,7 @@ pub struct Codex {
     rollout: Option<String>,
     /// The thread open kiln sent (method, params), how often, and whether to send it again at
     /// the next tick.
-    opening: Option<(&'static str, Value)>,
+    opening: Option<(String, Value)>,
     open_tries: u32,
     reopen: bool,
     /// Settings changed outside it (its own screen): it starts again to load them once idle.
@@ -381,8 +393,8 @@ impl Codex {
         core.meta.controls = c;
         let model = core.state.model.clone();
         core.meta.efforts = match self.efforts.get(&model).or_else(|| self.efforts.get("")) {
-            Some(l) => l.iter().map(|(e, d)| opt(e, &capitalize(e), d, false)).collect(),
-            None => EFFORTS.iter().map(|e| opt(e, &capitalize(e), "", false)).collect(),
+            Some(l) => l.iter().map(|(e, d)| opt(e, &super::model::effort_label(e), d, false)).collect(),
+            None => default_efforts().iter().map(|e| opt(e, &super::model::effort_label(e), "", false)).collect(),
         };
         core.touch_meta();
     }
@@ -536,7 +548,7 @@ impl Codex {
         }
         // Effort can be set from the start (model/list narrows the levels to the model's).
         if core.meta.efforts.is_empty() {
-            core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
+            core.meta.efforts = default_efforts().iter().map(|e| ControlOption { id: e.clone(), label: super::model::effort_label(e), description: String::new(), dangerous: false }).collect();
         }
         if !modes(self.allow_bypass).iter().any(|m| m.id == core.state.mode) {
             core.state.mode = self.mode.clone();
@@ -843,7 +855,7 @@ impl Codex {
         if std::mem::take(&mut self.reopen)
             && let Some((method, params)) = self.opening.clone()
         {
-            self.open_thread(core, method, params);
+            self.open_thread(core, &method, params);
             return;
         }
         if matches!(core.state.status, Status::Starting | Status::Exited) {
@@ -860,9 +872,9 @@ impl Codex {
     }
 
     /// thread/start, thread/resume or thread/fork, kept to be sent again.
-    fn open_thread(&mut self, core: &mut Core, method: &'static str, params: Value) {
+    fn open_thread(&mut self, core: &mut Core, method: &str, params: Value) {
         self.open_tries += 1;
-        self.opening = Some((method, params.clone()));
+        self.opening = Some((method.to_owned(), params.clone()));
         self.request(core, Pending::Thread, method, params);
     }
 
@@ -1567,6 +1579,7 @@ impl Codex {
                                         .and_then(Value::as_array)
                                         .map(|l| l.iter().filter_map(|e| e.get("reasoningEffort").and_then(Value::as_str).or_else(|| e.as_str()).map(str::to_owned)).collect())
                                         .unwrap_or_default(),
+                                    default: m.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
                                 })
                             })
                             .collect()
@@ -2777,10 +2790,6 @@ fn unwrap_shell(full: &str) -> String {
     rest.to_owned()
 }
 
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
-}
 
 /// A message as Codex input items: its text (with other files listed by path, for Codex to
 /// read with its tools), then images by path.
@@ -3531,7 +3540,9 @@ mod tests {
         let mut c = Codex::new(None, None, None, false);
         c.start(&mut core);
         let ids = |core: &Core| core.meta.efforts.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
-        assert_eq!(ids(&core), ["low", "medium", "high"]);
+        // Before model/list answers: its default model's levels (as Codex here last listed them,
+        // else the newest model kiln knows of).
+        assert_eq!(ids(&core), default_efforts());
         let w = written(&mut core);
         respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "kiln/0.162.1"}));
         let w = written(&mut core);

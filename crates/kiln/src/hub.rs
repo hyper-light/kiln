@@ -98,6 +98,9 @@ pub struct AgentLive {
     pub busy: u32,
     pub draining: bool,
     pub sample: Option<HostSample>,
+    /// Its battery, when it has one and its runner says ([`AgentMsg::Power`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery: Option<crate::os::battery::Battery>,
     pub terminal: bool,
     /// An outpost (`kiln outpost`, [`crate::proto::CAP_OUTPOST`]): kiln run where it isn't
     /// installed. It takes no jobs and the server doesn't upgrade it.
@@ -269,7 +272,7 @@ impl Hub {
 
     /// A job of kiln's own release pipeline succeeded (`[updates]`): the binaries it built are what
     /// each other platform's runners upgrade to now.
-    async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
+    pub(crate) async fn adopt_release(&self, job: &str, run: &crate::store::Run) {
         // The server's commit, or the newest one a runner runs (`crate::fleet`).
         let newest = self.updates.fleet.target().map(|t| t.commit).unwrap_or_default();
         if !crate::updates::adopts(&self.cfg.updates, run, crate::api::COMMIT) && (newest.is_empty() || !crate::updates::adopts(&self.cfg.updates, run, &newest)) {
@@ -456,6 +459,7 @@ impl Hub {
                     busy: 0,
                     draining: false,
                     sample: None,
+                    battery: None,
                     terminal: false,
                     dedicated_job: None,
                     exclusive: false,
@@ -595,7 +599,7 @@ impl Hub {
         sent
     }
 
-    async fn send_peer(&self, peer: PeerId, msg: &ServerMsg) {
+    pub(crate) async fn send_peer(&self, peer: PeerId, msg: &ServerMsg) {
         if let Ok(b) = proto::encode(msg) {
             self.net.send(peer, LANE_CONTROL, Kind::Control, b).await;
         }
@@ -733,6 +737,32 @@ impl Hub {
         Ok(())
     }
 
+    /// [`AgentMsg::Power`]: a machine's battery. Kept with the machine (the Runners page shows it);
+    /// a machine on battery that gets low is said once, as it gets there, to whoever is watching
+    /// (the UI) and to webhook subscribers (`machine.battery_low`), before it sleeps and its runner
+    /// with it.
+    async fn on_power(&self, agent: &str, json: &str) {
+        let Ok(b) = serde_json::from_str::<crate::os::battery::Battery>(json) else { return };
+        let (changed, was_low, snapshot) = {
+            let mut g = self.agents.lock();
+            let Some(a) = g.get_mut(agent) else { return };
+            let was_low = a.battery.as_ref().is_some_and(crate::os::battery::Battery::low);
+            let changed = a.battery.as_ref() != Some(&b);
+            a.battery = Some(b.clone());
+            (changed, was_low, a.clone())
+        };
+        if changed {
+            self.emit_agent(&snapshot);
+        }
+        if b.low() && !was_low {
+            let left = b.minutes.map(|m| format!(", about {m} min left")).unwrap_or_default();
+            let what = format!("{agent} is on battery at {}%{left}: plug it in, or it sleeps and its runner with it", b.percent);
+            tracing::warn!(machine = %agent, percent = b.percent, minutes = ?b.minutes, "a machine on battery is low");
+            self.store.audit("kiln".into(), "machine.battery_low".into(), what.clone()).await;
+            self.emit(&serde_json::json!({"type": "machine.battery_low", "machine": agent, "battery": b, "text": what}));
+        }
+    }
+
     fn agent_of(&self, peer: PeerId) -> Option<String> {
         self.peers.lock().get(&peer).cloned()
     }
@@ -829,9 +859,14 @@ impl Hub {
         if let AgentMsg::Hello(h) = msg {
             return self.on_hello(peer, h).await;
         }
-        // Says which runner process of its machine this is; precedes Hello.
+        // Says which runner process of its machine this is; precedes Hello. Again later: a new
+        // build that has taken over (blue/green) says it's the newest now.
         if let AgentMsg::Instance(ih) = msg {
-            self.instances.lock().announce(peer, ih);
+            let again = self.instances.lock().reannounce(peer, &ih);
+            match again {
+                Some(drain) => self.instance_promoted(peer, drain).await,
+                None => self.instances.lock().announce(peer, ih),
+            }
             return Ok(());
         }
         let Some(agent) = self.agent_of(peer) else {
@@ -948,6 +983,11 @@ impl Hub {
                 // What it can do decides which legs it may take.
                 self.ci.send(crate::ci::dispatch::Msg::RunnerUp { agent: agent.clone(), running: Vec::new() });
             }
+            AgentMsg::UpdatePrefs { accept } => {
+                self.updates.fleet.set_accept(&agent, accept);
+                self.updates.fleet.wake();
+                self.emit(&serde_json::json!({ "type": "updates" }));
+            }
             AgentMsg::Sync { json, raft } => self.sync_heard(&agent, &json, raft),
             AgentMsg::Convo { json, data } => {
                 // About the server's own store: a mirror's answer. Else the runner's own store's feed.
@@ -1019,13 +1059,28 @@ impl Hub {
                 }
             }
             AgentMsg::ReachAsk { req, json } => {
-                let op = serde_json::from_str::<serde_json::Value>(&json).ok().and_then(|v| v.get("op").and_then(serde_json::Value::as_str).map(str::to_owned));
-                let answer = match op.as_deref() {
-                    Some("directory") => serde_json::json!({ "runners": self.reach_directory() }),
-                    _ => serde_json::json!({ "error": "unknown reach question" }),
-                };
-                self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                let ask = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
+                match ask.get("op").and_then(serde_json::Value::as_str) {
+                    Some("directory") => {
+                        let answer = serde_json::json!({ "runners": self.reach_directory() });
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    }
+                    // An agent's MCP server on the runner asks for kiln's operations: answered on
+                    // their own, so a slow one holds up nothing else the runner says.
+                    Some("registry" | "call") => {
+                        let (hub, runner) = (Arc::clone(self), agent.clone());
+                        crate::rt::spawn(async move {
+                            let answer = crate::mcp::runner_ask(&hub, &runner, &ask).await;
+                            hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                        });
+                    }
+                    _ => {
+                        let answer = serde_json::json!({ "error": "unknown reach question" });
+                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                    }
+                }
             }
+            AgentMsg::Power { json } => self.on_power(&agent, &json).await,
             AgentMsg::UpgradeLog { job, line } => self.updates.on_log(self, &job, line),
             AgentMsg::UpgradeDone { job, ok, error } => self.updates.on_done(self, &job, ok, error),
             AgentMsg::Harness { session, json } => match serde_json::from_str::<crate::harness::core::Update>(&json) {
@@ -1199,6 +1254,7 @@ impl Hub {
             running: keep,
             draining: false,
             sample: None,
+            battery: None,
             terminal: h.terminal,
             dedicated_job: h.dedicated_job.clone(),
             exclusive: false,
@@ -1210,6 +1266,8 @@ impl Hub {
         let prev = self.agents.lock().get(&name).cloned();
         // Its facts stay until its new connection's probe reports.
         let prev_facts = prev.as_ref().and_then(|a| a.facts.clone());
+        // Its battery as last said, until it says again.
+        let prev_battery = prev.as_ref().and_then(|a| a.battery.clone());
         let draining = prev.as_ref().is_some_and(|a| a.draining);
         {
             let mut inst = self.instances.lock();
@@ -1227,7 +1285,7 @@ impl Hub {
         let busy = u32::try_from(running.len()).unwrap_or(u32::MAX);
         let live = match prev {
             Some(prev) if !joined.newest => AgentLive { connected: true, last_seen: now, running, busy, lost_at: None, ..prev },
-            _ => AgentLive { draining, running, busy, facts: prev_facts, ..live },
+            _ => AgentLive { draining, running, busy, facts: prev_facts, battery: prev_battery, ..live },
         };
         self.store
             .upsert_agent(AgentRow {
@@ -1295,7 +1353,24 @@ impl Hub {
         if !jobs.is_empty() {
             self.lost_instances.lock().insert(peer, (name.to_owned(), Instant::now(), jobs));
         }
-        // The newest process (maybe another one now) describes the machine.
+        self.newest_changed(name).await;
+    }
+
+    /// A runner process of `peer`'s machine, joined as the oldest (a blue/green upgrade's new
+    /// build), has taken over and is its newest now: the others take no new jobs, and new work
+    /// goes to it.
+    async fn instance_promoted(&self, peer: PeerId, drain: Vec<PeerId>) {
+        let Some(name) = self.agent_of(peer) else { return };
+        tracing::info!(agent = %name, peer, "a new runner process of this machine took over: new work goes to it");
+        for p in &drain {
+            self.send_peer(*p, &ServerMsg::Drain).await;
+        }
+        self.newest_changed(&name).await;
+        self.wake.notify();
+    }
+
+    /// The machine's newest process (maybe another one now) describes it, and runs its front door.
+    async fn newest_changed(&self, name: &str) {
         let newest = {
             let inst = self.instances.lock();
             inst.newest(name).and_then(|p| inst.get(p).map(|i| (p, i.hello.clone())))

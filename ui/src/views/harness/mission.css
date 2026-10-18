@@ -811,3 +811,31 @@ a.ms-why:hover {
 .ms-kind {
   color: #8c8f98;
 }
+
+/* A machine offline a while, with agents on it: they can go on elsewhere. */
+.ms-recover {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid #3a3326;
+  border-radius: 8px;
+  background: #1b1915;
+  color: #c9c3b6;
+  font-size: 13px;
+}
+.ms-recover > span:first-child {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+.ms-recover-go {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.ms-recover-none {
+  color: #97999f;
+}

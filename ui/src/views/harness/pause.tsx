@@ -54,7 +54,7 @@ export function PausedLine({ store, send }: { store: SessionStore; send: (c: Com
           <input type="checkbox" className="check" checked={pause.auto} onChange={(e) => send({ type: "auto_resume", on: e.target.checked })} />
           Resume by itself at the reset
         </label>
-        <label className="hx-paused-auto" title="It moves to another of your machines whose harness is signed in to an account with room; its conversation and repository go along">
+        <label className="hx-paused-auto" title="It moves to another of your machines with room (its harness signed in to another account, or another harness its conversation can be carried into); its conversation and repository go along">
           <input type="checkbox" className="check" checked={moveOn} onChange={(e) => send({ type: "move_on_limit", on: e.target.checked })} />
           Go on on another machine
         </label>

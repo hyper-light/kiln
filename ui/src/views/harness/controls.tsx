@@ -163,7 +163,7 @@ function LimitRows({ state, send }: { state: State | null; send: Send }) {
       <div className="hx-ctl">
         <div className="hx-ctl-text">
           <span className="hx-ctl-label">Go on elsewhere at a limit</span>
-          <span className="hx-dim text-[12px]">It moves to another of your machines whose harness is signed in to an account with room; its conversation and repository go along.</span>
+          <span className="hx-dim text-[12px]">It moves to another of your machines with room: its harness signed in to another account, or another harness its conversation can be carried into (Claude Code ⇄ Codex). Its conversation and repository go along.</span>
         </div>
         <div className="hx-ctl-input">
           <button type="button" role="switch" aria-checked={moving} aria-label="Go on elsewhere at a limit" className="hx-switch" onClick={() => send({ type: "move_on_limit", on: !moving })}>

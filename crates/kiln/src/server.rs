@@ -238,6 +238,7 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             shell: cfg.terminal.shell.clone(),
             credentials: Some(creds),
             instance: None,
+            config: None,
             reach: None,
             outpost: false,
             declared: cfg.agent.clone(),
