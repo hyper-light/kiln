@@ -31,31 +31,48 @@ pub async fn on_trigger(hub: &Hub, repo: &Repo, t: &Trigger) -> anyhow::Result<b
     let event = event(hub, repo, t).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
     for l in running {
-        match (&l.workflow, l.has_errors()) {
-            (Some(w), false) => match kiln_ci::trigger::matches(w, &event) {
-                Ok(()) => match super::actions::resolve(hub, w).await {
-                    // Every action the run may reach, pinned now (W07-R02).
-                    Ok(actions) => hub.ci.send(Msg::Start(Box::new(Start {
-                        repo: repo.clone(),
-                        event: event.clone(),
-                        path: l.path.clone(),
-                        workflow: Arc::new(w.clone()),
-                        message: message.clone(),
-                        author: author.clone(),
-                        actions,
-                    }))),
-                    Err(e) => fail_run(hub, repo, &event, l, &message, &author, e).await?,
-                },
-                Err(why) => tracing::debug!(workflow = %l.path, %why, "workflow not run"),
-            },
-            _ => startup_failure(hub, repo, &event, l, &message, &author).await?,
-        }
+        start(hub, repo, &event, l, &message, &author, serde_json::Value::Null).await?;
     }
     Ok(true)
 }
 
-/// The event a v1 trigger stands for.
-async fn event(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
+/// Starts workflow `l` for `event` when it matches (W03-R03), with its remote actions pinned
+/// now (W07-R02). A workflow with errors gets a run that fails at once, listing them (W02-AC09).
+/// `inputs` are the run's typed inputs (`workflow_dispatch`), or null. Whether a run began.
+pub async fn start(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, message: &str, author: &str, inputs: serde_json::Value) -> anyhow::Result<bool> {
+    let (Some(w), false) = (&l.workflow, l.has_errors()) else {
+        startup_failure(hub, repo, event, l, message, author).await?;
+        return Ok(true);
+    };
+    if let Err(why) = kiln_ci::trigger::matches(w, event) {
+        tracing::debug!(workflow = %l.path, %why, "workflow not run");
+        return Ok(false);
+    }
+    match super::actions::resolve(hub, w).await {
+        Ok(actions) => hub.ci.send(Msg::Start(Box::new(Start {
+            repo: repo.clone(),
+            event: event.clone(),
+            path: l.path.clone(),
+            workflow: Arc::new(w.clone()),
+            message: message.to_owned(),
+            author: author.to_owned(),
+            actions,
+            inputs,
+        }))),
+        Err(e) => fail_run(hub, repo, event, l, message, author, e).await?,
+    }
+    Ok(true)
+}
+
+/// What events need to know about a repository: how payloads describe it, its default branch
+/// and its mirror.
+pub struct Facts {
+    pub repo: context::Repo,
+    pub default_branch: String,
+    pub mirror: String,
+}
+
+pub async fn facts(hub: &Hub, repo: &Repo) -> Facts {
     let mirror = gitops::mirror_path(hub, &repo.name).to_string_lossy().to_string();
     let default_branch = gitops::run_git(hub, &["-C", &mirror, "symbolic-ref", "--short", "HEAD"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_else(|_| "main".into());
     let ctx_repo = context::Repo {
@@ -66,6 +83,12 @@ async fn event(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
         private: false,
         server_url: if repo.clone_url.contains("github.com") { "https://github.com".into() } else { hub.cfg.server.public_url.trim_end_matches('/').to_owned() },
     };
+    Facts { repo: ctx_repo, default_branch, mirror }
+}
+
+/// The event a v1 trigger stands for.
+async fn event(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
+    let Facts { repo: ctx_repo, default_branch, mirror } = facts(hub, repo).await;
     let (message, author) = gitops::commit_info(hub, repo, &t.sha).await;
     let mut e = Event { sha: t.sha.clone(), before: t.before.clone(), actor: author.clone(), trusted: true, source: Source::Poll, message: Some(message), ..Event::default() };
     match t.event {
@@ -171,4 +194,127 @@ async fn fail_run(hub: &Hub, repo: &Repo, e: &Event, l: &load::Loaded, message: 
     super::runs::finish_run(hub, &id, Status::Failed, "startup_failure", Some(error)).await?;
     hub.emit_run(&id).await;
     Ok(())
+}
+
+/// Why a dispatch was refused: GitHub's status and message.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: http::StatusCode,
+    pub message: String,
+}
+
+fn refused(status: http::StatusCode, message: impl Into<String>) -> Refused {
+    Refused { status, message: message.into() }
+}
+
+/// The full ref and commit `r` names: a branch, a tag, or a `refs/…` name.
+async fn named_ref(hub: &Hub, repo: &Repo, r: &str) -> Result<(String, String), Refused> {
+    let refs: std::collections::HashMap<String, String> = hub.store.refs(repo.id.clone()).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.into_iter().collect();
+    for full in [r.to_owned(), format!("refs/heads/{r}"), format!("refs/tags/{r}")] {
+        if let Some(sha) = refs.get(&full) {
+            return Ok((full, sha.clone()));
+        }
+    }
+    Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, format!("No ref found for: {r}")))
+}
+
+/// `workflow_dispatch` (W03-R11): runs workflow `which` (its path, or its file name as GitHub's
+/// API takes it) at `git_ref` with `inputs`, checked against what it declares.
+pub async fn workflow_dispatch(hub: &Hub, repo: &Repo, git_ref: &str, which: &str, given: &serde_json::Map<String, serde_json::Value>, actor: &str) -> Result<(), Refused> {
+    if !hub.ci.enabled() {
+        return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
+    }
+    let (full_ref, sha) = named_ref(hub, repo, git_ref).await?;
+    let commit = load::load(hub, repo, &sha).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let Some(l) = commit.workflows.iter().find(|l| l.path == which || l.path.rsplit('/').next() == Some(which)) else {
+        return Err(refused(http::StatusCode::NOT_FOUND, format!("Workflow {which} not found at {git_ref}")));
+    };
+    let declared = l.workflow.as_ref().and_then(|w| w.on.iter().find(|t| t.event == "workflow_dispatch")).map(|t| t.inputs.clone());
+    let Some(declared) = declared else {
+        return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, "Workflow does not have 'workflow_dispatch' trigger"));
+    };
+    let (typed, strings) = kiln_ci::trigger::dispatch::inputs(&declared, given).map_err(|m| refused(http::StatusCode::UNPROCESSABLE_ENTITY, m))?;
+    let f = facts(hub, repo).await;
+    let (message, _) = gitops::commit_info(hub, repo, &sha).await;
+    let mut e = Event { name: "workflow_dispatch".into(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), ..Event::default() };
+    e.payload = context::workflow_dispatch(&e, &f.repo, &l.path, &strings);
+    start(hub, repo, &e, l, &message, actor, typed).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))?;
+    Ok(())
+}
+
+/// `repository_dispatch` (W03-R11): runs the default branch's workflows that listen for
+/// `event_type`, with `client_payload` in the event.
+pub async fn repository_dispatch(hub: &Hub, repo: &Repo, event_type: &str, client_payload: &serde_json::Value, actor: &str) -> Result<usize, Refused> {
+    if !hub.ci.enabled() {
+        return Err(refused(http::StatusCode::NOT_FOUND, "The CI engine is off ([ci] enabled)."));
+    }
+    if event_type.is_empty() || event_type.chars().count() > 100 {
+        return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, "event_type must be 1 to 100 characters"));
+    }
+    if client_payload.as_object().is_some_and(|o| o.len() > 10) {
+        return Err(refused(http::StatusCode::UNPROCESSABLE_ENTITY, "client_payload can have at most 10 top-level properties"));
+    }
+    let f = facts(hub, repo).await;
+    let (full_ref, sha) = named_ref(hub, repo, &f.default_branch).await?;
+    let commit = load::load(hub, repo, &sha).await.map_err(|e| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let (message, _) = gitops::commit_info(hub, repo, &sha).await;
+    let mut e = Event { name: "repository_dispatch".into(), action: event_type.to_owned(), repo: repo.name.clone(), git_ref: full_ref, sha, actor: actor.to_owned(), trusted: true, source: Source::Api, message: Some(message.clone()), ..Event::default() };
+    e.payload = context::repository_dispatch(&e, &f.repo, client_payload);
+    let mut started = 0;
+    for l in commit.workflows.iter().filter(|l| l.runs && !l.has_errors()) {
+        if start(hub, repo, &e, l, &message, actor, serde_json::Value::Null).await.map_err(|err| refused(http::StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")))? {
+            started += 1;
+        }
+    }
+    Ok(started)
+}
+
+/// A run's chain of `workflow_run` triggers is at most this deep (W03-R13, GitHub-exact).
+pub const MAX_WORKFLOW_RUN_DEPTH: u64 = 3;
+
+/// `workflow_run` (W03-R02, W03-R13): a run was requested or completed. The default branch's
+/// workflows that listen for it run there, with the run in `github.event.workflow_run`. Chains
+/// stop at three levels.
+pub async fn workflow_run(hub: &Hub, repo: &Repo, action: &str, run: &context::RunSummary, depth: u64) {
+    if depth >= MAX_WORKFLOW_RUN_DEPTH {
+        tracing::debug!(repo = %repo.name, run = run.id, depth, "workflow_run chain at its limit");
+        return;
+    }
+    let f = facts(hub, repo).await;
+    let Ok((full_ref, sha)) = named_ref(hub, repo, &f.default_branch).await else { return };
+    let commit = match load::load(hub, repo, &sha).await {
+        Ok(c) => c,
+        Err(e) => return tracing::warn!(repo = %repo.name, error = %format!("{e:#}"), "workflow_run: the default branch's workflows could not be read"),
+    };
+    let listening: Vec<&load::Loaded> = commit.workflows.iter().filter(|l| l.runs && !l.has_errors() && l.workflow.as_ref().is_some_and(|w| w.on.iter().any(|t| t.event == "workflow_run"))).collect();
+    if listening.is_empty() {
+        return;
+    }
+    let (message, _) = gitops::commit_info(hub, repo, &sha).await;
+    let mut payload = context::workflow_run(action, run, &f.repo);
+    if let Some(o) = payload.as_object_mut() {
+        o.insert("kiln".into(), serde_json::json!({ "depth": depth + 1 }));
+    }
+    let e = Event {
+        name: "workflow_run".into(),
+        action: action.to_owned(),
+        repo: repo.name.clone(),
+        git_ref: full_ref,
+        sha,
+        actor: run.actor.clone(),
+        trusted: true,
+        source: Source::WorkflowRun,
+        payload,
+        message: Some(message.clone()),
+        workflow: Some(run.name.clone()),
+        workflow_path: Some(run.path.clone()),
+        conclusion: run.conclusion.clone(),
+        workflow_branch: Some(run.head_branch.clone()),
+        ..Event::default()
+    };
+    for l in listening {
+        if let Err(err) = start(hub, repo, &e, l, &message, &run.actor, serde_json::Value::Null).await {
+            tracing::warn!(repo = %repo.name, workflow = %l.path, error = %format!("{err:#}"), "workflow_run");
+        }
+    }
 }

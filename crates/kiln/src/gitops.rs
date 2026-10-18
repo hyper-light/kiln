@@ -540,6 +540,7 @@ pub async fn poll_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
 pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     let mut last_minute = -1i64;
     let mut cache: HashMap<(String, String), Vec<(String, Result<Pipeline, String>)>> = HashMap::new();
+    let mut ci_cache = crate::ci::schedule::Cache::default();
     loop {
         if !hub.shutdown.sleep(Duration::from_secs(10)).await {
             return Ok(());
@@ -550,6 +551,8 @@ pub async fn schedule_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
             continue;
         }
         last_minute = minute;
+        // The CI engine's workflows (docs/ci.md W03-R10), when it is on.
+        crate::ci::schedule::tick(&hub, minute * 60, &mut ci_cache).await;
         for repo in hub.store.repos().await? {
             let refs: HashMap<String, String> = hub.store.refs(repo.id.clone()).await?.into_iter().collect();
             let Some(head) = refs.get("HEAD->") else { continue };

@@ -2,6 +2,7 @@
 //!
 //! - [`context`]: the `github` context, and payloads for events kiln saw itself.
 //! - [`cron`]: schedules, with time zones.
+//! - [`dispatch`]: `workflow_dispatch` inputs, typed and checked.
 //! - [`event`]: the normalized event.
 //! - [`matcher`]: whether a workflow runs for an event, and why not.
 //! - [`pattern`]: GitHub's filter patterns.
@@ -9,6 +10,7 @@
 
 pub mod context;
 pub mod cron;
+pub mod dispatch;
 pub mod event;
 pub mod matcher;
 pub mod pattern;

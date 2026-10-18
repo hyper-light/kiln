@@ -2,8 +2,9 @@
 //! at `/api/v3` (GitHub Enterprise Server's path), for a leg's `GITHUB_TOKEN`. GraphQL is at
 //! `/api/graphql`.
 //!
-//! - Implemented so far: the artifact endpoints that `download-artifact` uses across runs
-//!   (W08-R08).
+//! - Implemented so far:
+//!   - the artifact endpoints that `download-artifact` uses across runs (W08-R08);
+//!   - `workflow_dispatch` and `repository_dispatch` (W03-R11).
 //! - Anything else answers 501 with `{"message": "not implemented by kiln: …"}`, and the leg gets
 //!   a warning naming the route, so gaps are visible and get filled.
 //!
@@ -73,8 +74,44 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], req: Request) -> Result<Respon
             hub.store.call(move |c| Ok(c.execute("DELETE FROM ci_artifacts WHERE id = ?1", [aid])?)).await.map_err(internal)?;
             Ok(srv::status(StatusCode::NO_CONTENT))
         }
+        // W03-R11: dispatches by a job's token (GitHub lets those start runs, unlike other
+        // events a token causes). Only trusted runs may.
+        (&Method::POST, ["repos", owner, repo, "actions", "workflows", which, "dispatches"]) => {
+            let Some(r) = trusted_repo(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            let ask: Value = srv::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            let git_ref = ask.get("ref").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let inputs = ask.get("inputs").and_then(Value::as_object).cloned().unwrap_or_default();
+            match super::events::workflow_dispatch(hub, &r, &git_ref, which, &inputs, "github-actions[bot]").await {
+                Ok(()) => Ok(srv::status(StatusCode::NO_CONTENT)),
+                Err(e) => Ok(message(e.status, &e.message)),
+            }
+        }
+        (&Method::POST, ["repos", owner, repo, "dispatches"]) => {
+            let Some(r) = trusted_repo(hub, &claims, owner, repo).await? else { return Ok(message(StatusCode::NOT_FOUND, "Not Found")) };
+            let ask: Value = srv::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            let event_type = ask.get("event_type").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let payload = ask.get("client_payload").cloned().unwrap_or(Value::Null);
+            match super::events::repository_dispatch(hub, &r, &event_type, &payload, "github-actions[bot]").await {
+                Ok(_) => Ok(srv::status(StatusCode::NO_CONTENT)),
+                Err(e) => Ok(message(e.status, &e.message)),
+            }
+        }
         _ => not_implemented(hub, &claims, &method, &format!("/api/v3/{}", rest.join("/"))).await,
     }
+}
+
+/// The token's repository when its run is trusted (W03-R08): untrusted runs can't start others.
+async fn trusted_repo(hub: &Hub, claims: &Claims, owner: &str, repo: &str) -> Result<Option<crate::store::Repo>, Fail> {
+    if repo_of(hub, claims, owner, repo).await?.is_none() {
+        return Ok(None);
+    }
+    let run = claims.run.clone();
+    let trusted: bool = hub.store.call(move |c| Ok(c.query_row("SELECT trust = 'trusted' FROM runs WHERE id = ?1", [&run], |r| r.get(0)).optional()?.unwrap_or(false))).await.map_err(internal)?;
+    if !trusted {
+        return Ok(None);
+    }
+    let repos = hub.store.repos().await.map_err(internal)?;
+    Ok(repos.into_iter().find(|r| r.id == claims.repo))
 }
 
 /// `/api/graphql`.

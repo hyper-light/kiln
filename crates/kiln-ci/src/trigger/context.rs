@@ -273,6 +273,73 @@ pub fn schedule(cron: &str, repo: &Repo) -> Value {
     json!({ "schedule": cron, "repository": repo.payload() })
 }
 
+/// A run, as `workflow_run` payloads describe it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunSummary {
+    /// `github.run_id`.
+    pub id: u64,
+    /// The workflow's name (its path when it has none).
+    pub name: String,
+    pub path: String,
+    pub display_title: String,
+    pub run_number: u64,
+    pub run_attempt: u32,
+    pub event: String,
+    /// `requested`, `in_progress` or `completed`.
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub head_branch: String,
+    pub head_sha: String,
+    pub head_message: String,
+    pub actor: String,
+    /// RFC 3339.
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A `workflow_run` payload (W03-R02): `action` is `requested`, `in_progress` or `completed`.
+pub fn workflow_run(action: &str, r: &RunSummary, repo: &Repo) -> Value {
+    let api = format!("{}/api/v3/repos/{}/actions/runs/{}", repo.server_url.trim_end_matches('/'), repo.full_name, r.id);
+    let user = json!({ "login": r.actor, "type": "User" });
+    json!({
+        "action": action,
+        "workflow_run": {
+            "id": r.id,
+            "name": r.name,
+            "node_id": format!("WFR_kiln{}", r.id),
+            "head_branch": r.head_branch,
+            "head_sha": r.head_sha,
+            "path": r.path,
+            "display_title": r.display_title,
+            "run_number": r.run_number,
+            "run_attempt": r.run_attempt,
+            "event": r.event,
+            "status": r.status,
+            "conclusion": r.conclusion,
+            "workflow_id": 0,
+            "url": api,
+            "html_url": format!("{}/actions/runs/{}", repo.html_url(), r.id),
+            "jobs_url": format!("{api}/jobs"),
+            "logs_url": format!("{api}/logs"),
+            "artifacts_url": format!("{api}/artifacts"),
+            "cancel_url": format!("{api}/cancel"),
+            "rerun_url": format!("{api}/rerun"),
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+            "run_started_at": r.created_at,
+            "actor": user,
+            "triggering_actor": user,
+            "head_commit": { "id": r.head_sha, "tree_id": "", "message": r.head_message, "timestamp": r.created_at },
+            "repository": repo.payload(),
+            "head_repository": repo.payload(),
+            "pull_requests": [],
+        },
+        "workflow": { "id": 0, "name": r.name, "path": r.path, "state": "active" },
+        "repository": repo.payload(),
+        "sender": user,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

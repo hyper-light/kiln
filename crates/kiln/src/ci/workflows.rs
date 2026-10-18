@@ -127,3 +127,36 @@ pub async fn get(hub: &Hub, repo: &str, path: &str, q: &HashMap<String, String>)
         }),
     ))
 }
+
+#[derive(Deserialize)]
+struct DispatchAsk {
+    #[serde(rename = "ref")]
+    git_ref: String,
+    #[serde(default)]
+    inputs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /api/ci/repos/:repo/workflows/<path>/dispatches { ref, inputs }` (W03-R11): GitHub's
+/// `workflow_dispatch`. 204 when the run starts.
+pub async fn dispatch(hub: &Hub, repo: &str, path: &str, body: Incoming) -> Result<Response, Fail> {
+    let repo = find_repo(hub, repo).await?;
+    let ask: DispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    super::events::workflow_dispatch(hub, &repo, &ask.git_ref, path, &ask.inputs, "kiln").await.map_err(|r| (r.status, r.message))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+#[derive(Deserialize)]
+struct RepoDispatchAsk {
+    event_type: String,
+    #[serde(default)]
+    client_payload: serde_json::Value,
+}
+
+/// `POST /api/ci/repos/:repo/dispatches { event_type, client_payload }` (W03-R11): GitHub's
+/// `repository_dispatch`. 204, as GitHub answers, whether or not a workflow listens.
+pub async fn repository_dispatch(hub: &Hub, repo: &str, body: Incoming) -> Result<Response, Fail> {
+    let repo = find_repo(hub, repo).await?;
+    let ask: RepoDispatchAsk = srv::body_json(body, 1 << 20).await.map_err(|e| bad(format!("{e:#}")))?;
+    super::events::repository_dispatch(hub, &repo, &ask.event_type, &ask.client_payload, "kiln").await.map_err(|r| (r.status, r.message))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}

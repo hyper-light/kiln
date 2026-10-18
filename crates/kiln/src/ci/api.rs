@@ -68,6 +68,9 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
         (&Method::GET, ["repos", repo, "workflows"]) => workflows::list(hub, repo, q).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => workflows::get(hub, repo, &path.join("/"), q).await,
+        // W03-R11: dispatches.
+        (&Method::POST, ["repos", repo, "workflows", path @ .., "dispatches"]) => workflows::dispatch(hub, repo, &path.join("/"), req.into_body()).await,
+        (&Method::POST, ["repos", repo, "dispatches"]) => workflows::repository_dispatch(hub, repo, req.into_body()).await,
         _ => Err((StatusCode::NOT_FOUND, format!("no such CI route: {method} /api/ci/{}", rest.join("/")))),
     }
 }

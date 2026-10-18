@@ -10,6 +10,7 @@ pub mod facade;
 pub mod load;
 pub mod rest;
 pub mod runs;
+pub mod schedule;
 pub mod services;
 pub mod token;
 pub mod workflows;
