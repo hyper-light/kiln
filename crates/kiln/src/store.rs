@@ -515,7 +515,8 @@ impl Store {
 
     pub async fn jobs(&self, run_id: String, with_spec: bool) -> anyhow::Result<Vec<Job>> {
         self.call(move |c| {
-            let mut st = c.prepare(&format!("{JOB_SELECT} WHERE run_id = ?1 ORDER BY rowid"))?;
+            // A CI run's legs of its current attempt (docs/ci.md W05-R17); v1's jobs have no job_id.
+            let mut st = c.prepare(&format!("{JOB_SELECT} WHERE run_id = ?1 AND (job_id IS NULL OR run_attempt = (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid"))?;
             let mut jobs: Vec<Job> =
                 st.query_map([&run_id], row_job)?.collect::<Result<Vec<_>, _>>()?;
             for j in &mut jobs {

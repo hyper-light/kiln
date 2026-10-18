@@ -54,6 +54,7 @@ struct Ran {
 }
 
 /// An action's post step, run after the main steps in reverse order (W06-R11).
+#[derive(Clone)]
 struct Post {
     name: String,
     node: PathBuf,
@@ -75,7 +76,13 @@ struct Located {
 const SIGINT_GRACE: Duration = Duration::from_millis(7_500);
 const SIGTERM_GRACE: Duration = Duration::from_millis(2_500);
 
+/// Background steps running at once in a leg (W06-R17); more wait their turn.
+const MAX_BACKGROUND: usize = 10;
+/// `cancel:` of a background step: SIGTERM, then SIGKILL after this.
+const BACKGROUND_GRACE: Duration = Duration::from_secs(10);
+
 /// The paths of W06-R01.
+#[derive(Clone)]
 struct Layout {
     workspace: PathBuf,
     runner_workspace: PathBuf,
@@ -190,6 +197,7 @@ fn str_map(m: &BTreeMap<String, String>) -> Value {
 }
 
 /// The leg's state as its steps change it.
+#[derive(Clone)]
 struct State {
     dialect: Dialect,
     layout: Layout,
@@ -217,6 +225,92 @@ struct State {
     containers: Option<super::docker::Containers>,
     /// The problem matchers steps added (W06-R06).
     matchers: matchers::Job,
+    /// A background step's own stop (`cancel:`, W06-R17).
+    stop: Option<Shutdown>,
+    /// Values `::add-mask::` added, for a background step's `wait` to carry into the leg.
+    masks_added: Vec<String>,
+}
+
+/// A background step that finished, and what it changed: applied to the leg at its `wait`, in
+/// the order the steps were declared (W06-R17).
+struct BgDone {
+    id: String,
+    /// Where it was declared: the order its changes apply in.
+    order: u32,
+    env: Vec<(String, String)>,
+    path: Vec<String>,
+    masks: Vec<String>,
+    done: Option<Done>,
+    posts: Vec<Post>,
+    groups: Vec<i32>,
+    conclusion: Conclusion,
+}
+
+type BgFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = BgDone> + Send + 'a>>;
+
+/// A leg's background steps (W06-R17): running beside the steps that follow them, folded into
+/// the leg when waited for.
+struct Background<'a> {
+    turns: &'a async_lock::Semaphore,
+    running: futures::stream::FuturesUnordered<BgFuture<'a>>,
+    /// Each started step's declaration order and stop.
+    started: BTreeMap<String, (u32, Shutdown)>,
+    finished: BTreeMap<String, BgDone>,
+    /// Steps whose changes the leg has.
+    folded: std::collections::BTreeSet<String>,
+}
+
+impl<'a> Background<'a> {
+    fn new(turns: &'a async_lock::Semaphore) -> Self {
+        Background { turns, running: futures::stream::FuturesUnordered::new(), started: BTreeMap::new(), finished: BTreeMap::new(), folded: std::collections::BTreeSet::new() }
+    }
+
+    /// Runs `fut` (the leg's next step) while the background steps run on.
+    async fn drive<T>(&mut self, fut: impl std::future::Future<Output = T>) -> T {
+        use futures::StreamExt as _;
+        let fut = fut.fuse();
+        futures::pin_mut!(fut);
+        loop {
+            if self.running.is_empty() {
+                return fut.await;
+            }
+            futures::select_biased! {
+                r = fut => return r,
+                d = self.running.select_next_some() => {
+                    self.finished.insert(d.id.clone(), d);
+                }
+            }
+        }
+    }
+
+    /// Lets steps just started begin now (take their turn, start their process), instead of
+    /// when the leg next waits on something: polls them until each is waiting.
+    fn kick(&mut self) {
+        use futures::{FutureExt as _, StreamExt as _};
+        while let Some(Some(d)) = self.running.next().now_or_never() {
+            self.finished.insert(d.id.clone(), d);
+        }
+    }
+
+    /// Waits until each of `ids` that started has finished.
+    async fn settle(&mut self, ids: &[String]) {
+        use futures::StreamExt as _;
+        while ids.iter().any(|id| self.started.contains_key(id) && !self.finished.contains_key(id)) {
+            match self.running.next().await {
+                Some(d) => {
+                    self.finished.insert(d.id.clone(), d);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// The started steps not yet folded into the leg, in declaration order.
+    fn unfolded(&self) -> Vec<String> {
+        let mut v: Vec<(&u32, &String)> = self.started.iter().filter(|(id, _)| !self.folded.contains(*id)).map(|(id, (o, _))| (o, id)).collect();
+        v.sort();
+        v.into_iter().map(|(_, id)| id.clone()).collect()
+    }
 }
 
 /// What reading one process's output keeps.
@@ -542,6 +636,8 @@ impl Leg {
             server_url: a.runtime.facade_url.clone(),
             containers: None,
             matchers: matchers::Job::default(),
+            stop: None,
+            masks_added: Vec::new(),
         };
         // The job's environment: the workflow's, `env-from`, then the job's (W04-R21, W06-R04).
         for (k, v) in &a.env_from {
@@ -572,17 +668,33 @@ impl Leg {
             return Ok(Status::Failed);
         }
         self.pre_steps(&mut st, deadline).await;
+        let turns = async_lock::Semaphore::new(MAX_BACKGROUND);
+        let mut bg = Background::new(&turns);
         for (idx, step) in a.steps.iter().enumerate() {
             let idx = u32::try_from(idx).unwrap_or(u32::MAX);
             if self.cancel.is_cancelled() {
                 st.cancelled = true;
             }
-            let end = self.step(&mut st, idx, step, deadline, false).await;
+            if step.is_control() {
+                self.control(&mut st, &mut bg, idx, step, deadline).await;
+                continue;
+            }
+            if self.background(&mut st, &mut bg, idx, idx, step, deadline) {
+                bg.kick();
+                continue;
+            }
+            let end = bg.drive(self.step(&mut st, idx, step, deadline, false)).await;
             if end == Some(End::TimedOut) && Instant::now() >= deadline {
                 timed_out = true;
                 st.failed = true;
                 self.note(idx, &format!("The job running on runner {} has exceeded the maximum execution time of {} minutes.", self.runner_name, a.timeout_minutes)).await;
             }
+        }
+        // An implicit `wait-all` before the post steps (W06-R17), so the job's outputs see them.
+        let rest = bg.unfolded();
+        if !rest.is_empty() {
+            bg.settle(&rest).await;
+            self.fold(&mut st, &mut bg, &rest);
         }
         self.job_outputs(&st).await;
         self.post_steps(&mut st, deadline).await;
@@ -606,6 +718,131 @@ impl Leg {
         } else {
             Status::Succeeded
         })
+    }
+
+    /// Starts `step` in the background when it says so (W06-R17): on a copy of the leg's state,
+    /// beside the steps that follow, its turn among [`MAX_BACKGROUND`] at once. Whether it did.
+    fn background<'a>(&'a self, st: &mut State, bg: &mut Background<'a>, idx: u32, order: u32, step: &'a Step, deadline: Instant) -> bool {
+        let on = match &step.background {
+            Some(v) => st.value(v, Site::StepContinueOnError, "background").map(|v| v.truthy()).unwrap_or(false),
+            None => false,
+        };
+        if !on {
+            return false;
+        }
+        self.start_background(st, bg, idx, order, step, step.id.clone().unwrap_or_else(|| format!("__background_{idx}")), deadline);
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_background<'a>(&'a self, st: &State, bg: &mut Background<'a>, idx: u32, order: u32, step: &'a Step, id: String, deadline: Instant) {
+        let stop = Shutdown::new();
+        bg.started.insert(id.clone(), (order, stop.clone()));
+        let mut s = st.clone();
+        s.stop = Some(stop.clone());
+        s.masks_added.clear();
+        let (env0, path0, posts0, groups0, steps0) = (st.env.clone(), st.path.entries().to_vec(), st.posts.len(), st.groups.len(), st.steps.len());
+        let turns = bg.turns;
+        let fut: BgFuture<'a> = Box::pin(async move {
+            // Its turn, unless it is cancelled first.
+            let permit = futures::select_biased! {
+                () = stop.cancelled().fuse() => None,
+                p = turns.acquire().fuse() => Some(p),
+            };
+            let end = match permit {
+                Some(_turn) => self.step(&mut s, idx, step, deadline, false).await,
+                None => {
+                    let name = step.id.clone().unwrap_or_else(|| "a background step".into());
+                    self.start(idx, &name, if step.uses.is_some() { "uses" } else { "run" }, step.uses.clone()).await;
+                    self.finish(&mut s, idx, step.id.clone(), Conclusion::Cancelled, Conclusion::Cancelled, None, BTreeMap::new(), false).await;
+                    Some(End::Cancelled)
+                }
+            };
+            let done = s.steps.get(steps0..).and_then(<[Done]>::last).cloned();
+            let conclusion = done.as_ref().and_then(|d| d.conclusion).unwrap_or(if end == Some(End::Cancelled) { Conclusion::Cancelled } else { Conclusion::Success });
+            BgDone {
+                id,
+                order,
+                env: s.env.iter().filter(|(k, v)| env0.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect(),
+                path: s.path.entries().iter().rev().filter(|d| !path0.contains(d)).cloned().collect(),
+                masks: std::mem::take(&mut s.masks_added),
+                done,
+                posts: s.posts.get(posts0..).map(<[Post]>::to_vec).unwrap_or_default(),
+                groups: s.groups.get(groups0..).map(<[i32]>::to_vec).unwrap_or_default(),
+                conclusion,
+            }
+        });
+        bg.running.push(fut);
+    }
+
+    /// Folds finished background steps into the leg, in declaration order: environment, path,
+    /// masks, the `steps` context, post steps. Whether any of them failed.
+    fn fold(&self, st: &mut State, bg: &mut Background<'_>, ids: &[String]) -> bool {
+        let mut list: Vec<&BgDone> = ids.iter().filter(|id| !bg.folded.contains(*id)).filter_map(|id| bg.finished.get(id)).collect();
+        list.sort_by_key(|d| d.order);
+        let mut failed = false;
+        for d in list {
+            for (k, v) in &d.env {
+                st.env.insert(k.clone(), v.clone());
+            }
+            for p in &d.path {
+                st.path.add(p);
+            }
+            for m in &d.masks {
+                st.masker.add(m);
+            }
+            if let Some(done) = &d.done {
+                st.steps.push(done.clone());
+            }
+            st.posts.extend(d.posts.iter().cloned());
+            st.groups.extend(d.groups.iter().copied());
+            failed |= d.conclusion == Conclusion::Failure;
+        }
+        for id in ids {
+            if bg.finished.contains_key(id) {
+                bg.folded.insert(id.clone());
+            }
+        }
+        failed
+    }
+
+    /// `wait`, `wait-all`, `cancel` and `parallel` (W06-R17): they always run and take no `if`.
+    async fn control<'a>(&'a self, st: &mut State, bg: &mut Background<'a>, idx: u32, step: &'a Step, deadline: Instant) {
+        let (name, ids) = if !step.parallel.is_empty() {
+            let mut ids = Vec::new();
+            for (n, child) in step.parallel.iter().enumerate() {
+                let cidx = st.next_idx;
+                st.next_idx += 1;
+                let id = child.id.clone().unwrap_or_else(|| format!("__parallel_{idx}_{n}"));
+                // Declared where the group is, in their order within it.
+                let order = idx.saturating_mul(1000).saturating_add(u32::try_from(n).unwrap_or(0));
+                self.start_background(st, bg, cidx, order, child, id.clone(), deadline);
+                ids.push(id);
+            }
+            bg.kick();
+            (step.name.as_ref().map_or_else(|| "Run in parallel".to_owned(), |t| st.render(t, Site::StepName, "name").unwrap_or_else(|_| t.src.clone())), ids)
+        } else if !step.cancel.is_empty() {
+            for id in &step.cancel {
+                if let Some((_, stop)) = bg.started.get(id) {
+                    stop.cancel();
+                }
+            }
+            (format!("Cancel {}", step.cancel.join(", ")), step.cancel.clone())
+        } else if step.wait_all {
+            ("Wait for all background steps".to_owned(), bg.unfolded())
+        } else {
+            (format!("Wait for {}", step.wait.join(", ")), step.wait.clone())
+        };
+        self.start(idx, &st.masker.mask(&name), "control", None).await;
+        bg.settle(&ids).await;
+        let failed = self.fold(st, bg, &ids);
+        // A failed step fails the `wait` that includes it (its `continue-on-error` made it a
+        // success already); a cancelled one doesn't fail its `cancel`.
+        let c = if failed && step.cancel.is_empty() { Conclusion::Failure } else { Conclusion::Success };
+        if c == Conclusion::Failure {
+            st.failed = true;
+        }
+        self.finish(st, idx, step.id.clone(), c, c, None, BTreeMap::new(), false).await;
     }
 
     /// One step (W06-R04): `if`, name, env, working directory, shell, timeout,
@@ -707,7 +944,7 @@ impl Leg {
         let ran = match (&script, &step.uses) {
             (Some(script), _) => self.exec(st, idx, Run::Script { script, shell: shell.as_deref() }, &wd, env, deadline).await,
             (None, Some(uses)) => Box::pin(self.action(st, idx, step, uses, with, &wd, env, deadline)).await,
-            (None, None) if step.is_control() => Err(anyhow::anyhow!("background steps (`background`, `wait`, `parallel`, docs/ci.md W06-R17) can't run on this runner yet")),
+            (None, None) if step.is_control() => Err(anyhow::anyhow!("`wait`, `wait-all`, `cancel` and `parallel` can't be steps of a composite action (docs/ci.md W06-R17)")),
             (None, None) => Err(anyhow::anyhow!("the step runs neither a script nor an action")),
         };
         let (end, outputs) = match ran {
@@ -966,6 +1203,16 @@ impl Leg {
         let mut flush = Interval::new(Duration::from_millis(100));
         let mut end: Option<End> = None;
         let mut output_done = false;
+        // A background step's `cancel:` (W06-R17).
+        let stop = st.stop.clone();
+        let stopped = async {
+            match &stop {
+                Some(s) => s.cancelled().await,
+                None => futures::future::pending().await,
+            }
+        }
+        .fuse();
+        futures::pin_mut!(stopped);
         loop {
             if output_done && end.is_some() {
                 break;
@@ -983,12 +1230,14 @@ impl Leg {
                 Exit(Option<i32>),
                 Flush,
                 Cancel,
+                Stop,
                 Deadline,
             }
             let ev = futures::select_biased! {
                 c = recv_if(&running.output, !output_done).fuse() => Ev::Chunk(c),
                 code = (&mut running.exit).fuse() => Ev::Exit(code.ok().flatten()),
                 () = self.cancel.cancelled().fuse() => Ev::Cancel,
+                () = stopped => Ev::Stop,
                 () = crate::rt::sleep_until(deadline).fuse() => Ev::Deadline,
                 () = flush.tick().fuse() => Ev::Flush,
             };
@@ -999,6 +1248,10 @@ impl Leg {
                 Ev::Flush => self.partial(st, idx, &mut r).await,
                 Ev::Cancel => {
                     crate::proc::interrupt_group(&mut running, SIGINT_GRACE, SIGTERM_GRACE).await;
+                    end = Some(End::Cancelled);
+                }
+                Ev::Stop => {
+                    crate::proc::terminate_group(&mut running, BACKGROUND_GRACE).await;
                     end = Some(End::Cancelled);
                 }
                 Ev::Deadline => {
@@ -1172,6 +1425,7 @@ impl Leg {
         match c {
             C::AddMask(v) => {
                 if st.masker.add(&v) {
+                    st.masks_added.push(v.clone());
                     self.event(&JobEventV2::Mask { value_sha256: crate::util::sha256_hex(v.as_bytes()) }).await;
                 }
             }
@@ -1864,6 +2118,152 @@ jobs:
         assert_eq!(ann("Unable to process command '::add-matcher::nope.json' successfully.").map(|a| a.0), Some(4));
         assert_eq!(finished(&events, 5).map(|f| f.1), Some(Conclusion::Failure), "a disabled command fails its step");
         assert_eq!(ann("Unable to process command '::set-env name=A::b' successfully.").map(|a| a.0), Some(5));
+        Ok(())
+    }
+
+    /// W06-AC08: background steps on the host executor.
+    #[cfg(unix)]
+    #[test]
+    fn background_steps() -> anyhow::Result<()> {
+        let wf = r###"on: push
+jobs:
+  t:
+    runs-on: x
+    outputs:
+      late: ${{ steps.late.outputs.x }}
+    steps:
+      - id: server
+        background: true
+        run: |
+          echo ready > ready.txt
+          echo "port=4000" >> "$GITHUB_OUTPUT"
+          echo "FROM_BG=1" >> "$GITHUB_ENV"
+          sleep 1
+          echo "server done"
+      - run: |
+          for i in $(seq 50); do test -f ready.txt && break; sleep 0.1; done
+          echo "read $(cat ready.txt); before the wait FROM_BG='$FROM_BG' port='${{ steps.server.outputs.port }}'"
+      - wait: server
+      - run: echo "after the wait FROM_BG=$FROM_BG port=${{ steps.server.outputs.port }}"
+      - id: soft
+        background: true
+        continue-on-error: true
+        run: exit 4
+      - wait: soft
+      - id: stubborn
+        background: true
+        run: |
+          trap '' TERM
+          echo "ignoring SIGTERM"
+          sleep 60
+      - run: sleep 1
+      - cancel: stubborn
+      - id: n0
+        background: true
+        run: |
+          mkdir -p running && touch running/n0 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n0
+      - id: n1
+        background: true
+        run: |
+          mkdir -p running && touch running/n1 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n1
+      - id: n2
+        background: true
+        run: |
+          mkdir -p running && touch running/n2 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n2
+      - id: n3
+        background: true
+        run: |
+          mkdir -p running && touch running/n3 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n3
+      - id: n4
+        background: true
+        run: |
+          mkdir -p running && touch running/n4 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n4
+      - id: n5
+        background: true
+        run: |
+          mkdir -p running && touch running/n5 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n5
+      - id: n6
+        background: true
+        run: |
+          mkdir -p running && touch running/n6 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n6
+      - id: n7
+        background: true
+        run: |
+          mkdir -p running && touch running/n7 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n7
+      - id: n8
+        background: true
+        run: |
+          mkdir -p running && touch running/n8 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n8
+      - id: n9
+        background: true
+        run: |
+          mkdir -p running && touch running/n9 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n9
+      - id: n10
+        background: true
+        run: |
+          mkdir -p running && touch running/n10 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n10
+      - id: n11
+        background: true
+        run: |
+          mkdir -p running && touch running/n11 && ls running | wc -l >> counts
+          sleep 1
+          rm running/n11
+      - wait-all: true
+      - run: echo "most at once $(sort -n counts | tail -1)"
+      - parallel:
+          - id: p1
+            run: echo "v=one" >> "$GITHUB_OUTPUT"
+          - id: p2
+            run: echo "v=two" >> "$GITHUB_OUTPUT"
+      - run: echo "parallel gave ${{ steps.p1.outputs.v }} ${{ steps.p2.outputs.v }}"
+      - id: late
+        background: true
+        run: sleep 1 && echo "x=late" >> "$GITHUB_OUTPUT"
+      - id: bad
+        background: true
+        run: exit 3
+      - wait: bad
+      - if: always()
+        run: echo "after the failed wait"
+"###;
+        let t = Instant::now();
+        let (r, logs, events) = run_leg(wf, &[])?;
+        let all: String = logs.values().cloned().collect();
+        assert_eq!(r.status, Status::Failed, "the failed background step fails its wait: {all}");
+        let log = |i: u32| logs.get(&i).cloned().unwrap_or_default();
+        assert!(log(1).contains("read ready; before the wait FROM_BG='' port=''"), "{}", log(1));
+        assert!(log(0).contains("server done"), "its own log: {:?}", logs.get(&0));
+        assert!(log(3).contains("after the wait FROM_BG=1 port=4000"), "{}", log(3));
+        assert_eq!(finished(&events, 5).map(|f| f.1), Some(Conclusion::Success), "continue-on-error: the wait succeeds");
+        assert_eq!(finished(&events, 6).map(|f| f.1), Some(Conclusion::Cancelled), "cancelled");
+        assert!(t.elapsed() >= BACKGROUND_GRACE, "SIGTERM was ignored: SIGKILL after the grace period");
+        let most = all.lines().find_map(|l| l.trim().strip_prefix("most at once ")).and_then(|n| n.trim().parse::<u32>().ok());
+        assert_eq!(most, Some(10), "12 background steps, 10 at once: {all}");
+        assert!(all.contains("parallel gave one two"), "{all}");
+        assert!(events.iter().any(|e| matches!(e, JobEventV2::JobOutputs { outputs, .. } if outputs.get("late").map(String::as_str) == Some("late"))), "the implicit wait-all before the job's outputs");
+        assert!(all.contains("after the failed wait"));
         Ok(())
     }
 

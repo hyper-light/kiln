@@ -102,6 +102,11 @@ pub fn path_lines(text: &str) -> Vec<String> {
 pub struct PrependPath(Vec<String>);
 
 impl PrependPath {
+    /// The directories, the last added first.
+    pub fn entries(&self) -> &[String] {
+        &self.0
+    }
+
     pub fn add(&mut self, dir: &str) {
         self.0.retain(|d| d != dir);
         self.0.push(dir.to_owned());

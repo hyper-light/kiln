@@ -347,6 +347,10 @@ export interface GoalItem {
   how?: "goal" | "goal_control" | "message";
   started_at?: number;
   ended_at?: number;
+  /** Times it was sent again, in a row, because the agent stopped short of it (no real work since). */
+  reminders?: number;
+  /** When it was last sent (unix ms). */
+  reminded_at?: number;
 }
 
 /** An agent's goals, one after another: each goes once the one before is met. */

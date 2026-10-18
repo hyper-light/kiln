@@ -1,9 +1,10 @@
 /**
  * An agent's goal stack, in its own panel under the Plan tab's plans: goals that run one after
  * another on this agent, as if you gave it /goal again and again yourself. Each goes as its
- * harness's own /goal (or, where it has none, as a message, done when that turn ends); when one is
- * met the next starts; one that isn't met stops the stack, with why. The server drives it, so it
- * goes on with the console closed.
+ * harness's own /goal (or, where it has none, as a message: the agent ends its reply with GOAL MET
+ * when it's met); when one is met the next starts. Until then the agent is kept on it: whenever it
+ * stops short of it, or loses it when it starts again, the goal is sent again. The server drives
+ * it, so it goes on with the console closed and across restarts.
  *
  * Drawn as a chain: each goal a numbered link (met, under way, next, not met), joined to the next;
  * one field to add a goal; the stack's few actions; editing the goals not yet started is one text
@@ -13,11 +14,19 @@ import * as React from "react";
 import { harnessApi, type GoalItem, type GoalStack } from "@/api/harness";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
+import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { useSuspenseResource } from "@/lib/resource";
 import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
+
+/** When the goal under way last went to the agent: sent, or sent again (how many times in a row). */
+function sentWords(g: GoalItem): string {
+  if (!g.reminded_at) return "";
+  const when = relativeTime(g.reminded_at / 1000);
+  return g.reminders ? ` · sent again ${g.reminders}×, last ${when}` : ` · sent ${when}`;
+}
 
 /** Each agent's last goal stack: a read that fails keeps showing it (with none yet, the panel says why). */
 const lastStack = new Map<string, GoalStack>();
@@ -154,9 +163,9 @@ function GoalPanel({
       </header>
       <p className="gs-what">
         {asMessage
-          ? `Goals run one after another on this agent: each goes to ${who} as a message, and the next starts when its turn ends.`
+          ? `Goals run one after another on this agent: each goes to ${who} as a message, and the next starts once it says the goal is met (GOAL MET).`
           : `Goals run one after another on this agent: each goes to ${who} as its own /goal, and the next starts once it's met.`}{" "}
-        One that isn&rsquo;t met stops the stack and says why.
+        Until then kiln keeps it on the goal: whenever it stops short, or loses the goal when it starts again, kiln sends it again.
       </p>
       {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
       {stack?.state === "paused" && stack.reason && <p className="gs-reason">{stack.reason}</p>}
@@ -189,22 +198,27 @@ function GoalPanel({
                   </button>
                 </li>
               ) : null}
-              {shown.map((g) => (
-                <li key={g.id} className="gs-link" data-status={g.status}>
-                  <span className="gs-node" aria-hidden="true">
-                    {g.status === "met" ? "✓" : g.status === "unmet" ? "✕" : g.status === "skipped" ? "–" : items.indexOf(g) + 1}
-                  </span>
-                  <span className="gs-text">
-                    {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                    {g.text.split(" — ")[0]}
-                    {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
-                    <span className="gs-word">
-                      {WORD[g.status]}
-                      {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
+              {shown.map((g) => {
+                // The goal under way while you've paused the stack: paused, not under way.
+                const held = g.status === "active" && stack?.state === "paused";
+                return (
+                  <li key={g.id} className="gs-link" data-status={held ? "paused" : g.status}>
+                    <span className="gs-node" aria-hidden="true">
+                      {g.status === "met" ? "✓" : g.status === "unmet" ? "✕" : g.status === "skipped" ? "–" : items.indexOf(g) + 1}
                     </span>
-                  </span>
-                </li>
-              ))}
+                    <span className="gs-text">
+                      {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
+                      {g.text.split(" — ")[0]}
+                      {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
+                      <span className="gs-word">
+                        {held ? "paused" : WORD[g.status]}
+                        {g.status === "active" && !held ? sentWords(g) : ""}
+                        {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
+                      </span>
+                    </span>
+                  </li>
+                );
+              })}
             </ol>
           )}
           <form

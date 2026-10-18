@@ -175,8 +175,8 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
-| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps left |
+| W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug and outputs JSON left |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
@@ -1701,10 +1701,21 @@ W20.
   - `crates/kiln/src/ci/dispatch.rs`, the dispatcher, behind `[ci] enabled`:
     - it uses the hub's slot bookkeeping, so v1 and v2 share runners;
     - v1 code reads only v1 rows;
-    - legs need `CAP_CI2`.
+    - legs need `CAP_CI2`;
+    - `/api/ci/legs/:id/routing` and the plan preview's per-leg routing (R20).
+  - R17, reruns as attempts of the same run (`github.run_attempt` one more): every job, the
+    failed and cancelled ones and the jobs that need them, or one job and its dependents
+    (`kiln_ci::plan::rerun`). The other legs keep their results as copies (`reused_from`, with
+    their steps and logs), and the plan takes their reports as they were.
+    - Debug reruns turn on step and runner debug.
+    - Legs and the plan log are kept per attempt.
+    - Checked end to end on a local server: `kiln rerun --failed` kept `a`'s output for `b`, and
+      `--job a --debug` reran the chain with debug lines.
+  - Replay (R25) goes on from the run's last log entry across attempts. It hands the plan the
+    result of a leg that ended before its report reached the log, so a server stopped in that
+    window no longer leaves the run waiting forever.
 - *Left.*
   - Pools and scaling (R27, with W13), reservations (R12).
-  - `/api/ci/legs/:id/routing`.
   - AC07 (cancel timing on the host executor), AC09 at 10,000 legs, AC11 live.
   - Resource capacity from W13's facts.
 
@@ -1922,10 +1933,13 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     repository's. setup-node's tsc matcher annotated a real type error end to end.
   - A command that fails fails its step, as on GitHub, with "Unable to process command '…'
     successfully.": an unreadable matcher file, a disabled `set-env`, a bad `echo` value.
+  - Background steps (R17, AC08). Each runs on a copy of the leg's state, beside the steps that
+    follow, at most 10 at once. `wait`, `wait-all`, `cancel` and `parallel` are steps of their
+    own, and an implicit `wait-all` runs before the job's outputs. Their environment, path,
+    masks, outputs and post steps reach the leg in declared order. `cancel` sends SIGTERM, then
+    SIGKILL after 10 s. Checked end to end on a local server: S05's background server, read by a
+    later step and cancelled.
 - *Left.*
-  - Background steps (R17). The plan: a background step's process runs in its own task, with
-    its own masker and command processor. Its environment, path and outputs are applied at its
-    `wait`, in declared order.
   - `KILN_OUTPUT_JSON` and `exports`.
   - Debug (R13).
   - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.

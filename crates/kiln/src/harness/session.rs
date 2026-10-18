@@ -611,6 +611,14 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&async_channel::Sender<Ve
     Jobs { previews, changes }
 }
 
+/// The next chunk from one of the harness's pipes. One already closed never answers again: a
+/// closed channel is always ready, so it would be chosen first on every turn of the loop, which
+/// would spin without ever yielding (starving every task on its thread, the one that reaps the
+/// harness among them) and never see the other pipe close or the process exit.
+async fn pipe(rx: &async_channel::Receiver<Vec<u8>>, open: bool) -> Option<Vec<u8>> {
+    if open { rx.recv().await.ok() } else { std::future::pending().await }
+}
+
 enum Ev {
     Change(Option<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>),
     Out(Option<Vec<u8>>),
@@ -1419,8 +1427,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     let ev = futures::select_biased! {
                         c = ctl_rx.recv().fuse() => Ev::Ctl(c.ok()),
-                        o = p.stdout.recv().fuse() => if out_open { Ev::Out(o.ok()) } else { Ev::Out(None) },
-                        e = p.stderr.recv().fuse() => if err_open { Ev::Err(e.ok()) } else { Ev::Err(None) },
+                        o = pipe(&p.stdout, out_open).fuse() => Ev::Out(o),
+                        e = pipe(&p.stderr, err_open).fuse() => Ev::Err(e),
                         d = pv_rx.recv().fuse() => Ev::Preview(d.ok()),
                         c = ch_rx.recv().fuse() => Ev::Change(c.ok()),
                         f = fx_rx.recv().fuse() => Ev::Fx(f.ok()),

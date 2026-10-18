@@ -247,6 +247,279 @@ pub async fn actions(args: ActionsArgs, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Where the CI API is, for the commands below.
+#[derive(clap::Args)]
+pub struct Conn {
+    #[arg(long, env = "KILN_URL", global = true)]
+    url: Option<String>,
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    token: Option<String>,
+}
+
+impl Conn {
+    async fn api(&self, cfg: &Config) -> Result<Api> {
+        Api::connect(cfg, self.url.as_deref(), self.token.as_deref()).await
+    }
+}
+
+/// `kiln runs`: the CI engine's runs (docs/ci.md §4.3).
+#[derive(clap::Args)]
+pub struct RunsArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// One run, with its legs.
+    run: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    workflow: Option<String>,
+    #[arg(long)]
+    branch: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    limit: u32,
+    /// Keep watching: a line whenever a run starts or changes.
+    #[arg(long)]
+    follow: bool,
+}
+
+fn run_line(r: &Value) -> String {
+    let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default();
+    let state = match s("conclusion") {
+        "" => s("status").to_owned(),
+        c => c.to_owned(),
+    };
+    format!("#{:<5} {:<16} {:<28} {:<10} {:<9} {:<8} {}", r.get("number").and_then(Value::as_i64).unwrap_or(0), state, s("workflow").trim_start_matches(".github/workflows/"), s("event"), s("branch"), s("sha").get(..7).unwrap_or_default(), s("id"))
+}
+
+pub async fn runs(args: RunsArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    if let Some(id) = &args.run {
+        let v = api.call(Method::Get, &format!("/runs/{}", enc(id)), None).await?;
+        println!("{}", run_line(v.get("run").unwrap_or(&Value::Null)));
+        for l in v.get("legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+            let s = |k: &str| l.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+            println!("  {:<32} {:<10} {:<10} {}", if s("key").is_empty() { s("name") } else { s("key") }, s("status"), s("conclusion"), s("id"));
+        }
+        return Ok(());
+    }
+    let mut q = format!("/runs?limit={}", args.limit.clamp(1, 200));
+    for (k, v) in [("repo", &args.repo), ("workflow", &args.workflow), ("branch", &args.branch)] {
+        if let Some(v) = v {
+            q.push_str(&format!("&{k}={}", enc(v)));
+        }
+    }
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    loop {
+        let v = api.call(Method::Get, &q, None).await?;
+        let mut list = v.get("runs").and_then(Value::as_array).cloned().unwrap_or_default();
+        list.reverse();
+        for r in &list {
+            let line = run_line(r);
+            let id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+            if seen.get(&id) != Some(&line) {
+                println!("{line}");
+                seen.insert(id, line);
+            }
+        }
+        if !args.follow {
+            return Ok(());
+        }
+        crate::rt::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// `kiln logs`: a leg's logs, or every leg's of a run.
+#[derive(clap::Args)]
+pub struct LogsArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// A run or a leg.
+    id: String,
+    /// Only this step.
+    #[arg(long)]
+    step: Option<u32>,
+    /// Keep printing until the legs end.
+    #[arg(long)]
+    follow: bool,
+}
+
+pub async fn logs(args: LogsArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let legs: Vec<(String, String)> = match api.call(Method::Get, &format!("/legs/{}", enc(&args.id)), None).await {
+        Ok(_) => vec![(args.id.clone(), String::new())],
+        Err(_) => {
+            let v = api.call(Method::Get, &format!("/runs/{}", enc(&args.id)), None).await?;
+            v.get("legs").and_then(Value::as_array).cloned().unwrap_or_default().iter().map(|l| (l.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(), l.get("key").and_then(Value::as_str).unwrap_or_default().to_owned())).collect()
+        }
+    };
+    // What was printed of each leg's steps.
+    let mut printed: std::collections::HashMap<(String, u32), usize> = std::collections::HashMap::new();
+    loop {
+        let mut live = false;
+        for (leg, key) in &legs {
+            let v = api.call(Method::Get, &format!("/legs/{}", enc(leg)), None).await?;
+            let status = v.pointer("/leg/status").or_else(|| v.get("status")).and_then(Value::as_str).unwrap_or_default().to_owned();
+            live |= matches!(status.as_str(), "queued" | "pending" | "running" | "assigned");
+            let steps: Vec<(u32, String)> = v.get("steps").and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|s| Some((u32::try_from(s.get("idx")?.as_i64()?).ok()?, s.get("name").and_then(Value::as_str).unwrap_or_default().to_owned()))).collect();
+            for (idx, name) in steps.iter().filter(|(i, _)| args.step.is_none_or(|n| n == *i)) {
+                let text = api.call(Method::Get, &format!("/legs/{}/logs?step={idx}", enc(leg)), None).await?;
+                let text = text.as_str().unwrap_or_default().to_owned();
+                let at = printed.entry((leg.clone(), *idx)).or_insert(0);
+                if text.len() > *at {
+                    if *at == 0 {
+                        println!("\x1b[1m── {}{name}\x1b[0m", if key.is_empty() { String::new() } else { format!("{key} · ") });
+                    }
+                    print!("{}", text.get(*at..).unwrap_or_default());
+                    *at = text.len();
+                }
+            }
+        }
+        if !args.follow || !live {
+            return Ok(());
+        }
+        crate::rt::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// `kiln dispatch`: a `workflow_dispatch` run.
+#[derive(clap::Args)]
+pub struct DispatchArgs {
+    #[command(flatten)]
+    conn: Conn,
+    /// The workflow: its path or file name.
+    workflow: String,
+    #[arg(long)]
+    repo: String,
+    /// The branch or tag (the default branch when omitted).
+    #[arg(long = "ref")]
+    git_ref: Option<String>,
+    /// `name=value`, repeatable.
+    #[arg(long = "input")]
+    inputs: Vec<String>,
+}
+
+pub async fn dispatch(args: DispatchArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let mut inputs = serde_json::Map::new();
+    for i in &args.inputs {
+        let Some((k, v)) = i.split_once('=') else { bail!("--input takes name=value, not `{i}`") };
+        inputs.insert(k.to_owned(), Value::String(v.to_owned()));
+    }
+    let path = if args.workflow.contains('/') { args.workflow.clone() } else { format!(".github/workflows/{}", args.workflow) };
+    let mut body = json!({ "inputs": inputs });
+    if let Some(r) = &args.git_ref
+        && let Some(o) = body.as_object_mut()
+    {
+        o.insert("ref".into(), json!(r));
+    }
+    api.call(Method::Post, &format!("/repos/{}/workflows/{path}/dispatches", enc(&args.repo)), Some(body)).await?;
+    println!("dispatched {path} on {}", args.git_ref.as_deref().unwrap_or("the default branch"));
+    Ok(())
+}
+
+/// `kiln rerun`: a new attempt of a run (W05-R17).
+#[derive(clap::Args)]
+pub struct RerunArgs {
+    #[command(flatten)]
+    conn: Conn,
+    run: String,
+    /// Only the failed jobs, and the jobs that need them.
+    #[arg(long, conflicts_with = "job")]
+    failed: bool,
+    /// Only this job, and the jobs that need it.
+    #[arg(long)]
+    job: Option<String>,
+    /// With debug logging (`ACTIONS_STEP_DEBUG`, `ACTIONS_RUNNER_DEBUG`).
+    #[arg(long)]
+    debug: bool,
+    /// Resolve the actions' refs again instead of reusing the run's pins.
+    #[arg(long)]
+    fresh_actions: bool,
+}
+
+pub async fn rerun(args: RerunArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let mode = if args.failed { "failed" } else if args.job.is_some() { "job" } else { "all" };
+    let v = api.call(Method::Post, &format!("/runs/{}/rerun", enc(&args.run)), Some(json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions }))).await?;
+    match v.get("attempt").and_then(Value::as_i64) {
+        Some(a) => println!("attempt {a} of run {} started", args.run),
+        None => println!("rerun of {} started", args.run),
+    }
+    Ok(())
+}
+
+/// `kiln cancel`.
+#[derive(clap::Args)]
+pub struct CancelArgs {
+    #[command(flatten)]
+    conn: Conn,
+    run: String,
+}
+
+pub async fn cancel(args: CancelArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    api.call(Method::Post, &format!("/runs/{}/cancel", enc(&args.run)), Some(json!({}))).await?;
+    println!("cancelling {}", args.run);
+    Ok(())
+}
+
+/// `kiln routing explain <leg>`, or for a workflow's jobs before they run.
+#[derive(clap::Args)]
+pub struct RoutingArgs {
+    #[command(flatten)]
+    conn: Conn,
+    #[command(subcommand)]
+    cmd: RoutingCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum RoutingCmd {
+    /// Why a leg waits and how every runner measures up; or, with --repo and a workflow path,
+    /// where its legs would go now.
+    Explain {
+        /// A leg id, or a workflow path with --repo.
+        target: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+    },
+}
+
+fn print_runners(runners: &[Value]) {
+    for r in runners {
+        let failed: Vec<String> = r.get("checks").and_then(Value::as_array).cloned().unwrap_or_default().iter().filter(|c| !c.get("pass").and_then(Value::as_bool).unwrap_or(true)).map(|c| format!("{} (has {})", c.get("requirement").and_then(Value::as_str).unwrap_or("a check"), c.get("value").and_then(Value::as_str).unwrap_or("nothing"))).collect();
+        let flag = |k: &str| r.get(k).and_then(Value::as_bool).unwrap_or(false);
+        println!("    {:<20} {}{}{}", r.get("name").and_then(Value::as_str).unwrap_or_default(), if flag("eligible") { "eligible" } else { "not eligible" }, if flag("eligible") && !flag("room") { ", busy" } else { "" }, if failed.is_empty() { String::new() } else { format!(": {}", failed.join("; ")) });
+    }
+}
+
+pub async fn routing(args: RoutingArgs, cfg: &Config) -> Result<()> {
+    let api = args.conn.api(cfg).await?;
+    let RoutingCmd::Explain { target, repo, git_ref } = args.cmd;
+    let Some(repo) = repo else {
+        let v = api.call(Method::Get, &format!("/legs/{}/routing", enc(&target)), None).await?;
+        if let Some(w) = v.get("wait_reason").filter(|w| !w.is_null()) {
+            println!("waiting: {w}");
+        }
+        print_runners(&v.get("runners").and_then(Value::as_array).cloned().unwrap_or_default());
+        return Ok(());
+    };
+    let mut body = json!({ "repo": repo, "path": target, "event": "push" });
+    if let Some(r) = git_ref
+        && let Some(o) = body.as_object_mut()
+    {
+        o.insert("ref".into(), json!(r));
+    }
+    let v = api.call(Method::Post, "/plan-preview", Some(body)).await?;
+    for l in v.pointer("/plan/legs").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let labels: Vec<String> = l.pointer("/routing/labels").and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|x| x.as_str().map(str::to_owned)).collect();
+        println!("{}  (labels: {}; image: {})", l.get("key").and_then(Value::as_str).unwrap_or_default(), labels.join(", "), l.pointer("/routing/image").and_then(Value::as_str).unwrap_or("none"));
+        print_runners(&l.pointer("/routing/runners").and_then(Value::as_array).cloned().unwrap_or_default());
+    }
+    Ok(())
+}
+
 /// Percent-encodes a query value.
 fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
