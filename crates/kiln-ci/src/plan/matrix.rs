@@ -55,6 +55,12 @@ fn members(v: &Value, what: &str) -> Result<Vec<(String, Value)>, String> {
 /// appended as a combination of its own when it fits none. With no axes, each `include` entry is
 /// a leg. More than `limit` legs is an error.
 pub fn expand(axes: &[(String, Vec<Value>)], include: &[Value], exclude: &[Value], limit: usize) -> Result<Vec<Combo>, String> {
+    expand_all(axes, include, exclude, limit).map(|(c, _)| c)
+}
+
+/// [`expand`], with the combinations `exclude` removed, each with the index of the first entry
+/// that matched it (for the plan preview, W04-R29).
+pub fn expand_all(axes: &[(String, Vec<Value>)], include: &[Value], exclude: &[Value], limit: usize) -> Result<(Vec<Combo>, Vec<(Combo, usize)>), String> {
     for (i, (k, vals)) in axes.iter().enumerate() {
         if vals.is_empty() {
             return Err(format!("matrix variable `{k}` has no values"));
@@ -82,7 +88,14 @@ pub fn expand(axes: &[(String, Vec<Value>)], include: &[Value], exclude: &[Value
         combos = next;
     }
     let excludes: Vec<Vec<(String, Value)>> = exclude.iter().map(|e| members(e, "exclude")).collect::<Result<_, _>>()?;
-    combos.retain(|c| !excludes.iter().any(|e| e.iter().all(|(k, v)| get(c, k).is_some_and(|x| same(x, v)))));
+    let mut removed = Vec::new();
+    combos.retain(|c| match excludes.iter().position(|e| e.iter().all(|(k, v)| get(c, k).is_some_and(|x| same(x, v)))) {
+        Some(i) => {
+            removed.push((c.clone(), i));
+            false
+        }
+        None => true,
+    });
     let is_axis = |k: &str| axes.iter().any(|(a, _)| a.eq_ignore_ascii_case(k));
     let originals = combos.len();
     for inc in include {
@@ -106,7 +119,7 @@ pub fn expand(axes: &[(String, Vec<Value>)], include: &[Value], exclude: &[Value
     if combos.len() > limit {
         return Err(format!("the matrix gives {} legs; at most {limit} are allowed per job", combos.len()));
     }
-    Ok(combos)
+    Ok((combos, removed))
 }
 
 /// A value as a leg's name shows it.

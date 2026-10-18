@@ -66,22 +66,52 @@ pub struct Spec {
     /// The host's Docker socket inside: GitHub mounts it in job containers. A `docker`
     /// executor's container doesn't get it (W13-R04: Docker access is opt-in per pool).
     pub docker_socket: bool,
+    /// For a `docker` executor's container: the host user (uid, gid) its steps run as, through
+    /// the image's `runner` user.
+    pub user: Option<(u32, u32)>,
+}
+
+/// The user this runner runs as: (uid, gid).
+#[cfg(unix)]
+pub fn host_user() -> Option<(u32, u32)> {
+    Some((nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw()))
+}
+
+#[cfg(not(unix))]
+pub fn host_user() -> Option<(u32, u32)> {
+    None
 }
 
 /// kiln's runner images (W13-R04), built on the runner the first time a leg needs one: what
 /// GitHub's hosted Ubuntu runners have that most workflows count on.
-pub fn runner_dockerfile(image: &str) -> Option<String> {
-    let base = match image.strip_prefix("kiln/runner-")? {
-        "ubuntu-24.04" => "ubuntu:24.04",
-        "ubuntu-22.04" => "ubuntu:22.04",
+///
+/// With `user`, steps run as `runner`, a user with the host's uid and gid and passwordless
+/// sudo, as on GitHub's hosted runners. What they write in the mounted work directory then stays
+/// the host user's, and tools that refuse root, or another user's files, work.
+pub fn runner_dockerfile(image: &str, user: Option<(u32, u32)>) -> Option<String> {
+    // `ImageOS` as GitHub's hosted runners set it: setup-ruby, setup-beam and others pick their
+    // prebuilt tools by it.
+    let (base, os) = match image.strip_prefix("kiln/runner-")? {
+        "ubuntu-24.04" => ("ubuntu:24.04", "ubuntu24"),
+        "ubuntu-22.04" => ("ubuntu:22.04", "ubuntu22"),
         _ => return None,
     };
-    Some(format!(
-        "FROM {base}\nLABEL kiln.runner-image=1\nENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8\n\
+    let mut d = format!(
+        "FROM {base}\nENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8 ImageOS={os}\n\
          RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl wget git git-lfs jq unzip zip xz-utils zstd bzip2 gnupg sudo \\\n    \
          build-essential pkg-config python3 python3-venv python3-pip openssh-client rsync file lsb-release tzdata locales iproute2 netcat-openbsd \\\n    \
          && rm -rf /var/lib/apt/lists/*\n"
-    ))
+    );
+    if let Some((uid, gid)) = user.filter(|(uid, _)| *uid != 0) {
+        // The base image's own user may hold the uid (Ubuntu's `ubuntu` is 1000).
+        d.push_str(&format!(
+            "RUN u=$(getent passwd {uid} | cut -d: -f1); if [ -n \"$u\" ]; then userdel -r \"$u\" 2>/dev/null || userdel \"$u\"; fi \\\n    \
+             && (getent group {gid} >/dev/null || groupadd -g {gid} runner) \\\n    \
+             && useradd -m -u {uid} -g {gid} -s /bin/bash runner \\\n    \
+             && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner\n"
+        ));
+    }
+    Some(d)
 }
 
 /// One runner image build at a time on this machine.
@@ -115,8 +145,11 @@ impl Cli {
     }
 
     /// The command for a step's process in a container (`docker exec`), its values by name.
-    pub fn exec_command(&self, container: &str, workdir: &str, env: &BTreeMap<String, String>, prog: &str, args: &[String]) -> Command {
+    pub fn exec_command(&self, container: &str, user: Option<&str>, workdir: &str, env: &BTreeMap<String, String>, prog: &str, args: &[String]) -> Command {
         let mut a: Vec<String> = vec!["exec".into(), "-i".into(), "--workdir".into(), workdir.to_owned()];
+        if let Some(u) = user {
+            a.extend(["--user".to_owned(), u.to_owned()]);
+        }
         for k in env.keys() {
             a.push("-e".into());
             a.push(k.clone());
@@ -212,6 +245,18 @@ impl PathMap {
         out
     }
 
+    /// A container's path as the host has it, when it is under a mount.
+    pub fn to_host(&self, path: &str) -> Option<PathBuf> {
+        self.0
+            .iter()
+            .filter_map(|(host, inside)| {
+                let rest = path.strip_prefix(inside.as_str())?;
+                (rest.is_empty() || rest.starts_with('/')).then(|| (inside.len(), host.join(rest.trim_start_matches('/'))))
+            })
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, p)| p)
+    }
+
     /// The mounts (`-v host:inside`).
     pub fn mounts(&self) -> Vec<String> {
         self.0.iter().map(|(h, i)| format!("{}:{i}", h.to_string_lossy())).collect()
@@ -231,6 +276,10 @@ pub struct Service {
 #[derive(Debug, Clone)]
 pub struct JobContainer {
     pub id: String,
+    /// `uid:gid` its steps run as, when not the image's own user.
+    pub user: Option<String>,
+    /// `HOME` for its steps.
+    pub home: String,
     /// The image's `PATH`, to which `GITHUB_PATH` entries are prepended.
     pub path: String,
     pub has_bash: bool,
@@ -256,7 +305,10 @@ impl Containers {
     /// `say` reports progress for the leg's "Initialize containers" log.
     #[allow(clippy::too_many_arguments)]
     pub async fn start(cli: Cli, leg: &str, map: PathMap, workdir: &str, job: Option<Spec>, services: Vec<(String, Spec)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<Containers> {
-        let short = leg.get(..12).unwrap_or(leg);
+        // The whole leg id (ids made in the same instant share their start) and a suffix of this
+        // start's own, so a retry never meets what an earlier attempt left.
+        let start = crate::util::new_id();
+        let short = format!("{leg}_{}", start.get(start.len().saturating_sub(6)..).unwrap_or(&start));
         let label = format!("kiln.leg={leg}");
         let network = format!("kiln_{short}");
         let none = BTreeMap::new();
@@ -273,7 +325,7 @@ impl Containers {
                 continue;
             }
             say(format!("Starting service {key} ({})", spec.image));
-            c.pull(&spec.image, say).await?;
+            let image = c.prepare(&spec.image, None, say).await?;
             let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_{key}"), s("--label"), c.label.clone(), s("--network"), c.network.clone(), s("--network-alias"), key.clone()];
             for p in &spec.ports {
                 args.extend([s("-p"), p.clone()]);
@@ -286,14 +338,19 @@ impl Containers {
                 args.extend([s("-v"), v.clone()]);
             }
             args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
-            args.push(spec.image.clone());
+            args.push(image);
             let id = c.cli.run(&args, &env, QUICK).await?;
             c.cli.run(&[s("start"), id.clone()], &none, QUICK).await?;
             c.services.push(Service { key: key.clone(), id, ports: BTreeMap::new() });
         }
         if let Some(spec) = &job {
             say(format!("Starting job container ({})", spec.image));
-            c.pull(&spec.image, say).await?;
+            // A rootless engine's root is the host user already.
+            let user = match spec.user {
+                Some(u) if u.0 != 0 && !c.rootless().await => Some(u),
+                _ => None,
+            };
+            let image = c.prepare(&spec.image, user, say).await?;
             let mut args = vec![s("create"), s("--name"), format!("kiln_{short}_job"), s("--label"), c.label.clone(), s("--workdir"), workdir.to_owned(), s("--network"), c.network.clone(), s("--add-host"), format!("{HOST_ALIAS}:host-gateway")];
             if spec.docker_socket && Path::new("/var/run/docker.sock").exists() {
                 args.extend([s("-v"), s("/var/run/docker.sock:/var/run/docker.sock")]);
@@ -312,12 +369,16 @@ impl Containers {
                 args.extend([s("-v"), v.clone()]);
             }
             args.extend(spec.options.as_deref().map(split_options).unwrap_or_default());
-            args.extend([s("--entrypoint"), s("tail"), spec.image.clone(), s("-f"), s("/dev/null")]);
+            args.extend([s("--entrypoint"), s("tail"), image.clone(), s("-f"), s("/dev/null")]);
             let id = c.cli.run(&args, &env, QUICK).await?;
             c.cli.run(&[s("start"), id.clone()], &none, QUICK).await?;
-            let path = c.image_path(&spec.image).await.unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+            let path = c.image_path(&image).await.unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
             let has_bash = c.cli.run(&[s("exec"), id.clone(), s("sh"), s("-c"), s("command -v bash")], &none, QUICK).await.is_ok_and(|o| !o.is_empty());
-            c.job = Some(JobContainer { id, path, has_bash, map });
+            let (user, home) = match user {
+                Some((uid, gid)) => (Some(format!("{uid}:{gid}")), "/home/runner".to_owned()),
+                None => (None, "/github/home".to_owned()),
+            };
+            c.job = Some(JobContainer { id, user, home, path, has_bash, map });
         }
         // Health checks, then the ports the host got.
         let ids: Vec<(String, String)> = c.services.iter().map(|x| (x.key.clone(), x.id.clone())).chain(c.job.iter().map(|j| ("job container".to_owned(), j.id.clone()))).collect();
@@ -334,13 +395,28 @@ impl Containers {
         Ok(c)
     }
 
-    async fn pull(&self, image: &str, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
-        if let Some(dockerfile) = runner_dockerfile(image) {
+    /// Whether the engine runs rootless.
+    async fn rootless(&self) -> bool {
+        let none = BTreeMap::new();
+        if self.cli.bin.ends_with("podman") {
+            return self.cli.run(&[s("info"), s("--format"), s("{{.Host.Security.Rootless}}")], &none, QUICK).await.is_ok_and(|o| o == "true");
+        }
+        self.cli.run(&[s("info"), s("--format"), s("{{json .SecurityOptions}}")], &none, QUICK).await.is_ok_and(|o| o.contains("rootless"))
+    }
+
+    /// The image to run `image` as: kiln's runner images are built here, tagged by their
+    /// Dockerfile's digest (so per version and user, and a changed one is built again); others
+    /// are pulled.
+    async fn prepare(&self, image: &str, user: Option<(u32, u32)>, say: &(dyn Fn(String) + Sync)) -> anyhow::Result<String> {
+        if let Some(dockerfile) = runner_dockerfile(image, user) {
             let _g = IMAGE_BUILD.lock().await;
-            if self.cli.run(&[s("image"), s("inspect"), image.to_owned()], &BTreeMap::new(), QUICK).await.is_ok() {
-                return Ok(());
+            let digest = crate::util::sha256_hex(dockerfile.as_bytes());
+            let tag = format!("{image}:{}", digest.get(..16).unwrap_or(&digest));
+            if self.cli.run(&[s("image"), s("inspect"), s("--format"), s("{{.Id}}"), tag.clone()], &BTreeMap::new(), QUICK).await.is_ok() {
+                return Ok(tag);
             }
-            say(format!("Building kiln's runner image {image} (once per machine)"));
+            let dockerfile = format!("{dockerfile}LABEL kiln.runner-image={image}\n");
+            say(format!("Building kiln's runner image {tag} (once per machine and version)"));
             let dir = self.cli.config.join(format!("image-{}", crate::util::new_id()));
             let d = dir.clone();
             crate::rt::blocking(move || -> std::io::Result<()> {
@@ -348,12 +424,13 @@ impl Containers {
                 std::fs::write(d.join("Dockerfile"), dockerfile)
             })
             .await??;
-            let r = self.cli.run(&[s("build"), s("--quiet"), s("-t"), image.to_owned(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
+            let r = self.cli.run(&[s("build"), s("--quiet"), s("-t"), tag.clone(), dir.to_string_lossy().to_string()], &BTreeMap::new(), SLOW).await;
             let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
-            return r.map(|_| ());
+            return r.map(|_| tag);
         }
         say(format!("{} pull {image}", self.cli.bin));
-        self.cli.run(&[s("pull"), s("--quiet"), image.to_owned()], &BTreeMap::new(), SLOW).await.map(|_| ())
+        self.cli.run(&[s("pull"), s("--quiet"), image.to_owned()], &BTreeMap::new(), SLOW).await?;
+        Ok(image.to_owned())
     }
 
     async fn image_path(&self, image: &str) -> Option<String> {
@@ -482,13 +559,29 @@ mod tests {
 
     #[test]
     fn runner_images_have_a_dockerfile() {
-        let d = runner_dockerfile("kiln/runner-ubuntu-24.04").unwrap_or_default();
+        let d = runner_dockerfile("kiln/runner-ubuntu-24.04", None).unwrap_or_default();
         assert!(d.starts_with("FROM ubuntu:24.04\n"), "{d}");
         assert!(d.contains("apt-get install -y --no-install-recommends ca-certificates"), "{d}");
         assert!(d.contains(" \\\n    build-essential"), "line continuations: {d}");
         assert!(d.trim_end().ends_with("rm -rf /var/lib/apt/lists/*"), "{d}");
-        assert!(runner_dockerfile("ubuntu:24.04").is_none());
-        assert!(runner_dockerfile("kiln/runner-centos").is_none());
+        assert!(d.contains(" ImageOS=ubuntu24\n"), "{d}");
+        assert!(runner_dockerfile("kiln/runner-ubuntu-22.04", None).unwrap_or_default().contains(" ImageOS=ubuntu22\n"));
+        assert!(runner_dockerfile("ubuntu:24.04", None).is_none());
+        assert!(runner_dockerfile("kiln/runner-centos", None).is_none());
+        // The host's user, with sudo; root stays root.
+        let u = runner_dockerfile("kiln/runner-ubuntu-24.04", Some((1000, 1000))).unwrap_or_default();
+        assert!(u.contains("useradd -m -u 1000 -g 1000 -s /bin/bash runner") && u.contains("NOPASSWD:ALL"), "{u}");
+        assert_eq!(runner_dockerfile("kiln/runner-ubuntu-24.04", Some((0, 0))), runner_dockerfile("kiln/runner-ubuntu-24.04", None));
+    }
+
+    #[test]
+    fn container_paths_map_back_to_the_host() {
+        let m = PathMap::new(vec![(PathBuf::from("/w/leg/repo"), "/__w/repo/repo".into()), (PathBuf::from("/w/leg/_temp"), "/__w/_temp".into()), (PathBuf::from("/w/_tool"), "/opt/hostedtoolcache".into())]);
+        assert_eq!(m.to_host("/__w/repo/repo/src/a.ts"), Some(PathBuf::from("/w/leg/repo/src/a.ts")));
+        assert_eq!(m.to_host("/__w/_temp"), Some(PathBuf::from("/w/leg/_temp")));
+        assert_eq!(m.to_host("/opt/hostedtoolcache/node/x"), Some(PathBuf::from("/w/_tool/node/x")));
+        assert_eq!(m.to_host("/__w/repo/repository"), None, "a prefix of a name is not its directory");
+        assert_eq!(m.to_host("/etc/passwd"), None);
     }
 
     #[test]

@@ -12,7 +12,9 @@
 #   at load time, so no Apple SDK is needed. If a dependency starts importing a new symbol,
 #   regenerate the stubs with ci/release/regen-macos-stubs.sh. The minimum OS is macOS 11.
 #
-# Expects ui/dist/client to exist (`npm run --prefix ui build`). Writes dist/kiln-<target>[.exe] and
+# Expects ui/dist/client to exist (`npm run --prefix ui build`). Each binary carries the UI server
+# for its platform: Bun and the UI server's files, packed here first (ui/scripts/pack-ui-server.mjs,
+# vendor/bun/README.md; KILN_UI_SERVER=off builds without). Writes dist/kiln-<target>[.exe] and
 # dist/SHA256SUMS. KILN_DIST, KILN_MACOS_STUBS and KILN_MACOS_LINK_ARGS override the output
 # directory, the stubs and extra macOS link arguments (regen-macos-stubs.sh uses them).
 set -euo pipefail
@@ -24,6 +26,14 @@ targets=("$@")
 [ ${#targets[@]} -gt 0 ] || targets=("${all[@]}")
 
 [ -f ui/dist/client/_shell.html ] || { echo "ui/dist is missing: run npm run --prefix ui build first" >&2; exit 1; }
+
+# The UI server each binary carries: Bun for every target (downloaded once per machine, into
+# KILN_BUN_CACHE, and checked against vendor/bun/bun.json), and the UI server's files.
+if [ "${KILN_UI_SERVER:-}" != off ]; then
+  packs=()
+  for t in "${targets[@]}"; do packs+=(--target "$t"); done
+  node ui/scripts/pack-ui-server.mjs --require "${packs[@]}"
+fi
 
 # zig and cargo-zigbuild, pinned, in a private virtualenv (both are published on PyPI).
 zig_version=0.17.0

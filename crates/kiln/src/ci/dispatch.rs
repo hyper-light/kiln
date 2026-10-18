@@ -54,6 +54,27 @@ pub enum Msg {
     Cancel { run: String, reason: String },
     /// Why a leg waits, and how each runner measures up against it (W05-R11).
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
+    /// The plan `Start` would make, without a run (W04-R29).
+    Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+}
+
+/// What a leg asks of routing (W05-R20).
+fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str) -> LegRoute {
+    let job = spec.def();
+    let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
+    let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
+    let caps = u64::from(CAP_CI2) | if uses { u64::from(CAP_ACTIONS) } else { 0 } | if docker { u64::from(CAP_DOCKER) } else { 0 };
+    LegRoute {
+        job: spec.job.clone(),
+        job_name: spec.job_name.clone(),
+        workflow: workflow.to_owned(),
+        repo: repo.to_owned(),
+        event: event.to_owned(),
+        labels: spec.runs_on.labels.clone(),
+        group: spec.runs_on.group.clone(),
+        requires: spec.requires.clone(),
+        caps,
+    }
 }
 
 /// The hub's handle on the dispatcher.
@@ -106,6 +127,8 @@ struct RunSt {
     created: i64,
     /// Whether `workflow_run` `in_progress` went out.
     in_progress: bool,
+    /// The reusable workflows it may call (W04-R18).
+    files: Arc<HashMap<String, Arc<Workflow>>>,
     wf: Arc<Workflow>,
     github: serde_json::Value,
     vars: serde_json::Value,
@@ -138,7 +161,7 @@ struct Source<'a> {
 impl PlanSource for Source<'_> {
     fn workflow(&self, uses: &str) -> Result<Arc<Workflow>, String> {
         let path = uses.trim_start_matches("./").trim_start_matches("$/");
-        self.files.get(path).cloned().ok_or_else(|| format!("`{uses}`: reusable workflows from other repositories arrive with docs/ci.md W07"))
+        self.files.get(uses).or_else(|| self.files.get(path)).cloned().ok_or_else(|| format!("`{uses}`: no such workflow (or it couldn't be fetched when the run started)"))
     }
 }
 
@@ -148,8 +171,6 @@ struct Dispatch {
     runs: HashMap<String, RunSt>,
     legs: HashMap<String, LegSt>,
     timers: BTreeSet<i64>,
-    /// Workflows of each run's commit, for reusable workflows.
-    files: HashMap<String, HashMap<String, Arc<Workflow>>>,
 }
 
 fn now_ms() -> i64 {
@@ -192,7 +213,7 @@ pub fn spawn(hub: Arc<Hub>) {
         if hub.cfg.ci.github_labels {
             rules.extend(routing::github_label_rules());
         }
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new(), files: HashMap::new() };
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -242,6 +263,11 @@ impl Dispatch {
             Msg::Cancel { run, reason } => self.cancel_run(&run, &reason).await,
             Msg::Explain { leg, reply } => {
                 let v = serde_json::json!({ "leg": leg, "known": self.legs.contains_key(&leg), "wait_reason": self.sched.reason(&leg), "runners": self.sched.explain(&leg) });
+                let _ = reply.try_send(v);
+                Ok(())
+            }
+            Msg::Preview { start, reply } => {
+                let v = self.preview(&start).await;
                 let _ = reply.try_send(v);
                 Ok(())
             }
@@ -322,7 +348,7 @@ impl Dispatch {
         };
         let input = RunInput { github: github.clone(), inputs, vars: vars.clone(), changed: s.event.changed.clone().map(Arc::new), trusted };
         self.save_input(&id, &input, &s.actions, &s.event).await?;
-        let files = self.files.get(&s.event.sha).cloned().unwrap_or_default();
+        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
         let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files });
         let (plan, actions) = match started {
             Ok(x) => x,
@@ -334,7 +360,7 @@ impl Dispatch {
         };
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0 };
+        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0 };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(id.clone(), st);
         self.hub.ci.runs.lock().insert(id.clone());
@@ -400,6 +426,37 @@ impl Dispatch {
         let depth = r.event.payload.pointer("/kiln/depth").and_then(serde_json::Value::as_u64).unwrap_or(0);
         let (hub, repo, action) = (Arc::clone(&self.hub), r.repo.clone(), action.to_owned());
         crate::rt::spawn(async move { super::events::workflow_run(&hub, &repo, &action, &summary, depth).await });
+    }
+
+    /// What [`Self::start`] would plan for `s`, without a run: the `github` context of run 0,
+    /// the variables and reusable workflows a run would get, and each leg's routing against the
+    /// runners connected now.
+    async fn preview(&mut self, s: &Start) -> serde_json::Value {
+        let name = s.workflow.name.clone().unwrap_or_else(|| s.path.clone());
+        let github = self.github_context(s, 0, 0, &name);
+        let inputs = if s.inputs.is_null() { s.event.payload.get("inputs").cloned().unwrap_or(serde_json::Value::Null) } else { s.inputs.clone() };
+        let vars = super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await.map(serde_json::Value::Object).unwrap_or_else(|_| serde_json::json!({}));
+        let input = RunInput { github, inputs, vars, changed: s.event.changed.clone().map(Arc::new), trusted: s.event.trusted };
+        let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
+        let p = match RunPlan::preview(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files }) {
+            Ok(p) => p,
+            Err(e) => return serde_json::json!({ "error": e }),
+        };
+        let workflow = s.workflow.name.clone().unwrap_or_default();
+        let legs: Vec<serde_json::Value> = p
+            .legs
+            .iter()
+            .map(|spec| {
+                let (req, runners) = self.sched.explain_route(&route_of(spec, &workflow, &s.repo.name, &s.event.name));
+                let mut v = serde_json::to_value(spec).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() {
+                    let constraints: Vec<&String> = req.constraints.iter().map(|(text, _)| text).collect();
+                    o.insert("routing".into(), serde_json::json!({ "labels": req.labels, "group": req.group, "constraints": constraints, "executors": req.executors, "image": req.image, "rules": req.rules, "runners": runners }));
+                }
+                v
+            })
+            .collect();
+        serde_json::json!({ "name": p.name, "legs": legs, "decided": p.decided, "removed": p.removed, "later": p.later })
     }
 
     fn settings(&self) -> Settings {
@@ -506,20 +563,7 @@ impl Dispatch {
         r.keys.insert(spec.key.clone(), id.clone());
         self.hub.ci.legs.lock().insert(id.clone());
         let job = spec.def();
-        let uses = job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| !u.starts_with("docker://"))));
-        let docker = spec.container.is_some() || !spec.services.is_empty() || job.is_some_and(|j| j.steps.iter().any(|s| s.uses.as_deref().is_some_and(|u| u.starts_with("docker://"))));
-        let caps = u64::from(CAP_CI2) | if uses { u64::from(CAP_ACTIONS) } else { 0 } | if docker { u64::from(CAP_DOCKER) } else { 0 };
-        let route = LegRoute {
-            job: spec.job.clone(),
-            job_name: spec.job_name.clone(),
-            workflow: r.wf.name.clone().unwrap_or_default(),
-            repo: r.repo.name.clone(),
-            event: r.event.name.clone(),
-            labels: spec.runs_on.labels.clone(),
-            group: spec.runs_on.group.clone(),
-            requires: spec.requires.clone(),
-            caps,
-        };
+        let route = route_of(&spec, &r.wf.name.clone().unwrap_or_default(), &r.repo.name, &r.event.name);
         let group = spec.concurrency.as_ref().map(|g| (format!("{}\0{}", r.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
         let retry = job.and_then(|j| j.kiln.retry.as_ref()).and_then(RetryPolicy::from_yval);
         let leg = LegIn {
@@ -826,7 +870,8 @@ impl Dispatch {
         let Some(run) = self.runs.get_mut(&l.run) else { return Ok(()) };
         run.seq += 1;
         let seq = run.seq;
-        let acts = run.plan.on_leg_finished(&l.key, report.clone(), &Source { files: &HashMap::new() });
+        let files = Arc::clone(&run.files);
+        let acts = run.plan.on_leg_finished(&l.key, report.clone(), &Source { files: &files });
         runs::log(&self.hub, &l.run, seq, "leg", Some(l.key.clone()), Some(report_json(&report))).await?;
         self.actions(&l.run, acts).await
     }
@@ -841,7 +886,8 @@ impl Dispatch {
         }
         r.seq += 1;
         let seq = r.seq;
-        let acts = r.plan.on_cancel(&Source { files: &HashMap::new() });
+        let files = Arc::clone(&r.files);
+        let acts = r.plan.on_cancel(&Source { files: &files });
         runs::log(&self.hub, run, seq, "cancel", None, Some(serde_json::json!({ "reason": reason }).to_string())).await?;
         Box::pin(self.actions(run, acts)).await
     }
@@ -877,7 +923,8 @@ impl Dispatch {
         };
         let row = self.hub.store.run(run.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("no run"))?;
         let repo = self.hub.store.repos().await?.into_iter().find(|r| r.id == row.repo_id).ok_or_else(|| anyhow::anyhow!("no repository"))?;
-        let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &HashMap::new() }).map_err(|e| anyhow::anyhow!(e))?;
+        let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
+        let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &files }).map_err(|e| anyhow::anyhow!(e))?;
         let run_owned = run.to_owned();
         let log: Vec<(i64, String, Option<String>, Option<String>)> = self.hub.store.call(move |c| {
             let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 ORDER BY seq")?;
@@ -889,11 +936,11 @@ impl Dispatch {
             seq = s;
             match kind.as_str() {
                 "cancel" => {
-                    let _ = plan.on_cancel(&Source { files: &HashMap::new() });
+                    let _ = plan.on_cancel(&Source { files: &files });
                 }
                 _ => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
-                    let _ = plan.on_leg_finished(leg.as_deref().unwrap_or_default(), rep, &Source { files: &HashMap::new() });
+                    let _ = plan.on_leg_finished(leg.as_deref().unwrap_or_default(), rep, &Source { files: &files });
                 }
             }
         }
@@ -907,7 +954,7 @@ impl Dispatch {
         let event = v.get("event").and_then(|e| serde_json::from_value::<Event>(e.clone()).ok()).unwrap_or_else(|| Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() });
         let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
         let path = run_path(&input.github);
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq };
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());

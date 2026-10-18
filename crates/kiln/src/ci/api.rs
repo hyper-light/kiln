@@ -71,9 +71,21 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
     match (&method, rest) {
         // W02: workflows.
         (&Method::POST, ["validate"]) => workflows::validate(req.into_body()).await,
+        // W04-R29: a plan without a run.
+        (&Method::POST, ["plan-preview"]) => super::preview::route(hub, req.into_body()).await,
         (&Method::GET, ["schema", kind]) => workflows::schema(kind),
         (&Method::GET, ["repos", repo, "workflows"]) => workflows::list(hub, repo, q).await,
         (&Method::GET, ["repos", repo, "workflows", path @ ..]) => workflows::get(hub, repo, &path.join("/"), q).await,
+        // W10-R12: the OIDC issuer's status, keys to publish, rotation.
+        (_, ["oidc", tail @ ..]) => {
+            let body: serde_json::Value = if method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+            super::oidc::admin(hub, &method, tail, body).await
+        }
+        // W07-R04, R12: action policies, the catalog, prefetching.
+        (_, ["actions", tail @ ..]) => {
+            let body: serde_json::Value = if method == Method::PUT || method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
+            super::actions::route(hub, &method, tail, q, body).await
+        }
         // W09: secrets (names only) and variables.
         (_, ["secrets", ..] | ["variables", ..]) => super::secrets::route(hub, &method, rest, q, req.into_body()).await,
         // W11: integrations, shared by jobs and deployments (docs/cd-targets.md §6, §7.1).

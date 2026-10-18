@@ -380,7 +380,7 @@ fn w04_ac04_inputs_outputs_secrets_permissions() {
     assert_eq!(r.queued, vec!["call / inner"]);
     let inner = r.spec("call / inner");
     assert_eq!(inner.job, "call/inner");
-    assert_eq!(inner.inputs, serde_json::json!({"n": 3.0, "flag": true, "s": "d"}));
+    assert_eq!(inner.inputs, serde_json::json!({"n": 3, "flag": true, "s": "d"}));
     assert_eq!(inner.secrets, SecretsSpec::Run);
     // write-all in the callee is cut down to the caller's.
     assert_eq!((inner.permissions.level("contents"), inner.permissions.level("issues")), (perms::Level::Read, perms::Level::None));
@@ -499,7 +499,7 @@ fn w04_ac05_shard_and_chunk() {
     assert_eq!(r.queued.len(), 3);
     let items: Vec<Vec<String>> = r.queued.iter().map(|k| r.spec(k).items).collect();
     assert_eq!(items.iter().map(Vec::len).sum::<usize>(), 8);
-    assert_eq!(at(&r.spec(r.queued.first().map_or("", String::as_str)).matrix, "/shard"), serde_json::json!({"index": 0.0, "total": 3.0}));
+    assert_eq!(at(&r.spec(r.queued.first().map_or("", String::as_str)).matrix, "/shard"), serde_json::json!({"index": 0, "total": 3}));
     // chunk: 10 items, 4 a leg.
     let chunk = "name: k\non: push\njobs:\n  t:\n    strategy:\n      chunk: { items: '${{ fromJSON(''[1,2,3,4,5,6,7,8,9,10]'') }}', size: 4 }\n    steps: [{run: t}]\n";
     let r = Run::kiln(chunk);
@@ -612,5 +612,14 @@ fn preview_matches_what_a_run_queues() -> Result<(), String> {
     assert_eq!(p.legs.iter().map(|l| l.key.as_str()).collect::<Vec<_>>(), vec!["a (1)", "a (2)", "b"]);
     assert!(p.decided.iter().any(|d| d.job == "c" && d.conclusion == Conclusion::Skipped));
     assert_eq!(p.later, vec!["b"]);
+    Ok(())
+}
+
+#[test]
+fn preview_lists_the_combinations_exclude_removed() -> Result<(), String> {
+    let src = "on: push\njobs:\n  t:\n    runs-on: x\n    strategy:\n      matrix:\n        os: [linux, mac]\n        node: [20, 22]\n        exclude:\n          - {os: linux, node: 99}\n          - {os: mac, node: 20}\n    steps: [{run: t}]\n";
+    let p = RunPlan::preview(workflow(src, Dialect::Gha), RunInput { trusted: true, ..RunInput::default() }, Settings::default(), &NoSource)?;
+    assert_eq!(p.legs.len(), 3);
+    assert_eq!(p.removed.get("t").cloned().unwrap_or_default(), vec![(serde_json::json!({"os": "mac", "node": 20}), "removed by exclude entry 2".to_owned())]);
     Ok(())
 }

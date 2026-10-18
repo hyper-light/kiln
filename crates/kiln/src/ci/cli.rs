@@ -111,6 +111,142 @@ impl Api {
     }
 }
 
+#[derive(clap::Args)]
+pub struct OidcArgs {
+    #[arg(long, env = "KILN_URL", global = true)]
+    url: Option<String>,
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    token: Option<String>,
+    #[command(subcommand)]
+    cmd: OidcCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum OidcCmd {
+    /// The issuer, its keys and which one signs.
+    Status,
+    /// The published key set (JWKS), for providers that take keys pasted in (Google Cloud, …).
+    Jwks,
+    /// Write the discovery document and keys to a directory for a static host (W10-R12): serve it
+    /// at the issuer URL (`[ci.oidc] issuer`). Run it again within 7 days of each new key (`kiln
+    /// oidc status`), or set `[ci.oidc] publish_dir` and the server keeps it written.
+    Publish {
+        #[arg(long)]
+        to: std::path::PathBuf,
+    },
+    /// Make a new signing key: it signs in 7 days, or at once with `--now`.
+    Rotate {
+        #[arg(long)]
+        now: bool,
+    },
+}
+
+/// `kiln oidc`.
+pub async fn oidc(args: OidcArgs, cfg: &Config) -> Result<()> {
+    let api = Api::connect(cfg, args.url.as_deref(), args.token.as_deref()).await?;
+    match args.cmd {
+        OidcCmd::Status => {
+            let v = api.call(Method::Get, "/oidc", None).await?;
+            println!("issuer {}", v.get("issuer").and_then(Value::as_str).unwrap_or_default());
+            for k in v.get("keys").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let flag = |n: &str| k.get(n).and_then(Value::as_bool).unwrap_or(false);
+                println!("{}  signs from {}{}{}", k.get("kid").and_then(Value::as_str).unwrap_or_default(), when(k.get("sign_from").and_then(Value::as_i64)), if flag("signing") { "  signing" } else { "" }, if flag("published") { "  published" } else { "" });
+            }
+        }
+        OidcCmd::Jwks => {
+            let v = api.call(Method::Get, "/oidc/jwks-export", None).await?;
+            println!("{}", serde_json::to_string_pretty(v.get("jwks").unwrap_or(&Value::Null))?);
+        }
+        OidcCmd::Publish { to } => {
+            let v = api.call(Method::Get, "/oidc/jwks-export", None).await?;
+            let (Some(discovery), Some(jwks)) = (v.get("discovery"), v.get("jwks")) else { bail!("the server sent no documents") };
+            super::oidc::write_published(&to, discovery, jwks)?;
+            println!("wrote the discovery document and keys to {}; serve it at {}", to.display(), v.get("issuer").and_then(Value::as_str).unwrap_or_default());
+        }
+        OidcCmd::Rotate { now } => {
+            let v = api.call(Method::Post, "/oidc/rotate", Some(json!({ "now": now }))).await?;
+            println!("a new signing key, signing from {}", when(v.get("sign_from").and_then(Value::as_i64)));
+        }
+    }
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct ActionsArgs {
+    #[arg(long, env = "KILN_URL", global = true)]
+    url: Option<String>,
+    #[arg(long, env = "KILN_ADMIN_TOKEN", hide_env_values = true, global = true)]
+    token: Option<String>,
+    #[command(subcommand)]
+    cmd: ActionsCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum ActionsCmd {
+    /// The mirrored actions whose name has QUERY, with their newest versions.
+    List { query: Option<String> },
+    /// Mirror `[ci.actions] prefetch` now, for a server that will run without reaching GitHub.
+    Sync,
+    /// The action policy: the server's, and a repository's with `--repo`. `--set` replaces the
+    /// repository's with the flags given; `--clear` removes it.
+    Policy {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        set: bool,
+        #[arg(long)]
+        clear: bool,
+        /// `owner/repo[/path][@ref]` globs a run may use (repeatable).
+        #[arg(long)]
+        allow: Vec<String>,
+        #[arg(long)]
+        deny: Vec<String>,
+        #[arg(long)]
+        require_sha_pins: bool,
+    },
+}
+
+/// `kiln actions`.
+pub async fn actions(args: ActionsArgs, cfg: &Config) -> Result<()> {
+    let api = Api::connect(cfg, args.url.as_deref(), args.token.as_deref()).await?;
+    match args.cmd {
+        ActionsCmd::List { query } => {
+            let v = api.call(Method::Get, &format!("/actions?q={}", enc(query.as_deref().unwrap_or_default())), None).await?;
+            for a in v.get("actions").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let versions: Vec<String> = a.get("versions").and_then(Value::as_array).cloned().unwrap_or_default().iter().take(5).filter_map(|x| x.get("ref").and_then(Value::as_str).map(str::to_owned)).collect();
+                let about = a.pointer("/action/description").and_then(Value::as_str).unwrap_or_default().lines().next().unwrap_or_default().to_owned();
+                println!("{:<44} {:<28} {about}", a.get("uses").and_then(Value::as_str).unwrap_or_default(), versions.join(" "));
+            }
+        }
+        ActionsCmd::Sync => {
+            let v = api.call(Method::Post, "/actions/sync", Some(json!({}))).await?;
+            let list = v.get("synced").and_then(Value::as_array).cloned().unwrap_or_default();
+            if list.is_empty() {
+                println!("nothing to mirror: `[ci.actions] prefetch` is empty");
+            }
+            for s in list {
+                let uses = s.get("uses").and_then(Value::as_str).unwrap_or_default();
+                match (s.get("sha").and_then(Value::as_str), s.get("error").and_then(Value::as_str)) {
+                    (Some(sha), _) => println!("{uses} → {sha}"),
+                    (_, e) => println!("{uses}: {}", e.unwrap_or("failed")),
+                }
+            }
+        }
+        ActionsCmd::Policy { repo, set, clear, allow, deny, require_sha_pins } => {
+            let q = repo.as_deref().map(|r| format!("?repo={}", enc(r))).unwrap_or_default();
+            let v = match (set, clear) {
+                (true, true) => bail!("--set or --clear, not both"),
+                (true, false) if repo.is_some() => api.call(Method::Put, &format!("/actions/policy{q}"), Some(json!({ "allow": allow, "deny": deny, "require_sha_pins": require_sha_pins }))).await?,
+                (false, true) if repo.is_some() => api.call(Method::Delete, &format!("/actions/policy{q}"), None).await?,
+                (false, false) => api.call(Method::Get, &format!("/actions/policy{q}"), None).await?,
+                _ => bail!("the server's policy is `[ci.actions]` in its config; --set and --clear take a --repo"),
+            };
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+    }
+    Ok(())
+}
+
 /// Percent-encodes a query value.
 fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()

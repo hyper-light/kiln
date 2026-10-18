@@ -18,7 +18,7 @@ runs the same way on bare metal and on Kubernetes.
 | Full machine control from the UI | PTY-backed terminal sessions (xterm.js + WebGL), full TTY semantics: resize, raw mode, alt-screen TUIs (k9s, htop, vim). |
 | Starts on boot, self-healing without systemd/K8s | `kiln supervise` is a tiny parent process that restarts the server with exponential backoff and reaps zombies (works as PID 1). Boot hook: systemd unit if present, else `@reboot` crontab, else XDG autostart. Inside the server, every subsystem is a supervised task that is restarted on error (Erlang-style). |
 | Never panic | Workspace lints deny `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`, unchecked indexing. Task boundaries additionally use `catch_unwind` as a last line of defence. |
-| Containerizable, single distribution | Static musl binary; the UI's static files (TanStack Start's client build) embedded with `rust-embed`; pages and React Server Components rendered by the UI server, which the kiln server runs under Bun (in the image; see [The web UI](#the-web-ui)). |
+| Containerizable, single distribution | One file: a static musl binary on Linux. It embeds the UI's static files (TanStack Start's client build, with `rust-embed`) and carries the UI server: Bun, pinned in `vendor/bun`, and TanStack Start's server build, which render pages and React Server Components. The server unpacks and runs them itself (see [The web UI](#the-web-ui)). |
 | Install with or without passwords | `kiln install` is interactive by default; `--unattended` never prompts (uses `sudo -n` or user-level install only, generates secrets itself and writes them `0600`). |
 | No paid services | Everything here is open source and self-hosted. |
 
@@ -44,12 +44,21 @@ The UI (`ui/`) is a TanStack Start app with React Server Components.
   Start's server build (`ui/dist/server`) run by Bun (`ui/server/main.ts`). The kiln server starts it
   on a loopback port, forwards the UI's requests to it with streaming both ways, and starts it
   again if it exits (`crate::uiserver`). The UI server stops when kiln does.
+- **kiln carries it** (`vendor/bun/README.md`): `npm run build` packs Bun, pinned per platform in
+  `vendor/bun/bun.json` and checked against it, with the UI server's files (`ui/dist/embed/`), and
+  the kiln binary embeds them. A server unpacks them once into `<data dir>/ui-server/<hash>/` (a
+  folder named for what's in it, renamed into place once whole) and runs them. On Linux, Bun's musl
+  build runs through the musl loader it came with, so it needs nothing installed, on glibc or musl.
 - **Without Bun or the UI server's files:** every page is the app's shell (`_shell.html`, rendered
-  at build time), and the app runs in the browser.
+  at build time), and the app runs in the browser. That's a kiln built without them
+  (`KILN_UI_SERVER=off`, or a build that couldn't download Bun, which says so).
 - **The API stays with the kiln server.** Server functions reach it on its own listener, carrying
   the visitor's cookie.
-- **Where it looks:** `KILN_UI_DIR` (default `/usr/local/lib/kiln/ui`) and `KILN_BUN` (default:
-  `bun` on the PATH).
+- **Where it looks:** a Bun and files of your own first, when `KILN_BUN` (default: `bun` on the
+  PATH) or `KILN_UI_DIR` (default `/usr/local/lib/kiln/ui`) is set. Then the one kiln carries,
+  unpacked into the data directory, or into `KILN_UI_SERVER_DIR` (a private folder that lets
+  programs run, for a data directory mounted noexec: kiln says so when it can't run from there).
+  Then `/usr/local/lib/kiln/ui`, where older images put them.
 - **HTTP/1.1 and HTTP/2:** the kiln server's listener speaks both (`crate::http::server`). Over TLS
   (`server.https`) the browser picks by ALPN. In the clear, HTTP/2 opens with its preface, which is
   how the front door passes a browser's HTTP/2 on. Handlers see every request shaped as HTTP/1.1's:

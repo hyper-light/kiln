@@ -174,13 +174,13 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W01 | Expressions | none | done | GitHub's 1,020 vectors pass; v1 corpus identical; 3.2 M evals/s |
 | W02 | Workflow model, dialects, validation | W01 (parser) | done (AC09 with W03, W05) | 457 real workflows, no errors; 32 codes at exact positions; v1 plans identical (2,392 jobs); 10⁵ mutations |
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
-| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit); preview and fixtures left |
+| W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10 |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; background steps, matchers left |
-| W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local, Docker; `actions/checkout@v4` unmodified; `$/`, policy left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps left |
+| W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
-| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken); principals and roles left |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing); principals and roles left |
 | W11 | Integrations and credential broker | W10 | in progress (CD, branch cd-design) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope, the `oci` kind (any OCI registry, Docker Hub first); cloud `mint()` (AWS, Google Cloud, Azure) next |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | in progress | host with job containers, services, Docker actions; the docker executor with kiln-built Ubuntu runner images; probes, pools, microVMs, k8s left |
@@ -192,7 +192,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | blocked (W05) | |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | ready (ops registry) | |
 | W21 | UI | each backend it shows | in progress | the CI API the pages read (runs, graph, legs, annotations, summaries, artifacts, routing explain); the pages left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC02 first batch (16 actions: 12 green, 4 hit a DNS outage) |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC02: 39 of F-21's 50 green, the rest waiting on W14, W18, accounts |
 
 ---
 
@@ -1426,10 +1426,19 @@ contexts to every later evaluation, and plan previews to W20 and W21.
   - `preview` (R29's core).
   - Tests: 42 unit tests (AC03 to AC06, S01 to S05) and the AC02 property test.
   - `ci/runs.rs` persists runs and legs; `ci_plans` and `ci_plan_log` rebuild a plan by replay.
+  - Reusable workflows reach the planner (`ci/reusable.rs`): the commit's own files, and remote
+    ones pinned through W07's mirror, nested; checked end to end on a local server.
+  - R29: `POST /api/ci/plan-preview` (`crates/kiln/src/ci/preview.rs`). It takes a workflow
+    being edited or a commit's, for any event at a ref and commit. It returns:
+    - diagnostics;
+    - whether the event starts it, and why not, including action-policy refusals;
+    - the plan the dispatcher makes with a real run's contexts, variables and reusable
+      workflows, each leg with its routing against the runners connected now (W05-R20);
+    - the decisions and their reasons;
+    - the combinations `exclude` and `where` removed;
+    - the jobs decided only once their needs finish.
 - *Left.*
-  - `POST /api/ci/plan-preview`.
   - Fixtures F-10 to F-15, AC07 and AC08 end to end.
-  - Remote reusable workflows (W07's mirror).
   - The live checks of AC04 and AC06.
 
 ### W05 Scheduler: queues, concurrency, priorities, routing, retries
@@ -1904,11 +1913,20 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     - a step's background processes kept until the leg ends.
   - `uses:` steps (W07), with pre and post steps (R11).
   - Runners announce `CAP_CI2` and `CAP_ACTIONS`.
+  - Problem matchers (R06), GitHub-exact, in `kiln_ci::runner::matchers`:
+    - matchers last the job; newer ones come first and replace an owner's;
+    - multi-line patterns, with `loop`;
+    - .NET's regular expressions (lookaround included);
+    - GitHub's validation messages.
+    A matched line becomes an annotation in its place. Its file is kept when it is one of the
+    repository's. setup-node's tsc matcher annotated a real type error end to end.
+  - A command that fails fails its step, as on GitHub, with "Unable to process command '…'
+    successfully.": an unreadable matcher file, a disabled `set-env`, a bad `echo` value.
 - *Left.*
   - Background steps (R17). The plan: a background step's process runs in its own task, with
     its own masker and command processor. Its environment, path and outputs are applied at its
     `wait`, in declared order.
-  - Problem matchers, `KILN_OUTPUT_JSON` and `exports`.
+  - `KILN_OUTPUT_JSON` and `exports`.
   - Debug (R13).
   - AC01 (toolkit conformance), AC04 on macOS and Windows, AC05 to AC08.
 
@@ -2035,11 +2053,25 @@ Gives step execution for `uses:`.
     - R08: outputs.
     - R06: Docker actions (Dockerfile and `docker://`), on hosts with Docker (W13).
   - `actions/checkout@v4` runs unmodified end to end against the git facade (W14).
+  - R01's `$/path`: resolved to the run's own commit and served from the repository's mirror,
+    to that repository's legs only. No checkout is needed.
+  - R02 through reusable workflows: their calls are followed when the run starts, and the
+    actions of the workflows they call are pinned with the rest.
+  - R04 (`kiln_ci::policy`, AC05's unit tests):
+    - `[ci.actions] allow`, `deny`, `require_sha_pins` (`KCI4021`) and `prefetch`;
+    - repositories' own narrower policies (`/api/ci/actions/policy?repo=`, `kiln actions
+      policy`);
+    - checked on every call and action before the run starts; a refusal is the run's startup
+      failure, and the plan preview lists refusals too;
+    - each run's resolutions audited: who, which ref, which commit;
+    - `kiln actions sync` mirrors `prefetch`.
+  - R12: `GET /api/ci/actions?q=` (`kiln actions list`): the mirrored actions, their newest
+    versions and their `action.yml`.
 - *Left.*
-  - R01's `$/path`, `kiln://` and `kiln/*`.
+  - R01's `kiln://` and `kiln/*`.
   - The pins on the run page, "rerun with fresh actions", `[[ci.actions.sources]]`, and storing
     tarballs in W08's store (today they are files under `<data>/actions/tar`).
-  - R04, R09 beyond checkout (with W14's REST facade), R10, R11, R12.
+  - R09 beyond checkout (with W14's REST facade), R10, R11, R12's built-ins.
   - musl Node for Alpine job containers, with W13.
   - AC01 to AC06.
 
@@ -2482,19 +2514,34 @@ elsewhere (G-24, G-33).
     - `crates/kiln/src/ci/oidc.rs`: RS256 keys sealed by the master key, the open discovery and
       JWKS documents, and `/_kiln/oidc/token` for legs granted `id-token: write` (R07);
     - untrusted runs get no ID tokens unless `[ci.oidc] untrusted` (R10).
+  - Workload tokens (R11, the CD half): `kiln_ci::oidc::workload_claims` gives a CD sync a deploy
+    job's subject (`repo:<owner>/<repo>:environment:<env>`), so one trust policy per environment
+    covers both; `kiln_source`, `kiln_app`, `kiln_deployment` and `kiln_trigger` tell them apart.
+    `ci::oidc::mint` signs them for the broker (W11).
+  - Publishing (R12): `/api/ci/oidc` (status, `jwks-export`, `rotate`, `publish`); `kiln oidc
+    status | jwks | publish --to <dir> | rotate [--now]`; `[ci.oidc] publish_dir`, rewritten by
+    the hourly upkeep and at each rotation, each file replaced by rename. AC07: a verifier that
+    reads only the published files accepts the signing and next keys' tokens and refuses
+    unpublished keys, forged bodies and other issuers.
   - Checked end to end on a local server:
     - AC03: `core.getIDToken('sts.amazonaws.com')` returns a token that verifies against the
       published keys, with GitHub's claims;
     - no ID token variables without the permission;
     - the token permissions;
-    - a token refused once its attempt ended.
+    - a token refused once its attempt ended;
+    - `kiln oidc` publishing to a directory, and a rotation's next key published at once;
+    - AC04's Vault case: unmodified `hashicorp/vault-action` logged in to a Vault dev server whose
+      JWT auth trusts kiln's issuer by discovery, and read a secret (a role bound to the
+      branch's subject).
 - *Left.*
   - R01, R02 and R05: principals, capabilities, roles, and the one route table, from access.md.
   - PATs and agent tokens (R03).
   - Kiln's own permission scopes (R04).
-  - Per-repository subject customization (R09; server-wide today), R11, R12 (`kiln oidc
-    publish`, `jwks`).
-  - AC01, AC02, AC04 (real federation, user-assisted), AC07.
+  - Per-repository subject customization (R09; server-wide today).
+  - R11's service and agent subjects (`kiln:<server-id>:service:<name>`, `kiln:agent:<session>`).
+  - R12: `--to s3://… | gs://…` (with W11's cloud modules), the front door serving only the
+    issuer paths, and the Settings → OIDC page (W21).
+  - AC01, AC02, AC04's cloud cases (AWS, Google Cloud, Azure: test tenants, user-assisted).
 
 ### W11 Integrations and the credential broker
 
@@ -2568,7 +2615,10 @@ catalog; this section is the machinery.
 - **W11-AC05 Model providers.** An agent kiln starts calls the Anthropic API with a federated
   token and no stored API key. *E2E, user-assisted.*
 
-**Progress.** Not started.
+**Progress.** Not started. Ownership, agreed 2026-10-18: the Kiln CD lane builds the registry and
+the exchanges (`crates/kiln/src/ci/integrations/`, each kind's `mint()`), on W10's
+`workload_claims` and `ci::oidc::mint`; this lane wires them into jobs (`integrations:`, `kiln
+auth`, W11-R03, R04).
 
 ### W12 Registries
 
@@ -2818,8 +2868,16 @@ enforcement points to W18, agent isolation to W20.
     socket;
   - GitHub's Ubuntu labels prefer it where the runner has Docker, and run on the host otherwise;
   - `kiln/runner-ubuntu-24.04` and `-22.04` are built on the runner the first time a leg needs
-    one, from a Dockerfile kiln carries;
-  - an `ubuntu-latest` leg ran `setup-python` in it end to end.
+    one, from a Dockerfile kiln carries. Each build is tagged by its Dockerfile's digest, so a
+    changed one is built again;
+  - laid out as GitHub's hosted runners are:
+    - the tool cache at `/opt/hostedtoolcache`, kept per image on the host;
+    - `ImageOS`;
+    - steps run as `runner`, a user with the host's uid and gid and passwordless sudo (root on
+      a rootless engine), so what they write stays the host user's;
+  - container and network names carry the whole leg id and a suffix of their own;
+  - `ubuntu-latest` legs ran `setup-python`, `setup-ruby`, `setup-beam`, `setup-php`,
+    `setup-r`, `flutter-action` and the rest of W22-AC02's second batch in it end to end.
 - *Left.*
   - R01's probes and R02.
   - The `firecracker`, `shards` and `k8s` executors (R05 to R07).
@@ -3641,7 +3699,32 @@ live cluster, fault injection, security, performance, and mixed-version fleets.
     `download-artifact` and `checkout`.
   - Failed, and why:
     - `setup-buildx`, `cosign-installer`, `setup-deno` and `setup-zig`: the host's DNS failed
-      during the run (to rerun).
+      during the run. All four passed in the second batch.
+- *AC02, second batch* (2026-10-18): 20 new actions green.
+  - In the `docker` executor: `setup-deno`, `setup-zig`, `cosign-installer`, `setup-dotnet`,
+    `actions-rust-lang/setup-rust-toolchain`, `taiki-e/install-action`, `goreleaser-action`,
+    `setup-beam`, `setup-ruby`, `setup-php`, `setup-gradle` (with `setup-java`),
+    `haskell-actions/setup`, `setup-r`, `setup-julia`, `flutter-action` and `setup-gcloud`.
+  - On the host: `setup-buildx-action`, `login-action`, `metadata-action` and
+    `build-push-action` pushing to a registry service; `golangci-lint-action`.
+- *AC02, third batch* (2026-10-18): `Swatinem/rust-cache` (with its cache), `dorny/paths-filter`
+  on a push, and `hashicorp/vault-action`. vault-action logged in to a local Vault dev server whose
+  JWT auth trusts kiln's issuer by discovery, with a role bound to `repo:acme/e2e:ref:refs/heads/main`,
+  and read a secret. rust-cache's earlier misses were the harness's: no toolchain in the isolated
+  home, then a stray `/tmp/Cargo.toml` above the fixture.
+  - Fixes found on the way:
+    - colliding container names;
+    - root-owned files from container steps;
+    - images that never rebuilt;
+    - the hosted runner's tool cache and `ImageOS`;
+    - problem matchers.
+  - Left of F-21:
+    - `labeler`, `create-pull-request`, `actions-gh-pages` and `upload-sarif`: W14's REST and
+      push;
+    - `attest-build-provenance`: W18;
+    - `setup-qemu-action`: it changes the kernel's binfmt, so it needs a disposable runner;
+    - `codecov`, `configure-aws-credentials`, `amazon-ecr-login`, `google-github-actions/auth`
+      and `azure/login`: accounts (W11-AC03).
     - `setup-python`: GitHub's `python-versions` manifest has builds for Ubuntu only, and the
       host is not Ubuntu. *Fixed:* `ubuntu-latest` legs now run in kiln's Ubuntu runner image
       (W13-R04), where it installs CPython 3.12.

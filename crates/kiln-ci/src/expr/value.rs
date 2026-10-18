@@ -198,6 +198,11 @@ impl Value {
         match self {
             Self::Null => serde_json::Value::Null,
             Self::Bool(b) => serde_json::Value::Bool(*b),
+            // Integral numbers as integers, as GitHub writes them (`20`, not `20.0`).
+            Self::Number(n) if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 && !(*n == 0.0 && n.is_sign_negative()) => {
+                #[allow(clippy::cast_possible_truncation)]
+                serde_json::Value::Number(serde_json::Number::from(*n as i64))
+            }
             Self::Number(n) => serde_json::Number::from_f64(*n).map_or(serde_json::Value::Null, serde_json::Value::Number),
             Self::String(s) => serde_json::Value::String(s.to_string()),
             Self::Array(a) | Self::Filtered(a) => serde_json::Value::Array(a.iter().map(Self::to_json).collect()),

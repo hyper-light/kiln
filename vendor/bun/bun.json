@@ -1,0 +1,26 @@
+{
+  "comment": "The Bun kiln carries to run its UI server (ui/server/main.ts), pinned: each platform's official release by file name and SHA-256 (from the release's SHASUMS256.txt), and, for Linux, the musl runtime that release needs, vendored beside this file (musl/<arch>/) from the oven/bun:<version>-alpine image. ui/scripts/pack-ui-server.mjs checks every hash before packing. To update: see README.md.",
+  "version": "1.4.3",
+  "url": "https://github.com/oven-sh/bun/releases/download/bun-v{version}/{file}",
+  "platforms": {
+    "linux-x86_64": { "file": "bun-linux-x64-musl-baseline.zip", "sha256": "4b5b0b5503f6ebf15161e8c56eb5a263134c05cd98a86dc11ee43ac5bda9862e", "musl": "x86_64" },
+    "linux-aarch64": { "file": "bun-linux-aarch64-musl.zip", "sha256": "8de8a0003cc2707bb555887e3d450e24e1edf3f605f491393e89ed61a8853420", "musl": "aarch64" },
+    "macos-x86_64": { "file": "bun-darwin-x64-baseline.zip", "sha256": "0fde04e8b092156b97fe6432e899baf16d9ed6ce52cbb4218d2d9c07a2f827ef" },
+    "macos-aarch64": { "file": "bun-darwin-aarch64.zip", "sha256": "80afd4c069b46a6fa8f3ec520bebc750a7843e4a8d5b9583d29ad436c00a3403" },
+    "windows-x86_64": { "file": "bun-windows-x64-baseline.zip", "sha256": "d7a7d3eb216614544aab0cde2d8d9f2e4e87839bf5a30a1cd11d077f02d84e0c" }
+  },
+  "musl": {
+    "alpine": "3.24.2",
+    "packages": ["musl-1.2.6-r2", "libstdc++-15.2.0-r5", "libgcc-15.2.0-r5"],
+    "x86_64": {
+      "ld-musl-x86_64.so.1": "38d022ce7425ff105ccfb53598f606e6e5f5f0a34bfbc793d65e6f34c9d72806",
+      "libstdc++.so.6": "67a940194aec6c44c3eb47a98e44c53d248e4dac5f4eb57c0971c0d6286eafe5",
+      "libgcc_s.so.1": "5ea51dd885b6fc691eccc569d0bda739204204f6161e97075b26dc9c050d1ca1"
+    },
+    "aarch64": {
+      "ld-musl-aarch64.so.1": "32377e6d71725bb019e9ff6d5e9f16b4d5156d6f2c36504191c2d6a7c4d4a44d",
+      "libstdc++.so.6": "bc958507db0cacf75cbf7298c395fbc7596667b17e1283d98bd6cfe3e59df951",
+      "libgcc_s.so.1": "b83bc14b3e1660d66b0387077aea7e104fce3ed93bb56d05e30e4e2cdb37b473"
+    }
+  }
+}
