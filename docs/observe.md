@@ -18,9 +18,9 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
-| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets); next: live tail, patterns | in progress |
+| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); next: live tail, patterns | in progress |
 | O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; next: anomaly, forecast, composite | in progress |
-| O-8 | Dashboards and explorers in the UI | planned |
+| O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub done; next: AWS, GCP, Azure | in progress |
 | O-10 | Load, soak and fault scenarios end to end; profiles; allocation and fault passes | continuous |
 
@@ -146,8 +146,13 @@ run-length encoded; `service`, `host`, `source` dictionary-encoded and run-lengt
 and `attributes` compressed together per block; trace ids raw. Each block carries the minimum and
 maximum of `ts`, the dictionaries, and a Bloom filter over the message's tokens sized for
 `LOG_BLOOM_FPR` (Bloom 1970; `k = (m/n) ln 2` hashes with Kirsch and Mitzenmacher's double hashing,
-2006), so a search reads only blocks that may match and the time range they cover. Events are a
-small log of their own, kept whole.
+2006), so a search reads only blocks that may match and the time range they cover.
+
+Events are records too, of source `kiln.event`: one store, one search. But they are not logs: a
+monitor's own alerts are events at error's severity, and a monitor of `status:error` that counted
+them would count its own alerting. A log monitor, and the logs explorer, read logs only
+(`kiln_obs::monitor::logs_only`: the search and `-source:kiln.event`) unless the search names
+`kiln.event`; the event stream reads events only.
 
 ## 5. Replication
 
@@ -225,7 +230,8 @@ factor     := number | "(" expr ")" | function "(" args ")" | metric_q
 metric_q   := [agg ":"] metric ["{" filters "}"] ["by" "{" tags "}"] modifier*
 agg        := avg | sum | min | max | count | p50 | p75 | p90 | p95 | p99 | pNN.N
 filters    := filter ("," filter)*            // AND; "*" = all
-filter     := ["!"] key ":" value             // value: exact, wildcard "web-*", or (a OR b)
+filter     := ["!"] key ":" value             // value: exact, wildcard "web-*", (a OR b), or
+                                              // "quoted" (any characters, exactly; \" and \\ within)
 modifier   := ".rollup(" fn ["," seconds] ")" | ".as_count()" | ".as_rate()" | ".fill(" how ")"
 function   := rate | per_second | per_minute | derivative | diff | abs | log2 | log10 | cumsum
             | top | bottom | timeshift | moving_avg | ewma | anomalies | forecast | outliers
@@ -243,7 +249,10 @@ anomalies(avg:system.load.1{host:adacachy}, 'seasonal', 3)
 
 Log search follows Datadog's log syntax: `service:web status:error @http.status_code:>=500
 "connection reset" -host:old-*`, with `AND`, `OR`, `NOT`, parentheses, wildcards and ranges, and
-log analytics `count() by {service}` over a search. Events take the same search syntax.
+log analytics `count() by {service}` over a search. A `-` that starts a term is NOT wherever it
+stands (`(a OR b) -env:dev`); one inside a term is the term's (`web-1`). A quoted value holds any
+characters (`@note:"say \"hi\""`), so a facet's every value can be searched for. Events take the
+same search syntax.
 
 ## 7. API
 
@@ -256,15 +265,17 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 | `POST logs/search` | `{query, from, to, limit}` → records newest first, with the blocks pruned |
 | `POST series` | ingest points as Datadog's v1 series API takes them (`metric`, `type`, `tags`, `points` of `[seconds, value]`) |
 | `POST logs` | ingest records as Datadog's log intake takes them (`message`, `timestamp`, `status`, `service`, `hostname`, `ddsource`, `attributes`) |
-| `GET status` | the group: members, leader, term, applied and durable index, series, blocks, bytes, cutoff, this node's writes, each machine's replica, digests |
+| `GET status` | the group: members, leader, term, applied and durable index, series, blocks, bytes on disk (observe's folder, hard-linked snapshot files once), cutoff, this node's writes, each machine's replica, digests (also in hex: a u64 is more than JavaScript's numbers hold) |
 | `POST compact`, `POST verify` | cut and compact the log now; take every replica's full digest (an operator's, or a test's, check that replicas agree) |
-| `POST logs/aggregate` | log analytics: `{query, from, to, by: [facets], measure, of}` → groups |
+| `POST logs/aggregate` | log analytics: `{query, from, to, by: [facets], measure, of}` → groups; with `step` (ms), each group's value a bucket on a grid (the explorer's histogram) |
+| `POST logs/facets` | `{query, from, to, facets, top}` → each facet's most common values and how many it has, every facet in one pass |
+| `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, read-only) and yours, kept in `<observe>/dashboards.json` |
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
-| `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups' |
+| `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups'; validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
-To come: `GET logs/tail` (websocket), dashboards.
+To come: `GET logs/tail` (websocket).
 
 OTLP/HTTP at its standard paths, `/v1/metrics` and `/v1/logs` (protobuf and JSON), on the server and
 on every runner at `127.0.0.1:4318`, so an app on a runner sends to its local runner as it would to
@@ -361,11 +372,38 @@ OAuth 2.0 client credentials).
 
 ## 11. UI
 
-An Observe area: dashboards (a grid of widgets: timeseries, query value, top list, distribution and
-heatmap, table, log stream, event stream, monitor summary, note), with template variables, a time
-range, live refresh; metric, log and event explorers; monitors with their history; integrations.
-Charts are uPlot, already kiln's; a series sent to a chart is reduced to the chart's width with
-largest-triangle-three-buckets (Steinarsson 2013), so a week of 10-second data draws in milliseconds.
+Observe, in kiln's console (`ui/src/views/observe/`), built from the console's own parts (panels,
+facts, the pill tabs, uPlot charts) and its rules: data through Suspense resources, no effects, the
+time range and the search in the address (a page is a link).
+
+- **Overview**: what is in trouble (monitors alerting, warning, without data), the newest events,
+  and the store: series, bytes on disk, from when it keeps, each machine's replica, how far behind it
+  is and whether it holds the same (its full digest at the server's index; "Compare replicas" asks
+  for them).
+- **Dashboards**: Datadog's model near enough. Widgets on a grid of twelve columns (one column on a
+  phone): timeseries (lines, areas or bars), query value, top list, table, log stream, event
+  stream, monitors, note (Markdown). Template variables above them (`$host` in a query stands for
+  `host:<value>`, or any), chosen from the tag's values, kept in the address. Your own are edited in
+  place: add, change, move, resize, remove, then save; kiln's own (hosts, CI, CD) are copied to be
+  changed.
+- **Metrics explorer**: a query, its series over the range and each one's last, average, least and
+  most; with no query, every metric kiln keeps, found by name. A query goes onto a dashboard, or
+  into a monitor, in a step.
+- **Logs explorer and event stream**: a search, a histogram of its records by status (stacked, a
+  bucket of a round size, about 60 to the range), each facet's most common values (a click narrows
+  the search to one, again widens it), the newest 100 records (and 100 more on asking), each opened
+  to its fields and attributes, any one a filter a click away.
+- **Monitors**: their states, in trouble first; each one's groups, what it watches drawn over the
+  range with its thresholds, what it said (its events), mute and unmute; made and edited in a form
+  that checks its query.
+- **Integrations**: added (Slack, Discord, Teams, PagerDuty, webhooks, signed), tested, removed;
+  each one's mention to copy.
+- **Live**: the hosts' samples of the last hour at 5 s, streamed (what the Metrics page was); before
+  that, the Hosts dashboard.
+
+Every chart is uPlot, already kiln's. To come: distribution and heatmap widgets; series reduced to
+the chart's width with largest-triangle-three-buckets (Steinarsson 2013) when a range holds more
+buckets than pixels (today the query's `points` bounds them: 240 a chart).
 
 ## 12. Measurements
 
@@ -530,6 +568,24 @@ store on disk, then searched for the newest 100 over the whole range, nine runs 
 The absent word's one unpruned block is the token filter's false positive, as its 1% rate predicts
 for 111 blocks.
 
+Log analytics over the whole range (every record read), nine runs each; allocations counted by
+hyper-measure's counting allocator:
+
+| aggregation | groups | rows | allocations a row | p50 |
+| --- | --- | --- | --- | --- |
+| `count by {service}` | 4 | 194,690 | 0.0007 (first: 3.04) | 36.7 ms (first: 46.1) |
+| `count by {service,status}` | 10 | 194,690 | 0.0009 (first: 5.04) | 37.4 ms (first: 52.5) |
+| `count by {@application}` | 5 | 194,690 | 0.0008 (first: 3.04) | 41.7 ms (first: 55.3) |
+| `cardinality(host) by {service}` over `status:error` | 2 | 30,000 | 0.0047 (first: 0.064) | 5.5 ms |
+| the explorer's facets: service, host, source, status | 4 | 194,690 | 0.0009 | 50.6 ms (as four scans: 152) |
+| the explorer's histogram: count by status, 60 buckets | 4 | 194,690 | 0.0008 | 37.0 ms |
+
+At first each row allocated its group's key and cloned it to look it up, and each block of a file
+read cloned the block's whole summary (its dictionaries and token filter) to get at its text. Groups
+are now found by their values borrowed from the row (a keyed table of the groups' places; a group's
+key allocated once, when it is new), and a file's block text is read into a buffer kept across
+blocks. What is left is reading: about 1 GB/s of rows decoded, LZ4 included.
+
 ### 12.9 The group: writes through the replicated log
 
 2026-10-18, same machine, NVMe under btrfs (a raw `write` + `fdatasync` there: 2.8 ms for 4 KiB,
@@ -599,6 +655,16 @@ integrations (services in the test) each in its format, a webhook refused once a
 its second try with its signature checked, a recovery that resolves PagerDuty's incident by the
 same key, and muted, a change of state with nothing said; GitHub's webhooks and posted events,
 searched and counted.
+
+**In a browser** (`ui/e2e/observe.mjs`, Playwright against a live server; how to run it is at
+its top): a query explored and put on a new dashboard, which is then given a note, saved and
+deleted; kiln's own dashboard narrowed by its template variable, then copied; logs searched,
+narrowed by a facet and by an attribute of a record, the API answering the page's search alike; a
+monitor made from the form, muted, unmuted and deleted; a signed webhook added, tested (the
+receiver checks the signature) and removed. Each checked through the API, not the page. 2026-10-18:
+all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch); and every Observe page
+loads in both with no error, failed request or sideways overflow, against a server holding two
+hours of metrics, an hour of logs, events, and three monitors alerting to a webhook and to Slack.
 
 To come: full disks, clock skew, load and soak.
 
