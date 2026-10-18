@@ -5,14 +5,16 @@
  * Kept plans are the same ones Agents › Plans lists; everything stays in the page's flow.
  */
 import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { planHref, plansApi, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
 import { SelectField } from "@/components/ui/misc";
+import { useRes } from "@/lib/data";
 import { relativeTime } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
-import { useSuspenseResource } from "@/lib/resource";
+import { invalidate } from "@/lib/resource";
+import { plansRes } from "./data";
 import { PlanItemsEditor } from "./items";
 import "./plans.css";
 
@@ -32,14 +34,14 @@ const MODES: { value: PlanMode; label: string }[] = [
 
 export function PlansHere({ session }: { session: string }) {
   return (
-    <Loadable label="Loading your plans">
-      <Here key={session} session={session} />
+    <Loadable label="your plans">
+      <Here session={session} />
     </Loadable>
   );
 }
 
 function Here({ session }: { session: string }) {
-  const res = useSuspenseResource("plans", (s) => plansApi.list(s));
+  const res = useRes(plansRes);
   const [draft, setDraft] = React.useState<Draft | null>(null);
   const [picked, setPicked] = React.useState("");
   const [mode, setMode] = React.useState<PlanMode>("message");
@@ -61,10 +63,10 @@ function Here({ session }: { session: string }) {
     setBusy(true);
     setError(null);
     try {
-      // Emptied, the title is taken from the plan (its overview, else its first step).
-      const body = { title: draft.title.trim(), body: draft.body, items: draft.items };
+      const body = { title: draft.title.trim() || undefined, body: draft.body, items: draft.items };
       const p = draft.id ? await plansApi.update(draft.id, body) : await plansApi.create({ ...body, source: { session } });
       res.setData((l) => [p, ...l.filter((x) => x.id !== p.id)]);
+      invalidate("plans/");
       setPicked(p.id);
       setDraft(null);
       setNote(draft.id ? `Saved as version ${p.version}.` : "Saved.");
@@ -81,8 +83,6 @@ function Here({ session }: { session: string }) {
     setRan(null);
     try {
       setRan(await plansApi.run(plan.id, { session }, steps(plan) ? mode : "message"));
-      // Its run count.
-      res.reload();
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -98,7 +98,7 @@ function Here({ session }: { session: string }) {
             Title
           </label>
           <div className="field">
-            <input id={`ph-title-${session}`} value={draft.title} placeholder="From the overview, or the first step, when left empty" onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
+            <input id={`ph-title-${session}`} value={draft.title} placeholder="From the first step when left empty" onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
           </div>
         </div>
         <div>

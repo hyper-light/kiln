@@ -7,6 +7,7 @@
 //! * [`codex`] — Codex over its app-server (JSON-RPC v2).
 //! * [`acp`] — any Agent Client Protocol agent (Gemini CLI, opencode, Goose, Amp's adapter).
 //! * [`diff`] — line diffs for edit previews.
+//! * [`handoff`] — a conversation carried from one harness to another (switching models across them).
 //! * [`kinds`] — the registry of harnesses and their adapters.
 //! * [`session`] — one agent session: the harness process, its adapter and its state.
 //! * [`host`] — a machine's sessions: limits, commands, continuing them after a restart.
@@ -21,6 +22,7 @@ pub mod codex;
 pub mod core;
 pub mod diff;
 pub mod elicit;
+pub mod handoff;
 pub mod host;
 pub mod kinds;
 pub mod model;

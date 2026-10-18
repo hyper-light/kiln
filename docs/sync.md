@@ -1,7 +1,9 @@
 # Repo sync
 
 > **Phases 1 and 2 are built:** the engine, each repo's Raft group, the server and runner sides,
-> the API and the synced folders on the Repositories page. Git refs (phase 3) and voters on machines (phase 4) are not yet.
+> the API and the synced folders on the Repositories page. So are [repositories on machines](#repositories-on-machines):
+> what each machine holds, and cloning, syncing and moving a repository between machines. Git refs
+> (phase 3) and voters on machines (phase 4) are not yet.
 
 ## Using it
 
@@ -114,6 +116,88 @@ back, with the `base` it had, and go through the conflict rule.
 - **Blobs.** The server keeps every blob a step names until each copy has applied it, then drops
   it. A copy asks the server for what it lacks before applying a step.
 
+## Repositories on machines
+
+The Repositories page lists every repository kiln knows of once: the ones it builds, the synced
+ones, and every git repository a machine holds, each with the machines it is on. It filters by kind,
+machine, OS, architecture, machine labels and state (each option counting what it would show) and
+sorts by name, machines, activity, latest run, last poll or age, as the agents list does. A
+repository opens under its row: where it is (each folder: a synced copy, kiln's clone, or one that
+was there; its branch, commit, what isn't committed or pushed, how it syncs), the tasks that put it
+there, and forms to put it on more machines, move it, or give a folder up.
+
+**Where repositories are.** Each runner looks at its machine's git repositories when it connects,
+every five minutes and when asked (*Look again*): home one level deep, two levels deep under its
+usual folders (`~/Projects`, `~/src`, `~/code`, `~/dev`, `~/Developer`, `~/work`, `~/repos`, `~/git`,
+`~/workspace`, `~/go/src`), the clones kiln made there (`<state>/sync/clones.json`) and its synced
+copies, wherever they are. Hidden folders, symlinks, dependencies and build output are not looked
+in, nor is a repository's inside; a look reports 400 repositories at the most. Git reports each one
+without taking a lock a person's git would trip over (`--no-optional-locks`): its remote (never its
+credentials: `https://token@host/…` is sent as `https://host/…`), branch, commit, upstream with how
+far ahead and behind, and how many tracked files changed. The server keeps what each machine last
+said (`<data>/sync/places.json`), so an offline machine's repositories still show.
+
+A repository is known by its **key**, its remote without scheme, user, credentials or `.git`
+(`github.com/hyper-light/kiln`): a clone over ssh and one over https are one repository, and so are
+the repository kiln builds and the clones of it. A synced repo joins the repository kiln builds of
+its name, else the one its copies' remote names. One with no remote is a place of its own.
+
+**Putting a repository on machines.** Any machines at once, picked one by one or by OS,
+architecture or label, each with a folder of its own: a whole path, or `~/…`, which is where that
+machine says its home is (`C:\Users\…` on Windows). It defaults to where the source is under its
+home (`~/Projects/kiln` stays `~/Projects/kiln`). A folder must be absent or empty: kiln never clones
+over files.
+
+- **Clone with git**: each machine gets a clone of its own, its commits and branches, from kiln's
+  mirror of a repository it builds (a clean checkout of a branch), from a machine that has it, or
+  from its remote (each machine fetching it itself). Work not committed stays where it is.
+- **Keep in sync**: each new folder is cloned, then joins the repo's sync group as a folder that
+  **adopts** the group's files: it proposes nothing until the log has brought it through the index
+  it joined at, the log's version of each file replaces its own, and what it holds that the group
+  doesn't (a file the source deleted and didn't commit) goes, unless it changed there meanwhile. A
+  clone of the source's commit becomes the source's working tree, uncommitted work and all, with no
+  conflict copies; from then on it is a copy like any other. A repository not synced yet starts its
+  group from the source folder, once that copy has looked at its folder and is in step (cloned from
+  kiln's mirror, the first new folder starts it). Only a folder the task itself cloned adopts: one
+  kiln made before joins as it is, so nothing changed in it is lost.
+- **Move** (a folder to another machine, or another folder): as a sync, to one place. Once the new
+  folder is in step, and the old one too (nothing of it still on its way), the old copy leaves the
+  group; a folder that wasn't synced gets a group for the move alone, which stops once it is done.
+  Every branch of the source becomes a branch of the new clone. With *delete the old folder*, the
+  old machine deletes it last.
+- **Remove** a place: a copy stops syncing there, kiln forgets its clone, and, if asked, the folder
+  goes.
+
+Nothing travels but over kiln's links, the ports it already uses. Commits go as a git bundle (the
+branches, tags and `HEAD`; not remote-tracking branches, not a mirror's pull requests): kiln makes
+it from its mirror, or the source machine makes it and sends it to the server (`PUT
+/api/sync/bundles/:batch`, hashed as it comes); each machine fetches it from the server (`GET`,
+checked against its SHA-256) and clones it, then points `origin` at the repository's real remote.
+Working trees go through the group, as any sync does. The bundle is deleted when its batch is done.
+
+**Deleting a folder** is the runner's call: only a real folder (no symlink) at least two levels
+below the root, never home, never one that holds kiln's state or its binary, never a folder still
+synced there, and, when the repository has a remote, only if its `origin` is still that remote.
+
+**Tasks.** Each machine's part is a task, the tasks started together a batch, driven by the server
+(`crate::sync::tasks`, kept in `<data>/sync/tasks.json`): *queued*, *bundling*, *fetching*,
+*cloning*, *joining*, *catching up*, *leaving*, *deleting*, then *done* or *failed*. The runner says
+how its part goes as it goes (progress while bytes move, and again every few seconds while it works,
+and after a reconnect); a machine silent for three minutes, or away for ten, fails its task. A task
+the server's restart cut short fails too. *Start it again* finds what is done already (kiln's clone
+in the folder, the copy in the group) and carries on from there.
+
+**Messages**, inside `Sync` on the sync lane, to runners announcing `CAP_REPOS` (`1 << 18`); a side
+that doesn't know a kind skips it: `repos` (runner → server: what it holds), `look`, `bundle`
+(`{task, path}`), `clone` (`{task, key, path, bundle, hash, size, url, branch, origin,
+all_branches}`), `delete` (`{task, path, origin}`), `forget` (`{path}`) and `task` (runner → server:
+`{task, state, detail, error, hash, size, branch, head}`). A copy's spec carries `adopt` (the index
+it adopts the group's files through) and its status `looked` and `adopting`.
+
+**Not carried**: what is staged arrives unstaged; stashes, hooks and a repository's own config stay;
+commits made after a sync joined move between copies with `git` (fetch, pull) until git refs
+(phase 3) carry them. Line endings a Windows checkout converts are a difference like any other.
+
 ## API
 
 | Method | Path | |
@@ -125,6 +209,15 @@ back, with the `base` it had, and go through the conflict rule.
 | GET | `/api/sync/:id/conflicts` | conflict copies, with both versions |
 | POST | `/api/sync/:id/conflicts/resolve` | `{path, keep: "name" | "copy" | "both"}` |
 | DELETE | `/api/sync/:id` | stop syncing (every copy's files stay) |
+| GET | `/api/places` | every repository with its places, the machines (home, what their runners can do), the tasks |
+| POST | `/api/places/clone` | `{key, from, branch?, to: [{machine, path}]}`: clone it to those machines (`from`: `{kind: "kiln", repo}`, `{kind: "machine", machine, path}` or `{kind: "url", url}`) |
+| POST | `/api/places/sync` | the same: clone, then keep in sync |
+| POST | `/api/places/move` | `{key, from: {kind: "machine", …}, to: [{machine, path}], delete?}` |
+| POST | `/api/places/remove` | `{key, from: {kind: "machine", …}, delete?}` |
+| POST | `/api/places/look` | every machine looks at its repositories again |
+| POST | `/api/places/tasks/:id/retry` | start a failed task again |
+| DELETE | `/api/places/tasks/:id` | forget a task that is over |
+| GET, PUT | `/api/sync/bundles/:batch?machine=` | a batch's bundle, to and from the machines it names (their sync token) |
 
 ## As built
 

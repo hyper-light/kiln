@@ -5,6 +5,7 @@
 import * as React from "react";
 import type { AgentInfo, Limit, StatusItem } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { useClock } from "./dom";
 import { HarnessMark } from "./parts";
 
 const tone = (pct: number | null) => (pct === null ? "none" : pct >= 90 ? "fail" : pct >= 70 ? "warn" : "ok");
@@ -47,17 +48,8 @@ function amount(l: Limit): string {
   return [of, pct].filter(Boolean).join(" · ") || "—";
 }
 
-function useMinuteClock() {
-  const [now, setNow] = React.useState(() => Date.now());
-  React.useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), 30_000);
-    return () => window.clearInterval(t);
-  }, []);
-  return now;
-}
-
 export function LimitMeter({ limit, compact }: { limit: Limit; compact?: boolean }) {
-  const now = useMinuteClock();
+  const now = useClock(30_000);
   const pct = limit.used_percent;
   const reset = resetsIn(limit.resets_at, now);
   // "5h": the session window, which its label ("Session") doesn't say the length of.

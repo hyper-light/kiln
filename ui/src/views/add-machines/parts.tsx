@@ -26,12 +26,6 @@ export async function copyText(text: string) {
 export function useCopy(): [boolean, (text: string) => void] {
   const [copied, setCopied] = React.useState(false);
   const timer = React.useRef<number | null>(null);
-  React.useEffect(
-    () => () => {
-      if (timer.current !== null) window.clearTimeout(timer.current);
-    },
-    [],
-  );
   const copy = React.useCallback((text: string) => {
     void copyText(text).then(() => {
       setCopied(true);

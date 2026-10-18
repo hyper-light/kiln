@@ -7,14 +7,16 @@
  * passed on as a link.
  */
 import * as React from "react";
-import { Link, useSearchParams } from "react-router";
+import { Link, useSearchParams } from "@/lib/router";
 import { GitBranch } from "lucide-react";
 
 import { appHref, cdApi } from "@/api/cd";
-import type { CdPlan, CdPlanApp, CdPlanAsk, CdPlanChanges, CdPlanDiff, CdPlanObject, CdPlanRepo, CdPlanSync } from "@/api/types";
+import type { CdPlan, CdPlanApp, CdPlanAsk, CdPlanChanges, CdPlanDiff, CdPlanObject, CdPlanSync } from "@/api/types";
 import { Button } from "@/components/ui/button";
-import { EmptyState, ErrorState, SelectField, SkeletonRows, TextField } from "@/components/ui/misc";
-import { useResource } from "@/lib/hooks";
+import { RowsHold } from "@/components/ui/hold";
+import { Loadable } from "@/components/ui/loading";
+import { Crumbs, EmptyState, SelectField, TextField } from "@/components/ui/misc";
+import { invalidate, useSuspenseResource } from "@/lib/resource";
 import { FileDiffView } from "@/views/harness/diff";
 import { RelTime } from "@/views/shared";
 import { StatePair, objectKey, objectLabel } from "./parts";
@@ -218,45 +220,69 @@ function PlanView({ plan, show, onShow, onAgain, busy }: { plan: CdPlan; show: S
   );
 }
 
+function PlansHead() {
+  return (
+    <header className="cd-head">
+      <Crumbs index={3} items={[{ label: "Deployments", to: "/deployments" }, { label: "Deploy plans" }]} />
+      <h1 className="cd-title">Deploy plans</h1>
+      <p className="cd-note">
+        What a branch, a commit or a pull request would deploy before it lands: each commit's own change, the whole stack's against trunk, and what a sync would do against what runs.
+      </p>
+    </header>
+  );
+}
+
 export default function DeployPlans() {
+  return (
+    <div className="container-console page cd-page">
+      <title>Deploy plans · kiln</title>
+      <PlansHead />
+      <Loadable label="the repositories" fallback={<FormHold />}>
+        <PlanForm />
+      </Loadable>
+    </div>
+  );
+}
+
+/** What is planned, as the URL says it. */
+function useAsk() {
   const [params, setParams] = useSearchParams();
   const mode: Mode = params.has("commit") ? "commit" : params.has("pr") ? "pr" : "head";
   const target = (params.get(mode) ?? "").trim();
   const repo = params.get("repo") ?? "";
   const show = (SHOWS.find((x) => x.value === params.get("show"))?.value ?? "own") as Show;
+  return { params, setParams, mode, target, repo, show };
+}
 
-  const repos = useResource((s) => cdApi.planRepos(s), []);
-  const list: CdPlanRepo[] = repos.data?.repos ?? [];
-  const [formRepo, setFormRepo] = React.useState(repo);
-  const [formMode, setFormMode] = React.useState<Mode>(mode);
-  const [formTarget, setFormTarget] = React.useState(target);
+function PlanForm() {
+  const { params, setParams, mode, target, repo, show } = useAsk();
+  const list = useSuspenseResource("cd/plans/repos", (s) => cdApi.planRepos(s)).data.repos;
+  const [form, setForm] = React.useState({ repo, mode, target });
   // The page's own URL changes (back, a link) carry into the form.
-  React.useEffect(() => {
-    setFormRepo(repo);
-    setFormMode(mode);
-    setFormTarget(target);
-  }, [repo, mode, target]);
-  const chosen = list.find((r) => r.url === formRepo) ?? (list.length === 1 ? list[0] : undefined);
+  const [seen, setSeen] = React.useState({ repo, mode, target });
+  if (seen.repo !== repo || seen.mode !== mode || seen.target !== target) {
+    setSeen({ repo, mode, target });
+    setForm({ repo, mode, target });
+  }
+  const [planning, startPlanning] = React.useTransition();
+  const chosen = list.find((r) => r.url === form.repo) ?? (list.length === 1 ? list[0] : undefined);
   const branches = (chosen?.branches ?? []).filter((b) => b.name !== chosen?.default_branch);
 
   const ask: CdPlanAsk | null = target ? { repo: repo || undefined, ...(mode === "pr" ? { pr: Number(target) } : { [mode]: target }) } : null;
-  // Each answer carries what it answers, so a plan of something else never shows as this one's.
   const askKey = JSON.stringify(ask);
-  const plan = useResource(async (s) => ({ key: askKey, plan: ask ? await cdApi.plan(ask, s) : null }), [askKey]);
-  const current = plan.data?.key === askKey ? plan.data.plan : null;
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    const t = formTarget.trim();
+    const t = form.target.trim();
     if (!t) return;
     const next = new URLSearchParams();
-    const r = formRepo || (list.length === 1 ? (list[0]?.url ?? "") : "");
+    const r = form.repo || (list.length === 1 ? (list[0]?.url ?? "") : "");
     if (r) next.set("repo", r);
-    next.set(formMode, formMode === "pr" ? t.replace(/^#/, "") : t);
+    next.set(form.mode, form.mode === "pr" ? t.replace(/^#/, "") : t);
     if (show !== "own") next.set("show", show);
     // The same plan asked for again is planned again.
-    if (next.toString() === params.toString()) plan.reload();
-    else setParams(next);
+    if (next.toString() === params.toString()) invalidate(`cd/plan/${askKey}`);
+    else startPlanning(() => setParams(next));
   };
   const setShow = (s: Show) => {
     const next = new URLSearchParams(params);
@@ -265,55 +291,41 @@ export default function DeployPlans() {
     setParams(next, { replace: true });
   };
   const listId = React.useId();
-  const field = FIELD[formMode];
+  const field = FIELD[form.mode];
 
   return (
-    <div className="container-console page cd-page">
-      <header className="cd-head">
-        <nav className="eyebrow cd-crumbs" aria-label="Breadcrumb">
-          <span className="spectrum-rule" />
-          <Link to="/deployments">03 / Deployments</Link>
-          <span aria-hidden="true">/</span>
-          <span>Deploy plans</span>
-        </nav>
-        <h1 className="cd-title">Deploy plans</h1>
-        <p className="cd-note">
-          What a branch, a commit or a pull request would deploy before it lands: each commit's own change, the whole stack's against trunk, and what a sync
-          would do against what runs.
-        </p>
-      </header>
-
+    <>
       <form className="cd-plan-form" onSubmit={submit} aria-label="What to plan">
         {list.length > 1 && (
           <SelectField
             label="Repository"
-            value={formRepo}
-            onChange={setFormRepo}
+            value={form.repo}
+            onChange={(v) => setForm({ ...form, repo: v })}
             options={[{ value: "", label: "Whichever has it" }, ...list.map((r) => ({ value: r.url, label: `${r.url} · ${plural(r.apps, "app")}` }))]}
             className="cd-plan-repo"
           />
         )}
-        <SelectField label="Plan" value={formMode} onChange={(v) => setFormMode(v as Mode)} options={MODES} className="cd-plan-mode" />
+        <SelectField label="Plan" value={form.mode} onChange={(v) => setForm({ ...form, mode: v as Mode })} options={MODES} className="cd-plan-mode" />
         <TextField
           label={field.label}
-          value={formTarget}
-          onChange={(e) => setFormTarget(e.target.value)}
+          value={form.target}
+          onChange={(e) => setForm({ ...form, target: e.target.value })}
           placeholder={field.placeholder}
-          list={formMode === "head" && branches.length ? listId : undefined}
-          inputMode={formMode === "pr" ? "numeric" : undefined}
+          list={form.mode === "head" && branches.length ? listId : undefined}
+          inputMode={form.mode === "pr" ? "numeric" : undefined}
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
           className="cd-plan-target"
         />
-        {formMode === "head" && branches.length > 0 && (
+        {form.mode === "head" && branches.length > 0 && (
           <datalist id={listId}>
             {branches.map((b) => (
               <option key={b.name} value={b.name} />
             ))}
           </datalist>
         )}
-        <Button type="submit" size="sm" disabled={!formTarget.trim() || plan.loading} className="cd-plan-go">
+        <Button type="submit" size="sm" disabled={!form.target.trim() || planning} className="cd-plan-go">
           Plan
         </Button>
       </form>
@@ -321,23 +333,35 @@ export default function DeployPlans() {
 
       {!ask ? (
         <EmptyState icon={<GitBranch size={20} />} title="Nothing planned yet.">
-          Name a branch, a commit or a pull request to see what each of its commits would change in every app it touches, before it lands. From a checkout:{" "}
-          <code>kiln cd plan --stack</code>.
+          Name a branch, a commit or a pull request to see what each of its commits would change in every app it touches, before it lands. From a checkout: <code>kiln cd plan --stack</code>.
         </EmptyState>
-      ) : plan.error && !plan.loading && !current ? (
-        <ErrorState error={plan.error} onRetry={plan.reload} />
-      ) : !current ? (
-        <SkeletonRows rows={6} cols={3} />
       ) : (
-        <>
-          {plan.error && !plan.loading && (
-            <p className="cd-notice" data-tone="fail">
-              Planning again failed: {plan.error.message}
-            </p>
-          )}
-          <PlanView plan={current} show={show} onShow={setShow} onAgain={plan.reload} busy={plan.loading} />
-        </>
+        <Loadable label="the plan" fallback={<RowsHold rows={6} rowHeight={56} label="Planning" />}>
+          <AskedPlan ask={ask} askKey={askKey} show={show} onShow={setShow} planning={planning} />
+        </Loadable>
       )}
-    </div>
+    </>
+  );
+}
+
+/** The plan asked for: planned once per ask, and again when asked again. */
+function AskedPlan({ ask, askKey, show, onShow, planning }: { ask: CdPlanAsk; askKey: string; show: Show; onShow: (s: Show) => void; planning: boolean }) {
+  const plan = useSuspenseResource(`cd/plan/${askKey}`, (s) => cdApi.plan(ask, s));
+  return <PlanView plan={plan.data} show={show} onShow={onShow} onAgain={plan.reload} busy={plan.refreshing || planning} />;
+}
+
+/** The form while the repositories load: its fields' space. */
+function FormHold() {
+  const { mode, target } = useAsk();
+  const field = FIELD[mode];
+  const noop = () => undefined;
+  return (
+    <form className="cd-plan-form" aria-label="What to plan" aria-busy="true">
+      <SelectField label="Plan" value={mode} onChange={noop} options={MODES} className="cd-plan-mode" />
+      <TextField label={field.label} value={target} readOnly placeholder={field.placeholder} className="cd-plan-target" />
+      <Button type="submit" size="sm" disabled className="cd-plan-go">
+        Plan
+      </Button>
+    </form>
   );
 }

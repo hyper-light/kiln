@@ -19,24 +19,68 @@ import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
 
+/** Each agent's last goal stack: a read that fails keeps showing it (with none yet, the panel says why). */
+const lastStack = new Map<string, GoalStack>();
+
+function readGoals(agent: string): Promise<{ stack: GoalStack | null; error: unknown }> {
+  return harnessApi.goals(agent).then(
+    (stack) => {
+      lastStack.set(agent, stack);
+      return { stack, error: null };
+    },
+    (error: unknown) => ({ stack: lastStack.get(agent) ?? null, error }),
+  );
+}
+
 export function Goals({ agent, harness }: { agent: string; harness?: string }) {
+  // Another agent's: these stay until its goals are in.
+  const shown = React.useDeferredValue(agent);
   return (
-    <Loadable label="Loading its goal stack">
-      <Stack key={agent} agent={agent} harness={harness} />
+    <Loadable label="Loading the goal stack" fallback={<GoalPanel agent={agent} harness={harness} stack={null} />}>
+      <AgentGoals agent={shown} harness={harness} />
     </Loadable>
   );
 }
 
-function Stack({ agent, harness }: { agent: string; harness?: string }) {
-  const res = useSuspenseResource(`goals/${agent}`, () => harnessApi.goals(agent), { pollMs: 2500 });
+/** The agent's goal stack, read again every few seconds while it shows. */
+function AgentGoals({ agent, harness }: { agent: string; harness?: string }) {
+  const res = useSuspenseResource(`harness/goals/${agent}`, () => readGoals(agent), { pollMs: 2500 });
+  return (
+    <GoalPanel
+      agent={agent}
+      harness={harness}
+      stack={res.data.stack}
+      error={res.data.error}
+      onStack={(s) => {
+        lastStack.set(agent, s);
+        res.setData(() => ({ stack: s, error: null }));
+      }}
+    />
+  );
+}
+
+function GoalPanel({
+  agent,
+  harness,
+  stack,
+  error: readError,
+  onStack,
+}: {
+  agent: string;
+  harness?: string;
+  /** None until it's read. */
+  stack: GoalStack | null;
+  /** Why it couldn't be read. */
+  error?: unknown;
+  onStack?: (s: GoalStack) => void;
+}) {
   const [adding, setAdding] = React.useState("");
   const [editing, setEditing] = React.useState<string | null>(null);
   const [asking, setAsking] = React.useState(false);
   const [earlier, setEarlier] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const stack = res.data;
-  const items = stack.items;
+  const items = stack?.items ?? [];
   const pending = items.filter((i) => i.status === "pending");
   const active = items.find((i) => i.status === "active");
   const met = items.filter((i) => i.status === "met").length;
@@ -45,7 +89,7 @@ function Stack({ agent, harness }: { agent: string; harness?: string }) {
   const folded = earlier ? 0 : Math.max(0, done.length - 3);
   const shown = items.filter((i) => !done.slice(0, folded).includes(i));
   // The goal that stopped the stack, to try again first.
-  const unmet = stack.state === "paused" ? [...items].reverse().find((i) => i.status === "unmet" || i.status === "skipped") : undefined;
+  const unmet = stack?.state === "paused" ? [...items].reverse().find((i) => i.status === "unmet" || i.status === "skipped") : undefined;
   const who = harness ?? "the agent";
   const asMessage = (active ?? items.filter((i) => i.how).at(-1))?.how === "message";
 
@@ -54,7 +98,7 @@ function Stack({ agent, harness }: { agent: string; harness?: string }) {
     setError(null);
     try {
       const s = await f();
-      res.setData(() => s);
+      onStack?.(s);
       return true;
     } catch (e) {
       setError(errorMessage(e));
@@ -85,7 +129,7 @@ function Stack({ agent, harness }: { agent: string; harness?: string }) {
       setEditing(null);
   };
 
-  const state = items.length === 0 ? "empty" : stack.state;
+  const state = !stack || items.length === 0 ? "empty" : stack.state;
   const chip =
     state === "running"
       ? `Running · ${met} of ${items.length} met`
@@ -109,7 +153,8 @@ function Stack({ agent, harness }: { agent: string; harness?: string }) {
           : `Goals run one after another on this agent: each goes to ${who} as its own /goal, and the next starts once it's met.`}{" "}
         One that isn&rsquo;t met stops the stack and says why.
       </p>
-      {stack.state === "paused" && stack.reason && <p className="gs-reason">{stack.reason}</p>}
+      {!stack && readError ? <p className="gs-error">{errorMessage(readError)}</p> : null}
+      {stack?.state === "paused" && stack.reason && <p className="gs-reason">{stack.reason}</p>}
 
       {editing !== null ? (
         <div className="gs-edit">
@@ -177,7 +222,7 @@ function Stack({ agent, harness }: { agent: string; harness?: string }) {
           <p className="field-hint gs-hint">A condition it can meet, like &ldquo;the parser tests pass&rdquo;. A plan&rsquo;s steps go here too: run it as Goals.</p>
           {items.length > 0 && (
             <div className="gs-actions">
-              {stack.state !== "running" && (pending.length > 0 || active) && (
+              {stack?.state !== "running" && (pending.length > 0 || active) && (
                 <Button size="sm" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "start"))}>
                   {unmet ? "Go on to the next" : met > 0 || active ? "Resume" : "Start"}
                 </Button>
@@ -197,7 +242,7 @@ function Stack({ agent, harness }: { agent: string; harness?: string }) {
                   Try it again
                 </Button>
               )}
-              {stack.state === "running" && (
+              {stack?.state === "running" && (
                 <Button size="sm" variant="secondary" disabled={busy} onClick={() => void act(() => harnessApi.goalAction(agent, "pause"))}>
                   Pause
                 </Button>

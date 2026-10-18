@@ -5,7 +5,7 @@
  */
 import * as React from "react";
 import { NameField } from "@/components/ui/name-field";
-import { useNavigate } from "react-router";
+import { useNavigate } from "@/lib/router";
 import { DropdownMenu } from "radix-ui";
 import {
   Bot,
@@ -17,10 +17,9 @@ import {
   SquareTerminal,
   X,
 } from "lucide-react";
-import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { harnessSessionsRes, useRes } from "@/lib/data";
 import { cn } from "@/lib/utils";
 import { HarnessMark, StatusPill } from "@/views/harness/parts";
-import { useAgents } from "@/views/harness/use-agents";
 
 export interface SwitcherTab {
   id: string;
@@ -99,10 +98,9 @@ function NewMenu({
   );
 }
 
-/** Every terminal and agent, to jump to; new ones at the bottom. */
+/** Every terminal and agent, to jump to; new ones at the bottom. Opens under the bar, in the page's flow. */
 function SwitcherSheet({
-  open,
-  onOpenChange,
+  onDone,
   tabs,
   activeId,
   onSelect,
@@ -111,8 +109,7 @@ function SwitcherSheet({
   onOpenTarget,
   onNewAgents,
 }: {
-  open: boolean;
-  onOpenChange: (o: boolean) => void;
+  onDone: () => void;
   tabs: SwitcherTab[];
   activeId: string | null;
   onSelect: (id: string) => void;
@@ -122,112 +119,66 @@ function SwitcherSheet({
   onNewAgents: () => void;
 }) {
   const navigate = useNavigate();
-  const { list } = useAgents();
-  const agents = (list ?? [])
-    .slice()
-    .sort(
-      (a, b) =>
-        Number(b.approvals.length > 0) - Number(a.approvals.length > 0) ||
-        b.last_activity - a.last_activity,
-    );
+  const list = useRes(harnessSessionsRes).data;
+  const agents = list.slice().sort((a, b) => Number(b.approvals.length > 0) - Number(a.approvals.length > 0) || b.last_activity - a.last_activity);
   const done = (fn: () => void) => () => {
-    onOpenChange(false);
+    onDone();
     fn();
   };
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        title="Sessions"
-        eyebrow="Terminal"
-        description={`${tabs.length} terminal${tabs.length === 1 ? "" : "s"} · ${agents.length} agent${agents.length === 1 ? "" : "s"}`}
-      >
-        <div className="sw-sheet">
-          <section>
-            <div className="sw-head">Terminals</div>
-            {tabs.length === 0 && (
-              <div className="sw-empty">No terminals open.</div>
-            )}
-            <ul>
-              {tabs.map((t, i) => (
-                <li
-                  key={t.id}
-                  className={cn("sw-row", t.id === activeId && "sw-current")}
-                >
-                  <button
-                    type="button"
-                    className="sw-main"
-                    onClick={done(() => onSelect(t.id))}
-                  >
-                    <i
-                      className="dot"
-                      data-status={dot(t.state)}
-                      aria-hidden="true"
-                    />
-                    <span className="sw-num">
-                      {String(i + 1).padStart(2, "0")}
-                    </span>
-                    <span className="sw-title">{t.title}</span>
-                    <span className="sw-sub">{targetName(t.target)}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="sw-x"
-                    aria-label={`Close ${t.title}`}
-                    onClick={() => onClose(t.id)}
-                  >
-                    <X size={14} />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </section>
-          <section>
-            <div className="sw-head">Agents</div>
-            {agents.length === 0 && (
-              <div className="sw-empty">No agents running.</div>
-            )}
-            <ul>
-              {agents.map((a) => (
-                <li key={a.id} className="sw-row">
-                  <button
-                    type="button"
-                    className="sw-main"
-                    onClick={done(() => navigate(`/agents/${a.id}`))}
-                  >
-                    <HarnessMark kind={a.kind} name={a.kind_name} size={20} />
-                    <span className="sw-title">{a.name}</span>
-                    {a.approvals.length > 0 ? (
-                      <span className="sw-needs">needs you</span>
-                    ) : (
-                      <StatusPill status={a.status} className="sw-pill" />
-                    )}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </section>
-          <div className="sw-new">
-            <button
-              type="button"
-              className="sw-new-btn"
-              onClick={done(onNewAgents)}
-            >
-              <Bot size={15} /> New agents
-            </button>
-            {targets.map((t) => (
-              <button
-                key={t}
-                type="button"
-                className="sw-new-btn"
-                onClick={done(() => onOpenTarget(t))}
-              >
-                <Plus size={15} /> Terminal on {targetName(t)}
+    <section
+      className="sw-sheet sw-sheet-flow"
+      aria-label="Sessions"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onDone();
+      }}
+    >
+      <p className="sw-sheet-sum">{`${tabs.length} terminal${tabs.length === 1 ? "" : "s"} · ${agents.length} agent${agents.length === 1 ? "" : "s"}`}</p>
+      <section>
+        <div className="sw-head">Terminals</div>
+        {tabs.length === 0 && <div className="sw-empty">No terminals open.</div>}
+        <ul>
+          {tabs.map((t, i) => (
+            <li key={t.id} className={cn("sw-row", t.id === activeId && "sw-current")}>
+              <button type="button" className="sw-main" onClick={done(() => onSelect(t.id))}>
+                <i className="dot" data-status={dot(t.state)} aria-hidden="true" />
+                <span className="sw-num">{String(i + 1).padStart(2, "0")}</span>
+                <span className="sw-title">{t.title}</span>
+                <span className="sw-sub">{targetName(t.target)}</span>
               </button>
-            ))}
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
+              <button type="button" className="sw-x" aria-label={`Close ${t.title}`} onClick={() => onClose(t.id)}>
+                <X size={14} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      </section>
+      <section>
+        <div className="sw-head">Agents</div>
+        {agents.length === 0 && <div className="sw-empty">No agents running.</div>}
+        <ul>
+          {agents.map((a) => (
+            <li key={a.id} className="sw-row">
+              <button type="button" className="sw-main" onClick={done(() => navigate(`/agents/${a.id}`))}>
+                <HarnessMark kind={a.kind} name={a.kind_name} size={20} />
+                <span className="sw-title">{a.name}</span>
+                {a.approvals.length > 0 ? <span className="sw-needs">needs you</span> : <StatusPill status={a.status} className="sw-pill" />}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </section>
+      <div className="sw-new">
+        <button type="button" className="sw-new-btn" onClick={done(onNewAgents)}>
+          <Bot size={15} /> New agents
+        </button>
+        {targets.map((t) => (
+          <button key={t} type="button" className="sw-new-btn" onClick={done(() => onOpenTarget(t))}>
+            <Plus size={15} /> Terminal on {targetName(t)}
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -262,11 +213,12 @@ export function MobileBar({
   onRenameDone?: () => void;
 }) {
   const [sheet, setSheet] = React.useState(false);
-  const { list } = useAgents();
-  const waiting = (list ?? []).filter((a) => a.approvals.length > 0).length;
+  const list = useRes(harnessSessionsRes).data;
+  const waiting = list.filter((a) => a.approvals.length > 0).length;
   const idx = tabs.findIndex((t) => t.id === activeId);
   const current = idx >= 0 ? tabs[idx] : null;
   return (
+    <>
     <div className="sw-bar">
       {renaming && current ? (
         <div className="sw-current-btn sw-renaming">
@@ -285,8 +237,9 @@ export function MobileBar({
         <button
           type="button"
           className="sw-current-btn"
-          onClick={() => setSheet(true)}
+          onClick={() => setSheet(!sheet)}
           aria-label="Switch session"
+          aria-expanded={sheet}
         >
           {current ? (
             <i
@@ -371,9 +324,10 @@ export function MobileBar({
           </DropdownMenu.Content>
         </DropdownMenu.Portal>
       </DropdownMenu.Root>
+    </div>
+    {sheet && (
       <SwitcherSheet
-        open={sheet}
-        onOpenChange={setSheet}
+        onDone={() => setSheet(false)}
         tabs={tabs}
         activeId={activeId}
         onSelect={onSelect}
@@ -382,7 +336,8 @@ export function MobileBar({
         onOpenTarget={onOpenTarget}
         onNewAgents={onNewAgents}
       />
-    </div>
+    )}
+    </>
   );
 }
 

@@ -160,6 +160,11 @@ pub struct Core {
     pub task_output: HashMap<String, TaskOutput>,
     /// The timeline was cut (a rewind): viewers start over from a snapshot.
     reset: bool,
+    /// kiln's queue waits: the session goes on in another harness once the turn under way ends,
+    /// and what is queued goes to that one.
+    pub hold: bool,
+    /// The harness running now (its name): new events say so (`Event::by`).
+    pub harness: Option<String>,
 }
 
 impl Default for Core {
@@ -190,6 +195,8 @@ impl Core {
             effects: Vec::new(),
             task_output: HashMap::new(),
             reset: false,
+            hold: false,
+            harness: None,
         }
     }
 
@@ -297,7 +304,7 @@ impl Core {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.events.push_back(Event { id: id.to_owned(), seq, at: Self::now(), parent, body });
+        self.events.push_back(Event { id: id.to_owned(), seq, at: Self::now(), parent, by: self.harness.clone(), body });
         self.index.insert(id.to_owned(), seq);
         self.changed.push(id.to_owned());
         while self.events.len() > MAX_EVENTS {

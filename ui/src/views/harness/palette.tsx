@@ -161,13 +161,16 @@ export function CommandList({
   /** A word beside a name, e.g. how many of the agents written to have it. */
   note?: (c: SlashCommand) => string | undefined;
 }) {
-  const ref = React.useRef<HTMLUListElement>(null);
-  React.useEffect(() => {
-    ref.current?.querySelector<HTMLElement>('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
-  }, [index]);
+  // The highlighted command stays in view (again whenever the highlight moves).
+  const follow = React.useCallback(
+    (ul: HTMLUListElement | null) => {
+      ul?.querySelectorAll<HTMLElement>('[role="option"]')[index]?.scrollIntoView({ block: "nearest" });
+    },
+    [index],
+  );
   let lastGroup: string | undefined;
   return (
-    <ul ref={ref} className="pl-list" role="listbox" aria-label="Commands">
+    <ul ref={follow} className="pl-list" role="listbox" aria-label="Commands">
       {items.map((c, i) => {
         const head = c.group !== lastGroup ? c.group : undefined;
         lastGroup = c.group;

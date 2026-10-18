@@ -57,6 +57,9 @@ function Questions({ a, onDecide, agentName, kind }: { a: Approval; onDecide: De
   );
 }
 
+/** Asked to say why not: the note is ready to type in when it shows. */
+const focusIt = (el: HTMLTextAreaElement | null) => el?.focus();
+
 /** The full card, where the decision is made. */
 /** Reasons that only restate that it's asking. */
 const GENERIC = /^(this |the )?(command|tool|action|operation|edit)s? (requires?|needs?) (your )?(approval|permission)\.?$/i;
@@ -64,10 +67,6 @@ const GENERIC = /^(this |the )?(command|tool|action|operation|edit)s? (requires?
 export function ApprovalCard({ a, cwd, onDecide, className, agentName, kind }: { a: Approval; cwd: string; onDecide: Decide; className?: string; agentName?: string; kind?: string }) {
   const [denying, setDenying] = React.useState(false);
   const [note, setNote] = React.useState("");
-  const noteRef = React.useRef<HTMLTextAreaElement>(null);
-  React.useEffect(() => {
-    if (denying) noteRef.current?.focus();
-  }, [denying]);
   const isQuestion = (a.questions?.length ?? 0) > 0;
   const isPlan = Boolean(a.plan);
   const stats = diffStats(a.diffs);
@@ -116,7 +115,7 @@ export function ApprovalCard({ a, cwd, onDecide, className, agentName, kind }: {
       ) : denying ? (
         <div className="hx-stack">
           <textarea
-            ref={noteRef}
+            ref={focusIt}
             className="hx-input"
             rows={2}
             value={note}

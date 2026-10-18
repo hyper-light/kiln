@@ -17,6 +17,7 @@ import type http from "node:http";
 import { randomBytes } from "node:crypto";
 import type { WebSocket } from "ws";
 import type { Account, AccountFlow, AccountMethod, AgentInfo, HEvent, Meta, SlashCommand, State } from "../src/api/harness.ts";
+import { longInfo } from "./conversation.ts";
 
 const now = () => Math.floor(Date.now() / 1000);
 const EMAIL = "ada@lundhe.audio";
@@ -302,6 +303,8 @@ export function handleDemoSession(ws: WebSocket, id: string): boolean {
   send({ t: "meta", meta: d.meta });
   send({ t: "state", state: stateOf(d) });
   send({ t: "events", events: d.events });
+  // As the server's socket does: the snapshot is complete.
+  if (process.env.MOCK_NO_SYNCED !== "1") send({ t: "synced" });
   ws.on("message", (raw) => {
     let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string };
     try {
@@ -361,12 +364,29 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     return true;
   }
 
+  // What New agents asks: each machine's harnesses, its past sessions, and a start.
+  if (p === "/api/harness/kinds" && m === "GET") {
+    const kinds = [
+      { id: "claude", name: "Claude Code", verified: true, available: true },
+      { id: "codex", name: "Codex", verified: true, available: true },
+    ];
+    json(res, 200, { local: kinds, "agent:metal-ryzen-01": kinds, "agent:metal-ryzen-02": kinds, "agent:metal-epyc-01": kinds, "agent:metal-mac-mini": kinds, "agent:metal-pi-04": kinds.slice(1) });
+    return true;
+  }
+  if (p === "/api/harness/history" && m === "GET") {
+    const kind = url.searchParams.get("kind") ?? "claude";
+    json(res, 200, [
+      { kind, id: "past-1", title: "Speed up the log viewer", cwd: "/home/ada/src/kiln", branch: "main", last_activity: now() - 3600 },
+      { kind, id: "past-2", title: "Trim the release notes", cwd: "/home/ada/src/kiln", last_activity: now() - 86_400 },
+    ]);
+    return true;
+  }
+  if (p === "/api/harness/sessions" && m === "POST") {
+    json(res, 200, [demos.get("demo-claude")!.info]);
+    return true;
+  }
   if (p === "/api/harness/sessions" && m === "GET") {
-    json(
-      res,
-      200,
-      [...demos.values()].map((d) => d.info),
-    );
+    json(res, 200, [...[...demos.values()].map((d) => d.info), longInfo()]);
     return true;
   }
 

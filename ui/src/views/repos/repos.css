@@ -1,0 +1,368 @@
+/* Repositories (views/repos): one list, its filter and sort above it as on Runners, a repository
+   opened under its row as a runner is, and every form in the page's flow. */
+
+.repos-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px 12px;
+  margin-bottom: 20px;
+}
+.repos-filter {
+  min-width: 0;
+  flex: 1 1 320px;
+}
+.repos-sort {
+  flex: 0 0 190px;
+}
+.repos-count {
+  align-self: center;
+  margin-left: auto;
+}
+
+.repos-underway {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 20px;
+  padding: 10px 14px;
+  border-left: 2px solid var(--color-accent);
+  background: var(--color-surface);
+}
+.repos-underway h2 {
+  margin: 0;
+}
+.repos-underway ul {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.repos-underway button {
+  display: flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+  text-align: left;
+}
+.repos-underway button:hover {
+  color: var(--color-foreground);
+}
+.repos-underway-name {
+  color: var(--color-foreground);
+}
+.repos-underway-detail {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.repos-underway-more {
+  color: var(--color-meta);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- a row */
+
+.repo-machines {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.repo-machine {
+  gap: 6px;
+}
+.repo-machine-n {
+  color: var(--color-faint);
+}
+.repo-row-machines {
+  margin-top: 3px;
+  padding-left: 18px;
+  overflow: hidden;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-detail-row > td {
+  padding: 0 !important;
+  background: transparent !important;
+}
+.repo-details {
+  display: grid;
+  gap: 16px;
+  margin: 4px 0 12px;
+  padding: 16px 18px 20px;
+  border-left: 2px solid var(--color-accent);
+  background: var(--color-surface);
+}
+.repo-details-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+.repo-details-head h3 {
+  margin: 2px 0 0;
+  color: var(--color-bright);
+  font-size: 18px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.repo-details-origin {
+  margin: 2px 0 0;
+  color: var(--color-meta);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.repo-section {
+  display: grid;
+  gap: 6px;
+}
+.repo-section h4,
+.repo-tasks h4 {
+  margin: 0;
+}
+.repo-section .sync-repo {
+  padding-bottom: 0;
+}
+
+.repo-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.repo-error {
+  margin: 0;
+  color: var(--color-fail);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- where it is */
+
+.repo-places,
+.repo-tasks ul {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.repo-place,
+.repo-task {
+  display: grid;
+  gap: 3px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.repo-place:last-child,
+.repo-task:last-child {
+  border-bottom: 0;
+}
+.repo-place-line,
+.repo-task-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-height: 30px;
+}
+.repo-place-machine,
+.repo-task-what {
+  color: var(--color-foreground);
+  font-size: 14px;
+  font-weight: 500;
+}
+.repo-place-os,
+.repo-place-state,
+.repo-task-state,
+.repo-task-when {
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+.repo-place-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+.repo-place-acts [aria-disabled="true"] {
+  opacity: 0.4;
+}
+.repo-place-path,
+.repo-task-path {
+  min-width: 0;
+  color: var(--color-slate);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.repo-place-meta {
+  margin: 0;
+  color: var(--color-meta);
+  font-size: 12px;
+}
+
+.repo-notes summary {
+  cursor: pointer;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+.repo-notes ol {
+  display: grid;
+  gap: 2px;
+  margin: 6px 0 0;
+  padding-left: 16px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+/* A question or form in place under a place (misc.tsx Confirm's look). */
+.repo-inline {
+  margin-top: 6px;
+}
+.repo-move {
+  justify-items: stretch;
+  max-width: 76ch;
+}
+.repo-warn {
+  color: var(--color-warn);
+  font-weight: 500;
+}
+.repo-move-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+@media (min-width: 640px) {
+  .repo-move-fields {
+    grid-template-columns: minmax(0, 240px) minmax(0, 1fr);
+  }
+}
+
+.repo-check {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  cursor: pointer;
+  color: var(--color-secondary);
+  font-size: 13px;
+}
+.repo-check input {
+  accent-color: var(--color-accent);
+}
+.repo-check em {
+  color: var(--color-warn);
+  font-style: normal;
+}
+
+/* ---------------------------------------------------------------- putting it on machines */
+
+.repo-put {
+  display: grid;
+  gap: 14px;
+  max-width: 820px;
+  padding: 14px 0 16px;
+  border-top: 1px solid var(--color-line);
+  border-bottom: 1px solid var(--color-line);
+}
+.repo-put-mode {
+  display: inline-flex;
+  justify-self: start;
+  padding: 2px;
+  border: 1px solid var(--color-line-strong);
+  border-radius: 8px;
+}
+.repo-seg {
+  padding: 5px 12px;
+  border-radius: 6px;
+  color: var(--color-muted);
+  font-size: 12.5px;
+}
+.repo-seg:hover {
+  color: var(--color-foreground);
+}
+.repo-seg-on {
+  background: rgb(255 255 255 / 7%);
+  color: var(--color-bright);
+}
+.repo-put-lead {
+  max-width: 72ch;
+  margin: 0;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.repo-put-from {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+@media (min-width: 720px) {
+  .repo-put-from {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 220px);
+  }
+}
+.repo-put-machines {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.repo-put-machines ul {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.repo-put-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.repo-put-quick .chip {
+  cursor: pointer;
+}
+.repo-put-quick .chip:hover {
+  color: var(--color-foreground);
+  border-color: rgb(255 255 255 / 22%);
+}
+.repo-put-machine {
+  display: grid;
+  gap: 6px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--color-line);
+}
+.repo-put-machine:last-child {
+  border-bottom: 0;
+}
+.repo-put-machine > div {
+  max-width: 560px;
+  padding-left: 24px;
+}
+.repo-put-off .repo-check {
+  cursor: default;
+  opacity: 0.55;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .repo-details * {
+    transition: none !important;
+  }
+}

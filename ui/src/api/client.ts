@@ -13,12 +13,17 @@ import type {
   MetricsHistory,
   NewRepo,
   Overview,
+  PlaceAsk,
+  PlacesView,
+  PlaceTask,
+  ReachRunner,
   Repo,
   Run,
   RunDetail,
   SyncKeep,
   SyncView,
   SystemInfo,
+  TaskKind,
   TerminalSessionInfo,
   UpdateJob,
   UpdatesOverview,
@@ -148,6 +153,14 @@ export const api = {
   syncRemoveCopy: (id: string, member: number) => del<void>(`/api/sync/${enc(id)}/copies/${member}`),
   syncDelete: (id: string) => del<void>(`/api/sync/${enc(id)}`),
   syncResolve: (id: string, path: string, keep: SyncKeep) => post<void>(`/api/sync/${enc(id)}/conflicts/resolve`, { path, keep }),
+  /** Every repository kiln knows of, the places each is, the machines and the tasks. */
+  places: (signal?: AbortSignal) => get<PlacesView>("/api/places", signal),
+  /** Asks every machine to look at its repositories again now. */
+  placesLook: () => post<{ asked: number }>("/api/places/look"),
+  /** Starts a clone, sync, move or removal: its tasks, one per machine. */
+  placesStart: (kind: TaskKind, ask: PlaceAsk) => post<PlaceTask[]>(`/api/places/${kind}`, ask),
+  placesRetry: (id: string) => post<PlaceTask[]>(`/api/places/tasks/${enc(id)}/retry`),
+  placesDismiss: (id: string) => del<void>(`/api/places/tasks/${enc(id)}`),
   addRepo: (repo: NewRepo) => post<Repo>("/api/repos", repo),
   deleteRepo: (id: string) => del<void>(`/api/repos/${enc(id)}`),
   pollRepo: (id: string) => post<void>(`/api/repos/${enc(id)}/poll`),
@@ -180,6 +193,8 @@ export const api = {
 
   system: (signal?: AbortSignal) => get<SystemInfo>("/api/system", signal),
   terminalSessions: (signal?: AbortSignal) => get<TerminalSessionInfo[]>("/api/terminal/sessions", signal),
+  /** Reach's directory: every runner, whether it takes commands from other runners, how busy it is. */
+  reachRunners: (signal?: AbortSignal) => get<{ runners: ReachRunner[] }>("/api/reach/runners", signal),
   /** End a session: its shell stops on every device. */
   closeTerminalSession: (id: string) => del<void>(`/api/terminal/sessions/${enc(id)}`),
   /** Names a terminal session ("" takes its name away). */

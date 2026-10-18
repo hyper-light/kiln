@@ -45,6 +45,10 @@ pub struct Repo {
     pub copies: Vec<CopyRef>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Synced only while a task moves the repository between machines (`crate::sync::tasks`): the
+    /// task's batch, which stops syncing it once the move is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient: Option<String>,
 }
 
 /// A copy of a repo: a machine and a folder on it.
@@ -54,6 +58,10 @@ pub struct CopyRef {
     pub machine: String,
     pub path: String,
     pub added: i64,
+    /// A folder kiln cloned to join: it takes the group's files through this log index
+    /// ([`CopySpec::adopt`]); cleared once it says it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt: Option<u64>,
 }
 
 /// What the API shows of a repo.
@@ -70,6 +78,9 @@ pub struct RepoView {
     pub conflicts: Vec<ConflictView>,
     pub copies: Vec<CopyView>,
     pub error: Option<String>,
+    /// Synced only for a move under way: that task's batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -122,8 +133,9 @@ pub enum Keep {
 /// What an admin asks.
 #[derive(Debug)]
 pub enum Ask {
-    Create { name: String, copies: Vec<(String, String)>, exclude: Vec<String> },
-    AddCopy { repo: String, machine: String, path: String },
+    Create { name: String, copies: Vec<(String, String)>, exclude: Vec<String>, transient: Option<String> },
+    /// `adopt`: the folder is one kiln just cloned, to take the group's files ([`CopySpec::adopt`]).
+    AddCopy { repo: String, machine: String, path: String, adopt: bool },
     RemoveCopy { repo: String, member: u64 },
     Delete { repo: String },
     Resolve { repo: String, path: String, keep: Keep },
@@ -141,6 +153,8 @@ pub struct Sync {
     tx: Sender<Input>,
     view: Arc<Mutex<View>>,
     out: async_channel::Receiver<Out>,
+    /// What others send a machine's syncing runner process on the sync lane (`crate::sync::tasks`).
+    say: async_channel::Sender<Out>,
     blobs: Option<Arc<Blobs>>,
     key: String,
 }
@@ -159,6 +173,7 @@ impl Sync {
                 None
             }
         };
+        let say = out_tx.clone();
         if let Some(b) = blobs.clone() {
             let (v, wake_tx) = (view.clone(), tx.clone());
             let k = key.clone();
@@ -173,7 +188,7 @@ impl Sync {
                 lock(&view).error = Some(format!("sync is off: {e}"));
             }
         }
-        Self { tx, view, out, blobs, key }
+        Self { tx, view, out, say, blobs, key }
     }
 
     pub fn view(&self) -> View {
@@ -185,11 +200,15 @@ impl Sync {
         self.blobs.as_deref()
     }
 
-    /// What a machine's runner said (`AgentMsg::Sync`).
-    pub fn from_runner(&self, machine: &str, json: &str, raft: Vec<u8>) {
-        if let Some(msg) = wire::decode(json) {
-            let _ = self.tx.send(Input::From { machine: machine.to_owned(), msg, raft });
-        }
+    /// What a machine's runner said of its copies (`AgentMsg::Sync`, decoded).
+    pub fn from_runner(&self, machine: &str, msg: Msg, raft: Vec<u8>) {
+        let _ = self.tx.send(Input::From { machine: machine.to_owned(), msg, raft });
+    }
+
+    /// Sends a machine's syncing runner process `msg` on the sync lane, after what is already on
+    /// its way there.
+    pub fn send(&self, machine: &str, msg: Msg) {
+        let _ = self.say.try_send(Out { machine: machine.to_owned(), msg, raft: Vec::new() });
     }
 
     /// A machine has a syncing runner process connected now (`up`), or none any more.
@@ -375,8 +394,13 @@ impl Owner {
             }
             Input::Ask { ask, reply } => {
                 let answer = self.ask(ask).map_err(|e| format!("{e:#}"));
+                // The view shows what was asked before the asker hears back (a task looks for the
+                // copy it just added).
+                self.changed = false;
+                self.viewed = Instant::now();
+                let view = self.make_view();
+                *lock(&self.view) = view;
                 let _ = reply.send(answer);
-                self.changed = true;
             }
         }
     }
@@ -397,12 +421,25 @@ impl Owner {
             Msg::Steps { repo, steps } => self.steps(machine, &repo, steps),
             Msg::Status(status) => {
                 if self.members_on(&status.repo, machine).contains(&status.member) {
+                    if status.looked && !status.adopting {
+                        self.settled(&status.repo, status.member);
+                    }
                     self.statuses.insert((status.repo.clone(), status.member), status);
                     self.changed = true;
                 }
             }
-            // Only the server says these.
-            Msg::Copies { .. } | Msg::Release | Msg::Want { .. } => {}
+            // Only the server says these, or they aren't for the groups (`crate::sync::places`).
+            Msg::Copies { .. } | Msg::Release | Msg::Want { .. } | Msg::Repos(_) | Msg::Look | Msg::Bundle { .. } | Msg::Clone(_) | Msg::Delete { .. } | Msg::Forget { .. } | Msg::Task(_) => {}
+        }
+    }
+
+    /// A copy that was to take the group's files has: it is a copy like any other from now on, and
+    /// is never told to again (a machine whose state was lost must not overwrite its files).
+    fn settled(&mut self, repo: &str, member: u64) {
+        let Some(c) = self.repos.iter_mut().filter(|r| r.id == repo).flat_map(|r| r.copies.iter_mut()).find(|c| c.member == member && c.adopt.is_some()) else { return };
+        c.adopt = None;
+        if let Err(e) = self.save() {
+            tracing::warn!(error = %format!("{e:#}"), "the synced repos could not be saved");
         }
     }
 
@@ -481,6 +518,7 @@ impl Owner {
                     path: c.path.clone(),
                     exclude: r.exclude.clone(),
                     max_size: None,
+                    adopt: c.adopt,
                 })
             })
             .collect();
@@ -573,13 +611,13 @@ impl Owner {
 
     fn ask(&mut self, ask: Ask) -> anyhow::Result<String> {
         match ask {
-            Ask::Create { name, copies, exclude } => {
+            Ask::Create { name, copies, exclude, transient } => {
                 let name = name.trim().to_owned();
                 anyhow::ensure!(!name.is_empty(), "a synced repo needs a name");
                 anyhow::ensure!(!self.repos.iter().any(|r| r.name == name), "a synced repo named {name} exists already");
                 anyhow::ensure!(self.repos.len() < disk::GROUPS, "this server syncs {} repos at the most", disk::GROUPS);
                 let group = self.repos.iter().map(|r| r.group).max().unwrap_or(0).saturating_add(1);
-                let mut repo = Repo { id: crate::util::new_id(), name, group, created: now_s(), next_member: SERVER.saturating_add(1), copies: Vec::new(), exclude };
+                let mut repo = Repo { id: crate::util::new_id(), name, group, created: now_s(), next_member: SERVER.saturating_add(1), copies: Vec::new(), exclude, transient };
                 for (machine, path) in copies {
                     add_copy(&mut repo, &machine, &path)?;
                 }
@@ -593,9 +631,17 @@ impl Owner {
                 }
                 Ok(id)
             }
-            Ask::AddCopy { repo, machine, path } => {
+            Ask::AddCopy { repo, machine, path, adopt } => {
+                // What the folder takes the group's files through: everything committed now.
+                let index = self.groups.get(&repo).map_or(0, |g| g.r.applied().index);
                 let r = self.repos.iter_mut().find(|r| r.id == repo).ok_or_else(|| anyhow::anyhow!("no such synced repo"))?;
                 let member = add_copy(r, &machine, &path)?;
+                if adopt
+                    && index > 0
+                    && let Some(c) = r.copies.iter_mut().find(|c| c.member == member)
+                {
+                    c.adopt = Some(index);
+                }
                 self.save()?;
                 self.tell_copies(&machine);
                 Ok(member.to_string())
@@ -708,6 +754,7 @@ impl Owner {
                         None => Some("its group did not open".to_owned()),
                         Some(g) => g.error.clone(),
                     },
+                    transient: r.transient.clone(),
                 }
             })
             .collect();
@@ -723,7 +770,7 @@ fn add_copy(repo: &mut Repo, machine: &str, path: &str) -> anyhow::Result<u64> {
     anyhow::ensure!(!repo.copies.iter().any(|c| c.machine == machine && c.path == path), "{machine}:{path} is a copy already");
     let member = repo.next_member;
     repo.next_member = member.saturating_add(1);
-    repo.copies.push(CopyRef { member, machine: machine.to_owned(), path: path.to_owned(), added: now_s() });
+    repo.copies.push(CopyRef { member, machine: machine.to_owned(), path: path.to_owned(), added: now_s(), adopt: None });
     Ok(member)
 }
 
@@ -739,7 +786,7 @@ mod tests {
 
     #[test]
     fn a_copy_is_a_full_path_on_a_named_machine() {
-        let mut r = Repo { id: "r".into(), name: "n".into(), group: 1, created: 0, next_member: 2, copies: Vec::new(), exclude: Vec::new() };
+        let mut r = Repo { id: "r".into(), name: "n".into(), group: 1, created: 0, next_member: 2, copies: Vec::new(), exclude: Vec::new(), transient: None };
         assert_eq!(add_copy(&mut r, "mac", "/Users/a/src/kiln").ok(), Some(2));
         assert_eq!(add_copy(&mut r, "box", "C:\\src\\kiln").ok(), Some(3));
         assert!(add_copy(&mut r, "mac", "/Users/a/src/kiln").is_err(), "twice");

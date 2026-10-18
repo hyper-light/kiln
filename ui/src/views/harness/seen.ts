@@ -56,10 +56,15 @@ export function useSeen(): Record<string, number> {
   return React.useSyncExternalStore(subscribe, read, () => ({}));
 }
 
-/** While an agent's page is open, everything it does counts as seen. */
+const nothing = () => 0;
+
+/**
+ * While an agent's page is open, everything it does counts as seen: now, every few seconds while
+ * the tab is shown, and on leaving. (Subscribed to as a store is, so it runs once per agent shown.)
+ */
 export function useMarkSeen(id: string) {
-  React.useEffect(() => {
-    if (!id) return;
+  const watch = React.useCallback(() => {
+    if (!id) return () => undefined;
     const mark = () => {
       if (!document.hidden) markSeen(id);
     };
@@ -72,4 +77,5 @@ export function useMarkSeen(id: string) {
       markSeen(id);
     };
   }, [id]);
+  React.useSyncExternalStore(watch, nothing, nothing);
 }

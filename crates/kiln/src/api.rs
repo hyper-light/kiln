@@ -195,11 +195,27 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let hash = (*hash).to_owned();
             return sync_blob_put(&hub, &hash, req).await;
         }
+        (&Method::GET, ["api", "sync", "bundles", batch]) => {
+            let batch = (*batch).to_owned();
+            return sync_bundle_get(&hub, &batch, &req);
+        }
+        (&Method::PUT, ["api", "sync", "bundles", batch]) => {
+            let batch = (*batch).to_owned();
+            return sync_bundle_put(&hub, &batch, req).await;
+        }
         (&Method::GET, ["metrics"]) => return Ok(metrics_handler(&hub, req.headers())),
         (&Method::GET, ["healthz"]) => return Ok(srv::text(StatusCode::OK, "ok")),
         (&Method::GET, ["readyz"]) => return Ok(readyz(&hub).await),
         (&Method::GET, ["dl", "kiln"]) => return download_binary().await,
         (&Method::GET, ["dl", "kiln", target]) => return download_for(&hub, target).await,
+        (&Method::GET, ["dl", "kiln", target, build]) => return download_build(&hub, target, build).await,
+        // A machine building kiln itself (`crate::fleet`), with its build's token.
+        (&Method::GET, ["api", "updates", "jobs", id, "source"]) => return build_source(&hub, id, req.headers()).await,
+        (&Method::POST, ["api", "updates", "jobs", id, "binary"]) => {
+            let id = (*id).to_owned();
+            let q = srv::query(&req);
+            return build_binary(&hub, &id, &q, req).await;
+        }
         (&Method::GET, ["install.sh"]) => return Ok(install_script(&hub)),
         (&Method::GET, ["install.ps1"]) => return Ok(install_powershell(&hub)),
         // kiln's CA for devices (it is public): PEM, DER, and an Apple configuration profile.
@@ -218,7 +234,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
 
     let is_api = s.first() == Some(&"api");
     if !is_api {
-        return Ok(crate::ui::serve(&req));
+        return Ok(crate::uiserver::serve(req).await);
     }
     if !authed(&hub, req.headers()) {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
@@ -266,6 +282,10 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         }
         (&Method::GET, ["api", "jobs", id, "artifacts"]) => get_artifacts(&hub, id).await,
         (&Method::GET, ["api", "agents"]) => Ok(srv::json(StatusCode::OK, &hub.agent_list().await)),
+        (&Method::GET, ["api", "reach", "runners"]) => {
+            let want = srv::query(&req).get("want").cloned();
+            reach_runners(&hub, want.as_deref())
+        }
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
         (&Method::POST, ["api", "discovery", "scan"]) => discovery_scan(&hub, req).await,
@@ -316,6 +336,25 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             sync_ask(&hub, "sync.copy.remove", id, crate::sync::server::Ask::RemoveCopy { repo: (*id).to_owned(), member }).await
         }
         (&Method::POST, ["api", "sync", id, "conflicts", "resolve"]) => sync_resolve(&hub, id, req).await,
+        (&Method::GET, ["api", "places"]) => Ok(srv::json(StatusCode::OK, &crate::sync::places::now(&hub).await?)),
+        (&Method::POST, ["api", "places", "look"]) => Ok(places_look(&hub).await),
+        (&Method::POST, ["api", "places", kind @ ("clone" | "sync" | "move" | "remove")]) => {
+            let kind = (*kind).to_owned();
+            places_start(&hub, &kind, req).await
+        }
+        (&Method::POST, ["api", "places", "tasks", id, "retry"]) => {
+            let tasks = crate::sync::tasks::retry(&hub, id).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+            hub.store.audit("admin".into(), "places.retry".into(), (*id).to_owned()).await;
+            Ok(srv::json(StatusCode::CREATED, &tasks))
+        }
+        (&Method::DELETE, ["api", "places", "tasks", id]) => {
+            if hub.tasks.dismiss(id) {
+                hub.emit(&json!({ "type": "places" }));
+                Ok(srv::status(StatusCode::NO_CONTENT))
+            } else {
+                Err(err(StatusCode::CONFLICT, "no such task, or it is still under way"))
+            }
+        }
         (&Method::GET, ["api", "plans"]) => plans_list(&hub, &q).await,
         (&Method::POST, ["api", "plans"]) => plans_create(&hub, req).await,
         (&Method::GET, ["api", "plans", id]) => crate::plans::get(&hub, id).await.map(|p| srv::json(StatusCode::OK, &p)).map_err(plan_err),
@@ -693,7 +732,7 @@ async fn sync_create(hub: &Hub, req: Request) -> R {
         known_machine(hub, &c.machine).await?;
     }
     let what = format!("{} ({} copies)", a.name, a.copies.len());
-    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude };
+    let ask = crate::sync::server::Ask::Create { name: a.name, copies: a.copies.into_iter().map(|c| (c.machine, c.path)).collect(), exclude: a.exclude, transient: None };
     let id = hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), "sync.create".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "id": id })))
@@ -703,7 +742,7 @@ async fn sync_add_copy(hub: &Hub, id: &str, req: Request) -> R {
     let a: SyncCopyAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     known_machine(hub, &a.machine).await?;
     let what = format!("{id}: {}:{}", a.machine, a.path);
-    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    let member = hub.sync.ask(crate::sync::server::Ask::AddCopy { repo: id.to_owned(), machine: a.machine, path: a.path, adopt: false }).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), "sync.copy.add".into(), what).await;
     Ok(srv::json(StatusCode::CREATED, &serde_json::json!({ "member": member.parse::<u64>().unwrap_or(0) })))
 }
@@ -726,6 +765,91 @@ async fn sync_ask(hub: &Hub, action: &str, id: &str, ask: crate::sync::server::A
     hub.sync.ask(ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
     hub.store.audit("admin".into(), action.to_owned(), id.to_owned()).await;
     Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
+// ------------------------------------------------------------------ repositories on machines
+
+/// The largest bundle a machine sends (kiln's own mirrors' have no limit but the disk).
+const SYNC_BUNDLE_MAX: u64 = 64 << 30;
+
+/// A bundle's request: the machine it names (`?machine=`), when it carries that machine's token.
+fn bundle_machine(hub: &Hub, req: &Request) -> Option<String> {
+    let q = srv::query(req);
+    let machine = q.get("machine").filter(|m| !m.is_empty())?.clone();
+    bearer(req.headers()).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), hub.sync.token(&machine).as_bytes())).then_some(machine)
+}
+
+/// A batch's bundle, for a machine it goes to.
+fn sync_bundle_get(hub: &Hub, batch: &str, req: &Request) -> R {
+    let machine = bundle_machine(hub, req).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "bad sync token"))?;
+    let (file, _, _) = hub.tasks.may_fetch(batch, &machine).ok_or_else(|| err(StatusCode::NOT_FOUND, "no such bundle for that machine"))?;
+    let body = crate::rt::file_source(file).map_err(|_| err(StatusCode::NOT_FOUND, "no such bundle"))?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+}
+
+/// A batch's bundle, from the machine that makes it: kept whole, hashed as it comes, refused while
+/// the server's disk has less than [`SYNC_DISK_FLOOR`] free.
+async fn sync_bundle_put(hub: &Hub, batch: &str, req: Request) -> R {
+    use sha2::Digest as _;
+    let machine = bundle_machine(hub, &req).ok_or_else(|| err(StatusCode::UNAUTHORIZED, "bad sync token"))?;
+    if !hub.tasks.may_send(batch, &machine) {
+        return Err(err(StatusCode::CONFLICT, format!("no bundle is wanted from {machine} for that")));
+    }
+    let file = hub.tasks.bundle_file(batch).ok_or_else(|| err(StatusCode::BAD_REQUEST, "no such batch"))?;
+    let length = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if length.is_some_and(|n| n > SYNC_BUNDLE_MAX) {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, format!("bundles go up to {} GiB", SYNC_BUNDLE_MAX >> 30)));
+    }
+    if hub.sync.blobs().and_then(crate::sync::Blobs::free_bytes).is_some_and(|free| free < SYNC_DISK_FLOOR.saturating_add(length.unwrap_or(0))) {
+        return Err(err(StatusCode::INSUFFICIENT_STORAGE, "the server's disk is nearly full"));
+    }
+    let tmp = file.with_extension("part");
+    let (sink, done) = crate::rt::file_sink(tmp.clone(), SYNC_BUNDLE_MAX)?;
+    let mut h = sha2::Sha256::new();
+    let mut body = req.into_body();
+    while let Some(chunk) = srv::next_chunk(&mut body).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))? {
+        h.update(&chunk);
+        if sink.send(chunk).await.is_err() {
+            break;
+        }
+    }
+    drop(sink);
+    let size = match done.await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")));
+        }
+    };
+    std::fs::rename(&tmp, &file).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let hash = hex::encode(h.finalize());
+    hub.tasks.sent(batch, hash.clone(), size);
+    Ok(srv::json(StatusCode::CREATED, &json!({ "hash": hash, "size": size })))
+}
+
+/// Starts a clone, sync, move or removal (`kind`) of a repository: its tasks, under way.
+async fn places_start(hub: &Arc<Hub>, kind: &str, req: Request) -> R {
+    let mut v: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("kind".into(), json!(kind));
+    }
+    let ask: crate::sync::tasks::Ask = serde_json::from_value(v).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let what = format!("{} to {}", ask.key, ask.to.iter().map(|t| format!("{}:{}", t.machine, t.path)).collect::<Vec<_>>().join(", "));
+    let tasks = crate::sync::tasks::start(hub, ask).await.map_err(|e| err(StatusCode::CONFLICT, e))?;
+    hub.store.audit("admin".into(), format!("places.{kind}"), what).await;
+    Ok(srv::json(StatusCode::CREATED, &tasks))
+}
+
+/// Asks every connected machine that can to look at its repositories again now.
+async fn places_look(hub: &Hub) -> Response {
+    let mut asked = 0;
+    for a in hub.agent_list().await.into_iter().filter(|a| a.connected && !a.ephemeral) {
+        if hub.runner_caps(&a.name) & crate::proto::CAP_REPOS != 0 {
+            hub.sync.send(&a.name, crate::sync::wire::Msg::Look);
+            asked += 1;
+        }
+    }
+    srv::json(StatusCode::ACCEPTED, &json!({ "asked": asked }))
 }
 
 // ------------------------------------------------------------------ plans (crate::plans)
@@ -1394,6 +1518,18 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
 }
 
+/// `GET /api/reach/runners?want=linux/amd64`: reach's directory, ranked for `want` (every runner
+/// without one), with why the others were passed over.
+fn reach_runners(hub: &Hub, want: Option<&str>) -> R {
+    let runners = hub.reach_directory();
+    let want = match want.map(crate::reach::directory::Want::parse).transpose() {
+        Ok(w) => w.unwrap_or_default(),
+        Err(e) => return Err(err(StatusCode::BAD_REQUEST, format!("{e:#}"))),
+    };
+    let (ranked, passed) = crate::reach::directory::rank(&runners, &want, "");
+    Ok(srv::json(StatusCode::OK, &json!({ "want": want.describe(), "runners": runners, "ranked": ranked, "passed": passed })))
+}
+
 /// `POST /api/agents/instance`: a certificate for a second runner process of a machine that is
 /// already enrolled, so a new runner can work beside the old one (which keeps its terminals until
 /// they end) instead of replacing it. Needs no token: the request carries the machine's current
@@ -1828,6 +1964,46 @@ async fn download_for(hub: &Hub, target: &str) -> R {
     Ok(srv::with_header(r, header::CACHE_CONTROL, "no-store"))
 }
 
+/// Build `build` for `target`: what an upgrade names, so a machine gets exactly the binary it
+/// was told the SHA-256 of (kiln may hand out more than one for a platform).
+async fn download_build(hub: &Hub, target: &str, build: &str) -> R {
+    let Some(b) = crate::updates::binaries(hub).into_iter().find(|b| b.target == target && b.build == build) else {
+        return Err(err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")));
+    };
+    if b.origin == "server" {
+        return download_binary().await;
+    }
+    let (path, _) = crate::updates::stored(hub, target).filter(|(_, m)| m.build == build).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln has no build {build} for {target}")))?;
+    let body = crate::rt::file_source(path)?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+}
+
+fn build_token_ok(hub: &Hub, headers: &HeaderMap, job: &str) -> bool {
+    bearer(headers).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), crate::fleet::token(hub, job).as_bytes()))
+}
+
+/// `GET /api/updates/jobs/{id}/source`: the source of the commit a machine builds itself
+/// (`crate::fleet`), as tar.
+async fn build_source(hub: &Hub, id: &str, headers: &HeaderMap) -> R {
+    if !build_token_ok(hub, headers, id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad build token"));
+    }
+    let stdout = crate::fleet::source(hub, id).await.map_err(|e| err(StatusCode::NOT_FOUND, format!("{e:#}")))?;
+    Ok(srv::response(StatusCode::OK, "application/x-tar", srv::channel_body(stdout)))
+}
+
+/// `POST /api/updates/jobs/{id}/binary?sha256=<hex>`: what a machine built of itself; the binary
+/// as the body when it is kept for the machine's platform, else nothing.
+async fn build_binary(hub: &Arc<Hub>, id: &str, q: &HashMap<String, String>, req: Request) -> R {
+    if !build_token_ok(hub, req.headers(), id) {
+        return Err(err(StatusCode::UNAUTHORIZED, "bad build token"));
+    }
+    let sha256 = q.get("sha256").cloned().unwrap_or_default();
+    let bytes = srv::body_bytes(req.into_body(), crate::updates::MAX_BINARY).await.map_err(|e| err(StatusCode::PAYLOAD_TOO_LARGE, format!("{e:#}")))?;
+    crate::fleet::on_built(hub, id, &sha256, Some(bytes.to_vec())).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    Ok(srv::status(StatusCode::NO_CONTENT))
+}
+
 // ------------------------------------------------------------------ updates (Settings → Updates)
 
 /// `GET /api/updates`: this server and how it is upgraded, every machine's runner, the latest
@@ -1849,6 +2025,8 @@ async fn updates_overview(hub: &Arc<Hub>, force: bool) -> Response {
             "binaries": crate::updates::binaries(hub),
             "targets": targets,
             "build": release_build(hub).await,
+            "newest": hub.updates.fleet.target(),
+            "follow": hub.cfg.updates.follow,
         }),
     )
 }
@@ -1861,7 +2039,9 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
         return json!({ "repo": u.release_repo, "pipeline": u.release_pipeline, "error": format!("kiln doesn't build {} (no repository of that name)", u.release_repo) });
     };
     let last = hub.store.runs(Some(repo.id.clone()), 100, None).await.unwrap_or_default().into_iter().find(|r| r.pipeline == u.release_pipeline);
-    let s = crate::updates::in_step(hub, COMMIT);
+    // The newest kiln (`crate::fleet`): the server's commit, or a newer one a runner runs.
+    let newest = hub.updates.fleet.target().map_or_else(|| COMMIT.to_owned(), |t| t.commit);
+    let s = crate::updates::in_step(hub, &newest);
     json!({
         "repo": u.release_repo,
         "pipeline": u.release_pipeline,
@@ -1879,14 +2059,15 @@ async fn release_build(hub: &Hub) -> serde_json::Value {
 async fn build_every_platform(hub: &Hub) -> R {
     let u = &hub.cfg.updates;
     let repo = hub.store.repos().await?.into_iter().find(|r| r.name == u.release_repo).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("kiln doesn't build {}", u.release_repo)))?;
-    // The commit this server runs, when it knows it: only that build is what runners take.
-    let run = if COMMIT.is_empty() {
+    // The newest kiln (`crate::fleet`), when kiln knows it: only that build is what runners take.
+    let newest = hub.updates.fleet.target().map_or_else(|| COMMIT.to_owned(), |t| t.commit);
+    let run = if newest.is_empty() {
         let runs = crate::gitops::manual(hub, &repo, Some(u.release_branch.clone()), Some(u.release_pipeline.clone()))
             .await
             .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
         runs.into_iter().next().ok_or_else(|| err(StatusCode::CONFLICT, format!("{} has no pipeline called {}", u.release_repo, u.release_pipeline)))?
     } else {
-        crate::updates::build_commit(hub, &repo, COMMIT).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?
+        crate::updates::build_commit(hub, &repo, &newest).await.map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?
     };
     hub.store.audit("admin".into(), "upgrade.build".into(), format!("{} {} #{}", u.release_repo, u.release_pipeline, run.number)).await;
     Ok(srv::json(StatusCode::ACCEPTED, &run))
@@ -2458,6 +2639,9 @@ async fn harness_command_many(hub: &Arc<Hub>, req: Request) -> R {
     Ok(srv::json(StatusCode::OK, &json!({ "sent": sent, "report": report })))
 }
 
+/// After a snapshot on an agent session's socket: what was resent is complete.
+const SYNCED: &str = r#"{"t":"synced"}"#;
+
 fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
     let (resp, upgrade) = ws::accept(req).map_err(|r| ApiError(r.status, r.reason.into()))?;
     crate::rt::spawn(async move {
@@ -2470,7 +2654,9 @@ fn harness_ws(hub: Arc<Hub>, id: String, req: Request) -> R {
 }
 
 /// A viewer of one agent session: the snapshot, then live updates (JSON frames tagged `t`); the
-/// viewer sends commands (JSON tagged `type`).
+/// viewer sends commands (JSON tagged `type`). `{"t": "synced"}` follows each snapshot sent here
+/// (on attach, and again after falling behind): the history resent since its `open` is complete,
+/// so a viewer can swap it in at once instead of clearing what it shows.
 async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> anyhow::Result<()> {
     use futures::FutureExt as _;
     let (mut tx, mut rx) = socket.split();
@@ -2481,6 +2667,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> any
     for f in att.frames {
         tx.send(ws::text(f)).await?;
     }
+    tx.send(ws::text(SYNCED)).await?;
     let mut live = att.live;
     loop {
         futures::select_biased! {
@@ -2491,6 +2678,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket) -> any
                     for f in hub.harness.frames(&id).unwrap_or_default() {
                         tx.send(ws::text(f)).await?;
                     }
+                    tx.send(ws::text(SYNCED)).await?;
                 }
                 Err(async_broadcast::RecvError::Closed) => return Ok(()),
             },

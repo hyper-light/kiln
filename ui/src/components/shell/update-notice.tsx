@@ -1,12 +1,13 @@
 /**
- * "kiln was updated": a page left open across a deploy keeps running the old app until it is
- * reloaded, and nothing would say so. This compares the app this page runs with the one the server
- * now serves — when the event stream reconnects (servers restart on deploy), when the tab comes
- * back into view, and every few minutes — and offers a reload when they differ.
+ * "kiln was updated": a page left open across a deploy keeps running the build it loaded (it
+ * switches by itself the next time the tab is hidden, lib/update.ts). This says so in the header,
+ * with a Reload for now. It compares the build this page runs with the one the server serves: when
+ * the event stream reconnects (servers restart on deploy), when the tab comes back into view, and
+ * every few minutes. Checked outside React; the header only reads the answer.
  */
-import * as React from "react";
+import { useSyncExternalStore } from "react";
 import { RefreshCw } from "lucide-react";
-import { useConnection } from "@/api/events";
+import { events } from "@/api/events";
 
 const EVERY_MS = 5 * 60_000;
 
@@ -17,48 +18,58 @@ function loadedApp(): string | null {
   return m ? m[0] : null;
 }
 
+let stale = false;
+let started = false;
+const listeners = new Set<() => void>();
+
+async function check() {
+  const mine = loadedApp();
+  if (!mine || stale) return;
+  try {
+    const html = await (await fetch("/", { cache: "no-store", credentials: "same-origin" })).text();
+    const served = html.match(/\/assets\/index-[^"'?#]+\.js/)?.[0];
+    if (served && served !== mine) {
+      stale = true;
+      listeners.forEach((l) => l());
+    }
+  } catch {
+    /* offline: the next reconnection asks again */
+  }
+}
+
+function start() {
+  if (started) return;
+  started = true;
+  events.onReopen(() => void check());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") void check();
+  });
+  window.setInterval(() => void check(), EVERY_MS);
+  void check();
+}
+
+function subscribe(listener: () => void) {
+  start();
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/** In the header, beside the connection: only once a newer build is live. */
 export function UpdateNotice() {
-  const conn = useConnection();
-  const [stale, setStale] = React.useState(false);
-  const mine = React.useMemo(loadedApp, []);
-  const check = React.useCallback(async () => {
-    if (!mine) return;
-    try {
-      const html = await (await fetch("/", { cache: "no-store", credentials: "same-origin" })).text();
-      const served = html.match(/\/assets\/index-[^"'?#]+\.js/)?.[0];
-      if (served && served !== mine) setStale(true);
-    } catch {
-      /* offline: try again later */
-    }
-  }, [mine]);
-
-  const wasClosed = React.useRef(false);
-  React.useEffect(() => {
-    if (conn.state === "closed") wasClosed.current = true;
-    if (conn.state === "open" && wasClosed.current) {
-      wasClosed.current = false;
-      void check();
-    }
-  }, [conn.state, check]);
-
-  React.useEffect(() => {
-    const onVisible = () => document.visibilityState === "visible" && void check();
-    document.addEventListener("visibilitychange", onVisible);
-    const t = window.setInterval(() => void check(), EVERY_MS);
-    void check();
-    return () => {
-      document.removeEventListener("visibilitychange", onVisible);
-      window.clearInterval(t);
-    };
-  }, [check]);
-
-  if (!stale) return null;
+  const updated = useSyncExternalStore(
+    subscribe,
+    () => stale,
+    () => false,
+  );
+  if (!updated) return null;
   return (
-    <div className="update-notice" role="status">
-      <span>kiln was updated</span>
+    <span className="update-notice" role="status">
+      <span className="max-sm:sr-only">kiln was updated</span>
       <button type="button" onClick={() => window.location.reload()}>
-        <RefreshCw size={13} /> Reload
+        <RefreshCw size={13} aria-hidden="true" /> Reload
       </button>
-    </div>
+    </span>
   );
 }

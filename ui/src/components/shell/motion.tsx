@@ -1,47 +1,34 @@
-import { createContext, useContext, useEffect, useState, useSyncExternalStore } from "react";
+/**
+ * The global motion toggle: paused here (kept per browser) or by the device's reduced-motion
+ * setting, which always wins. Applied to the page as `:root[data-motion]`, where every animation
+ * in the stylesheet looks.
+ */
+import { useSyncExternalStore } from "react";
 import { Pause, Play } from "lucide-react";
-import { readLocal } from "@/lib/hooks";
+import { getPref, setPref, usePref, usePrefs } from "@/lib/prefs";
 
-const MotionContext = createContext({ paused: false, reduced: false, toggle: () => {} });
+const KEY = "kiln.motionPaused";
+const media = typeof window === "undefined" ? null : window.matchMedia("(prefers-reduced-motion: reduce)");
 
-function subscribeToMotion(callback: () => void) {
-  const media = window.matchMedia("(prefers-reduced-motion: reduce)");
-  media.addEventListener("change", callback);
-  return () => media.removeEventListener("change", callback);
+function apply() {
+  document.documentElement.dataset.motion = getPref(KEY, false) || media?.matches ? "paused" : "playing";
 }
-const getReducedMotion = () => window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-export function MotionProvider({ children }: { children: React.ReactNode }) {
-  const [paused, setPaused] = useState<boolean>(() => readLocal("kiln.motionPaused", false));
-  const reduced = useSyncExternalStore(subscribeToMotion, getReducedMotion, () => false);
-
-  useEffect(() => {
-    document.documentElement.dataset.motion = paused || reduced ? "paused" : "playing";
-  }, [paused, reduced]);
-
-  return (
-    <MotionContext.Provider
-      value={{
-        paused: paused || reduced,
-        reduced,
-        toggle: () =>
-          setPaused((v) => {
-            try {
-              localStorage.setItem("kiln.motionPaused", JSON.stringify(!v));
-            } catch {
-              /* ignore */
-            }
-            return !v;
-          }),
-      }}
-    >
-      {children}
-    </MotionContext.Provider>
-  );
+if (media) {
+  apply();
+  usePrefs.subscribe(apply);
+  media.addEventListener("change", apply);
 }
+
+function subscribeToReduced(callback: () => void) {
+  media?.addEventListener("change", callback);
+  return () => media?.removeEventListener("change", callback);
+}
+const getReduced = () => media?.matches ?? false;
 
 export function useMotionPreference() {
-  return useContext(MotionContext);
+  const [pausedHere] = usePref(KEY, false);
+  const reduced = useSyncExternalStore(subscribeToReduced, getReduced, () => false);
+  return { paused: pausedHere || reduced, reduced, toggle: () => setPref(KEY, !pausedHere) };
 }
 
 export function MotionToggle() {

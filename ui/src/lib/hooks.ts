@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { ApiError } from "@/api/client";
+import { getPref, usePref } from "./prefs";
 
 /* ------------------------------------------------------------------ */
 /* Shared ticking clock: one interval for every live timer in the app. */
@@ -33,64 +34,9 @@ export function useNow(): number {
 
 /* ------------------------------------------------------------------ */
 /* useResource: fetch with abort, refetch, optimistic local mutation.  */
+/* Legacy, used by no page now (they read useSuspenseResource,         */
+/* lib/resource.ts); kept until it is deleted on main.                 */
 /* ------------------------------------------------------------------ */
-
-export interface Resource<T> {
-  data: T | undefined;
-  error: Error | null;
-  loading: boolean;
-  reload: () => void;
-  setData: (fn: (prev: T | undefined) => T | undefined) => void;
-}
-
-export function useResource<T>(
-  fetcher: (signal: AbortSignal) => Promise<T>,
-  deps: React.DependencyList,
-  opts: { pollMs?: number } = {},
-): Resource<T> {
-  const [data, setDataState] = useState<T | undefined>(undefined);
-  const [error, setError] = useState<Error | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [nonce, setNonce] = useState(0);
-  const fetcherRef = useRef(fetcher);
-  useEffect(() => {
-    fetcherRef.current = fetcher;
-  });
-
-  useEffect(() => {
-    const ctl = new AbortController();
-    setLoading(true);
-    fetcherRef
-      .current(ctl.signal)
-      .then((d) => {
-        if (ctl.signal.aborted) return;
-        setDataState(d);
-        setError(null);
-      })
-      .catch((e: unknown) => {
-        if (ctl.signal.aborted) return;
-        if (e instanceof DOMException && e.name === "AbortError") return;
-        setError(e instanceof Error ? e : new Error(String(e)));
-      })
-      .finally(() => {
-        if (!ctl.signal.aborted) setLoading(false);
-      });
-    return () => ctl.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [...deps, nonce]);
-
-  useEffect(() => {
-    if (!opts.pollMs) return;
-    const t = window.setInterval(() => {
-      if (!document.hidden) setNonce((n) => n + 1);
-    }, opts.pollMs);
-    return () => window.clearInterval(t);
-  }, [opts.pollMs]);
-
-  const reload = useCallback(() => setNonce((n) => n + 1), []);
-  const setData = useCallback((fn: (prev: T | undefined) => T | undefined) => setDataState(fn), []);
-  return { data, error, loading, reload, setData };
-}
 
 export function errorMessage(e: unknown): string {
   if (e instanceof ApiError) return e.message;
@@ -102,36 +48,13 @@ export function errorMessage(e: unknown): string {
 /* Local storage-backed state (per-viewer conveniences only).          */
 /* ------------------------------------------------------------------ */
 
+/** A preference kept in this browser (see lib/prefs.ts): shared by every reader, kept at once. */
 export function useLocalStorage<T>(key: string, initial: T): [T, (v: T) => void] {
-  const [value, setValue] = useState<T>(() => {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw === null ? initial : (JSON.parse(raw) as T);
-    } catch {
-      return initial;
-    }
-  });
-  const set = useCallback(
-    (v: T) => {
-      setValue(v);
-      try {
-        localStorage.setItem(key, JSON.stringify(v));
-      } catch {
-        /* private mode etc. */
-      }
-    },
-    [key],
-  );
-  return [value, set];
+  return usePref(key, initial);
 }
 
 export function readLocal<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw === null ? fallback : (JSON.parse(raw) as T);
-  } catch {
-    return fallback;
-  }
+  return getPref(key, fallback);
 }
 
 export function useMediaQuery(query: string): boolean {
@@ -146,23 +69,14 @@ export function useMediaQuery(query: string): boolean {
   );
 }
 
-export function useDocumentTitle(title: string) {
-  useEffect(() => {
-    document.title = title ? `${title} · kiln` : "kiln";
-  }, [title]);
-}
-
 /**
  * For a row that has to scroll sideways: marks which edges hide more (`data-scroll-edge` = start,
  * end or both) so the stylesheet can fade them — a scroller you can see is a scroller. Use the
  * returned callback as the element's ref.
  */
-export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => void {
-  const cleanup = useRef<(() => void) | null>(null);
+export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => () => void {
   return useCallback((el: T | null) => {
-    cleanup.current?.();
-    cleanup.current = null;
-    if (!el) return;
+    if (!el) return () => {};
     const update = () => {
       const max = el.scrollWidth - el.clientWidth;
       const start = el.scrollLeft > 2;
@@ -176,9 +90,25 @@ export function useScrollEdges<T extends HTMLElement>(): (el: T | null) => void 
     const ro = new ResizeObserver(update);
     ro.observe(el);
     for (const c of Array.from(el.children)) ro.observe(c);
-    cleanup.current = () => {
+    return () => {
       el.removeEventListener("scroll", update);
       ro.disconnect();
     };
   }, []);
+}
+
+/**
+ * An element's width, kept as it changes: `[ref, width]`. Measured as the ref attaches (before
+ * paint), so a layout chosen by width never shows a frame of the wrong one; 0 until then.
+ */
+export function useElementWidth<T extends HTMLElement>(): [(el: T | null) => (() => void) | undefined, number] {
+  const [width, setWidth] = useState(0);
+  const ref = useCallback((el: T | null) => {
+    if (!el) return;
+    setWidth(el.clientWidth);
+    const ro = new ResizeObserver(() => setWidth(el.clientWidth));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width];
 }

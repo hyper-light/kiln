@@ -203,13 +203,12 @@
   color: #8a8e98;
   line-height: 1.6;
 }
+/* Still: an eyebrow's rule is the prism, not a state (motion marks what changes). */
 .spectrum-rule {
   display: inline-block;
   width: 30px;
   height: 2px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
   flex: 0 0 auto;
 }
 @keyframes prism-current {
@@ -356,8 +355,6 @@
   right: 8px;
   height: 1px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
 }
 .desktop-nav a .nav-index {
   font-family: var(--font-mono);
@@ -368,6 +365,29 @@
 }
 .desktop-nav a[aria-current="page"] .nav-index {
   color: #9a9ca5;
+}
+/* What opens in the header (the phones' menu, the command palette): under its bar, in its flow,
+   on the page's own ground (no veil over the page). */
+  .header-band {
+    max-height: calc(100dvh - var(--header-h));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-top: 1px solid rgb(255 255 255 / 7%);
+    background: #08090a;
+  }
+  .palette-inner {
+    width: min(720px, calc(100% - 32px));
+    margin-inline: auto;
+  }
+  .palette-list {
+    max-height: min(52dvh, 480px);
+    overflow-y: auto;
+    padding: 4px 0 8px;
+  }
+  /* A page fills the window at least, so the footer sits below the fold and never jumps in view
+   while the page loads. */
+.page-main {
+  min-height: calc(100dvh - var(--header-h));
 }
 /* Ten places don't fit beside the right-hand controls below 1440px with their numbers: the
    numbers go there, and below 1280px the menu takes the whole list. */
@@ -406,6 +426,31 @@
   font-size: 14px;
   line-height: 1.8;
   color: #a1a4ad;
+}
+/* Crumbs (misc.tsx): a detail page's eyebrow, its parts linking back up. */
+.crumbs {
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.crumbs .spectrum-rule {
+  margin-right: 4px;
+}
+.crumbs a {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  color: inherit;
+  transition: color 0.2s;
+}
+.crumbs a:hover {
+  color: #ededee;
+}
+/* A quiet line where a list or a chart has nothing to show yet. */
+.empty-line {
+  margin: 0;
+  color: #8f939e;
+  font-size: 13px;
+  line-height: 1.6;
 }
 .section-heading {
   display: flex;
@@ -1245,6 +1290,45 @@
   max-width: 420px;
   line-height: 1.7;
 }
+/* What an action did, said once on its page: quiet when it went well, warm when it didn't. */
+.notice {
+  margin: 0 0 16px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.notice[data-tone="ok"] {
+  color: var(--color-ok);
+}
+.notice[data-tone="fail"] {
+  color: #d8b9bb;
+}
+/* A question asked in place (misc.tsx Confirm): every page's confirmations look alike. */
+.confirm {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  max-width: 72ch;
+  padding: 12px 14px;
+  border: 1px solid #2b2d32;
+  border-left: 2px solid var(--color-accent);
+  border-radius: 6px;
+  background: var(--color-surface);
+  color: #c8cad0;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.confirm[data-tone="danger"] {
+  border-left-color: var(--color-fail);
+}
+.confirm p {
+  margin: 0;
+}
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
 .skeleton {
   position: relative;
   overflow: hidden;
@@ -1312,8 +1396,6 @@
   margin: auto;
   border-radius: 50%;
   border: 1px solid;
-  animation: optic-breathe 14s ease-in-out infinite;
-  animation-delay: calc(var(--i) * -0.55s);
 }
 @keyframes optic-breathe {
   50% {
@@ -1525,6 +1607,32 @@
     background 0.2s;
   overflow: hidden;
 }
+/* Stacked (dag.tsx, where the graph doesn't fit): each column a row of its jobs, one under the other. */
+.dag-node[data-flow] {
+  position: relative;
+  min-height: 60px;
+}
+.dag-stages {
+  display: grid;
+  gap: 22px;
+  margin: 0;
+  padding: 4px 20px 6px;
+  list-style: none;
+}
+.dag-stage {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+.dag-stage + .dag-stage::before {
+  content: "";
+  position: absolute;
+  left: 20px;
+  top: -22px;
+  height: 22px;
+  border-left: 1px solid #343a45;
+}
 .dag-node:hover {
   border-color: #47464f;
   background: #111317;
@@ -1663,8 +1771,6 @@
   bottom: -1px;
   height: 1px;
   background: var(--prism);
-  background-size: 250% 100%;
-  animation: prism-current 6s ease-in-out infinite alternate;
 }
 
 /* On-screen terminal keyboard */
@@ -1886,12 +1992,15 @@
 }
 
 @layer components {
-/* Live connection indicator */
+/* Live connection indicator: one width whatever it says, so the header never shifts. */
 .conn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 7px;
+  min-width: 104px;
   min-height: 32px;
+  font-variant-numeric: tabular-nums;
   padding: 0 10px;
   border-radius: 999px;
   border: 1px solid rgb(255 255 255 / 8%);
@@ -2169,6 +2278,24 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 .sw-on {
   color: #d8d0f2;
 }
+/* The sessions list on phones: under the bar, in the page's flow (the terminal gives it room). */
+.sw-sheet-flow {
+  flex: none;
+  max-height: 62%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px 14px 16px;
+  border-bottom: 1px solid #1d1f23;
+  background: var(--color-surface);
+}
+.sw-sheet-sum {
+  margin: 0;
+  color: #8c8f98;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
 .sw-sheet {
   display: flex;
   flex-direction: column;
@@ -2261,22 +2388,16 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   color: #e4e5e8;
 }
 
-/* A page left open across a deploy: offer the new app. */
+/* A page left open across a deploy: offered in the header, beside the connection (in its flow). */
 .update-notice {
-  position: fixed;
-  z-index: 95;
-  top: calc(var(--header-h) + 10px);
-  left: 50%;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 12px;
-  padding: 6px 6px 6px 16px;
-  transform: translateX(-50%);
+  gap: 10px;
+  min-height: 32px;
+  padding: 0 3px 0 12px;
   border: 1px solid #3a3550;
   border-radius: 999px;
-  background: rgb(17 16 23 / 96%);
-  box-shadow: 0 14px 40px rgb(0 0 0 / 55%);
-  font-size: 13px;
+  font-size: 12px;
   color: #e4e5e8;
   white-space: nowrap;
 }
@@ -2284,15 +2405,58 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 30px;
-  padding: 0 12px;
+  height: 26px;
+  padding: 0 10px;
   border-radius: 999px;
   background: #e4e5e7;
   color: #111214;
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 500;
 }
+@media (max-width: 639px) {
+  .update-notice {
+    padding-left: 3px;
+  }
+}
 
+/* Terminal bands: asked and answered between the tabs and the terminal, in the page's flow. */
+.term-band {
+  flex: none;
+  max-height: 60%;
+  overflow-y: auto;
+  padding: 14px 16px 16px;
+  border-bottom: 1px solid #1d1f23;
+  background: var(--color-surface);
+}
+.term-band > .confirm {
+  max-width: none;
+}
+/* Long lines wrap: the text is there to select, and nothing scrolls sideways. */
+.term-band .clip-text {
+  height: min(36dvh, 360px);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.term-band-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.term-band-title {
+  margin: 0;
+  color: #e1e5e9;
+  font-size: 16px;
+  font-weight: 450;
+  letter-spacing: -0.02em;
+}
+.term-band-desc {
+  margin: 4px 0 0;
+  color: #aab3c1;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
 /* Terminal copy and paste dialogs */
 .clip-text {
   display: block;
@@ -2689,34 +2853,8 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 .runner-up-go {
   margin-left: auto;
 }
-.runner-up-confirm {
-  display: grid;
-  gap: 8px;
-  max-width: 72ch;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-accent);
-  background: var(--color-surface);
-  color: var(--color-secondary);
-  font-size: 13px;
-}
-.runner-up-confirm p {
-  margin: 0;
-}
-.runner-up-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
 .upd-confirm {
-  display: grid;
-  gap: 8px;
-  max-width: 72ch;
   margin: 10px 0 2px;
-  padding: 10px 12px;
-  border-left: 2px solid var(--color-accent);
-  background: var(--color-surface);
-  color: var(--color-secondary);
-  font-size: 13px;
 }
 .upd-confirm p {
   margin: 0;
@@ -2803,40 +2941,9 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
   align-items: center;
   gap: 8px;
 }
-.upd-select {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
+.upd-upload > .upd-select {
+  flex: 0 1 260px;
   min-width: 0;
-  max-width: 100%;
-}
-.upd-select select {
-  min-width: 0;
-  max-width: 100%;
-  min-height: 36px;
-  padding: 0 32px 0 14px;
-  appearance: none;
-  border: 1px solid rgb(255 255 255 / 15%);
-  border-radius: 999px;
-  background: rgb(255 255 255 / 3%);
-  color: #e4e5e7;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  text-overflow: ellipsis;
-}
-.upd-select select:focus-visible {
-  outline: 2px solid rgb(255 255 255 / 80%);
-  outline-offset: 3px;
-}
-.upd-select option {
-  background: #0a0c0f;
-  color: #e4e5e7;
-}
-.upd-select svg {
-  position: absolute;
-  right: 12px;
-  color: #9aa3b1;
-  pointer-events: none;
 }
 
 @media (max-width: 640px) {
@@ -2925,6 +3032,19 @@ html[data-motion="paused"] :is(.overlay, .dialog, .drawer, .popover, .toast, .na
 }
 :root[data-motion="paused"] .hl-rule {
   animation: hl-appear 0.01s linear 0.18s forwards;
+}
+/* Stand-ins (hold.tsx): the space and frame of what loads, the loader over its top. */
+.hold {
+  position: relative;
+}
+.hold > .hold-loader {
+  position: absolute;
+  inset: 0 0 auto;
+  height: min(100%, 200px);
+  pointer-events: none;
+}
+.data-table tbody tr.hold-row:hover {
+  background: transparent;
 }
 /* Loading failed: said in place, with a way to try again. */
 .hl-failed {

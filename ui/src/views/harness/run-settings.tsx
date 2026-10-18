@@ -7,6 +7,8 @@
  *   each is one track: tap a stop or slide to it. A mode that turns checks off waits for an
  *   explicit "Turn them off".
  * - The model is a family (Opus, Fable, Sonnet, Haiku); its other versions are one tap further.
+ *   The other harnesses' models on the agent's machine follow, by harness: choosing one goes on
+ *   there (at the end of the turn under way), the conversation carried over.
  *
  * A choice applies at once, "· UNDO" waits on the line for a few seconds, and the setting folds
  * away shortly after. Nothing pops up or covers the conversation.
@@ -16,6 +18,7 @@
 import * as React from "react";
 import type { ControlOption, ModelOption, ModeOption } from "@/api/harness";
 import { cn } from "@/lib/utils";
+import { useListener } from "./dom";
 import "./run-settings.css";
 
 type Kind = "mode" | "model" | "effort";
@@ -31,6 +34,8 @@ interface Word {
   hint?: string;
   /** Turns checks off, so it takes an explicit confirmation. */
   dangerous?: boolean;
+  /** A model of another harness than the agent's (its id): choosing it switches there. */
+  kind?: string;
 }
 
 const KEY: Record<Kind, string> = { mode: "Permissions", model: "Model", effort: "Effort" };
@@ -168,47 +173,49 @@ function families(words: Word[]): Family[] {
 
 /* ------------------------------------------------------------------ a row of words */
 
-/** Keeps a row's underline under its checked word. Once placed it glides from word to word (CSS: transform only). */
-function useGlide(group: React.RefObject<HTMLElement | null>, bar: React.RefObject<HTMLElement | null>, deps: string) {
-  React.useLayoutEffect(() => {
-    const g = group.current;
-    const b = bar.current;
-    if (!g || !b) return;
-    let live = true;
-    const place = () => {
-      if (!live) return;
-      const on = g.querySelector('[aria-checked="true"] > .rs-word-text');
-      if (!on) {
-        b.style.opacity = "0";
-        return;
-      }
-      const a = g.getBoundingClientRect();
-      const r = on.getBoundingClientRect();
-      b.style.opacity = "";
-      b.style.transform = `translate(${r.left - a.left}px, ${r.bottom - a.top + UNDERLINE_GAP}px) scaleX(${r.width / 100})`;
-    };
-    place();
-    // The first placement doesn't glide in from the corner.
-    const frame = b.hasAttribute("data-glide") ? 0 : requestAnimationFrame(() => b.setAttribute("data-glide", ""));
-    const watch = new ResizeObserver(place);
-    watch.observe(g);
-    void document.fonts?.ready.then(place);
-    return () => {
-      live = false;
-      cancelAnimationFrame(frame);
-      watch.disconnect();
-    };
-  }, [group, bar, deps]);
+/**
+ * The ref callback for a row's underline: keeps it under the checked word. It places it when the
+ * row appears, and again whenever the row changes (another word checked, other words) or resizes.
+ * Once placed it glides from word to word (CSS: transform only).
+ */
+function glide(b: HTMLElement | null) {
+  const g = b?.parentElement;
+  if (!b || !g) return;
+  let live = true;
+  const place = () => {
+    if (!live) return;
+    const on = g.querySelector('[aria-checked="true"] > .rs-word-text');
+    if (!on) {
+      b.style.opacity = "0";
+      return;
+    }
+    const a = g.getBoundingClientRect();
+    const r = on.getBoundingClientRect();
+    b.style.opacity = "";
+    b.style.transform = `translate(${r.left - a.left}px, ${r.bottom - a.top + UNDERLINE_GAP}px) scaleX(${r.width / 100})`;
+  };
+  place();
+  // The first placement doesn't glide in from the corner.
+  const frame = b.hasAttribute("data-glide") ? 0 : requestAnimationFrame(() => b.setAttribute("data-glide", ""));
+  const watch = new ResizeObserver(place);
+  watch.observe(g);
+  // Another word checked, or other words: React changes the row, and the underline follows before it's drawn.
+  const changes = new MutationObserver(place);
+  changes.observe(g, { subtree: true, childList: true, characterData: true, attributeFilter: ["aria-checked"] });
+  void document.fonts?.ready.then(place);
+  return () => {
+    live = false;
+    cancelAnimationFrame(frame);
+    watch.disconnect();
+    changes.disconnect();
+  };
 }
 
 /** A few short choices as words: a radiogroup (arrow keys move, Enter or Space picks). */
 function WordRow({ label, words, value, onPick }: { label: string; words: Word[]; value: string; onPick: (w: Word) => void }) {
-  const group = React.useRef<HTMLDivElement>(null);
-  const bar = React.useRef<HTMLElement>(null);
   const [focus, setFocus] = React.useState<string | null>(null);
   // One stop in the tab order: the word with focus, else the current one, else the first.
   const stop = [focus, value, words[0]?.id].find((id) => id != null && words.some((w) => w.id === id));
-  useGlide(group, bar, `${value}\n${words.map((w) => `${w.id}\t${w.text}`).join("\n")}`);
 
   const rove = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const radios = Array.from(e.currentTarget.querySelectorAll<HTMLElement>('[role="radio"]'));
@@ -224,7 +231,6 @@ function WordRow({ label, words, value, onPick }: { label: string; words: Word[]
 
   return (
     <div
-      ref={group}
       role="radiogroup"
       aria-label={label}
       className="rs-words"
@@ -255,7 +261,7 @@ function WordRow({ label, words, value, onPick }: { label: string; words: Word[]
           )}
         </span>
       ))}
-      <i ref={bar} className="rs-glide" aria-hidden="true" />
+      <i ref={glide} className="rs-glide" aria-hidden="true" />
     </div>
   );
 }
@@ -394,6 +400,13 @@ function ModelChoice({ words, value, onPick }: { words: Word[]; value: string; o
 
 /* ------------------------------------------------------------------ the line */
 
+/** Another harness on the agent's machine, and its models. */
+export interface Elsewhere {
+  kind: string;
+  name: string;
+  models: ModelOption[];
+}
+
 export interface RunSettingsProps {
   modes: ModeOption[];
   mode: string;
@@ -401,7 +414,11 @@ export interface RunSettingsProps {
   onMode?: (id: string) => void;
   models: ModelOption[];
   model: string;
-  onModel?: (id: string) => void;
+  /** With the harness the model is in: the agent's own (`harness`) or one of `elsewhere`. */
+  onModel?: (id: string, kind?: string) => void;
+  /** The harness the agent runs in, and the others whose models it can go on with (its conversation carried over). */
+  harness?: string;
+  elsewhere?: Elsewhere[];
   /** How a model id reads ("claude-opus-5-5" → "Opus 5.5"). */
   modelLabel?: (id: string) => string;
   efforts: ControlOption[];
@@ -421,6 +438,9 @@ interface Change {
   /** What Undo puts back. */
   prev: string;
   to: string;
+  /** For a model: the harnesses of `prev` and `to`. */
+  prevKind?: string;
+  toKind?: string;
   /** Offers Undo (an undo itself doesn't). */
   undoable: boolean;
 }
@@ -436,6 +456,8 @@ export function RunSettings({
   models,
   model,
   onModel,
+  harness,
+  elsewhere = [],
   modelLabel = same,
   efforts,
   effort,
@@ -455,73 +477,76 @@ export function RunSettings({
   const [said, setSaid] = React.useState("");
   const root = React.useRef<HTMLDivElement>(null);
   const values = React.useRef<Partial<Record<Kind, HTMLButtonElement | null>>>({});
-  /** Where focus goes after the next render, when the element that had it goes away. */
-  const refocus = React.useRef<Kind | null>(null);
   const panelId = React.useId();
   const held = hover || keyboard;
 
   const actual: Record<Kind, string> = { mode, model, effort };
   const shown = (k: Kind) => (change?.kind === k && actual[k] === change.base ? change.to : actual[k]);
+  // The other harnesses' models, by harness (they switch the agent there).
+  const groups = onModel ? elsewhere.filter((h) => h.models.length > 0).map((h) => ({ ...h, words: h.models.map((m) => ({ ...modelWord(m, modelLabel), kind: h.kind })) })) : [];
+  const others = groups.flatMap((g) => g.words);
+  // The agent's own models (its current one among them, unless that is another harness's: a switch waiting).
+  const own = modelWords(models, others.some((w) => w.id === shown("model")) ? "" : shown("model"), modelLabel);
   const sets: Record<Kind, { words: Word[]; count: number; pick?: (id: string) => void }> = {
     mode: { words: modeWords(modes, shown("mode")), count: modes.length, pick: onMode },
-    model: { words: modelWords(models, shown("model"), modelLabel), count: models.length, pick: onModel },
+    model: { words: [...own, ...others], count: models.length + others.length, pick: onModel },
     effort: { words: effortWords(efforts, shown("effort")), count: efforts.length, pick: onEffort },
   };
+  const kindOf = (id: string) => others.find((w) => w.id === id)?.kind ?? harness;
   const nameOf = (k: Kind, id: string) => sets[k].words.find((w) => w.id === id)?.full ?? id;
   const editable = (k: Kind) => Boolean(sets[k].pick && sets[k].count > 0);
   const nextTurn = (k: Kind) => Boolean(running && appliesNextTurn?.[k]);
   const waiting = armed && sets[armed.kind].words.some((w) => w.id === armed.id) ? armed : null;
 
-  // Undo is offered for a few seconds, longer while a keyboard or mouse is on it.
-  React.useEffect(() => {
-    if (!change || held) return;
-    const t = window.setTimeout(() => setChange(null), UNDO_MS);
-    return () => window.clearTimeout(t);
-  }, [change, held]);
+  /** Folds the setting away; focus that was in it goes to its value on the line (which stays). */
+  const fold = React.useCallback((k: Kind) => {
+    if (root.current?.contains(document.activeElement)) values.current[k]?.focus({ preventScroll: true });
+    setOpen(null);
+  }, []);
+
+  // Undo is offered for a few seconds, longer while a keyboard or mouse is on it. The top line shows
+  // the change (and Undo) meanwhile: its timer, set again whenever either changes.
+  const lasting = React.useCallback(
+    (top: HTMLDivElement | null) => {
+      if (!top || !change || held) return;
+      const t = window.setTimeout(() => setChange(null), UNDO_MS);
+      return () => window.clearTimeout(t);
+    },
+    [change, held],
+  );
 
   // The setting folds away a little after a change, unless keyboard focus or a mouse is in it, or
-  // a confirmation is waiting.
-  React.useEffect(() => {
-    if (!open || tick === 0 || held || waiting) return;
-    const t = window.setTimeout(() => {
-      if (root.current?.contains(document.activeElement)) refocus.current = open;
-      setOpen(null);
-    }, FOLD_MS);
-    return () => window.clearTimeout(t);
-  }, [open, tick, held, waiting]);
+  // a confirmation is waiting: the open setting's own timer, set again whenever one of those changes.
+  const folding = React.useCallback(
+    (panel: HTMLDivElement | null) => {
+      if (!panel || !open || tick === 0 || held || waiting) return;
+      const t = window.setTimeout(() => fold(open), FOLD_MS);
+      return () => window.clearTimeout(t);
+    },
+    [open, tick, held, waiting, fold],
+  );
 
   // A waiting confirmation stops waiting when anything other than its track or button is tapped or focused.
-  React.useEffect(() => {
-    if (!waiting) return;
-    const away = (e: Event) => {
-      const keep = [root.current?.querySelector(".rs-confirm-line"), root.current?.querySelector(".rs-track")];
-      if (e.target instanceof Node && keep.some((el) => el?.contains(e.target as Node))) return;
-      setArmed(null);
-    };
-    document.addEventListener("pointerdown", away, true);
-    document.addEventListener("focusin", away, true);
-    return () => {
-      document.removeEventListener("pointerdown", away, true);
-      document.removeEventListener("focusin", away, true);
-    };
-  }, [waiting]);
-
-  React.useLayoutEffect(() => {
-    const to = refocus.current;
-    if (!to) return;
-    refocus.current = null;
-    values.current[to]?.focus({ preventScroll: true });
-  });
+  const away = (e: Event) => {
+    const keep = [root.current?.querySelector(".rs-confirm-line"), root.current?.querySelector(".rs-track")];
+    if (e.target instanceof Node && keep.some((el) => el?.contains(e.target as Node))) return;
+    setArmed(null);
+  };
+  useListener(document, "pointerdown", away, { on: Boolean(waiting), capture: true });
+  useListener(document, "focusin", away, { on: Boolean(waiting), capture: true });
 
   const apply = (k: Kind, to: string) => {
     const pick = sets[k].pick;
     const prev = shown(k);
     if (!pick || to === prev) return;
-    pick(to);
-    setChange({ kind: k, base: actual[k], prev, to, undoable: Boolean(prev) });
+    const [prevKind, toKind] = k === "model" ? [kindOf(prev), kindOf(to)] : [undefined, undefined];
+    if (k === "model" && onModel) onModel(to, toKind);
+    else pick(to);
+    setChange({ kind: k, base: actual[k], prev, to, undoable: Boolean(prev), prevKind, toKind });
     setArmed(null);
     setTick((t) => t + 1);
-    setSaid(`${KEY[k]}: ${nameOf(k, to)}${nextTurn(k) ? ", from the next turn" : ""}`);
+    const there = groups.find((g) => g.kind === toKind)?.name;
+    setSaid(`${KEY[k]}: ${nameOf(k, to)}${there ? `, in ${there}: the conversation carries over${running ? " at the end of this turn" : ""}` : nextTurn(k) ? ", from the next turn" : ""}`);
   };
 
   const choose = (k: Kind, w: Word) => {
@@ -539,9 +564,11 @@ export function RunSettings({
 
   const undo = () => {
     if (!change?.undoable) return;
-    const { kind: k, prev, to } = change;
-    sets[k].pick?.(prev);
-    setChange({ kind: k, base: actual[k], prev: to, to: prev, undoable: false });
+    const { kind: k, prev, to, prevKind, toKind } = change;
+    // A switch undone goes back to the harness the agent was in (or doesn't happen).
+    if (k === "model" && onModel) onModel(prev, prevKind);
+    else sets[k].pick?.(prev);
+    setChange({ kind: k, base: actual[k], prev: to, to: prev, undoable: false, prevKind: toKind, toKind: prevKind });
     setArmed(null);
     setTick((t) => t + 1);
     setSaid(`${KEY[k]}: back to ${nameOf(k, prev)}`);
@@ -569,8 +596,18 @@ export function RunSettings({
     if (k === "model") {
       return (
         <>
-          <ModelChoice words={s.words} value={shown(k)} onPick={pick} />
+          <ModelChoice words={own} value={shown(k)} onPick={pick} />
           {after}
+          {groups.map((g) => (
+            <div key={g.kind} className="rs-elsewhere" role="group" aria-label={`${g.name} models`}>
+              <p className="rs-elsewhere-name">{g.name}</p>
+              <ModelChoice words={g.words} value={shown(k)} onPick={pick} />
+              <p className="rs-desc">
+                Switches to {g.name}
+                {running ? " at the end of this turn" : ""} — the conversation carries over
+              </p>
+            </div>
+          ))}
         </>
       );
     }
@@ -604,8 +641,7 @@ export function RunSettings({
           setArmed(null);
           return;
         }
-        if (root.current?.contains(document.activeElement)) refocus.current = open;
-        setOpen(null);
+        fold(open);
       }}
       onPointerEnter={(e) => {
         if (e.pointerType === "mouse") setHover(true);
@@ -618,7 +654,7 @@ export function RunSettings({
         if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyboard(false);
       }}
     >
-      <div className="rs-top">
+      <div ref={lasting} className="rs-top">
         <p className="rs-line">
           {parts.map((p, i) => (
             <React.Fragment key={p.k}>
@@ -662,7 +698,7 @@ export function RunSettings({
         )}
       </div>
       {open && (
-        <div id={panelId} className="rs-panel" role="group" aria-label={KEY[open]} data-kind={open}>
+        <div ref={folding} id={panelId} className="rs-panel" role="group" aria-label={KEY[open]} data-kind={open}>
           {panel(open)}
         </div>
       )}

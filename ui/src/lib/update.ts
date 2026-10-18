@@ -13,9 +13,12 @@ function loaded(): string | null {
   return document.querySelector<HTMLScriptElement>('script[type="module"][src*="/assets/"]')?.getAttribute("src") ?? null;
 }
 
-/** The build the server serves now. */
+/**
+ * The build the server serves now. Asked for as a page: until the UI server is up (just after a
+ * restart, say), kiln answers a page with the app's shell, which names the same build.
+ */
 async function served(): Promise<string | null> {
-  const html = await (await fetch("/", { cache: "no-store", credentials: "same-origin" })).text();
+  const html = await (await fetch("/", { cache: "no-store", credentials: "same-origin", headers: { accept: "text/html" } })).text();
   return /<script[^>]+type="module"[^>]+src="([^"]+)"/.exec(html)?.[1] ?? null;
 }
 

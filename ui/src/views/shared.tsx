@@ -1,5 +1,4 @@
-import * as React from "react";
-import { Link } from "react-router";
+import { Link } from "@/lib/router";
 import { Clock, GitCommitHorizontal, GitPullRequest, Hand, Tag } from "lucide-react";
 import type { Agent, Child, HostSample, Run } from "@/api/types";
 import { StatusDot, Chips } from "@/components/ui/status";
@@ -7,6 +6,8 @@ import { Meter, Sparkline } from "@/components/ui/misc";
 import { formatBytes, formatDuration, firstLine, relativeTime, shortSha, spanSeconds, formatPct } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+
+export { upsert } from "@/lib/data";
 
 export function childStatus(c: Child): string {
   switch (c.state) {
@@ -83,7 +84,7 @@ export function AgentMiniCard({ agent, history, onOpen }: { agent: Agent; histor
         <div className="flex items-center gap-2.5">
           <StatusDot status={status} title={!agent.connected ? "disconnected" : agent.draining ? "draining" : agent.busy ? "busy" : "idle"} />
           <h3 className="min-w-0 flex-1 truncate text-[15px] font-[480] tracking-[-0.3px]">{agent.name}</h3>
-          <span className="font-mono text-[10px] text-[#8c8f98]">
+          <span className="font-mono text-[10px] text-[#8c8f98] tabular-nums">
             {agent.busy}/{agent.slots}
           </span>
         </div>
@@ -116,28 +117,6 @@ export function AgentMiniCard({ agent, history, onOpen }: { agent: Agent; histor
       </div>
     </article>
   );
-}
-
-export function useInterval(fn: () => void, ms: number) {
-  const ref = React.useRef(fn);
-  React.useEffect(() => {
-    ref.current = fn;
-  });
-  React.useEffect(() => {
-    const t = window.setInterval(() => ref.current(), ms);
-    return () => window.clearInterval(t);
-  }, [ms]);
-}
-
-/** Merge or insert an entity into a list by key. */
-export function upsert<T>(list: T[] | undefined, item: T, key: (t: T) => string, prepend = true): T[] {
-  const arr = list ?? [];
-  const k = key(item);
-  const i = arr.findIndex((x) => key(x) === k);
-  if (i === -1) return prepend ? [item, ...arr] : [...arr, item];
-  const copy = arr.slice();
-  copy[i] = item;
-  return copy;
 }
 
 export function EventIcon({ event }: { event: string }) {

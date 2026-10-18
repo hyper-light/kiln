@@ -17,9 +17,9 @@ export default tseslint.config(
       "react-hooks/rules-of-hooks": "error",
       "react-hooks/exhaustive-deps": "warn",
       "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],
-      // No effects in kiln's UI (warnings while the last ones are replaced; then an error).
+      // No effects in kiln's UI.
       "no-restricted-syntax": [
-        "warn",
+        "error",
         {
           selector: "CallExpression[callee.name=/^use(Layout)?Effect$/], CallExpression[callee.object.name='React'][callee.property.name=/^use(Layout)?Effect$/]",
           message:

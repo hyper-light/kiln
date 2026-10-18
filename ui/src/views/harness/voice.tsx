@@ -7,8 +7,10 @@
 import * as React from "react";
 import { LoaderCircle, Mic, Square } from "lucide-react";
 import { api } from "@/api/client";
+import { Loadable } from "@/components/ui/loading";
 import { Tip } from "@/components/ui/tooltip";
-import { errorMessage } from "@/lib/hooks";
+import { errorMessage, useNow } from "@/lib/hooks";
+import { useSuspenseResource } from "@/lib/resource";
 import { cn } from "@/lib/utils";
 
 /** The parts of the Web Speech API used here (not in TypeScript's DOM types). */
@@ -40,27 +42,16 @@ function speech(): RecognitionCtor | undefined {
   return w.SpeechRecognition ?? w.webkitSpeechRecognition;
 }
 
+/** Browsers lend the microphone only to a secure page. */
+const secure = () => window.isSecureContext && Boolean(navigator.mediaDevices);
+
 /** How this browser can take speech, or why it can't. */
-function useWay(): Way | null {
-  const [way, setWay] = React.useState<Way | null>(null);
-  React.useEffect(() => {
-    let live = true;
-    if (!window.isSecureContext || !navigator.mediaDevices) {
-      setWay({ kind: "off", why: "The microphone needs HTTPS: browsers lend it only to an https:// page." });
-      return;
-    }
-    void serverVoice().then((s) => {
-      if (!live) return;
-      const Rec = speech();
-      if (Rec) setWay({ kind: "speech", Rec, lang: s.language || navigator.language || "en-US" });
-      else if (typeof MediaRecorder !== "undefined" && s.transcribe) setWay({ kind: "record", mime: MIMES.find((m) => MediaRecorder.isTypeSupported(m)) ?? "" });
-      else setWay({ kind: "off", why: "This browser can't turn speech into text; set up [voice] on the server (docs/voice.md) and it will." });
-    });
-    return () => {
-      live = false;
-    };
-  }, []);
-  return way;
+function wayOf(s: { transcribe: boolean; language: string }): Way {
+  if (!secure()) return { kind: "off", why: "The microphone needs HTTPS: browsers lend it only to an https:// page." };
+  const Rec = speech();
+  if (Rec) return { kind: "speech", Rec, lang: s.language || navigator.language || "en-US" };
+  if (typeof MediaRecorder !== "undefined" && s.transcribe) return { kind: "record", mime: MIMES.find((m) => MediaRecorder.isTypeSupported(m)) ?? "" };
+  return { kind: "off", why: "This browser can't turn speech into text; set up [voice] on the server (docs/voice.md) and it will." };
 }
 
 const WHY: Record<string, string> = {
@@ -74,38 +65,59 @@ const WHY: Record<string, string> = {
 
 const clock = (ms: number) => `${Math.floor(ms / 60_000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
 
-/**
- * The microphone, beside a text field: tap to speak, tap again to stop. `field` is the text field
- * and `setText` sets its text; `onNote` says, in a line, why it can't listen or what went wrong.
- */
-export function MicButton({
-  field,
-  setText,
-  onNote,
-  disabled,
-  className,
-}: {
+interface MicProps {
   field: React.RefObject<HTMLTextAreaElement | null>;
   setText: (text: string) => void;
   onNote: (note: string) => void;
   disabled?: boolean;
   className?: string;
-}) {
-  const way = useWay();
+}
+
+/**
+ * The microphone, beside a text field: tap to speak, tap again to stop. `field` is the text field
+ * and `setText` sets its text; `onNote` says, in a line, why it can't listen or what went wrong.
+ */
+export const MicButton = React.memo(function MicButton(props: MicProps) {
+  return (
+    <Loadable label="Loading the microphone" fallback={<Unready className={props.className} />}>
+      <Microphone {...props} />
+    </Loadable>
+  );
+});
+
+/** The button while it's still asked how this browser can take speech: there, not yet usable. */
+function Unready({ className }: { className?: string }) {
+  return (
+    <Tip content="Speak: the words go in at the cursor">
+      <button type="button" className={cn("cp-icon cp-mic", className)} data-state="idle" aria-label="Speak" aria-pressed={false} disabled>
+        <Mic size={15} aria-hidden="true" />
+      </button>
+    </Tip>
+  );
+}
+
+/** How long it's been listening. Leaving the page meanwhile stops listening (`ref` is told when it goes). */
+function Elapsed({ since, ref }: { since: number; ref: React.Ref<HTMLSpanElement> }) {
+  const now = useNow();
+  return (
+    <span ref={ref} className="cp-mic-time">
+      {clock(Math.max(0, now - since))}
+    </span>
+  );
+}
+
+function Microphone({ field, setText, onNote, disabled, className }: MicProps) {
+  // Nothing to ask the server where the page can't have the microphone anyway.
+  const way = wayOf(useSuspenseResource("voice", () => (secure() ? serverVoice() : Promise.resolve({ transcribe: false, language: "" }))).data);
   const [state, setState] = React.useState<"idle" | "listening" | "transcribing">("idle");
   const [since, setSince] = React.useState(0);
-  const [now, setNow] = React.useState(0);
   /** The text around the cursor when it started, and the words heard since. */
   const words = React.useRef<{ before: string; after: string; heard: string } | null>(null);
   const stopper = React.useRef<(() => void) | null>(null);
-
-  React.useEffect(() => {
-    if (state !== "listening") return;
-    const t = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(t);
-  }, [state]);
-  // Leaving the page stops listening.
-  React.useEffect(() => () => stopper.current?.(), []);
+  // Leaving the page stops listening: the time it's been listening goes with it.
+  const stopOnLeave = React.useCallback((time: HTMLSpanElement | null) => {
+    if (time) return () => stopper.current?.();
+  }, []);
 
   /** Puts the words heard (and those still being heard) in at the cursor, and the cursor after them. */
   const show = (pending = "") => {
@@ -126,7 +138,6 @@ export function MicButton({
     const to = el?.selectionEnd ?? v.length;
     words.current = { before: v.slice(0, from), after: v.slice(to), heard: "" };
     setSince(Date.now());
-    setNow(Date.now());
     setState("listening");
   };
   const done = () => {
@@ -203,7 +214,6 @@ export function MicButton({
   };
 
   const click = () => {
-    if (!way) return;
     if (way.kind === "off") {
       onNote(way.why);
       return;
@@ -218,17 +228,17 @@ export function MicButton({
   };
 
   const listening = state === "listening";
-  const label = way?.kind === "off" ? "Speak (unavailable here)" : listening ? "Stop listening" : state === "transcribing" ? "Turning it into text" : "Speak";
+  const label = way.kind === "off" ? "Speak (unavailable here)" : listening ? "Stop listening" : state === "transcribing" ? "Turning it into text" : "Speak";
   return (
-    <Tip content={way?.kind === "off" ? way.why : listening ? "Stop" : "Speak: the words go in at the cursor"}>
+    <Tip content={way.kind === "off" ? way.why : listening ? "Stop" : "Speak: the words go in at the cursor"}>
       <button
         type="button"
         className={cn("cp-icon cp-mic", className)}
-        data-state={way?.kind === "off" ? "off" : state}
+        data-state={way.kind === "off" ? "off" : state}
         aria-label={label}
         aria-pressed={listening}
-        aria-disabled={way?.kind === "off" || undefined}
-        disabled={disabled || way === null || state === "transcribing"}
+        aria-disabled={way.kind === "off" || undefined}
+        disabled={disabled || state === "transcribing"}
         onClick={click}
       >
         {state === "transcribing" ? (
@@ -238,7 +248,7 @@ export function MicButton({
         ) : (
           <Mic size={15} aria-hidden="true" />
         )}
-        {listening && <span className="cp-mic-time">{clock(now - since)}</span>}
+        {listening && <Elapsed since={since} ref={stopOnLeave} />}
       </button>
     </Tip>
   );

@@ -52,8 +52,8 @@ pub const MAX_BINARY: usize = 256 << 20;
 /// never listed (no one's terminal tab), also after a restart that adopts them back.
 pub const HIDDEN_MARK: &str = "# kiln-upgrade ";
 /// What a terminal-driven upgrade prints when it ends, for the job to read.
-const OK_MARK: &str = "KILN-UPGRADE-OK";
-const FAIL_MARK: &str = "KILN-UPGRADE-FAIL";
+pub(crate) const OK_MARK: &str = "KILN-UPGRADE-OK";
+pub(crate) const FAIL_MARK: &str = "KILN-UPGRADE-FAIL";
 /// Labels of the pod that reads which build an image holds. Deliberately not
 /// `app.kubernetes.io/managed-by=kiln`: the job-pod reaper owns those.
 const CHECK_SELECTOR: &str = "kiln.dev/role=image-check";
@@ -75,13 +75,17 @@ pub struct Job {
     /// The machine, or "server".
     pub target: String,
     /// "native" (the runner's own upgrade command), "terminal" (through a terminal on an older
-    /// runner), "restart" (Kubernetes rollout) or "replace" (the server's binary).
+    /// runner), "build" (the machine builds the newest kiln itself, `crate::fleet`), "restart"
+    /// (Kubernetes rollout) or "replace" (the server's binary).
     pub method: &'static str,
     pub state: JobState,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub from_build: Option<String>,
     pub to_build: Option<String>,
+    /// The commit it brings the machine to, when kiln knows it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     /// The machine reported running `to_build`.
     pub reached: bool,
     pub log: Vec<String>,
@@ -94,8 +98,9 @@ pub struct Binary {
     pub target: String,
     pub sha256: String,
     pub size: u64,
-    /// "server" (this server's own), "upload", "release" (a GitHub release) or "built" (by kiln's
-    /// own release pipeline, `run` and `sha`).
+    /// "server" (this server's own), "upload", "release" (a GitHub release), "built" (by kiln's
+    /// own release pipeline, `run` and `sha`) or "machine" (a machine built it of itself, `by`
+    /// and `sha`; `crate::fleet`).
     pub origin: String,
     pub at: i64,
     #[serde(default)]
@@ -106,6 +111,9 @@ pub struct Binary {
     /// The commit it was built from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha: Option<String>,
+    /// The machine that built it of itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -142,6 +150,8 @@ pub struct Updates {
     checking_image: AtomicBool,
     /// A push to the release branch: the server's commit may be there now (`in_step_loop`).
     in_step_wake: crate::rt::Notify,
+    /// Every runner on the newest kiln.
+    pub fleet: crate::fleet::Fleet,
 }
 
 impl Updates {
@@ -263,6 +273,16 @@ pub fn store(hub: &Hub, target: &str, bytes: &[u8], origin: &str) -> anyhow::Res
     keep(&store_dir(hub), target, bytes, origin, None)
 }
 
+/// Keep the binary `machine` built of `commit` for its own platform (`crate::fleet`): what the
+/// other machines of the platform download.
+pub fn keep_built(hub: &Hub, target: &str, bytes: &[u8], machine: &str, commit: &str) -> anyhow::Result<Binary> {
+    let mut b = keep(&store_dir(hub), target, bytes, "machine", None)?;
+    b.sha = Some(commit.to_ascii_lowercase());
+    b.by = Some(machine.to_owned());
+    std::fs::write(meta_path(hub, target), serde_json::to_vec(&b)?)?;
+    Ok(b)
+}
+
 /// Whether a run's binaries become what runners upgrade to: kiln's own release pipeline, built
 /// from a release tag or from the release branch, and from the commit this server runs (`own`;
 /// any, when it was built without knowing one), so no platform runs ahead of or behind it. A
@@ -276,7 +296,8 @@ pub fn adopts(u: &crate::config::Updates, run: &crate::store::Run, own: &str) ->
 
 /// What the release pipeline's job left in its artifacts (`dist/kiln-<target>[.exe]`): kept as the
 /// binaries each other platform's runners upgrade to. This server's own platform keeps its own
-/// build, so its runners run what it runs.
+/// build from a run of the server's commit; a run of a newer one (`crate::fleet`) brings that
+/// platform's too.
 pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::store::Run) -> anyhow::Result<Vec<Binary>> {
     let dir = cfg.server.data_dir.join("binaries");
     use std::io::Read as _;
@@ -287,7 +308,7 @@ pub fn adopt_into(cfg: &crate::config::Config, artifacts: &Path, run: &crate::st
         let path = entry.path()?.to_string_lossy().into_owned();
         let name = path.rsplit('/').next().unwrap_or(&path);
         let Some(target) = name.strip_prefix("kiln-").map(|t| t.strip_suffix(".exe").unwrap_or(t)) else { continue };
-        if !known_target(target) || target == crate::api::TARGET || entry.size() > MAX_BINARY as u64 {
+        if !known_target(target) || (target == crate::api::TARGET && run.sha.eq_ignore_ascii_case(crate::api::COMMIT)) || entry.size() > MAX_BINARY as u64 {
             continue;
         }
         let mut bytes = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
@@ -322,11 +343,18 @@ pub struct InStep {
     pub behind: Vec<String>,
 }
 
-/// The other platforms' binaries kept here against `commit`.
+/// The other platforms' binaries kept here against `commit`. This server's own platform is one
+/// of them when `commit` is a newer one than the server's (`crate::fleet`).
 pub fn in_step(hub: &Hub, commit: &str) -> InStep {
-    let others: Vec<&str> = crate::api::RELEASE_TARGETS.iter().copied().filter(|t| *t != crate::api::TARGET).collect();
+    let own = commit.eq_ignore_ascii_case(crate::api::COMMIT);
+    let others: Vec<&str> = crate::api::RELEASE_TARGETS.iter().copied().filter(|t| !(own && *t == crate::api::TARGET)).collect();
     let kept: Vec<Binary> = others.iter().filter_map(|t| stored(hub, t).map(|(_, b)| b)).collect();
-    in_step_of(&others, &kept, commit)
+    let mut s = in_step_of(&others, &kept, commit);
+    if !own && !kept.iter().any(|b| b.target == crate::api::TARGET) && !s.behind.iter().any(|t| t == crate::api::TARGET) {
+        s.behind.push(crate::api::TARGET.to_owned());
+        s.in_step = false;
+    }
+    s
 }
 
 fn in_step_of(others: &[&str], kept: &[Binary], commit: &str) -> InStep {
@@ -385,13 +413,13 @@ pub async fn build_commit(hub: &Hub, repo: &crate::store::Repo, commit: &str) ->
 /// commit not in the repository yet is tried again later.
 pub async fn in_step_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
     use futures::FutureExt as _;
-    let commit = crate::api::COMMIT;
-    if commit.is_empty() || !hub.cfg.updates.in_step {
+    if crate::api::COMMIT.is_empty() || !hub.cfg.updates.in_step {
         hub.shutdown.cancelled().await;
         return Ok(());
     }
     let mut tick = crate::rt::Interval::new(IN_STEP_EVERY);
     let mut starts = Starts::default();
+    let mut was = String::new();
     loop {
         futures::select_biased! {
             () = hub.shutdown.cancelled().fuse() => return Ok(()),
@@ -399,8 +427,14 @@ pub async fn in_step_loop(hub: Arc<Hub>) -> anyhow::Result<()> {
             () = hub.updates.in_step_wake.notified().fuse() => starts.last = None,
             () = tick.tick().fuse() => {}
         }
-        if let Err(e) = keep_in_step(&hub, commit, &mut starts).await {
-            tracing::warn!(commit = short(commit), error = %format!("{e:#}"), "couldn't build every platform from the server's commit");
+        // The newest kiln (`crate::fleet`): the server's commit, or a newer one a runner runs.
+        let commit = hub.updates.fleet.target().map_or_else(|| crate::api::COMMIT.to_owned(), |t| t.commit);
+        if commit != was {
+            starts.last = None;
+            was.clone_from(&commit);
+        }
+        if let Err(e) = keep_in_step(&hub, &commit, &mut starts).await {
+            tracing::warn!(commit = short(&commit), error = %format!("{e:#}"), "couldn't build every platform from the newest commit");
         }
     }
 }
@@ -442,7 +476,7 @@ fn keep(dir: &Path, target: &str, bytes: &[u8], origin: &str, built: Option<(i64
     std::fs::rename(&tmp, dir.join(format!("kiln-{target}")))?;
     let sha256 = hex::encode(Sha256::digest(bytes));
     let (run, sha) = built.map_or((None, None), |(n, s)| (Some(n), Some(s)));
-    let meta = Binary { target: target.to_owned(), build: build_id(&sha256), sha256, size: bytes.len() as u64, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha };
+    let meta = Binary { target: target.to_owned(), build: build_id(&sha256), sha256, size: bytes.len() as u64, origin: origin.to_owned(), at: crate::util::now_unix(), run, sha, by: None };
     std::fs::write(dir.join(format!("kiln-{target}.json")), serde_json::to_vec(&meta)?)?;
     Ok(meta)
 }
@@ -461,7 +495,8 @@ pub fn unstore(hub: &Hub, target: &str) -> bool {
 pub fn binaries(hub: &Hub) -> Vec<Binary> {
     let mut v = Vec::new();
     if let Ok((sha256, size)) = own_binary() {
-        v.push(Binary { target: crate::api::TARGET.to_owned(), build: build_id(&sha256), sha256, size, origin: "server".to_owned(), at: 0, run: None, sha: None });
+        let sha = (!crate::api::COMMIT.is_empty()).then(|| crate::api::COMMIT.to_owned());
+        v.push(Binary { target: crate::api::TARGET.to_owned(), build: build_id(&sha256), sha256, size, origin: "server".to_owned(), at: 0, run: None, sha, by: None });
     }
     let mut targets: Vec<&str> = crate::api::RELEASE_TARGETS.to_vec();
     if !targets.contains(&crate::api::TARGET) {
@@ -696,7 +731,7 @@ async fn check_image(hub: &Hub, image: &str, node: Option<&str>) -> anyhow::Resu
 // ------------------------------------------------------------------ jobs
 
 impl Updates {
-    fn insert(&self, job: Job) {
+    pub(crate) fn insert(&self, job: Job) {
         let mut jobs = self.jobs.lock();
         jobs.push_back(job);
         while jobs.len() > KEEP_JOBS {
@@ -713,16 +748,16 @@ impl Updates {
         self.jobs.lock().iter().find(|j| j.id == id).cloned()
     }
 
-    fn running(&self, id: &str) -> bool {
+    pub(crate) fn running(&self, id: &str) -> bool {
         self.jobs.lock().iter().any(|j| j.id == id && j.state == JobState::Running)
     }
 
-    fn reached(&self, id: &str) -> bool {
+    pub(crate) fn reached(&self, id: &str) -> bool {
         self.jobs.lock().iter().any(|j| j.id == id && j.reached)
     }
 
     /// A job already running for `target`.
-    fn running_for(&self, kind: &str, target: &str) -> Option<Job> {
+    pub(crate) fn running_for(&self, kind: &str, target: &str) -> Option<Job> {
         self.jobs.lock().iter().find(|j| j.kind == kind && j.target == target && j.state == JobState::Running).cloned()
     }
 
@@ -737,13 +772,19 @@ impl Updates {
         hub.emit(&serde_json::json!({ "type": "update_job", "job": snapshot }));
     }
 
-    fn say(&self, hub: &Hub, id: &str, line: impl Into<String>) {
+    pub(crate) fn say(&self, hub: &Hub, id: &str, line: impl Into<String>) {
         let line = line.into();
         self.update(hub, id, |j| push_line(j, line));
     }
 
-    fn finish(&self, hub: &Hub, id: &str, result: Result<String, String>) {
+    /// A build job's machine says which build it made: the job is reached when that reports in.
+    pub(crate) fn set_to_build(&self, hub: &Hub, id: &str, build: &str) {
+        self.update(hub, id, |j| j.to_build = Some(build.to_owned()));
+    }
+
+    pub(crate) fn finish(&self, hub: &Hub, id: &str, result: Result<String, String>) {
         let now = crate::util::now_unix();
+        let error = result.as_ref().err().cloned();
         self.update(hub, id, |j| {
             if j.state != JobState::Running {
                 return;
@@ -763,6 +804,9 @@ impl Updates {
                 }
             }
         });
+        if let Some(j) = self.job(id) {
+            crate::fleet::on_job_end(hub, &j, error.as_deref());
+        }
         hub.emit(&serde_json::json!({ "type": "updates" }));
     }
 
@@ -807,7 +851,7 @@ fn push_line(j: &mut Job, line: String) {
     }
 }
 
-fn new_job(kind: &'static str, target: &str, method: &'static str, from_build: Option<String>, to_build: Option<String>) -> Job {
+pub(crate) fn new_job(kind: &'static str, target: &str, method: &'static str, from_build: Option<String>, to_build: Option<String>) -> Job {
     Job {
         id: crate::util::new_id(),
         kind,
@@ -818,6 +862,7 @@ fn new_job(kind: &'static str, target: &str, method: &'static str, from_build: O
         ended_at: None,
         from_build,
         to_build,
+        commit: None,
         reached: false,
         log: Vec::new(),
         error: None,
@@ -842,7 +887,20 @@ pub struct RunnerInfo {
     pub target_build: Option<String>,
     /// The build its newest runner process runs (`None`: too old to say).
     pub build: Option<String>,
+    /// It runs the newest kiln (`crate::fleet`); without a newest known, the build kiln has for
+    /// its platform.
     pub up_to_date: bool,
+    /// The commit it runs, when kiln knows it.
+    pub commit: Option<String>,
+    /// Where it stands against the newest kiln (`None`: no newest known).
+    pub standing: Option<crate::fleet::Standing>,
+    /// What it does next to reach the newest kiln, as the end of a sentence about it ("builds
+    /// 94f0847a1b2c itself", "waits for …").
+    pub next: Option<String>,
+    /// How: "download", "build", "wait", "upgrading" (it is), or "left" (left alone).
+    pub how: Option<&'static str>,
+    /// Its kiln checkout, as it reports it.
+    pub checkout: Option<String>,
     /// "native" or "terminal".
     pub method: &'static str,
     /// Terminals are allowed on it (an older runner is upgraded through one).
@@ -877,47 +935,100 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 connected: a.connected,
                 version: a.version,
                 instances,
+                commit: None,
+                standing: None,
+                next: None,
+                how: None,
+                checkout: None,
             }
         })
         .collect();
     out.sort_by(|a, b| b.connected.cmp(&a.connected).then_with(|| a.name.cmp(&b.name)));
+    // Against the newest kiln, when there is one: the commit each runs, and how it gets there.
+    let newest = hub.updates.fleet.target();
+    for r in &mut out {
+        r.commit = crate::fleet::runner_commit(hub, &r.name, r.build.as_deref());
+        r.checkout = crate::fleet::reported(hub, &r.name).and_then(|k| k.checkout);
+        let Some(t) = &newest else { continue };
+        r.target_build = r.target.as_deref().and_then(|target| crate::fleet::binary_for(hub, target, &t.commit)).map(|b| b.build);
+        let s = crate::fleet::standing(hub, r, t).await;
+        r.up_to_date = s == crate::fleet::Standing::Current;
+        r.standing = Some(s);
+        if r.connected
+            && let Some((how, next)) = crate::fleet::next(hub, r, t, s).await
+        {
+            r.how = Some(how);
+            r.next = Some(next);
+        }
+    }
     out
 }
 
-/// Start upgrading `machine`'s runner to the build kiln has for its platform. Nothing it runs is
-/// stopped.
+/// Start upgrading `machine`'s runner to the newest kiln (`crate::fleet`): a binary of it when
+/// kiln has one for its platform, else a build of it on the machine itself. With no newest known
+/// (a server built without knowing its commit), to the build kiln has for its platform. Nothing it
+/// runs is stopped.
 pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job> {
     if let Some(j) = hub.updates.running_for("runner", machine) {
         return Ok(j);
     }
     let r = runners(hub).await.into_iter().find(|r| r.name == machine).ok_or_else(|| anyhow::anyhow!("there is no runner called {machine}"))?;
     anyhow::ensure!(r.connected, "{machine} is not connected");
+    if let Some(t) = hub.updates.fleet.target() {
+        anyhow::ensure!(!r.up_to_date, "{machine} already runs the newest kiln ({})", crate::fleet::short(&t.commit));
+        return match crate::fleet::plan(hub, &r, &t).await {
+            crate::fleet::Plan::Download(b) => upgrade_with(hub, &r, &b, "admin").await,
+            crate::fleet::Plan::Build(c) => crate::fleet::self_build(hub, &r, &t.commit, c, "admin").await,
+            crate::fleet::Plan::Wait(why) => anyhow::bail!("{machine} can't be upgraded yet: it {why}"),
+        };
+    }
+    let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
+    let (sha256, size) = ensure_binary(hub, &target).await?;
+    let b = binaries(hub).into_iter().find(|b| b.target == target && b.sha256 == sha256).unwrap_or_else(|| Binary {
+        build: build_id(&sha256),
+        target,
+        sha256,
+        size,
+        origin: "release".to_owned(),
+        at: 0,
+        run: None,
+        sha: None,
+        by: None,
+    });
+    upgrade_with(hub, &r, &b, "admin").await
+}
+
+/// Which runner process is `r`'s newest, by the start of its id: the service of one set up beside
+/// another is named after it (empty for the machine's usual one).
+pub(crate) fn instance8(r: &RunnerInfo) -> String {
+    r.instances
+        .iter()
+        .find(|i| i.newest && !i.legacy && i.id != crate::upgrade::MAIN)
+        .map(|i| i.id.chars().filter(char::is_ascii_alphanumeric).take(8).collect::<String>())
+        .unwrap_or_default()
+}
+
+/// Start upgrading `r` to binary `b` (`by`: who asked, for the audit log). Nothing it runs is
+/// stopped.
+pub async fn upgrade_with(hub: &Arc<Hub>, r: &RunnerInfo, b: &Binary, by: &str) -> anyhow::Result<Job> {
+    let machine = &r.name;
     anyhow::ensure!(
         r.method == "native" || r.terminal,
         "{machine} runs a kiln too old to upgrade itself and has terminals turned off: run `kiln install --agent --upgrade` with a new kiln binary on it"
     );
-    let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
-    let (sha256, size) = ensure_binary(hub, &target).await?;
-    let to = build_id(&sha256);
-    anyhow::ensure!(r.build.as_deref() != Some(to.as_str()), "{machine} already runs build {to}");
-    let job = new_job("runner", machine, r.method, r.build.clone(), Some(to.clone()));
+    anyhow::ensure!(r.build.as_deref() != Some(b.build.as_str()), "{machine} already runs build {}", b.build);
+    let mut job = new_job("runner", machine, r.method, r.build.clone(), Some(b.build.clone()));
+    job.commit.clone_from(&b.sha);
     let id = job.id.clone();
     hub.updates.insert(job.clone());
-    hub.store.audit("admin".into(), "upgrade.runner".into(), format!("{machine} to build {to} ({target}, {})", r.method)).await;
-    hub.updates.say(hub, &id, format!("upgrading {machine} to build {to} ({target}); nothing it runs is stopped"));
-    let h = Arc::clone(hub);
-    let machine = machine.to_owned();
+    hub.store.audit(by.into(), "upgrade.runner".into(), format!("{machine} to build {} ({}, {})", b.build, b.target, r.method)).await;
+    hub.updates.say(hub, &id, format!("upgrading {machine} to build {} ({}); nothing it runs is stopped", b.build, b.target));
+    let (h, machine, b) = (Arc::clone(hub), machine.clone(), b.clone());
     if r.method == "native" {
-        crate::rt::spawn(async move { native(&h, &id, &machine, &target, &sha256, size).await });
+        crate::rt::spawn(async move { native(&h, &id, &machine, &b).await });
     } else {
-        // Which runner process this is: the service of one set up beside another is named after it.
-        let inst8 = r
-            .instances
-            .iter()
-            .find(|i| i.newest && !i.legacy && i.id != crate::upgrade::MAIN)
-            .map(|i| i.id.chars().filter(char::is_ascii_alphanumeric).take(8).collect::<String>())
-            .unwrap_or_default();
-        crate::rt::spawn(async move { terminal(&h, &id, &machine, &target, &sha256, &inst8).await });
+        let inst8 = instance8(r);
+        crate::rt::spawn(async move { terminal(&h, &id, &machine, &b, &inst8).await });
     }
     Ok(job)
 }
@@ -926,9 +1037,10 @@ pub async fn upgrade_runner(hub: &Arc<Hub>, machine: &str) -> anyhow::Result<Job
 /// `install --agent --upgrade`, reporting back (UpgradeLog / UpgradeDone). A runner that takes
 /// the binary in place restarts its own process (same pid, terminals handed over) and so may
 /// never send UpgradeDone: the new build reporting in is what completes the job.
-async fn native(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, sha256: &str, size: u64) {
+async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
     let u = &hub.updates;
-    let msg = ServerMsg::Upgrade { job: id.to_owned(), path: format!("/dl/kiln/{target}"), sha256: sha256.to_owned(), size };
+    // That exact build: the server may hand out more than one for a platform.
+    let msg = ServerMsg::Upgrade { job: id.to_owned(), path: format!("/dl/kiln/{}/{}", b.target, b.build), sha256: b.sha256.clone(), size: b.size };
     if !hub.send_to_agent(machine, LANE_CONTROL, &msg).await {
         u.finish(hub, id, Err(format!("{machine} is not connected")));
         return;
@@ -998,21 +1110,26 @@ exit "$rc"
     )
 }
 
-/// Where a machine can fetch binaries from this server: its public URL, then the one pods use.
-fn download_urls(hub: &Hub, target: &str) -> Vec<String> {
+/// Where a machine can reach this server: its public URL, then the one pods use.
+pub(crate) fn server_bases(hub: &Hub) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     for base in [hub.cfg.server.public_url.as_str(), hub.cfg.kubernetes.server_url.as_deref().unwrap_or("")] {
         let base = base.trim_end_matches('/');
         let usable = (base.starts_with("http://") || base.starts_with("https://")) && !base.contains(|c: char| c.is_whitespace() || "'\\\"`$;&|<>()".contains(c));
-        if usable && !v.iter().any(|u| u.starts_with(base)) {
-            v.push(format!("{base}/dl/kiln/{target}"));
+        if usable && !v.iter().any(|u| u == base) {
+            v.push(base.to_owned());
         }
     }
     v
 }
 
+/// Where a machine can fetch build `build` for `target` from this server.
+fn download_urls(hub: &Hub, target: &str, build: &str) -> Vec<String> {
+    server_bases(hub).into_iter().map(|base| format!("{base}/dl/kiln/{target}/{build}")).collect()
+}
+
 /// Terminal output without escape sequences or carriage returns.
-fn plain(s: &str) -> String {
+pub(crate) fn plain(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1049,15 +1166,15 @@ fn plain(s: &str) -> String {
 }
 
 /// Through a terminal on the runner (it knows nothing of upgrades): download, check, install.
-async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, sha256: &str, inst8: &str) {
+async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary, inst8: &str) {
     use crate::termsess::Frame;
     let u = &hub.updates;
-    let urls = download_urls(hub, target);
+    let urls = download_urls(hub, &b.target, &b.build);
     if urls.is_empty() {
         u.finish(hub, id, Err("kiln has no public URL (server.public_url) the machine could download from".to_owned()));
         return;
     }
-    let script = terminal_script(id, &urls, sha256, inst8);
+    let script = terminal_script(id, &urls, &b.sha256, inst8);
     let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(format!("sh -c '{script}'")), 200, 50);
     u.say(hub, id, "this runner predates upgrade commands: running the upgrade in a terminal on it (not listed anywhere)");
     let mut att = session.attach();
@@ -1125,11 +1242,12 @@ async fn terminal(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, sha256:
     u.finish(hub, id, Ok("installed; the new runner hasn't reported in yet (it shows under Runners when it does)".to_owned()));
 }
 
-/// Upgrade every connected runner that isn't on the build kiln has for it.
+/// Upgrade every connected runner that isn't on the newest kiln (one running a branch or a local
+/// build on purpose is left alone: upgrade it by itself).
 pub async fn upgrade_all(hub: &Arc<Hub>) -> Vec<Result<Job, String>> {
     let mut out = Vec::new();
     for r in runners(hub).await {
-        if r.connected && !r.up_to_date {
+        if r.connected && !r.up_to_date && !matches!(r.standing, Some(crate::fleet::Standing::Branch | crate::fleet::Standing::Local)) {
             out.push(upgrade_runner(hub, &r.name).await.map_err(|e| format!("{}: {e:#}", r.name)));
         }
     }
@@ -1497,15 +1615,48 @@ pub fn runner_build() -> AgentMsg {
     AgentMsg::Build { build: own_build(), caps: RUNNER_CAPS }
 }
 
+/// What a runner says of itself after its build ([`AgentMsg::Facts`]): for now, the kiln it
+/// runs and where its kiln checkout is (`crate::fleet`).
+pub fn runner_facts() -> AgentMsg {
+    let facts = kiln_ci::facts::RunnerFacts {
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+        kiln: Some(kiln_ci::facts::KilnFacts {
+            commit: crate::api::COMMIT.to_owned(),
+            build: own_build(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            target: crate::api::TARGET.to_owned(),
+            checkout: kiln_checkout().map(|p| p.to_string_lossy().into_owned()),
+        }),
+        probed_at: crate::util::now_unix(),
+        ..kiln_ci::facts::RunnerFacts::default()
+    };
+    AgentMsg::Facts { json: serde_json::to_string(&facts).unwrap_or_default() }
+}
+
+/// A checkout of kiln on this machine: `KILN_SOURCE`, else one of the usual places in the home
+/// directory (`crate::fleet::USUAL`).
+pub fn kiln_checkout() -> Option<PathBuf> {
+    let looks = |p: &Path| p.join("crates/kiln/Cargo.toml").is_file() && p.join("ui/package.json").is_file();
+    if let Some(p) = std::env::var_os("KILN_SOURCE").map(PathBuf::from).filter(|p| looks(p)) {
+        return Some(p);
+    }
+    let home = crate::os::home_dir();
+    crate::fleet::USUAL.iter().map(|u| home.join(u)).find(|p| looks(p))
+}
+
 /// Everything this build's runner can do ([`AgentMsg::Build`]).
 pub const RUNNER_CAPS: u32 = CAP_UPGRADE
+    | crate::proto::CAP_FACTS
     | crate::proto::CAP_TAKEOVER
     | crate::proto::CAP_DIRS
     | crate::proto::CAP_TAKEOVER_STOP
     | crate::proto::CAP_SYNC
+    | crate::proto::CAP_REPOS
     | crate::proto::CAP_FRONT_DOOR
     | crate::proto::CAP_CI2
-    | crate::proto::CAP_ACTIONS;
+    | crate::proto::CAP_ACTIONS
+    | crate::proto::CAP_REACH;
 
 #[cfg(test)]
 mod tests {
@@ -1568,6 +1719,7 @@ mod tests {
             build: String::new(),
             run: None,
             sha: sha.map(str::to_owned),
+            by: None,
         };
         let c = "a".repeat(40);
         // Nothing kept yet: every platform is behind.
@@ -1663,12 +1815,24 @@ mod tests {
             error: None,
             concurrency_group: None,
         };
+        // A run of a newer commit than the server's (`crate::fleet`): every platform's, the
+        // server's own included.
         let kept = adopt_into(&cfg, &artifacts, &run)?;
         let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
         targets.sort_unstable();
-        assert_eq!(targets, ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"], "this server's own platform keeps its own build");
+        let mut all = vec!["aarch64-apple-darwin", "x86_64-pc-windows-msvc", crate::api::TARGET];
+        all.sort_unstable();
+        assert_eq!(targets, all);
         assert!(kept.iter().all(|b| b.origin == "built" && b.run == Some(12) && b.sha.as_deref() == Some("0d21482abcdef")));
         assert!(dir.path().join("binaries/kiln-aarch64-apple-darwin").exists());
+        // A run of the server's own commit: its platform keeps the server's own build.
+        if !crate::api::COMMIT.is_empty() {
+            let own = crate::store::Run { sha: crate::api::COMMIT.to_owned(), ..run };
+            let kept = adopt_into(&cfg, &artifacts, &own)?;
+            let mut targets: Vec<&str> = kept.iter().map(|b| b.target.as_str()).collect();
+            targets.sort_unstable();
+            assert_eq!(targets, ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"], "this server's own platform keeps its own build");
+        }
         Ok(())
     }
 

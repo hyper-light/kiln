@@ -3,6 +3,9 @@ import type { CdApp, CdNode, CdOperation, CdResourceKey } from "@/api/types";
 import { cn } from "@/lib/utils";
 import { kindShort } from "./model";
 
+/** Keys of one app's data (lib/resource.ts): `cd/app/<id>/…`, so `invalidate(appKey(id))` reads all of it again. */
+export const appKey = (id: string) => `cd/app/${id}/`;
+
 /** Health in the run tones: healthy is a success, progressing runs, degraded failed. */
 export const HEALTH_TONE: Record<string, string> = {
   Healthy: "succeeded",

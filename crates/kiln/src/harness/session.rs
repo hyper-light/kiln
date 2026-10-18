@@ -11,8 +11,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::core::{Core, Update};
-use super::kinds::Kind;
-use super::model::{Command, ExitInfo, State, Status, ToolKind};
+use super::kinds::{Kind, Protocol};
+use super::model::{Command, ExitInfo, Level, State, Status, ToolKind};
 
 /// What to start.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,6 +63,11 @@ pub struct Spec {
     /// it to quit, then kills it) rather than only waiting for it to end.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub takeover_stop: bool,
+    /// Reach (`crate::reach`): the agent's tools for running commands on other runners. None:
+    /// it has them; `"off"`: it does not; anything else: where its commands go unless it says
+    /// otherwise (a runner's name, or `linux/amd64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<String>,
 }
 
 fn yes() -> bool {
@@ -92,6 +97,7 @@ impl Default for Spec {
             fork: false,
             takeover_pid: None,
             takeover_stop: false,
+            reach: None,
         }
     }
 }
@@ -294,7 +300,7 @@ fn store_attachments(files: &Files, msg: &str, list: Vec<super::model::Attachmen
 }
 
 /// The longest name a session takes.
-const MAX_NAME: usize = 80;
+pub(crate) const MAX_NAME: usize = 80;
 
 /// Names a session (the "rename" control: the console, `/rename`, a broadcast): in kiln's lists,
 /// and kept across restarts in its spec. Returns the control to pass on when the harness names
@@ -915,8 +921,206 @@ fn loopback_target(url: &str) -> Option<(String, u16, String)> {
     matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1").then_some((host, port, target))
 }
 
+/// A switch to another harness, waiting for the turn under way to end.
+struct Switch {
+    to: &'static Kind,
+    model: String,
+}
+
+/// Nothing is under way: no turn, nothing waiting for a person.
+fn settled(s: &Session) -> bool {
+    let core = s.core.lock();
+    core.state.status == Status::Idle && core.state.approvals.is_empty() && core.state.turn_started.is_none()
+}
+
+/// A person chose a model of harness `to`: the session goes on in it once nothing is under way
+/// (kiln's queue waits for it meanwhile). None: it can't (said in the timeline).
+fn wanted(s: &Session, from: &'static Kind, to: &str, model: String) -> Option<Switch> {
+    let target = Kind::get(to).filter(|k| k.switchable() && from.switchable());
+    let installed = target.is_some_and(Kind::available);
+    let mut core = s.core.lock();
+    let Some(target) = target else {
+        core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("A conversation can't be carried from {} to {to}.", from.name) });
+        return None;
+    };
+    if !installed {
+        core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text: format!("{} is not installed on this machine.", target.name) });
+        return None;
+    }
+    core.hold = true;
+    core.state.switching = Some(super::model::Switching { kind: target.id.to_owned(), model: model.clone() });
+    core.touch_state();
+    if !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited) {
+        let text = format!("Switching to {} ({}) when this turn ends — the conversation carries over", model_label(target, &model), target.name);
+        core.upsert("switch-pending", None, super::model::Body::Notice { level: Level::Info, text });
+    }
+    Some(Switch { to: target, model })
+}
+
+/// A model's name as its harness lists it, else its id.
+fn model_label(kind: &Kind, model: &str) -> String {
+    super::kinds::models_of(kind.id).into_iter().find(|m| m.id == model && !m.label.is_empty()).map_or_else(|| model.to_owned(), |m| m.label)
+}
+
+/// Most of a conversation carried to another harness (bytes, about): what fits a smaller model's
+/// context window with room to work (≈ 160k tokens). Larger ones lose their long tool outputs'
+/// middles first, then their oldest messages.
+const CARRY_MAX: usize = 640 * 1024;
+
+/// Go on in harness `sw.to` (the one the session ran in, `from`, has ended): the conversation so
+/// far read from `from`'s own record and written the way `sw.to` keeps its own, the permission
+/// mode and effort carried over. The session's id, timeline, changeset and queue stay. Returns
+/// the harness to start and, for one that takes it once started (Codex), the conversation; None:
+/// it couldn't be carried (said in the timeline), and the session stays in `from`.
+async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usize, sink: &Sink) -> Option<(&'static Kind, Option<Vec<serde_json::Value>>)> {
+    use super::handoff;
+    let to = sw.to;
+    let (env, allow_bypass) = {
+        let sp = s.spec.lock();
+        (sp.env.clone(), sp.allow_bypass)
+    };
+    let (cwd, session, old_model, mode, effort) = {
+        let core = s.core.lock();
+        let st = &core.state;
+        (st.cwd.clone(), st.harness_session.clone(), st.model.clone(), st.mode.clone(), st.effort.clone())
+    };
+    let fail = |s: &Arc<Session>, text: String| {
+        let mut core = s.core.lock();
+        core.hold = false;
+        core.state.switching = None;
+        core.touch_state();
+        core.upsert(&format!("switch-{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text });
+        if let Some(e) = core.get_mut("switch-pending") {
+            e.body = super::model::Body::Notice { level: Level::Info, text: "Switch cancelled".to_owned() };
+        }
+    };
+    // What the model saw, from the harness's own record (no session yet: nothing to carry).
+    let read = match session {
+        None => Some(handoff::Conversation::default()),
+        Some(id) => {
+            let env = env.clone();
+            crate::rt::blocking(move || match from.protocol {
+                Protocol::ClaudeStreamJson => handoff::read_claude(&env, &id),
+                Protocol::CodexAppServer => handoff::read_codex(&env, &id),
+                Protocol::Acp(_) | Protocol::Terminal => None,
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+    };
+    let Some(mut conv) = read else {
+        fail(s, format!("kiln could not read {}'s record of this conversation, so it goes on in {}.", from.name, from.name));
+        return None;
+    };
+    let dropped = handoff::fit(&mut conv, CARRY_MAX);
+    let empty = conv.entries.is_empty() && conv.summary.is_none();
+    // The same latitude (never more) and the nearest effort the new model takes.
+    let offered: Vec<String> = to.modes().0.into_iter().filter(|m| !m.dangerous || allow_bypass).map(|m| m.id).collect();
+    let mode = handoff::mode_for(from.id, &mode, to.id, &offered);
+    let levels: Vec<String> = super::kinds::models_of(to.id)
+        .into_iter()
+        .find(|m| m.id == sw.model)
+        .map(|m| m.efforts)
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| to.efforts().into_iter().map(|e| e.id).collect());
+    let effort = handoff::effort_for(&effort, &levels);
+    let note = handoff::note(from.name, &old_model, to.name, &conv.todos, dropped);
+    let (resume, seed) = match to.protocol {
+        _ if empty => (None, None),
+        Protocol::ClaudeStreamJson => {
+            let id = uuid::Uuid::now_v7().to_string();
+            let recs = handoff::to_claude(&conv, Some(&format!("<system-reminder>\n{note}\n</system-reminder>")), &id, &cwd, if old_model.is_empty() { "unknown" } else { &old_model });
+            let (env, cwd, sid) = (env.clone(), cwd.clone(), id.clone());
+            match crate::rt::blocking(move || handoff::write_claude(&env, &cwd, &sid, &recs)).await {
+                Ok(Ok(_)) => (Some(id), None),
+                Ok(Err(e)) | Err(e) => {
+                    fail(s, format!("kiln could not write the conversation for {}: {e:#}", to.name));
+                    return None;
+                }
+            }
+        }
+        Protocol::CodexAppServer => (None, Some(handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))))),
+        Protocol::Acp(_) | Protocol::Terminal => (None, None),
+    };
+    {
+        let mut sp = s.spec.lock();
+        sp.kind = to.id.to_owned();
+        sp.model = Some(sw.model.clone());
+        sp.mode.clone_from(&mode);
+        sp.effort.clone_from(&effort);
+        sp.resume.clone_from(&resume);
+        sp.resume_at = None;
+        sp.fork = false;
+        sp.prompt = None;
+        // A program of its own was the old harness's.
+        sp.program = None;
+        sp.takeover_pid = None;
+        sp.takeover_stop = false;
+    }
+    {
+        let mut core = s.core.lock();
+        let st = &mut core.state;
+        st.harness_session = resume;
+        st.model.clone_from(&sw.model);
+        st.mode = mode.unwrap_or_default();
+        st.effort = effort.unwrap_or_default();
+        // What was the old harness's own goes with it.
+        st.mcp.clear();
+        st.skills.clear();
+        st.plugins.clear();
+        st.inventory = Default::default();
+        st.harness_status.clear();
+        st.limits.clear();
+        st.account = None;
+        st.plan = None;
+        st.control_values.clear();
+        st.objective = None;
+        st.usage.context_tokens = None;
+        st.usage.context_window = None;
+        st.exit = None;
+        st.activity = None;
+        st.doing = None;
+        st.status = Status::Starting;
+        core.meta = super::model::Meta::default();
+        core.hold = false;
+        core.state.switching = None;
+        let mut text = format!("Now {} ({})", model_label(to, &sw.model), to.name);
+        if !empty {
+            text.push_str(" — the conversation carried over");
+        }
+        if dropped > 0 {
+            text.push_str(&format!(" ({dropped} older messages left out to fit)"));
+        }
+        if left > 0 {
+            text.push_str(&format!("; the {left} task(s) {} left running were stopped", from.name));
+        }
+        // `harness-switch:` marks it for viewers: a line between the turns of one harness and the next.
+        core.upsert(&format!("harness-switch:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+        core.touch_meta();
+        core.touch_state();
+    }
+    {
+        let mut info = s.info.lock();
+        if info.name == from.name {
+            to.name.clone_into(&mut info.name);
+        }
+        to.id.clone_into(&mut info.kind);
+        to.name.clone_into(&mut info.kind_name);
+    }
+    // Everyone sees it as the harness it is now.
+    for u in s.snapshot() {
+        let _ = sink.send((s.id.clone(), u)).await;
+    }
+    tracing::info!(session = %s.id, from = from.id, to = to.id, model = %sw.model, dropped, "agent session switched harness");
+    Some((to, seed))
+}
+
 /// The session's life: start the process, pump it, and after it exits wait to be restarted.
 async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Receiver<Ctl>, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files) {
+    // The harness it runs in (a switch changes it); what it says is marked as its.
+    let mut kind = kind;
+    s.core.lock().harness = Some(kind.name.to_owned());
     let (pv_tx, pv_rx) = async_channel::unbounded::<(String, Vec<super::model::FileDiff>)>();
     let (ch_tx, ch_rx) = async_channel::unbounded::<(String, (Option<super::model::FileChange>, Option<super::core::Baseline>))>();
     let (fx_tx, fx_rx) = async_channel::unbounded::<Done>();
@@ -952,12 +1156,38 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
     let mut carry: Vec<Command> = Vec::new();
     // A rewind: the harness starts again, continuing its session from this point.
     let mut rewind_to: Option<Option<String>> = None;
+    // A switch to another harness, waiting for the turn under way to end; and the conversation
+    // carried over, for a harness that takes it once started (Codex), until it has.
+    let mut switching: Option<Switch> = None;
+    let mut seed: Option<Vec<serde_json::Value>> = None;
+    // Tasks the harness left running that a switch stopped.
+    let mut left = 0usize;
+    // The models it last listed (the machine keeps the list for its "new agent" and switches).
+    let mut models_seen: Vec<super::model::ModelOption> = Vec::new();
     loop {
+        // The harness it ran in is down: on in the other one.
+        if let Some(sw) = switching.take() {
+            if let Some((to, carried)) = carry_over(&s, kind, sw, std::mem::take(&mut left), &sink).await {
+                kind = to;
+                seed = carried;
+                models_seen.clear();
+            }
+            first = false;
+            on_change();
+        }
         let mut spec = if first { s.spec.lock().clone() } else { s.resume_spec() };
         if let Some(at) = rewind_to.take() {
             spec.resume_at = at;
         }
+        // A start that takes a carried conversation is the harness's new session, not an old one.
+        if seed.is_some() {
+            spec.resume = None;
+        }
         let mut adapter = kind.adapter(&spec);
+        s.core.lock().harness = Some(kind.name.to_owned());
+        if let Some(items) = &seed {
+            adapter.seed(items.clone());
+        }
         let started = Instant::now();
         let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
         let spawned = match blocked {
@@ -992,6 +1222,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                 let mut last_session = s.core.lock().state.harness_session.clone();
                 let mut last_queue = 0usize;
                 let mut next_tick = Instant::now() + TICK;
+                // It is being ended for a switch (it is idle).
+                let mut ending = false;
                 loop {
                     for job in jobs.previews.drain(..) {
                         let tx = pv_tx.clone();
@@ -1065,7 +1297,22 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 }
                                 on_change();
                             }
+                            Command::SetModel { model, kind: Some(to) } if to != kind.id => {
+                                if let Some(sw) = wanted(&s, kind, &to, model) {
+                                    switching = Some(sw);
+                                }
+                            }
                             c => {
+                                // A model of its own harness: no switch after all.
+                                if matches!(c, Command::SetModel { .. }) && switching.take().is_some() {
+                                    let mut core = s.core.lock();
+                                    core.hold = false;
+                                    core.state.switching = None;
+                                    core.touch_state();
+                                    if let Some(e) = core.get_mut("switch-pending") {
+                                        e.body = super::model::Body::Notice { level: Level::Info, text: "Switch cancelled".to_owned() };
+                                    }
+                                }
                                 let c = prepare(&files, c).await;
                                 let mut core = s.core.lock();
                                 adapter.command(&mut core, c);
@@ -1128,12 +1375,32 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         adapter.tick(&mut s.core.lock());
                     }
                     jobs = flush(&s, &sink, Some(&p.stdin)).await;
+                    let listed = {
+                        let core = s.core.lock();
+                        (core.meta.models != models_seen).then(|| core.meta.models.clone())
+                    };
+                    if let Some(m) = listed {
+                        super::kinds::note_models(kind.id, &m);
+                        models_seen = m;
+                    }
                     if let Some(at) = effects(&s, kind, &files, &fx_tx) {
                         rewind_to = Some(at);
                     }
                     if rewind_to.is_some() {
                         p.terminate(Duration::from_secs(2));
                         let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        break;
+                    }
+                    // A switch, now that nothing is under way: the harness ends by itself once its
+                    // input closes (its record of the conversation complete), else it is stopped.
+                    if switching.is_some() && settled(&s) {
+                        left = s.core.lock().state.tasks.iter().filter(|t| t.left_running()).count();
+                        p.stdin.close();
+                        if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
+                            p.terminate(Duration::from_secs(2));
+                            let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        }
+                        ending = true;
                         break;
                     }
                     let (session, queue) = {
@@ -1151,6 +1418,17 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     first = false;
                     continue;
                 }
+                if ending {
+                    {
+                        let mut core = s.core.lock();
+                        adapter.exited(&mut core, None, None);
+                    }
+                    if adapter.seeded() {
+                        seed = None;
+                    }
+                    first = false;
+                    continue;
+                }
                 let tail = String::from_utf8_lossy(&stderr_tail).trim().to_owned();
                 if !tail.is_empty() && code != Some(0) {
                     error = Some(super::model::clip_middle(&tail, 2000).0);
@@ -1164,6 +1442,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
         flush(&s, &sink, None).await;
         on_change();
         first = false;
+        if adapter.seeded() {
+            seed = None;
+        }
+        // A switch waiting for the turn: the turn is over (it ended with the harness).
+        if switching.is_some() {
+            continue;
+        }
         // A crash after a good run comes back by itself (a few times); a harness that will not
         // start waits for a person.
         let ran = started.elapsed();
@@ -1187,6 +1472,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     Command::Snapshot => {
                         for u in s.snapshot() {
                             let _ = sink.send((s.id.clone(), u)).await;
+                        }
+                    }
+                    // Another harness's model: the session goes on in it, now.
+                    Command::SetModel { model, kind: Some(to) } if to != kind.id => {
+                        if let Some(sw) = wanted(&s, kind, &to, model) {
+                            switching = Some(sw);
+                            break;
                         }
                     }
                     c @ (Command::Send { .. } | Command::SkillRun { .. }) => {
