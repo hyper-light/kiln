@@ -3,8 +3,12 @@
 //! `.kiln-keep-until` file in it says until when. Each leg's start also sweeps what is left
 //! behind: workspaces no running leg uses whose keep has run out, or that never had one (a runner
 //! stopped mid-leg). The tool cache, actions and Node runtimes beside them stay (W06-R01).
+//!
+//! A running leg holds a lock beside its workspace (`<8 hex>.lock`), so the machine's other
+//! runner processes, which share the work directory (an upgrade's new build runs beside the old
+//! one until the old one's legs end), leave it be too.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -49,11 +53,36 @@ impl Drop for ToolCache {
 /// The file that keeps a failed leg's workspace, holding the Unix time it may go.
 pub const KEEP_FILE: &str = ".kiln-keep-until";
 
-/// Workspaces of the legs running in this process.
-static IN_USE: LazyLock<parking_lot::Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+/// Workspaces of the legs running in this process, each with its lock (`None`: it couldn't be
+/// taken).
+static IN_USE: LazyLock<parking_lot::Mutex<HashMap<PathBuf, Option<std::fs::File>>>> = LazyLock::new(Default::default);
 
 fn in_use(p: &Path) -> bool {
-    IN_USE.lock().contains(p)
+    IN_USE.lock().contains_key(p) || held_elsewhere(p)
+}
+
+/// The lock a running leg holds beside its workspace.
+fn lock_path(ws: &Path) -> PathBuf {
+    let mut name = ws.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".lock");
+    ws.with_file_name(name)
+}
+
+/// Another process holds `ws`'s lock: a leg of another runner process of this machine runs in it.
+fn held_elsewhere(ws: &Path) -> bool {
+    let Ok(f) = std::fs::File::open(lock_path(ws)) else { return false };
+    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Take `ws`'s lock for a leg of this process.
+fn lock(ws: &Path) -> Option<std::fs::File> {
+    let path = lock_path(ws);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).ok()?;
+    f.try_lock().ok()?;
+    Some(f)
 }
 
 /// When a kept workspace may go, if it is kept.
@@ -84,11 +113,19 @@ fn remove(p: &Path) {
 fn sweep(root: &Path, now: i64) -> usize {
     let Ok(rd) = std::fs::read_dir(root) else { return 0 };
     let mut n = 0;
-    for p in rd.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()) {
+    for p in rd.filter_map(Result::ok).map(|e| e.path()) {
+        if !p.is_dir() {
+            // A lock whose workspace is gone, that no one holds.
+            if p.extension().is_some_and(|x| x == "lock") && !p.with_extension("").exists() && !held_elsewhere(&p.with_extension("")) {
+                let _ = std::fs::remove_file(&p);
+            }
+            continue;
+        }
         if in_use(&p) || kept_until(&p).is_some_and(|t| t > now) {
             continue;
         }
         remove(&p);
+        let _ = std::fs::remove_file(lock_path(&p));
         n += 1;
     }
     n
@@ -97,7 +134,11 @@ fn sweep(root: &Path, now: i64) -> usize {
 /// A leg starts using `ws` (under `<work>/w`): nothing removes it while it runs, and what earlier
 /// legs left behind goes.
 pub async fn claim(work: &Path, ws: &Path) {
-    IN_USE.lock().insert(ws.to_path_buf());
+    let held = lock(ws);
+    if held.is_none() {
+        tracing::warn!(workspace = %ws.display(), "a leg's workspace lock couldn't be taken: another runner process of this machine may sweep it");
+    }
+    IN_USE.lock().insert(ws.to_path_buf(), held);
     let root = work.join("w");
     let swept = crate::rt::blocking(move || sweep(&root, crate::util::now_unix())).await.unwrap_or(0);
     if swept > 0 {
@@ -108,9 +149,14 @@ pub async fn claim(work: &Path, ws: &Path) {
 /// A leg is done with `ws` (or a kept one's keep ran out): it is removed, and the sweep leaves
 /// it be no longer.
 pub async fn release(ws: &Path) {
-    IN_USE.lock().remove(ws);
+    let held = IN_USE.lock().remove(ws);
     let ws = ws.to_path_buf();
-    let _ = crate::rt::blocking(move || remove(&ws)).await;
+    let _ = crate::rt::blocking(move || {
+        remove(&ws);
+        let _ = std::fs::remove_file(lock_path(&ws));
+        drop(held);
+    })
+    .await;
 }
 
 /// A failed leg's workspace is kept until `until` (Unix seconds): the sweep leaves it until then,
@@ -151,12 +197,32 @@ mod tests {
         }
         std::fs::write(kept.join(KEEP_FILE), "2000")?;
         std::fs::write(expired.join(KEEP_FILE), "500")?;
-        IN_USE.lock().insert(running.clone());
+        IN_USE.lock().insert(running.clone(), None);
         assert_eq!(sweep(&root, 1000), 2);
         assert!(running.exists() && kept.exists() && !expired.exists() && !left.exists());
         IN_USE.lock().remove(&running);
         assert_eq!(sweep(&root, 3000), 2, "once the leg ended and the keep ran out");
         assert!(!running.exists() && !kept.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_sweep_leaves_the_workspace_of_a_leg_another_runner_process_runs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("w");
+        let (theirs, stale) = (root.join("bbbb0001"), root.join("bbbb0002"));
+        for p in [&theirs, &stale] {
+            std::fs::create_dir_all(p)?;
+        }
+        // The other process's lock (a lock taken through another open file conflicts all the same).
+        let held = lock(&theirs).ok_or_else(|| anyhow::anyhow!("no lock"))?;
+        // A lock left by a leg that ended without cleaning up.
+        std::fs::write(lock_path(&stale), "")?;
+        assert_eq!(sweep(&root, 1000), 1);
+        assert!(theirs.exists() && !stale.exists() && !lock_path(&stale).exists());
+        drop(held);
+        assert_eq!(sweep(&root, 1000), 1, "once that leg ended");
+        assert!(!theirs.exists() && !lock_path(&theirs).exists());
         Ok(())
     }
 }

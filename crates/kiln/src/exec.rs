@@ -636,7 +636,8 @@ impl Drop for PgidRecord {
 
 /// Kill process groups left behind by a previous incarnation of this agent. A group is only
 /// killed when its leader still carries `KILN_JOB_ID=<job>` in its environment, so a recycled pid
-/// is never touched.
+/// is never touched, and its parent isn't a kiln still running: another runner process of this
+/// machine (an upgrade's new build beside the old one shares the work directory) runs it.
 pub fn reap_orphans(work_dir: &Path) -> usize {
     let dir = work_dir.join("pgids");
     let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
@@ -644,6 +645,9 @@ pub fn reap_orphans(work_dir: &Path) -> usize {
     for e in entries.flatten() {
         let path = e.path();
         let pgid: i32 = e.file_name().to_string_lossy().parse().unwrap_or(0);
+        if u32::try_from(pgid).is_ok_and(parent_is_another_kiln) {
+            continue;
+        }
         let job = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
         if pgid <= 0 || job.is_empty() {
@@ -654,6 +658,20 @@ pub fn reap_orphans(work_dir: &Path) -> usize {
         }
     }
     killed
+}
+
+/// Whether process `pid` was started by a kiln that still runs, other than this process.
+fn parent_is_another_kiln(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let p = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), false, ProcessRefreshKind::nothing());
+    let Some(parent) = sys.process(p).and_then(sysinfo::Process::parent) else { return false };
+    if parent.as_u32() <= 1 || parent.as_u32() == std::process::id() {
+        return false;
+    }
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[parent]), false, ProcessRefreshKind::nothing());
+    sys.process(parent).is_some_and(|pp| pp.name().to_string_lossy().starts_with("kiln"))
 }
 
 /// A lock file (`flock` on Unix, `LockFileEx` on Windows) so concurrent jobs, even in separate
