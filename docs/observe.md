@@ -987,6 +987,13 @@ warm 148–164 to 130 ns a point (the load test's request), 363–367 to 276–2
 285–306 (500 routes); cold 900–910 to 750–768 (the SDK's). A point's transient bytes grow by a
 fifth (166 to 199 the load test's: an entry is 16 bytes, not 8), its allocations not at all.
 
+A receiver now decodes into a decoding handed back once the node's owner has taken its samples
+(`decode_into`; a few kept, `crate::observe::owner::Spares`), the request's series table and key
+buffer kept with it, and unzips into bytes handed back the same way: a request's transient bytes a
+point fall from 199 to 17 (the load test's), 184 to 5.4 (the SDK's) and 164 to 2.1 (500 routes), its
+allocations from 0.03 to 0.013, 0.09 to 0.062 and 0.010 to 0.007, and it is 4–7% faster (the bench's
+"kept" columns).
+
 ### 12.11 Under load, end to end
 
 2026-10-18, same machine (32 threads, shared: the load average stood at 30 to 36 from other work,

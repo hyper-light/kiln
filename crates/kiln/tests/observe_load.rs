@@ -212,6 +212,51 @@ fn spent(before: &std::collections::BTreeMap<String, f64>, after: &std::collecti
     d.iter().map(|(k, v)| format!("{k} {v:.1}")).collect::<Vec<_>>().join(", ")
 }
 
+/// A process's resident anonymous memory by where it lies (`/proc/<pid>/smaps`): the main heap,
+/// the C library's thread arenas (each a 64 MiB reservation, `[anon]` mappings of exactly that
+/// size or less after trimming, aligned to it), and the rest (mmapped allocations, stacks).
+fn anon_by_mapping(pid: u32) -> String {
+    let smaps = std::fs::read_to_string(format!("/proc/{pid}/smaps")).unwrap_or_default();
+    let (mut heap, mut arenas, mut other, mut n_arenas) = (0u64, 0u64, 0u64, 0usize);
+    let mut each: Vec<u64> = Vec::new();
+    let mut current: Option<(u64, u64, bool)> = None;
+    let mut flush = |c: Option<(u64, u64, bool)>, rss: u64| {
+        if let Some((start, len, is_heap)) = c {
+            if is_heap {
+                heap += rss;
+            } else if len <= 64 << 20 && start % (64 << 20) == 0 {
+                arenas += rss;
+                n_arenas += usize::from(rss > 0);
+                each.push(rss);
+            } else {
+                other += rss;
+            }
+        }
+    };
+    let mut rss = 0u64;
+    for line in smaps.lines() {
+        let mut parts = line.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        if let Some((a, b)) = first.split_once('-')
+            && let (Ok(a), Ok(b)) = (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16))
+        {
+            flush(current.take(), rss);
+            rss = 0;
+            let rest: Vec<&str> = parts.collect();
+            let name = rest.get(4).copied().unwrap_or("");
+            // Anonymous: no file; the heap by name.
+            current = if name.is_empty() || name == "[heap]" { Some((a, b - a, name == "[heap]")) } else { None };
+        } else if first == "Anonymous:" {
+            rss = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024;
+        }
+    }
+    flush(current.take(), rss);
+    let mib = |b: u64| b as f64 / 1048576.0;
+    each.sort_unstable_by(|a, b| b.cmp(a));
+    let top: Vec<String> = each.iter().take(4).map(|&b| format!("{:.0}", mib(b))).collect();
+    format!("heap {:.0} MiB, {} arenas {:.0} MiB (the largest {} MiB), other {:.0} MiB", mib(heap), n_arenas, mib(arenas), top.join(", "), mib(other))
+}
+
 fn pct(sorted: &[u64], q: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -402,6 +447,7 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     let ((s_now, s_anon), (r_now, r_anon)) = (rss(server_pid), rss(runner_pid));
     eprintln!("  before it  the server held {:.0} MiB ({:.0} anonymous), the runner {:.0} MiB ({:.0} anonymous)", before_server.0, before_server.1, before_runner.0, before_runner.1);
     eprintln!("  after it   the server holds {s_now:.0} MiB ({s_anon:.0} anonymous), the runner {r_now:.0} MiB ({r_anon:.0} anonymous)");
+    eprintln!("  where      the server's {}; the runner's {}", anon_by_mapping(server_pid), anon_by_mapping(runner_pid));
     let mib = |k: &str| at(&s, &[k]).as_u64().unwrap_or(0) as f64 / 1048576.0;
     eprintln!(
         "  the server's store: {} blocks, {:.0} MiB on disk; in memory symbols {:.1} MiB, index {:.1} MiB, head samples {:.1} MiB",

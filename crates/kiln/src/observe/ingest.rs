@@ -95,6 +95,8 @@ pub struct Batcher {
     /// series.
     starts: Vec<u32>,
     sorted: Vec<(i64, f64)>,
+    /// Reused to place a request's series.
+    places: Vec<u32>,
     /// The queue's least wait in this interval, and when the interval began; the last interval's.
     least: Option<Duration>,
     interval_from: Option<Instant>,
@@ -133,6 +135,7 @@ impl Batcher {
             spare: Out::default(),
             starts: Vec::new(),
             sorted: Vec::new(),
+            places: Vec::new(),
             least: None,
             interval_from: None,
             judged: Duration::ZERO,
@@ -199,8 +202,8 @@ impl Batcher {
     }
 
     /// Samples as a request decoded them (`kiln_obs::otlp::metrics::Decoded`): each with its
-    /// series' place in `keys`, waiting for the next write.
-    pub fn samples(&mut self, keys: Vec<SeriesKey>, samples: &[(u32, i64, f64)], now: Instant) {
+    /// series' place in `keys` (taken, the list's room left), waiting for the next write.
+    pub fn samples(&mut self, keys: &mut Vec<SeriesKey>, samples: &[(u32, i64, f64)], now: Instant) {
         if samples.is_empty() {
             return;
         }
@@ -210,11 +213,14 @@ impl Batcher {
             return;
         }
         // Each key's place here, by its place there.
-        let places: Vec<u32> = keys.into_iter().map(|k| self.slot(k, now)).collect();
+        let mut places = std::mem::take(&mut self.places);
+        places.clear();
+        places.extend(keys.drain(..).map(|k| self.slot(k, now)));
         for &(i, ts, v) in samples {
             let Some(&slot) = places.get(i as usize) else { continue };
             self.push(slot, ts, v);
         }
+        self.places = places;
         self.first_waiting.get_or_insert(now);
     }
 
@@ -584,7 +590,7 @@ mod tests {
                 *n += 1;
             }
             let mut flat = Batcher::new(9);
-            flat.samples(keys.clone(), &shuffled, t0);
+            flat.samples(&mut keys.clone(), &shuffled, t0);
             anyhow::ensure!(applied_all(&writes(&mut flat, t0))? == want, "order {seed} stored otherwise");
         }
         Ok(())

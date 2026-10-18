@@ -56,9 +56,31 @@ pub struct Decoded {
     pub samples: Vec<(u32, i64, f64)>,
     pub points: u64,
     pub dropped: Dropped,
+    /// What decoding works with, kept with it for the next request ([`decode_into`]).
+    scratch: Scratch,
+}
+
+/// A decoding's buffers that hold nothing of a request once it is decoded.
+#[derive(Debug, Default)]
+struct Scratch {
+    found: HashTable<(u64, usize)>,
+    key: Vec<u8>,
+    counts: Vec<u64>,
+    bounds: Vec<f64>,
 }
 
 impl Decoded {
+    /// The bytes its buffers hold room for (what keeping it for the next request keeps).
+    pub fn capacity_bytes(&self) -> usize {
+        let s = &self.scratch;
+        self.keys.capacity() * std::mem::size_of::<SeriesKey>()
+            + self.samples.capacity() * std::mem::size_of::<(u32, i64, f64)>()
+            + s.found.capacity() * std::mem::size_of::<(u64, usize)>()
+            + s.key.capacity()
+            + s.counts.capacity() * 8
+            + s.bounds.capacity() * 8
+    }
+
     /// Each series with its samples, in the order series came.
     pub fn series(&self) -> Vec<(SeriesKey, Vec<(i64, f64)>)> {
         let mut out: Vec<(SeriesKey, Vec<(i64, f64)>)> = self.keys.iter().map(|k| (k.clone(), Vec::new())).collect();
@@ -272,16 +294,40 @@ pub fn decode(body: &[u8], now_ms: i64) -> Result<Decoded, OtlpError> {
 /// [`decode`] with a receiver's [`Keys`]: what a node's receivers decode with, so a series' key is
 /// made once in the node's life.
 pub fn decode_with(body: &[u8], now_ms: i64, keys: &Keys) -> Result<Decoded, OtlpError> {
+    let mut out = Decoded::default();
+    decode_into(body, now_ms, keys, &mut out)?;
+    Ok(out)
+}
+
+/// [`decode_with`] into `out`, emptied first and its room kept: a receiver that hands its
+/// [`Decoded`] back once its samples are taken decodes request after request without allocating
+/// for them.
+pub fn decode_into(body: &[u8], now_ms: i64, keys: &Keys, out: &mut Decoded) -> Result<(), OtlpError> {
+    let mut d = std::mem::take(out);
+    d.keys.clear();
+    d.samples.clear();
+    d.points = 0;
+    d.dropped = Dropped::default();
     // A sample takes some 32 bytes of a request: room for them all at once, most of the time.
-    let out = Decoded { keys: Vec::with_capacity(body.len() / 32), samples: Vec::with_capacity(body.len() / 32), ..Decoded::default() };
-    let mut sink = Sink { out, keys, found: HashTable::new(), attrs: Vec::new(), tags: Vec::new(), key: Vec::new(), counts: Vec::new(), bounds: Vec::new() };
-    for f in Fields::new(body) {
-        let (n, w) = f?;
-        if n == 1 {
-            resource_metrics(w.bytes().unwrap_or(&[]), now_ms, &mut sink)?;
+    d.keys.reserve(body.len() / 32);
+    d.samples.reserve(body.len() / 32);
+    let Scratch { mut found, key, counts, bounds } = std::mem::take(&mut d.scratch);
+    found.clear();
+    let mut sink = Sink { out: d, keys, found, attrs: Vec::new(), tags: Vec::new(), key, counts, bounds };
+    let mut read = || -> Result<(), OtlpError> {
+        for f in Fields::new(body) {
+            let (n, w) = f?;
+            if n == 1 {
+                resource_metrics(w.bytes().unwrap_or(&[]), now_ms, &mut sink)?;
+            }
         }
-    }
-    Ok(sink.out)
+        Ok(())
+    };
+    let done = read();
+    let Sink { out: mut d, found, key, counts, bounds, .. } = sink;
+    d.scratch = Scratch { found, key, counts, bounds };
+    *out = d;
+    done
 }
 
 fn resource_metrics<'a>(msg: &'a [u8], now_ms: i64, sink: &mut Sink<'a, '_>) -> Result<(), OtlpError> {
@@ -975,6 +1021,41 @@ mod tests {
                 parsed.metric == metric && tag.is_none_or(|t| parsed.tags.contains(&t))
             })
             .unwrap_or_else(|| panic!("no {metric} {tag:?}"))
+    }
+
+    /// A decoding kept from request to request reads each as a new one would: nothing of the last
+    /// left in it, a failed request's part included.
+    #[test]
+    fn a_kept_decoding_reads_each_request_as_a_new_one_would() {
+        let keys = Keys::new();
+        let full = request();
+        let mut small = Writer::default();
+        small.message(1, |rm| {
+            rm.message(2, |sm| {
+                sm.message(2, |m| {
+                    m.str(1, "solo");
+                    m.message(5, |g| {
+                        g.message(1, |p| {
+                            p.fixed64(3, 1_700_000_000_000_000_000);
+                            p.double(4, 7.0);
+                        });
+                    });
+                });
+            });
+        });
+        let small = small.buf;
+        let fresh = |b: &[u8]| decode_with(b, 0, &keys).unwrap();
+        let same = |a: &Decoded, b: &Decoded| a.keys.iter().map(|k| &*k.key).eq(b.keys.iter().map(|k| &*k.key)) && a.samples == b.samples && a.points == b.points && a.dropped == b.dropped;
+        let mut kept = Decoded::default();
+        for b in [&full, &small, &full, &full] {
+            decode_into(b, 0, &keys, &mut kept).unwrap();
+            assert!(same(&kept, &fresh(b)));
+        }
+        // A request cut short fails; the next reads clean.
+        assert!(decode_into(&full[..full.len() / 2], 0, &keys, &mut kept).is_err());
+        decode_into(&small, 0, &keys, &mut kept).unwrap();
+        assert!(same(&kept, &fresh(&small)));
+        assert!(kept.capacity_bytes() > 0);
     }
 
     #[test]

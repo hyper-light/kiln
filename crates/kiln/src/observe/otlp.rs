@@ -382,10 +382,17 @@ pub fn take(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &
     if o.busy() {
         return Answer::Busy;
     }
-    let mut plain = Vec::new();
+    // Unzipped into bytes handed back after, whatever the answer.
+    let mut plain = o.bytes();
+    let answer = take_plain(o, signal, content_type, gzip, body, now_ns, &mut plain);
+    o.give_bytes(plain);
+    answer
+}
+
+fn take_plain(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &[u8], now_ns: i64, plain: &mut Vec<u8>) -> Answer {
     let body = if gzip {
         let mut d = flate2::read::GzDecoder::new(body).take(MAX_BODY as u64 + 1);
-        if d.read_to_end(&mut plain).is_err() {
+        if d.read_to_end(plain).is_err() {
             return Answer::Bad("the body is not gzip".into());
         }
         if plain.len() > MAX_BODY {
@@ -409,16 +416,23 @@ pub fn take(o: &Observe, signal: Signal, content_type: &str, gzip: bool, body: &
         body
     };
     match signal {
-        Signal::Metrics => match kiln_obs::otlp::metrics::decode_with(pb, now_ns / 1_000_000, keys()) {
-            Ok(d) => {
-                let points = d.points;
-                if !o.offer_samples(d.keys, d.samples) {
-                    return Answer::Busy;
+        Signal::Metrics => {
+            let mut d = o.decoding();
+            match kiln_obs::otlp::metrics::decode_into(pb, now_ns / 1_000_000, keys(), &mut d) {
+                Ok(()) => {
+                    let points = d.points;
+                    if !o.offer_samples(d) {
+                        return Answer::Busy;
+                    }
+                    Answer::Ok { json, points }
                 }
-                Answer::Ok { json, points }
+                Err(e) => {
+                    let why = e.to_string();
+                    o.give_decoding(d);
+                    Answer::Bad(why)
+                }
             }
-            Err(e) => Answer::Bad(e.to_string()),
-        },
+        }
         Signal::Logs => match kiln_obs::otlp::logs::decode(pb, now_ns) {
             Ok(d) => {
                 let n = d.records.len() as u64;

@@ -173,7 +173,7 @@ enum Input {
     Up { machine: String, up: bool },
     Series(Vec<(SeriesKey, Vec<(i64, f64)>)>),
     /// Samples as a request decoded them: keys once, samples flat.
-    Samples(Vec<SeriesKey>, Vec<(u32, i64, f64)>),
+    Samples(kiln_obs::otlp::metrics::Decoded),
     Logs(Vec<Record>),
     Staged { generation: u64, msg: Box<Message>, ok: bool },
     Fetched { generation: u64, done: u64, of: u64 },
@@ -201,6 +201,52 @@ struct Admission {
     congested: AtomicBool,
     /// The disk has too little room for the next cut: exporters are refused until a cut frees it.
     disk_low: AtomicBool,
+    /// Requests' buffers handed back for the next request.
+    spares: Spares,
+}
+
+/// Buffers a request is decoded into, handed back once the owner has taken what they held: a few
+/// kept, so steady ingest decodes into buffers already grown and never frees on one thread what it
+/// grows again on another (the C library keeps what each thread's arena grew, §12.11).
+#[derive(Default)]
+struct Spares {
+    decoded: Mutex<Vec<kiln_obs::otlp::metrics::Decoded>>,
+    bytes: Mutex<Vec<Vec<u8>>>,
+}
+
+/// Buffers of each kind kept at the most: twice the requests decoded at once (the blocking pool's
+/// `fs` share, 8 on a server; `crate::rt::Profile`).
+const SPARES: usize = 16;
+/// The room a kept buffer may hold: a large request's go back to the allocator.
+const SPARE_BYTES: usize = 1 << 20;
+
+impl Spares {
+    fn decoded(&self) -> kiln_obs::otlp::metrics::Decoded {
+        lock(&self.decoded).pop().unwrap_or_default()
+    }
+
+    fn give_decoded(&self, d: kiln_obs::otlp::metrics::Decoded) {
+        if d.capacity_bytes() <= SPARE_BYTES {
+            let mut kept = lock(&self.decoded);
+            if kept.len() < SPARES {
+                kept.push(d);
+            }
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        lock(&self.bytes).pop().unwrap_or_default()
+    }
+
+    fn give_bytes(&self, mut b: Vec<u8>) {
+        if b.capacity() <= SPARE_BYTES {
+            b.clear();
+            let mut kept = lock(&self.bytes);
+            if kept.len() < SPARES {
+                kept.push(b);
+            }
+        }
+    }
 }
 
 /// Takes room for `n` against `max`, or says there is none. One write bigger than the bound is taken
@@ -313,22 +359,44 @@ impl Observe {
         true
     }
 
-    /// Samples an exporter sent, as a request decoded them (`kiln_obs::otlp::metrics::Decoded`):
-    /// as [`Observe::offer`].
+    /// Samples an exporter sent, as a request decoded them: as [`Observe::offer`]; the decoding
+    /// comes back to [`Observe::decoding`] once taken or refused.
     #[must_use]
-    pub fn offer_samples(&self, keys: Vec<SeriesKey>, samples: Vec<(u32, i64, f64)>) -> bool {
-        let n = samples.len() as u64;
+    pub fn offer_samples(&self, d: kiln_obs::otlp::metrics::Decoded) -> bool {
+        let n = d.samples.len() as u64;
+        let a = &self.admission;
         if n == 0 {
+            a.spares.give_decoded(d);
             return true;
         }
-        let a = &self.admission;
         if a.congested.load(Ordering::Acquire) || a.disk_low.load(Ordering::Acquire) || !reserve(&a.points, &a.left_points, n, WAITING_POINTS as u64 / 4 * 3) {
+            a.spares.give_decoded(d);
             return false;
         }
-        if self.tx.send(Input::Samples(keys, samples)).is_err() {
+        if let Err(std::sync::mpsc::SendError(Input::Samples(d))) = self.tx.send(Input::Samples(d)) {
             a.left_points.fetch_add(n, Ordering::AcqRel);
+            a.spares.give_decoded(d);
         }
         true
+    }
+
+    /// A decoding to decode a request into: one handed back, its room kept, or a new one.
+    pub fn decoding(&self) -> kiln_obs::otlp::metrics::Decoded {
+        self.admission.spares.decoded()
+    }
+
+    /// Bytes to read a request into (its body unzipped), and to hand back after.
+    pub fn bytes(&self) -> Vec<u8> {
+        self.admission.spares.bytes()
+    }
+
+    pub fn give_bytes(&self, b: Vec<u8>) {
+        self.admission.spares.give_bytes(b);
+    }
+
+    /// A decoding not offered (it did not decode), handed back.
+    pub fn give_decoding(&self, d: kiln_obs::otlp::metrics::Decoded) {
+        self.admission.spares.give_decoded(d);
     }
 
     /// Log records of kiln's own (its events): taken up to the bound itself, else refused and
@@ -732,7 +800,10 @@ impl Owner {
                 }
             }
             Input::Series(series) => self.batcher.series(series, Instant::now()),
-            Input::Samples(keys, samples) => self.batcher.samples(keys, &samples, Instant::now()),
+            Input::Samples(mut d) => {
+                self.batcher.samples(&mut d.keys, &d.samples, Instant::now());
+                self.admission.spares.give_decoded(d);
+            }
             Input::Logs(records) => self.batcher.logs(records, Instant::now()),
             Input::Staged { generation, msg, ok } => {
                 if self.fetching.as_ref().is_some_and(|f| f.generation == generation) {

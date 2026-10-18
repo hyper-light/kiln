@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use hyper_measure::{alloc, faults};
 use kiln_obs::batch::{Kind, SeriesKey};
-use kiln_obs::otlp::metrics::{Keys, decode, decode_with};
+use kiln_obs::otlp::metrics::{Decoded, Keys, decode, decode_into, decode_with};
 use kiln_obs::otlp::pb::Writer;
 
 #[global_allocator]
@@ -148,8 +148,8 @@ fn median(mut ns: Vec<u64>) -> u64 {
 
 fn main() {
     println!(
-        "{:<20} {:>7} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10}",
-        "request", "bytes", "points", "cold ns/pt", "allocs/pt", "warm ns/pt", "allocs/pt", "bytes/pt", "faults", "inflate", "keys ns/pt"
+        "{:<20} {:>7} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>11} {:>10} {:>10}",
+        "request", "bytes", "points", "cold ns/pt", "allocs/pt", "warm ns/pt", "allocs/pt", "bytes/pt", "faults", "inflate", "keys ns/pt", "kept ns/pt", "allocs/pt", "bytes/pt"
     );
     for (name, body) in [("flat, 1,000 series", flat(1000)), ("an SDK's, 50 routes", sdk(50)), ("an SDK's, 500 routes", sdk(500))] {
         let now_ms = (NS / 1_000_000) as i64;
@@ -190,6 +190,22 @@ fn main() {
         let c = alloc::end();
         let f1 = faults::read().unwrap();
         drop(out);
+        // A receiver that hands its decoding back (`decode_into`): its buffers grown once.
+        let mut kept = Decoded::default();
+        decode_into(&body, now_ms, &keys, &mut kept).unwrap();
+        let kept_ns = median(
+            (0..51)
+                .map(|_| {
+                    let t = Instant::now();
+                    decode_into(&body, now_ms, &keys, &mut kept).unwrap();
+                    std::hint::black_box(&kept);
+                    t.elapsed().as_nanos() as u64
+                })
+                .collect(),
+        );
+        alloc::begin();
+        decode_into(&body, now_ms, &keys, &mut kept).unwrap();
+        let k = alloc::end();
         // gzip's part: inflating the request as it came, a point's worth.
         let gz = gzip(&body);
         let inflate = median(
@@ -216,7 +232,7 @@ fn main() {
                 .collect(),
         );
         println!(
-            "{:<20} {:>7} {:>7} {:>10.1} {:>10.2} {:>10.1} {:>10.2} {:>10.1} {:>10} {:>6.1}ns {:>10.1}",
+            "{:<20} {:>7} {:>7} {:>10.1} {:>10.2} {:>10.1} {:>10.2} {:>10.1} {:>10} {:>6.1}ns {:>10.1} {:>11.1} {:>10.3} {:>10.1}",
             name,
             body.len(),
             points,
@@ -228,6 +244,9 @@ fn main() {
             f1.since(&f0).total(),
             inflate as f64 / points as f64,
             key_ns as f64 / points as f64,
+            kept_ns as f64 / points as f64,
+            k.calls() as f64 / points as f64,
+            k.bytes as f64 / points as f64,
         );
     }
 }
