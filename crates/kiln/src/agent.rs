@@ -812,6 +812,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         h.restore_from(convo.as_ref());
         h
     });
+    // A copy of the server's store this runner keeps, if the server picks it (a mirror).
+    let mut mirror: Option<crate::convo::feed::Intake> = None;
     let shipper = convo.clone().map(|st| {
         // The harnesses' own records, followed into the store.
         if let Some(h) = harness.clone() {
@@ -1923,9 +1925,38 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             s.heard(&json, raft);
                         }
                     }
-                    ServerMsg::Convo { json, .. } => {
-                        if let (Some(f), Some(m)) = (&shipper, crate::convo::feed::decode(&json)) {
-                            f.link(crate::convo::feed::Link::Heard(m));
+                    ServerMsg::Convo { json, data } => {
+                        let Some(m) = crate::convo::feed::decode(&json) else { continue };
+                        if convo.as_ref().is_some_and(|st| st.id() == m.store()) {
+                            // The server's answer to this runner's own feed.
+                            if let Some(f) = &shipper {
+                                f.link(crate::convo::feed::Link::Heard(m));
+                            }
+                            continue;
+                        }
+                        // The server's store, of which this runner keeps a copy (a mirror), beside
+                        // its own store; opened the first time the server sends it.
+                        if mirror.is_none() && convo.is_some() {
+                            mirror = crate::convo::open_file(&own_dir, crate::convo::MIRROR_FILE).and_then(|st| match crate::convo::feed::Intake::start(st, crate::convo::feed::Brings::AsItSays) {
+                                Ok((intake, out)) => {
+                                    let up = uplink.0.clone();
+                                    crate::rt::spawn(async move {
+                                        while let Ok(o) = out.recv().await {
+                                            if up.send(Up::Convo(AgentMsg::Convo { json: o.json, data: Vec::new() })).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                    Some(intake)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %format!("{e:#}"), "this runner can't keep a copy of the conversation store");
+                                    None
+                                }
+                            });
+                        }
+                        if let Some(intake) = &mirror {
+                            intake.heard(SERVER_PEER, "server", json, data);
                         }
                     }
                     ServerMsg::DirList { req, path } => {

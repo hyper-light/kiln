@@ -134,7 +134,7 @@ pub const RECORD_LINES: &str = "SELECT n, line FROM records WHERE session = ?1 A
 pub const DROP_ADD: &str = "INSERT INTO drops (rev, session, what, source, n, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
 /// A feed: what came after a number, oldest first, `?2` at most of each kind.
-pub const FEED_SESSIONS: &str = "SELECT id, info, meta, state, changes, updated_at, closed_at, epoch, rev FROM sessions WHERE rev > ?1 ORDER BY rev LIMIT ?2";
+pub const FEED_SESSIONS: &str = "SELECT id, info, meta, state, changes, updated_at, closed_at, epoch, rev, machine FROM sessions WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 pub const FEED_EVENTS: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 pub const FEED_RECORDS: &str = "SELECT session, source, n, line_end, line, rev FROM records WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 pub const FEED_DROPS: &str = "SELECT rev, session, what, source, n, at FROM drops WHERE rev > ?1 ORDER BY rev LIMIT ?2";

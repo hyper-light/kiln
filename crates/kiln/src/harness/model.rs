@@ -997,6 +997,11 @@ pub struct State {
     /// Events dropped from the front of the timeline to bound memory.
     #[serde(default)]
     pub dropped: u64,
+    /// The conversation was cleared (`/clear`): the number of the timeline's first event since.
+    /// The events before it stay history (the store keeps them and search finds them), and a
+    /// timeline taken up again (a restart, a move) leaves them out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared: Option<u64>,
     /// The effort / reasoning level in use, where the harness has one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effort: String,

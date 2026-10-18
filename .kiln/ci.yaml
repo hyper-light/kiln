@@ -13,7 +13,14 @@ jobs:
     name: rust lint + test
     runs-on: [k8s]
     toolchain: rust
-    resources: { cpu: "4", memory: 8Gi }
+    # Compiling kiln's own crate takes 7 GiB and more, and `cargo test` compiles it twice at once
+    # (the library, and the library as its tests): 8Gi ran out, rustc killed. Cargo runs a rustc
+    # per CPU the machine has, not per CPU asked for, unless told; line tables are the debug info
+    # a test's backtrace needs, at far less memory.
+    resources: { cpu: "4", memory: 16Gi }
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     timeout-minutes: 45
     steps:
       - name: toolchain

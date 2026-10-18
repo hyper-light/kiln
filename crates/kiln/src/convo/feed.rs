@@ -48,6 +48,15 @@ pub enum Msg {
     Ack { store: String, rev: u64 },
 }
 
+impl Msg {
+    /// The store it is about.
+    pub fn store(&self) -> &str {
+        match self {
+            Msg::Hello { store } | Msg::From { store, .. } | Msg::Batch { store, .. } | Msg::Ack { store, .. } => store,
+        }
+    }
+}
+
 pub fn encode(m: &Msg) -> String {
     serde_json::to_string(m).unwrap_or_default()
 }
@@ -226,20 +235,29 @@ struct Partial {
     bytes: Vec<u8>,
 }
 
-/// The server's side: one thread takes what runners' feeds send into the server's store, in the
-/// order each sent it, and hands back what to answer.
+/// Where the sessions a feed brings run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Brings {
+    /// On the machine whose feed it is: a runner's store, sent to the server's.
+    TheirMachine,
+    /// Where its rows say: the server's store, sent to a mirror.
+    AsItSays,
+}
+
+/// The taking side: one thread takes what feeds send into a store, in the order each sent it, and
+/// hands back what to answer. The server's takes runners' stores; a mirror's takes the server's.
 pub struct Intake {
     tx: std::sync::mpsc::SyncSender<(hyper_transport::PeerId, String, String, Vec<u8>)>,
 }
 
 impl Intake {
-    pub fn start(store: Store) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
+    pub fn start(store: Store, brings: Brings) -> anyhow::Result<(Self, async_channel::Receiver<Out>)> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<(hyper_transport::PeerId, String, String, Vec<u8>)>(256);
         let (out_tx, out_rx) = async_channel::bounded::<Out>(1024);
         std::thread::Builder::new().name("kiln-convo-intake".into()).spawn(move || {
             let mut partial: HashMap<(hyper_transport::PeerId, String), Partial> = HashMap::new();
             while let Ok((peer, machine, json, data)) = rx.recv() {
-                for m in take(&store, &mut partial, peer, &machine, &json, data) {
+                for m in take(&store, &mut partial, peer, &machine, brings, &json, data) {
                     if out_tx.send_blocking(Out { peer, json: encode(&m) }).is_err() {
                         return;
                     }
@@ -262,7 +280,7 @@ pub fn peer_name(machine: &str, store: &str) -> String {
 }
 
 /// One message from a runner, taken: what to answer.
-fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, json: &str, data: Vec<u8>) -> Vec<Msg> {
+fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>, peer: hyper_transport::PeerId, machine: &str, brings: Brings, json: &str, data: Vec<u8>) -> Vec<Msg> {
     let have = |s: &str| store.peer(&peer_name(machine, s)).unwrap_or(0);
     match decode(json) {
         Some(Msg::Hello { store: s }) => {
@@ -303,7 +321,8 @@ fn take(store: &Store, partial: &mut HashMap<(hyper_transport::PeerId, String), 
                     return vec![Msg::From { store: s, rev }];
                 }
             };
-            match store.take(&peer_name(machine, &s), machine, from, batch) {
+            let theirs = (brings == Brings::TheirMachine).then_some(machine);
+            match store.take(&peer_name(machine, &s), theirs, from, batch) {
                 Ok(t) if t.gap => vec![Msg::From { store: s, rev: t.rev }],
                 Ok(t) => {
                     if t.fenced > 0 {
@@ -335,8 +354,12 @@ mod tests {
     /// Everything `runner` has, sent to `server` the way the feed does it (batches of `bytes`,
     /// each in parts), and the number the server has at the end.
     fn feed_all(runner: &Store, server: &Store, machine: &str, bytes: usize) -> anyhow::Result<u64> {
+        feed_as(runner, server, machine, Brings::TheirMachine, bytes)
+    }
+
+    fn feed_as(runner: &Store, server: &Store, machine: &str, brings: Brings, bytes: usize) -> anyhow::Result<u64> {
         let mut partial = HashMap::new();
-        let hello = take(server, &mut partial, 7, machine, &encode(&Msg::Hello { store: runner.id().to_owned() }), Vec::new());
+        let hello = take(server, &mut partial, 7, machine, brings, &encode(&Msg::Hello { store: runner.id().to_owned() }), Vec::new());
         let Some(Msg::From { mut rev, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
         loop {
             let batch = runner.changes(rev, bytes)?;
@@ -345,7 +368,7 @@ mod tests {
             }
             let mut answer = Vec::new();
             for (m, data) in parts(runner.id(), rev, &batch)? {
-                answer = take(server, &mut partial, 7, machine, &encode(&m), data);
+                answer = take(server, &mut partial, 7, machine, brings, &encode(&m), data);
             }
             match answer.first() {
                 Some(Msg::Ack { rev: r, .. }) => rev = *r,
@@ -394,6 +417,32 @@ mod tests {
     }
 
     #[test]
+    fn a_mirror_keeps_the_server_store_and_where_each_session_runs() -> anyhow::Result<()> {
+        let (_a, a) = super::super::store::scratch()?;
+        let (_s, server) = super::super::store::scratch()?;
+        let (_m, mirror) = super::super::store::scratch()?;
+        let info = serde_json::json!({ "id": "s1", "kind": "claude", "kind_name": "Claude Code", "target": "", "name": "parser", "cwd": "/w", "created_at": 1, "status": "idle", "title": "", "model": "", "mode": "", "approvals": [], "queued": 0, "tasks_running": 0, "cost_usd": 0.0, "last_activity": 1, "goal": "" }).to_string();
+        a.put(vec![super::super::rows::Row::Session { session: "s1".into(), info: Some(info), meta: None, state: None, changes: None, epoch: None, open: true, at: crate::util::now_ms() }]);
+        a.send("s1", &said("m1", 1, "kept twice"));
+        a.put(vec![line("s1", "cc-1", 0, "{\"type\":\"user\"}")]);
+        a.sync()?;
+        feed_all(&a, &server, "box-a", 1 << 20)?;
+        // The server's store to its mirror: its rows say where each session runs.
+        feed_as(&server, &mirror, "server", Brings::AsItSays, 1 << 20)?;
+        let kept = mirror.unended(0)?;
+        assert_eq!(kept.iter().map(|u| (u.id.as_str(), u.machine.as_deref())).collect::<Vec<_>>(), vec![("s1", Some("box-a"))]);
+        assert_eq!(mirror.kept("s1", 10)?.map(|k| k.events.len()), Some(1));
+        assert_eq!(mirror.record("s1", "cc-1", 0, 10)?, server.record("s1", "cc-1", 0, 10)?);
+        // More on the runner reaches the mirror through the server, from where each left off.
+        a.send("s1", &said("m2", 2, "and again"));
+        a.sync()?;
+        feed_all(&a, &server, "box-a", 1 << 20)?;
+        feed_as(&server, &mirror, "server", Brings::AsItSays, 1 << 20)?;
+        assert_eq!(mirror.kept("s1", 10)?.map(|k| k.events.into_iter().map(|e| e.id).collect::<Vec<_>>()), Some(vec!["m1".to_owned(), "m2".to_owned()]));
+        Ok(())
+    }
+
+    #[test]
     fn a_batch_that_does_not_follow_what_the_server_has_is_refused_with_where_it_stands() -> anyhow::Result<()> {
         let (_r, runner) = super::super::store::scratch()?;
         let (_s, server) = super::super::store::scratch()?;
@@ -405,7 +454,7 @@ mod tests {
         let mut partial = HashMap::new();
         let mut answer = Vec::new();
         for (m, data) in parts(runner.id(), 2, &batch)? {
-            answer = take(&server, &mut partial, 7, "box", &encode(&m), data);
+            answer = take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&m), data);
         }
         assert_eq!(answer, vec![Msg::From { store: runner.id().to_owned(), rev: 0 }]);
         assert_eq!(server.kept("a1", 10)?, None);
@@ -413,7 +462,7 @@ mod tests {
         let (m, data) = parts(runner.id(), 0, &runner.changes(0, 1 << 20)?)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no part"))?;
         let Msg::Batch { store, from, upto, parts: n, .. } = m else { anyhow::bail!("not a batch") };
         let astray = Msg::Batch { store, from, upto, part: 1, parts: n + 1 };
-        assert_eq!(take(&server, &mut partial, 7, "box", &encode(&astray), data), vec![Msg::From { store: runner.id().to_owned(), rev: 0 }]);
+        assert_eq!(take(&server, &mut partial, 7, "box", Brings::TheirMachine, &encode(&astray), data), vec![Msg::From { store: runner.id().to_owned(), rev: 0 }]);
         Ok(())
     }
 
@@ -453,7 +502,7 @@ mod tests {
             let mut partial = HashMap::new();
             // The server's side, in this test: what the shipper sends is taken, answers go back.
             let answer = |json: String, data: Vec<u8>, partial: &mut HashMap<(hyper_transport::PeerId, String), Partial>| {
-                for m in take(&server, partial, 7, "box", &json, data) {
+                for m in take(&server, partial, 7, "box", Brings::TheirMachine, &json, data) {
                     ship.link(Link::Heard(m));
                 }
             };

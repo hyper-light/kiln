@@ -188,7 +188,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W15 | Environments and deployments | W04, W09 | in progress | CI's half: environments from trunk and kiln, protection (reviewers, wait timers, branch and tag policies), approvals on the run page and CLI, deployment records with URLs; CD's half (kinds, kiln/deploy, previews, board) in the CD lane |
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
-| W18 | Supply chain, untrusted code | W10, W13 | not started | |
+| W18 | Supply chain, untrusted code | W10, W13 | in progress | provenance the server makes from its own records and signs (SLSA v1.0, DSSE, Sigstore bundles, its own P-256 key), `kiln/attest@v1` and the job's `attest:`, bundles beside files, on the run and through GitHub's attestations API; SBOMs (SPDX 2.3, CycloneDX 1.6) from ten lockfile kinds and `syft`, `kiln sbom`; AC01 with cosign, AC02; keyless, cosign key files and KMS, images' referrers (W12), R04, untrusted code left |
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
@@ -3750,7 +3750,44 @@ code from outside a repository's trust safely: microVMs or containers, limited e
 - **W18-AC04 Deploy policy.** An image without matching provenance is refused by an environment
   with `require-provenance`, and one with it deploys. *E2E.*
 
-**Progress.** Not started.
+**Progress.** R01, R03, AC01 and AC02 done; R02 with the server's key:
+- **Attesting.** `kiln/attest@v1` takes GitHub's subjects (`subject-path` patterns,
+  `subject-name` with `subject-digest`, `subject-checksums`) and kiln's (`subject-image`, whose
+  digests come from the runner's engine or the reference; `subjects`, files where one matches,
+  else images), `provenance` (default true) and `sbom` (`spdx`, `cyclonedx`). A kiln job's
+  `attest: { subjects, provenance, sbom }` runs it after the job's steps.
+- **Who writes what.** The runner reports the subjects' digests over its own channel
+  (`JobEventV2::Attest`, which no step can send) and uploads the SBOM under a random name only
+  that report carries (`POST /_kiln/attestations/sbom`; anything but SPDX or CycloneDX is
+  refused). The server builds the statement from its own records:
+  - `builder.id` and `buildType`;
+  - the workflow's path and ref, and the inputs;
+  - the source commit, the actions as pinned when the run started, and the images its
+    containers ran;
+  - the run URL, attempt, runner, executor and isolation.
+
+  It signs DSSE envelopes with a P-256 key it made (`<data_dir>/keys/attest-signing.p8`, public
+  at `/_kiln/attestation-key.pem`).
+- **Where bundles go.** Sigstore v0.3 bundles go to the step (`bundle-path`, `sbom-path`,
+  `sbom-bundle-path`, and `<file>.sigstore.json` beside each file) and to the run
+  (`GET /api/ci/runs/:id/attestations`). GitHub's attestations API on the facade finds them by
+  digest; a job's own `POST` is kept as the job's (`origin: job`), never as kiln's.
+- **SBOMs.** The built-in readers cover the ten lockfile kinds, and `syft`, when it is on the
+  runner, covers the ecosystems they don't. `kiln sbom [DIR] --format spdx|cyclonedx` prints one.
+  Both formats validate against their JSON schemas.
+- **AC01**, verified E2E with cosign 2.4.1 (`verify-blob-attestation --key <key>
+  --new-bundle-format --insecure-ignore-tlog --type slsaprovenance1`, with an empty
+  `--trusted-root` offline): kiln's provenance and SBOM bundles verify. These don't:
+  - a changed file;
+  - a step's own statement, which is refused as an SBOM upload, and which the facade keeps as
+    the job's but kiln's key doesn't verify.
+- **AC02** is an integration test over kiln's own `Cargo.lock` and `ui/package-lock.json`.
+
+Left:
+- keyless signing (Fulcio, Rekor), cosign key files and KMS;
+- attaching to images through the OCI referrers API (W12);
+- the SBOM differences in review;
+- R04 (with CD), R05–R08, AC03 and AC04.
 
 ### W19 Insights, audit and notifications
 

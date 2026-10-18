@@ -13,6 +13,8 @@
 //! - [`results`]: test reports and flaky classification (W16).
 //! - [`insights`]: rollups that merge, percentiles, critical paths (W19).
 //! - [`compare`]: what differs between two runs or legs (W19).
+//! - [`sbom`]: SBOMs from lockfiles, SPDX and CycloneDX (W18).
+//! - [`attest`]: provenance statements, DSSE envelopes and Sigstore bundles (W18).
 //! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
 //! - [`store`]: chunking and GitHub's cache rules for the runtime store (W08).
 //! - [`secrets`]: secret scopes, and which secrets a leg reads (W09).
@@ -20,6 +22,7 @@
 //! - [`facts`]: what runners report about themselves (W13).
 //! - [`wire`]: the JSON payloads between the server and CI runners (§2.5).
 
+pub mod attest;
 pub mod compare;
 pub mod env;
 pub mod expr;
@@ -30,6 +33,7 @@ pub mod plan;
 pub mod policy;
 pub mod results;
 pub mod runner;
+pub mod sbom;
 pub mod sched;
 pub mod secrets;
 pub mod stats;

@@ -209,6 +209,11 @@ pub struct Claude {
     plugins: Vec<(String, String, String, Option<String>)>,
     /// When plan usage was last asked for (ms).
     usage_at: i64,
+    /// What the session had cost when this process started, and what of it this process's own
+    /// total doesn't hold (Claude Code carries a resumed session's cost over only sometimes): what
+    /// it costs adds up across restarts and account switches.
+    cost_prior: f64,
+    cost_base: Option<f64>,
     /// When the MCP servers were last asked for (ms).
     mcp_at: i64,
     /// CLI runs under way, by job.
@@ -257,6 +262,8 @@ impl Claude {
             skill_rows: Vec::new(),
             plugins: Vec::new(),
             usage_at: 0,
+            cost_prior: 0.0,
+            cost_base: None,
             mcp_at: 0,
             runs: HashMap::new(),
             goal_capped: false,
@@ -381,6 +388,15 @@ impl Claude {
         let text = || value.as_ref().and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.get("text").and_then(Value::as_str).map(str::to_owned))).unwrap_or_default();
         let event = || value.as_ref().and_then(|v| v.get("event")).and_then(Value::as_str).map(str::to_owned);
         match id {
+            // Signed in on this machine (kiln's /login): Claude Code takes the account when it
+            // starts, so it starts again once nothing is under way, the conversation going on.
+            "account" => {
+                self.reload = Some("Signed in".to_owned());
+                if self.busy(core) {
+                    self.notice(core, Level::Info, "Signed in: Claude Code starts again with that account when this turn ends (the conversation continues)".to_owned(), None);
+                }
+                self.reload_when_idle(core);
+            }
             "thinking_display" => {
                 let d = text();
                 self.request(core, Pending::Plain("thinking shown".into()), json!({"subtype": "set_max_thinking_tokens", "thinking_display": d}));
@@ -526,6 +542,8 @@ impl Claude {
     /// Right after the process starts.
     pub fn start(&mut self, core: &mut Core) {
         self.started_at = Core::now();
+        self.cost_prior = core.state.usage.cost_usd;
+        self.cost_base = None;
         core.meta.modes = modes(self.allow_bypass);
         // Effort can be set from the start (initialize narrows the levels to the model's).
         core.meta.efforts = EFFORTS.iter().map(|e| ControlOption { id: (*e).to_owned(), label: capitalize(e), description: String::new(), dangerous: false }).collect();
@@ -551,8 +569,8 @@ impl Claude {
         for id in self.tools.keys().cloned().collect::<Vec<_>>() {
             finish_tool(core, &id, ToolStatus::Cancelled, None);
         }
-        // What it ran ends with it.
-        for t in core.state.tasks.iter_mut().filter(|t| t.live()) {
+        // What it ran ends with it (what kiln took back over runs apart from it: `survivors`).
+        for t in core.state.tasks.iter_mut().filter(|t| t.live() && !t.id.starts_with(super::survivors::LEFT)) {
             t.status = "stopped".into();
             t.ended.get_or_insert_with(Core::now);
         }
@@ -960,6 +978,19 @@ impl Claude {
         core.state.account = Some(account_id("claude", &plan, who));
         core.state.plan = Some(plan);
         core.touch_state();
+    }
+
+    /// Signed in as someone else: the old account's usage limits go, and a pause for one of them
+    /// ends; what the session cost so far stays, and adds up. The new account's limits are asked.
+    fn switched_account(&mut self, core: &mut Core) {
+        core.state.limits.clear();
+        core.touch_state();
+        if core.state.pause.as_ref().is_some_and(|p| p.reason == super::pause::LIMIT)
+            && let Some(p) = super::pause::release(core, "Signed in to another account: going on.")
+        {
+            self.go_on(core, p);
+        }
+        self.ask_usage(core);
     }
 
     /// get_usage's answer: the plan's windows, as the CLI's /usage shows them.
@@ -1450,8 +1481,19 @@ impl Claude {
             "result" => self.result(core, &v),
             "command_lifecycle" => self.lifecycle(core, &v),
             "rate_limit_event" => self.rate_limit(core, &v),
+            "conversation_reset" => self.conversation_reset(core),
             _ => {}
         }
+    }
+
+    /// The CLI started the conversation over (`/clear`; a new session id follows in an init): so
+    /// does the timeline, and with it what was asked and planned in the one before.
+    fn conversation_reset(&mut self, core: &mut Core) {
+        self.entries.clear();
+        core.clear();
+        core.state.goal.clear();
+        core.state.todos.clear();
+        self.notice(core, Level::Info, "Conversation cleared", None);
     }
 
     fn control_response(&mut self, core: &mut Core, v: &Value) {
@@ -1499,7 +1541,11 @@ impl Claude {
                     self.set_commands(core, cmds);
                 }
                 if let Some(a) = body.get("account") {
+                    let was = core.state.account.clone();
                     Self::account(core, a);
+                    if was.is_some() && core.state.account != was {
+                        self.switched_account(core);
+                    }
                 }
                 if let Some(models) = body.get("models").and_then(Value::as_array) {
                     for m in models {
@@ -1652,6 +1698,13 @@ impl Claude {
             }
             Pending::Usage => {
                 core.state.inventory.limits = Known::Ready;
+                // The first answer says what this process's total starts from: what it carried
+                // over of what came before.
+                if self.cost_base.is_none()
+                    && let Some(carried) = body.pointer("/session/total_cost_usd").and_then(Value::as_f64)
+                {
+                    self.cost_base = Some((self.cost_prior - carried).max(0.0));
+                }
                 Self::usage(core, &body);
                 core.touch_state();
                 if let Some(p) = super::pause::checked(core, Core::now()) {
@@ -2495,10 +2548,15 @@ impl Claude {
         let started = core.state.turn_started;
         core.state.turn_started = None;
         core.state.doing = None;
-        let u = &mut core.state.usage;
         if let Some(c) = v.get("total_cost_usd").and_then(Value::as_f64) {
-            u.cost_usd = u.cost_usd.max(c);
+            // Its total counts from where it started (none of what came before, or all of it):
+            // when its usage didn't say which first, a total below what came before started over.
+            let prior = self.cost_prior;
+            let base = *self.cost_base.get_or_insert(if c + 1e-9 >= prior { 0.0 } else { prior });
+            let u = &mut core.state.usage;
+            u.cost_usd = u.cost_usd.max(base + c);
         }
+        let u = &mut core.state.usage;
         if let Some(models) = v.get("modelUsage").and_then(Value::as_object) {
             let (mut i, mut o, mut cr) = (0u64, 0u64, 0u64);
             for m in models.values() {
@@ -3760,6 +3818,65 @@ mod tests {
     }
 
     #[test]
+    fn clear_starts_the_timeline_over_and_what_came_before_stays_history() -> anyhow::Result<()> {
+        let mut c = Claude::new(false);
+        let mut core = Core::new();
+        c.start(&mut core);
+        c.line(&mut core, r#"{"type":"system","subtype":"init","cwd":"/work","session_id":"old-1","model":"claude-opus-5-5","permissionMode":"default"}"#);
+        c.command(&mut core, Command::Send { id: "m1".into(), text: "fix the flaky test".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        feed(&mut c, &mut core, &[
+            r#"{"type":"user","message":{"role":"user","content":"fix the flaky test"},"session_id":"old-1","parent_tool_use_id":null,"uuid":"m1","isReplay":true}"#,
+            r#"{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Fixed."}]},"parent_tool_use_id":null,"session_id":"old-1","uuid":"a1"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Fixed.","session_id":"old-1"}"#,
+            r#"{"type":"command_lifecycle","command_uuid":"m1","state":"completed","session_id":"old-1"}"#,
+        ]);
+        let old: Vec<_> = core.events().cloned().collect();
+        assert_eq!(old.len(), 2);
+        core.take_out();
+        core.take_writes();
+
+        // /clear goes as a message; Claude Code 2.1.302 answers with a reset, then an init under
+        // the new session id, the command's replay (context, not words) and its result.
+        c.command(&mut core, Command::Control { id: "clear".into(), value: None });
+        let sent: Value = serde_json::from_str(core.take_writes().last().map(String::as_str).unwrap_or("{}"))?;
+        assert_eq!(sent.pointer("/message/content").and_then(Value::as_str), Some("/clear"));
+        let uuid = sent.get("uuid").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let replay = json!({"type": "user", "message": {"role": "user", "content": "<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>"}, "session_id": "new-2", "parent_tool_use_id": null, "uuid": uuid, "isReplay": true}).to_string();
+        let reset = json!({"type": "conversation_reset", "new_conversation_id": "r1", "uuid": "r1", "trigger": "clear", "user_message_uuid": uuid, "session_id": "old-1"}).to_string();
+        let done = json!({"type": "command_lifecycle", "command_uuid": uuid, "state": "completed", "session_id": "new-2"}).to_string();
+        feed(&mut c, &mut core, &[
+            &reset,
+            r#"{"type":"system","subtype":"init","cwd":"/work","session_id":"new-2","model":"claude-opus-5-5","permissionMode":"default"}"#,
+            &replay,
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":0,"session_id":"new-2"}"#,
+            &done,
+        ]);
+
+        // The timeline holds only the line saying so; viewers start over from it, and the store
+        // keeps everything before it.
+        let left: Vec<&Body> = core.events().map(|e| &e.body).collect();
+        assert!(matches!(left.as_slice(), [Body::Notice { text, .. }] if text == "Conversation cleared"), "{left:?}");
+        let cleared = core.state.cleared.ok_or_else(|| anyhow::anyhow!("not marked cleared"))?;
+        assert!(old.iter().all(|e| e.seq < cleared) && core.events().all(|e| e.seq >= cleared));
+        assert!(matches!(core.take_out().first(), Some(Update::Reset { from: Some(n) }) if *n == cleared));
+        assert_eq!(core.state.harness_session.as_deref(), Some("new-2"));
+        assert!(core.state.goal.is_empty());
+
+        // Taken up again (a restart, a move) from all the store kept: the cleared part stays out,
+        // and new events come after it.
+        let mut again = Core::new();
+        again.adopt(old.into_iter().chain(core.events().cloned()).collect(), core.state.clone());
+        assert_eq!(again.events().map(|e| e.id.clone()).collect::<Vec<_>>(), core.events().map(|e| e.id.clone()).collect::<Vec<_>>());
+        again.upsert("next", None, Body::Notice { level: Level::Info, text: "x".into() });
+        assert!(again.get("next").is_some_and(|e| e.seq > cleared));
+
+        // The next message goes to the new session.
+        c.command(&mut core, Command::Send { id: "m2".into(), text: "now the docs".into(), mode: SendMode::Queue, attachments: vec![], overrides: None });
+        assert!(core.take_writes().last().is_some_and(|w| w.contains("\"session_id\":\"new-2\"")));
+        Ok(())
+    }
+
+    #[test]
     fn a_turn_with_an_approval_from_send_to_result() -> anyhow::Result<()> {
         let mut c = Claude::new(false);
         let mut core = Core::new();
@@ -4323,6 +4440,40 @@ mod tests {
         info.apply(&core.state);
         assert_eq!((info.limits.len(), info.plan.as_deref()), (4, Some("Max")));
         Ok(())
+    }
+
+    #[test]
+    fn another_account_drops_the_old_ones_limits_and_what_it_cost_adds_up() {
+        let (mut c, mut core, reqs) = started();
+        reply_to(&mut c, &mut core, &reqs, "get_usage", json!({"session": {"total_cost_usd": 0.0}, "rate_limits": {"five_hour": {"utilization": 100.0, "resets_at": "2026-10-17T05:00:00Z"}}}));
+        assert_eq!(core.state.limits.len(), 1);
+        c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "total_cost_usd": 2.0, "stop_reason": "end_turn"}).to_string());
+        assert!((core.state.usage.cost_usd - 2.0).abs() < 1e-9);
+        core.state.pause = Some(super::super::model::Pause { reason: super::super::pause::LIMIT.into(), auto: true, ..Default::default() });
+        // Signed in as someone else, it starts again (kiln's /login): the old account's limits and
+        // its pause go; what it cost so far stays, and its new total (from nothing) adds to it.
+        let mut c2 = Claude::new(false).with_config_dir("/home/u/.claude".into());
+        c2.start(&mut core);
+        let reqs2 = requests(&mut core);
+        reply_to(&mut c2, &mut core, &reqs2, "initialize", json!({"commands": [], "models": [], "account": {"email": "other@example.com", "subscriptionType": "pro", "tokenSource": "claude.ai"}}));
+        assert!(core.state.limits.is_empty(), "{:?}", core.state.limits);
+        assert!(core.state.pause.is_none());
+        assert_eq!(core.state.plan.as_deref(), Some("Pro"));
+        reply_to(&mut c2, &mut core, &reqs2, "get_usage", json!({"session": {"total_cost_usd": 0.0}, "rate_limits": {"five_hour": {"utilization": 3.0, "resets_at": "2026-10-17T05:00:00Z"}}}));
+        c2.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "total_cost_usd": 0.5, "stop_reason": "end_turn"}).to_string());
+        assert!((core.state.usage.cost_usd - 2.5).abs() < 1e-9, "{}", core.state.usage.cost_usd);
+        // One that carried its total over (the same session resumed) isn't counted twice.
+        let mut c3 = Claude::new(false).with_config_dir("/home/u/.claude".into());
+        c3.start(&mut core);
+        let reqs3 = requests(&mut core);
+        reply_to(&mut c3, &mut core, &reqs3, "get_usage", json!({"session": {"total_cost_usd": 2.5}}));
+        c3.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "total_cost_usd": 3.0, "stop_reason": "end_turn"}).to_string());
+        assert!((core.state.usage.cost_usd - 3.0).abs() < 1e-9, "{}", core.state.usage.cost_usd);
+        // Signed in on its machine: it starts again with the account once nothing is under way.
+        core.effects.clear();
+        core.set_status(Status::Idle);
+        c3.command(&mut core, Command::Control { id: "account".into(), value: None });
+        assert!(core.effects.iter().any(|e| matches!(e, Effect::Restart { .. })));
     }
 
     #[test]

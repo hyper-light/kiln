@@ -164,7 +164,16 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 /* The state word keeps the width of its longest ("Needs you"), so "Ready" turning "Working" as a
    turn starts doesn't move the rest of the row. */
 .ag-state > .st-word {
-  min-width: calc(14px + 9ch + 0.2em);
+  min-width: calc(22px + 9ch + 0.2em);
+}
+/* Its dot sits in a column as wide as the turn's mark above it, centred under it, so the two rows'
+   marks and words line up. */
+.ag-state > .st-word > i {
+  margin: 0 4px;
+}
+/* Between turns there's no mark: the words start where the state's do. */
+.ag-turn-row > .ag-turn-idle {
+  padding-left: 22px;
 }
 /* The turn has a row of its own above the state, there between turns too and always as tall, so
    nothing moves as a turn starts or ends; what's in it (a taller word, the offer to force a stop)
@@ -368,6 +377,85 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
   .cp .hx-compose-input {
     max-height: calc(4 * 1.55em + 16px);
   }
+}
+/* What's typed, marked (marks.tsx): drawn under the field, whose own text is clear, in its box,
+   size and font. Both keep a scrollbar's room alike, so lines break in the same places. */
+.cp-field {
+  position: relative;
+}
+.cp .cp-input {
+  position: relative;
+  color: transparent;
+  caret-color: var(--color-foreground);
+  scrollbar-gutter: stable;
+}
+.cp .cp-input::selection {
+  background: rgb(186 176 227 / 30%);
+}
+.cp .hx-compose-input.cp-mirror {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  scrollbar-gutter: stable;
+  color: var(--color-foreground);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  pointer-events: none;
+  user-select: none;
+}
+.cp-mirror[data-off] {
+  opacity: 0.5;
+}
+/* iOS sets a field's text in from where a box's is: there it stays plain. */
+@supports (-webkit-touch-callout: none) {
+  .cp .hx-compose-input.cp-mirror {
+    display: none;
+  }
+  .cp .cp-input {
+    color: var(--color-foreground);
+  }
+}
+.cp-mirror .md-m {
+  color: #6d707a;
+}
+.cp-mirror .md-b,
+.cp-mirror .md-h {
+  color: var(--color-bright);
+  -webkit-text-stroke: 0.35px currentColor;
+}
+.cp-mirror .md-i {
+  font-style: italic;
+}
+.cp-mirror .md-s {
+  color: var(--color-secondary);
+  text-decoration: line-through;
+}
+.cp-mirror .md-code {
+  border-radius: 4px;
+  background: #191b22;
+  box-shadow: 0 0 0 1px #2a2d38;
+  color: #cdc4e0;
+}
+.cp-mirror .md-pre {
+  color: #cdc4e0;
+}
+.cp-mirror .md-q {
+  color: var(--color-secondary);
+}
+.cp-mirror .md-li {
+  color: #bab0e3;
+}
+.cp-mirror .md-a {
+  color: var(--color-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/* A command the agent has, wherever it is in the message. */
+.cp-mirror .md-cmd {
+  border-radius: 4px;
+  background: rgb(186 176 227 / 14%);
+  box-shadow: 0 0 0 1px rgb(186 176 227 / 24%);
+  color: #d9d2f5;
 }
 .cp-bar {
   display: flex;
@@ -682,6 +770,22 @@ html[data-window="short"] .hx-agent:has(.hx-dock:focus-within) > .ag-head {
 }
 .hx-turn .hx-work {
   border-top: 0;
+}
+/* The end of a turn under way while nothing at its end moves: what it's doing, and for how long
+   since its last step. */
+.hx-live-tail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 2px;
+  color: #8f929b;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.hx-live-tail .sg-label {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: none;
 }
 .hx-turn .hx-note,
 .hx-turn .hx-outcome {

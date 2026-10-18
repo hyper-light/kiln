@@ -30,6 +30,8 @@ pub struct Config {
     pub cd: Cd,
     /// CI (docs/ci.md).
     pub ci: ci::Ci,
+    /// Conversations (docs/conversations.md): the runners that keep a copy of the server's store.
+    pub conversations: Conversations,
     /// Environment variables injected into every job (e.g. registry mirrors). Values starting with
     /// `file:` are read from that path at job dispatch time and masked in logs.
     pub secrets: BTreeMap<String, String>,
@@ -142,6 +144,16 @@ pub struct Retention {
     pub max_job_log_mb: u64,
     /// How long the audit log keeps its rows (docs/ci.md W19-R05).
     pub audit_days: u32,
+}
+
+/// `[conversations]` (docs/conversations.md, "Mirrors").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Conversations {
+    /// How many runners keep a copy of the server's conversation store. 0: none.
+    pub mirrors: usize,
+    /// Runners to pick first, by name (each still has to keep a store of its own).
+    pub mirror_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +380,12 @@ impl Default for Discovery {
 impl Default for Terminal {
     fn default() -> Self {
         Self { enabled: true, shell: None, max_sessions: 32, idle_minutes: 720 }
+    }
+}
+
+impl Default for Conversations {
+    fn default() -> Self {
+        Self { mirrors: 1, mirror_on: Vec::new() }
     }
 }
 

@@ -26,6 +26,8 @@ pub struct Planned {
     pub hash: u64,
     /// It is a hook: a sync runs it rather than keeping it deployed.
     pub hook: bool,
+    /// The namespace the app makes (`CreateNamespace=true`): a step only while it is missing.
+    pub made: bool,
 }
 
 /// What one step of a planned sync does.
@@ -132,9 +134,10 @@ impl Engine {
             }
         };
         let namespace = self.namespace_render(&app.cfg, &render);
+        let made_ns = namespace.as_ref().and_then(|n| n.objects.first()).map(|o| o.name.clone());
         let mut objects: Vec<Planned> = Vec::with_capacity(render.objects.len() + 1);
         let mut at: FxHashMap<ResKey, usize> = FxHashMap::default();
-        for r in render.objects.iter().chain(namespace.iter().flat_map(|n| n.objects.iter())) {
+        for (made, r) in render.objects.iter().map(|r| (false, r)).chain(namespace.iter().flat_map(|n| n.objects.iter()).map(|r| (true, r))) {
             let ns = if namespaced(&r.group, &r.kind) {
                 if r.namespace.is_empty() { app.cfg.namespace.clone() } else { r.namespace.clone() }
             } else {
@@ -143,7 +146,7 @@ impl Engine {
             let key = ResKey { group: r.group.clone(), kind: r.kind.clone(), namespace: ns, name: r.name.clone() };
             let Ok(mut v) = r.blob.decode() else { continue };
             self.decorate(app, &key, &mut v);
-            let p = Planned { hash: obj::hash_value(&v), key, object: v, hook: r.hook };
+            let p = Planned { hash: obj::hash_value(&v), key, object: v, hook: r.hook, made: made && made_ns.as_ref() == Some(&r.name) };
             // Two objects with one key: the later one is what the app deploys.
             match (p.hook, at.get(&p.key)) {
                 (false, Some(&i)) => {
@@ -168,7 +171,14 @@ impl Engine {
             }
             let slots: Vec<_> = self.slots(c, &p.key).iter().collect();
             let seen = slots.iter().filter_map(|ix| self.res(c, *ix)).find_map(|r| r.live.as_ref());
-            let other = slots.iter().filter_map(|ix| self.res(c, *ix)).find(|r| r.app != Some(a) && r.desired.is_some()).and_then(|r| r.app).or_else(|| seen.and_then(|l| l.tracked).filter(|t| *t != a));
+            // The namespace the app makes: made when missing, never another app's (Argo CD's).
+            if p.made {
+                if seen.is_none() {
+                    cands.push(Candidate { key: p.key.clone(), desired: Some(i), live: None, out_of_sync: true, change: create(), why: None });
+                }
+                continue;
+            }
+            let other = slots.iter().filter_map(|ix| self.res(c, *ix)).find(|r| r.app != Some(a) && r.desired.is_some() && !r.made).and_then(|r| r.app).or_else(|| seen.and_then(|l| l.tracked).filter(|t| *t != a));
             if let Some(o) = other {
                 plan.shared.push((p.key.clone(), self.app(o).map(|x| x.cfg.id.clone()).unwrap_or_else(|| Str::from(""))));
             }

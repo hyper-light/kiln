@@ -474,6 +474,89 @@ fn create_namespace_makes_one_that_outlives_prunes() {
     assert!(h.clusters.get("dev").and_then(|c| c.get(&ns)).is_some(), "the namespace was deleted with the app");
 }
 
+/// The namespace "web", as someone else made it.
+fn someone_elses_namespace(h: &mut Harness) {
+    let ns = json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "web", "labels": {"keep": "1"},
+        "annotations": {"argocd.argoproj.io/tracking-id": "platform:/Namespace:/web"}}});
+    if let Some(c) = h.clusters.get_mut("dev") {
+        let _ = c.apply(0, ns, "someone", false);
+    }
+}
+
+fn web_namespace(h: &Harness) -> Option<Value> {
+    h.clusters.get("dev").and_then(|c| c.get(&ResKey::new("", "Namespace", "", "web")))
+}
+
+/// Argo CD's CreateNamespace: the namespace is no object of the app's. Already there, it is
+/// neither compared nor counted, and a sync leaves it as it is.
+#[test]
+fn a_namespace_an_app_makes_is_never_compared() {
+    let (mut h, git) = harness(fast());
+    someone_elses_namespace(&mut h);
+    let before = web_namespace(&h);
+    let mut a = auto("web");
+    a.create_namespace = Some((Vec::new(), Vec::new()));
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let s = status(&h, "web");
+    assert_eq!(s.map(|s| (s.resources, s.out_of_sync, s.shared)), Some((1, 0, 0)), "{s:?}");
+    assert_eq!(web_namespace(&h).map(|v| (v.pointer("/metadata/labels").cloned(), v.pointer("/metadata/annotations").cloned())), before.map(|v| (v.pointer("/metadata/labels").cloned(), v.pointer("/metadata/annotations").cloned())), "the sync left it alone");
+    assert!(h.engine.resources("web").iter().all(|r| &*r.key.kind != "Namespace"), "not one of its objects");
+}
+
+/// Missing, it is made, with none of kiln's marks: no tracking, no wave, no options.
+#[test]
+fn a_missing_namespace_is_made_without_kilns_marks() {
+    let (mut h, git) = harness(fast());
+    let mut a = auto("web");
+    a.create_namespace = Some((Vec::new(), Vec::new()));
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let ns = web_namespace(&h);
+    assert!(ns.is_some(), "made");
+    let annotations = ns.as_ref().and_then(|v| v.pointer("/metadata/annotations")).and_then(Value::as_object).map(|m| m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+    assert!(annotations.iter().all(|k| !k.contains("tracking") && !k.contains("sync-options") && !k.contains("sync-wave")), "{annotations:?}");
+    assert_eq!(status(&h, "web").map(|s| s.resources), Some(1));
+}
+
+/// managedNamespaceMetadata: applied to the namespace at every sync, beside what others set.
+#[test]
+fn managed_namespace_metadata_is_applied_to_one_already_there() {
+    let (mut h, git) = harness(fast());
+    someone_elses_namespace(&mut h);
+    let mut a = auto("web");
+    a.create_namespace = Some((vec![("team".into(), "web".into())], vec![("owner".into(), "ada".into())]));
+    a.manage_namespace = true;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let ns = web_namespace(&h).unwrap_or_default();
+    assert_eq!((obj::label(&ns, "team"), obj::label(&ns, "keep"), obj::annotation(&ns, "owner")), (Some("web"), Some("1"), Some("ada")));
+    assert!(obj::annotation(&ns, "argocd.argoproj.io/sync-options").is_none());
+}
+
+/// Another app deploys the namespace as one of its objects: it is that app's alone, not shared
+/// with the app that makes it, and that app prunes it once git drops it.
+#[test]
+fn a_namespace_another_app_deploys_is_not_shared_with_one_that_makes_it() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("namespaces")));
+    deploy(&mut h, &git, "namespaces", "n1", vec![json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "web"}})]);
+    assert!(h.run_until(60_000, |h| settled(h, "namespaces")), "{:?}", status(&h, "namespaces"));
+    let mut a = auto("web");
+    a.create_namespace = Some((Vec::new(), Vec::new()));
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "web", "w1", vec![config_map("cfg", "1", json!({}))]);
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    assert_eq!((status(&h, "web").map(|s| s.shared), status(&h, "namespaces").map(|s| s.shared)), (Some(0), Some(0)));
+    assert!(h.engine.resources("namespaces").iter().all(|r| r.shared_with.is_empty()));
+    // Dropped from git: the app that deploys it prunes it; the one that makes it doesn't hold it.
+    deploy(&mut h, &git, "namespaces", "n2", vec![config_map("marker", "1", json!({}))]);
+    assert!(h.run_until(30_000, |h| web_namespace(h).is_none()), "{:?}", h.engine.resources("namespaces"));
+}
+
 #[test]
 fn shadow_mode_compares_and_never_writes() {
     let (mut h, git) = harness(fast());
@@ -795,4 +878,33 @@ fn objects_without_tracking_differ_only_by_kilns_marks() {
     assert_eq!(s, Some((2, 1, 0, 1)), "y missing, x only unmarked");
     let x = h.engine.resources("one").into_iter().find(|r| &*r.key.name == "x");
     assert!(x.is_some_and(|r| r.marks_only && r.tracked_by.is_none()));
+}
+
+
+/// A sync of objects already there and healthy applies every one of them, however many wait in
+/// the cluster's queue: a task waits for its own answer, not for the live object it is about to
+/// change (which is the one from before, and healthy).
+#[test]
+fn a_sync_of_objects_already_there_applies_every_one() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertCluster { name: "dev".into(), qps: None, inflight: Some(2) });
+    let cms: Vec<Value> = (0..12).map(|i| config_map(&format!("cfg{i}"), "1", json!({}))).collect();
+    for i in 0..12 {
+        let cm = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": format!("cfg{i}"), "namespace": "web"}, "data": {"v": "1"}});
+        if let Some(c) = h.clusters.get_mut("dev") {
+            let _ = c.apply(0, cm, "someone", false);
+        }
+    }
+    h.input(Input::UpsertApp(AppConfig::new("web", "dev", "web")));
+    deploy(&mut h, &git, "web", "r1", cms);
+    h.run_for(5_000);
+    let n = h.records.len();
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let marked = (0..12)
+        .filter(|i| h.clusters.get("dev").and_then(|c| c.get(&ResKey::new("", "ConfigMap", "web", &format!("cfg{i}")))).is_some_and(|v| obj::annotation(&v, crate::engine::TRACKING).is_some()))
+        .count();
+    assert_eq!(marked, 12, "every object applied");
+    let applied = h.records.iter().skip(n).find_map(|r| if let Record::Finished { applied, .. } = r { Some(*applied) } else { None });
+    assert_eq!(applied, Some(12));
 }

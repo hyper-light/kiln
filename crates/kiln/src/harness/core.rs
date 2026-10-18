@@ -296,7 +296,11 @@ impl Core {
     /// Take over the timeline and state the session had on another machine (it moved here): its
     /// events as they were (ids, order, times, who said them), its queue, todos and title. What
     /// belonged to the process over there (its tasks, a turn's state) stays there.
-    pub fn adopt(&mut self, events: Vec<Event>, state: State) {
+    pub fn adopt(&mut self, mut events: Vec<Event>, state: State) {
+        // A conversation cleared since: what came before it is history, not the timeline.
+        if let Some(from) = state.cleared {
+            events.retain(|e| e.seq >= from);
+        }
         let first = events.first().map_or(1, |e| e.seq.max(1));
         // Numbers stay contiguous: an event's place is found from its number.
         self.events = events
@@ -308,7 +312,7 @@ impl Core {
             })
             .collect();
         self.index = self.events.iter().map(|e| (e.id.clone(), e.seq)).collect();
-        self.next_seq = self.events.back().map_or(1, |e| e.seq + 1);
+        self.next_seq = self.events.back().map_or(1, |e| e.seq + 1).max(state.cleared.unwrap_or(1));
         let cwd = std::mem::take(&mut self.state.cwd);
         let harness_session = self.state.harness_session.take();
         self.state = state;
@@ -341,6 +345,20 @@ impl Core {
         self.next_seq = seq;
         self.changed.clear();
         self.stream.clear();
+        self.reset = true;
+        self.state_dirty = true;
+    }
+
+    /// The conversation starts over (`/clear`): the timeline empties and its numbers go on. What
+    /// it held stays history, as events dropped to bound memory do: viewers get the timeline
+    /// again, the store keeps the events, and a timeline taken up again leaves them out.
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.index.clear();
+        self.changed.clear();
+        self.stream.clear();
+        self.state.cleared = Some(self.next_seq);
+        self.state.dropped = 0;
         self.reset = true;
         self.state_dirty = true;
     }
@@ -594,7 +612,9 @@ impl Core {
 
     /// Everything a newly attached viewer needs, as updates (events in bounded batches).
     pub fn snapshot(&self, batch_bytes: usize) -> Vec<Update> {
-        let mut out = vec![Update::Reset { from: self.events.front().map(|e| e.seq) }, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(self.state.clone()) }];
+        // Cleared and nothing since: the store still keeps what came before.
+        let from = self.events.front().map(|e| e.seq).or(self.state.cleared);
+        let mut out = vec![Update::Reset { from }, Update::Meta { meta: Box::new(self.meta.clone()) }, Update::State { state: Box::new(self.state.clone()) }];
         if !self.changes.is_empty() {
             out.push(Update::Changes { files: self.changes() });
         }

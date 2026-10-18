@@ -46,6 +46,10 @@ pub async fn open(hub: &Arc<Hub>, seg: &[&str], req: Request) -> Option<Result<R
         ["_kiln", "notify"] => Some(super::notify::from_leg(hub, req).await),
         // W19-R03: what a leg runs on, for comparing runs.
         ["_kiln", "facts"] => Some(super::compare::facts_from_leg(hub, req).await),
+        // W18: an attest step's SBOM and bundles, for its runner; the key that signs them.
+        ["_kiln", "attestations", "sbom"] if req.method() == Method::POST => Some(super::attest::upload(hub, req).await),
+        ["_kiln", "attestations"] => Some(super::attest::for_leg(hub, &req).await),
+        ["_kiln", "attestation-key.pem"] => Some(super::attest::key_pem(hub)),
         // Only while tokens are minted (CI's jobs, CD's federated accounts): fetching the keys
         // makes the first one.
         _ if super::oidc::is_issuer(hub, seg).is_some() => {
@@ -137,6 +141,7 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["runs", id, "graph"]) => super::runs_api::graph(hub, id, q).await,
         // W19-R03: what changed between two runs or legs (`last-green`: since the last success).
         (&Method::GET, ["runs", id, "compare", other]) => super::compare::runs(hub, id, other).await,
+        (&Method::GET, ["runs", id, "attestations"]) => super::attest::for_run(hub, id).await,
         (&Method::GET, ["legs", id, "compare", other]) => super::compare::legs(hub, id, other).await,
         // W16-R03: tests, failures first.
         (&Method::GET, ["runs", id, "tests"]) => super::results::of(hub, Some(id), None, q).await,

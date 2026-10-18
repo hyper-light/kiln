@@ -70,7 +70,7 @@ function lineOf(a: AgentInfo, stand: Stand): string {
       return a.pause ? pauseLine(a.pause, Date.now()) : "Paused";
     case "working": {
       const plan = (a.todos_total ?? 0) > 0 ? `plan ${a.todos_done ?? 0}/${a.todos_total}` : "";
-      return [a.status === "starting" ? "Starting" : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
+      return [a.status === "starting" ? (a.harness_session ? "Resuming" : "Starting") : a.doing || a.activity || "Working", plan].filter(Boolean).join(" · ");
     }
     case "finished":
       return a.summary ? plain(a.summary) : a.goal || a.title || "Done";
