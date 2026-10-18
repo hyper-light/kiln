@@ -2360,16 +2360,25 @@ impl Claude {
         let id = if uuid.is_empty() { format!("user-{}", Core::now()) } else { uuid.to_owned() };
         let ours = core.state.delivery.contains_key(&id);
         let human = ours || v.get("isReplay").and_then(Value::as_bool) == Some(true);
-        // One of kiln's own (keeping it going) stays kiln's, and isn't what the person asked for.
-        let from = if ours { super::core::origin_of(&id) } else if human { "human" } else { "system" };
+        let (keep_images, keep_names, was) = match core.get(&id).map(|e| &e.body) {
+            Some(Body::User { images, attachments, origin, .. }) => (*images, attachments.clone(), origin.clone()),
+            _ => (0, Vec::new(), None),
+        };
+        // One of kiln's own (keeping it going, going on after a pause: `pause::from_kiln`) stays
+        // kiln's when the CLI says it back, and isn't what the person asked for.
+        let from = if was.as_deref() == Some("kiln") {
+            "kiln"
+        } else if ours {
+            super::core::origin_of(&id)
+        } else if human {
+            "human"
+        } else {
+            "system"
+        };
         if human && from != "kiln" && core.state.goal.is_empty() {
             core.state.goal = clip_middle(t, 600).0;
             core.touch_state();
         }
-        let (keep_images, keep_names) = match core.get(&id).map(|e| &e.body) {
-            Some(Body::User { images, attachments, .. }) => (*images, attachments.clone()),
-            _ => (0, Vec::new()),
-        };
         // The replay of our own message: its words without the attached-files list we added.
         let t = t.split("\n\nAttached files:\n").next().unwrap_or(t);
         core.upsert(
@@ -3730,6 +3739,9 @@ mod tests {
         assert_eq!(core.state.queue.len(), 2);
         let go_on = user.get("uuid").and_then(Value::as_str).unwrap_or_default().to_owned();
         assert!(matches!(core.get(&go_on).map(|e| &e.body), Some(Body::User { origin: Some(o), .. }) if o == "kiln"));
+        // Claude Code says it back (it replays what it's sent): it stays kiln's, not yours.
+        c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": crate::harness::pause::CONTINUE}, "session_id": "s1", "parent_tool_use_id": null, "uuid": go_on, "isReplay": true}).to_string());
+        assert!(matches!(core.get(&go_on).map(|e| &e.body), Some(Body::User { origin: Some(o), .. }) if o == "kiln"), "the replay made kiln's message someone else's");
         c.line(&mut core, &json!({"type": "result", "subtype": "success", "is_error": false, "result": "Done.", "session_id": "s1"}).to_string());
         c.line(&mut core, &json!({"type": "command_lifecycle", "command_uuid": go_on, "state": "completed", "uuid": "y", "session_id": "s1"}).to_string());
         let next: Vec<Value> = core.take_writes().iter().filter_map(|w| serde_json::from_str(w).ok()).collect();
