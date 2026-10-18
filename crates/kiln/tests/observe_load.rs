@@ -233,7 +233,7 @@ fn anon_of(pid: u32) -> Anon {
     let mut out = Anon::default();
     // The mapping being read: its start, length, and whether it is the heap; None for a file's.
     let mut current: Option<(u64, u64, bool)> = None;
-    let mut add = |out: &mut Anon, c: Option<(u64, u64, bool)>, bytes: u64| match c {
+    let add = |out: &mut Anon, c: Option<(u64, u64, bool)>, bytes: u64| match c {
         Some((_, _, true)) => out.heap += bytes,
         Some((start, len, false)) if len <= 64 << 20 && start % (64 << 20) == 0 => out.arenas.push(bytes),
         Some(_) => out.other += bytes,
