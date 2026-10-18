@@ -56,6 +56,13 @@ pub async fn start(hub: &Arc<Hub>, id: &str, to: &str, now: bool) -> Result<serd
     if !installed {
         return Err(format!("{} is not installed on {to}", info.kind_name));
     }
+    // Its machine is away: it can't hand the session over, so it goes on from the server's copy of
+    // its conversation (`docs/conversations.md`, "Resuming on another machine").
+    if !hub.agents.lock().get(&from).is_some_and(|a| a.connected) {
+        let (there, _) = folder(hub, id, &from, &to, &info.cwd, true).await?;
+        hub.harness.resume_on(hub, id, &to, Some(there)).await?;
+        return Ok(serde_json::json!({ "moving": to, "from_store": true }));
+    }
     for m in [&from, &to] {
         if hub.instances.lock().newest_with(m, crate::proto::CAP_REACH).is_none() {
             return Err(format!("{m}'s runner can't hand sessions over (an older runner: upgrade it)"));
@@ -76,15 +83,16 @@ async fn say(hub: &Arc<Hub>, id: &str, text: &str) {
 }
 
 async fn prepare_and_go(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, now: bool) -> Result<(), String> {
-    let (there, note) = folder(hub, id, from, to, cwd).await?;
+    let (there, note) = folder(hub, id, from, to, cwd, false).await?;
     match hub.harness.command(hub, id, Command::MoveTo { to: to.to_owned(), cwd: there, note, now }).await {
         Sent::Ok => Ok(()),
         _ => Err(format!("{from} is not connected")),
     }
 }
 
-/// Where the session goes on on `to`, and what of its folder came along (in words).
-async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str) -> Result<(String, Option<String>), String> {
+/// Where the session goes on on `to`, and what of its folder came along (in words). `away`: `from`
+/// is away, so nothing is copied from it.
+async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str, away: bool) -> Result<(String, Option<String>), String> {
     let view = crate::sync::places::now(hub).await.map_err(|e| format!("{e:#}"))?;
     let home = hub.places.of(from).map(|h| h.home).filter(|h| !h.is_empty());
     // `~/…` for a path under `from`'s home: the same place under `to`'s.
@@ -104,7 +112,10 @@ async fn folder(hub: &Arc<Hub>, id: &str, from: &str, to: &str, cwd: &str) -> Re
         return Ok((join(&there.path, &rel), Some(format!("Its repository is kept in step between {from} and {to}."))));
     }
     // Else a copy is made there and kept in step from now on: beside a folder of it already
-    // there (never over it).
+    // there (never over it). Not from a machine that's away: its files stay there.
+    if away {
+        return Ok((mapped(cwd), Some(format!("{from} is away, so its repository's files stay there."))));
+    }
     let mut target = mapped(&place.path);
     let taken = |t: &str| {
         let whole = hub.places.resolve(to, t);

@@ -919,6 +919,11 @@ pub struct State {
     /// The harness's own session id (what `--resume` takes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session: Option<String>,
+    /// How many times the session went on on another machine (a move, a resume elsewhere): its
+    /// conversation's writer. A store takes a session's rows from its latest writer alone
+    /// (`docs/conversations.md`, "Fencing").
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub epoch: u64,
     /// Where its commands may run besides its machine (`Spec::reach`): None anywhere it needs,
     /// `"off"` only its own machine, else a runner or platform it prefers.
     #[serde(default, skip_serializing_if = "Option::is_none")]

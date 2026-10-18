@@ -92,7 +92,11 @@ export function MoveDialog({ agent, onClose }: { agent: Agent; onClose: () => vo
     <Dialog open onOpenChange={(o) => !o && onClose()}>
       <DialogContent
         title={`Move ${agent.name} to…`}
-        description="Its conversation, timeline and queue go along. A git repository it works in goes too, kept in step between both machines; other folders stay where they are."
+        description={
+          agent.status === "disconnected"
+            ? "Its machine is away, so it goes on from the kiln server's copy: its conversation, timeline and queue. Its files stay on that machine, unless its repository is kept in step where it goes."
+            : "Its conversation, timeline and queue go along. A git repository it works in goes too, kept in step between both machines; other folders stay where they are."
+        }
       >
         <Loadable label="Loading your machines" fallback={<p className="mv-none">Looking at your machines…</p>}>
           <Choices agent={agent} picked={picked} onPick={setPicked} />

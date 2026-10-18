@@ -22,7 +22,7 @@ use crate::rt::{Interval, Shutdown};
 use crate::exec::{Exec, Up, Uplink};
 use crate::net::{self, Kind, NetEvent, Out, SERVER_PEER};
 use crate::pki::Leaf;
-use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
+use crate::proto::{self, AgentMsg, Hello, JobResult, LANE_CONTROL, LANE_CONVO, LANE_LOGS, LANE_REACH, LANE_SYNC, LANE_TERM, ServerMsg};
 use crate::store::Status;
 use crate::terminal::{self, PtyOut, PtySession};
 
@@ -362,13 +362,34 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // in-process agent: the server hosts those itself). They outlive the server connection and
     // this process's restarts: each continues its harness session.
     let (harness_tx, harness_rx) = async_channel::bounded::<(String, crate::harness::core::Update)>(8192);
+    // Conversations kept on disk as they happen (docs/conversations.md), and sent to the server's
+    // store over this link (`crate::convo::feed`).
+    let mut convo: Option<crate::convo::store::Store> = None;
     let harness = (!o.ephemeral && o.terminal).then(|| {
-        // Conversations kept on disk as they happen (docs/conversations.md).
-        let convo = crate::convo::open(&own_dir);
+        convo = crate::convo::open(&own_dir);
         let sink = convo.as_ref().map_or_else(|| harness_tx.clone(), |st| crate::convo::store::tee(harness_tx.clone(), st.clone(), 8192));
         let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), Default::default());
         h.restore_from(convo.as_ref());
         h
+    });
+    let shipper = convo.clone().map(|st| {
+        // The harnesses' own records, followed into the store.
+        if let Some(h) = harness.clone() {
+            let follow = h;
+            if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || follow.record_sources()) {
+                tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
+            }
+        }
+        let (shipper, said) = crate::convo::feed::Shipper::start(st);
+        let up = uplink.0.clone();
+        crate::rt::spawn(async move {
+            while let Ok((json, data)) = said.recv().await {
+                if up.send(Up::Convo(AgentMsg::Convo { json, data })).await.is_err() {
+                    break;
+                }
+            }
+        });
+        shipper
     });
     // What `kiln spawn` in this machine's terminals talks to.
     let harness_sock = harness.as_ref().and_then(|h| match crate::harness::socket::serve(h, crate::harness::socket::path(&name, &own_dir)) {
@@ -619,7 +640,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 }
                 // Which build this is and that it takes upgrade commands (an older server skips it);
                 // an outpost says it's one instead.
-                let build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
+                let mut build = if o.outpost { crate::updates::outpost_build() } else { crate::updates::runner_build() };
+                // It sends its conversations' store: the server keeps them from that.
+                if shipper.is_some()
+                    && let AgentMsg::Build { caps, .. } = &mut build
+                {
+                    *caps |= proto::CAP_CONVO;
+                }
                 if !o.ephemeral
                     && let Ok(b) = proto::encode(&build)
                 {
@@ -642,6 +669,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 connected = true;
                 if let Some(s) = &sync {
                     s.connected(true);
+                }
+                if let Some(f) = &shipper {
+                    f.link(crate::convo::feed::Link::Up);
                 }
                 while let Some((lane, kind, data)) = buffer.pop_front() {
                     buffered = buffered.saturating_sub(data.len());
@@ -670,6 +700,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 connected = false;
                 if let Some(s) = &sync {
                     s.connected(false);
+                }
+                if let Some(f) = &shipper {
+                    f.link(crate::convo::feed::Link::Down);
                 }
                 if let Some(r) = &reach {
                     r.feed(crate::reach::node::In::Server(false)).await;
@@ -948,6 +981,35 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             h.close(&session);
                         }
                     }
+                    ServerMsg::HarnessPackage { session, offset, data, done } => {
+                        // A session going on here from the server's store (its machine is gone).
+                        let Some(h) = harness.clone() else { continue };
+                        match h.receive_package(&session, offset, &data, done) {
+                            Ok(Some(path)) => {
+                                let up = uplink.0.clone();
+                                crate::rt::spawn(async move {
+                                    let h2 = h.clone();
+                                    let taken = crate::rt::blocking(move || h2.adopt_package(&path)).await.unwrap_or_else(|e| Err(format!("{e:#}")));
+                                    if let Err(why) = taken {
+                                        tracing::warn!(%session, %why, "an agent session couldn't go on here");
+                                        let spec = serde_json::json!({ "kind": "claude" }).to_string();
+                                        for u in crate::harness::host::refusal(&session, &spec, &format!("Couldn't go on here: {why}")) {
+                                            if let Ok(json) = serde_json::to_string(&u) {
+                                                up.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(%session, error = %format!("{e:#}"), "a session package couldn't be kept"),
+                        }
+                    }
+                    ServerMsg::HarnessRelease { session } => {
+                        if let Some(h) = &harness {
+                            h.let_go(&session);
+                        }
+                    }
                     ServerMsg::Upgrade { job, path, sha256, size } if o.outpost => {
                         // Nothing of an outpost is installed: its next kiln is the one downloaded next.
                         let _ = (path, sha256, size);
@@ -1007,6 +1069,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     ServerMsg::Sync { json, raft } => {
                         if let Some(s) = &sync {
                             s.heard(&json, raft);
+                        }
+                    }
+                    ServerMsg::Convo { json, .. } => {
+                        if let (Some(f), Some(m)) = (&shipper, crate::convo::feed::decode(&json)) {
+                            f.link(crate::convo::feed::Link::Heard(m));
                         }
                     }
                     ServerMsg::DirList { req, path } => {
@@ -1203,11 +1270,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     Up::Term(m) => (LANE_TERM, Kind::Term, proto::encode(m)),
                     Up::Sync(m) => (LANE_SYNC, Kind::Control, proto::encode(m)),
                     Up::Reach(m) => (LANE_REACH, Kind::Term, proto::encode(m)),
+                    Up::Convo(m) => (LANE_CONVO, Kind::Log, proto::encode(m)),
                 };
                 let Ok(data) = data else { continue };
                 if connected {
                     net.send(SERVER_PEER, lane, kind, data).await;
-                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH {
+                } else if kind != Kind::Term && lane != LANE_SYNC && lane != LANE_REACH && lane != LANE_CONVO {
                     buffered += data.len();
                     buffer.push_back((lane, kind, data));
                     // Shed the oldest log chunks first; results and step events are kept.
