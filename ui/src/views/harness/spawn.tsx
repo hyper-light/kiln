@@ -317,13 +317,13 @@ function MoreFields({
       <label className="sp-field">
         <span>Commands</span>
         <select className="hx-select" value={reach} onChange={(e) => onReach(e.target.value)}>
-          <option value="">Here, and other runners when it needs them</option>
+          <option value="">Any runner it needs</option>
           {reachOptions.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}
             </option>
           ))}
-          <option value="off">Only on its own machine</option>
+          <option value="off">Only its own machine</option>
         </select>
       </label>
       {shells.length > 0 && (
