@@ -11,6 +11,7 @@ use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use hyper_measure::alloc;
+use kiln_obs::logs::bloom::{Bloom, tokens};
 use kiln_obs::lz4;
 
 #[global_allocator]
@@ -26,6 +27,10 @@ fn main() {
         std::fs::File::open(p).unwrap().read_to_end(&mut data).unwrap();
     }
     println!("logs: {:.1} MB", data.len() as f64 / 1e6);
+    if std::env::args().any(|a| a == "tokens") {
+        token_stats(&data);
+        return;
+    }
     println!("{:>9} {:>10} {:>8} {:>12} {:>12}", "block", "codec", "ratio", "compress", "decompress");
     for block in [64usize << 10, 256 << 10, 1 << 20, 4 << 20] {
         let blocks: Vec<&[u8]> = data.chunks(block).collect();
@@ -70,5 +75,43 @@ fn main() {
             let dt = t.elapsed();
             println!("{:>8}K {:>10} {:>8.2} {:>9.0}MB/s {:>9.0}MB/s", block >> 10, format!("deflate-{level}"), data.len() as f64 / csize as f64, data.len() as f64 / ct.as_secs_f64() / 1e6, data.len() as f64 / dt.as_secs_f64() / 1e6);
         }
+    }
+}
+
+/// Distinct tokens a 256 KiB block, and what a Bloom filter of them costs against the block's LZ4
+/// text, at several false-positive rates (`docs/observe.md` §12.7).
+fn token_stats(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let block = 256 << 10;
+    let mut distinct: Vec<usize> = Vec::new();
+    let mut comp_sizes: Vec<usize> = Vec::new();
+    let mut buf = String::new();
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    while start < bytes.len() {
+        let mut end = (start + block).min(bytes.len());
+        while end < bytes.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        let chunk = &text[start..end];
+        let mut set = std::collections::HashSet::new();
+        tokens(chunk, &mut buf, |t| {
+            set.insert(t.to_owned());
+        });
+        distinct.push(set.len());
+        let mut c = Vec::new();
+        lz4::compress(chunk.as_bytes(), &mut c);
+        comp_sizes.push(c.len());
+        start = end;
+    }
+    distinct.sort_unstable();
+    let mean = distinct.iter().sum::<usize>() as f64 / distinct.len() as f64;
+    let comp_mean = comp_sizes.iter().sum::<usize>() as f64 / comp_sizes.len() as f64;
+    println!("{} blocks of 256 KiB: distinct tokens mean {:.0}, p50 {}, p99 {}, max {}; LZ4 text mean {:.0} bytes", distinct.len(), mean, distinct[distinct.len() / 2], distinct[distinct.len() * 99 / 100], distinct[distinct.len() - 1], comp_mean);
+    for p in [0.001, 0.005, 0.01, 0.02, 0.05, 0.1] {
+        let b = Bloom::with_rate(mean as usize, p);
+        // A false positive decompresses the block's text (at 3.8 GB/s, §12.6) for nothing.
+        let wasted_us = p * (block as f64) / 3.8e9 * 1e6;
+        println!("  p {:>5}: {:>6} bytes a block ({:>5.1}% of its LZ4 text), k {:>2}; a missing word costs {:.2} µs a block in wasted decompression", p, b.byte_len(), 100.0 * b.byte_len() as f64 / comp_mean, b.k, wasted_us);
     }
 }

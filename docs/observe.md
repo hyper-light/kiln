@@ -18,7 +18,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-3 | Replication: the store as a hyper-durable state machine; kiln carries Raft between nodes | planned |
 | O-4 | Query language: metrics done (parser without recursion, evaluator, §12.5); logs and events with O-6; the HTTP API with O-3 | in progress |
 | O-5 | Ingestion: kiln itself, runners' hosts, OTLP/HTTP (protobuf and JSON), kiln CI and CD | planned |
-| O-6 | Logs: columnar log blocks, search, facets, live tail, patterns | planned |
+| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax; next: the store's log head, persistence, OTLP logs, facets, live tail, patterns | in progress |
 | O-7 | Monitors: threshold, change, anomaly, forecast, logs, events, CI/CD, composite; notifications | planned |
 | O-8 | Dashboards and explorers in the UI | planned |
 | O-9 | Integrations: Slack, Discord, Teams, PagerDuty, webhooks, GitHub, AWS, GCP, Azure | planned |
@@ -385,6 +385,25 @@ most, are LZ4 (twice deflate's decompression rate); blocks compaction rewrites, 
 holding most of the bytes, are deflate-6 (1.86× smaller), as ClickHouse pairs LZ4 for hot parts
 with a stronger codec for cold. A block's text is 256 KiB: the smallest within 2% of LZ4's ratio
 plateau, so a search that hits one row decompresses at most 256 KiB (about 70 µs).
+
+### 12.7 Log blocks' token filters
+
+`... --bench lz4 -- tokens`: the corpus of §12.6 in blocks of 256 KiB has 2,603 distinct tokens a
+block on average (median 2,326, p99 5,531). A filter for them at each false-positive rate, against the
+block's LZ4 text (37.8 KB on average):
+
+| rate | bytes a block | of its text | hashes | wasted decompression a block a missing word |
+| --- | --- | --- | --- | --- |
+| 0.1% | 4,684 | 12.4% | 10 | 0.07 µs |
+| 0.5% | 3,596 | 9.5% | 8 | 0.34 µs |
+| **1%** | **3,124** | **8.3%** | **7** | **0.69 µs** |
+| 2% | 2,660 | 7.0% | 6 | 1.38 µs |
+| 5% | 2,036 | 5.4% | 4 | 3.45 µs |
+| 10% | 1,564 | 4.1% | 3 | 6.90 µs |
+
+1% is where tenfold fewer false positives stop costing little space (from 5% to 1%: 2.9 points of
+space for a fifth of the waste; from 1% to 0.1%: 4.1 points for a tenth), and RocksDB's default for the
+same trade (10 bits a key).
 
 ## 13. Scenarios
 
