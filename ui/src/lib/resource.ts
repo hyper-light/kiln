@@ -46,6 +46,9 @@ interface Entry {
   opts: ResourceOptions;
   snap: Snap;
   promise: Promise<void> | null;
+  /** What its first read suspended on. Reads after it hand React that same promise (settled), so a
+   * render React replays after suspending gets back the promise it waited for. */
+  read: Promise<void> | null;
   /** Asked to refresh while a load was on its way: load once more after it. */
   again: boolean;
   /** Out of date while not shown: refreshed when it's shown again. */
@@ -61,7 +64,8 @@ interface Entry {
 /**
  * Already settled, for React: `use()` reads its status and doesn't wait. A read must call `use()`
  * on every render, not only while loading: React replays the render that suspended and needs the
- * same calls (react.dev/warnings/conditional-use-of-use).
+ * same calls (react.dev/warnings/conditional-use-of-use). For data that came without a load
+ * (`setData`); a key that was loaded hands back the promise its first read waited on.
  */
 const SETTLED: Promise<void> = Object.assign(Promise.resolve(), { status: "fulfilled", value: undefined });
 
@@ -78,6 +82,7 @@ function entry(key: string, fetcher: Fetcher<unknown>, opts: ResourceOptions): E
       opts,
       snap: { data: undefined, has: false, error: undefined, failed: false, refreshing: false },
       promise: null,
+      read: null,
       again: false,
       stale: false,
       listeners: new Set(),
@@ -118,10 +123,14 @@ function load(e: Entry): Promise<void> {
   }
   e.stale = false;
   e.again = false;
-  const p = e
+  const p: Promise<void> = e
     .fetcher(new AbortController().signal)
     .then(
-      (data) => set(e, { data, has: true, error: undefined, failed: false, refreshing: false }),
+      (data) => {
+        // Settled for React before anyone hears of the data: the render it replays reads on at once.
+        Object.assign(p, { status: "fulfilled", value: undefined });
+        set(e, { data, has: true, error: undefined, failed: false, refreshing: false });
+      },
       (error: unknown) => {
         // A refresh that failed leaves the data that's shown; a first load that failed says so.
         if (e.snap.has) set(e, { refreshing: false });
@@ -180,7 +189,7 @@ export function useSuspenseResource<T>(key: string, fetcher: Fetcher<T>, opts: R
     () => e.snap,
   );
   if (!snap.has && snap.failed) throw snap.error;
-  use(snap.has ? SETTLED : (e.promise ?? load(e)));
+  use(snap.has ? (e.read ?? SETTLED) : (e.read = e.promise ?? load(e)));
   return {
     data: snap.data as T,
     refreshing: snap.refreshing,
