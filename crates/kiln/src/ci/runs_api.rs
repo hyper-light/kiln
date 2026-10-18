@@ -86,7 +86,8 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
         .call(move |c| {
             let mut st = c.prepare(
                 "SELECT id, key, display, job_id, matrix, status, conclusion, agent, executor, attempt, wait_reason, queued_at, started_at, finished_at, error, needs, exit_code, reused_from,
-                        CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END, waits
+                        CASE WHEN kept_until > strftime('%s', 'now') THEN kept_until END, waits,
+                        (SELECT s.run_id FROM jobs s WHERE s.id = jobs.reused_from), (SELECT r.number FROM jobs s JOIN runs r ON r.id = s.run_id WHERE s.id = jobs.reused_from)
                  FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1)) ORDER BY rowid",
             )?;
             let rows = st.query_map(params![run, attempt], |r| {
@@ -101,6 +102,9 @@ async fn legs(hub: &Hub, run: &str, attempt: Option<i64>) -> Result<Vec<Value>, 
                     "kept_until": r.get::<_, Option<i64>>(18)?,
                     // Seconds queued, by wait reason (W19-R01).
                     "waits": json_col(19)?,
+                    // Whose result it took over: an earlier attempt's of this run, or another
+                    // run's with the same inputs (W08-R10).
+                    "reused_run": r.get::<_, Option<String>>(20)?, "reused_number": r.get::<_, Option<i64>>(21)?,
                 }))
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -272,8 +276,10 @@ pub async fn rerun(hub: &Hub, id: &str, body: &Value) -> Result<Response, Fail> 
     } else {
         None
     };
+    // "Run anyway" (W08-R10): no leg takes an earlier result over.
+    let no_reuse = body.get("no_reuse").and_then(Value::as_bool).unwrap_or(false);
     let (tx, rx) = async_channel::bounded(1);
-    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, reply: tx });
+    hub.ci.send(super::dispatch::Msg::Rerun { run: id.to_owned(), mode, debug, keep_failed, actions, no_reuse, reply: tx });
     match crate::rt::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
         Ok(Ok(Ok(attempt))) => Ok(srv::json(StatusCode::CREATED, &json!({ "run": id, "attempt": attempt }))),
         Ok(Ok(Err(e))) => Err((StatusCode::CONFLICT, e)),

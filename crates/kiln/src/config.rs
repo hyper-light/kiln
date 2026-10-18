@@ -93,6 +93,15 @@ pub struct RepoConfig {
     pub clone_url: Option<String>,
     pub branches: Vec<String>,
     pub poll_seconds: Option<u32>,
+    /// `native`: kiln hosts it (docs/ci.md W14-R01), made empty or from `import`; `upstream`
+    /// (the default): kiln follows `clone_url`.
+    pub mode: Option<String>,
+    /// A native repository's history, copied once from this URL.
+    pub import: Option<String>,
+    /// A new, empty native repository's trunk (`main`).
+    pub default_branch: Option<String>,
+    /// A native repository's upstream: its trunk is pushed there after each land.
+    pub mirror: Option<String>,
 }
 
 
@@ -157,6 +166,16 @@ pub struct Conversations {
     pub mirrors: usize,
     /// Runners to pick first, by name (each still has to keep a store of its own).
     pub mirror_on: Vec<String>,
+    /// Days the server's store keeps an ended agent's transcript (its events stay). 0: for good.
+    /// Runners and mirrors keep them the default 30.
+    pub keep_closed_days: u32,
+}
+
+impl Conversations {
+    /// How long ended agents' transcripts are kept (None: for good).
+    pub fn keep_closed(&self) -> Option<std::time::Duration> {
+        (self.keep_closed_days > 0).then(|| std::time::Duration::from_secs(u64::from(self.keep_closed_days) * 86_400))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,7 +407,7 @@ impl Default for Terminal {
 
 impl Default for Conversations {
     fn default() -> Self {
-        Self { mirrors: 1, mirror_on: Vec::new() }
+        Self { mirrors: 1, mirror_on: Vec::new(), keep_closed_days: 30 }
     }
 }
 

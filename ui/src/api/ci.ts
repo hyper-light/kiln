@@ -50,6 +50,9 @@ export interface CiLeg {
   exit_code: number | null;
   /** A leg a rerun kept: the leg whose result it keeps. */
   reused_from: string | null;
+  /** The run whose leg it took over (this one, for an earlier attempt's), and its number (W08-R10). */
+  reused_run?: string | null;
+  reused_number?: number | null;
   /** A failed leg kept to look into, until when (W17-R02). */
   kept_until?: number | null;
 }

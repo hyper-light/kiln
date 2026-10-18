@@ -421,17 +421,35 @@ pub async fn manual(hub: &Hub, repo: &Repo, branch: Option<String>, pipeline: Op
 async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Result<()> {
     let poll = hub.cfg.gitops.poll_seconds;
     for r in &hub.cfg.repos {
+        let native = r.mode.as_deref() == Some("native");
+        let clone_url = match r.mode.as_deref() {
+            Some("native") => match crate::ci::hosting::create(hub, &r.name, r.default_branch.as_deref().unwrap_or("main"), r.import.as_deref()).await {
+                Ok(path) => crate::ci::hosting::clone_url(&path),
+                Err(e) => {
+                    tracing::warn!(repo = %r.name, error = %format!("{e:#}"), "the native repository couldn't be made");
+                    continue;
+                }
+            },
+            Some("upstream") | None => r.clone_url.clone().unwrap_or_else(|| default_url(&r.name)),
+            Some(m) => {
+                tracing::warn!(repo = %r.name, mode = %m, "a repository's mode is `native` or `upstream`; left out");
+                continue;
+            }
+        };
         hub.store
             .upsert_repo(Repo {
                 id: crate::util::new_id(),
                 name: r.name.clone(),
-                clone_url: r.clone_url.clone().unwrap_or_else(|| default_url(&r.name)),
+                clone_url,
                 branches: r.branches.clone(),
                 poll_seconds: r.poll_seconds.unwrap_or(poll),
                 enabled: true,
                 created_at: crate::util::now_unix(),
                 last_polled_at: None,
                 last_error: None,
+                mode: if native { "native" } else { "upstream" }.into(),
+                default_branch: r.default_branch.clone().filter(|_| native),
+                mirror: r.mirror.clone().filter(|_| native),
             })
             .await?;
     }
@@ -484,6 +502,9 @@ async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Resu
                         created_at: crate::util::now_unix(),
                         last_polled_at: None,
                         last_error: None,
+                        mode: "upstream".into(),
+                        default_branch: None,
+                        mirror: None,
                     })
                     .await?;
             }

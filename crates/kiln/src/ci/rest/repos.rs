@@ -134,7 +134,7 @@ pub async fn commit_json(s: &Site<'_>, sha: &str, files: bool) -> Option<Value> 
 }
 
 /// Changed files between two commits (`None`: from the empty tree), GitHub's `files`.
-async fn diff_files(s: &Site<'_>, base: Option<&str>, head: &str) -> (Vec<Value>, Value) {
+pub(crate) async fn diff_files(s: &Site<'_>, base: Option<&str>, head: &str) -> (Vec<Value>, Value) {
     let empty = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
     let from = base.unwrap_or(empty);
     let names = s.text(&["diff", "--name-status", "-M", "-z", from, head]).await.unwrap_or_default();
