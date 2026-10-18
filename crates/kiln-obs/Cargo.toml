@@ -15,6 +15,7 @@ hashbrown = { version = "0.17.1", default-features = false }
 sha2 = "0.11.1"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 hyper-measure = { git = "https://github.com/hyper-light/hyper-raft", rev = "767627fb9b15e9912aa4accb2d92db2d9518d6b1" }
 
 [[bench]]

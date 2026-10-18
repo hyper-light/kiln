@@ -16,7 +16,8 @@ use hyper_measure::faults;
 use kiln_obs::batch::{Builder, Kind, SeriesKey};
 use kiln_obs::hash::Keyed;
 use kiln_obs::index::{Clause, NameMatch, Selector, ValueMatch};
-use kiln_obs::store::Store;
+use kiln_obs::manifest::Point;
+use kiln_obs::store::{Scratch, Store};
 
 #[global_allocator]
 static COUNTING: alloc::Counting = alloc::Counting;
@@ -186,8 +187,13 @@ fn main() {
     }
     println!("select node_* instance:*:9100 !mode:idle ({} series): {}", ids.len(), tails(wild_ns));
 
+    if std::env::args().any(|a| a == "persist") {
+        persist(&batches, samples, t_max, t_min);
+    }
+
     // Range reads: the last hour and the whole day of every series.
     let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    let mut scratch = Scratch::default();
     for (label, from) in [("last hour", t_max - 3_600_000), ("whole day", t_min)] {
         let t = Instant::now();
         alloc::begin();
@@ -195,11 +201,70 @@ fn main() {
         for id in 0..store.series_count() as u32 {
             ts.clear();
             vs.clear();
-            store.read(id, from, t_max, &mut ts, &mut vs).unwrap();
+            store.read_with(id, from, t_max, &mut scratch, &mut ts, &mut vs).unwrap();
             n += ts.len();
         }
         let c = alloc::end();
         let el = t.elapsed();
         println!("read the {label} of every series: {n} samples in {:.1} ms, {:.2} ns a sample, {} allocations", el.as_secs_f64() * 1e3, el.as_nanos() as f64 / n as f64, c.calls());
     }
+}
+
+/// §12.4: the same batches into a store on disk, cut every `KOBS_CUT_BATCHES` (default 120: two
+/// hours of 60 s batches, Gorilla's and Prometheus's block span) and compacted after each cut.
+fn persist(batches: &[Vec<u8>], samples: usize, t_max: i64, t_min: i64) {
+    let every = std::env::var("KOBS_CUT_BATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(120usize);
+    let tmp = std::env::temp_dir().join(format!("kobs-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut store = Store::open(&tmp, Keyed::new()).unwrap();
+    let mut cut_ns = Vec::new();
+    let mut compact_ns = Vec::new();
+    let mut written = 0u64;
+    let t0 = Instant::now();
+    for (i, b) in batches.iter().enumerate() {
+        store.apply(b).unwrap();
+        if (i + 1) % every == 0 || i + 1 == batches.len() {
+            let c = Instant::now();
+            let done = store.cut(Point { index: i as u64 + 1, term: 1 }).unwrap();
+            cut_ns.push(c.elapsed().as_nanos() as u64);
+            written += done.bytes_written;
+            let c = Instant::now();
+            let done = store.compact().unwrap();
+            compact_ns.push(c.elapsed().as_nanos() as u64);
+            written += done.bytes_written;
+        }
+    }
+    let total = t0.elapsed();
+    let disk = store.disk_bytes();
+    println!("\npersist: a cut every {every} batches, compaction after each");
+    println!("  apply, cut and compact in all: {:.1} ns a sample", total.as_nanos() as f64 / samples as f64);
+    println!("  cut {} (head of {} batches)", tails(cut_ns), every);
+    println!("  compact {}", tails(compact_ns));
+    println!("  on disk: {:.2} MB in {} blocks, {:.3} bytes a sample; written {:.2} MB, write amplification {:.2}", disk as f64 / 1e6, store.block_count(), disk as f64 / samples as f64, written as f64 / 1e6, written as f64 / disk as f64);
+    drop(store);
+    let f0 = faults::read().ok();
+    let t1 = Instant::now();
+    alloc::begin();
+    let store = Store::open(&tmp, Keyed::new()).unwrap();
+    let c = alloc::end();
+    let open = t1.elapsed();
+    let f1 = faults::read().ok();
+    println!("  reopen: {:.1} ms, {} series, {} allocations, {} page faults", open.as_secs_f64() * 1e3, store.series_count(), c.calls(), f0.zip(f1).map_or(0, |(a, b)| b.since(&a).total()));
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    let mut scratch = Scratch::default();
+    for (label, from) in [("last hour", t_max - 3_600_000), ("whole day", t_min)] {
+        let t = Instant::now();
+        alloc::begin();
+        let mut n = 0usize;
+        for id in 0..store.series_count() as u32 {
+            ts.clear();
+            vs.clear();
+            store.read_with(id, from, t_max, &mut scratch, &mut ts, &mut vs).unwrap();
+            n += ts.len();
+        }
+        let c = alloc::end();
+        let el = t.elapsed();
+        println!("  read the {label} of every series from blocks: {n} samples in {:.1} ms, {:.2} ns a sample, {:.2} allocations a series", el.as_secs_f64() * 1e3, el.as_nanos() as f64 / n as f64, c.calls() as f64 / store.series_count() as f64);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
 }

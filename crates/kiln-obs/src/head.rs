@@ -171,6 +171,39 @@ impl HeadSeries {
         Ok(())
     }
 
+    /// The first and last times held.
+    pub fn span(&self) -> Option<(i64, i64)> {
+        let mut first: Option<i64> = self.closed.first().map(|c| c.first).or_else(|| self.open.span().map(|s| s.0));
+        let mut last: Option<i64> = self.open.span().map(|s| s.1).or_else(|| self.closed.last().map(|c| c.last));
+        if let Some(late) = &self.late {
+            for (f, l) in late.chunks.iter().map(|c| (c.first, c.last)).chain(late.buffer.first().zip(late.buffer.last()).map(|(a, b)| (a.0, b.0))) {
+                first = Some(first.map_or(f, |x| x.min(f)));
+                last = Some(last.map_or(l, |x| x.max(l)));
+            }
+        }
+        first.zip(last)
+    }
+
+    /// Takes the series' samples as chunks in time order that do not overlap (late writes merged
+    /// in first), leaving the series empty: what a cut writes to a block.
+    pub fn drain_chunks(&mut self) -> Result<Vec<Chunk>, DecodeError> {
+        if self.late.is_some() {
+            self.rewrite()?;
+        }
+        let mut chunks = std::mem::take(&mut self.closed);
+        let open = std::mem::take(&mut self.open);
+        if open.count() > 0 {
+            chunks.push(open.finish());
+        }
+        Ok(chunks)
+    }
+
+    /// Puts back what [`HeadSeries::drain_chunks`] took (a cut that failed to write).
+    pub fn restore(&mut self, chunks: Vec<Chunk>) {
+        self.closed = chunks;
+        self.open = Encoder::new();
+    }
+
     /// Samples held (late ones that correct a held time counted once each).
     pub fn samples(&self) -> u64 {
         self.in_order_samples() + self.late.as_ref().map_or(0, |l| l.samples)

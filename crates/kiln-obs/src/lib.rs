@@ -7,9 +7,12 @@
 
 pub mod batch;
 pub mod bits;
+pub mod block;
+pub mod crc32c;
 pub mod hash;
 pub mod head;
 pub mod index;
+pub mod manifest;
 pub mod store;
 pub mod symbols;
 pub mod gorilla;

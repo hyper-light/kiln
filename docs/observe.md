@@ -14,7 +14,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | Milestone | What | State |
 | --- | --- | --- |
 | O-1 | Engine core: Gorilla chunks, symbols, series index and selection, head with late writes, write batches; measured (§12.1–12.3) | done |
-| O-2 | Columnar blocks on disk, compaction, retention; restart from disk | planned |
+| O-2 | Columnar blocks on disk, compaction, retention; restart from disk; measured (§12.4) | done |
 | O-3 | Replication: the store as a hyper-durable state machine; kiln carries Raft between nodes | planned |
 | O-4 | Query language (metrics, logs, events) and the HTTP API | planned |
 | O-5 | Ingestion: kiln itself, runners' hosts, OTLP/HTTP (protobuf and JSON), kiln CI and CD | planned |
@@ -328,6 +328,21 @@ fingerprint after; one replica applies them in order.
 | select `node_*{instance:*:9100, !mode:idle}` (1,010 series) | p50 28.4 µs, p99 56.3 µs (first glob, allocating: 274 µs) |
 | read the last hour of every series | 678,336 samples, 9.1 ms, 13.4 ns a sample, 16 allocations in all |
 | read the whole day of every series | 16.2 M samples, 107.5 ms, 6.6 ns a sample, 10 allocations in all |
+
+### 12.4 Blocks, compaction, reopening
+
+2026-10-18, same machine: `... --bench store -- persist`. The same batches into a store on disk,
+the head cut into a block every 120 batches (two hours, Gorilla's and Prometheus's block span) and
+compacted after each cut by the logarithmic method.
+
+| | |
+| --- | --- |
+| cut a two-hour head into a block | p50 5.2 ms, max 6.3 ms |
+| compaction | p50 60 ms, max 277 ms; write amplification 4.15 (12 cuts: log2 12 + 1 ≈ 4.6 bound) |
+| on disk | 24.3 MB in 3 blocks, 1.49 bytes a sample (each block names its series: self-describing) |
+| reopen | 9.6 ms for 5,655 series; 9 page faults |
+| read the last hour of every series, from blocks | 15.3 ns a sample; no allocation a series |
+| read the whole day of every series, from blocks | 7.9 ns a sample; no allocation a series |
 
 ## 13. Scenarios
 

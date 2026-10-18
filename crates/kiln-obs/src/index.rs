@@ -101,6 +101,16 @@ impl Index {
         self.keys.get(start..end)
     }
 
+    /// Series `id`'s fingerprint.
+    pub fn fp(&self, id: u32) -> Option<u64> {
+        self.fps.get(id as usize).copied()
+    }
+
+    /// Series `id`'s canonical key.
+    pub fn key(&self, id: u32) -> Option<&[u8]> {
+        self.key_of(id)
+    }
+
     /// The series with fingerprint `fp`.
     #[inline]
     pub fn by_fp(&self, fp: u64) -> Option<u32> {
