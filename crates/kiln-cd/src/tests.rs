@@ -557,7 +557,7 @@ fn a_plan_says_what_a_sync_of_another_render_would_do_and_changes_nothing() {
     let next = vec![config_map("cfg", "2", json!({})), config_map("extra", "1", json!({})), deployment("web", "web:1", json!({})), job("migrate", "PreSync")];
     let plan = h.engine.plan("web", Some(next), &FxHashMap::default()).unwrap_or_default();
     assert_eq!(steps(&plan), ["hook PreSync migrate", "update Sync cfg", "create Sync extra", "prune Sync web"]);
-    assert_eq!((plan.unchanged, plan.held.len(), plan.unread.len(), plan.taken.len()), (1, 0, 0, 0));
+    assert_eq!((plan.unchanged, plan.held.len(), plan.unread.len(), plan.shared.len()), (1, 0, 0, 0));
     let cfg = plan.steps.iter().find(|s| &*s.key.name == "cfg").map(|s| &s.change);
     let data = |v: Option<&Value>| v.and_then(|v| v.pointer("/data/v")).cloned();
     assert_eq!(cfg.map(|c| (data(c.before.as_ref()), data(c.after.as_ref()))), Some((Some(json!("1")), Some(json!("2")))));
@@ -626,4 +626,173 @@ fn a_plan_reads_kinds_the_engine_has_not_listed_from_what_the_owner_read() {
     assert!(plan.unread.is_empty());
     assert_eq!(steps(&plan), ["create Sync cfg", "update Sync web"]);
     assert_eq!(plan.unchanged, 1);
+}
+
+/// A ConfigMap Argo CD deployed for its Application `kps`.
+fn argo_config_map(name: &str) -> Value {
+    json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": "web",
+        "annotations": {"argocd.argoproj.io/tracking-id": format!("kps:/ConfigMap:web/{name}")}}, "data": {"v": "1"}})
+}
+
+/// An app adopted from Argo CD, shadowed: kiln compares it and never writes.
+fn shadow(id: &str, tracking: &str) -> AppConfig {
+    let mut a = AppConfig::new(id, "dev", "web");
+    a.tracking = crate::model::Tracking::ArgoAnnotation;
+    a.tracking_name = Some(tracking.into());
+    a.read_only = true;
+    a
+}
+
+/// What an app's status counts: sync, resources, differing, shared.
+fn counts(h: &Harness, id: &str) -> Option<(Sync, u32, u32, u32)> {
+    status(h, id).map(|s| (s.sync, s.resources, s.out_of_sync, s.shared))
+}
+
+fn present(h: &Harness, name: &str) -> bool {
+    h.clusters.get("dev").and_then(|c| c.get(&ResKey::new("", "ConfigMap", "web", name))).is_some()
+}
+
+/// Taking an app over from Argo CD: Argo CD's app (shadowed) and kiln's own deploy the same
+/// objects. Each compares all of them, whichever renders first and however often; kiln's shows
+/// them as Argo CD's until a person's sync takes them over; nothing is pruned either way.
+#[test]
+fn two_apps_deploying_the_same_objects_each_compare_all_of_them() {
+    let (mut h, git) = harness(fast());
+    let names = ["a", "b", "c"];
+    if let Some(c) = h.clusters.get_mut("dev") {
+        for n in names {
+            let _ = c.apply(0, argo_config_map(n), "argocd-controller", false);
+        }
+    }
+    let objects: Vec<Value> = names.iter().map(|n| config_map(n, "1", json!({}))).collect();
+    h.input(Input::UpsertApp(shadow("default/kps", "kps")));
+    h.input(Input::UpsertApp(AppConfig::new("default/kps-production", "dev", "web")));
+    // Ours renders first, then Argo CD's, then ours again at a new revision.
+    deploy(&mut h, &git, "default/kps-production", "p1", objects.clone());
+    h.run_for(5_000);
+    deploy(&mut h, &git, "default/kps", "s1", objects.clone());
+    h.run_for(5_000);
+    deploy(&mut h, &git, "default/kps-production", "p2", objects.clone());
+    h.run_for(5_000);
+    assert_eq!(counts(&h, "default/kps"), Some((Sync::Synced, 3, 0, 0)));
+    assert_eq!(counts(&h, "default/kps-production"), Some((Sync::OutOfSync, 3, 3, 3)));
+    let views = h.engine.resources("default/kps-production");
+    assert!(
+        views.iter().all(|r| r.tracked_by.as_deref() == Some("default/kps") && r.shared_with.iter().any(|x| &**x == "default/kps") && !r.requires_pruning),
+        "{views:?}"
+    );
+    assert!(views.iter().all(|r| r.why.as_deref().is_some_and(|w| w.contains("default/kps's tracking"))), "{views:?}");
+    assert!(views.iter().all(|r| r.marks_only), "only the tracking marks would change: {views:?}");
+    assert_eq!(status(&h, "default/kps-production").map(|s| (s.shared, s.unmarked)), Some((3, 0)), "taken over, not merely unmarked");
+    // A real change in one of them isn't a matter of marks.
+    deploy(&mut h, &git, "default/kps-production", "p3", vec![config_map("a", "2", json!({})), config_map("b", "1", json!({})), config_map("c", "1", json!({}))]);
+    h.run_for(5_000);
+    let a = h.engine.resources("default/kps-production").into_iter().find(|r| &*r.key.name == "a");
+    assert!(a.as_ref().is_some_and(|r| !r.marks_only && r.tracked_by.is_some()), "{a:?}");
+
+    deploy(&mut h, &git, "default/kps-production", "p4", objects.clone());
+    h.run_for(5_000);
+    // A person syncs ours: it takes them over. Argo CD's now sees ours on them; nothing is pruned.
+    h.input(Input::Sync { app: "default/kps-production".into(), request: SyncRequest::default() });
+    h.run_for(10_000);
+    assert_eq!(counts(&h, "default/kps-production"), Some((Sync::Synced, 3, 0, 0)));
+    assert_eq!(counts(&h, "default/kps"), Some((Sync::OutOfSync, 3, 3, 3)));
+    assert_eq!(h.clusters.get("dev").map(sim::Cluster::len), Some(3));
+}
+
+/// An app prunes what carries its tracking only while no other app deploys it.
+#[test]
+fn an_app_never_prunes_what_another_app_deploys() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("one")));
+    deploy(&mut h, &git, "one", "o1", vec![config_map("x", "1", json!({})), config_map("y", "1", json!({}))]);
+    assert!(h.run_until(30_000, |h| settled(h, "one")));
+    h.input(Input::UpsertApp(AppConfig::new("two", "dev", "web")));
+    deploy(&mut h, &git, "two", "t1", vec![config_map("x", "1", json!({}))]);
+    deploy(&mut h, &git, "one", "o2", vec![config_map("y", "1", json!({}))]);
+    h.run_for(30_000);
+    assert!(present(&h, "x"), "one doesn't prune what two deploys");
+    assert_eq!(counts(&h, "one").map(|c| (c.0, c.2)), Some((Sync::Synced, 0)));
+    // Two drops it too: now it is one's to prune, and one's automatic sync does.
+    deploy(&mut h, &git, "two", "t2", vec![]);
+    h.run_for(30_000);
+    assert!(!present(&h, "x"), "pruned once nobody deploys it");
+    assert!(present(&h, "y"));
+}
+
+/// Deleting an app with its objects leaves those another app deploys.
+#[test]
+fn deleting_an_app_leaves_what_another_app_deploys() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("one")));
+    deploy(&mut h, &git, "one", "o1", vec![config_map("x", "1", json!({})), config_map("y", "1", json!({}))]);
+    assert!(h.run_until(30_000, |h| settled(h, "one")));
+    h.input(Input::UpsertApp(AppConfig::new("two", "dev", "web")));
+    deploy(&mut h, &git, "two", "t1", vec![config_map("x", "1", json!({}))]);
+    h.run_for(5_000);
+    assert_eq!(counts(&h, "two").map(|c| c.3), Some(1), "x carries one's tracking");
+    h.input(Input::RemoveApp { id: "one".into(), cascade: Some(crate::model::Propagation::Foreground) });
+    h.run_for(10_000);
+    assert!(present(&h, "x"), "two deploys x");
+    assert!(!present(&h, "y"), "y was one's alone");
+    // The tracking on x names nobody now: x is two's to sync, shared with nobody.
+    assert_eq!(counts(&h, "two").map(|c| (c.0, c.3)), Some((Sync::OutOfSync, 0)));
+}
+
+/// Argo CD's FailOnSharedResource: a sync fails before it applies anything when another app's
+/// tracking is on something it deploys.
+#[test]
+fn fail_on_shared_resource_fails_a_sync_before_it_applies_anything() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("one")));
+    deploy(&mut h, &git, "one", "o1", vec![config_map("x", "1", json!({}))]);
+    assert!(h.run_until(30_000, |h| settled(h, "one")));
+    let mut two = AppConfig::new("two", "dev", "web");
+    two.sync.options.fail_on_shared_resource = Some(true);
+    h.input(Input::UpsertApp(two));
+    deploy(&mut h, &git, "two", "t1", vec![config_map("x", "2", json!({}))]);
+    h.run_for(5_000);
+    h.input(Input::Sync { app: "two".into(), request: SyncRequest::default() });
+    h.run_for(10_000);
+    let op = status(&h, "two").and_then(|s| s.operation.clone());
+    assert!(op.as_ref().is_some_and(|o| o.phase == OpPhase::Failed && o.message.contains("Shared resource found: ConfigMap/x is part of applications two and one")), "{op:?}");
+    let x = h.clusters.get("dev").and_then(|c| c.get(&ResKey::new("", "ConfigMap", "web", "x")));
+    assert_eq!(x.as_ref().and_then(|v| v.pointer("/data/v")), Some(&json!("1")), "untouched");
+}
+
+/// Two apps syncing automatically never take an object from each other: a person decides.
+#[test]
+fn automatic_syncs_never_take_an_object_from_another_app() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertApp(auto("one")));
+    deploy(&mut h, &git, "one", "o1", vec![config_map("x", "1", json!({}))]);
+    assert!(h.run_until(30_000, |h| settled(h, "one")));
+    h.input(Input::UpsertApp(auto("two")));
+    deploy(&mut h, &git, "two", "t1", vec![config_map("x", "1", json!({}))]);
+    h.run_for(120_000);
+    let syncs = |h: &Harness, app: &str| h.records.iter().filter(|r| matches!(r, Record::Started { app: a, .. } if &**a == app)).count();
+    assert_eq!(syncs(&h, "two"), 0, "two waits for a person");
+    assert_eq!(counts(&h, "two").map(|c| (c.0, c.3)), Some((Sync::OutOfSync, 1)));
+    // A person syncs two: it has x now, and one's self-heal doesn't take it back.
+    h.input(Input::Sync { app: "two".into(), request: SyncRequest::default() });
+    h.run_for(120_000);
+    assert_eq!((syncs(&h, "one"), syncs(&h, "two")), (1, 1));
+    assert_eq!(counts(&h, "one").map(|c| (c.0, c.3)), Some((Sync::OutOfSync, 1)));
+}
+
+/// An object the app deploys that has no tracking at all (made by hand, or a CRD Argo CD
+/// leaves unmarked) differs only by kiln's marks: counted apart from changes.
+#[test]
+fn objects_without_tracking_differ_only_by_kilns_marks() {
+    let (mut h, git) = harness(fast());
+    if let Some(c) = h.clusters.get_mut("dev") {
+        let _ = c.apply(0, json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "x", "namespace": "web"}, "data": {"v": "1"}}), "kubectl", false);
+    }
+    h.input(Input::UpsertApp(AppConfig::new("one", "dev", "web")));
+    deploy(&mut h, &git, "one", "o1", vec![config_map("x", "1", json!({})), config_map("y", "1", json!({}))]);
+    h.run_for(5_000);
+    let s = status(&h, "one").map(|s| (s.out_of_sync, s.missing, s.shared, s.unmarked));
+    assert_eq!(s, Some((2, 1, 0, 1)), "y missing, x only unmarked");
+    let x = h.engine.resources("one").into_iter().find(|r| &*r.key.name == "x");
+    assert!(x.is_some_and(|r| r.marks_only && r.tracked_by.is_none()));
 }

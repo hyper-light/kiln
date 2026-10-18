@@ -377,6 +377,9 @@ impl Live {
                 missing: r.missing,
                 requires_pruning: r.requires_pruning,
                 why: r.why,
+                tracked_by: r.tracked_by.map(|t| t.to_string()),
+                shared_with: r.shared_with.iter().map(|s| s.to_string()).collect(),
+                marks_only: r.marks_only,
                 ..Managed::new(r.key)
             })
             .collect();

@@ -561,10 +561,10 @@ fn steps_json(p: &Plan, brief: bool) -> Value {
         .iter()
         .map(|(k, m)| json!({"key": ops::key_json(k), "prune": if *m == PruneMode::Never { "false" } else { "confirm" }}))
         .collect();
-    let taken: Vec<Value> = p.taken.iter().map(|(k, app)| json!({"key": ops::key_json(k), "app": app.as_ref()})).collect();
+    let shared: Vec<Value> = p.shared.iter().map(|(k, app)| json!({"key": ops::key_json(k), "app": app.as_ref()})).collect();
     json!({
         "create": n(StepKind::Create), "update": n(StepKind::Update), "prune": n(StepKind::Prune), "hooks": n(StepKind::Hook),
-        "unchanged": p.unchanged, "unread": p.unread.len(), "held": held, "taken": taken, "steps": steps,
+        "unchanged": p.unchanged, "unread": p.unread.len(), "held": held, "shared": shared, "steps": steps,
     })
 }
 
@@ -738,7 +738,7 @@ async fn plan_app(cd: Arc<Cd>, st: Arc<Stack>, id: String, def: AppDef, brief: b
                             notes.extend(confirm
                                 .difference(&was_confirm)
                                 .map(|k| format!("{} leaves git and is pruned only once a person confirms (Prune=confirm)", named(k))));
-                            notes.extend(cur.plan.taken.iter().map(|(k, other)| format!("{} is deployed by {other}, which keeps it", named(k))));
+                            notes.extend(cur.plan.shared.iter().map(|(k, other)| format!("{} is {other}'s too: this sync takes it over", named(k))));
                             let (gone, unknown): (Vec<&ResKey>, Vec<&ResKey>) = cur.plan.unread.iter().partition(|k| unserved.contains(*k));
                             notes.extend(gone.iter().map(|k| {
                                 format!("{} is of a kind cluster {} doesn't serve, and nothing in the render defines it: a sync of it fails until something installs it", named(k), def.destination.cluster)

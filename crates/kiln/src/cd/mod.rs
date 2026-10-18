@@ -1235,6 +1235,10 @@ pub fn summary_json(s: &Summary) -> Value {
         "revision": s.revision.as_deref(),
         "resources": s.resources,
         "out_of_sync": s.out_of_sync,
+        "shared": s.shared,
+        "missing": s.missing,
+        "prune": s.prune,
+        "unmarked": s.unmarked,
         "message": s.message,
         "operation": s.operation.as_ref().map(|o| json!({
             "id": o.id,
