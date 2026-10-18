@@ -460,12 +460,16 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
     } else {
         match i.kind.as_str() {
             "oci" => match registry_of(hub, &i).await {
-                Ok(r) => {
-                    // Docker Hub scopes tokens to a repository: ask for one under the user's
-                    // namespace, which any account may pull from.
-                    let repo = r.credentials.as_ref().filter(|_| r.name == oci::DOCKER_HUB).map(|(u, _)| format!("{u}/probe"));
-                    oci::verify(&r, repo.as_deref()).await.map_err(|e| format!("{e:#}"))
-                }
+                // A registry someone named: checked only where requests may go (W22-AC07).
+                Ok(r) => match hub.cfg.ci.reach().check_url(&r.base).await {
+                    Ok(()) => {
+                        // Docker Hub scopes tokens to a repository: ask for one under the user's
+                        // namespace, which any account may pull from.
+                        let repo = r.credentials.as_ref().filter(|_| r.name == oci::DOCKER_HUB).map(|(u, _)| format!("{u}/probe"));
+                        oci::verify(&r, repo.as_deref()).await.map_err(|e| format!("{e:#}"))
+                    }
+                    Err(e) => Err(format!("{e:#}")),
+                },
                 Err(e) => Err(format!("{e:#}")),
             },
             "aws" | "gcp" | "azure" => verify_federated(hub, &i, as_).await,

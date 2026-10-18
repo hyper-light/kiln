@@ -1122,25 +1122,7 @@ impl Leg {
             bytes.extend_from_slice(&c);
             anyhow::ensure!(bytes.len() < 8 << 30, "the commit is over 8 GiB");
         }
-        crate::rt::blocking(move || -> anyhow::Result<()> {
-            std::fs::create_dir_all(&ws)?;
-            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes.as_slice()));
-            for entry in ar.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?.into_owned();
-                let rel: PathBuf = path.components().skip(1).collect();
-                if rel.as_os_str().is_empty() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-                    continue;
-                }
-                let target = ws.join(rel);
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                entry.unpack(target)?;
-            }
-            Ok(())
-        })
-        .await??;
+        crate::rt::blocking(move || unpack_tree(&bytes, &ws)).await??;
         Ok(())
     }
 
@@ -2240,6 +2222,52 @@ impl Leg {
     }
 }
 
+/// A commit's tarball (`<prefix>/<path>…`, gzipped) unpacked into `ws`, its prefix dropped. No
+/// entry lands outside `ws` (docs/ci.md W22-AC07): none with `..`, and none whose directory a
+/// link earlier in the archive leads elsewhere. Links themselves are kept as git has them.
+pub(crate) fn unpack_tree(bytes: &[u8], ws: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(ws)?;
+    let root = ws.canonicalize()?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let rel: PathBuf = path.components().skip(1).collect();
+        if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            continue;
+        }
+        let target = ws.join(&rel);
+        if let Some(parent) = target.parent() {
+            if !stays_inside(&root, parent) {
+                tracing::warn!(path = %rel.display(), "a tarball entry would land outside the workspace; skipped");
+                continue;
+            }
+            std::fs::create_dir_all(parent)?;
+        }
+        // A link there is replaced, never written through.
+        if target.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+            std::fs::remove_file(&target)?;
+        }
+        entry.unpack(target)?;
+    }
+    Ok(())
+}
+
+/// Whether `dir`, made or yet to be made, is inside `root`: its deepest part that exists, with
+/// links resolved (a dangling one isn't).
+fn stays_inside(root: &Path, dir: &Path) -> bool {
+    let mut probe = dir;
+    loop {
+        if probe.symlink_metadata().is_ok() {
+            return probe.canonicalize().is_ok_and(|p| p.starts_with(root));
+        }
+        match probe.parent() {
+            Some(p) => probe = p,
+            None => return false,
+        }
+    }
+}
+
 /// Patterns of the working directory `wd` as the workspace's (`!` negations kept).
 fn from_wd(root: &Path, wd: &Path, patterns: &[String]) -> Vec<String> {
     let rel = wd.strip_prefix(root).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
@@ -2959,6 +2987,52 @@ impl Leg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W22-AC07: a hostile tarball can't write outside the workspace, through `..`, a link to a
+    /// directory outside, or a link where a file goes.
+    #[cfg(unix)]
+    #[test]
+    fn w22_ac07_tarball_stays_in_the_workspace() -> anyhow::Result<()> {
+        type Tar = tar::Builder<flate2::write::GzEncoder<Vec<u8>>>;
+        let dir = tempfile::tempdir()?;
+        let (ws, outside) = (dir.path().join("ws"), dir.path().join("outside"));
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("victim"), b"untouched")?;
+        let mut tar: Tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let file = |b: &mut Tar, path: &str, body: &[u8]| -> anyhow::Result<()> {
+            let mut h = tar::Header::new_old();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            // Its name as raw bytes: the builder itself refuses `..`.
+            h.as_old_mut().name.iter_mut().zip(path.as_bytes()).for_each(|(d, s)| *d = *s);
+            h.set_cksum();
+            b.append(&h, body)?;
+            Ok(())
+        };
+        let link = |b: &mut Tar, path: &str, to: &Path| -> anyhow::Result<()> {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            b.append_link(&mut h, path, to)?;
+            Ok(())
+        };
+        file(&mut tar, "repo-abc/ok.txt", b"fine")?;
+        file(&mut tar, "repo-abc/../../escape", b"no")?;
+        link(&mut tar, "repo-abc/out", &outside)?;
+        file(&mut tar, "repo-abc/out/evil", b"no")?;
+        file(&mut tar, "repo-abc/out/new/deeper", b"no")?;
+        link(&mut tar, "repo-abc/victim", &outside.join("victim"))?;
+        file(&mut tar, "repo-abc/victim", b"replaced")?;
+        let bytes = tar.into_inner()?.finish()?;
+        unpack_tree(&bytes, &ws)?;
+        assert_eq!(std::fs::read(ws.join("ok.txt"))?, b"fine");
+        assert!(!dir.path().join("escape").exists() && !outside.join("evil").exists() && !outside.join("new").exists());
+        assert_eq!(std::fs::read(outside.join("victim"))?, b"untouched", "a link replaced, not written through");
+        assert_eq!(std::fs::read(ws.join("victim"))?, b"replaced");
+        assert!(ws.join("out").symlink_metadata()?.file_type().is_symlink(), "links are kept as they are");
+        Ok(())
+    }
 
     /// A leg run here, with what it sent: logs by step, and events. (Its tests run `bash` and
     /// `sh`, so they and their helpers are Unix-only.)

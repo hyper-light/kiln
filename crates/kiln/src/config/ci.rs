@@ -49,10 +49,23 @@ pub struct Ci {
     pub fairness: Fairness,
     pub insights: Insights,
     pub untrusted: Untrusted,
+    /// Where requests to addresses someone gave kiln may go besides the public internet (docs/ci.md
+    /// W22-AC07): webhooks, channels and integrations' checks never reach this machine, private
+    /// networks or link-local addresses (a cloud's metadata service) unless one of these allows
+    /// it: a host (`hooks.corp`, `hooks.corp:8443`, `*.corp`), an address, or a network
+    /// (`10.0.0.0/8`).
+    pub allow_private_targets: Vec<String>,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+impl Ci {
+    /// Where requests to addresses someone supplied may go (`allow_private_targets`).
+    pub fn reach(&self) -> crate::http::io::Reach {
+        crate::http::io::Reach { allow: self.allow_private_targets.clone() }
+    }
 }
 
 /// `[ci.scheduler]`: how waiting legs are ordered (docs/ci.md W05-R09, R10).
