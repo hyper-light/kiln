@@ -149,6 +149,17 @@ export interface HostSample {
   procs: number;
 }
 
+/** A machine's battery, when it has one (its runner says, about once a minute). */
+export interface Battery {
+  /** How full, 0–100. */
+  percent: number;
+  /** It runs on its charger (false: on battery). */
+  ac: boolean;
+  charging: boolean;
+  /** Minutes left on battery, when the machine says. */
+  minutes?: number | null;
+}
+
 export interface Agent {
   name: string;
   labels: string[];
@@ -166,6 +177,8 @@ export interface Agent {
   busy: number;
   draining: boolean;
   sample: HostSample | null;
+  /** Its battery, when it has one. */
+  battery?: Battery | null;
   /** While a new runner replaces an old one without a restart: both processes, newest first. */
   instances?: RunnerInstance[];
   /** An outpost (`kiln outpost`): kiln run where it isn't installed. It takes no jobs and the server doesn't upgrade it. */

@@ -441,6 +441,17 @@ reloads) and goes to the agent in order once it can take it, ahead of anything s
 Files attached go along when they were uploaded; ones that couldn't be (no server) stay with the
 page until it reloads.
 
+### A machine on battery
+
+A laptop's runner says how its battery stands about once a minute (`AgentMsg::Power`). On macOS it
+reads `pmset -g batt`; on Linux, `/sys/class/power_supply`, where a peripheral's battery doesn't
+count. The Runners page shows it under the machine's name ("battery 34% · 2h 15m left", "charging",
+"on its charger"). A machine on battery that drops to 20% or less is low: Runners and Mission
+Control say so at the top, with what stops when it sleeps (its agents, its jobs). The server logs
+it, audits it and sends it to webhook subscribers as `machine.battery_low`, once, as the machine
+gets there. A Mac on battery hibernates at about 1%, and its runner, agents and jobs go with it
+until it's plugged in; kiln can't keep it up, only say so in time.
+
 ### Tasks: shells, monitors and other work an agent leaves running
 
 `state.tasks` holds every task a harness runs beside its turns: subagents, and also commands it
