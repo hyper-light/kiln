@@ -68,6 +68,8 @@ pub struct Host {
 
 /// Largest file a message can carry.
 pub const ATTACHMENT_MAX: u64 = 25 << 20;
+/// Largest package of a session going on here from the server's store (its whole transcript).
+pub const PACKAGE_MAX: u64 = 1 << 30;
 
 impl Host {
     pub fn new(sink: Sink, file: Option<PathBuf>, limits: Limits) -> Arc<Self> {
@@ -111,6 +113,43 @@ impl Host {
             self.received.lock().insert(file.to_owned(), path);
         }
         Ok(())
+    }
+
+    /// A piece of the package of a session the server sends to go on here (it went on from the
+    /// server's conversation store: its machine is gone). Blocking (small writes). The package,
+    /// once its last piece is here.
+    pub fn receive_package(&self, session: &str, offset: u64, data: &[u8], done: bool) -> anyhow::Result<Option<PathBuf>> {
+        use std::io::{Seek as _, Write as _};
+        if session.is_empty() || session.len() > 64 || !session.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            anyhow::bail!("bad session id");
+        }
+        if offset.saturating_add(data.len() as u64) > PACKAGE_MAX {
+            anyhow::bail!("a session package too large");
+        }
+        let dir = self.files_dir.join(session);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("package.json");
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(offset == 0).open(&path)?;
+        f.seek(std::io::SeekFrom::Start(offset))?;
+        f.write_all(data)?;
+        Ok(done.then_some(path))
+    }
+
+    /// Take over the session in the package the server sent (`receive_package`). Blocking.
+    pub fn adopt_package(&self, path: &std::path::Path) -> Result<(), String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("the session's package: {e}"));
+        let _ = std::fs::remove_file(path);
+        self.adopt("the kiln server", &bytes?)
+    }
+
+    /// Session `id` went on on another machine since: its harness here stops, and this machine
+    /// lets go of it (it isn't closed).
+    pub fn let_go(&self, id: &str) -> bool {
+        let s = self.get(id);
+        if let Some(s) = &s {
+            s.let_go();
+        }
+        s.is_some()
     }
 
     /// A received file, once (its id is spent).
@@ -449,6 +488,7 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         objective: None,
         summary: String::new(),
         doing: None,
+        epoch: 0,
         todos_done: 0,
         todos_total: 0,
         files_changed: 0,

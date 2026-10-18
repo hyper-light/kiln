@@ -327,6 +327,16 @@ pub enum ServerMsg {
     /// Only to runners announcing [`CAP_CONVO`]. Appended last: postcard encodes variants by
     /// index.
     Convo { json: String, data: Vec<u8> },
+    /// A piece of a session's package (`crate::harness::moving::Package`, JSON) for it to go on on
+    /// this machine, made from the server's conversation store (`crate::convo::resume`): its
+    /// machine is gone. Written at `offset`; on the last piece (`done`) the runner takes the
+    /// session over. On [`LANE_CONVO`]; only to runners announcing [`CAP_CONVO`]. Appended last:
+    /// postcard encodes variants by index.
+    HarnessPackage { session: String, offset: u64, data: Vec<u8>, done: bool },
+    /// Let go of this session: it went on on another machine since (its copy here is from an
+    /// earlier epoch). Its harness stops; it isn't closed. Only to runners announcing
+    /// [`CAP_CONVO`]. Appended last: postcard encodes variants by index.
+    HarnessRelease { session: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -495,10 +505,16 @@ mod tests {
     #[test]
     fn the_conversation_feed_is_appended_after_every_older_variant() -> anyhow::Result<()> {
         let last_server = encode(&ServerMsg::JobExec { job: "j".into(), session: "s".into(), command: "c".into() })?;
-        let convo = ServerMsg::Convo { json: "{}".into(), data: vec![1, 2] };
-        let b = encode(&convo)?;
-        assert_eq!(b.first().copied(), last_server.first().map(|i| i + 1), "ServerMsg::Convo comes right after JobExec");
-        assert_eq!(decode::<ServerMsg>(&b)?, convo);
+        let after = [
+            ServerMsg::Convo { json: "{}".into(), data: vec![1, 2] },
+            ServerMsg::HarnessPackage { session: "s".into(), offset: 3, data: vec![4], done: true },
+            ServerMsg::HarnessRelease { session: "s".into() },
+        ];
+        for (i, m) in after.into_iter().enumerate() {
+            let b = encode(&m)?;
+            assert_eq!(b.first().copied(), last_server.first().map(|n| n + 1 + i as u8), "{m:?} comes right after the ones before it");
+            assert_eq!(decode::<ServerMsg>(&b)?, m);
+        }
         let last_agent = encode(&AgentMsg::ReachAsk { req: 1, json: "{}".into() })?;
         let convo = AgentMsg::Convo { json: "{}".into(), data: Vec::new() };
         let b = encode(&convo)?;

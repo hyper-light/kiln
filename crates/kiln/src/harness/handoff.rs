@@ -1247,7 +1247,19 @@ pub fn read_codex(env: &[(String, String)], thread: &str) -> Option<Conversation
     }
     let mut segments = Vec::new();
     for f in files {
-        let lines = super::transcript::tail_lines(&f, READ_MAX)?;
+        segments.push(super::transcript::tail_lines(&f, READ_MAX)?);
+    }
+    codex_of_lines(&segments, thread)
+}
+
+/// The conversation of Codex thread `thread` from the lines of its rollout files (a copy of them:
+/// the conversation store's).
+pub fn codex_of_lines(files: &[Vec<String>], thread: &str) -> Option<Conversation> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for lines in files {
         let recs: Vec<Value> = lines.iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
         let meta = recs.iter().find(|r| str_of(r, "type") == Some("session_meta"));
         // A segment of this thread (a branch's own is another thread's file).

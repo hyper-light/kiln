@@ -14,6 +14,10 @@ use super::core::{Core, Update};
 use super::kinds::{Kind, Protocol};
 use super::model::{Command, ExitInfo, Level, State, Status, ToolKind};
 
+fn is_zero_epoch(n: &u64) -> bool {
+    *n == 0
+}
+
 /// What to start.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Spec {
@@ -160,6 +164,10 @@ pub struct Info {
     /// What it is doing right now, in plain words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doing: Option<String>,
+    /// Its writer's epoch ([`State::epoch`]): a machine that announces a copy from before the
+    /// session went on elsewhere lets go of it.
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    pub epoch: u64,
     #[serde(default)]
     pub todos_done: u32,
     #[serde(default)]
@@ -219,6 +227,7 @@ impl Info {
             self.cwd.clone_from(&s.cwd);
         }
         self.harness_session.clone_from(&s.harness_session);
+        self.epoch = s.epoch;
         self.approvals = s
             .approvals
             .iter()
@@ -395,6 +404,8 @@ async fn prepare(files: &Files, c: Command) -> Command {
 enum Ctl {
     Cmd(Box<Command>),
     Close,
+    /// It went on on another machine: it stops here, and isn't closed.
+    LetGo,
 }
 
 /// A running session, as its machine holds it.
@@ -422,6 +433,12 @@ impl Session {
 
     pub fn close(&self) {
         let _ = self.ctl.try_send(Ctl::Close);
+    }
+
+    /// It went on on another machine since: its harness here stops and this machine lets go of
+    /// it, without closing it (its viewers follow it there).
+    pub fn let_go(&self) {
+        let _ = self.ctl.try_send(Ctl::LetGo);
     }
 
     /// Everything a new viewer (or a restarted server) needs, starting with the announcement.
@@ -588,6 +605,7 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         objective: None,
         summary: String::new(),
         doing: None,
+        epoch: 0,
         todos_done: 0,
         todos_total: 0,
         files_changed: 0,
@@ -1643,10 +1661,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 }
                             }
                         },
-                        Ev::Ctl(Some(Ctl::Close)) | Ev::Ctl(None) => {
+                        Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
                             // Ending the agent ends what it left running: stopped through the
                             // harness first, then whatever is still under it (shells and
                             // terminals that left its process group included), then the harness.
+                            // Letting go of it (it went on elsewhere) ends what ran here alike.
                             if s.core.lock().state.tasks.iter().any(super::model::Task::live) {
                                 adapter.command(&mut s.core.lock(), Command::StopTasks);
                                 let _ = flush(&s, &sink, Some(&p.stdin)).await;
@@ -1660,7 +1679,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             .await;
                             p.terminate(Duration::from_secs(3));
                             *s.pid.lock() = None;
-                            let _ = sink.send((s.id.clone(), Update::Closed)).await;
+                            if matches!(ctl, Some(Ctl::LetGo)) {
+                                tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
+                                (files.release)(&s.id);
+                            } else {
+                                let _ = sink.send((s.id.clone(), Update::Closed)).await;
+                            }
                             on_change();
                             return;
                         }
@@ -1842,8 +1866,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     }
                     c => adapter.command(&mut s.core.lock(), c),
                 },
-                Ev::Ctl(Some(Ctl::Close) | None) => {
-                    let _ = sink.send((s.id.clone(), Update::Closed)).await;
+                Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
+                    if matches!(ctl, Some(Ctl::LetGo)) {
+                        tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
+                        (files.release)(&s.id);
+                    } else {
+                        let _ = sink.send((s.id.clone(), Update::Closed)).await;
+                    }
                     on_change();
                     return;
                 }
@@ -1900,6 +1929,7 @@ mod tests {
             objective: None,
             summary: String::new(),
             doing: None,
+            epoch: 0,
             todos_done: 0,
             todos_total: 0,
             files_changed: 0,

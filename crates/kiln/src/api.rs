@@ -461,6 +461,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
             let now = body.get("now").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            // Its machine away: from the server's copy of its conversation (`relocate::start`).
             match crate::harness::relocate::start(&hub, id, &to, now).await {
                 Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
                 Err(e) => Err(err(StatusCode::CONFLICT, e)),

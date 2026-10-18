@@ -893,6 +893,35 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             h.close(&session);
                         }
                     }
+                    ServerMsg::HarnessPackage { session, offset, data, done } => {
+                        // A session going on here from the server's store (its machine is gone).
+                        let Some(h) = harness.clone() else { continue };
+                        match h.receive_package(&session, offset, &data, done) {
+                            Ok(Some(path)) => {
+                                let up = uplink.0.clone();
+                                crate::rt::spawn(async move {
+                                    let h2 = h.clone();
+                                    let taken = crate::rt::blocking(move || h2.adopt_package(&path)).await.unwrap_or_else(|e| Err(format!("{e:#}")));
+                                    if let Err(why) = taken {
+                                        tracing::warn!(%session, %why, "an agent session couldn't go on here");
+                                        let spec = serde_json::json!({ "kind": "claude" }).to_string();
+                                        for u in crate::harness::host::refusal(&session, &spec, &format!("Couldn't go on here: {why}")) {
+                                            if let Ok(json) = serde_json::to_string(&u) {
+                                                up.send(Up::Term(AgentMsg::Harness { session: session.clone(), json })).await.ok();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(%session, error = %format!("{e:#}"), "a session package couldn't be kept"),
+                        }
+                    }
+                    ServerMsg::HarnessRelease { session } => {
+                        if let Some(h) = &harness {
+                            h.let_go(&session);
+                        }
+                    }
                     ServerMsg::Upgrade { job, path, sha256, size } if o.outpost => {
                         // Nothing of an outpost is installed: its next kiln is the one downloaded next.
                         let _ = (path, sha256, size);
