@@ -17,6 +17,7 @@
 pub mod aws_ecs;
 pub mod aws_lambda;
 pub mod cloudflare_workers;
+pub mod vercel;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -352,10 +353,16 @@ pub const CATALOG: &[ProviderDef] = &[
         place: &[],
         scope: None,
         settings: &[s("project", true, "the project"), s("prebuilt", false, "the prebuilt output CI made (${{ artifacts.* }}); otherwise Vercel builds the commit"), s("domains", false, "domains to keep on the project")],
-        kinds: &[kind("vercel.kiln.dev", "Project", "Project"), kind("vercel.kiln.dev", "Domain", "Domain"), kind("vercel.kiln.dev", "EnvVar", "Environment variable"), child(kind("vercel.kiln.dev", "Deployment", "Deployment"))],
+        kinds: &[
+            kind("vercel.kiln.dev", "Project", "Project"),
+            kind("vercel.kiln.dev", "Production", "Production deployment"),
+            scoped(kind("vercel.kiln.dev", "Domain", "Domain")),
+            scoped(kind("vercel.kiln.dev", "EnvVar", "Environment variable")),
+            child(kind("vercel.kiln.dev", "Deployment", "Deployment")),
+        ],
         capabilities: &[Traffic, Versions, Previews, Logs, Drift, Adopt],
         reads: &["vercel.json"],
-        built: false,
+        built: true,
     },
     ProviderDef {
         name: "railway",
@@ -627,6 +634,7 @@ pub fn render(provider: &str, input: &RenderInput<'_>) -> Result<Vec<Value>, Str
         "aws-ecs" => aws_ecs::render(input),
         "aws-lambda" => aws_lambda::render(input),
         "cloudflare-workers" => cloudflare_workers::render(input),
+        "vercel" => vercel::render(input),
         other => match get(other) {
             Some(p) => Err(format!("{} isn't built yet: kiln lists it, and deploys to it once it is", p.title)),
             None => Err(format!("no provider {other}")),
@@ -641,6 +649,7 @@ pub fn files(provider: &str, spec: &Value) -> Vec<String> {
         "aws-ecs" => aws_ecs::files(spec),
         "aws-lambda" => aws_lambda::files(spec),
         "cloudflare-workers" => cloudflare_workers::files(spec),
+        "vercel" => vercel::files(spec),
         _ => Vec::new(),
     }
 }
@@ -652,6 +661,7 @@ pub fn health(obj: &Value) -> Option<Status> {
         "aws-ecs" => aws_ecs::health(obj),
         "aws-lambda" => aws_lambda::health(obj),
         "cloudflare-workers" => cloudflare_workers::health(obj),
+        "vercel" => vercel::health(obj),
         _ => None,
     }
 }

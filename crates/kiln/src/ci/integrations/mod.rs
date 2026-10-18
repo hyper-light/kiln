@@ -15,6 +15,7 @@ pub mod azure;
 pub mod cloudflare;
 pub mod gcp;
 pub mod oci;
+pub mod vercel;
 
 use std::collections::HashMap;
 
@@ -136,7 +137,7 @@ pub const KINDS: &[KindInfo] = &[
         built: true,
     },
     KindInfo { kind: "cloudflare", title: "Cloudflare", category: "hosting", mode: Mode::Token, fields: &[f("account_id", true, "the account Workers and Pages live in")], secret: Some("API token"), built: true },
-    KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: false },
+    KindInfo { kind: "vercel", title: "Vercel", category: "hosting", mode: Mode::Token, fields: &[f("team_id", false, "the team, when not a personal account")], secret: Some("access token"), built: true },
     KindInfo { kind: "railway", title: "Railway", category: "hosting", mode: Mode::Token, fields: &[f("workspace", false, "the workspace")], secret: Some("API token"), built: false },
     KindInfo { kind: "fly", title: "Fly.io", category: "hosting", mode: Mode::Token, fields: &[f("org", false, "the organization slug")], secret: Some("access token"), built: false },
     KindInfo { kind: "netlify", title: "Netlify", category: "hosting", mode: Mode::Token, fields: &[f("account", false, "the team slug")], secret: Some("personal access token"), built: false },
@@ -446,6 +447,11 @@ pub async fn verify(hub: &Hub, name: &str, as_: &VerifyAs) -> anyhow::Result<Res
                 Err(e) => Err(format!("{e:#}")),
             },
             "aws" | "gcp" | "azure" => verify_federated(hub, &i, as_).await,
+            "vercel" => match secret(hub, &i).await {
+                Ok(Some(token)) => vercel::verify(&token, i.config.get("team_id").and_then(Value::as_str)).await.map_err(|e| format!("{e:#}")),
+                Ok(None) => Err("no token stored".into()),
+                Err(e) => Err(format!("{e:#}")),
+            },
             "cloudflare" => match secret(hub, &i).await {
                 Ok(Some(token)) => cloudflare::verify(&token, i.config.get("account_id").and_then(Value::as_str)).await.map_err(|e| format!("{e:#}")),
                 Ok(None) => Err("no token stored".into()),

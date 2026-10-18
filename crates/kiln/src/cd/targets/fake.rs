@@ -763,3 +763,166 @@ pub async fn start_cf(fake: Arc<FakeCf>) -> anyhow::Result<String> {
     });
     Ok(format!("http://{addr}"))
 }
+
+// ------------------------------------------------------------------ Vercel
+
+/// The parts of Vercel's API the provider calls, in memory.
+#[derive(Default)]
+pub struct VercelState {
+    pub projects: BTreeMap<String, Value>,
+    /// Each deployment made: its body, id and state.
+    pub deployments: Vec<Value>,
+    /// Files Vercel has, by SHA-1.
+    pub known: std::collections::BTreeSet<String>,
+    pub uploads: u32,
+    pub domains: BTreeMap<(String, String), Value>,
+    next: u32,
+}
+
+impl VercelState {
+    /// A deployment made outside kiln serves `project`'s production now.
+    pub fn foreign_production(&mut self, project: &str) {
+        self.next += 1;
+        let id = format!("dpl_foreign{}", self.next);
+        self.deployments.push(json!({ "id": id, "readyState": "READY", "polls": 0 }));
+        if let Some(Value::Object(p)) = self.projects.get_mut(project) {
+            p.insert("targets".into(), json!({ "production": { "id": id } }));
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct FakeVercel {
+    pub state: Mutex<VercelState>,
+}
+
+fn vc_err(status: u16, code: &str, message: &str, extra: Value) -> Response {
+    let mut e = json!({ "code": code, "message": message });
+    if let (Value::Object(m), Value::Object(x)) = (&mut e, extra) {
+        m.extend(x);
+    }
+    srv::json(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST), &json!({ "error": e }))
+}
+
+impl srv::Handler for FakeVercel {
+    async fn handle(self: Arc<Self>, req: Request) -> Response {
+        if srv::header_str(&req, &http::header::AUTHORIZATION) != Some("Bearer vc-token") {
+            return vc_err(403, "forbidden", "Not authorized", json!({}));
+        }
+        let query = srv::query(&req);
+        if query.get("teamId").map(String::as_str) != Some("team1") {
+            return vc_err(403, "forbidden", "Not authorized for this team", json!({}));
+        }
+        let digest = srv::header_str(&req, &http::header::HeaderName::from_static("x-vercel-digest")).map(str::to_owned);
+        let method = req.method().clone();
+        let path = req.uri().path().to_owned();
+        let raw = srv::body_bytes(req.into_body(), 8 << 20).await.unwrap_or_default();
+        let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+        let mut st = self.state.lock();
+        let segs: Vec<String> = path.trim_start_matches('/').split('/').map(srv::decode).collect();
+        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        match (method.as_str(), segs.as_slice()) {
+            ("POST", ["v2", "files"]) => {
+                let sha = crate::ci::integrations::vercel::sha1_hex(&raw);
+                if digest.as_deref() != Some(sha.as_str()) {
+                    return vc_err(400, "invalid_digest", "the file doesn't hash to its digest", json!({}));
+                }
+                st.known.insert(sha);
+                st.uploads += 1;
+                ok(json!({}))
+            }
+            ("GET", ["v9", "projects"]) => ok(json!({ "projects": st.projects.values().cloned().collect::<Vec<_>>() })),
+            ("POST", ["v11", "projects"]) => {
+                st.next += 1;
+                let mut p = body.as_object().cloned().unwrap_or_default();
+                p.insert("id".into(), json!(format!("prj_{}", st.next)));
+                let name = p.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                st.projects.insert(name, Value::Object(p.clone()));
+                ok(Value::Object(p))
+            }
+            ("GET", ["v9", "projects", name]) => match st.projects.get(*name) {
+                Some(p) => ok(p.clone()),
+                None => vc_err(404, "not_found", "Project not found", json!({})),
+            },
+            ("PATCH", ["v9", "projects", name]) => match st.projects.get_mut(*name) {
+                Some(Value::Object(p)) => {
+                    for (k, v) in body.as_object().cloned().unwrap_or_default() {
+                        p.insert(k, v);
+                    }
+                    ok(Value::Object(p.clone()))
+                }
+                _ => vc_err(404, "not_found", "Project not found", json!({})),
+            },
+            ("DELETE", ["v9", "projects", name]) => match st.projects.remove(*name) {
+                Some(_) => srv::status(http::StatusCode::NO_CONTENT),
+                None => vc_err(404, "not_found", "Project not found", json!({})),
+            },
+            ("POST", ["v13", "deployments"]) => {
+                let project = body.get("project").and_then(Value::as_str).unwrap_or_default().to_owned();
+                if !st.projects.contains_key(&project) {
+                    return vc_err(404, "not_found", "Project not found", json!({}));
+                }
+                let lacks: Vec<String> = body.get("files").and_then(Value::as_array).into_iter().flatten().filter_map(|f| f.get("sha").and_then(Value::as_str)).filter(|s| !st.known.contains(*s)).map(str::to_owned).collect();
+                if !lacks.is_empty() {
+                    return vc_err(400, "missing_files", "Missing files", json!({ "missing": lacks }));
+                }
+                st.next += 1;
+                let id = format!("dpl_{}", st.next);
+                let mut d = body.as_object().cloned().unwrap_or_default();
+                d.insert("id".into(), json!(id));
+                d.insert("url".into(), json!(format!("site-{}.vercel.app", st.next)));
+                d.insert("readyState".into(), json!("BUILDING"));
+                d.insert("polls".into(), json!(0));
+                st.deployments.push(Value::Object(d.clone()));
+                ok(Value::Object(d))
+            }
+            ("GET", ["v13", "deployments", id]) => {
+                let Some(d) = st.deployments.iter_mut().find(|d| d.get("id").and_then(Value::as_str) == Some(*id)).and_then(Value::as_object_mut) else { return vc_err(404, "not_found", "Deployment not found", json!({})) };
+                // Ready after one look; production then serves it.
+                let polls = d.get("polls").and_then(Value::as_u64).unwrap_or(0) + 1;
+                d.insert("polls".into(), json!(polls));
+                if polls > 1 && d.get("readyState") == Some(&json!("BUILDING")) {
+                    d.insert("readyState".into(), json!("READY"));
+                }
+                let d = Value::Object(d.clone());
+                if d.get("readyState") == Some(&json!("READY"))
+                    && d.get("target") == Some(&json!("production"))
+                    && let Some(Value::Object(p)) = d.get("project").and_then(Value::as_str).and_then(|p| st.projects.get_mut(p))
+                    && p.get("targets").and_then(|t| t.pointer("/production/id")).is_none_or(|cur| cur.as_str().is_some_and(|c| !c.starts_with("dpl_foreign")))
+                {
+                    p.insert("targets".into(), json!({ "production": { "id": id } }));
+                }
+                ok(d)
+            }
+            ("GET", ["v9", "projects", project, "domains"]) => ok(json!({ "domains": st.domains.iter().filter(|((p, _), _)| p == project).map(|(_, d)| d.clone()).collect::<Vec<_>>() })),
+            ("GET", ["v9", "projects", project, "domains", name]) => match st.domains.get(&((*project).to_owned(), (*name).to_owned())) {
+                Some(d) => ok(d.clone()),
+                None => vc_err(404, "not_found", "Domain not found", json!({})),
+            },
+            ("POST", ["v10", "projects", project, "domains"]) => {
+                let name = body.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+                let d = json!({ "name": name, "verified": true, "projectId": project });
+                st.domains.insert(((*project).to_owned(), name), d.clone());
+                ok(d)
+            }
+            ("DELETE", ["v9", "projects", project, "domains", name]) => {
+                st.domains.remove(&((*project).to_owned(), (*name).to_owned()));
+                srv::status(http::StatusCode::NO_CONTENT)
+            }
+            _ => vc_err(400, "bad_request", &format!("the fake has no {method} {path}"), json!({})),
+        }
+    }
+}
+
+/// Starts the fake Vercel on a free port: its base URL.
+pub async fn start_vercel(fake: Arc<FakeVercel>) -> anyhow::Result<String> {
+    let tcp = hyper_rt::tcp::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)), 64).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let addr = tcp.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+    crate::rt::spawn(async move {
+        while let Ok(s) = tcp.accept().await {
+            let (h, r) = (Arc::clone(&fake), s.peer_addr().ok());
+            crate::rt::spawn(srv::serve_connection(crate::http::io::RtIo::new(s), h, r));
+        }
+    });
+    Ok(format!("http://{addr}"))
+}
