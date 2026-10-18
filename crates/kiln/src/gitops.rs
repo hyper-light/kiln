@@ -449,6 +449,7 @@ async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Resu
                 last_error: None,
                 mode: if native { "native" } else { "upstream" }.into(),
                 default_branch: r.default_branch.clone().filter(|_| native),
+                mirror: r.mirror.clone().filter(|_| native),
             })
             .await?;
     }
@@ -503,6 +504,7 @@ async fn discover(hub: &Hub, http: &crate::http::client::Client) -> anyhow::Resu
                         last_error: None,
                         mode: "upstream".into(),
                         default_branch: None,
+                        mirror: None,
                     })
                     .await?;
             }

@@ -3381,6 +3381,21 @@ land queue are built; the review UI, the App and the facade's REST half are left
   - Checked end to end with real git: W14-AC01 (`w14_ac01_stacks`: three commits as a stack,
     D2 amended, the stack rebased and reordered, an interdiff, the refusals, the options, the
     author's actions, the runs), and the CLI (`w14_r03_cli`).
+- *Done.* The rest of R01 and R02, and of R05 and R07:
+  - `native + mirror`: a repository's `mirror` (API, `[[repos]] mirror =`) gets its trunk after
+    each land and each direct push of it;
+  - branch protection: `.kiln/review.yaml` `protected: [globs]`: those branches aren't deleted
+    or rewritten (git refuses their non-fast-forwards once it has the commits), and only those who
+    may land push them;
+  - a suggestion applied as an amend (`POST /api/comments/:id/apply`): a diff's new version (its
+    parent, message and author kept), a change request's commit on its branch; the thread is
+    resolved, saying which version;
+  - landed commits signed when `[ci] land_signing = { key, format }` says so (an SSH key by
+    default);
+  - a patch series without git (`POST /api/repos/:repo/submit`): `git format-patch` output or
+    `{ message, diff }` patches, applied onto the trunk in a temporary index, given Change-Ids,
+    and submitted as a push is.
+  - Checked end to end (`w14_r05_suggestions_mirror_signing`).
 - *Done.* R04's change requests, in `crates/kiln/src/ci/cr.rs`: a branch reviewed against a
   trunk as a whole (`CR4`, numbered with the diffs):
   - opened by pushing `refs/for/<trunk>/branch/<name>` (`kiln cr open [branch]`, `-o title=`)
@@ -3473,13 +3488,10 @@ land queue are built; the review UI, the App and the facade's REST half are left
     - `softprops/action-gh-release` with an asset;
     - `actions/checkout` unpacking the tarball where git is missing.
 - *Left.* Everything else:
-  - `native + mirror` (R01), with the land queue that moves trunk;
-  - branch protection rules (R02, with R09);
   - R03's `kiln absorb`;
   - the rest of R11's REST subset and GraphQL;
-  - suggestions applied as amends, replies by email or chat (R05);
+  - replies by email or chat (R05, with W11-R06);
   - R06's diffs UI and the review pages (with W21);
-  - commit signing of landed commits (R07);
   - the App (R10);
   - AC05 to AC07.
 

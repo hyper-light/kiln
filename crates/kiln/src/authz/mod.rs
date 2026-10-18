@@ -309,6 +309,8 @@ pub static ROUTES: &[Rule] = &[
     r("POST", "/api/diffs/*/viewed", "diffs.read", At::Diff(2)),
     r("POST", "/api/diffs/*/land", "diffs.land", At::Diff(2)),
     r("PATCH", "/api/comments/*", "diffs.review", At::Comment(2)),
+    r("POST", "/api/comments/*/apply", "diffs.submit", At::Comment(2)),
+    r("POST", "/api/repos/*/submit", "diffs.submit", At::Repo(2)),
     r("GET", "/api/review/inbox", "diffs.read", At::Anywhere),
     r("GET", "/api/repos/*/queue", "diffs.read", At::Repo(2)),
     r("DELETE", "/api/queue/*", "queue.manage", At::Entry(2)),

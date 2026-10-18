@@ -256,6 +256,80 @@ pub fn plan(commits: &[Commit], known: &BTreeMap<String, Known>, base: &str) -> 
     Ok(out)
 }
 
+/// A patch of a series submitted without git (W14-R03's `POST /api/repos/:repo/submit`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Patch {
+    /// `Name <email>`; the submitter when absent.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// As git takes it (`GIT_AUTHOR_DATE`).
+    #[serde(default)]
+    pub date: Option<String>,
+    pub message: String,
+    /// A unified diff (`git diff` or `diff -u` with `a/` and `b/` paths).
+    pub diff: String,
+}
+
+/// The patches of `git format-patch` output (one file, or many concatenated), in order.
+pub fn parse_mbox(text: &str) -> Vec<Patch> {
+    let mut out = Vec::new();
+    let mut chunks: Vec<Vec<&str>> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("From ") && line.split_whitespace().nth(1).is_some_and(|w| w.len() >= 40 && w.chars().all(|c| c.is_ascii_hexdigit())) {
+            chunks.push(Vec::new());
+            continue;
+        }
+        if let Some(c) = chunks.last_mut() {
+            c.push(line);
+        }
+    }
+    for c in chunks {
+        let (mut author, mut date, mut subject) = (None, None, String::new());
+        let mut i = 0;
+        // Headers, with continuation lines, up to the first blank line.
+        let mut last: Option<&str> = None;
+        while let Some(line) = c.get(i) {
+            i += 1;
+            if line.is_empty() {
+                break;
+            }
+            if line.starts_with([' ', '\t']) {
+                if last == Some("subject") {
+                    subject.push_str(line);
+                }
+                continue;
+            }
+            let Some((k, v)) = line.split_once(':') else { continue };
+            last = None;
+            match k.to_ascii_lowercase().as_str() {
+                "from" => author = Some(v.trim().to_owned()),
+                "date" => date = Some(v.trim().to_owned()),
+                "subject" => {
+                    subject = v.trim().to_owned();
+                    last = Some("subject");
+                }
+                _ => {}
+            }
+        }
+        // `[PATCH 2/3] title` → `title`.
+        let title = match subject.strip_prefix('[') {
+            Some(rest) if rest.split_once(']').is_some_and(|(tag, _)| tag.to_ascii_uppercase().contains("PATCH")) => rest.split_once(']').map_or(rest, |(_, t)| t).trim().to_owned(),
+            _ => subject.trim().to_owned(),
+        };
+        // The body to `---`, then the diff to the signature (`-- ` and git's version).
+        let rest: Vec<&str> = c.get(i..).unwrap_or_default().to_vec();
+        let cut = rest.iter().position(|l| *l == "---").unwrap_or(rest.len());
+        let body = rest.get(..cut).unwrap_or_default().join("\n");
+        let after = rest.get(cut + 1..).unwrap_or_default();
+        let start = after.iter().position(|l| l.starts_with("diff --git ") || l.starts_with("--- ")).unwrap_or(after.len());
+        let end = after.iter().rposition(|l| *l == "-- ").unwrap_or(after.len());
+        let diff = after.get(start..end.max(start)).unwrap_or_default().join("\n");
+        let message = if body.trim().is_empty() { format!("{title}\n") } else { format!("{title}\n\n{}\n", body.trim_end()) };
+        out.push(Patch { author, date, message, diff: format!("{}\n", diff.trim_end()) });
+    }
+    out
+}
+
 /// A hunk of `git diff -U0`: `@@ -old_start,old_len +new_start,new_len @@`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hunk {
@@ -332,6 +406,18 @@ mod tests {
         assert_eq!(with_change_id("fix: x\n", A), format!("fix: x\n\nChange-Id: {A}\n"));
         assert_eq!(with_change_id("fix: x\n\nbody\n\nSigned-off-by: Ada <a@x>\n", A), format!("fix: x\n\nbody\n\nSigned-off-by: Ada <a@x>\nChange-Id: {A}\n"));
         assert_eq!(with_change_id(&m, B), m, "one is enough");
+    }
+
+    #[test]
+    fn w14_r03_mbox() {
+        let mbox = "From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001\nFrom: Ada <ada@example.com>\nDate: Sun, 18 Oct 2026 12:00:00 +0000\nSubject: [PATCH 1/2] one: a\n\nWhy one.\n---\n a.txt | 1 +\n\ndiff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+one\n-- \n2.47.0\n\nFrom 2222222222222222222222222222222222222222 Mon Sep 17 00:00:00 2001\nFrom: Ada <ada@example.com>\nSubject: [PATCH 2/2] two: a\n continued\n\n---\ndiff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n-- \n2.47.0\n";
+        let p = parse_mbox(mbox);
+        assert_eq!(p.len(), 2);
+        let (a, b) = (p.first().cloned().unwrap_or_default(), p.get(1).cloned().unwrap_or_default());
+        assert_eq!((a.author.as_deref(), a.message.as_str()), (Some("Ada <ada@example.com>"), "one: a\n\nWhy one.\n"));
+        assert!(a.diff.starts_with("diff --git a/a.txt b/a.txt\n") && a.diff.ends_with("+one\n"), "{:?}", a.diff);
+        assert_eq!(b.message, "two: a continued\n");
+        assert!(b.diff.contains("+two") && !b.diff.contains("2.47"), "{:?}", b.diff);
     }
 
     #[test]

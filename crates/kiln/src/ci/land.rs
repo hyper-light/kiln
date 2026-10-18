@@ -405,11 +405,21 @@ async fn author(hub: &Hub, path: &str, commit: &str) -> anyhow::Result<(String, 
     Ok((f.next().unwrap_or_default().to_owned(), f.next().unwrap_or_default().to_owned(), f.next().unwrap_or_default().to_owned()))
 }
 
-/// A commit of `tree` on `parents`, by `who` (committed by kiln), saying `message`.
+/// A commit of `tree` on `parents`, by `who` (committed by kiln, signed when
+/// `[ci.land_signing]` says so), saying `message`.
 async fn commit_tree(hub: &Hub, path: &str, tree: &str, parents: &[&str], who: &(String, String, String), message: &str) -> anyhow::Result<String> {
-    let mut args = vec!["-C", path, "commit-tree", tree];
+    let signing = hub.cfg.ci.land_signing.as_ref().filter(|s| !s.key.is_empty());
+    let (fmt, key) = signing.map(|s| (format!("gpg.format={}", s.format.as_deref().unwrap_or("ssh")), format!("user.signingkey={}", s.key))).unwrap_or_default();
+    let mut args: Vec<&str> = Vec::new();
+    if signing.is_some() {
+        args.extend(["-c", &fmt, "-c", &key]);
+    }
+    args.extend(["-C", path, "commit-tree", tree]);
     for p in parents {
         args.extend(["-p", p]);
+    }
+    if signing.is_some() {
+        args.push("-S");
     }
     args.extend(["-F", "-"]);
     let env = [("GIT_AUTHOR_NAME", who.0.as_str()), ("GIT_AUTHOR_EMAIL", who.1.as_str()), ("GIT_AUTHOR_DATE", who.2.as_str()), ("GIT_COMMITTER_NAME", "kiln"), ("GIT_COMMITTER_EMAIL", "kiln@localhost")];
@@ -737,6 +747,7 @@ async fn landed(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str, batch: &[E
         hub.store.audit("kiln".into(), "queue.land".into(), format!("{} {trunk} at {tip}: entry {} by {}", repo.name, e.id, e.enqueued_by)).await;
     }
     tracing::info!(repo = %repo.name, %trunk, %tip, diffs = all.len(), "landed");
+    super::hosting::mirror_trunk(hub, repo, path, trunk);
     // The trunk's push runs (the poller sees it now).
     hub.gitops_kick.notify();
     for id in &all {

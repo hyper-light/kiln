@@ -472,3 +472,97 @@ pub async fn inbox(hub: &Hub, caller: &Caller) -> Result<Value, Fail> {
     let mine: Vec<Value> = mine.into_iter().filter(|(repo, ..)| may(repo)).map(|(repo, diff, title, state)| json!({ "repo": repo, "diff": diff, "title": title, "state": state })).collect();
     Ok(json!({ "you": me, "waiting_for_you": yours, "waiting_for_others": theirs, "review_requested": asked, "your_diffs": mine }))
 }
+
+/// `POST /api/comments/:id/apply` (W14-R05): a comment's suggestion, the lines it replaces taken
+/// to the latest version. A diff gets a new version, its commit amended (same parent, same
+/// message, same author); a change request's branch gets a commit. The thread is resolved, saying
+/// where the suggestion went.
+pub async fn apply_suggestion(hub: &std::sync::Arc<Hub>, id: &str, caller: &Caller) -> Result<Value, Fail> {
+    let key = id.to_owned();
+    #[allow(clippy::type_complexity)]
+    let found: Option<(Option<String>, String, String, String, u32, Option<String>, Option<String>, Option<u32>, Option<u32>)> = hub
+        .store
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT c.suggestion, c.author, c.thread_id, t.diff_id, t.version, t.file, t.side, t.start_line, t.end_line FROM review_comments c JOIN review_threads t ON t.id = c.thread_id WHERE c.id = ?1 OR CAST(c.rowid AS TEXT) = ?1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+            )
+            .optional()?)
+        })
+        .await
+        .map_err(fail)?;
+    let Some((suggestion, suggested_by, thread, diff, version, file, side, start, end)) = found else { return Err((StatusCode::NOT_FOUND, "no such comment".into())) };
+    let Some(suggestion) = suggestion else { return Err(bad("the comment suggests nothing")) };
+    let (Some(file), Some(start)) = (file, start) else { return Err(bad("a suggestion is on a file's lines")) };
+    if side.as_deref() == Some("old") {
+        return Err(bad("a suggestion replaces lines of the new side"));
+    }
+    let d = super::diffs::find(hub, &diff).await.map_err(fail)?.ok_or((StatusCode::NOT_FOUND, "the diff is gone".to_owned()))?;
+    if !caller.can("diffs.submit", &Scope::Repo { repo: d.repo.clone() }) {
+        return Err((StatusCode::FORBIDDEN, "applying a suggestion needs `diffs.submit`".into()));
+    }
+    if !State::parse(&d.state).is_some_and(|s| s.is_open() && s != State::Landing) {
+        return Err((StatusCode::CONFLICT, format!("{} is {}", d.name, d.state)));
+    }
+    let versions = super::diffs::versions(hub, &d).await.map_err(fail)?;
+    let (Some(from), Some(latest)) = (versions.iter().find(|v| v.n == version).cloned(), versions.last().cloned()) else { return Err(bad("the comment's version is gone")) };
+    let (repo, path) = super::diffs::home(hub, &d).await?;
+    let (s, e) = follow(hub, &path, &file, "new", (&from, &latest), (start, end.unwrap_or(start))).await.ok_or((StatusCode::CONFLICT, "the lines it replaces changed since: it's outdated".to_owned()))?;
+    // The file with the lines replaced.
+    let old = gitops::run_git(hub, &["-C", &path, "show", &format!("{}:{file}", latest.commit)], LS_REMOTE_TIMEOUT).await.map_err(|_| bad(format!("{file} isn't in the latest version")))?;
+    let text = String::from_utf8_lossy(&old).into_owned();
+    let ends_nl = text.ends_with('\n');
+    let mut lines: Vec<&str> = text.lines().collect();
+    let (lo, hi) = (usize::try_from(s).unwrap_or(1).max(1) - 1, usize::try_from(e).unwrap_or(1));
+    if hi > lines.len() || lo >= hi {
+        return Err((StatusCode::CONFLICT, "the lines it replaces aren't there".into()));
+    }
+    let replacement: Vec<&str> = suggestion.lines().collect();
+    lines.splice(lo..hi, replacement);
+    let mut new_text = lines.join("\n");
+    if ends_nl {
+        new_text.push('\n');
+    }
+    let listing = gitops::run_git(hub, &["-C", &path, "ls-tree", &latest.commit, "--", &file], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+    let mode = listing.split_whitespace().next().unwrap_or("100644").to_owned();
+    let tree = super::diffs::tree_with(hub, &path, &latest.commit, super::diffs::Edit::Put { file: &file, mode: &mode, content: new_text.into_bytes() }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (me, _) = who(caller);
+    let applier = me.strip_prefix("user:").unwrap_or(&me).to_owned();
+    let n = match &d.branch {
+        // A change request: a commit on its branch, a version from it.
+        Some(branch) => {
+            let msg = format!("Apply a suggestion from {suggested_by}\n\nOn {file}, lines {s}-{e}.\n");
+            let c = super::diffs::make_commit(hub, &path, &tree, &latest.commit, (&applier, None), &applier, &msg).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            gitops::run_git(hub, &["-C", &path, "update-ref", &format!("refs/heads/{branch}"), &c, &latest.commit], LS_REMOTE_TIMEOUT).await.map_err(|_| (StatusCode::CONFLICT, format!("{branch} moved: push or pull, then try again")))?;
+            let by = super::cr::By { pushed_by: caller.name.clone(), author: super::diffs::author_of(&caller.name, Some(caller.kind)) };
+            super::cr::submit(hub, &repo, &path, &d.trunk, branch, &c, &by, &kiln_ci::review::Options::default()).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?.version
+        }
+        // A diff: its commit amended.
+        None => {
+            let message = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%B", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).into_owned()).unwrap_or_default();
+            let who_wrote = gitops::run_git(hub, &["-C", &path, "log", "-1", "--format=%an <%ae>%x00%ad", "--date=raw", &latest.commit], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
+            let (author, date) = who_wrote.split_once('\0').unwrap_or((&who_wrote, ""));
+            let c = super::diffs::make_commit(hub, &path, &tree, &latest.parent, (author, Some(date).filter(|d| !d.is_empty())), &applier, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let patch = super::diffs::git_run(hub, &["-C", &path, "show", "--no-color", &c], &[], Vec::new()).await.ok().map(|r| r.out).unwrap_or_default();
+            let patch_id = super::diffs::git_with_input(hub, &["-C", &path, "patch-id", "--stable"], patch).await.ok().and_then(|o| String::from_utf8_lossy(&o).split_whitespace().next().map(str::to_owned)).unwrap_or_default();
+            let id = d.id.clone();
+            let below: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT parent_diff FROM diffs WHERE id = ?1", [&id], |r| r.get(0)).optional()?.flatten())).await.map_err(fail)?;
+            let nv = super::diffs::NewVersion { commit: c, parent: latest.parent.clone(), base: latest.base.clone(), patch_id, message, note: Some(format!("applied a suggestion from {suggested_by}")), rebase_only: false, pushed_by: caller.name.clone(), parent_diff: below };
+            super::diffs::add_version(hub, &repo, &path, &d, nv).await.map_err(fail)?
+        }
+    };
+    // The thread says where it went, and is done.
+    let (t, me2, note) = (thread.clone(), me.clone(), format!("Applied in v{n}."));
+    hub.store
+        .call(move |c| {
+            let now = crate::util::now_unix();
+            c.execute("INSERT INTO review_comments (id, thread_id, author, body, created_at, updated_at, published) VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)", params![crate::util::new_id(), t, me2, note, now])?;
+            c.execute("UPDATE review_threads SET state = 'resolved' WHERE id = ?1", [&t])?;
+            Ok(())
+        })
+        .await
+        .map_err(fail)?;
+    hub.store.audit(caller.name.clone(), "diffs.suggestion.apply".into(), format!("{} {} v{n}", d.repo, d.name)).await;
+    Ok(json!({ "diff": d.name, "version": n, "thread": thread, "state": "resolved" }))
+}

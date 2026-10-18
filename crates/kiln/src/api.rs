@@ -301,7 +301,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -
         }
         (_, ["api", "ci", rest @ ..]) => crate::ci::api::route(&hub, rest, &q, req).await.map_err(|(c, m)| err(c, m)),
         // W14: diffs and stacks.
-        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests"]) => {
+        (_, ["api", "diffs" | "change-requests" | "stacks" | "comments" | "review" | "queue", ..]) | (&Method::GET, ["api", "repos", _, "diffs" | "queue" | "change-requests"]) | (&Method::POST, ["api", "repos", _, "change-requests" | "submit"]) => {
             let segs: Vec<&str> = s.iter().skip(1).copied().collect();
             let body: serde_json::Value = if matches!(method, Method::POST | Method::PATCH | Method::PUT) { srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or(serde_json::Value::Null) } else { serde_json::Value::Null };
             crate::ci::diffs::route(&hub, &method, &segs, &q, &caller, &body).await.map_err(|(c, m)| err(c, m))
@@ -1332,6 +1332,8 @@ struct NewRepo {
     import: Option<String>,
     /// A new, empty native repository's trunk (`main`).
     default_branch: Option<String>,
+    /// A native repository's upstream, its trunk pushed there after each land (W14-R01).
+    mirror: Option<String>,
 }
 
 async fn add_repo(hub: &Hub, req: Request) -> R {
@@ -1347,6 +1349,12 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
         Some(m) => return Err(err(StatusCode::BAD_REQUEST, format!("mode `{m}`: `native` or `upstream`"))),
     };
     let default_branch = r.default_branch.clone().filter(|_| native).or_else(|| native.then(|| "main".to_owned()));
+    if let Some(m) = r.mirror.as_deref() {
+        if !native {
+            return Err(err(StatusCode::BAD_REQUEST, "a mirror is a native repository's upstream"));
+        }
+        crate::ci::hosting::importable(m).map_err(|e| err(StatusCode::BAD_REQUEST, e.replace("an import copies", "a mirror is")))?;
+    }
     let clone_url = if native {
         if let Some(url) = &r.import {
             crate::ci::hosting::importable(url).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
@@ -1370,6 +1378,7 @@ async fn add_repo(hub: &Hub, req: Request) -> R {
             last_error: None,
             mode: if native { "native" } else { "upstream" }.into(),
             default_branch,
+            mirror: r.mirror.clone(),
         })
         .await?;
     hub.store.audit("admin".into(), "repo.add".into(), name).await;

@@ -100,6 +100,8 @@ pub struct RepoConfig {
     pub import: Option<String>,
     /// A new, empty native repository's trunk (`main`).
     pub default_branch: Option<String>,
+    /// A native repository's upstream: its trunk is pushed there after each land.
+    pub mirror: Option<String>,
 }
 
 

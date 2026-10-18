@@ -88,6 +88,9 @@ pub struct Repo {
     /// A native repository's trunk when it was made.
     #[serde(default)]
     pub default_branch: Option<String>,
+    /// A native repository's upstream, its trunk pushed there after each land (W14-R01).
+    #[serde(default)]
+    pub mirror: Option<String>,
 }
 
 fn upstream() -> String {
@@ -307,12 +310,12 @@ impl Store {
                 tracing::info!(repo = %r.name, from = %url, to = %r.clone_url, "repository moved: adopting its new remote's branches and tags as they are");
             }
             c.execute(
-                "INSERT INTO repos (id, name, clone_url, branches, poll_seconds, enabled, created_at, mode, default_branch)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO repos (id, name, clone_url, branches, poll_seconds, enabled, created_at, mode, default_branch, mirror)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(name) DO UPDATE SET clone_url = excluded.clone_url,
                    branches = excluded.branches, poll_seconds = excluded.poll_seconds,
                    enabled = excluded.enabled, mode = excluded.mode,
-                   default_branch = COALESCE(excluded.default_branch, repos.default_branch)",
+                   default_branch = COALESCE(excluded.default_branch, repos.default_branch), mirror = excluded.mirror",
                 params![
                     r.id,
                     r.name,
@@ -322,7 +325,8 @@ impl Store {
                     r.enabled,
                     r.created_at,
                     r.mode,
-                    r.default_branch
+                    r.default_branch,
+                    r.mirror
                 ],
             )?;
             let id: String =
@@ -344,7 +348,7 @@ impl Store {
         self.call(|c| {
             let mut st = c.prepare(
                 "SELECT id, name, clone_url, branches, poll_seconds, enabled, created_at,
-                        last_polled_at, last_error, mode, default_branch FROM repos ORDER BY name",
+                        last_polled_at, last_error, mode, default_branch, mirror FROM repos ORDER BY name",
             )?;
             let rows = st.query_map([], |r| {
                 Ok(Repo {
@@ -359,6 +363,7 @@ impl Store {
                     last_error: r.get(8)?,
                     mode: r.get(9)?,
                     default_branch: r.get(10)?,
+                    mirror: r.get(11)?,
                 })
             })?;
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1210,6 +1215,7 @@ mod tests {
                 last_error: None,
                 mode: "upstream".into(),
                 default_branch: None,
+                mirror: None,
             };
             let repo = s.upsert_repo(at("http://kiln-git/kiln.git")).await?;
             s.set_ref(repo.id.clone(), "refs/heads/main".into(), "a1".into()).await?;
@@ -1262,6 +1268,7 @@ mod tests {
                 last_error: None,
                 mode: "upstream".into(),
                 default_branch: None,
+                mirror: None,
             })
             .await?;
         let p = pipeline::parse(

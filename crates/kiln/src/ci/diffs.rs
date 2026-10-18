@@ -79,6 +79,128 @@ pub(crate) async fn git_with_input(hub: &Hub, args: &[&str], input: Vec<u8>) -> 
     Ok(r.out)
 }
 
+/// What a tree is made from in a temporary index.
+pub(crate) enum Edit<'a> {
+    /// A unified diff, applied (`git apply --cached`).
+    Apply(&'a str),
+    /// A file's new content, its mode kept.
+    Put { file: &'a str, mode: &'a str, content: Vec<u8> },
+}
+
+/// `base`'s tree with `edit` made to it, written to the repository without a working tree;
+/// why not when it doesn't apply.
+pub(crate) async fn tree_with(hub: &Hub, path: &str, base: &str, edit: Edit<'_>) -> Result<String, String> {
+    let index = std::env::temp_dir().join(format!("kiln-index-{}", crate::util::new_id()));
+    let idx = index.to_string_lossy().into_owned();
+    let env = [("GIT_INDEX_FILE", idx.as_str())];
+    let result = async {
+        let r = git_run(hub, &["-C", path, "read-tree", base], &env, Vec::new()).await.map_err(|e| format!("{e:#}"))?;
+        if !r.ok {
+            return Err(format!("{base}: {}", String::from_utf8_lossy(&r.err).trim()));
+        }
+        match edit {
+            Edit::Apply(diff) => {
+                let r = git_run(hub, &["-C", path, "apply", "--cached", "--whitespace=nowarn", "-"], &env, diff.as_bytes().to_vec()).await.map_err(|e| format!("{e:#}"))?;
+                if !r.ok {
+                    return Err(String::from_utf8_lossy(&r.err).trim().to_owned());
+                }
+            }
+            Edit::Put { file, mode, content } => {
+                let blob = git_with_input(hub, &["-C", path, "hash-object", "-w", "--stdin"], content).await.map_err(|e| format!("{e:#}"))?;
+                let info = format!("{mode},{},{file}", String::from_utf8_lossy(&blob).trim());
+                let r = git_run(hub, &["-C", path, "update-index", "--add", "--cacheinfo", &info], &env, Vec::new()).await.map_err(|e| format!("{e:#}"))?;
+                if !r.ok {
+                    return Err(String::from_utf8_lossy(&r.err).trim().to_owned());
+                }
+            }
+        }
+        let r = git_run(hub, &["-C", path, "write-tree"], &env, Vec::new()).await.map_err(|e| format!("{e:#}"))?;
+        if !r.ok {
+            return Err(String::from_utf8_lossy(&r.err).trim().to_owned());
+        }
+        Ok(String::from_utf8_lossy(&r.out).trim().to_owned())
+    }
+    .await;
+    let _ = std::fs::remove_file(&index);
+    result
+}
+
+/// A commit of `tree` on `parent`, by `author` (`Name <email>`, at `date` when given), committed
+/// by `committer`, saying `message`.
+pub(crate) async fn make_commit(hub: &Hub, path: &str, tree: &str, parent: &str, (author, date): (&str, Option<&str>), committer: &str, message: &str) -> Result<String, String> {
+    let split = |who: &str| -> (String, String) {
+        match who.rsplit_once('<') {
+            Some((name, email)) => (name.trim().to_owned(), email.trim_end_matches('>').trim().to_owned()),
+            None => (who.trim().to_owned(), format!("{}@kiln", who.trim().replace([' ', ':'], "-"))),
+        }
+    };
+    let ((an, ae), (cn, ce)) = (split(author), split(committer));
+    let mut env = vec![("GIT_AUTHOR_NAME", an.as_str()), ("GIT_AUTHOR_EMAIL", ae.as_str()), ("GIT_COMMITTER_NAME", cn.as_str()), ("GIT_COMMITTER_EMAIL", ce.as_str())];
+    if let Some(d) = date {
+        env.push(("GIT_AUTHOR_DATE", d));
+    }
+    let r = git_run(hub, &["-C", path, "commit-tree", tree, "-p", parent, "-F", "-"], &env, message.as_bytes().to_vec()).await.map_err(|e| format!("{e:#}"))?;
+    if !r.ok {
+        return Err(String::from_utf8_lossy(&r.err).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&r.out).trim().to_owned())
+}
+
+/// A Change-Id no commit has yet.
+pub(crate) fn new_change_id() -> String {
+    let h = crate::util::sha256_hex(crate::util::random_token().as_bytes());
+    format!("I{}", h.get(..40).unwrap_or(&h))
+}
+
+/// `POST /api/repos/:repo/submit` (W14-R03, for agents without git): `{ trunk?, patches: [{
+/// message, diff, author?, date? }] | mbox: "<git format-patch output>", draft?, reviewers?,
+/// topic?, message? }`. The patches become commits on the trunk's tip, given Change-Ids where
+/// they lack one, and are submitted as a push to `refs/for/<trunk>` is.
+pub async fn submit_patches(hub: &Arc<Hub>, repo_key: &str, caller: &Caller, body: &Value) -> Result<Value, Fail> {
+    let repos = hub.store.repos().await.map_err(fail)?;
+    let repo = repos.into_iter().find(|r| r.name == repo_key || r.id == repo_key).ok_or((StatusCode::NOT_FOUND, "no such repository".to_owned()))?;
+    if !caller.can("diffs.submit", &Scope::Repo { repo: repo.name.clone() }) {
+        return Err((StatusCode::FORBIDDEN, "submitting needs `diffs.submit`".into()));
+    }
+    let path = super::hosting::native_path(hub, &repo).ok_or((StatusCode::CONFLICT, "diffs are for repositories kiln hosts".to_owned()))?;
+    let p = path.to_string_lossy().into_owned();
+    let head = gitops::run_git(hub, &["-C", &p, "symbolic-ref", "--short", "HEAD"], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_else(|_| "main".into());
+    let trunk = body.get("trunk").and_then(Value::as_str).map_or(head, str::to_owned);
+    let patches: Vec<review::Patch> = match (body.get("mbox").and_then(Value::as_str), body.get("patches")) {
+        (Some(m), _) => review::parse_mbox(m),
+        (None, Some(list)) => serde_json::from_value(list.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("`patches`: {e}")))?,
+        (None, None) => Vec::new(),
+    };
+    if patches.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "nothing to submit: give `patches` or `mbox`".into()));
+    }
+    let tip = gitops::run_git(hub, &["-C", &p, "rev-parse", "--verify", &format!("refs/heads/{trunk}^{{commit}}")], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).map_err(|_| (StatusCode::UNPROCESSABLE_ENTITY, format!("{trunk} has no commits yet")))?;
+    let (name, kind) = author_of(&caller.name, Some(caller.kind));
+    let me = name.strip_prefix("user:").unwrap_or(&name).to_owned();
+    let mut parent = tip;
+    for (i, patch) in patches.iter().enumerate() {
+        let tree = tree_with(hub, &p, &parent, Edit::Apply(&patch.diff)).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("patch {} doesn't apply: {e}", i + 1)))?;
+        let message = if patch.message.trim().is_empty() { return Err((StatusCode::BAD_REQUEST, format!("patch {} has no message", i + 1))) } else { review::with_change_id(&patch.message, &new_change_id()) };
+        let author = patch.author.clone().unwrap_or_else(|| me.clone());
+        parent = make_commit(hub, &p, &tree, &parent, (&author, patch.date.as_deref()), &me, &message).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
+    let mut given: Vec<String> = Vec::new();
+    if body.get("draft").and_then(Value::as_bool) == Some(true) {
+        given.push("draft".into());
+    }
+    for r in body.get("reviewers").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+        given.push(format!("reviewer={r}"));
+    }
+    for k in ["topic", "message"] {
+        if let Some(v) = body.get(k).and_then(Value::as_str) {
+            given.push(format!("{k}={v}"));
+        }
+    }
+    let options = review::options(&given);
+    let out = submit(hub, Submission { repo: &repo, path: &p, trunk: &trunk, sha: &parent, pushed_by: &caller.name, author: (name, kind), options }).await.map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    Ok(json!({ "diffs": out }))
+}
+
 /// Who a diff is by, as its rows name them: `user:ada` (a person, through any of their tokens),
 /// `agent:review`, `admin`, `job:<leg>`; and whether that is a `human` or an `agent`.
 pub fn author_of(caller_name: &str, kind: Option<crate::authz::gate::Kind>) -> (String, &'static str) {
@@ -760,6 +882,8 @@ pub async fn route(hub: &Arc<Hub>, method: &Method, segs: &[&str], q: &HashMap<S
         (&Method::GET, ["repos", repo, "diffs"]) => ok(list(hub, repo, q, "diff").await?),
         (&Method::GET, ["repos", repo, "change-requests"]) => ok(list(hub, repo, q, "change_request").await?),
         (&Method::POST, ["repos", repo, "change-requests"]) => ok(super::cr::create(hub, repo, caller, body).await?),
+        (&Method::POST, ["repos", repo, "submit"]) => ok(submit_patches(hub, repo, caller, body).await?),
+        (&Method::POST, ["comments", id, "apply"]) => ok(super::review::apply_suggestion(hub, id, caller).await?),
         (&Method::GET, ["repos", repo, "queue"]) => ok(super::land::list(hub, repo).await?),
         (&Method::GET, ["stacks", id]) => ok(stack(hub, id).await?),
         (&Method::GET, ["review", "inbox"]) => ok(super::review::inbox(hub, caller).await?),

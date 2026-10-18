@@ -55,10 +55,27 @@ pub struct Ci {
     /// it: a host (`hooks.corp`, `hooks.corp:8443`, `*.corp`), an address, or a network
     /// (`10.0.0.0/8`).
     pub allow_private_targets: Vec<String>,
+    /// `[ci.land_signing]`: the land queue signs the commits it writes (docs/ci.md W14-R07).
+    ///
+    /// ```toml
+    /// [ci.land_signing]
+    /// key = "/etc/kiln/land_ed25519"   # an SSH private key; with format = "openpgp", a key id
+    /// ```
+    pub land_signing: Option<LandSigning>,
     /// `kiln workflow run`'s own server (docs/ci.md W17-R06): every leg runs on its one runner,
     /// whatever names for runners its `runs-on` uses. Not a setting.
     #[serde(skip)]
     pub local: bool,
+}
+
+/// How landed commits are signed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LandSigning {
+    /// An SSH private key file (`ssh`), or a key id (`openpgp`, `x509`).
+    pub key: String,
+    /// `ssh` (the default), `openpgp` or `x509`, as git's `gpg.format`.
+    pub format: Option<String>,
 }
 
 impl Ci {

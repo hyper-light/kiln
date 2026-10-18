@@ -878,3 +878,99 @@ jobs:
     assert!(land.get("blockers").and_then(Value::as_array).is_some_and(|b| b.iter().any(|x| x.as_str() == Some("1 open thread"))), "{land}");
     Ok(())
 }
+
+/// The rest of hosting and review: branch protection (W14-R02: not deleted, not rewritten,
+/// pushed by those who land), a reviewer's suggestion applied as an amend (R05), landed commits
+/// signed (R07), the trunk mirrored upstream after a land (R01 `native + mirror`), and a patch
+/// series submitted without git (R03, `git format-patch` output).
+#[test]
+fn w14_r05_suggestions_mirror_signing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let key = dir.path().join("land_key");
+    let signing = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-C", "kiln-land", "-f"]).arg(&key).status().map(|s| s.success()).unwrap_or(false);
+    let ci = if signing { format!("land_signing = {{ key = \"{}\" }}", key.display()) } else { String::new() };
+    let s = start(dir.path(), &Options { ci: &ci, ..Options::default() })?;
+    let home = dir.path().join("githome");
+    std::fs::create_dir_all(&home)?;
+    let url = |token: &str, repo: &str| format!("http://x:{token}@127.0.0.1:{}/git/acme/{repo}.git", s.port);
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/upstream", "mode": "native" })))?;
+    anyhow::ensure!(st == 200, "upstream: {st} {body}");
+    let (st, body) = http(s.port, "POST", "/api/repos", &s.admin, Some(&json!({ "name": "acme/app", "mode": "native", "mirror": url(&s.admin, "upstream") })))?;
+    anyhow::ensure!(st == 200, "native repository: {st} {body}");
+    let dev = person(&s, "dev", &["developer@repo:acme/app"])?;
+    let rev = person(&s, "rev", &["developer@repo:acme/app"])?;
+    let lead = person(&s, "lead", &["maintainer@repo:acme/app"])?;
+    must(git(&home, dir.path(), &["clone", "-q", &url(&dev, "app"), "work"]), "clone")?;
+    let work = dir.path().join("work");
+    let g = |args: &[&str]| must(git(&home, &work, args), &args.join(" "));
+    std::fs::create_dir_all(work.join(".kiln"))?;
+    std::fs::write(work.join(".kiln/review.yaml"), "land:\n  approvals: 1\nprotected: [\"release/*\"]\n")?;
+    std::fs::write(work.join("README.md"), "app\n")?;
+    g(&["add", "."])?;
+    g(&["commit", "-qm", "first"])?;
+    g(&["push", "-q", "origin", "main"])?;
+
+    // Protected branches: those who land push them; nobody rewrites or deletes them.
+    let (ok, out) = git(&home, &work, &["push", "origin", "HEAD:refs/heads/release/1"])?;
+    assert!(!ok && out.contains("release/1 is protected") && out.contains("diffs.land"), "{out}");
+    g(&["push", "-q", &url(&lead, "app"), "HEAD:refs/heads/release/1"])?;
+    g(&["commit", "-q", "--allow-empty", "-m", "a fork"])?;
+    let (ok, out) = git(&home, &work, &["push", "-f", &url(&lead, "app"), "HEAD~1:refs/heads/release/1", "--force"])?;
+    assert!(ok || out.contains("Everything up-to-date"), "the same commit is no rewrite: {out}");
+    g(&["commit", "-q", "--amend", "--allow-empty", "-m", "another fork"])?;
+    g(&["push", "-q", &url(&lead, "app"), "HEAD:refs/heads/release/1"])?;
+    g(&["reset", "-q", "--hard", "HEAD~1"])?;
+    g(&["commit", "-q", "--allow-empty", "-m", "a rewrite"])?;
+    let (ok, out) = git(&home, &work, &["push", "-f", &url(&lead, "app"), "HEAD:refs/heads/release/1"])?;
+    assert!(!ok && out.contains("isn't rewritten") && out.contains("non-fast-forward"), "{out}");
+    let (ok, out) = git(&home, &work, &["push", &url(&lead, "app"), ":refs/heads/release/1"])?;
+    assert!(!ok && out.contains("isn't deleted"), "{out}");
+    g(&["reset", "-q", "--hard", "origin/main"])?;
+
+    // A suggestion, applied by the author: a new version with the lines replaced.
+    commit(&home, &work, "a.txt", "one\ntwo\nthree\n", "one: a", "I1111111111111111111111111111111111111111")?;
+    g(&["push", "-q", "origin", "HEAD:refs/for/main"])?;
+    let (st, c) = post(&s, &rev, "/api/diffs/D1/comments", &json!({ "file": "a.txt", "start_line": 2, "body": "shout it", "suggestion": "TWO", "publish": true }))?;
+    anyhow::ensure!(st == 200, "{c}");
+    let (st, r) = post(&s, &dev, &format!("/api/comments/{}/apply", text(&c, "id")), &json!({}))?;
+    anyhow::ensure!(st == 200, "apply: {r}");
+    assert_eq!(r.get("version"), Some(&json!(2)), "{r}");
+    let d1 = api(&s, &dev, "GET", "/api/diffs/D1")?;
+    let v2 = d1.get("versions").and_then(Value::as_array).and_then(|v| v.last()).cloned().unwrap_or_default();
+    g(&["fetch", "-q", "origin", "refs/kiln/diffs/D1/v2"])?;
+    assert_eq!(g(&["show", "FETCH_HEAD:a.txt"])?, "one\nTWO\nthree\n");
+    assert!(g(&["log", "-1", "--format=%B", "FETCH_HEAD"])?.contains("Change-Id: I1111111111111111111111111111111111111111"), "the amend keeps its Change-Id");
+    assert_eq!(text(&v2, "rebase_only"), "", "{v2}");
+    let threads = api(&s, &dev, "GET", "/api/diffs/D1/comments")?;
+    assert_eq!(threads.pointer("/threads/0/state"), Some(&json!("resolved")), "{threads}");
+
+    // Landed, signed, and mirrored upstream.
+    post(&s, &rev, "/api/diffs/D1/review", &json!({ "action": "accept" }))?;
+    let (st, e) = post(&s, &lead, "/api/diffs/D1/land", &json!({}))?;
+    anyhow::ensure!(st == 200, "land: {e}");
+    until(30, "D1 lands", || Ok((text(&api(&s, &dev, "GET", "/api/diffs/D1")?, "state") != "landed").then(|| "not yet".to_owned())))?;
+    g(&["fetch", "-q", "origin"])?;
+    let landed = g(&["rev-parse", "origin/main"])?.trim().to_owned();
+    if signing {
+        assert!(g(&["cat-file", "commit", &landed])?.contains("gpgsig -----BEGIN SSH SIGNATURE-----"), "signed");
+    }
+    until(30, "the mirror has the trunk", || {
+        let up = must(git(&home, &work, &["ls-remote", &url(&s.admin, "upstream"), "refs/heads/main"]), "ls-remote")?;
+        Ok((!up.starts_with(&landed)).then(|| up))
+    })?;
+
+    // A patch series without git: `git format-patch` output, submitted over the API.
+    g(&["reset", "-q", "--hard", "origin/main"])?;
+    std::fs::write(work.join("b.txt"), "bee\n")?;
+    g(&["add", "b.txt"])?;
+    g(&["commit", "-qm", "two: b\n\nWhy bees."])?;
+    let mbox = g(&["format-patch", "-1", "--stdout"])?;
+    let (st, r) = post(&s, &dev, "/api/repos/acme%2Fapp/submit", &json!({ "mbox": mbox, "draft": true }))?;
+    anyhow::ensure!(st == 200, "submit: {st} {r}");
+    assert_eq!(r.pointer("/diffs/0/name"), Some(&json!("D2")), "{r}");
+    let d2 = api(&s, &dev, "GET", "/api/diffs/D2")?;
+    assert_eq!((text(&d2, "title"), text(&d2, "state"), text(&d2, "summary")), ("two: b", "draft", "Why bees."), "{d2}");
+    let (st, r) = post(&s, &dev, "/api/repos/acme%2Fapp/submit", &json!({ "patches": [{ "message": "nope", "diff": "diff --git a/zz b/zz\n--- a/zz\n+++ b/zz\n@@ -1 +1 @@\n-x\n+y\n" }] }))?;
+    assert!(st == 422 && r.to_string().contains("doesn't apply"), "{st} {r}");
+    Ok(())
+}

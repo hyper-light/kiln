@@ -89,6 +89,23 @@ pub async fn create(hub: &Hub, name: &str, branch: &str, import: Option<&str>) -
     Ok(path)
 }
 
+/// Pushes `trunk` to the repository's mirror, if it has one (W14-R01 `native + mirror`), in the
+/// background; a refusal there is logged and audited, and the next land tries again.
+pub fn mirror_trunk(hub: &Arc<Hub>, repo: &Repo, path: &str, trunk: &str) {
+    let Some(url) = repo.mirror.clone() else { return };
+    let (hub, name, path, trunk) = (hub.clone(), repo.name.clone(), path.to_owned(), trunk.to_owned());
+    crate::rt::spawn(async move {
+        let spec = format!("refs/heads/{trunk}:refs/heads/{trunk}");
+        match crate::gitops::run_git(&hub, &["-C", &path, "push", "--quiet", "--", &url, &spec], std::time::Duration::from_secs(600)).await {
+            Ok(_) => tracing::info!(repo = %name, %trunk, "mirrored the trunk upstream"),
+            Err(e) => {
+                tracing::warn!(repo = %name, %trunk, error = %format!("{e:#}"), "the trunk's mirror refused it");
+                hub.store.audit("kiln".into(), "repo.mirror".into(), format!("{name} {trunk} not mirrored: {}", crate::util::truncate(&format!("{e:#}"), 300))).await;
+            }
+        }
+    });
+}
+
 /// A ref update a push asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
@@ -304,7 +321,8 @@ impl Pusher {
 }
 
 /// Why `pusher` may not make `u` on `repo` (whose trunks are `trunks`; `empty`: it has no
-/// branch yet); `None` when it may.
+/// branch yet); `None` when it may. (A protected branch's rewrites are git's to refuse, once it
+/// has the pushed commits: see [`serve`].)
 pub fn refused(pusher: &Pusher, repo: &str, review: &Review, trunks: &[String], u: &Update, empty: bool) -> Option<String> {
     let name = &u.name;
     let may = |cap: &str, level: kiln_ci::plan::perms::Level| match pusher {
@@ -343,6 +361,12 @@ pub fn refused(pusher: &Pusher, repo: &str, review: &Review, trunks: &[String], 
             // An empty repository takes its first trunk from anyone who may push.
             let first = u.creates() && empty && may("diffs.submit", write);
             return (!direct && !first).then(|| format!("{branch} is a trunk: only the land queue writes it (or `direct-push` in .kiln/review.yaml)"));
+        }
+        if review.protects(branch) {
+            if u.deletes() {
+                return Some(format!("{branch} is protected: it isn't deleted"));
+            }
+            return (!may("diffs.land", write)).then(|| format!("{branch} is protected: pushing it needs `diffs.land` (a job's token: `contents: write`)"));
         }
         return (!may("diffs.submit", write)).then(|| "pushing branches needs `diffs.submit` (a job's token: `contents: write`)".to_owned());
     }
@@ -463,6 +487,9 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     let branches = crate::gitops::run_git(hub, &["-C", &p, "for-each-ref", "--count=1", "--format=%(refname)", "refs/heads/"], crate::gitops::LS_REMOTE_TIMEOUT).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let empty = branches.iter().all(u8::is_ascii_whitespace);
     let mut no: Vec<(Update, String)> = updates.iter().filter_map(|u| refused(&who, &repo.name, &review, &trunk_list, u, empty).map(|why| (u.clone(), why))).collect();
+    // A protected branch isn't rewritten: git refuses this push's non-fast-forwards once it has
+    // the commits (before, they aren't there to compare).
+    let guarded: Vec<String> = updates.iter().filter(|u| !u.creates() && !u.deletes()).filter_map(|u| u.name.strip_prefix("refs/heads/").filter(|b| review.protects(b)).map(str::to_owned)).collect();
     let submitted: Vec<&Update> = updates.iter().filter(|u| u.name.starts_with("refs/for/")).collect();
     if submitted.len() > 1 {
         no.extend(submitted.iter().skip(1).map(|u| ((*u).clone(), "one refs/for/<trunk> a push".to_owned())));
@@ -505,6 +532,11 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     };
     // git takes the push; its answer (a report, and its progress) is read before it's passed on,
     // so kiln can say what the push made.
+    let mut configs: Vec<&str> = cgi.configs.to_vec();
+    if !guarded.is_empty() {
+        configs.push("receive.denyNonFastForwards=true");
+    }
+    let cgi = super::facade::Cgi { configs: &configs, ..cgi };
     let answer = super::facade::run(&cgi, head, Some(body)).await?;
     if answer.status != StatusCode::OK {
         let status = answer.status;
@@ -521,6 +553,11 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
         Pusher::Caller(c) => super::diffs::author_of(&c.name, Some(c.kind)),
         Pusher::Job(j) => super::diffs::author_of(&format!("job:{}", j.leg), None),
     };
+    for b in &guarded {
+        if report.lines.iter().any(|l| l.starts_with(&format!("ng refs/heads/{b} ")) && l.contains("fast-forward")) {
+            said.push(format!("{b} is protected: it isn't rewritten (a push that isn't a fast-forward)"));
+        }
+    }
     // What git took (`ok <ref>`), before kiln says more.
     let took: std::collections::HashSet<String> = report.lines.iter().filter_map(|l| l.strip_prefix("ok ")).map(|r| r.split_whitespace().next().unwrap_or(r).to_owned()).collect();
     if let Some(target) = &target {
@@ -575,6 +612,10 @@ pub async fn serve(hub: &Arc<Hub>, repo: &Repo, path: &Path, tail: &[&str], req:
     if !branches.is_empty() {
         let by = super::cr::By { pushed_by: user.clone(), author: author.clone() };
         said.extend(super::cr::pushed(hub, repo, &p, &branches, &by).await);
+    }
+    // A trunk written directly goes to the mirror too.
+    for t in trunk_list.iter().filter(|t| took.contains(&format!("refs/heads/{t}"))) {
+        mirror_trunk(hub, repo, &p, t);
     }
     hub.store.audit(user, "repo.push".into(), format!("{}: {summary}", repo.name)).await;
     // The poller takes the new refs now: events, runs.
@@ -660,6 +701,13 @@ mod tests {
         // still the land queue's.
         let two = vec!["main".to_owned(), "release".to_owned()];
         assert!(refused(&dev, "acme/app", &review, &two, &up("refs/heads/release", ZERO, &b), false).is_some());
+        // Protected branches: not deleted, not rewritten, pushed by those who land.
+        let guarded = Review { protected: vec!["release/*".into()], ..Review::default() };
+        assert!(refused(&dev, "acme/app", &guarded, &trunks, &up("refs/heads/release/1", &a, &b), false).is_some_and(|w| w.contains("diffs.land")));
+        assert!(refused(&owner, "acme/app", &guarded, &trunks, &up("refs/heads/release/1", &a, &b), false).is_none());
+        assert!(refused(&owner, "acme/app", &guarded, &trunks, &up("refs/heads/release/1", &a, ZERO), false).is_some_and(|w| w.contains("deleted")));
+        assert!(refused(&dev, "acme/app", &guarded, &trunks, &up("refs/heads/topic", &a, &b), false).is_none(), "others are anyone's");
+        assert!(guarded.protects("release/1") && !guarded.protects("topic"));
         // Another case of a trunk's name is the trunk, where the disk ignores case.
         assert!(refused(&owner, "acme/app", &Review::default(), &trunks, &up("refs/heads/MAIN", &a, &b), false).is_some());
         assert!(refused(&dev, "acme/app", &review, &trunks, &up("refs/heads/Main", ZERO, &b), true).is_some());

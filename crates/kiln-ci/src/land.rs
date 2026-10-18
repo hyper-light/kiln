@@ -109,6 +109,16 @@ pub struct Policy {
     pub queue: Queue,
     /// Who may push trunks directly, bypassing the queue.
     pub direct_push: Vec<String>,
+    /// Branches (globs) that are never deleted or rewritten, and that only those who may land
+    /// push (W14-R02's branch protection).
+    pub protected: Vec<String>,
+}
+
+impl Policy {
+    /// Whether `branch` is protected.
+    pub fn protects(&self, branch: &str) -> bool {
+        !self.protected.is_empty() && Patterns::new(&self.protected).is_ok_and(|p| p.matches(branch))
+    }
 }
 
 impl Policy {
