@@ -180,8 +180,8 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W07 | Actions | W06 | in progress | pins at run start, mirror, JS (pre/post), composite, local; `actions/checkout@v4` unmodified; Docker, `$/`, policy left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; environments, brokered, UI left |
-| W10 | Identity, tokens, OIDC issuer | none | ready | |
-| W11 | Integrations and credential broker | W10 | blocked (W10) | |
+| W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt), OIDC issuer (RS256, rotation, GitHub claims, getIDToken); principals and roles left |
+| W11 | Integrations and credential broker | W10 | ready (OIDC issuer) | |
 | W12 | Registries | W08 (store) | blocked (W08) | |
 | W13 | Runners and executors | W06 | ready (facts, docker) | |
 | W14 | Code hosting, stacks, review, landing | W03 | in progress | the facade: git (smart HTTP at the root), REST at /api/v3 (artifacts, 501s); hosting, review left |
@@ -2463,7 +2463,35 @@ elsewhere (G-24, G-33).
   reading them over HTTPS accepts (checked by a verifier that fetches only from that location).
   *Integration test.*
 
-**Progress.** Not started.
+**Progress.** In progress.
+
+- *Done.*
+  - Job tokens (R03, R04):
+    - `GITHUB_TOKEN` is `kiln_job_<leg>_<random>`, stored as its SHA-256 hash with its last use,
+      carrying the job's permissions;
+    - it is revoked when its attempt ends;
+    - the facade checks it with GitHub's mapping (git fetches need `contents: read`, and so on),
+      refusing with "Resource not accessible by integration";
+    - `ACTIONS_RUNTIME_TOKEN` stays the leg's signed JWT (W08-R04).
+  - The OIDC issuer:
+    - `kiln_ci::oidc`: rotation, claims, subjects and the discovery document (R06, R08, R09, AC05,
+      AC06);
+    - `crates/kiln/src/ci/oidc.rs`: RS256 keys sealed by the master key, the open discovery and
+      JWKS documents, and `/_kiln/oidc/token` for legs granted `id-token: write` (R07);
+    - untrusted runs get no ID tokens unless `[ci.oidc] untrusted` (R10).
+  - Checked end to end on a local server:
+    - AC03: `core.getIDToken('sts.amazonaws.com')` returns a token that verifies against the
+      published keys, with GitHub's claims;
+    - no ID token variables without the permission;
+    - the token permissions;
+    - a token refused once its attempt ended.
+- *Left.*
+  - R01, R02 and R05: principals, capabilities, roles, and the one route table, from access.md.
+  - PATs and agent tokens (R03).
+  - Kiln's own permission scopes (R04).
+  - Per-repository subject customization (R09; server-wide today), R11, R12 (`kiln oidc
+    publish`, `jwks`).
+  - AC01, AC02, AC04 (real federation, user-assisted), AC07.
 
 ### W11 Integrations and the credential broker
 
