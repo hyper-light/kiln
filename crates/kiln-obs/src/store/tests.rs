@@ -806,3 +806,45 @@ fn a_maintenance_thread_rewrites_while_the_store_applies_and_cuts() {
     assert!(taken > 0, "the thread took rewrites in");
     assert_eq!(view(&shared.read().unwrap()), view(&c));
 }
+
+/// Cuts as a busy group makes them, a big one and then a small one (a compaction's, then a
+/// snapshot's), and the logarithmic method's merges after each: the blocks stay a handful, each
+/// more than twice the next newer, however long it goes on. (Merging only the newest pair stalled
+/// here: a small cut always sat at the newest end, so equal blocks behind it never merged.)
+#[test]
+fn alternating_big_and_small_cuts_still_merge_into_a_handful_of_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Keyed::new()).unwrap();
+    let keys: Vec<SeriesKey> = (0..500).map(|i| SeriesKey::new("load.v", [("s", &i.to_string()[..])], Kind::Gauge).unwrap()).collect();
+    let (mut index, mut t) = (0u64, 0i64);
+    let mut most = 0;
+    for cut in 0..64 {
+        // A big cut is 20 batches, a small one 2.
+        for _ in 0..(if cut % 2 == 0 { 20 } else { 2 }) {
+            let mut b = Builder::new();
+            for k in &keys {
+                if index == 0 {
+                    b.define(k);
+                }
+                b.run(k.fp, (0..20).map(|j| (t + j, (t + j) as f64 * 0.5)));
+            }
+            t += 20;
+            index += 1;
+            s.apply(&b.finish()).unwrap();
+        }
+        s.cut(Point { index, term: 1 }).unwrap();
+        s.compact().unwrap();
+        most = most.max(s.block_count());
+        let sizes: Vec<u64> = s.block_list().iter().map(|b| b.2).collect();
+        // Every pair but the newest end's keeps the invariant (the newest may be a small cut).
+        for w in sizes.windows(2) {
+            assert!(w[1] * 2 < w[0], "cut {cut}: blocks {sizes:?}");
+        }
+    }
+    // 64 cuts of 704 batches in all: log2 of it, give or take.
+    assert!(most <= 12, "{most} blocks at the most");
+    let mut ids = Vec::new();
+    s.select(&crate::index::Selector::metric("load.v"), &mut ids);
+    assert_eq!(ids.len(), 500);
+    assert_eq!(s.totals().samples, index * 500 * 20);
+}

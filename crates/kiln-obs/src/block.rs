@@ -2,20 +2,30 @@
 //!
 //! ```text
 //! block  := MAGIC 8 | FORMAT u32-le | data | index | footer
-//! data   := each series' chunks, contiguous, series after series
+//! data   := each series' region, contiguous, series after series by fingerprint
+//! region := table length varint | table | the chunks' bytes, in time order
+//! table  := chunks varint | per chunk: first zigzag | last−first varint | count varint | length varint
 //! index  := series varint | per series, by fingerprint:
-//!             fp u64-le | kind u8 | key varint-length bytes | data offset varint | data length varint
-//!             | data crc32c u32-le | chunks varint | per chunk: first zigzag | last−first varint | count varint | length varint
+//!             fp u64-le | kind u8 | key varint-length bytes | region offset varint | region length varint
+//!             | region crc32c u32-le | first zigzag | last−first varint
 //! footer := index offset u64-le | index length u64-le | min ts i64-le | max ts i64-le
 //!           | crc32c of the index and the footer's first 32 bytes u32-le | TAIL 4              (40 bytes)
 //! ```
 //!
-//! Opening a block reads its footer and index only, so a store opens in time proportional to its
-//! series, not its samples; a series' data is read with one positioned read and checked against
-//! its own CRC-32C, so damage anywhere is found when it is read, and nothing past it is trusted.
+//! An open block holds, of each series, its fingerprint and where its region is (some 40 bytes),
+//! nothing a chunk or a key: what it holds in memory grows with its series, not its samples, so a
+//! store keeps a year without keeping a year's index in memory (Prometheus's blocks and
+//! ClickHouse's parts read their marks the same way, from disk, as a read needs them). A series'
+//! region, its chunk table and its chunks, is read with one positioned read and checked against its
+//! own CRC-32C, so damage anywhere is found when it is read, and nothing past it is trusted. Keys
+//! are read from the index when they are wanted: when a store opens, and when blocks merge.
+//!
+//! A block is written as it goes ([`Writer`]): a region at a time, its index (small: a series'
+//! entry) kept until the end. A merge copies a region another block holds whole when nothing of it
+//! changes ([`Writer::region`]): no sample decoded, none encoded.
 
 use std::fs::File;
-use std::io::{self, Write as _};
+use std::io::{self, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
 use crate::batch::{Kind, fingerprint};
@@ -24,7 +34,7 @@ use crate::gorilla::{ChunkRef, DecodeError};
 use crate::varint;
 
 pub const MAGIC: [u8; 8] = *b"KOBLOCK\n";
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 const TAIL: [u8; 4] = *b"KOB1";
 const FOOTER: usize = 40;
 const HEADER: usize = 12;
@@ -41,29 +51,19 @@ pub enum BlockError {
     Damaged(PathBuf, &'static str),
     #[error("{0}: a chunk does not decode: {1}")]
     Decode(PathBuf, DecodeError),
+    #[error("{0}: series written out of fingerprint order")]
+    Order(PathBuf),
 }
 
-/// A chunk as a block holds it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkMeta {
-    pub first: i64,
-    pub last: i64,
-    pub count: u32,
-    /// Offset in its series' data.
-    off: u32,
-    len: u32,
-}
-
+/// What an open block holds of a series.
 #[derive(Debug, Clone, Copy)]
 struct SeriesMeta {
     kind: Kind,
-    key_at: u32,
-    key_len: u32,
     data_off: u64,
     data_len: u32,
     data_crc: u32,
-    chunks_at: u32,
-    chunks: u32,
+    first: i64,
+    last: i64,
 }
 
 /// An open block.
@@ -76,10 +76,10 @@ pub struct Block {
     pub bytes: u64,
     /// The footer's checksum: with `bytes`, what names this block's contents.
     pub crc: u32,
+    index_off: u64,
+    index_len: u64,
     fps: Vec<u64>,
     series: Vec<SeriesMeta>,
-    keys: Vec<u8>,
-    chunks: Vec<ChunkMeta>,
 }
 
 /// A series to write: its identity and its chunks, in time order and not overlapping.
@@ -95,56 +95,126 @@ fn io_err(path: &Path) -> impl FnOnce(io::Error) -> BlockError + '_ {
     move |source| BlockError::Io { path: path.to_owned(), source }
 }
 
-/// Writes a block of `series` (any order: it is sorted by fingerprint here) to `path`, durably:
-/// the file is written whole, then synced. Series with no chunk are left out.
+/// Writes a block of `series` (any order: it is sorted by fingerprint here) to `path`, durably.
+/// Series with no chunk are left out.
 pub fn write(path: &Path, mut series: Vec<SeriesData<'_>>) -> Result<Block, BlockError> {
     series.retain(|s| !s.chunks.is_empty());
     series.sort_unstable_by_key(|s| s.fp);
-    let mut out: Vec<u8> = Vec::with_capacity(HEADER + series.iter().map(|s| s.chunks.iter().map(|c| c.3.len()).sum::<usize>()).sum::<usize>() + series.len() * 64 + FOOTER);
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&FORMAT.to_le_bytes());
-    let mut index = Vec::new();
-    varint::put(&mut index, series.len() as u64);
-    let (mut min_ts, mut max_ts) = (i64::MAX, i64::MIN);
+    let mut w = Writer::create(path)?;
     for s in &series {
-        let data_off = out.len() as u64;
-        for c in &s.chunks {
-            out.extend_from_slice(c.3);
-        }
-        let data = out.get(data_off as usize..).unwrap_or(&[]);
-        index.extend_from_slice(&s.fp.to_le_bytes());
-        index.push(s.kind as u8);
-        varint::put(&mut index, s.key.len() as u64);
-        index.extend_from_slice(s.key);
-        varint::put(&mut index, data_off);
-        varint::put(&mut index, data.len() as u64);
-        index.extend_from_slice(&crc32c::checksum(data).to_le_bytes());
-        varint::put(&mut index, s.chunks.len() as u64);
-        for c in &s.chunks {
-            varint::put(&mut index, varint::zig(c.0));
-            varint::put(&mut index, (c.1 as u64).wrapping_sub(c.0 as u64));
-            varint::put(&mut index, u64::from(c.2));
-            varint::put(&mut index, c.3.len() as u64);
-            min_ts = min_ts.min(c.0);
-            max_ts = max_ts.max(c.1);
-        }
+        w.series(s.fp, s.kind, s.key, &s.chunks)?;
     }
-    let index_off = out.len() as u64;
-    out.extend_from_slice(&index);
-    let mut foot = Vec::with_capacity(FOOTER);
-    foot.extend_from_slice(&index_off.to_le_bytes());
-    foot.extend_from_slice(&(index.len() as u64).to_le_bytes());
-    foot.extend_from_slice(&min_ts.to_le_bytes());
-    foot.extend_from_slice(&max_ts.to_le_bytes());
-    let crc = crc32c::update(crc32c::checksum(&index), &foot);
-    foot.extend_from_slice(&crc.to_le_bytes());
-    foot.extend_from_slice(&TAIL);
-    out.extend_from_slice(&foot);
-    let mut f = File::create(path).map_err(io_err(path))?;
-    f.write_all(&out).map_err(io_err(path))?;
-    f.sync_all().map_err(io_err(path))?;
-    drop(f);
-    Block::open(path)
+    w.finish()
+}
+
+/// A block being written: regions as they come (by fingerprint), the index kept until
+/// [`Writer::finish`] writes it and the footer, syncs the file and opens it.
+pub struct Writer {
+    path: PathBuf,
+    file: BufWriter<File>,
+    at: u64,
+    index: Vec<u8>,
+    count: u64,
+    min_ts: i64,
+    max_ts: i64,
+    last_fp: Option<u64>,
+    /// Reused: a region's chunk table, and its length before it.
+    table: Vec<u8>,
+    head: Vec<u8>,
+}
+
+impl Writer {
+    pub fn create(path: &Path) -> Result<Self, BlockError> {
+        let file = File::create(path).map_err(io_err(path))?;
+        let mut file = BufWriter::with_capacity(1 << 20, file);
+        file.write_all(&MAGIC).map_err(io_err(path))?;
+        file.write_all(&FORMAT.to_le_bytes()).map_err(io_err(path))?;
+        Ok(Self { path: path.to_owned(), file, at: HEADER as u64, index: Vec::new(), count: 0, min_ts: i64::MAX, max_ts: i64::MIN, last_fp: None, table: Vec::new(), head: Vec::new() })
+    }
+
+    /// A series, its chunks in time order (`(first, last, count, bytes)` each); none, nothing.
+    pub fn series(&mut self, fp: u64, kind: Kind, key: &[u8], chunks: &[(i64, i64, u32, &[u8])]) -> Result<(), BlockError> {
+        let (Some(first), Some(last)) = (chunks.first(), chunks.last()) else { return Ok(()) };
+        let (first, last) = (first.0, last.1);
+        self.table.clear();
+        varint::put(&mut self.table, chunks.len() as u64);
+        for c in chunks {
+            varint::put(&mut self.table, varint::zig(c.0));
+            varint::put(&mut self.table, (c.1 as u64).wrapping_sub(c.0 as u64));
+            varint::put(&mut self.table, u64::from(c.2));
+            varint::put(&mut self.table, c.3.len() as u64);
+        }
+        self.head.clear();
+        varint::put(&mut self.head, self.table.len() as u64);
+        let mut crc = crc32c::update(crc32c::checksum(&self.head), &self.table);
+        let mut len = (self.head.len() + self.table.len()) as u64;
+        for c in chunks {
+            crc = crc32c::update(crc, c.3);
+            len += c.3.len() as u64;
+        }
+        self.entry(fp, kind, key, len, crc, first, last)?;
+        let path = &self.path;
+        self.file.write_all(&self.head).map_err(io_err(path))?;
+        self.file.write_all(&self.table).map_err(io_err(path))?;
+        for c in chunks {
+            self.file.write_all(c.3).map_err(io_err(path))?;
+        }
+        self.at += len;
+        Ok(())
+    }
+
+    /// A series' region as another block holds it (`region`, its checksum `crc`, its span), copied
+    /// whole: what a merge does of a series nothing changes of.
+    pub fn region(&mut self, fp: u64, kind: Kind, key: &[u8], region: &[u8], crc: u32, span: (i64, i64)) -> Result<(), BlockError> {
+        self.entry(fp, kind, key, region.len() as u64, crc, span.0, span.1)?;
+        self.file.write_all(region).map_err(io_err(&self.path))?;
+        self.at += region.len() as u64;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn entry(&mut self, fp: u64, kind: Kind, key: &[u8], len: u64, crc: u32, first: i64, last: i64) -> Result<(), BlockError> {
+        if self.last_fp.is_some_and(|l| l >= fp) {
+            return Err(BlockError::Order(self.path.clone()));
+        }
+        self.last_fp = Some(fp);
+        self.index.extend_from_slice(&fp.to_le_bytes());
+        self.index.push(kind as u8);
+        varint::put(&mut self.index, key.len() as u64);
+        self.index.extend_from_slice(key);
+        varint::put(&mut self.index, self.at);
+        varint::put(&mut self.index, len);
+        self.index.extend_from_slice(&crc.to_le_bytes());
+        varint::put(&mut self.index, varint::zig(first));
+        varint::put(&mut self.index, (last as u64).wrapping_sub(first as u64));
+        self.count += 1;
+        self.min_ts = self.min_ts.min(first);
+        self.max_ts = self.max_ts.max(last);
+        Ok(())
+    }
+
+    /// The index and the footer written, the file synced, the block opened.
+    pub fn finish(mut self) -> Result<Block, BlockError> {
+        let mut index = Vec::with_capacity(self.index.len() + 10);
+        varint::put(&mut index, self.count);
+        index.extend_from_slice(&self.index);
+        let index_off = self.at;
+        let mut foot = Vec::with_capacity(FOOTER);
+        foot.extend_from_slice(&index_off.to_le_bytes());
+        foot.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        foot.extend_from_slice(&self.min_ts.to_le_bytes());
+        foot.extend_from_slice(&self.max_ts.to_le_bytes());
+        let crc = crc32c::update(crc32c::checksum(&index), &foot);
+        foot.extend_from_slice(&crc.to_le_bytes());
+        foot.extend_from_slice(&TAIL);
+        let path = self.path.clone();
+        self.file.write_all(&index).map_err(io_err(&path))?;
+        self.file.write_all(&foot).map_err(io_err(&path))?;
+        let f = self.file.into_inner().map_err(|e| io_err(&path)(e.into_error()))?;
+        f.sync_all().map_err(io_err(&path))?;
+        drop(f);
+        Block::open(&path)
+    }
 }
 
 #[cfg(unix)]
@@ -169,8 +239,80 @@ fn read_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// A region's chunks overlapping a range ([`Block::chunks_in`]), its table read as they are asked
+/// for; every chunk's bytes checked to lie in the region.
+pub struct RegionChunks<'b> {
+    path: &'b Path,
+    table: &'b [u8],
+    left: usize,
+    chunks: &'b [u8],
+    off: usize,
+    from: i64,
+    to: i64,
+}
+
+impl<'b> Iterator for RegionChunks<'b> {
+    /// A chunk: its first and last time, its samples, its bytes.
+    type Item = Result<(i64, i64, u32, &'b [u8]), BlockError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.left > 0 {
+            self.left -= 1;
+            let damaged = || BlockError::Damaged(self.path.to_owned(), "a series' chunk table");
+            let mut get = || varint::get(&mut self.table);
+            let (Some(first), Some(span), Some(count), Some(len)) = (get(), get(), get(), get()) else { return Some(Err(damaged())) };
+            let first = varint::zag(first);
+            let last = (first as u64).wrapping_add(span) as i64;
+            let (Ok(count), Ok(len)) = (u32::try_from(count), usize::try_from(len)) else { return Some(Err(damaged())) };
+            let Some(bytes) = self.off.checked_add(len).and_then(|end| self.chunks.get(self.off..end)) else { return Some(Err(damaged())) };
+            self.off += len;
+            if last >= self.from && first <= self.to {
+                return Some(Ok((first, last, count, bytes)));
+            }
+        }
+        None
+    }
+}
+
+/// A block's index, read from disk for its keys ([`Block::keys`]).
+pub struct Keys {
+    path: PathBuf,
+    index: Vec<u8>,
+}
+
+impl Keys {
+    /// Every series: fingerprint, kind, canonical key, in fingerprint order; each key checked
+    /// against its fingerprint.
+    pub fn iter(&self) -> impl Iterator<Item = Result<(u64, Kind, &[u8]), BlockError>> + '_ {
+        let mut at = self.index.as_slice();
+        let n = varint::get(&mut at).unwrap_or(0);
+        (0..n).map_while(move |_| {
+            let entry = (|| {
+                let (fp, rest) = at.split_first_chunk::<8>()?;
+                let (&kind, rest) = rest.split_first()?;
+                at = rest;
+                let key_len = usize::try_from(varint::get(&mut at)?).ok()?;
+                let (key, rest) = at.split_at_checked(key_len)?;
+                at = rest;
+                varint::get(&mut at)?;
+                varint::get(&mut at)?;
+                let (_, rest) = at.split_first_chunk::<4>()?;
+                at = rest;
+                varint::get(&mut at)?;
+                varint::get(&mut at)?;
+                Some((u64::from_le_bytes(*fp), Kind::from_u8(kind)?, key))
+            })();
+            Some(match entry {
+                Some((fp, kind, key)) if fingerprint(key) == fp => Ok((fp, kind, key)),
+                Some(_) => Err(BlockError::Damaged(self.path.clone(), "a key is not its fingerprint's")),
+                None => Err(BlockError::Damaged(self.path.clone(), "index")),
+            })
+        })
+    }
+}
+
 impl Block {
-    /// Opens a block: its footer and index, checked.
+    /// Opens a block: its footer and index, checked; of the index, each series' place kept.
     pub fn open(path: &Path) -> Result<Self, BlockError> {
         let file = File::open(path).map_err(io_err(path))?;
         let bytes = file.metadata().map_err(io_err(path))?.len();
@@ -206,7 +348,7 @@ impl Block {
         if crc32c::update(crc32c::checksum(&index), foot.get(..32).unwrap_or(&[])) != crc {
             return Err(damaged("index checksum"));
         }
-        let mut b = Self { path: path.to_owned(), file, min_ts, max_ts, bytes, crc, fps: Vec::new(), series: Vec::new(), keys: Vec::new(), chunks: Vec::new() };
+        let mut b = Self { path: path.to_owned(), file, min_ts, max_ts, bytes, crc, index_off, index_len, fps: Vec::new(), series: Vec::new() };
         b.parse_index(&index, index_off).ok_or_else(|| damaged("index"))?;
         Ok(b)
     }
@@ -214,12 +356,12 @@ impl Block {
     fn parse_index(&mut self, index: &[u8], data_end: u64) -> Option<()> {
         let mut at = index;
         let n = usize::try_from(varint::get(&mut at)?).ok()?;
-        // Each series takes at least 16 bytes of index: a count beyond that is damage.
-        if n > index.len() / 16 + 1 {
+        // Each series takes at least 18 bytes of index: a count beyond that is damage.
+        if n > index.len() / 18 + 1 {
             return None;
         }
-        self.fps.reserve(n);
-        self.series.reserve(n);
+        self.fps.reserve_exact(n);
+        self.series.reserve_exact(n);
         let mut last_fp = None;
         for _ in 0..n {
             let (fp, rest) = at.split_first_chunk::<8>()?;
@@ -232,7 +374,7 @@ impl Block {
             at = rest;
             let kind = Kind::from_u8(kind)?;
             let key_len = usize::try_from(varint::get(&mut at)?).ok()?;
-            let (key, rest) = at.split_at_checked(key_len)?;
+            let (_, rest) = at.split_at_checked(key_len)?;
             at = rest;
             let data_off = varint::get(&mut at)?;
             let data_len = u32::try_from(varint::get(&mut at)?).ok()?;
@@ -241,24 +383,10 @@ impl Block {
             }
             let (crc, rest) = at.split_first_chunk::<4>()?;
             at = rest;
-            let chunks = u32::try_from(varint::get(&mut at)?).ok()?;
-            let chunks_at = u32::try_from(self.chunks.len()).ok()?;
-            let mut off = 0u32;
-            for _ in 0..chunks {
-                let first = varint::zag(varint::get(&mut at)?);
-                let last = (first as u64).wrapping_add(varint::get(&mut at)?) as i64;
-                let count = u32::try_from(varint::get(&mut at)?).ok()?;
-                let len = u32::try_from(varint::get(&mut at)?).ok()?;
-                self.chunks.push(ChunkMeta { first, last, count, off, len });
-                off = off.checked_add(len)?;
-            }
-            if off != data_len {
-                return None;
-            }
-            let key_at = u32::try_from(self.keys.len()).ok()?;
-            self.keys.extend_from_slice(key);
+            let first = varint::zag(varint::get(&mut at)?);
+            let last = (first as u64).wrapping_add(varint::get(&mut at)?) as i64;
             self.fps.push(fp);
-            self.series.push(SeriesMeta { kind, key_at, key_len: key_len as u32, data_off, data_len, data_crc: u32::from_le_bytes(*crc), chunks_at, chunks });
+            self.series.push(SeriesMeta { kind, data_off, data_len, data_crc: u32::from_le_bytes(*crc), first, last });
         }
         at.is_empty().then_some(())
     }
@@ -280,30 +408,26 @@ impl Block {
         self.fps.binary_search(&fp).ok()
     }
 
-    /// Every series: fingerprint, kind, canonical key; each key checked against its fingerprint.
-    pub fn series(&self) -> impl Iterator<Item = Result<(u64, Kind, &[u8]), BlockError>> + '_ {
-        self.fps.iter().zip(&self.series).map(|(&fp, s)| {
-            let key = self.keys.get(s.key_at as usize..(s.key_at + s.key_len) as usize).ok_or_else(|| BlockError::Damaged(self.path.clone(), "key"))?;
-            if fingerprint(key) != fp {
-                return Err(BlockError::Damaged(self.path.clone(), "a key is not its fingerprint's"));
-            }
-            Ok((fp, s.kind, key))
-        })
+    /// The block's keys, read from its index (checked again against the index's checksum).
+    pub fn keys(&self) -> Result<Keys, BlockError> {
+        let mut index = vec![0u8; usize::try_from(self.index_len).map_err(|_| BlockError::Damaged(self.path.clone(), "index length"))?];
+        read_at(&self.file, &mut index, self.index_off).map_err(io_err(&self.path))?;
+        let mut foot = [0u8; 32];
+        read_at(&self.file, &mut foot, self.bytes - FOOTER as u64).map_err(io_err(&self.path))?;
+        if crc32c::update(crc32c::checksum(&index), &foot) != self.crc {
+            return Err(BlockError::Damaged(self.path.clone(), "index checksum"));
+        }
+        Ok(Keys { path: self.path.clone(), index })
     }
 
     /// The time span of series `i`'s data here.
     pub fn span(&self, i: usize) -> Option<(i64, i64)> {
-        let chunks = self.chunk_metas(i)?;
-        Some((chunks.first()?.first, chunks.last()?.last))
+        self.series.get(i).map(|s| (s.first, s.last))
     }
 
-    fn chunk_metas(&self, i: usize) -> Option<&[ChunkMeta]> {
-        let s = self.series.get(i)?;
-        self.chunks.get(s.chunks_at as usize..(s.chunks_at + s.chunks) as usize)
-    }
-
-    /// Reads series `i`'s data into `buf` (reused across calls), checked.
-    pub fn load(&self, i: usize, buf: &mut Vec<u8>) -> Result<(), BlockError> {
+    /// Reads series `i`'s region (its chunk table and chunks) into `buf` (reused across calls),
+    /// checked; its checksum.
+    pub fn load(&self, i: usize, buf: &mut Vec<u8>) -> Result<u32, BlockError> {
         let s = self.series.get(i).ok_or_else(|| BlockError::Damaged(self.path.clone(), "series index"))?;
         buf.clear();
         buf.resize(s.data_len as usize, 0);
@@ -311,12 +435,19 @@ impl Block {
         if crc32c::checksum(buf) != s.data_crc {
             return Err(BlockError::Damaged(self.path.clone(), "series data checksum"));
         }
-        Ok(())
+        Ok(s.data_crc)
     }
 
-    /// Series `i`'s chunks overlapping `[from, to]`, from its data as [`Block::load`] read it.
-    pub fn chunks_in<'b>(&self, i: usize, data: &'b [u8], from: i64, to: i64) -> impl Iterator<Item = ChunkRef<'b>> + use<'b, '_> {
-        self.chunk_metas(i).unwrap_or(&[]).iter().filter(move |c| c.last >= from && c.first <= to).filter_map(move |c| data.get(c.off as usize..(c.off + c.len) as usize).map(|b| ChunkRef::new(b, c.count)))
+    /// Series `i`'s chunks overlapping `[from, to]`, from its region as [`Block::load`] read it,
+    /// read from its chunk table as they are asked for: nothing allocated.
+    pub fn chunks_in<'b>(&'b self, i: usize, data: &'b [u8], from: i64, to: i64) -> Result<RegionChunks<'b>, BlockError> {
+        let _ = i;
+        let damaged = || BlockError::Damaged(self.path.clone(), "a series' chunk table");
+        let mut at = data;
+        let table_len = varint::get(&mut at).and_then(|n| usize::try_from(n).ok()).ok_or_else(damaged)?;
+        let (mut table, chunks) = at.split_at_checked(table_len).ok_or_else(damaged)?;
+        let left = varint::get(&mut table).and_then(|n| usize::try_from(n).ok()).filter(|&n| n <= table_len).ok_or_else(damaged)?;
+        Ok(RegionChunks { path: &self.path, table, left, chunks, off: 0, from, to })
     }
 
     /// Appends series `i`'s samples in `[from, to]`, in time order.
@@ -326,8 +457,9 @@ impl Block {
             return Ok(());
         }
         self.load(i, buf)?;
-        for c in self.chunks_in(i, buf, from, to) {
-            let mut d = c.iter();
+        for c in self.chunks_in(i, buf, from, to)? {
+            let (_, _, count, bytes) = c?;
+            let mut d = ChunkRef::new(bytes, count).iter();
             while let Some((t, v)) = d.next_sample().map_err(|e| BlockError::Decode(self.path.clone(), e))? {
                 if t > to {
                     break;
@@ -345,24 +477,40 @@ impl Block {
         self.series.get(i).map(|s| s.kind)
     }
 
-    /// Reads every series' data whole, checked against its checksum and decoded: what a block
-    /// fetched from another replica is put through before it is taken.
+    /// Reads every series' region whole, checked against its checksum and decoded, and every key
+    /// against its fingerprint: what a block fetched from another replica is put through before it
+    /// is taken.
     pub fn verify(&self) -> Result<(), BlockError> {
+        let keys = self.keys()?;
+        let mut n = 0usize;
+        for k in keys.iter() {
+            k?;
+            n += 1;
+        }
+        if n != self.len() {
+            return Err(BlockError::Damaged(self.path.clone(), "index"));
+        }
         let mut buf = Vec::new();
-        for (i, s) in self.series().enumerate() {
-            s?;
+        for i in 0..self.len() {
             self.load(i, &mut buf)?;
-            for c in self.chunks_in(i, &buf, i64::MIN, i64::MAX) {
-                let mut d = c.iter();
-                while d.next_sample().map_err(|e| BlockError::Decode(self.path.clone(), e))?.is_some() {}
+            let mut samples = 0u64;
+            for c in self.chunks_in(i, &buf, i64::MIN, i64::MAX)? {
+                let (_, _, count, bytes) = c?;
+                let mut d = ChunkRef::new(bytes, count).iter();
+                while d.next_sample().map_err(|e| BlockError::Decode(self.path.clone(), e))?.is_some() {
+                    samples += 1;
+                }
+            }
+            if samples == 0 {
+                return Err(BlockError::Damaged(self.path.clone(), "a series without samples"));
             }
         }
         Ok(())
     }
 
-    /// Bytes the open block holds in memory: its index.
+    /// Bytes the open block holds in memory: a place a series.
     pub fn heap_bytes(&self) -> usize {
-        self.fps.capacity() * 8 + self.series.capacity() * std::mem::size_of::<SeriesMeta>() + self.keys.capacity() + self.chunks.capacity() * std::mem::size_of::<ChunkMeta>()
+        self.fps.capacity() * 8 + self.series.capacity() * std::mem::size_of::<SeriesMeta>()
     }
 }
 
@@ -416,7 +564,8 @@ mod tests {
                 assert_eq!(ts.len(), d.len() - 5);
             }
         }
-        let listed: Vec<u64> = again.series().map(|r| r.unwrap().0).collect();
+        let keys_read = again.keys().unwrap();
+        let listed: Vec<u64> = keys_read.iter().map(|r| r.unwrap().0).collect();
         let mut fps: Vec<u64> = keys.iter().map(|k| k.fp).collect();
         fps.sort_unstable();
         assert_eq!(listed, fps);

@@ -254,8 +254,9 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     let r_flt0 = MINFLT.with(std::cell::Cell::get);
     let (s_threads0, r_threads0) = (cpu_by_thread(server_pid), cpu_by_thread(runner_pid));
 
-    // Points stand 10 ms apart in each series, from ten minutes ago: each request's its own time.
-    let t0_ms = common::now_ms() - 600_000;
+    // Points stand 1 ms apart in each series, from two hours ago: each request's its own time, all
+    // of them in the past however long the flood (a minute of it is some 60,000 requests a sender).
+    let t0_ms = common::now_ms() - 7_200_000;
     let stop = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
     let mut threads = Vec::new();
@@ -269,7 +270,7 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
             let headers = format!("{auth}Content-Type: application/x-protobuf\r\n{}", if compress { "Content-Encoding: gzip\r\n" } else { "" });
             let mut i: u64 = 0;
             while !stop.load(Ordering::Relaxed) {
-                let ts_ns = (t0_ms as u64 + i * 10) * 1_000_000;
+                let ts_ns = (t0_ms as u64 + i) * 1_000_000;
                 let body = request(sender, series, ts_ns);
                 let body = if compress { gzip(&body).unwrap_or(body) } else { body };
                 let t = Instant::now();
@@ -300,13 +301,15 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     // What a dashboard asks meanwhile: one series, and every series by host.
     let reader = {
         let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
+        let t0 = t0_ms;
         std::thread::spawn(move || -> (Vec<u64>, Vec<u64>, Vec<String>) {
             let (mut one, mut all, mut errors) = (Vec::new(), Vec::new(), Vec::new());
             let mut conn = Conn::new(port);
             while !stop.load(Ordering::Relaxed) && env("KOBS_LOAD_READ", 1) == 1 {
-                let now = common::now_ms();
+                // What came in the last 15 seconds of the flood's own time (its points' times).
+                let now = t0 + started.elapsed().as_millis() as i64 * 3;
                 for (q, into) in [("avg:load.v{host:load-0,s:7}", &mut one), ("sum:load.v{*} by {host}", &mut all)] {
-                    let body = serde_json::to_vec(&json!({ "query": q, "from": now - 900_000, "to": now, "points": 120 })).unwrap_or_default();
+                    let body = serde_json::to_vec(&json!({ "query": q, "from": now - 15_000, "to": now, "points": 120 })).unwrap_or_default();
                     let t = Instant::now();
                     match conn.send("/api/observe/v1/query", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &body) {
                         Ok(a) if a.code == 200 => into.push(t.elapsed().as_micros() as u64),
@@ -352,7 +355,7 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     }
     let lag = settled.elapsed();
     // Every point taken, readable, once: the count settles at what was taken, no more, no less.
-    let to = common::now_ms() + 60_000;
+    let to = newest.iter().map(|(_, ms)| *ms).max().unwrap_or(t0_ms) + 1_000;
     let mut have = 0;
     while settled.elapsed() < Duration::from_secs(180) {
         have = stored(&f, t0_ms - 60_000, to)?;
@@ -397,8 +400,25 @@ fn an_otlp_flood_is_taken_or_refused_never_lost_and_replicas_agree() -> anyhow::
     let ((s_now, s_anon), (r_now, r_anon)) = (rss(server_pid), rss(runner_pid));
     eprintln!("  after it   the server holds {s_now:.0} MiB ({s_anon:.0} anonymous), the runner {r_now:.0} MiB ({r_anon:.0} anonymous)");
     let mib = |k: &str| at(&s, &[k]).as_u64().unwrap_or(0) as f64 / 1048576.0;
-    eprintln!("  the server's store in memory: symbols {:.1} MiB, index {:.1} MiB, head samples {:.1} MiB", mib("heap_symbols"), mib("heap_index"), mib("heap_samples"));
+    eprintln!(
+        "  the server's store: {} blocks, {:.0} MiB on disk; in memory symbols {:.1} MiB, index {:.1} MiB, head samples {:.1} MiB",
+        at(&s, &["blocks"]).as_u64().unwrap_or(0),
+        mib("disk_bytes"),
+        mib("heap_symbols"),
+        mib("heap_index"),
+        mib("heap_samples")
+    );
     eprintln!("  replicas   agree at index {index}: {digest:016x}");
+    if std::env::var("KOBS_LOAD_FILES").is_ok() {
+        let dir = f.root.path().join("server").join("observe").join("store");
+        let mut files: Vec<(String, u64)> = std::fs::read_dir(&dir)?.flatten().filter_map(|e| Some((e.file_name().to_string_lossy().into_owned(), e.metadata().ok()?.len()))).collect();
+        files.sort();
+        eprintln!("  the server's store files: {files:?}");
+        let log = std::fs::read_to_string(f.root.path().join("server.log")).unwrap_or_default();
+        for l in log.lines().filter(|l| l.contains("rewrite") || l.contains("maintenance looks") || l.contains("WARN") || l.contains("not taken")).take(40) {
+            eprintln!("  server log: {l}");
+        }
+    }
     // Under a profiler (KOBS_PROFILE), each node stops gently so its profile is saved.
     f.stop_gently();
     Ok(())
@@ -416,7 +436,7 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
     f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
     let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
     let runner_pid = f.runners.get("r1").and_then(Option::as_ref).map_or(0, |p| p.child.id());
-    let t0_ms = common::now_ms() - 600_000;
+    let t0_ms = common::now_ms() - 7_200_000;
     let stop = Arc::new(AtomicBool::new(false));
     // When each sender was first refused, as ms since the server went away (0: not yet).
     let away = Arc::new(std::sync::Mutex::new(None::<Instant>));
@@ -438,7 +458,7 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
                             std::thread::sleep(wait);
                         }
                     }
-                    let ts_ns = (t0_ms as u64 + i * 10) * 1_000_000;
+                    let ts_ns = (t0_ms as u64 + i) * 1_000_000;
                     let body = gzip(&request(sender, series, ts_ns)).unwrap_or_default();
                     match conn.send("/v1/metrics", "Content-Type: application/x-protobuf\r\nContent-Encoding: gzip\r\n", &body) {
                         Ok(a) if a.code == 200 => {
@@ -488,7 +508,7 @@ fn a_runner_whose_server_is_away_refuses_in_time_and_loses_nothing_it_took() -> 
     anyhow::ensure!(all.errors.is_empty(), "senders' errors (but 503s): {:?}\n{}", all.errors.iter().take(5).collect::<Vec<_>>(), f.logs());
     let first = refusals.iter().flatten().min().copied().ok_or_else(|| anyhow::anyhow!("no refusal while the server was away\n{}", f.logs()))?;
     // Everything taken, stored once.
-    let to = common::now_ms() + 60_000;
+    let to = t0_ms + 3_600_000;
     let settled = Instant::now();
     let mut have = 0;
     while settled.elapsed() < Duration::from_secs(120) {

@@ -306,9 +306,11 @@ impl Rewrite {
 
     fn build_inner(&self) -> Result<Block, StoreError> {
         let blocks: Vec<Block> = self.from.iter().map(|(_, f)| Block::open(&self.dir.join(f))).collect::<Result<_, _>>()?;
+        // Every series of every input, by fingerprint; of one, the newest input's kind and key.
         let mut keys: Vec<(u64, Kind, Vec<u8>)> = Vec::new();
         for blk in blocks.iter().rev() {
-            for s in blk.series() {
+            let k = blk.keys()?;
+            for s in k.iter() {
                 let (fp, kind, key) = s?;
                 keys.push((fp, kind, key.to_vec()));
             }
@@ -316,31 +318,66 @@ impl Rewrite {
         // Stable: of one fingerprint, the newest input's first.
         keys.sort_by_key(|k| k.0);
         keys.dedup_by_key(|k| k.0);
+        // Written as it is read, a series at a time: what a merge holds is a series, not a block.
+        let mut w = block::Writer::create(&self.dir.join(&self.file))?;
         let mut buf = Vec::new();
-        let mut chunks_of: Vec<Vec<Chunk>> = Vec::with_capacity(keys.len());
+        let mut regions: Vec<Vec<u8>> = blocks.iter().map(|_| Vec::new()).collect();
         let (mut ts, mut vs) = (Vec::new(), Vec::new());
-        for (fp, _, _) in &keys {
-            ts.clear();
-            vs.clear();
-            let mut parts: Vec<(Vec<i64>, Vec<f64>)> = Vec::new();
-            for blk in &blocks {
-                if let Some(i) = blk.find(*fp) {
-                    let (mut t, mut v) = (Vec::new(), Vec::new());
-                    blk.read(i, self.keep_from, i64::MAX, &mut buf, &mut t, &mut v)?;
-                    parts.push((t, v));
+        let mut holders: Vec<(&Block, usize, (i64, i64))> = Vec::with_capacity(blocks.len());
+        for (fp, kind, key) in &keys {
+            holders.clear();
+            holders.extend(blocks.iter().filter_map(|blk| {
+                let i = blk.find(*fp)?;
+                Some((blk, i, blk.span(i)?))
+            }));
+            let uncut = holders.iter().all(|h| h.2.0 >= self.keep_from);
+            // One input holds it and the cutoff takes none of it: its region as it is, nothing
+            // decoded or encoded.
+            if let [(blk, i, span)] = holders.as_slice()
+                && uncut
+            {
+                let crc = blk.load(*i, &mut buf)?;
+                w.region(*fp, *kind, key, &buf, crc, *span)?;
+                continue;
+            }
+            // Several, each input's after the one before (the samples came in order), none cut:
+            // their chunks one after another, nothing decoded, so long as they are full enough
+            // (half a chunk's samples each on average; fewer, and they are packed anew below).
+            if uncut && holders.windows(2).all(|p| matches!(p, [a, b] if a.2.1 < b.2.0)) {
+                for ((blk, i, _), region) in holders.iter().zip(regions.iter_mut()) {
+                    blk.load(*i, region)?;
+                }
+                let mut chunks: Vec<(i64, i64, u32, &[u8])> = Vec::new();
+                for ((blk, i, _), region) in holders.iter().zip(&regions) {
+                    for c in blk.chunks_in(*i, region, i64::MIN, i64::MAX)? {
+                        chunks.push(c?);
+                    }
+                }
+                let samples: u64 = chunks.iter().map(|c| u64::from(c.2)).sum();
+                if !chunks.is_empty() && samples / chunks.len() as u64 >= u64::from(CHUNK_SAMPLES / 2) {
+                    w.series(*fp, *kind, key, &chunks)?;
+                    continue;
                 }
             }
-            if parts.len() == 1 {
-                if let Some((t, v)) = parts.pop() {
-                    chunks_of.push(rechunk(&t, &v));
-                }
+            let mut parts: Vec<(Vec<i64>, Vec<f64>)> = Vec::with_capacity(holders.len());
+            for (blk, i, _) in &holders {
+                let (mut t, mut v) = (Vec::new(), Vec::new());
+                blk.read(*i, self.keep_from, i64::MAX, &mut buf, &mut t, &mut v)?;
+                parts.push((t, v));
+            }
+            let chunks = if parts.len() == 1 {
+                let (t, v) = parts.pop().unwrap_or_default();
+                rechunk(&t, &v)
             } else {
+                ts.clear();
+                vs.clear();
                 merge_parts(parts, &mut ts, &mut vs);
-                chunks_of.push(rechunk(&ts, &vs));
-            }
+                rechunk(&ts, &vs)
+            };
+            let refs: Vec<(i64, i64, u32, &[u8])> = chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect();
+            w.series(*fp, *kind, key, &refs)?;
         }
-        let series: Vec<SeriesData<'_>> = keys.iter().zip(&chunks_of).map(|((fp, kind, key), chunks)| SeriesData { fp: *fp, kind: *kind, key, chunks: chunks.iter().map(|c| (c.first, c.last, c.count, c.bytes.as_slice())).collect() }).collect();
-        Ok(block::write(&self.dir.join(&self.file), series)?)
+        Ok(w.finish()?)
     }
 
     /// Bytes its inputs hold.
@@ -443,7 +480,8 @@ impl Store {
         let mut index = Index::new(self.hash);
         let mut last: Vec<i64> = Vec::new();
         for b in &self.blocks {
-            for (i, s) in b.block.series().enumerate() {
+            let keys = b.block.keys()?;
+            for (i, s) in keys.iter().enumerate() {
                 let (fp, kind, key) = s?;
                 let Some((_, newest)) = b.block.span(i) else { continue };
                 if newest < self.cutoff {
@@ -814,7 +852,7 @@ impl Store {
     }
 
     /// Compacts blocks by the logarithmic method (Bentley and Saxe, "Decomposable searching
-    /// problems I: static-to-dynamic transformation", J. Algorithms 1980): the two newest blocks
+    /// problems I: static-to-dynamic transformation", J. Algorithms 1980): two neighbouring blocks
     /// are merged while the newer holds at least half of what the older does, so a store keeps
     /// O(log n) blocks of n samples and a sample is rewritten O(log n) times. Here, under the
     /// caller's hold of the store; [`Store::plan_merge`] does it a merge at a time apart.
@@ -831,10 +869,13 @@ impl Store {
     /// ([`Store::commit`]).
     pub fn plan_merge(&mut self) -> Option<Rewrite> {
         let dir = self.dir.clone()?;
-        let [.., older, newer] = self.blocks.as_slice() else { return None };
-        if newer.block.bytes.saturating_mul(2) < older.block.bytes {
-            return None;
-        }
+        // The method's invariant holds of every pair: each block more than twice the next newer.
+        // The oldest pair that breaks it is merged, in its place (the newer's), so merges carry on
+        // like a binary counter's, whatever small cut lands at the newest end meanwhile.
+        let (older, newer) = self.blocks.windows(2).find_map(|w| match w {
+            [older, newer] if newer.block.bytes.saturating_mul(2) >= older.block.bytes => Some((older, newer)),
+            _ => None,
+        })?;
         let from = vec![(older.seq, older.file.clone()), (newer.seq, newer.file.clone())];
         let seq = newer.seq;
         Some(self.reserve(dir, from, seq))
@@ -1165,6 +1206,11 @@ impl Store {
 
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// The blocks' places (their sequence numbers), files and bytes, oldest first.
+    pub fn block_list(&self) -> Vec<(u64, &str, u64)> {
+        self.blocks.iter().map(|b| (b.seq, b.file.as_str(), b.block.bytes)).collect()
     }
 
     /// Bytes of blocks on disk.

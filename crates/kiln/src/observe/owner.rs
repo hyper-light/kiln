@@ -387,6 +387,9 @@ struct Rep {
     _log: Log<DeviceFile>,
     out: Output<(u64, Answer)>,
     compacted: u64,
+    /// The store's durable point when maintenance was last told: a cut since is new blocks to
+    /// merge, however it came (a compaction, a snapshot's persisting).
+    told: u64,
 }
 
 /// Which member each machine is, as the server keeps it (`<observe>/members.json`).
@@ -565,7 +568,7 @@ impl Owner {
             let depth = store.depth();
             let settings = group::settings(id, depth).map_err(|e| format!("the group's settings: {e:?}"))?;
             let r = Replica::open(&settings, store, machine, Unbounded).map_err(|e| format!("the replica: {e:?}"))?;
-            Ok(Rep { compacted: r.applied().index, r, _log: log, out: Output::default() })
+            Ok(Rep { compacted: r.applied().index, told: 0, r, _log: log, out: Output::default() })
         })();
         match opened {
             Ok(mut rep) => {
@@ -923,6 +926,11 @@ impl Owner {
         if (asked || group::due(&rep.r)) && rep.r.compact(keep, now, &self.waker).unwrap_or(false) {
             self.compact_asked = false;
             rep.compacted = rep.r.applied().index;
+        }
+        // A cut made blocks: maintenance merges them (the logarithmic method keeps a few).
+        let durable = rep.r.machine().read().durable().index;
+        if durable != rep.told {
+            rep.told = durable;
             if let Some(m) = &self.maintain {
                 m.poke();
             }
@@ -1181,19 +1189,22 @@ fn maintain(store: &Shared, rx: &Receiver<()>) {
             loop {
                 let plan = {
                     let mut s = store.write().unwrap_or_else(PoisonError::into_inner);
+                    tracing::debug!(blocks = ?s.block_list().iter().rev().take(4).collect::<Vec<_>>(), "observe's maintenance looks");
                     if let Err(e) = s.drop_expired() {
                         tracing::warn!(error = %e, "observe's expired files were not deleted");
                     }
                     s.plan_merge().or_else(|| s.plan_retention())
                 };
                 let Some(plan) = plan else { break };
+                tracing::debug!(inputs = plan.input_bytes(), "observe's rewrite planned");
                 match plan.build() {
-                    Ok(built) => {
-                        if let Err(e) = store.write().unwrap_or_else(PoisonError::into_inner).commit(built) {
+                    Ok(built) => match store.write().unwrap_or_else(PoisonError::into_inner).commit(built) {
+                        Ok(done) => tracing::debug!(?done, "observe's rewrite taken in"),
+                        Err(e) => {
                             tracing::warn!(error = %e, "observe's rewritten block was not taken in");
                             break;
                         }
-                    }
+                    },
                     // Its inputs went (an install), or the disk refused: looked at again next time.
                     Err(e) => {
                         tracing::debug!(error = %e, "observe's rewrite stopped");
