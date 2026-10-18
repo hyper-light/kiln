@@ -287,6 +287,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
             reach_runners(&hub, want.as_deref())
         }
         (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
+        (&Method::POST, ["api", "outposts", "invite"]) => Ok(outpost_invite(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(discovery(&hub).await),
         (&Method::POST, ["api", "discovery", "scan"]) => discovery_scan(&hub, req).await,
         (&Method::POST, ["api", "discovery", "probe"]) => discovery_probe(&hub, req).await,
@@ -1512,25 +1513,56 @@ fn join_info(hub: &Hub) -> Response {
     )
 }
 
+/// `POST /api/outposts/invite`: a one-time invite for an outpost (`kiln outpost`), and a line per
+/// OS that downloads kiln from this server into a folder of its own and runs it from there,
+/// installing nothing. The invite works once, within [`crate::hub::OUTPOST_INVITE_TTL`].
+fn outpost_invite(hub: &Hub) -> Response {
+    let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
+    let (token, expires_at) = hub.outpost_invites.mint();
+    srv::json(
+        StatusCode::OK,
+        &json!({
+            "token": token,
+            "expires_at": expires_at,
+            "commands": {
+                "linux": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
+                "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --outpost --token {token}"),
+                "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Outpost -Token '{token}'"),
+            },
+        }),
+    )
+}
+
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     let ephemeral = !persistent && hub.ephemeral_tokens.lock().remove(&r.token).is_some();
-    if !persistent && !ephemeral {
+    let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
+    if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
         return Err(err(StatusCode::UNAUTHORIZED, "invalid join token"));
     }
     let name = crate::pki::sanitize_name(&r.name);
-    let days = if ephemeral { crate::pki::EPHEMERAL_DAYS } else { 365 };
+    // An outpost never takes another machine's name: the same machine enrolling again keeps its
+    // own, another one gets `<name>-2`.
+    let name = if outpost { free_agent_name(hub, &name, &r.hostname).await } else { name };
+    let days = if ephemeral {
+        crate::pki::EPHEMERAL_DAYS
+    } else if outpost {
+        crate::pki::OUTPOST_DAYS
+    } else {
+        365
+    };
     let cert = hub.pki.sign_csr(&r.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let quic = if ephemeral {
         hub.cfg.kubernetes.server_quic.clone().unwrap_or_else(|| hub.cfg.server.quic_advertise.clone())
     } else {
         hub.cfg.server.quic_advertise.clone()
     };
-    if persistent {
-        hub.store.audit(name.clone(), "agent.enroll".into(), String::new()).await;
-        tracing::info!(agent = %name, "agent enrolled");
+    if persistent || outpost {
+        let what = if outpost { "outpost.enroll" } else { "agent.enroll" };
+        hub.store.audit(name.clone(), what.into(), String::new()).await;
+        tracing::info!(agent = %name, outpost, "agent enrolled");
     }
     Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name }))
 }
@@ -2791,5 +2823,15 @@ mod tests {
             assert!(script.contains("@@KILN_SERVER@@"));
             assert!(script.contains("/dl/kiln/"));
         }
+    }
+
+    #[test]
+    fn install_scripts_run_an_outpost_without_installing_it() {
+        let sh = include_str!("../assets/install-agent.sh");
+        assert!(sh.contains("--outpost) OUTPOST=1"));
+        assert!(sh.contains(r#"exec "$BIN_DIR/kiln" outpost --server "$SERVER" --state-dir "$BIN_DIR""#));
+        let ps1 = include_str!("../assets/install-agent.ps1");
+        assert!(ps1.contains("[switch]$Outpost"));
+        assert!(ps1.contains("@('outpost', '--server', $Server, '--state-dir', $dir)"));
     }
 }

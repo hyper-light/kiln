@@ -11,17 +11,26 @@
 # agent is installed the same way.
 #
 #   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --join [--labels baremetal,bench] [--name box1]
+#
+# With `--outpost` and a one-time invite (Machines -> Add an outpost), nothing is installed: kiln,
+# its certificate and its files go in ~/.kiln-outpost, nothing starts on boot, and it runs in this
+# terminal as an outpost until you stop it (Ctrl-C). Its terminals, AI sessions and agents show up
+# in kiln; it takes no jobs.
+#
+#   curl -fsSL @@KILN_SERVER@@/install.sh | sh -s -- --outpost --token <invite> [--name box1]
 set -eu
 
 SERVER="@@KILN_SERVER@@"
 # The target the server itself was built for: its own binary is served when it fits this machine.
 SERVER_TARGET="@@KILN_TARGET@@"
 JOIN=0
+OUTPOST=0
 ARGS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="$2"; shift 2 ;;
     --join) JOIN=1; shift ;;
+    --outpost) OUTPOST=1; shift ;;
     *) ARGS="$ARGS $1"; shift ;;
   esac
 done
@@ -48,7 +57,9 @@ case "$SERVER_TARGET" in
   "$ARCH"-unknown-linux-*) if [ "$OS" = unknown-linux-musl ]; then URL="$SERVER/dl/kiln"; fi ;;
 esac
 
-if [ "$(id -u)" = "0" ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="${HOME}/.local/bin"; fi
+# An outpost keeps kiln, its certificate and its files in a folder of its own, root or not.
+if [ "$OUTPOST" = 1 ]; then BIN_DIR="${HOME}/.kiln-outpost"
+elif [ "$(id -u)" = "0" ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="${HOME}/.local/bin"; fi
 mkdir -p "$BIN_DIR"
 TMP="$(mktemp "${BIN_DIR}/.kiln.XXXXXX")"
 trap 'rm -f "$TMP"' EXIT
@@ -60,6 +71,11 @@ fi
 chmod 0755 "$TMP"
 mv -f "$TMP" "$BIN_DIR/kiln"
 trap - EXIT
+if [ "$OUTPOST" = 1 ]; then
+  echo "kiln ($TARGET) is in $BIN_DIR, not installed: it runs here as an outpost until you stop it (Ctrl-C)"
+  # shellcheck disable=SC2086
+  exec "$BIN_DIR/kiln" outpost --server "$SERVER" --state-dir "$BIN_DIR" $ARGS
+fi
 echo "kiln ($TARGET) installed to $BIN_DIR/kiln"
 if [ "$JOIN" = 1 ]; then
   # shellcheck disable=SC2086

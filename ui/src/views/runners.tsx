@@ -234,25 +234,30 @@ function RunnersBody() {
                         <Chips labels={a.labels} max={4} />
                       </td>
                       <td className="min-w-[90px]">
-                        <div className="font-mono text-[11px] text-[#c8cad0] tabular-nums">
-                          {a.busy}/{a.slots}
-                          {a.running.length > 0 && (
-                            <span className="ml-1.5 text-[#7b7e88]">
-                              · {a.running.length} job{a.running.length > 1 ? "s" : ""}
-                            </span>
-                          )}
-                        </div>
-                        <div className="mt-1 w-20">
-                          <Meter value={a.busy} max={Math.max(1, a.slots)} label="Slots busy" />
-                        </div>
+                        {a.outpost ? (
+                          // Kiln run there without installing it: its terminals and agents, no jobs.
+                          <div className="font-mono text-[11px] text-[#7b7e88]">outpost · no jobs</div>
+                        ) : (
+                          <>
+                            <div className="font-mono text-[11px] text-[#c8cad0] tabular-nums">
+                              {a.busy}/{a.slots}
+                              {a.running.length > 0 && (
+                                <span className="ml-1.5 text-[#7b7e88]">
+                                  · {a.running.length} job{a.running.length > 1 ? "s" : ""}
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-1 w-20">
+                              <Meter value={a.busy} max={Math.max(1, a.slots)} label="Slots busy" />
+                            </div>
+                          </>
+                        )}
                       </td>
                       <td className="num cell-mono hidden sm:table-cell">{s ? formatPct(s.cpu_pct) : "—"}</td>
                       <td className="num cell-mono hidden lg:table-cell">{s ? formatPct(memPct(s)) : "—"}</td>
                       <td className="num cell-mono hidden xl:table-cell">{s ? formatPct(diskPct(s)) : "—"}</td>
                       <td className="num cell-mono hidden xl:table-cell">{s ? s.load1.toFixed(2) : "—"}</td>
-                      <td className="hidden md:table-cell">
-                        <DrainCheck agent={a} onChange={(v) => drain(a, v)} />
-                      </td>
+                      <td className="hidden md:table-cell">{!a.outpost && <DrainCheck agent={a} onChange={(v) => drain(a, v)} />}</td>
                       <td className="hidden text-right whitespace-nowrap sm:table-cell">
                         <Tip content={a.connected ? "Open terminal" : "Runner offline"}>
                           <button
@@ -468,9 +473,11 @@ function AgentDetails({
         <Button variant="secondary" size="xs" disabled={!agent.connected} onClick={onTerminal}>
           <SquareTerminal /> Open terminal
         </Button>
-        <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
-          {agent.draining ? "Resume scheduling" : "Drain"}
-        </Button>
+        {!agent.outpost && (
+          <Button variant="ghost" size="xs" disabled={!agent.connected} onClick={() => onDrain(agent, !agent.draining)}>
+            {agent.draining ? "Resume scheduling" : "Drain"}
+          </Button>
+        )}
         {!forgetting && (
           <Button variant="ghost-danger" size="xs" onClick={() => setForgetting(true)}>
             <Trash2 /> Forget
