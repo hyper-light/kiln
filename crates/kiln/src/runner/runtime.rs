@@ -2496,7 +2496,30 @@ impl Leg {
         let loc = self.locate(uses).await?;
         let dir = loc.dir.clone();
         let action = crate::rt::blocking(move || load_action(&dir)).await??;
-        let inputs = self.inputs(st, idx, &action, &with).await;
+        // A kiln action that declares secrets sees exactly those (W09-R07): the job's of each
+        // name, or the one the step's `with-secrets` maps; the job's are back after it.
+        if action.secrets.is_empty() {
+            return self.action_as(st, idx, step, uses, &action, &loc, with, wd, env, deadline).await;
+        }
+        let declared: BTreeMap<String, String> = action
+            .secrets
+            .iter()
+            .filter_map(|d| {
+                let name = d.name.to_ascii_uppercase();
+                let from = step.kiln.with_secrets.iter().find(|(k, _)| k.eq_ignore_ascii_case(&name)).map_or_else(|| name.clone(), |(_, f)| f.to_ascii_uppercase());
+                st.secrets.get(&from).map(|v| (name, v.clone()))
+            })
+            .collect();
+        let job_secrets = std::mem::replace(&mut st.secrets, declared);
+        let ran = self.action_as(st, idx, step, uses, &action, &loc, with, wd, env, deadline).await;
+        st.secrets = job_secrets;
+        ran
+    }
+
+    /// A `uses:` step's action, its metadata read.
+    #[allow(clippy::too_many_arguments)]
+    async fn action_as(&self, st: &mut State, idx: u32, step: &Step, uses: &str, action: &kiln_ci::wf::Action, loc: &Located, with: BTreeMap<String, String>, wd: &Path, env: BTreeMap<String, String>, deadline: Instant) -> anyhow::Result<Ran> {
+        let inputs = self.inputs(st, idx, action, &with).await;
         let mut aenv = env;
         for (k, v) in &inputs {
             aenv.insert(input_var(k), v.clone());
@@ -2528,7 +2551,7 @@ impl Leg {
                 }
                 Ok(ran)
             }
-            "composite" => Box::pin(self.composite(st, idx, &action, &loc, &inputs, aenv, deadline)).await,
+            "composite" => Box::pin(self.composite(st, idx, action, loc, &inputs, aenv, deadline)).await,
             "docker" => {
                 // A Docker action (W07-R06): its image built or pulled, then run with GitHub's mounts.
                 let cli = self.cli(st).await?;
