@@ -879,3 +879,32 @@ fn objects_without_tracking_differ_only_by_kilns_marks() {
     let x = h.engine.resources("one").into_iter().find(|r| &*r.key.name == "x");
     assert!(x.is_some_and(|r| r.marks_only && r.tracked_by.is_none()));
 }
+
+
+/// A sync of objects already there and healthy applies every one of them, however many wait in
+/// the cluster's queue: a task waits for its own answer, not for the live object it is about to
+/// change (which is the one from before, and healthy).
+#[test]
+fn a_sync_of_objects_already_there_applies_every_one() {
+    let (mut h, git) = harness(fast());
+    h.input(Input::UpsertCluster { name: "dev".into(), qps: None, inflight: Some(2) });
+    let cms: Vec<Value> = (0..12).map(|i| config_map(&format!("cfg{i}"), "1", json!({}))).collect();
+    for i in 0..12 {
+        let cm = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": format!("cfg{i}"), "namespace": "web"}, "data": {"v": "1"}});
+        if let Some(c) = h.clusters.get_mut("dev") {
+            let _ = c.apply(0, cm, "someone", false);
+        }
+    }
+    h.input(Input::UpsertApp(AppConfig::new("web", "dev", "web")));
+    deploy(&mut h, &git, "web", "r1", cms);
+    h.run_for(5_000);
+    let n = h.records.len();
+    h.input(Input::Sync { app: "web".into(), request: SyncRequest::default() });
+    assert!(h.run_until(60_000, |h| settled(h, "web")), "{:?}", status(&h, "web"));
+    let marked = (0..12)
+        .filter(|i| h.clusters.get("dev").and_then(|c| c.get(&ResKey::new("", "ConfigMap", "web", &format!("cfg{i}")))).is_some_and(|v| obj::annotation(&v, crate::engine::TRACKING).is_some()))
+        .count();
+    assert_eq!(marked, 12, "every object applied");
+    let applied = h.records.iter().skip(n).find_map(|r| if let Record::Finished { applied, .. } = r { Some(*applied) } else { None });
+    assert_eq!(applied, Some(12));
+}

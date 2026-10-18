@@ -973,6 +973,16 @@ impl Registry {
         Ok(Command::Send { id: mid, text, mode, attachments: out, overrides })
     }
 
+    /// A harness signed in on a machine (kiln's /login): each of that machine's sessions of it is
+    /// told, to take up the account (Claude Code starts again with it once its turn ends; Codex reads
+    /// it again).
+    pub async fn signed_in(&self, hub: &Hub, target: &str, kind: &str) {
+        let ids: Vec<String> = self.list().into_iter().filter(|i| i.target == target && i.kind == kind).map(|i| i.id).collect();
+        for id in ids {
+            let _ = self.command(hub, &id, Command::Control { id: "account".into(), value: None }).await;
+        }
+    }
+
     /// A command for a session, from any device.
     pub async fn command(&self, hub: &Hub, id: &str, c: Command) -> Sent {
         let Some(loc) = self.location(id) else { return Sent::NoSession };

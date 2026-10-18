@@ -18,7 +18,7 @@ import { ConfirmDialog } from "@/components/ui/dialog";
 import { Loading } from "@/components/ui/loading";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useMediaQuery } from "@/lib/hooks";
-import { AccountCard } from "./account-card";
+import { AccountDialog } from "./account-card";
 import { Composer } from "./composer";
 import { useAgentActions } from "./actions";
 import { SettingsSheet, useAttachments, type Attachments } from "./controls";
@@ -98,7 +98,6 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
     [id],
   );
   // /login and /logout open the account in the conversation, below what was said: brought into view once.
-  const showAccount = React.useCallback((el: HTMLDivElement | null) => el?.scrollIntoView({ block: "nearest", behavior: "smooth" }), []);
   // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown. A
   // match found from Mission Control (`?find=`) opens it already looking.
   const [params] = useSearchParams();
@@ -214,15 +213,10 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const footer = React.useMemo(
     () => (
       <>
-        {account && info && (
-          <div ref={showAccount} className="hx-signin">
-            <AccountCard key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />
-          </div>
-        )}
         {!task && <BesideTerminals agent={id} info={info} onInsert={hand} />}
       </>
     ),
-    [account, info, task, id, hand, showAccount],
+    [info, task, id, hand],
   );
   const planSource = React.useMemo(
     () => (info ? { session: info.id, harness: info.kind, machine: info.target === "local" ? null : info.target.replace(/^agent:/, ""), cwd, agent: info.name } : null),
@@ -301,6 +295,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       }}
     >
       <title>{info ? `${agentLabel(info)} · Agents · kiln` : "Agent · kiln"}</title>
+      {account && info && <AccountDialog key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />}
       {dragging && (
         <div className="hx-dropzone" aria-hidden="true">
           <span>{attachments.enabled ? "Drop screenshots or files to attach" : "This agent can't take attachments"}</span>
@@ -550,6 +545,7 @@ function AgentLoading() {
               </Link>
             </p>
             <h1 className="ag-title hx-ghost">Agent</h1>
+            <div className="ag-turn-row hx-ghost" aria-hidden="true" />
             <div className="ag-state hx-ghost" aria-hidden="true">
               <StateWord a={{ status: "starting", approvals: [] }} />
             </div>

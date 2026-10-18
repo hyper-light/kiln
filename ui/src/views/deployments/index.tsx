@@ -473,6 +473,8 @@ const AppRow = React.memo(function AppRow({
   const note = app.source_error ?? (failed ? app.operation?.message : app.message) ?? "";
   const tone = app.health === "Degraded" || failed || app.source_error ? "fail" : app.sync === "OutOfSync" ? "warn" : undefined;
   const extent = whatDiffers(app);
+  // While it syncs, what the sync is doing.
+  const doing = live ? [opWords(app.operation), app.operation?.message].filter(Boolean).join(" · ") : "";
   return (
     <div role="listitem" aria-posinset={pos} aria-setsize={size} className="cd-item" data-checked={checked || undefined} data-live={live || undefined} data-tone={tone}>
       <label className="cd-pick">
@@ -488,11 +490,11 @@ const AppRow = React.memo(function AppRow({
           </span>
         </span>
         <span className="cd-row-states">
-          <SyncPair sync={app.sync} />
+          <SyncPair sync={app.sync} op={app.operation} />
           <HealthPair health={app.health} />
         </span>
-        <span className="cd-row-note" title={note || undefined}>
-          {live ? opWords(app.operation) : note || extent}
+        <span className="cd-row-note" title={(live ? doing : note) || undefined}>
+          {live ? <span className="cd-live-text">{doing}</span> : note || extent}
         </span>
       </Link>
     </div>
