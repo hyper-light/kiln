@@ -81,6 +81,10 @@ export interface LogPatterns {
   took_ms: number;
 }
 
+/** What a live tail says each tick (200 ms), or once to refuse: the tick's records (a uniform sample
+ * past the rate asked), and how many rows it read, matched and missed (the tail fell behind). */
+export type LogTailMessage = { type: "records"; records: LogRecord[]; read: number; matched: number; missed: number; ms: number } | { type: "error"; message: string };
+
 /** What one replica says of itself (the server's view of each machine's). */
 export interface ReplicaStatus {
   member: number;
@@ -312,6 +316,8 @@ export const observeApi = {
   facets: (body: { query: string; from: number; to: number; facets: string[]; top?: number }, signal?: AbortSignal) => request<LogFacets>("POST", `${BASE}/logs/facets`, body, { signal }),
   events: (body: { query: string; from: number; to: number; limit?: number }, signal?: AbortSignal) => request<LogSearch>("POST", `${BASE}/events/search`, body, { signal }),
   patterns: (body: { query: string; from: number; to: number }, signal?: AbortSignal) => request<LogPatterns>("POST", `${BASE}/logs/patterns`, body, { signal }),
+  /** The live tail's WebSocket path: the search's records as they are applied. */
+  tailPath: (query: string) => `${BASE}/logs/tail?query=${enc(query)}`,
   status: (signal?: AbortSignal) => request<ObserveStatus>("GET", `${BASE}/status`, undefined, { signal }),
   verify: () => request<unknown>("POST", `${BASE}/verify`, {}),
   monitors: (signal?: AbortSignal) => request<{ monitors: Monitor[] }>("GET", `${BASE}/monitors`, undefined, { signal }).then((r) => r.monitors),

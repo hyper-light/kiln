@@ -3,10 +3,12 @@
  * a search (docs/observe.md §4.6), how its records fall over the range by status, each facet's
  * most common values (a click narrows the search to one, again widens it), and the newest
  * records, each opened to its attributes; or their patterns (Drain, §12.13), each a click from
- * its records.
+ * its records; or, live, its records as they come (§6).
  */
 import * as React from "react";
-import { observeApi, type LogFacets, type LogPatterns, type LogRecord } from "@/api/observe";
+import { wsUrl } from "@/api/client";
+import { observeApi, type LogFacets, type LogPatterns, type LogRecord, type LogTailMessage } from "@/api/observe";
+import { SERIES } from "@/components/charts/types";
 import { Button } from "@/components/ui/button";
 import { Hold, RowsHold } from "@/components/ui/hold";
 import { Loadable } from "@/components/ui/loading";
@@ -37,6 +39,9 @@ import {
 /** The newest records a page shows at first, each "more" adds, and shows at the most (the API's). */
 const LIMIT = 100;
 const MOST = 1000;
+/** Records the live tail keeps on the page, the newest first; and the span its rates are over. */
+const LIVE_KEEP = 500;
+const RATE_WINDOW_MS = 5_000;
 
 const KINDS = {
   logs: {
@@ -123,14 +128,17 @@ export function LogsExplorer({ kind }: { kind: keyof typeof KINDS }) {
           <Segmented
             label="Show"
             className="mb-3"
-            value={view === "patterns" ? "patterns" : "records"}
+            value={view === "patterns" || view === "live" ? view : "records"}
             onChange={(v) => setView(v)}
             options={[
               { value: "records", label: "Records" },
               { value: "patterns", label: "Patterns" },
+              { value: "live", label: "Live tail" },
             ]}
           />
-          {view === "patterns" ? (
+          {view === "live" ? (
+            <Live key={query} query={query} onFilter={(t) => setQ(toggle(q, t))} />
+          ) : view === "patterns" ? (
             <Loadable key={`p/${query}`} label="the patterns" fallback={<RowsHold rows={10} rowHeight={36} />}>
               <Patterns query={query} range={range} onPick={(terms) => setParams({ q: terms.reduce((acc, t) => (acc.split(/\s+/).includes(t) ? acc : toggle(acc, t)), q), view: null })} />
             </Loadable>
@@ -242,17 +250,7 @@ function Records({ query, range, onFilter }: { query: string; range: Range; onFi
     <section aria-label="Records">
       <ol className="divide-y divide-[#1d1f23] border-y border-[#1d1f23]">
         {found.records.map((r, i) => (
-          <li key={`${r.ts_ns}-${i}`}>
-            <button type="button" aria-expanded={open === i} onClick={() => setOpen(open === i ? null : i)} className="flex w-full items-baseline gap-3 px-2 py-2 text-left hover:bg-[#101114]">
-              <span className="inline-block size-2 shrink-0 translate-y-[-1px] rounded-full" style={{ background: STATUS_COLOR[r.status] }} title={r.status} aria-label={r.status} />
-              <time className="shrink-0 font-mono text-[10.5px] text-[#8c8f98] tabular-nums" dateTime={new Date(r.ts_ns / 1e6).toISOString()}>
-                {when(r.ts_ns)}
-              </time>
-              {r.service && <span className="hidden shrink-0 font-mono text-[10.5px] text-[#a7aab3] sm:inline">{r.service}</span>}
-              <span className={cn("min-w-0 flex-1 text-[12.5px] text-[#d6d8dd]", open === i ? "whitespace-pre-wrap break-words" : "truncate")}>{open === i ? r.message : firstLine(r.message)}</span>
-            </button>
-            {open === i && <Detail r={r} onFilter={onFilter} />}
-          </li>
+          <RecordRow key={`${r.ts_ns}-${i}`} r={r} open={open === i} onToggle={() => setOpen(open === i ? null : i)} onFilter={onFilter} />
         ))}
       </ol>
       <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
@@ -266,6 +264,151 @@ function Records({ query, range, onFilter }: { query: string; range: Range; onFi
           </Button>
         )}
       </div>
+    </section>
+  );
+}
+
+/** A record's row: its status, time, service and first line; opened, its message whole and its fields. */
+function RecordRow({ r, open, onToggle, onFilter }: { r: LogRecord; open: boolean; onToggle: () => void; onFilter: (t: string) => void }) {
+  return (
+    <li>
+      <button type="button" aria-expanded={open} onClick={onToggle} className="flex w-full items-baseline gap-3 px-2 py-2 text-left hover:bg-[#101114]">
+        <span className="inline-block size-2 shrink-0 translate-y-[-1px] rounded-full" style={{ background: STATUS_COLOR[r.status] }} title={r.status} aria-label={r.status} />
+        <time className="shrink-0 font-mono text-[10.5px] text-[#8c8f98] tabular-nums" dateTime={new Date(r.ts_ns / 1e6).toISOString()}>
+          {when(r.ts_ns)}
+        </time>
+        {r.service && <span className="hidden shrink-0 font-mono text-[10.5px] text-[#a7aab3] sm:inline">{r.service}</span>}
+        <span className={cn("min-w-0 flex-1 text-[12.5px] text-[#d6d8dd]", open ? "whitespace-pre-wrap break-words" : "truncate")}>{open ? r.message : firstLine(r.message)}</span>
+      </button>
+      {open && <Detail r={r} onFilter={onFilter} />}
+    </li>
+  );
+}
+
+/** A rate a second, as read: tenths below ten. */
+function perSecond(n: number) {
+  return n < 10 ? n.toFixed(1).replace(/\.0$/, "") : Math.round(n).toLocaleString();
+}
+
+type Shown = { seq: number; r: LogRecord };
+type TailState = { kind: "opening" | "live" | "ended"; why?: string };
+
+/** The search's records as they come, the newest first: every one while they are few, a uniformly
+ * random sample once they come faster than they can be read, how fast they match said either way.
+ * Paused, or a record opened, what comes waits (counted) until resumed. */
+function Live({ query, onFilter }: { query: string; onFilter: (t: string) => void }) {
+  const [shown, setShown] = React.useState<Shown[]>([]);
+  const [state, setState] = React.useState<TailState>({ kind: "opening" });
+  const [rate, setRate] = React.useState({ matched: 0, shown: 0 });
+  const [paused, setPausedState] = React.useState(false);
+  const [waiting, setWaiting] = React.useState(0);
+  const [open, setOpen] = React.useState<number | null>(null);
+  const [epoch, setEpoch] = React.useState(0);
+  const pausedRef = React.useRef(false);
+  const heldRef = React.useRef<Shown[]>([]);
+  const seqRef = React.useRef(0);
+  const path = observeApi.tailPath(query);
+  const setPaused = (p: boolean) => {
+    pausedRef.current = p;
+    setPausedState(p);
+    if (!p) {
+      const held = heldRef.current;
+      heldRef.current = [];
+      setWaiting(0);
+      setShown((s) => [...held, ...s].slice(0, LIVE_KEEP));
+    }
+  };
+  const stream = React.useCallback(
+    (el: HTMLElement | null) => {
+      if (!el) return;
+      const ticks: { at: number; matched: number; shown: number }[] = [];
+      const ws = new WebSocket(wsUrl(path));
+      ws.onopen = () => setState({ kind: "live" });
+      ws.onmessage = (m) => {
+        if (typeof m.data !== "string") return;
+        const msg = JSON.parse(m.data) as LogTailMessage;
+        if (msg.type === "error") {
+          setState({ kind: "ended", why: msg.message });
+          return;
+        }
+        const now = Date.now();
+        ticks.push({ at: now, matched: msg.matched, shown: msg.records.length });
+        while ((ticks.at(0)?.at ?? now) < now - RATE_WINDOW_MS) ticks.shift();
+        const span = (Math.max(0, now - (ticks.at(0)?.at ?? now)) + msg.ms) / 1000;
+        setRate({ matched: ticks.reduce((a, t) => a + t.matched, 0) / span, shown: ticks.reduce((a, t) => a + t.shown, 0) / span });
+        if (msg.records.length === 0) return;
+        const add = msg.records.map((r) => ({ seq: seqRef.current++, r })).reverse();
+        if (pausedRef.current) {
+          heldRef.current = [...add, ...heldRef.current].slice(0, LIVE_KEEP);
+          setWaiting((w) => w + add.length);
+        } else setShown((s) => [...add, ...s].slice(0, LIVE_KEEP));
+      };
+      ws.onclose = () => setState((s) => (s.kind === "ended" ? s : { kind: "ended" }));
+      return () => ws.close();
+    },
+    // A new socket for each "follow again".
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [path, epoch],
+  );
+  const sampled = rate.matched > rate.shown * 1.05 + 0.5;
+  const said =
+    state.kind === "opening"
+      ? "Opening the tail…"
+      : state.kind === "ended"
+        ? state.why
+          ? `Stopped: ${state.why}`
+          : "Stopped."
+        : paused
+          ? `Paused · ${waiting.toLocaleString()} new`
+          : sampled
+            ? `Live · ${perSecond(rate.matched)} a second · showing a sample of ${perSecond(rate.shown)} a second`
+            : `Live · ${perSecond(rate.matched)} a second`;
+  return (
+    <section aria-label="Live tail" ref={stream}>
+      <div className="mb-2 flex items-start justify-between gap-3">
+        <p className="flex min-w-0 items-baseline gap-2 pt-1.5 font-mono text-[10.5px] text-[#8c8f98]" aria-live="polite">
+          <span className="inline-block size-1.5 shrink-0 -translate-y-px rounded-full" style={{ background: state.kind === "live" && !paused ? SERIES.ok : "#5b5e66" }} aria-hidden="true" />
+          <span className="min-w-0">{said}</span>
+        </p>
+        {state.kind === "ended" ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="shrink-0"
+            onClick={() => {
+              setState({ kind: "opening" });
+              setEpoch((e) => e + 1);
+            }}
+          >
+            Follow again
+          </Button>
+        ) : (
+          <Button variant="ghost" size="sm" className="shrink-0" onClick={() => setPaused(!paused)}>
+            {paused ? "Resume" : "Pause"}
+          </Button>
+        )}
+      </div>
+      {shown.length === 0 ? (
+        <p className="empty-line py-16 text-center">{state.kind === "ended" ? "Nothing came." : "Records that match show here as they come."}</p>
+      ) : (
+        <ol className="divide-y divide-[#1d1f23] border-y border-[#1d1f23]">
+          {shown.map(({ seq, r }) => (
+            <RecordRow
+              key={seq}
+              r={r}
+              open={open === seq}
+              onToggle={() => {
+                if (open === seq) setOpen(null);
+                else {
+                  setOpen(seq);
+                  if (!paused) setPaused(true);
+                }
+              }}
+              onFilter={onFilter}
+            />
+          ))}
+        </ol>
+      )}
     </section>
   );
 }

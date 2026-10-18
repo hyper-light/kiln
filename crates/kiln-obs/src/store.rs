@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use hashbrown::HashTable;
 
@@ -41,6 +42,7 @@ use crate::index::{Defined, Index, IndexError, Selector, SeriesInfo};
 use crate::logs::file::LogFile;
 use crate::logs::search::Search;
 use crate::logs::store::{Found, HeldFile, LogStore, LogStoreError};
+use crate::logs::tail::Feed;
 use crate::manifest::{self, BlockEntry, Manifest, ManifestError, Membership, Point, Session};
 use crate::symbols::Symbols;
 
@@ -221,6 +223,10 @@ pub struct Store {
     pending: Vec<Pending>,
     /// `pending` by fingerprint (a fingerprint is a hash already: it is its own).
     pending_at: HashTable<u32>,
+    /// Who follows the log records applied (live tail), and whether the entry being applied is
+    /// new to them.
+    feed: Option<Arc<Feed>>,
+    publishing: bool,
 }
 
 impl Default for Store {
@@ -441,7 +447,14 @@ impl Store {
             applied: 0,
             pending: Vec::new(),
             pending_at: HashTable::new(),
+            feed: None,
+            publishing: false,
         }
+    }
+
+    /// Log records applied from here on are published to `feed` (live tail, [`crate::logs::tail`]).
+    pub fn set_feed(&mut self, feed: Option<Arc<Feed>>) {
+        self.feed = feed;
     }
 
     /// Opens the store in `dir` (made if missing): the state its manifest states, its files as it
@@ -596,6 +609,13 @@ impl Store {
     /// Applies the command an entry at `index` holds.
     pub fn apply_entry(&mut self, index: u64, data: &[u8]) -> Result<Answer, Newer> {
         self.applied = index;
+        self.publishing = self.feed.as_ref().is_some_and(|f| f.entry(index));
+        let answer = self.apply_command(index, data);
+        self.publishing = false;
+        answer
+    }
+
+    fn apply_command(&mut self, index: u64, data: &[u8]) -> Result<Answer, Newer> {
         let c = match command::decode(data) {
             Ok(c) => c,
             Err(CommandError::Unknown(tag)) => return Err(Newer::Command(tag)),
@@ -711,6 +731,11 @@ impl Store {
                     let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon).map_err(|_| ApplyError::LogRows)?;
                     done.counts.logs_ahead += ahead;
                     if rows > 0 {
+                        if self.publishing
+                            && let Some(f) = self.feed.as_ref().filter(|f| f.following())
+                        {
+                            f.publish(&raw, rows);
+                        }
                         self.logs.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
                     }
                     done.counts.logs += u64::from(rows);
@@ -1089,9 +1114,10 @@ impl Store {
         for e in self.manifest.blocks.iter().chain(&self.manifest.logs) {
             remove_if_there(&dir.join(&e.file))?;
         }
-        let epoch = self.epoch + 1;
+        let (epoch, feed) = (self.epoch + 1, self.feed.take());
         *self = Self::open(&dir, self.hash)?;
         self.epoch = epoch;
+        self.feed = feed;
         Ok(())
     }
 

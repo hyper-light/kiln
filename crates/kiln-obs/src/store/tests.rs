@@ -877,3 +877,61 @@ fn alternating_big_and_small_cuts_still_merge_into_a_handful_of_blocks() {
     assert_eq!(ids.len(), 500);
     assert_eq!(s.totals().samples, index * 500 * 20);
 }
+
+/// Live tail: the log records entries apply reach whoever follows, each once: the entries a store
+/// opened again applies again (those after its last cut) are not published twice, and a store that
+/// installs an image keeps its feed.
+#[test]
+fn applied_log_records_reach_a_follower_once_through_a_reopen_and_an_image() {
+    use crate::logs::tail::{Feed, Follower, Sample};
+    let (dir, other, snaps, staging) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let rec = |i: i64| Record { ts: i * 1_000_000_000, severity: 9, service: "api".into(), host: "h".into(), source: "kiln".into(), message: format!("event {i}"), ..Record::default() };
+    let entry = |seq: u64| {
+        let mut b = Builder::new();
+        let from = (seq as i64 - 1) * 2;
+        b.logs(&(from..from + 2).map(rec).collect::<Vec<_>>());
+        crate::command::write(7, seq, 0, &b.finish())
+    };
+    let all = crate::logs::search::parse("*").unwrap();
+    let read = |f: &mut Follower| {
+        let mut sample = Sample::new(100, 1);
+        f.read(&all, &mut sample).unwrap();
+        sample.records().map(|r| r.message.clone()).collect::<Vec<_>>()
+    };
+    let feed = Feed::new();
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    s.set_feed(Some(feed.clone()));
+    // Applied while no one follows: nothing kept for anyone.
+    s.apply_entry(1, &entry(1)).unwrap();
+    assert_eq!(feed.held_bytes(), 0);
+    let mut f = feed.follow().unwrap();
+    s.apply_entry(2, &entry(2)).unwrap();
+    s.cut(Point { index: 2, term: 1 }).unwrap();
+    s.apply_entry(3, &entry(3)).unwrap();
+    assert_eq!(read(&mut f), ["event 2", "event 3", "event 4", "event 5"]);
+    // A crash: opened again, the store applies entry 3 again (after its cut), the follower sees
+    // nothing new; entry 4 is.
+    drop(s);
+    let mut s = Store::open(dir.path(), Keyed::with_keys(1, 2)).unwrap();
+    s.set_feed(Some(feed.clone()));
+    s.apply_entry(3, &entry(3)).unwrap();
+    assert!(read(&mut f).is_empty());
+    s.apply_entry(4, &entry(4)).unwrap();
+    assert_eq!(read(&mut f), ["event 6", "event 7"]);
+    // The entry applied again was the store's all the same.
+    assert_eq!(s.search_logs(&all, 0, i64::MAX, 100).unwrap().records.len(), 8);
+    // Another store installs this one's image: its feed stays, and what it applies next is
+    // published.
+    s.cut(Point { index: 4, term: 1 }).unwrap();
+    let image = s.image();
+    let snap = s.link_snapshot(snaps.path()).unwrap();
+    for file in &image.files {
+        std::fs::copy(snap.join(&file.name), staging.path().join(&file.name)).unwrap();
+    }
+    drop(s);
+    let mut t = Store::open(other.path(), Keyed::with_keys(1, 2)).unwrap();
+    t.set_feed(Some(feed.clone()));
+    t.install(staging.path(), &image, Point { index: 4, term: 1 }, Membership::default()).unwrap();
+    t.apply_entry(5, &entry(5)).unwrap();
+    assert_eq!(read(&mut f), ["event 8", "event 9"]);
+}

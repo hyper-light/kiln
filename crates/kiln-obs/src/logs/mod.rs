@@ -7,3 +7,4 @@ pub mod patterns;
 pub mod record;
 pub mod search;
 pub mod store;
+pub mod tail;

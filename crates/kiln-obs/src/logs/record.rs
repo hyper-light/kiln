@@ -75,6 +75,49 @@ impl<'a> RecordRef<'a> {
     }
 }
 
+impl Record {
+    /// Becomes `r`, in the buffers it has; attribute pairs it has no more use for go to `spare`, and
+    /// those it needs more of come from there. Records set over and over, whatever their
+    /// attributes, allocate nothing once their buffers and the spares have grown.
+    pub fn set_from(&mut self, r: &RecordRef<'_>, spare: &mut Vec<(String, String)>) {
+        fn set(s: &mut String, v: &str) {
+            s.clear();
+            s.push_str(v);
+        }
+        self.ts = r.ts;
+        self.severity = r.severity;
+        set(&mut self.service, r.service);
+        set(&mut self.host, r.host);
+        set(&mut self.source, r.source);
+        set(&mut self.message, r.message);
+        let mut n = 0;
+        for (k, v) in r.attrs() {
+            match self.attrs.get_mut(n) {
+                Some((a, b)) => {
+                    set(a, k);
+                    set(b, v);
+                }
+                None => match spare.pop() {
+                    Some((mut a, mut b)) => {
+                        set(&mut a, k);
+                        set(&mut b, v);
+                        self.attrs.push((a, b));
+                    }
+                    None => self.attrs.push((k.to_owned(), v.to_owned())),
+                },
+            }
+            n += 1;
+        }
+        while self.attrs.len() > n {
+            if let Some(pair) = self.attrs.pop() {
+                spare.push(pair);
+            }
+        }
+        self.trace_id = r.trace_id;
+        self.span_id = r.span_id;
+    }
+}
+
 /// The level a severity number names (OpenTelemetry's ranges: 1–4 trace, 5–8 debug, 9–12 info,
 /// 13–16 warn, 17–20 error, 21–24 fatal).
 pub fn level(severity: u8) -> &'static str {

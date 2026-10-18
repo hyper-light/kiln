@@ -527,8 +527,15 @@ fn leaf_row(l: &Leaf, r: &RecordRef<'_>, lower: &mut String, lowered: &mut bool,
     let lower_msg = |lower: &mut String, lowered: &mut bool| {
         if !*lowered {
             lower.clear();
-            for c in r.message.chars() {
-                lower.extend(c.to_lowercase());
+            // Most lines are ASCII: lowered a byte at a time (what `char::to_lowercase` gives
+            // there), four to five times faster than a char at a time (§12.14).
+            if r.message.is_ascii() {
+                lower.push_str(r.message);
+                lower.make_ascii_lowercase();
+            } else {
+                for c in r.message.chars() {
+                    lower.extend(c.to_lowercase());
+                }
             }
             *lowered = true;
         }
@@ -586,6 +593,25 @@ mod tests {
         let mut rows = crate::logs::record::Rows::new(&raw, 1);
         let rr = rows.next_row().unwrap().unwrap();
         s.row(&rr, &mut RowScratch::default())
+    }
+
+    /// A phrase matches whatever the case, the line ASCII (lowered a byte at a time) or not (a char
+    /// at a time), and the two agree where both apply.
+    #[test]
+    fn phrases_match_whatever_the_case_ascii_or_not() {
+        let ascii = rec("web", 9, "Connection REFUSED by db-3:5432", &[]);
+        let wide = rec("web", 9, "ÜBER-Fehler: Connection Refused by db-3", &[]);
+        for (q, r, want) in [
+            ("\"connection refused\"", &ascii, true),
+            ("\"CONNECTION refused\"", &ascii, true),
+            ("\"connection refused\"", &wide, true),
+            ("\"über-fehler\"", &wide, true),
+            ("\"ÜBER-FEHLER: connection\"", &wide, true),
+            ("\"refused by db-4\"", &ascii, false),
+            ("\"über\"", &ascii, false),
+        ] {
+            assert_eq!(matches(q, r), want, "{q} on {:?}", r.message);
+        }
     }
 
     #[test]

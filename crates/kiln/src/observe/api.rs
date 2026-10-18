@@ -186,6 +186,7 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["logs", "aggregate"]) => aggregate(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["logs", "facets"]) => facets(read_json(req.into_body(), QUERY_BODY).await?).await,
         (&Method::POST, ["logs", "patterns"]) => patterns(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::GET, ["logs", "tail"]) => tail(q, req),
         (&Method::POST, ["events"]) => post_event(read_json(req.into_body(), QUERY_BODY).await?),
         (&Method::POST, ["events", "search"]) => {
             let mut b: SearchBody = read_json(req.into_body(), QUERY_BODY).await?;
@@ -507,33 +508,13 @@ async fn search(body: SearchBody) -> Result<Response, Fail> {
         let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
         let ns = |ms: i64| ms.saturating_mul(1_000_000);
         let found = s.search_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), body.limit.unwrap_or(100).clamp(1, LOGS_MAX)).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-        let records: Vec<Value> = found
-            .records
-            .iter()
-            .map(|r| {
-                json!({
-                    "ts_ns": r.ts,
-                    "status": kiln_obs::logs::record::level(r.severity),
-                    "severity": r.severity,
-                    "service": r.service,
-                    "host": r.host,
-                    "source": r.source,
-                    "message": r.message,
-                    "attributes": r.attrs.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
-                    "trace_id": r.trace_id.map(hex),
-                    "span_id": r.span_id.map(hex),
-                })
-            })
-            .collect();
-        Ok(srv::json(
-            StatusCode::OK,
-            &json!({
-                "records": records,
-                "blocks": { "total": found.blocks_total, "pruned": found.blocks_pruned },
-                "rows_scanned": found.rows_scanned,
-                "took_ms": started.elapsed().as_secs_f64() * 1000.0,
-            }),
-        ))
+        let out = SearchOut {
+            records: RecordsOut(&found.records),
+            blocks: BlocksOut { total: found.blocks_total, pruned: found.blocks_pruned },
+            rows_scanned: found.rows_scanned,
+            took_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
+        Ok(srv::json(StatusCode::OK, &out))
     })
     .await
 }
@@ -682,8 +663,251 @@ fn post_event(e: EventIn) -> Result<Response, Fail> {
     Ok(srv::json(StatusCode::ACCEPTED, &json!({ "status": "ok" })))
 }
 
-fn hex<const N: usize>(b: [u8; N]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+/// A log record as the API gives one (a search's, a tail's), written from the record as it is: the
+/// JSON a `serde_json::Value` of it made, without a tree of values built a record. kiln's
+/// serde_json keeps an object's keys in the order they were put in (`preserve_order`, which the
+/// QUIC stack's qlog turns on): the fields in that order, the attributes in the order their keys
+/// first come, a key given twice its last value.
+struct RecordOut<'a>(&'a Record);
+
+impl serde::Serialize for RecordOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let r = self.0;
+        let mut m = s.serialize_map(Some(10))?;
+        m.serialize_entry("ts_ns", &r.ts)?;
+        m.serialize_entry("status", kiln_obs::logs::record::level(r.severity))?;
+        m.serialize_entry("severity", &r.severity)?;
+        m.serialize_entry("service", &r.service)?;
+        m.serialize_entry("host", &r.host)?;
+        m.serialize_entry("source", &r.source)?;
+        m.serialize_entry("message", &r.message)?;
+        m.serialize_entry("attributes", &AttrsOut(&r.attrs))?;
+        m.serialize_entry("trace_id", &r.trace_id.map(HexOut))?;
+        m.serialize_entry("span_id", &r.span_id.map(HexOut))?;
+        m.end()
+    }
+}
+
+/// Attributes as an object: each key where it first comes, with the last value it is given. A record
+/// has a few: a key's earlier and later pairs are found by passes over them, nothing allocated;
+/// past [`ATTRS_SCANNED`] they are sorted by key once instead.
+struct AttrsOut<'a>(&'a [(String, String)]);
+
+const ATTRS_SCANNED: usize = 32;
+
+impl serde::Serialize for AttrsOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let a = self.0;
+        let mut m = s.serialize_map(None)?;
+        if a.len() > ATTRS_SCANNED {
+            let key = |i: usize| a.get(i).map(|p| p.0.as_str());
+            // Sorted by key, stably: a key's pairs in the order given, its first and last at the ends.
+            let mut order: Vec<usize> = (0..a.len()).collect();
+            order.sort_by(|&x, &y| key(x).cmp(&key(y)));
+            let mut keys: Vec<(usize, usize)> = order.chunk_by(|&x, &y| key(x) == key(y)).filter_map(|run| Some((*run.first()?, *run.last()?))).collect();
+            keys.sort_unstable();
+            for (first, last) in keys {
+                if let (Some((k, _)), Some((_, v))) = (a.get(first), a.get(last)) {
+                    m.serialize_entry(k, v)?;
+                }
+            }
+            return m.end();
+        }
+        for (i, (k, v)) in a.iter().enumerate() {
+            if a.get(..i).unwrap_or_default().iter().any(|(e, _)| e == k) {
+                continue;
+            }
+            let last = a.get(i..).unwrap_or_default().iter().rev().find(|(e, _)| e == k).map_or(v, |(_, v)| v);
+            m.serialize_entry(k, last)?;
+        }
+        m.end()
+    }
+}
+
+/// Bytes as lowercase hex, written from the stack.
+struct HexOut<const N: usize>([u8; N]);
+
+impl<const N: usize> serde::Serialize for HexOut<N> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut buf = [0u8; 64];
+        let mut n = 0;
+        for x in self.0.iter().take(32) {
+            for d in [x >> 4, x & 15] {
+                if let Some(b) = buf.get_mut(n) {
+                    *b = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+                }
+                n += 1;
+            }
+        }
+        s.serialize_str(std::str::from_utf8(buf.get(..n).unwrap_or_default()).unwrap_or_default())
+    }
+}
+
+/// Records, as a list of [`RecordOut`].
+struct RecordsOut<'a>(&'a [Record]);
+
+impl serde::Serialize for RecordsOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(RecordOut))
+    }
+}
+
+/// A tail's records, as a list of [`RecordOut`].
+struct KeptOut<'a>(&'a [(u64, Record)]);
+
+impl serde::Serialize for KeptOut<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(|(_, r)| RecordOut(r)))
+    }
+}
+
+/// A search's answer: its fields in the order a `Value` of it gave them.
+#[derive(serde::Serialize)]
+struct SearchOut<'a> {
+    records: RecordsOut<'a>,
+    blocks: BlocksOut,
+    rows_scanned: u64,
+    took_ms: f64,
+}
+
+#[derive(serde::Serialize)]
+struct BlocksOut {
+    total: u64,
+    pruned: u64,
+}
+
+/// A tail's message.
+#[derive(serde::Serialize)]
+struct TailOut<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    records: KeptOut<'a>,
+    read: u64,
+    matched: u64,
+    missed: u64,
+    ms: u64,
+}
+
+/// A tail's message each [`TAIL_TICK`]: as live as a list is read (the eye takes in a moving list
+/// a fixation at a time, 200–250 ms in reading: Rayner, "Eye movements in reading and information
+/// processing: 20 years of research", Psychological Bulletin 124(3), 1998), and never redrawn
+/// faster than that.
+const TAIL_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+/// How often a tail reads the feed between its messages: what the ring holds for it stays a small
+/// part of the ring's bound.
+const TAIL_READ: std::time::Duration = std::time::Duration::from_millis(50);
+/// Records a second a tail shows, sampled past it, unless asked otherwise: each row in view, of the
+/// 25 or so a list shows, for two fixations (Rayner 1998), 25 / 0.5 s. Past it they come faster
+/// than they can be read, and the tail says how many matched besides.
+const TAIL_RATE: u32 = 50;
+const TAIL_MAX_RATE: u32 = 1_000;
+/// A tail with nothing to show says so this often, its counts at 0 (and its socket kept alive).
+const TAIL_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// A client that takes no message for this long is let go, and its place in the feed with it.
+const TAIL_SEND_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Live tail (`docs/observe.md` §6): over a WebSocket, the log records a search matches as this
+/// node's replica applies them; past `rate` a second (50 unless asked) a uniformly random sample of
+/// them, as Datadog's Live Tail. Each message holds a tick's records and how many rows the tick
+/// read, matched and missed (a client too slow to keep up misses rows; it never holds the node up).
+fn tail(q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
+    let o = observe()?;
+    let query = q.get("query").cloned().unwrap_or_default();
+    let rate = q.get("rate").map(|r| r.parse::<u32>().ok().filter(|r| (1..=TAIL_MAX_RATE).contains(r))).unwrap_or(Some(TAIL_RATE));
+    let (resp, upgrade) = crate::http::ws::accept_limited(req, 64 << 10).map_err(|r| fail(r.status, r.reason))?;
+    // Taken before the upgrade completes: what is applied meanwhile is the tail's.
+    let follower = o.feed().follow();
+    crate::rt::spawn(async move {
+        let socket = match upgrade.await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "a tail's upgrade failed");
+                return;
+            }
+        };
+        let started = match (kiln_obs::logs::search::parse(&query), rate, follower) {
+            (Err(e), _, _) => Err(e.to_string()),
+            (_, None, _) => Err(format!("a rate: 1 to {TAIL_MAX_RATE} records a second")),
+            (_, _, None) => Err(format!("{} tails follow this node already; one must close first", kiln_obs::logs::tail::MAX_FOLLOWERS)),
+            (Ok(search), Some(rate), Some(f)) => Ok((search, rate, f)),
+        };
+        let ended = match started {
+            Ok((search, rate, f)) => follow_tail(socket, f, search, rate).await,
+            Err(e) => refuse_tail(socket, &e).await,
+        };
+        if let Err(e) = ended {
+            tracing::debug!(error = %format!("{e:#}"), "a tail ended");
+        }
+    });
+    Ok(resp)
+}
+
+async fn refuse_tail(socket: crate::http::ws::WebSocket, why: &str) -> anyhow::Result<()> {
+    let mut socket = socket;
+    socket.send(crate::http::ws::text(json!({ "type": "error", "message": why }).to_string())).await?;
+    socket.close(None).await.ok();
+    Ok(())
+}
+
+async fn follow_tail(socket: crate::http::ws::WebSocket, follower: kiln_obs::logs::tail::Follower, search: kiln_obs::logs::search::Search, rate: u32) -> anyhow::Result<()> {
+    use futures::{FutureExt as _, StreamExt as _};
+    use std::time::Instant;
+    use crate::http::ws::Message;
+    // What a tick may show: its share of the rate, and what the ticks before left of theirs, up to a
+    // second's worth. Records are applied in batches, so a tick often reads none; its share goes to
+    // the next, and over a second what is shown is the rate asked whenever more than that match.
+    let share = f64::from(rate) * TAIL_TICK.as_secs_f64();
+    let mut allowance = share;
+    let whole = |a: f64| a.floor() as usize;
+    let (mut tx, mut rx) = socket.split();
+    let mut state = Some((follower, kiln_obs::logs::tail::Sample::new(whole(allowance), rand::random()), search));
+    let (mut next, mut said) = (Instant::now() + TAIL_TICK, Instant::now());
+    // Each message is written here, then copied out once.
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        futures::select_biased! {
+            msg = rx.next().fuse() => match msg {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(()),
+                _ => continue,
+            },
+            () = crate::rt::sleep(TAIL_READ).fuse() => {}
+        }
+        let Some((mut f, mut sample, search)) = state.take() else { return Ok(()) };
+        let (f, mut sample, search) = if f.pending() {
+            crate::rt::blocking(move || {
+                let read = f.read(&search, &mut sample);
+                if let Err(e) = read {
+                    tracing::warn!(error = %e, "a tail read rows it could not decode");
+                }
+                (f, sample, search)
+            })
+            .await?
+        } else {
+            (f, sample, search)
+        };
+        let now = Instant::now();
+        if now >= next {
+            next = (next + TAIL_TICK).max(now);
+            if sample.read > 0 || sample.missed > 0 || now.duration_since(said) >= TAIL_IDLE {
+                let (read, matched, missed) = (sample.read, sample.matched, sample.missed);
+                let kept = sample.kept();
+                allowance -= kept.len() as f64;
+                buf.clear();
+                serde_json::to_writer(&mut buf, &TailOut { kind: "records", records: KeptOut(kept), read, matched, missed, ms: TAIL_TICK.as_millis() as u64 })?;
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                match crate::rt::timeout(TAIL_SEND_WITHIN, tx.send(crate::http::ws::text(text))).await {
+                    Ok(sent) => sent?,
+                    Err(_) => return Ok(()),
+                }
+                said = now;
+            }
+            allowance = (allowance + share).min(f64::from(rate));
+            sample.clear(whole(allowance));
+        }
+        state = Some((f, sample, search));
+    }
 }
 
 /// Points as Datadog's series API takes them (v1): a metric, its type, its tags as `key:value`
@@ -805,3 +1029,67 @@ pub fn snapshot(snapshot: &str, file: &str, req: &Request) -> Result<Response, F
     Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex<const N: usize>(b: [u8; N]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// The JSON a record was given as before: a `serde_json::Value` built of it.
+    fn as_value(r: &Record) -> Value {
+        json!({
+            "ts_ns": r.ts,
+            "status": kiln_obs::logs::record::level(r.severity),
+            "severity": r.severity,
+            "service": r.service,
+            "host": r.host,
+            "source": r.source,
+            "message": r.message,
+            "attributes": r.attrs.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
+            "trace_id": r.trace_id.map(hex),
+            "span_id": r.span_id.map(hex),
+        })
+    }
+
+    /// Written from the record as it is, a record's JSON is byte for byte what a `Value` of it gave:
+    /// fields in order, attributes where their keys first come (a key given twice its last value,
+    /// past the count scanned as well as under it), text escaped, ids as hex.
+    #[test]
+    fn a_record_is_written_as_a_value_of_it_was() -> Result<(), serde_json::Error> {
+        let pairs = |n: usize| -> Vec<(String, String)> { (0..n).map(|i| (format!("k{}", (i * 7919) % n), format!("v{i}"))).collect() };
+        let mut many = pairs(ATTRS_SCANNED + 9);
+        many.push(("k3".into(), "last".into()));
+        let records = [
+            Record::default(),
+            Record {
+                ts: -5,
+                severity: 17,
+                service: "api".into(),
+                host: "h1".into(),
+                source: "kiln".into(),
+                message: "line \"one\"\n\ttab \u{1} and ünïcödé".into(),
+                attrs: vec![("zeta".into(), "1".into()), ("alpha".into(), "2".into()), ("zeta".into(), "3".into()), ("".into(), "empty key".into())],
+                trace_id: Some([0xab; 16]),
+                span_id: Some([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+            },
+            Record { ts: i64::MAX, severity: 9, message: "x".repeat(70_000), attrs: pairs(ATTRS_SCANNED), ..Record::default() },
+            Record { ts: 1, severity: 24, attrs: many, ..Record::default() },
+        ];
+        for r in &records {
+            assert_eq!(serde_json::to_string(&RecordOut(r))?, serde_json::to_string(&as_value(r))?);
+        }
+        let (blocks_pruned, blocks_total, rows_scanned) = (3u64, 9u64, 1234u64);
+        let out = SearchOut { records: RecordsOut(&records), blocks: BlocksOut { total: blocks_total, pruned: blocks_pruned }, rows_scanned, took_ms: 1.5 };
+        let before = json!({
+            "records": records.iter().map(as_value).collect::<Vec<_>>(),
+            "blocks": { "total": blocks_total, "pruned": blocks_pruned },
+            "rows_scanned": rows_scanned,
+            "took_ms": 1.5,
+        });
+        assert_eq!(serde_json::to_string(&out)?, serde_json::to_string(&before)?);
+        Ok(())
+    }
+}

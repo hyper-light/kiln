@@ -27,6 +27,7 @@ use kiln_obs::group::{self, TICK};
 use kiln_obs::hash::Keyed;
 use kiln_obs::image::{FileKind, Image};
 use kiln_obs::logs::record::Record;
+use kiln_obs::logs::tail::Feed;
 use kiln_obs::machine::{Machine, Shared};
 use kiln_obs::manifest::{Point, plain_name};
 use kiln_obs::store::{Answer, snapshot_name};
@@ -230,6 +231,7 @@ pub struct Observe {
     out: async_channel::Receiver<Out>,
     snaps: PathBuf,
     key: Option<String>,
+    feed: Arc<Feed>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -249,9 +251,10 @@ impl Observe {
             Role::Runner { .. } => None,
         };
         let admission = Arc::new(Admission::default());
-        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key };
+        let feed = Feed::new();
+        let handle = Self { tx: tx.clone(), admission: admission.clone(), store: store.clone(), view: view.clone(), out: out_rx, snaps, key, feed: feed.clone() };
         let spawned = std::thread::Builder::new().name("kiln-observe".into()).spawn(move || {
-            let mut owner = Owner::new(settings, store, view, out_tx, tx, admission);
+            let mut owner = Owner::new(settings, store, view, out_tx, tx, admission, feed);
             owner.run(&rx);
         });
         if let Err(e) = spawned {
@@ -383,6 +386,12 @@ impl Observe {
         lock(&self.store).clone()
     }
 
+    /// The log records this node's replica applies, as it applies them (live tail): the same feed
+    /// whichever replica is open.
+    pub fn feed(&self) -> &Arc<Feed> {
+        &self.feed
+    }
+
     pub fn view(&self) -> View {
         lock(&self.view).clone()
     }
@@ -474,6 +483,7 @@ struct Owner {
     waker: Waker,
     input: Sender<Input>,
     admission: Arc<Admission>,
+    feed: Arc<Feed>,
     start: Instant,
     batcher: Batcher,
     joiner: Joiner,
@@ -519,7 +529,7 @@ fn now_ns(start: Instant) -> u64 {
 }
 
 impl Owner {
-    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>) -> Self {
+    fn new(settings: Settings, store: Arc<Mutex<Option<Shared>>>, view: Arc<Mutex<View>>, out: async_channel::Sender<Out>, input: Sender<Input>, admission: Arc<Admission>, feed: Arc<Feed>) -> Self {
         let wakeup = Arc::new(Wakeup { tx: input.clone(), pending: AtomicBool::new(false) });
         let waker = Waker::from(wakeup.clone());
         let mut o = Self {
@@ -538,6 +548,7 @@ impl Owner {
             waker,
             input,
             admission,
+            feed,
             start: Instant::now(),
             batcher: Batcher::new(rand::random()),
             joiner: Joiner::default(),
@@ -632,6 +643,12 @@ impl Owner {
                 if id == SERVER && rep.r.configuration().voters == [SERVER] {
                     let _ = rep.r.campaign();
                 }
+                // What it applies from here on is published, but nothing its log held as it
+                // opened: entries applied before a restart are applied again.
+                if let Ok(last) = hyper_raft::Storage::last_index(rep.r.core().store()) {
+                    self.feed.seen(last);
+                }
+                rep.r.machine().shared().write().unwrap_or_else(PoisonError::into_inner).set_feed(Some(self.feed.clone()));
                 *lock(&self.store) = Some(rep.r.machine().shared());
                 self.opened_at = Some(Instant::now());
                 self.maintain = Some(Maintenance::start(rep.r.machine().shared(), self.dir.clone()));
@@ -902,6 +919,7 @@ impl Owner {
                         self.close();
                         let _ = std::fs::remove_dir_all(self.dir.join("store"));
                         let _ = std::fs::remove_file(self.dir.join("obs.log"));
+                        self.feed.reset();
                     }
                     if let Err(e) = save_json(&self.dir.join("member.json"), &me) {
                         self.error = Some(format!("{e:#}"));

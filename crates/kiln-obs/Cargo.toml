@@ -66,5 +66,9 @@ harness = false
 name = "loghub"
 harness = false
 
+[[bench]]
+name = "tail"
+harness = false
+
 [lints]
 workspace = true

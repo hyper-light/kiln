@@ -28,6 +28,16 @@ const api = async (method, path, body) => {
 const expect = (ok, what) => {
   if (!ok) throw new Error(`expected: ${what}`);
 };
+/** Types `text` into a field and checks it took: WebKit can drop text inserted into a field the page
+ * made a moment before (no input event at all, the field left empty), so it is typed again. */
+const fillIn = async (locator, text) => {
+  for (let i = 0; ; i++) {
+    await locator.fill(text);
+    if ((await locator.inputValue()) === text) return;
+    if (i >= 4) throw new Error(`the field never took ${JSON.stringify(text)}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+};
 const until = async (what, f, ms = 15_000) => {
   const end = Date.now() + ms;
   for (;;) {
@@ -49,6 +59,10 @@ const problems = [];
 page.on("pageerror", (e) => !/due to access control checks/.test(e.message) && problems.push(`pageerror: ${e.message}`));
 page.on("console", (m) => m.type() === "error" && !m.text().startsWith("Failed to load resource") && problems.push(`console: ${m.text()}`));
 page.on("response", (r) => r.status() >= 400 && problems.push(`HTTP ${r.status()} ${r.request().method()} ${r.url().replace(BASE, "")}`));
+// The page's loads and navigations, said when a scenario fails (a reload loses what was typed).
+const navs = [];
+page.on("framenavigated", (f) => f === page.mainFrame() && navs.push(`${Date.now() % 100_000} navigated ${f.url().replace(BASE, "")}`));
+page.on("load", () => navs.push(`${Date.now() % 100_000} load`));
 if (process.env.TRACE) page.on("request", (r) => r.url().includes("/api/") && console.log(`  ${Date.now() % 100000} ${r.method()} ${r.url().replace(BASE, "")}`));
 
 const scenarios = {
@@ -56,19 +70,19 @@ const scenarios = {
   async "a query goes from the explorer onto a new dashboard, which is changed and saved"() {
     const query = "avg:app.latency.p95{*} by {service}";
     await page.goto(`${BASE}/observe/metrics`);
-    await page.locator("#observe-query").fill(query);
-    await page.getByRole("button", { name: "Run" }).click();
+    await fillIn(page.locator("#observe-query"), query);
+    await page.getByRole("button", { name: "Run", exact: true }).click();
     await page.waitForURL(/\/observe\/metrics\?q=/);
     const rows = page.locator("table.data-table tbody tr");
     await until("the series' rows", async () => (await rows.count()) === 3);
     const labels = (await rows.locator("td:first-child").allTextContents()).map((t) => t.trim()).sort();
     expect(JSON.stringify(labels) === JSON.stringify(["service:api", "service:web", "service:worker"]), `the series by service, got ${labels}`);
-    await page.getByRole("button", { name: "Add to dashboard" }).click();
+    await page.getByRole("button", { name: "Add to dashboard", exact: true }).click();
     const dialog = page.getByRole("dialog");
     await dialog.getByLabel("Dashboard", { exact: true }).selectOption("new");
-    await dialog.getByLabel("New dashboard's title").fill(`E2E ${run}`);
-    await dialog.getByLabel("Widget's title").fill("Latency by service");
-    await dialog.getByRole("button", { name: "Add" }).click();
+    await fillIn(dialog.getByLabel("New dashboard's title"), `E2E ${run}`);
+    await fillIn(dialog.getByLabel("Widget's title"), "Latency by service");
+    await dialog.getByRole("button", { name: "Add", exact: true }).click();
     await page.waitForURL(/\/observe\/dashboards\/d[0-9a-f]+/);
     const id = decodeURIComponent(page.url().split("/").pop().split("?")[0]);
     await page.getByRole("heading", { name: `E2E ${run}` }).waitFor();
@@ -76,20 +90,20 @@ const scenarios = {
     let d = await api("GET", `/api/observe/v1/dashboards/${id}`);
     expect(d.status === 200 && d.body.widgets.length === 1 && d.body.widgets[0].queries[0] === query, "the dashboard kept, its widget of the query");
     // A note added in place, then saved.
-    await page.getByRole("button", { name: "Edit" }).click();
-    await page.getByRole("button", { name: "Add a widget" }).click();
+    await page.getByRole("button", { name: "Edit", exact: true }).click();
+    await page.getByRole("button", { name: "Add a widget", exact: true }).click();
     await page.getByRole("dialog").getByLabel("Kind").selectOption("note");
-    await page.getByRole("dialog").getByLabel("Title").fill("Read me");
-    await page.locator("#widget-text").fill("Latency is **p95**, by service.");
-    await page.getByRole("dialog").getByRole("button", { name: "Add" }).click();
-    await page.getByRole("button", { name: "Save" }).click();
-    await page.getByRole("button", { name: "Edit" }).waitFor();
+    await fillIn(page.getByRole("dialog").getByLabel("Title"), "Read me");
+    await fillIn(page.locator("#widget-text"), "Latency is **p95**, by service.");
+    await page.getByRole("dialog").getByRole("button", { name: "Add", exact: true }).click();
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await page.getByRole("button", { name: "Edit", exact: true }).waitFor();
     await page.locator(".obs-note strong", { hasText: "p95" }).waitFor();
     d = await api("GET", `/api/observe/v1/dashboards/${id}`);
     expect(d.body.widgets.length === 2 && d.body.widgets[1].kind === "note" && d.body.widgets[1].layout.y >= d.body.widgets[0].layout.y, "two widgets, the note after the chart");
     // Deleted from its page: gone from the list.
-    await page.getByRole("button", { name: "Delete the dashboard" }).click();
-    await page.getByRole("dialog").getByRole("button", { name: "Delete" }).click();
+    await page.getByRole("button", { name: "Delete the dashboard", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
     await page.waitForURL(/\/observe\/dashboards$/);
     expect((await api("GET", `/api/observe/v1/dashboards/${id}`)).status === 404, "the dashboard gone");
   },
@@ -102,8 +116,8 @@ const scenarios = {
     await page.getByLabel("$host").selectOption(hosts[0]);
     await page.waitForURL(new RegExp(`var\\.host=${encodeURIComponent(hosts[0])}`));
     // A copy changes; kiln's own does not.
-    expect((await page.getByRole("button", { name: "Edit" }).count()) === 0, "kiln's own dashboard has no Edit");
-    await page.getByRole("button", { name: "Copy to change" }).click();
+    expect((await page.getByRole("button", { name: "Edit", exact: true }).count()) === 0, "kiln's own dashboard has no Edit");
+    await page.getByRole("button", { name: "Copy to change", exact: true }).click();
     await page.waitForURL(/\/observe\/dashboards\/d[0-9a-f]+/);
     const id = decodeURIComponent(page.url().split("/").pop().split("?")[0]);
     const d = await api("GET", `/api/observe/v1/dashboards/${id}`);
@@ -116,9 +130,26 @@ const scenarios = {
 
   /** Logs searched, narrowed by a facet, a record opened and one of its attributes searched. */
   async "a log search narrows by a facet and by an attribute of a record"() {
+    // Records of its own (whatever else the server holds): two services, errors and not, each with a route.
+    const source = `e2e-${run}`;
+    const routes = ["/api/runs", "/api/jobs", "/login"];
+    const logs = Array.from({ length: 30 }, (_, i) => ({
+      message: i % 2 ? `GET ${routes[i % 3]} 200` : `POST ${routes[i % 3]} 500: deadline exceeded`,
+      status: i % 2 ? "info" : "error",
+      service: i % 3 ? `${source}-api` : `${source}-web`,
+      hostname: "e2e",
+      source,
+      attributes: { route: routes[i % 3] },
+    }));
+    expect((await api("POST", "/api/observe/v1/logs", logs)).status === 202, "posting the records");
+    const search = `status:error source:${source}`;
+    await until(
+      "the records searchable",
+      async () => (await api("POST", "/api/observe/v1/logs/search", { query: search, from: Date.now() - 600_000, to: Date.now(), limit: 20 })).body?.records?.length === 15,
+    );
     await page.goto(`${BASE}/observe/logs`);
-    await page.locator("#observe-search").fill("status:error");
-    await page.getByRole("button", { name: "Search" }).click();
+    await fillIn(page.locator("#observe-search"), search);
+    await page.getByRole("button", { name: "Search", exact: true }).click();
     await page.waitForURL(/q=status%3Aerror/);
     const service = page.locator('aside[aria-label="Facets"] section[aria-label="service"] button').first();
     await service.waitFor();
@@ -138,8 +169,9 @@ const scenarios = {
     // The search the page made is one the API answers the same.
     const q = new URL(page.url()).searchParams.get("q");
     const viaApi = await api("POST", "/api/observe/v1/logs/search", { query: `(${q}) -source:kiln.event`, from: Date.now() - 3_600_000, to: Date.now(), limit: 1000 });
+    const expected = logs.filter((l) => l.status === "error" && l.service === name && l.attributes.route === value).length;
     expect(
-      viaApi.status === 200 && viaApi.body.records.length > 0 && viaApi.body.records.every((r) => r.status === "error" && r.service === name && r.attributes.route === value),
+      viaApi.status === 200 && viaApi.body.records.length === expected && viaApi.body.records.every((r) => r.status === "error" && r.service === name && r.attributes.route === value),
       "the API agrees with the page's search",
     );
   },
@@ -147,23 +179,23 @@ const scenarios = {
   /** A monitor made from the form, muted, unmuted and deleted. */
   async "a monitor is made, muted, unmuted and deleted"() {
     await page.goto(`${BASE}/observe/monitors/new?query=${encodeURIComponent("avg(last_5m):avg:app.latency.p95{*} by {service} > 1000000")}`);
-    await page.getByLabel("Name", { exact: true }).fill(`E2E latency ${run}`);
-    await page.getByLabel("Warning at", { exact: true }).fill("900000");
-    await page.getByRole("button", { name: "Create" }).click();
+    await fillIn(page.getByLabel("Name", { exact: true }), `E2E latency ${run}`);
+    await fillIn(page.getByLabel("Warning at", { exact: true }), "900000");
+    await page.getByRole("button", { name: "Create", exact: true }).click();
     await page.waitForURL(/\/observe\/monitors\/m[0-9a-f]+$/);
     const id = page.url().split("/").pop();
     let m = await api("GET", `/api/observe/v1/monitors/${id}`);
     expect(m.status === 200 && m.body.name === `E2E latency ${run}` && m.body.options.thresholds.warning === 900000, "the monitor kept as made");
-    await page.getByRole("button", { name: "Mute" }).click();
+    await page.getByRole("button", { name: "Mute", exact: true }).click();
     await page.getByText("· muted").first().waitFor();
     m = await api("GET", `/api/observe/v1/monitors/${id}`);
     expect(m.body.muted_until > Date.now(), "muted on the server");
-    await page.getByRole("button", { name: "Unmute" }).click();
-    await page.getByRole("button", { name: "Mute" }).waitFor();
+    await page.getByRole("button", { name: "Unmute", exact: true }).click();
+    await page.getByRole("button", { name: "Mute", exact: true }).waitFor();
     m = await api("GET", `/api/observe/v1/monitors/${id}`);
     expect(!(m.body.muted_until > Date.now()), "unmuted on the server");
-    await page.getByRole("button", { name: "Delete the monitor" }).click();
-    await page.getByRole("dialog").getByRole("button", { name: "Delete" }).click();
+    await page.getByRole("button", { name: "Delete the monitor", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
     await page.waitForURL(/\/observe\/monitors$/);
     expect((await api("GET", `/api/observe/v1/monitors/${id}`)).status === 404, "the monitor gone");
   },
@@ -174,17 +206,17 @@ const scenarios = {
     if (!receiver) return "skipped: no RECEIVER";
     const name = `e2e-${run}`;
     await page.goto(`${BASE}/observe/integrations`);
-    await page.getByRole("button", { name: "Add integration" }).click();
+    await page.getByRole("button", { name: "Add integration", exact: true }).click();
     const dialog = page.getByRole("dialog");
     await dialog.getByLabel("Kind").selectOption("webhook");
-    await dialog.getByLabel("Name").fill(name);
-    await dialog.getByLabel("URL").fill(`${receiver}/${name}`);
-    await dialog.getByLabel("Signing secret (optional)").fill("e2e-secret");
-    await dialog.getByRole("button", { name: "Add" }).click();
+    await fillIn(dialog.getByLabel("Name"), name);
+    await fillIn(dialog.getByLabel("URL"), `${receiver}/${name}`);
+    await fillIn(dialog.getByLabel("Signing secret (optional)"), "e2e-secret");
+    await dialog.getByRole("button", { name: "Add", exact: true }).click();
     const row = page.locator("tr", { hasText: name });
     await row.waitFor();
     const before = fs.existsSync(process.env.RECEIVED) ? fs.readFileSync(process.env.RECEIVED, "utf8").split("\n").filter(Boolean).length : 0;
-    await row.getByRole("button", { name: "Test" }).click();
+    await row.getByRole("button", { name: "Test", exact: true }).click();
     const got = await until("the test notice at the receiver", () => {
       const lines = fs.existsSync(process.env.RECEIVED) ? fs.readFileSync(process.env.RECEIVED, "utf8").split("\n").filter(Boolean) : [];
       return lines
@@ -193,15 +225,24 @@ const scenarios = {
         .find((x) => x.path === `/${name}`);
     });
     expect(/^sha256=[0-9a-f]{64}$/.test(got.sig ?? ""), `a signed notice, got ${got.sig}`);
-    await row.getByRole("button", { name: `Remove ${name}` }).click();
-    await page.getByRole("dialog").getByRole("button", { name: "Remove" }).click();
+    await row.getByRole("button", { name: `Remove ${name}`, exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
     await until("the integration gone", async () => !(await api("GET", "/api/observe/v1/integrations")).body.integrations.some((i) => i.name === name));
   },
   /** A search's patterns: the seed's message shapes grouped, and a pattern a click from its records. */
   async "a search's records group into patterns, and a pattern narrows the search to its own"() {
-    await page.goto(`${BASE}/observe/logs?view=patterns&range=4h&q=${encodeURIComponent("source:seed")}`);
+    // Records of its own, of three shapes.
+    const source = `e2e-p-${run}`;
+    const shapes = [(i) => `connection refused by db-${i % 4}:${5400 + i}`, (i) => `GET /api/runs/${1000 + i} 200 in ${i + 3} ms`, (i) => `job ${7000 + i} queued`];
+    const logs = Array.from({ length: 45 }, (_, i) => ({ message: shapes[i % 3](i), status: i % 3 ? "info" : "error", service: "e2e", hostname: "e2e", source }));
+    expect((await api("POST", "/api/observe/v1/logs", logs)).status === 202, "posting the records");
+    await until(
+      "the records searchable",
+      async () => (await api("POST", "/api/observe/v1/logs/search", { query: `source:${source}`, from: Date.now() - 600_000, to: Date.now(), limit: 100 })).body?.records?.length === 45,
+    );
+    await page.goto(`${BASE}/observe/logs?view=patterns&q=${encodeURIComponent(`source:${source}`)}`);
     const rows = page.getByRole("region", { name: "Patterns" }).getByRole("listitem");
-    await until("the patterns", async () => (await rows.count()) >= 5, 20_000);
+    await until("the patterns", async () => (await rows.count()) >= 3, 20_000);
     const refused = rows.filter({ hasText: "connection refused by db-" });
     await refused.first().waitFor();
     await refused.first().getByRole("button").click();
@@ -209,12 +250,44 @@ const scenarios = {
     const q = new URL(page.url()).searchParams.get("q");
     await page.getByRole("region", { name: "Records" }).waitFor();
     const to = Date.now();
-    const found = await api("POST", "/api/observe/v1/logs/search", { query: `-source:kiln.event (${q})`, from: to - 4 * 3_600_000, to, limit: 200 });
+    const found = await api("POST", "/api/observe/v1/logs/search", { query: `-source:kiln.event (${q})`, from: to - 3_600_000, to, limit: 200 });
     expect(found.status === 200 && found.body.records.length > 0, `the narrowed search finds records: ${JSON.stringify(found.body).slice(0, 200)}`);
     expect(
       found.body.records.every((r) => /^connection refused by db-\d+:\d+$/.test(r.message)),
       `every record the pattern narrows to is of it: ${found.body.records.map((r) => r.message).slice(0, 5)}`,
     );
+  },
+
+  /** A search followed live: what is posted after it opens comes, the newest on top, and what it does
+   * not match never; paused, what comes waits (said how many), resuming shows it; opening a record
+   * pauses. */
+  async "a search followed live shows each record as it comes, and holds them while paused"() {
+    const tag = `live-${run}`;
+    await page.goto(`${BASE}/observe/logs?view=live&q=${encodeURIComponent(`service:${tag}`)}`);
+    const region = page.getByRole("region", { name: "Live tail" });
+    await region.getByText(/^Live · /).waitFor({ timeout: 15_000 });
+    const post = async (i, service = tag) => {
+      const r = await api("POST", "/api/observe/v1/logs", [{ message: `${tag} record ${i}`, service, hostname: "e2e", source: "e2e", status: i % 3 === 0 ? "error" : "info" }]);
+      expect(r.status === 202, `posting record ${i}: ${r.status}`);
+    };
+    for (let i = 0; i < 3; i++) await post(i);
+    await post(99, `${tag}-other`);
+    const rows = region.getByRole("listitem");
+    await until("the three records", async () => (await rows.count()) === 3);
+    expect((await rows.first().innerText()).includes(`${tag} record 2`), "the newest on top");
+    await page.waitForTimeout(1_000);
+    expect(!(await region.innerText()).includes("record 99"), "another service's record never comes");
+    await region.getByRole("button", { name: "Pause", exact: true }).click();
+    for (let i = 3; i < 5; i++) await post(i);
+    await region.getByText("Paused · 2 new").waitFor();
+    expect((await rows.count()) === 3, "paused, the list stays as it was");
+    await region.getByRole("button", { name: "Resume", exact: true }).click();
+    await until("the records held while paused", async () => (await rows.count()) === 5);
+    expect((await rows.first().innerText()).includes(`${tag} record 4`), "resumed, the newest on top");
+    // Opening a record pauses the tail, so it stays where it is.
+    await rows.nth(1).getByRole("button").first().click();
+    await region.getByRole("button", { name: "Resume", exact: true }).waitFor();
+    expect((await rows.nth(1).getByRole("button").first().getAttribute("aria-expanded")) === "true", "the record opened");
   },
 
   /**
@@ -252,20 +325,20 @@ const scenarios = {
     const clouds = async () => (await api("GET", "/api/observe/v1/clouds")).body.clouds;
     try {
       await page.goto(`${BASE}/observe/integrations`);
-      await page.getByRole("button", { name: "Add cloud" }).click();
+      await page.getByRole("button", { name: "Add cloud", exact: true }).click();
       const add = page.getByRole("dialog");
       await add.getByLabel("Cloud", { exact: true }).selectOption("gcp");
-      await add.getByLabel("Name", { exact: true }).fill(`${name}-g`);
-      await add.getByLabel("Service account key (JSON)").fill("not a key");
+      await fillIn(add.getByLabel("Name", { exact: true }), `${name}-g`);
+      await fillIn(add.getByLabel("Service account key (JSON)"), "not a key");
       await add.getByText("Not a key file's JSON.").waitFor();
-      expect(await add.getByRole("button", { name: "Add" }).isDisabled(), "a key that is not one: Add is off");
+      expect(await add.getByRole("button", { name: "Add", exact: true }).isDisabled(), "a key that is not one: Add is off");
       await add.getByLabel("Credentials", { exact: true }).selectOption("server");
-      await add.getByRole("button", { name: "Test" }).click();
+      await add.getByRole("button", { name: "Test", exact: true }).click();
       await add
         .getByRole("status")
         .getByText(/no Google credentials/)
         .waitFor({ timeout: 20_000 });
-      await add.getByRole("button", { name: "Add" }).click();
+      await add.getByRole("button", { name: "Add", exact: true }).click();
       await rowOf(`${name}-g`).waitFor();
       expect(
         (await clouds()).some((c) => c.name === `${name}-g` && c.kind === "gcp" && c.service_account === undefined),
@@ -284,22 +357,22 @@ const scenarios = {
       expect(made.status === 204, `the cloud made, got ${made.status}`);
       const row = rowOf(name);
       await until("shown pulling, its series counted", async () => /Pulling/.test((await row.textContent()) ?? "") && /3 series/.test((await row.textContent()) ?? ""), 30_000);
-      await row.getByRole("button", { name: `Edit ${name}` }).click();
+      await row.getByRole("button", { name: `Edit ${name}`, exact: true }).click();
       const edit = page.getByRole("dialog");
       await edit.getByText("Kept. Type a new one to replace it.").waitFor();
-      await edit.getByLabel("Every (seconds)").fill("120");
-      await edit.getByRole("button", { name: "Save" }).click();
+      await fillIn(edit.getByLabel("Every (seconds)"), "120");
+      await edit.getByRole("button", { name: "Save", exact: true }).click();
       const after = await until("saved", async () => (await clouds()).find((c) => c.name === name && c.interval_s === 120));
       expect(after.secret_access_key === "…" && after.endpoint === endpoint && after.access_key_id === "AKIDE2E", `its secret, key and endpoint kept: ${JSON.stringify(after)}`);
       const calls = seen.length;
-      await row.getByRole("button", { name: `Pull ${name} now` }).click();
+      await row.getByRole("button", { name: `Pull ${name} now`, exact: true }).click();
       await until("a pull after the change, signed by its key", async () => seen.length > calls && seen.slice(calls).every((s) => s.auth.includes("Credential=AKIDE2E/")));
       await until("pulling still", async () => (await clouds()).find((c) => c.name === name)?.status.state === "ok");
       for (const n of [name, `${name}-g`]) {
         await rowOf(n)
-          .getByRole("button", { name: `Remove ${n}` })
+          .getByRole("button", { name: `Remove ${n}`, exact: true })
           .click();
-        await page.getByRole("dialog").getByRole("button", { name: "Remove" }).click();
+        await page.getByRole("dialog").getByRole("button", { name: "Remove", exact: true }).click();
         await until(`${n} gone`, async () => !(await clouds()).some((c) => c.name === n));
       }
     } finally {
@@ -313,6 +386,7 @@ let failed = 0;
 for (const [name, f] of Object.entries(scenarios).filter(([n]) => !process.env.ONLY || n.includes(process.env.ONLY))) {
   const t0 = Date.now();
   problems.length = 0;
+  navs.length = 0;
   try {
     const note = await f();
     if (problems.length) throw new Error(problems.join("\n"));
@@ -324,6 +398,7 @@ for (const [name, f] of Object.entries(scenarios).filter(([n]) => !process.env.O
         .split("\n")
         .join("\n     ")}`,
     );
+    console.log(`     the page's loads and navigations:\n       ${navs.join("\n       ")}`);
     // What the page showed when it failed (SHOTS: a folder to keep it in).
     await page.screenshot({ path: `${process.env.SHOTS ?? "/tmp"}/observe-e2e-${which}${phone ? "-phone" : ""}-${Object.keys(scenarios).indexOf(name)}.png`, fullPage: true }).catch(() => undefined);
   }

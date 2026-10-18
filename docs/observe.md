@@ -18,7 +18,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-3 | Replication: the store as a hyper-durable state machine (§5); kiln carries Raft on its own lane, snapshots' files over HTTP; deterministic replicas (1,000-seed scenario), a group on real logs (crashes, partitions, images), live processes killed and restarted (§13); measured (§12.9) | done |
 | O-4 | Query language: metrics (parser without recursion, evaluator, §12.5; answers agree to the bit on every replica), log search and analytics, events; the API (§7) | done |
 | O-5 | Ingestion (§8): OTLP/HTTP metrics and logs (protobuf, JSON, gzip) on the server and every runner; every node's host, container and process; kiln's registry; kiln CI's jobs and runs, kiln CD's deploys and status; GitHub's webhooks; Datadog-style series, logs and events | done |
-| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); next: live tail | in progress |
+| O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); patterns (Drain, 0.887 on Loghub, §12.13); live tail (each record once as the replica applies it, a uniform sample past the rate asked, §6, §12.14) | done |
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; next: forecast, composite | in progress |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
@@ -173,6 +173,13 @@ them would count its own alerting. A log monitor, and the logs explorer, read lo
 (`kiln_obs::monitor::logs_only`: the search and `-source:kiln.event`) unless the search names
 `kiln.event`; the event stream reads events only.
 
+A replica publishes the log records it applies to a **feed** (`kiln_obs::logs::tail`) while anyone
+follows them (live tail, §6): each batch's rows copied once into a ring bounded at 32 MiB, kept until
+every follower has read them or the bound passes them by (a follower that fell that far behind is
+told how many rows it missed; none holds the replica up). With no one following, applying costs a
+load. What a replica applies again is not published again: opening, it applies the entries after its
+last cut once more, and the feed skips every entry its log held as it opened.
+
 ## 5. Replication
 
 The store on each member is a `hyper_durable::StateMachine` (`kiln_obs::machine`). The Raft log is
@@ -280,6 +287,16 @@ stand apart, one setting for every system (depth 5, similarity 0.7, a masked var
 the template has a wildcard): on Loghub's 16 systems, 0.887 of lines grouped right, the setting
 chosen by leaving each system out (§12.13).
 
+A search can be **followed live** (`GET logs/tail`, a WebSocket): its records as this node's replica
+applies them, each once, in the order applied, a message each tick (200 ms; a record posted is on
+the tail within 0.41 s at the most, §13). Past the rate asked (50 records a second unless asked,
+1,000 at the most) they come faster than they can be read, and the tail shows a uniformly random
+sample of them, as Datadog's Live Tail does ("the sampling applied is uniformly random"), saying how
+many matched besides: each tick's matched rows each kept with probability `max / matched` (Vitter's
+Algorithm R, 1985), a tick's unused share carried to the next (up to a second's worth), so over a
+second the rate asked is what is shown. The default rate: of the 25 or so rows a list shows, each
+in view for two fixations (200–250 ms each in reading; Rayner 1998), 25 / 0.5 s.
+
 Log search follows Datadog's log syntax: `service:web status:error @http.status_code:>=500
 "connection reset" -host:old-*`, with `AND`, `OR`, `NOT`, parentheses, wildcards and ranges, and
 log analytics `count() by {service}` over a search. A `-` that starts a term is NOT wherever it
@@ -303,6 +320,7 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 | `POST logs/aggregate` | log analytics: `{query, from, to, by: [facets], measure, of}` → groups; with `step` (ms), each group's value a bucket on a grid (the explorer's histogram) |
 | `POST logs/facets` | `{query, from, to, facets, top}` → each facet's most common values and how many it has, every facet in one pass |
 | `POST logs/patterns` | `{query, from, to}` → the search's newest records (10,000 at the most) grouped by their template (Drain, §12.13): each its count, first and last seen, newest message and its records by status, the most common first |
+| `GET logs/tail?query=&rate=` | live tail (§6), a WebSocket: each 200 ms, `{type: "records", records, read, matched, missed, ms}`, the tick's records (all the search matched, or a uniform sample past `rate` a second: 50 unless said, 1 to 1,000) and how many rows it read, matched and missed (missed: it fell more than the feed's bound behind); idle, one a second, its counts 0. `{type: "error", message}`, then closed, for a search that does not parse, a rate out of bounds, or a node that 16 tails follow already |
 | `GET/POST dashboards`, `GET/PUT/DELETE dashboards/{id}` | dashboards (§11): kiln's own (`builtin:hosts`, `builtin:ci`, `builtin:cd`, read-only) and yours, kept in `<observe>/dashboards.json` |
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups'; validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated |
@@ -310,7 +328,6 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 | `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
-To come: `GET logs/tail` (websocket).
 
 OTLP/HTTP at its standard paths, `/v1/metrics` and `/v1/logs` (protobuf and JSON), on the server and
 on every runner at `127.0.0.1:4318`, so an app on a runner sends to its local runner as it would to
@@ -531,6 +548,10 @@ time range and the search in the address (a page is a link).
   search's records grouped by their template (Drain), the most common first, each its count, its
   worst status, its template (variables a quiet `*`) and when last seen; a click narrows the search
   to the pattern's fixed text and shows its records.
+- **Live tail** (their third view, `?view=live`): the search's records as they come, the newest on
+  top, as the records list shows them; the line above says how many a second match and, when they
+  come faster than 50 a second, that a sample of them is shown. Pause holds what comes (counted)
+  until Resume; opening a record pauses.
 - **Logs explorer and event stream**: a search, a histogram of its records by status (stacked, a
   bucket of a round size, about 60 to the range), each facet's most common values (a click narrows
   the search to one, again widens it), the newest 100 records (and 100 more on asking), each opened
@@ -930,6 +951,53 @@ line of another event is all wrong, so Windows' largest group (608 lines) falls 
 Proxifier's `lifetime <1 sec` and `lifetime 00:01` are one event of different lengths, which Drain
 never joins (nor does the reference, given no rule for it). A line costs 0.2–0.8 µs.
 
+### 12.14 Live tail
+
+2026-10-18, same machine, loaded (load average 40–48: other sessions compiling), so its figures are
+compared with each other, not with §12.8's: `KOBS_LOGS=<journal>:<pods> cargo bench -p kiln-obs
+--bench tail`. The records of §12.8 as 195 entries of 1,000, applied to an in-memory store; the three
+ways of applying taken in turn in each of nine rounds, the median of each:
+
+| applying | records/s | allocations a record |
+| --- | --- | --- |
+| no feed | 624,090 | 0.055 |
+| a feed, no one following | 632,220 | 0.055 |
+| followed (the apply alone) | 644,293 | 0.056 |
+
+A feed costs nothing measurable; followed, its copy into the ring is one allocation an entry. A
+follower reads every row applied (here a tick of 5,000) and keeps a uniform sample:
+
+| search | matched | ns a row | allocations a tick, 10 kept / 200 kept |
+| --- | --- | --- | --- |
+| `*` | 194,690 | 82 | 14.6 / 194 |
+| `status:error` | 122 | 86 | 0 / 1.5 |
+| `service:kube status:warn` | 25,961 | 90 | 0 / 0 |
+| `"connection refused"` | 12 | 103 | 0.06 / 0.06 |
+| `@application:kiln-namespaces` | 4,254 | 109 | 13 / 181 |
+
+At the most kiln applies on a core (§12.8: 580,000 records a second) a follower costs 5–6% of a core,
+so the 16 a node takes cost about one. With 0, 1, 4 and 16 followers on threads of their own, each
+reading every 50 ms, while a thread applies everything as fast as it can: 597,408, 652,498, 660,409
+and 645,529 records a second, and no row missed (a follower holds the ring's lock to clone an entry's
+chunk out, no longer).
+
+The passes it took:
+- A phrase was matched in the message lowered a char at a time (`char::to_lowercase`): 421 ns a row.
+  An ASCII line is now lowered a byte at a time, what `to_lowercase` gives there: 103 ns, and the
+  phrase search of §12.8 1.25 ms where it was 1.91.
+- A kept record set over another let go of the attribute pairs it had no more use for, and the next
+  that needed them allocated them again: they go to a pool of spares now, and a tick's allocations
+  at 10 kept fell from 235 to 14.6 (at 200, from 2,892 to 194). What remains is buffers growing to
+  the longest records yet, which ends as they have.
+- A record was written to the API as a `serde_json::Value` (some fifteen allocations a record); it
+  is written from the record now (a search's 1,000, a tail's tick), byte for byte what the `Value`
+  gave (`observe::api` tests), in the key order serde_json's `preserve_order` gives (the QUIC stack's
+  qlog turns it on, so kiln's `Value`s keep keys in the order they were put in).
+
+Live, a debug build (§13): a record posted comes on the tail within 0.41 s at the most; in a steady
+flood at 50 asked the tail shows 51 a second (10 a tick, 20 after a tick that read nothing), every
+one of 18,700 posted counted and none missed.
+
 ## 13. Scenarios
 
 What a user would see, checked end to end; not the code's internals.
@@ -975,17 +1043,34 @@ both from the history before them, the spike past its band and at most a few of 
 minutes alerts the spiking host's group alone, and a webhook hears of it. 2026-10-18: passes, four
 runs of four.
 
+**Live tail** (`crates/kiln/tests/observe_tail.rs`, a server as a process, its tail followed over a
+real WebSocket while records are posted to its API): what is posted after a tail opens comes on it,
+each record once, in the order posted, and only those its search matches, never one posted before
+it opened; each within 0.41 s of its post at the most; nothing coming, it says so each second. A
+flood of 40,000, a tenth of them of a rare service, followed at 1,000 a second: no message past the
+rate, no record twice, every one counted and none missed, the rare share of the 4,200 shown 0.096
+(within the 0.999 interval of 0.1, ±0.015). The server killed and started again: a tail opened as soon as it
+answers shows none of the 20,000 records it applied again, only what is posted after, and the store
+holds the 20,000 once. A search that does not parse, a rate out of bounds and a seventeenth tail are
+told why; one that closes makes room. 2026-10-18: all four pass.
+
 **In a browser** (`ui/e2e/observe.mjs`, Playwright against a live server; how to run it is at
 its top): a query explored and put on a new dashboard, which is then given a note, saved and
 deleted; kiln's own dashboard narrowed by its template variable, then copied; logs searched,
 narrowed by a facet and by an attribute of a record, the API answering the page's search alike; a
 search's patterns, one of them clicked, the search it narrows to finding its records alone (checked
-through the API); a
+through the API); a search followed live: what is posted after comes, the newest on top, another
+service's never; paused, what comes waits (said how many) and resuming shows it; opening a record
+pauses; a
 monitor made from the form, muted, unmuted and deleted; a signed webhook added, tested (the
-receiver checks the signature) and removed. Each checked through the API, not the page. 2026-10-18:
-all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch); and every Observe page
-loads in both with no error, failed request or sideways overflow, against a server holding two
-hours of metrics, an hour of logs, events, and three monitors alerting to a webhook and to Slack.
+receiver checks the signature) and removed. Each makes its own records and checks through the API,
+not the page. 2026-10-18: all pass in Chromium at 1,440 px and in WebKit as a phone (390 px, touch);
+and every Observe page loads in both with no error, failed request or sideways overflow, against a
+server holding two hours of metrics, an hour of logs, events, and three monitors alerting to a
+webhook and to Slack. Run again and again, two flakes showed and are gone: WebKit, a moment after a
+page makes a field, can drop text typed into it with no input event at all (every field is now
+checked to hold what was typed, and typed again if not); and a button found by part of its name
+also found kiln's own metrics named `…_running` (every button is found by its whole name).
 
 **Under load** (`crates/kiln/tests/observe_load.rs`): the flood of §12.11, every point taken
 stored exactly once, the replicas alike; and a runner flooded while its server is killed (SIGKILL)
@@ -996,7 +1081,8 @@ its memory bounded, and everything it took is stored once the server is back.
 (`KILN_OBSERVE_CLOCK_SKEW_MS` moves the clock observe uses; a real one takes root to move) is
 measured an hour ahead from its writes and said so once; its own figures, an hour ahead, are dropped
 and counted (`ahead`), not kept; points it takes with true times are stored; started again with a
-true clock, it is said to agree. Samples more than ten minutes past their write's time and log
+true clock, it is said to agree (each event looked for until it comes: written as any record is, it
+is searchable a moment after the status shows the skew). Samples more than ten minutes past their write's time and log
 records more than two hours past it are dropped by every replica alike: the leader stamps every
 write it proposes with its clock.
 
