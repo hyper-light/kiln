@@ -54,6 +54,28 @@ pub struct AppDef {
     /// revision to a digest, read in its sources as `${{ artifacts.<name> }}`.
     #[serde(default)]
     pub artifacts: BTreeMap<String, ArtifactSpec>,
+    /// How a new version takes traffic (docs/cd-targets.md §5): canary, linear or blue/green.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<crate::rollout::RolloutSpec>,
+    /// The checks its rollout uses, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checks: BTreeMap<String, crate::rollout::CheckSpec>,
+}
+
+/// The annotation a traffic-carrying object holds its app's rollout in: `{ rollout, checks }`.
+pub const ROLLOUT: &str = "kiln.dev/rollout";
+
+/// Marks the objects that carry traffic (a Lambda alias, a Worker, a production deployment)
+/// with the app's rollout, so the provider that applies them rolls them out.
+pub fn stamp_rollout(def: &AppDef, objects: &mut [Value]) {
+    let Some(r) = &def.rollout else { return };
+    let text = serde_json::json!({ "rollout": r, "checks": def.checks }).to_string();
+    for o in objects.iter_mut() {
+        let traffic = crate::providers::kind_def(obj::group(o), obj::kind(o)).is_some_and(|k| k.traffic);
+        if traffic && let Some(ann) = obj::ensure_map(o, &["metadata", "annotations"]) {
+            ann.insert(ROLLOUT.into(), Value::String(text.clone()));
+        }
+    }
 }
 
 /// An artifact an app deploys: an image, resolved for each revision to an immutable digest
@@ -644,6 +666,8 @@ pub fn from_argo(v: &Value, parent: Option<&str>, clusters: &dyn Fn(&str) -> Opt
         cascade,
         managed_namespace,
         artifacts: BTreeMap::new(),
+        rollout: None,
+        checks: BTreeMap::new(),
     })
 }
 
@@ -655,6 +679,9 @@ pub struct DeployFile {
     /// (`aws-ecs:`), split off by [`split_provider`].
     #[serde(default)]
     pub apps: BTreeMap<String, Value>,
+    /// Checks every app's rollout may use, by name (docs/cd-targets.md §5).
+    #[serde(default)]
+    pub checks: BTreeMap<String, Value>,
 }
 
 /// An app's settings and its provider's key (`aws-ecs: {…}`), if it names one.
@@ -713,6 +740,12 @@ pub struct AppSpec {
     /// Artifacts it deploys.
     #[serde(default)]
     pub artifacts: BTreeMap<String, ArtifactSpec>,
+    /// How a new version takes traffic.
+    #[serde(default)]
+    pub rollout: Option<crate::rollout::RolloutSpec>,
+    /// Checks of its own, beside the file's.
+    #[serde(default)]
+    pub checks: BTreeMap<String, Value>,
 }
 
 /// A source: a path, or more.
@@ -1045,7 +1078,7 @@ pub fn from_deploy_file(
                 Some(e) => format!("{name}-{e}"),
             };
             let p = provider.as_ref().map(|(p, v)| (p.as_str(), v, &target));
-            out.push(app_from_spec(&app_name, &spec, p, repo, trunk, env, &cluster, ns, &scope)?);
+            out.push(app_from_spec(&app_name, &spec, p, &file.checks, repo, trunk, env, &cluster, ns, &scope)?);
         }
     }
     Ok(out)
@@ -1075,6 +1108,7 @@ fn app_from_spec(
     name: &str,
     spec: &AppSpec,
     provider: Option<(&str, &Value, &Map<String, Value>)>,
+    file_checks: &BTreeMap<String, Value>,
     repo: &str,
     trunk: &str,
     environment: Option<String>,
@@ -1188,6 +1222,16 @@ fn app_from_spec(
         }
         None => SyncPolicy::default(),
     };
+    // Checks: the file's, then the app's own; `rollout.*` and `result.*` wait for the rollout.
+    let mut checks = BTreeMap::new();
+    for (n, raw) in file_checks.iter().chain(spec.checks.iter()) {
+        let v = scope.interpolate_value_keeping(raw, &["git", "artifacts", "rollout", "result"]);
+        let c: crate::rollout::CheckSpec = serde_json::from_value(v).map_err(|e| DefError(format!("check {n}: {e}")))?;
+        checks.insert(n.clone(), c);
+    }
+    if let Some(r) = &spec.rollout {
+        crate::rollout::compile(r, &checks).map_err(|e| DefError(format!("app {name}: rollout: {e}")))?;
+    }
     for (n, a) in &spec.artifacts {
         let kinds = [!a.image.is_empty(), a.published.is_some(), a.artifact.is_some()].iter().filter(|x| **x).count();
         if kinds != 1 {
@@ -1253,6 +1297,8 @@ fn app_from_spec(
                 )
             })
             .collect(),
+        rollout: spec.rollout.clone(),
+        checks,
     })
 }
 
@@ -1390,6 +1436,39 @@ apps:
         assert!(from_deploy_file("apps: { x: { aws-lambda: { function: f, code: s3://b/k }, to: production } }", "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("no aws-lambda target")));
         assert!(from_deploy_file("apps: { x: { aws-ecs: {}, aws-lambda: {}, to: production } }", "r", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("one provider")));
         assert!(from_deploy_file("apps: { x: { aws-ecs: {}, to: { cluster: in-cluster } } }", "r", "main", &envs, &Scope::default()).is_err());
+        Ok(())
+    }
+
+    /// docs/cd-targets.md §5: a rollout and the checks it uses read from the deploy file, the
+    /// rollout's context waiting for the rollout; the traffic-carrying object carries them.
+    #[test]
+    fn rollouts_and_checks_read_and_stamp() -> Result<(), DefError> {
+        let envs: BTreeMap<String, EnvironmentSpec> = serde_yaml::from_str("production: { targets: { aws-lambda: { account: aws, region: us-east-1 } } }").map_err(|e| DefError(e.to_string()))?;
+        let text = r#"
+checks:
+  smoke:
+    http: { url: "${{ rollout.preview_url }}/healthz" }
+    pass: "${{ result.status == 200 }}"
+apps:
+  api:
+    aws-lambda: { function: api, code: s3://b/k.zip, set: { Runtime: python3.13, Handler: a.h, Role: r } }
+    rollout: { blue-green: { before: [smoke, e2e], keep: 1h } }
+    checks:
+      e2e: { script: { run: "./e2e.sh ${{ env.name }}" } }
+    to: production
+"#;
+        let apps = from_deploy_file(text, "acme/api", "main", &envs, &Scope::default())?;
+        let app = apps.first().ok_or_else(|| DefError("no app".into()))?;
+        assert!(app.rollout.as_ref().is_some_and(|r| r.blue_green.is_some()));
+        assert_eq!(app.checks.get("smoke").and_then(|c| c.http.clone()), Some(json!({ "url": "${{ rollout.preview_url }}/healthz" })));
+        assert_eq!(app.checks.get("e2e").and_then(|c| c.script.clone()), Some(json!({ "run": "./e2e.sh production" })), "known now: env.name");
+        let mut objs = vec![json!({ "apiVersion": "lambda.aws.kiln.dev/v1", "kind": "Alias", "metadata": { "name": "api:live" } }), json!({ "apiVersion": "lambda.aws.kiln.dev/v1", "kind": "Function", "metadata": { "name": "api" } })];
+        stamp_rollout(app, &mut objs);
+        assert!(objs.first().and_then(|o| obj::annotation(o, ROLLOUT)).is_some_and(|r| r.contains("blue_green") || r.contains("blue-green")));
+        assert!(objs.get(1).and_then(|o| obj::annotation(o, ROLLOUT)).is_none(), "only what carries traffic");
+        // A rollout naming a check nobody defined is a deploy file error.
+        let bad = text.replace("before: [smoke, e2e]", "before: [nope]");
+        assert!(from_deploy_file(&bad, "acme/api", "main", &envs, &Scope::default()).is_err_and(|e| e.0.contains("no check named nope")));
         Ok(())
     }
 

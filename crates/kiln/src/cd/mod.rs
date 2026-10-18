@@ -827,6 +827,7 @@ impl Cd {
         for p in &inputs.pull_secrets {
             objects.push(apps::pull_secret(&p.name, &def.destination.namespace, &p.config));
         }
+        apps::stamp_rollout(def, &mut objects);
         let _ = std::fs::remove_dir_all(&views);
         let (children, objects): (Vec<Value>, Vec<Value>) =
             objects.into_iter().partition(|o| obj::group(o) == "argoproj.io" && obj::kind(o) == "Application");
