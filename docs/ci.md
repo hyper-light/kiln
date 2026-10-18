@@ -176,7 +176,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance on the host (every `@actions/core` API, `getIDToken` included); the same on the other executors (W13-AC02) left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
@@ -3095,6 +3095,17 @@ enforcement points to W18, agent isolation to W20.
   `docker version`. Exactly the declared fact and the answering probe appear.
 
   Firecracker and shards are reported as tools until the runner can run legs on them.
+- **Executor parity (AC02), on the executors this fleet has.** A workflow on a local server runs
+  F-20 from the repository on the host and in the `docker` executor (`ubuntu-latest`, kiln's
+  runner image). Every effect is the same in both:
+  - inputs of each kind; outputs, `exportVariable` and `addPath` in a later step;
+  - the secret masked;
+  - `exec` and `io`;
+  - annotations with their properties, and the summary;
+  - the post step's state;
+  - `getIDToken` from kiln's own issuer, for its audience and the repository's subject, masked.
+
+  Firecracker, shards and `k8s` follow when their executors do.
 
 - *Done.* `crates/kiln/src/runner/docker.rs`, on the host executor through Docker or Podman
   (R03, R08), as GitHub's self-hosted runner does it:
