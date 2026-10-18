@@ -2844,6 +2844,8 @@ mod tests {
         let said = "You've hit your usage limit. Upgrade to Pro or try again in 2 hours 13 minutes.";
         let before = Core::now();
         feed(&mut c, &mut core, &[json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "failed", "items": [], "error": {"message": said, "codexErrorInfo": "usageLimitExceeded"}}}})]);
+        // A failed turn is cut short (the pause, not keep-going, takes it from here).
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref())), Some(("cut", Some("failed"))));
         let p = core.state.pause.clone().ok_or_else(|| anyhow::anyhow!("not paused"))?;
         let wait = 2 * 3_600_000 + 13 * 60_000;
         assert!(p.until.is_some_and(|u| u >= before + wait && u <= Core::now() + wait), "{p:?}");
@@ -2938,6 +2940,8 @@ mod tests {
         assert_eq!(core.state.status, Status::Idle);
         assert_eq!(core.state.delivery.get("m1"), Some(&Delivery::Completed));
         assert_eq!(core.state.usage.context_window, Some(1000));
+        // How the turn ended, for kiln's keep-going: done, with its command among its tools.
+        assert_eq!(core.state.last_turn.as_ref().map(|t| (t.how.as_str(), t.why.as_deref(), t.tools)), Some(("done", Some("completed"), 1)));
         assert_eq!(core.state.summary, "Removed build/.");
         Ok(())
     }

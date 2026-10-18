@@ -346,6 +346,7 @@ pub fn spawn(hub: Arc<Hub>) {
     super::services::spawn_maintenance(Arc::clone(&hub));
     super::webhooks::spawn(Arc::clone(&hub));
     super::insights::spawn(Arc::clone(&hub));
+    super::logsearch::spawn(Arc::clone(&hub));
     crate::rt::spawn(async move {
         // Legs kept to look into before a restart (W17-R02).
         match runs::kept_legs(&hub).await {

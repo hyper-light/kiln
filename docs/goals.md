@@ -73,10 +73,21 @@ part-way is one that:
   limit, an error part-way; a Codex turn that failed; an ACP agent out of tokens;
 - ended on a failed tool, with nothing said after it;
 - said nothing about the work;
+- ended saying it's going on ("Next, I'll wire the UI.", "Let me check the logs:") and didn't:
+  last words that wait on you ("I'll wait for your go-ahead", "Let me know…") or ask something
+  don't count;
 - left to-dos open, its last words asking you nothing;
 - its harness started again under (a crash, a resume): kiln saw it at work, and it's back idle
   with that turn never having ended. Kiln's clock decides this, so a machine whose clock is off
-  can't make a turn that ended look cut short.
+  can't make a turn that ended look cut short; and only for an agent whose runner reports how its
+  turns end (one from before keep-going would look started again after every turn).
+
+Every harness kiln runs as an agent reports how its turns end: Claude Code (its result's stop
+reason), Codex (`turn/completed`: completed, interrupted, failed) and the ACP agents, Gemini CLI,
+opencode, Goose and Amp (the prompt's `stopReason`: end_turn, max_tokens, max_turn_requests,
+refusal, cancelled). Their to-dos are Claude Code's TodoWrite, Codex's plan and ACP's plan. A
+harness kiln only runs as a terminal program (the Antigravity CLI today) isn't kept going: kiln
+can't tell its turns from its screen.
 
 Kiln waits four seconds (a message of yours goes first), then sends one line, shown as kiln's in
 the timeline: "Your last turn stopped part-way (stop_sequence). Pick up where you left off and

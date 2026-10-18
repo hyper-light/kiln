@@ -8,9 +8,13 @@
 //!   Codex turn that failed, an ACP agent out of tokens;
 //! - its last step was a tool that failed, with nothing said after it;
 //! - it said nothing about the work ("No response requested.");
+//! - its last words say it's going on ("Next, I'll wire the UI.", "Let me check the logs:") and
+//!   then the turn ended there;
 //! - its to-dos are still open and its last words don't ask you anything;
 //! - its harness started again under it (a crash, a resume): the server saw it at work, and it's
-//!   back idle with that turn never having ended.
+//!   back idle with that turn never having ended. Only for an agent whose runner reports how its
+//!   turns end: one that doesn't (a runner from before, a harness kiln runs as a terminal) would
+//!   look started again after every turn.
 //!
 //! Not when you stopped it, it waits on you (an approval, a question, last words that ask), a
 //! message is queued, a background task of its runs, a usage limit paused it, a goal stack drives
@@ -60,6 +64,8 @@ pub(super) enum Why {
     AfterError,
     /// It said nothing about the work.
     Hollow,
+    /// Its last words say it's going on (them, shortened), and the turn ended there.
+    Promised(String),
     Todos { open: u32 },
     Restarted,
 }
@@ -77,6 +83,28 @@ pub(super) enum Next {
 fn hollow(summary: &str) -> bool {
     let s = summary.trim();
     s.is_empty() || s.starts_with("No response requested")
+}
+
+/// The last sentence of `summary` when it says the agent is going on, by itself, now: "I'll run the
+/// suite next.", "Let me check the logs:", "Continuing with the migration…". Not when it waits on
+/// you ("I'll wait for your go-ahead", "Let me know…", "…once you confirm"), asks something, or
+/// leaves things where they are.
+fn promises_more(summary: &str) -> Option<String> {
+    let text = summary.trim().trim_end_matches(['…', '.', '*', '_', '`', ' ']).trim_end();
+    let colon = text.ends_with(':');
+    let text = text.trim_end_matches(':');
+    let last = text.rsplit(['.', '!', '?', '\n']).map(str::trim).find(|s| !s.is_empty())?;
+    let clean = last.trim_start_matches(['-', '*', '>', '"', ' ']).trim();
+    let lower = clean.to_lowercase();
+    if summary.trim_end().ends_with('?') || ["you", "let me know", "wait", "once ", " if ", "leave", "stop here", "hand"].iter().any(|w| lower.contains(w)) {
+        return None;
+    }
+    const GOING_ON: &[&str] = &[
+        "i'll ", "i will ", "i'm going to ", "i am going to ", "let me ", "next, i", "next i", "now i'll", "now i will", "now let me", "continuing", "proceeding",
+        "moving on to", "on to ", "starting on ", "going to ",
+    ];
+    let going = GOING_ON.iter().any(|g| lower.starts_with(g));
+    (going || (colon && ["checking", "running", "looking", "reading", "fixing", "testing"].iter().any(|g| lower.starts_with(g)))).then(|| crate::harness::model::clip_middle(clean, 120).0)
 }
 
 /// What the server makes of one agent at `now`, given what it `seen` before (updated here, and
@@ -101,7 +129,8 @@ fn judge(info: &Info, seen: &mut Seen, now: i64) -> Next {
         return Next::Wait;
     }
     // At work after its last turn ended, and idle now with no end since: started again under it.
-    let restarted = seen.busy_at > seen.end_seen;
+    // Only for an agent known to report its turns' ends.
+    let restarted = seen.end > 0 && seen.busy_at > seen.end_seen;
     let at = if restarted { seen.busy_at } else { seen.end_seen };
     if at == 0 || at <= seen.handled {
         return Next::Wait;
@@ -131,6 +160,8 @@ fn judge(info: &Info, seen: &mut Seen, now: i64) -> Next {
         Why::AfterError
     } else if hollow(&info.summary) {
         Why::Hollow
+    } else if let Some(said) = promises_more(&info.summary) {
+        Why::Promised(said)
     } else if info.todos_total > info.todos_done {
         Why::Todos { open: info.todos_total - info.todos_done }
     } else {
@@ -146,6 +177,7 @@ pub(super) fn message(why: &Why) -> String {
         Why::Cut(how) => format!("Your last turn stopped part-way{}. {go_on}", how.as_deref().map(|h| format!(" ({h})")).unwrap_or_default()),
         Why::AfterError => "Your last step failed and the turn ended there. See what went wrong, then carry on. If it's all done, say so; if you're blocked, say what you need.".to_owned(),
         Why::Hollow => format!("Your last turn ended without a word about the work. {go_on}"),
+        Why::Promised(said) => format!("You said you'd carry on (\"{said}\"), then the turn ended. Go ahead. If it's all done, say so; if you need something from me, ask."),
         Why::Todos { open } => format!(
             "{open} of your to-dos {} still open. Carry on with {}, or mark {} done if {} are. If you need something from me, ask.",
             if *open == 1 { "is" } else { "are" },
@@ -264,6 +296,28 @@ mod tests {
         let mut seen = Seen::default();
         decide(&agent(Status::Running, None), &mut seen, now - 30_000);
         assert!(!matches!(decide(&agent(Status::Idle, Some(ended("done", now - 3_600_000))), &mut seen, now), Next::Keep { why: Why::Restarted, .. }));
+    }
+
+    #[test]
+    fn an_agent_that_never_reports_its_turns_is_never_taken_as_started_again() {
+        // A runner from before, or a harness kiln runs as a terminal: at work, then idle, no end.
+        let now = 1_792_000_000_000;
+        let mut seen = Seen::default();
+        decide(&agent(Status::Running, None), &mut seen, now - 30_000);
+        assert!(matches!(decide(&agent(Status::Idle, None), &mut seen, now), Next::Leave { .. } | Next::Wait));
+        assert_eq!(decide(&agent(Status::Idle, None), &mut seen, now + 60_000), Next::Wait);
+    }
+
+    #[test]
+    fn last_words_that_say_it_goes_on_and_then_dont_go_on() {
+        let now = 1_792_000_000_000;
+        for said in ["Tests pass. I'll now update the docs.", "Let me check the remaining failures:", "Next, I'll wire the UI.", "Continuing with the migration…", "The box is behind. Checking the runner's log:"] {
+            assert!(matches!(after_turn(ended("done", now - 12_000), said, (0, 0), now), Next::Keep { why: Why::Promised(_), .. }), "{said}");
+        }
+        for said in ["Let me know if you want the docs updated too.", "I'll wait for your go-ahead.", "I'll do that once you confirm.", "Done: 41/41 pass.", "Should I go on with the rest?", "I'll leave the rest for you."] {
+            assert!(!matches!(after_turn(ended("done", now - 12_000), said, (0, 0), now), Next::Keep { .. }), "{said}");
+        }
+        assert!(message(&Why::Promised("Next, I'll wire the UI".into())).starts_with("You said you'd carry on (\"Next, I'll wire the UI\")"));
     }
 
     #[test]

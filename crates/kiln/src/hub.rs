@@ -1808,6 +1808,7 @@ impl Hub {
             let jobs = self.store.prune(self.cfg.retention.days).await?;
             if !jobs.is_empty() {
                 tracing::info!(jobs = jobs.len(), "pruned old runs");
+                crate::ci::logsearch::forget(&self, jobs.clone()).await;
                 self.logs.remove(jobs).await;
             }
         }

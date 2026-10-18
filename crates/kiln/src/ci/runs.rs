@@ -289,6 +289,8 @@ pub async fn finish_leg(hub: &Hub, leg: &str, status: Status, conclusion: &str, 
         })
         .await?;
     crate::observe::kiln::leg_finished(hub, &leg_id).await;
+    // Its logs go into the search index (W19-R04).
+    super::logsearch::kick();
     Ok(())
 }
 
