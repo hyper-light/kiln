@@ -185,7 +185,7 @@ fn start(l: &carried::Launch, port: u16, api: &str) -> std::io::Result<Child> {
 /// 30 s when it keeps failing).
 pub async fn run(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     let base = unpack_base(&hub);
-    let Some(mut l) = crate::rt::blocking(move || launch(&base)).await? else {
+    let Some(l) = crate::rt::blocking(move || launch(&base)).await? else {
         tracing::info!("no UI server here (Bun or its files are missing): every page is the app's shell, rendered in the browser");
         hub.shutdown.cancelled().await;
         return Ok(());
@@ -193,23 +193,18 @@ pub async fn run(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
     tracing::info!(what = %l.what, main = %l.main.display(), "UI server");
     let api = api_url(&hub.cfg.server.http_addr);
     let mut backoff = Duration::from_secs(1);
-    let mut moved = false;
     loop {
         let port = free_port()?;
         let started = Instant::now();
         let mut child = match start(&l, port, &api) {
             Ok(c) => c,
-            // The data directory's filesystem doesn't let programs run (mounted noexec): the
-            // carried UI server goes to the temporary directory instead, once.
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && !moved && carried::carried() && std::env::var_os("KILN_UI_SERVER_DIR").is_none() => {
-                moved = true;
-                let tmp = std::env::temp_dir().join("kiln");
-                tracing::warn!(error = %e, program = %l.program.display(), to = %tmp.display(), "the UI server can't run from the data directory (is it mounted noexec?); unpacking it into the temporary directory (KILN_UI_SERVER_DIR sets where)");
-                match crate::rt::blocking(move || carried::launch(&tmp)).await? {
-                    Ok(next) => l = next,
-                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "can't unpack the UI server kiln carries"),
-                }
-                continue;
+            // Most likely a filesystem that doesn't let programs run (mounted noexec). The folder to
+            // use instead is the operator's to name: a shared one (the temporary directory) would let
+            // another user put a program of theirs where kiln looks for its own.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(error = %e, program = %l.program.display(), "can't start the UI server: if its folder's filesystem is mounted noexec, set KILN_UI_SERVER_DIR to a private folder that lets programs run");
+                hub.shutdown.cancelled().await;
+                return Ok(());
             }
             Err(e) => {
                 tracing::warn!(error = %e, program = %l.program.display(), "can't start the UI server");

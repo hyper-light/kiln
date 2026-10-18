@@ -56,9 +56,9 @@ The UI (`ui/`) is a TanStack Start app with React Server Components.
   the visitor's cookie.
 - **Where it looks:** a Bun and files of your own first, when `KILN_BUN` (default: `bun` on the
   PATH) or `KILN_UI_DIR` (default `/usr/local/lib/kiln/ui`) is set. Then the one kiln carries,
-  unpacked into the data directory, or `KILN_UI_SERVER_DIR` for a data directory whose filesystem
-  doesn't allow running programs (kiln tries the temporary directory itself when it can't run from
-  there). Then `/usr/local/lib/kiln/ui`, where older images put them.
+  unpacked into the data directory, or into `KILN_UI_SERVER_DIR` (a private folder that lets
+  programs run, for a data directory mounted noexec: kiln says so when it can't run from there).
+  Then `/usr/local/lib/kiln/ui`, where older images put them.
 - **HTTP/1.1 and HTTP/2:** the kiln server's listener speaks both (`crate::http::server`). Over TLS
   (`server.https`) the browser picks by ALPN. In the clear, HTTP/2 opens with its preface, which is
   how the front door passes a browser's HTTP/2 on. Handlers see every request shaped as HTTP/1.1's:

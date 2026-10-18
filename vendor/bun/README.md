@@ -43,9 +43,10 @@ Which Bun build each platform carries, and why:
    `<data dir>/ui-server/<hash>/`. The folder is named after the packs' content, so a kiln with the
    same packs reuses it, and a new one never runs an old one's files. It unpacks into a temporary
    folder first, then renames it into place, so a half-unpacked folder is never used. Older folders
-   are removed. `KILN_UI_SERVER_DIR` unpacks somewhere else, for a data directory whose filesystem
-   doesn't allow running programs. `KILN_BUN` with `KILN_UI_DIR` still runs a Bun and files of your
-   own.
+   are removed. The `ui-server` folder is private to kiln's user (what's in it runs as kiln).
+   `KILN_UI_SERVER_DIR` unpacks somewhere else: a private folder that lets programs run, for a data
+   directory mounted noexec (kiln says so when it can't run from there). `KILN_BUN` with
+   `KILN_UI_DIR` still runs a Bun and files of your own.
 
 ## Updating Bun
 

@@ -69,9 +69,14 @@ fn is_ready(dir: &Path, hash: &str) -> bool {
     std::fs::read_to_string(dir.join(READY)).is_ok_and(|h| h.trim() == hash)
 }
 
-/// Unpacks `packs` beside `dir`, then renames them into it.
+/// Unpacks `packs` beside `dir`, then renames them into it. `root` is made private to kiln's user:
+/// what's in it is run as kiln.
 fn unpack_to(root: &Path, dir: &Path, hash: &str, packs: &[&[u8]]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(root)?;
+    let mut mk = std::fs::DirBuilder::new();
+    mk.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut mk, 0o700);
+    mk.create(root)?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
     let tmp = root.join(format!(".{hash}.{}.{nanos}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
