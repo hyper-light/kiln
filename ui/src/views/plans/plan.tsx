@@ -2,16 +2,17 @@
  * One plan: written or changed in place (each saved change a version), its steps as they will run,
  * run on an agent (one that runs, or a new one; as one message, step by step, or as goals), shared
  * by a link, exported, its versions and runs. Everything in the page's flow. A kept plan's page
- * reads all it shows at once, and appears when it's all in.
+ * asks for all it shows at once: the plan appears when it's in, the sections under it together
+ * when theirs are.
  */
 import * as React from "react";
 import { Link, useNavigate, useParams } from "react-router";
-import { api } from "@/api/client";
+import { api, ApiError } from "@/api/client";
 import { harnessApi } from "@/api/harness";
 import { planHref, plansApi, shareUrl, type Plan, type PlanItem, type PlanMode, type PlanRan } from "@/api/plans";
 import { Button } from "@/components/ui/button";
 import { Loadable } from "@/components/ui/loading";
-import { CopyButton, SelectField, TextField } from "@/components/ui/misc";
+import { CopyButton, EmptyState, SelectField, TextField } from "@/components/ui/misc";
 import { relativeTime } from "@/lib/format";
 import { errorMessage, useDocumentTitle } from "@/lib/hooks";
 import { invalidate, preload, useSuspenseResource } from "@/lib/resource";
@@ -46,13 +47,35 @@ export default function PlanPage() {
   );
 }
 
+/** None, for a plan that isn't there (deleted, or a wrong link): trying again won't bring it. */
+const unlessGone = (e: unknown) => {
+  if (e instanceof ApiError && e.status === 404) return null;
+  throw e;
+};
+
 /** A kept plan: its sections' data asked for together, then the plan. */
 function SavedPlan({ id }: { id: string }) {
   preload(KINDS, readKinds);
   preload(ME, readMe);
   preload(versionsKey(id), (s) => plansApi.versions(id, s));
   preload(runsKey(id), (s) => plansApi.runs(id, s));
-  const res = useSuspenseResource(planKey(id), (s) => plansApi.get(id, s));
+  const res = useSuspenseResource(planKey(id), (s) => plansApi.get(id, s).catch(unlessGone));
+  if (!res.data) {
+    return (
+      <div className="container-console page plan-page">
+        <EmptyState
+          title="No plan here"
+          action={
+            <Button asChild size="sm" variant="secondary">
+              <Link to="/agents/plans">All plans</Link>
+            </Button>
+          }
+        >
+          It was deleted, or the link is wrong.
+        </EmptyState>
+      </div>
+    );
+  }
   return <PlanEditor plan={res.data} onChange={(p) => res.setData(() => p)} />;
 }
 
@@ -129,7 +152,7 @@ function PlanEditor({ plan, onChange }: { plan: Plan | null; onChange?: (p: Plan
           </span>
         )}
       </div>
-      <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder={isNew ? "From the first heading when left empty" : ""} />
+      <TextField label="Title" className="plan-title-field" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="From its text, or its first step, when left empty" />
       <div className="plan-edit" data-preview={preview}>
         <div className="plan-text">
           <label htmlFor="plan-body" className="field-label">
@@ -182,13 +205,13 @@ function PlanEditor({ plan, onChange }: { plan: Plan | null; onChange?: (p: Plan
         {error && <span className="plan-error">{error}</span>}
       </div>
       {plan && (
-        <>
+        <Loadable label="Loading how it runs" fallback={null}>
           <RunPlan plan={plan} dirty={dirty} onRan={() => invalidate(planKey(plan.id))} />
           <SharePlan plan={plan} onChange={(p) => onChange?.(p)} />
           <Versions plan={plan} onRestored={saved} />
           <Runs plan={plan} />
           <DeletePlan plan={plan} />
-        </>
+        </Loadable>
       )}
     </div>
   );
