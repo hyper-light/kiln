@@ -289,3 +289,42 @@ fn a_runner_that_presents_the_wrong_key_gets_nothing() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+#[cfg(unix)]
+#[test]
+fn thousands_of_small_files_and_a_big_one_sync_without_stalling() -> anyhow::Result<()> {
+    crate::rt::block_on(async move {
+        let lab = lab().await?;
+        let tree = tempfile::tempdir()?;
+        let t = tree.path();
+        for d in 0..60 {
+            let dir = t.join(format!("d{d:02}"));
+            std::fs::create_dir_all(&dir)?;
+            for f in 0..100 {
+                std::fs::write(dir.join(format!("f{f:03}.txt")), format!("file {d}/{f}\n").repeat(8))?;
+            }
+        }
+        std::fs::write(t.join("big.bin"), (0..5_000_000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>())?;
+        let req = RunReq {
+            target: "linux".into(),
+            command: "find . -type f | wc -l; wc -c < big.bin; cksum < big.bin".into(),
+            cwd: Some(t.to_string_lossy().into_owned()),
+            sync: true,
+            ..RunReq::default()
+        };
+        let started = std::time::Instant::now();
+        let evs = run_from_mac(&lab, req.clone(), |_| None).await?;
+        let took = started.elapsed();
+        let out = output(&evs, false);
+        let lines: Vec<&str> = out.lines().map(str::trim).collect();
+        let local_sum = std::process::Command::new("sh").arg("-c").arg("cksum < big.bin").current_dir(t).output()?;
+        assert_eq!(lines.first().copied(), Some("6001"), "{evs:?}");
+        assert_eq!(lines.get(1).copied(), Some("5000000"));
+        assert_eq!(lines.get(2).copied(), Some(String::from_utf8_lossy(&local_sum.stdout).trim()));
+        assert!(took < Duration::from_secs(60), "took {took:?}");
+        // Again, unchanged: nothing goes.
+        let evs = run_from_mac(&lab, req, |_| None).await?;
+        assert!(evs.iter().any(|e| matches!(e, Ev::Synced { sent: 0, .. })), "{evs:?}");
+        Ok(())
+    })
+}

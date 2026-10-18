@@ -335,8 +335,8 @@ fn set_mode(path: &Path, e: &Entry) -> anyhow::Result<()> {
 pub struct Mirror {
     pub root: PathBuf,
     plan: Vec<Entry>,
-    /// Files being written: their temporary file and entry.
-    open: HashMap<String, (std::fs::File, PathBuf)>,
+    /// Files being written: their temporary file, where it is, and how many bytes arrived.
+    open: HashMap<String, (std::fs::File, PathBuf, u64)>,
     pub written: u32,
     pub bytes: u64,
 }
@@ -377,16 +377,19 @@ impl Mirror {
             real_parents(&self.root, &rel)?;
             let tmp = self.root.join(format!("{}.kiln-part", rel.display()));
             let f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-            self.open.insert(path.to_owned(), (f, tmp));
+            self.open.insert(path.to_owned(), (f, tmp, 0));
         }
-        let Some((f, _)) = self.open.get_mut(path) else { anyhow::bail!("{path} is not open") };
+        let Some((f, _, got)) = self.open.get_mut(path) else { anyhow::bail!("{path} is not open") };
         f.seek(std::io::SeekFrom::Start(offset))?;
         f.write_all(data)?;
+        *got = (*got).max(offset + data.len() as u64);
         self.bytes += data.len() as u64;
         if last {
-            let Some((f, tmp)) = self.open.remove(path) else { anyhow::bail!("{path} is not open") };
-            f.set_len(entry.size)?;
-            f.set_modified(mtime_of(&entry))?;
+            let Some((f, tmp, got)) = self.open.remove(path) else { anyhow::bail!("{path} is not open") };
+            f.set_len(got)?;
+            // A file that changed or vanished while it was sent is kept as it arrived, dated so the
+            // next sync sends it again.
+            f.set_modified(if got == entry.size { mtime_of(&entry) } else { std::time::UNIX_EPOCH })?;
             drop(f);
             let target = self.root.join(&rel);
             if std::fs::symlink_metadata(&target).is_ok_and(|m| m.file_type().is_dir()) {
@@ -402,7 +405,7 @@ impl Mirror {
     /// Make the copy match the list: folders and symlinks as listed, and whatever is not listed
     /// removed. Returns how many entries were removed.
     pub fn commit(&mut self) -> anyhow::Result<u32> {
-        for (_, (_, tmp)) in self.open.drain() {
+        for (_, (_, tmp, _)) in self.open.drain() {
             let _ = std::fs::remove_file(tmp);
         }
         let listed: HashSet<&str> = self.plan.iter().map(|e| e.path.as_str()).collect();

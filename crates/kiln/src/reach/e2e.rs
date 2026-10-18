@@ -320,7 +320,10 @@ impl Tls {
         cfg.enable_early_data = false;
         // The name is not checked (the verifier pins the key); SNI is off, so it is never sent.
         let name = ServerName::try_from("kiln-reach").context("reach server name")?;
-        let conn = rustls::ClientConnection::new(&mut cfg, name).context("reach TLS client")?;
+        let mut conn = rustls::ClientConnection::new(&mut cfg, name).context("reach TLS client")?;
+        // rustls refuses writes past 64 KiB of unsent data; a link's windows bound it instead (a
+        // message is up to 4 MiB).
+        conn.set_buffer_limit(None);
         Ok(Self { conn: Conn::Client(conn, Box::new(cfg)), closed: false })
     }
 
@@ -336,7 +339,8 @@ impl Tls {
         cfg.alpn_protocols = vec![ALPN.to_vec()];
         cfg.send_tls13_tickets = 0;
         cfg.max_early_data_size = 0;
-        let conn = rustls::ServerConnection::new(&cfg).context("reach TLS server")?;
+        let mut conn = rustls::ServerConnection::new(&cfg).context("reach TLS server")?;
+        conn.set_buffer_limit(None);
         Ok(Self { conn: Conn::Server(conn, Box::new(cfg)), closed: false })
     }
 
@@ -472,6 +476,12 @@ mod tests {
         assert_eq!(n.suite, "TLS13_AES_256_GCM_SHA384");
         assert_eq!(n.group, "secp384r1MLKEM1024");
         assert_eq!(server.negotiated(), Some(n));
+        // A message far over rustls's default 64 KiB buffer goes in one send.
+        let big = vec![7u8; 3 << 20];
+        server.send(&big)?;
+        at_a.clear();
+        pump(&mut client, &mut server, &mut at_a, &mut at_b)?;
+        assert_eq!(at_a.len(), big.len());
         // Goodbye reaches the other side.
         client.close();
         pump(&mut client, &mut server, &mut at_a, &mut at_b)?;

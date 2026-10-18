@@ -104,9 +104,12 @@ pub enum Local {
     Forget { runner: String, reply: oneshot::Sender<bool> },
 }
 
-/// How local tools reach the node.
+/// How the agent and local tools reach the node. What the network and the node's own runs say
+/// goes in unbounded (the agent never waits on the node: windows bound what is in flight); local
+/// tools wait their turn.
 #[derive(Clone)]
 pub struct Handle {
+    net: async_channel::Sender<In>,
     tx: async_channel::Sender<In>,
     announce: Announce,
 }
@@ -121,8 +124,9 @@ impl Handle {
         &self.announce.fingerprint
     }
 
+    /// From the agent: a frame, an answer, the server coming or going. Never waits.
     pub async fn feed(&self, m: In) -> bool {
-        self.tx.send(m).await.is_ok()
+        self.net.try_send(m).is_ok()
     }
 
     async fn ask<T>(&self, f: impl FnOnce(oneshot::Sender<T>) -> Local) -> anyhow::Result<T> {
@@ -174,9 +178,11 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
     let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: wire::VERSION };
-    let (tx, rx) = async_channel::bounded::<In>(4096);
-    let (out_tx, out_rx) = async_channel::bounded::<AgentMsg>(1024);
-    let ticker = tx.clone();
+    let (net_tx, net_rx) = async_channel::unbounded::<In>();
+    let (tx, rx) = async_channel::bounded::<In>(1024);
+    // Unbounded too: the node must never wait on the agent while the agent feeds it.
+    let (out_tx, out_rx) = async_channel::unbounded::<AgentMsg>();
+    let ticker = net_tx.clone();
     crate::rt::spawn(async move {
         loop {
             crate::rt::sleep(Duration::from_secs(1)).await;
@@ -200,7 +206,8 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         pins,
         host,
         out: out_tx,
-        tx: tx.clone(),
+        tx: net_tx.clone(),
+        dirty: Vec::new(),
         server: false,
         directory: None,
         asked: HashMap::new(),
@@ -210,17 +217,37 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, async_channel::Receiver<Age
         peers: HashMap::new(),
         served: HashMap::new(),
     };
+    // Kept open by the node itself, so local tools going away never ends it.
+    let keep = tx.clone();
     crate::rt::spawn(async move {
+        let _keep = keep;
         let mut node = node;
-        while let Ok(m) = rx.recv().await {
-            let r = std::panic::AssertUnwindSafe(node.on(m)).catch_unwind().await;
-            if r.is_err() {
-                crate::metrics::global().panics_caught.inc();
-                tracing::error!("reach node handler panicked; carrying on");
+        loop {
+            let first = futures::select_biased! {
+                m = net_rx.recv().fuse() => m,
+                m = rx.recv().fuse() => m,
+            };
+            let Ok(first) = first else { return };
+            // Whatever else is waiting, then everything said goes out together: many messages per
+            // frame, not a frame per message.
+            let mut batch = vec![first];
+            while batch.len() < 512 {
+                match net_rx.try_recv().or_else(|_| rx.try_recv()) {
+                    Ok(m) => batch.push(m),
+                    Err(_) => break,
+                }
             }
+            for m in batch {
+                let r = std::panic::AssertUnwindSafe(node.on(m)).catch_unwind().await;
+                if r.is_err() {
+                    crate::metrics::global().panics_caught.inc();
+                    tracing::error!("reach node handler panicked; carrying on");
+                }
+            }
+            node.flush().await;
         }
     });
-    Ok((Handle { tx, announce }, out_rx))
+    Ok((Handle { net: net_tx, tx, announce }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +376,8 @@ struct Node {
     host: Host,
     out: async_channel::Sender<AgentMsg>,
     tx: async_channel::Sender<In>,
+    /// Links with ciphertext waiting, flushed after each batch.
+    dirty: Vec<String>,
     server: bool,
     directory: Option<(Instant, Vec<RunnerInfo>)>,
     asked: HashMap<u64, Instant>,
@@ -478,16 +507,39 @@ impl Node {
 
     /// Send a message on a link.
     async fn say_on<T: Serialize>(&mut self, id: &str, msg: &T) -> bool {
-        let Ok(bytes) = wire::frame(msg) else { return false };
+        let bytes = match wire::frame(msg) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(link = id, error = %format!("{e:#}"), "a reach message could not be encoded");
+                return false;
+            }
+        };
         let Some(l) = self.links.get_mut(id) else { return false };
-        if l.tls.send(&bytes).is_err() {
+        if let Err(e) = l.tls.send(&bytes) {
+            // Never lose a message quietly: the link goes, and its session resumes on a new one.
+            let why = format!("{e:#}");
+            tracing::warn!(link = id, error = %why, "reach link could not take a message");
+            self.drop_link(id, &why, true).await;
             return false;
         }
-        self.send_frames(id, None).await;
+        self.mark(id);
         true
     }
 
-    /// The link is over: tell the server (unless the close came from there) and both roles' state.
+    /// The link has ciphertext to send (at the end of the batch).
+    fn mark(&mut self, id: &str) {
+        if !self.dirty.iter().any(|d| d == id) {
+            self.dirty.push(id.to_owned());
+        }
+    }
+
+    /// Send what every link has waiting.
+    async fn flush(&mut self) {
+        for id in std::mem::take(&mut self.dirty) {
+            self.send_frames(&id, None).await;
+        }
+    }
+
     async fn drop_link(&mut self, id: &str, why: &str, tell: bool) {
         if tell && self.links.contains_key(id) {
             if let Some(l) = self.links.get_mut(id) {
@@ -589,8 +641,9 @@ impl Node {
                 tracing::info!(runner = %peer, fingerprint = %e2e::short(&fp), "pinned a runner's reach key");
             }
         }
-        // Whatever the handshake left to say (its Finished, the held first message).
-        self.send_frames(&link, None).await;
+        // Whatever the handshake left to say (its Finished, the held first message) goes with the
+        // batch.
+        self.mark(&link);
         loop {
             let Some(l) = self.links.get_mut(&link) else { return };
             let role = l.role;
@@ -1306,7 +1359,8 @@ enum Msg {
 /// A sync done for another runner: its own task, the file system work on blocking threads. What it
 /// says goes back through the node.
 fn sync_worker(root: PathBuf, key: String, session: (String, String), node: async_channel::Sender<In>) -> async_channel::Sender<SyncAsk> {
-    let (tx, rx) = async_channel::bounded::<SyncAsk>(64);
+    // Unbounded: the node never waits on a sync; the asker's window bounds what is in flight.
+    let (tx, rx) = async_channel::unbounded::<SyncAsk>();
     crate::rt::spawn(async move {
         let say = |s: SyncSay| {
             let node = node.clone();
