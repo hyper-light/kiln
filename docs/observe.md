@@ -912,6 +912,14 @@ variables alike, 0.874; a number's sign with it (`blk_-…` and `blk_…` one to
 | Thunderbird | 0.961 | 0.955 | | OpenStack | 0.881 | 0.733 |
 | Windows | 0.695 | 0.997 | | Mac | 0.756 | 0.787 |
 
+Joining templates Drain's tree kept apart (a variable among the first tokens it branches on, as in
+`user ada signed in` and `user sam signed in`, sends each value down a branch of its own) was
+measured three ways and is off: joining those as alike as a message must be, 0.865 at the grid's
+best; only those differing among the branched tokens, 0.838; only where three values or more stand
+at one such place (IPLoM's reading of a position, Makanju et al. 2009), 0.838. On these systems the
+leading tokens that vary are mostly an event's own (a method's or a component's name), so, as Drain
+has it, a variable among a message's first two tokens makes a pattern of each of its values.
+
 Where it loses: Loghub labels some values as constants (`client SPP` and
 `client WindowsUpdateAgent`, `user=root` and `user=guest` are each two events), and a group with one
 line of another event is all wrong, so Windows' largest group (608 lines) falls with one line;

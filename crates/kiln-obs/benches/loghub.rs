@@ -174,10 +174,13 @@ fn main() {
     let mut best = (0.0, Params::default());
     // Each setting's accuracy on each system, for the cross-validation below.
     let mut grid: Vec<(Params, Vec<f64>)> = Vec::new();
+    // LOGHUB_MERGE=1: the study of `Params::merge` (off by default).
+    let merge = std::env::var("LOGHUB_MERGE").map_or(Params::default().merge, |m| m == "1");
+    println!("(templates the tree kept apart joined after: {merge})");
     for st in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8] {
         print!("{st:<10}");
         for depth in depths {
-            let p = Params { depth, similarity: st, ..Params::default() };
+            let p = Params { depth, similarity: st, merge, ..Params::default() };
             let each: Vec<f64> = data.iter().zip(&masked).map(|((_, _, truth), lines)| patterns::grouping_accuracy(truth, &patterns::parse(lines.clone(), p).0)).collect();
             let avg = each.iter().sum::<f64>() / data.len() as f64;
             if avg > best.0 {

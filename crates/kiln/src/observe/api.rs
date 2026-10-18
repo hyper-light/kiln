@@ -436,7 +436,8 @@ async fn patterns(body: SearchBody) -> Result<Response, Fail> {
             sample: &'a str,
             statuses: std::collections::BTreeMap<&'static str, u64>,
         }
-        let mut drain = Drain::new(Params::default());
+        let params = Params::default();
+        let mut drain = Drain::new(params);
         let mut seen: Vec<Seen<'_>> = Vec::new();
         for r in found.records.iter().rev() {
             let id = drain.add(&tokens(&r.message));
@@ -453,9 +454,30 @@ async fn patterns(body: SearchBody) -> Result<Response, Fail> {
                 *g.statuses.entry(kiln_obs::logs::record::level(r.severity)).or_default() += 1;
             }
         }
-        // Templates that came out alike are one pattern.
+        // Templates the tree kept apart, joined when the parameters say; then those that came out
+        // alike are one pattern.
+        let into: Vec<usize> = if params.merge { drain.merge() } else { (0..seen.len()).collect() };
+        let mut joined: Vec<Seen<'_>> = Vec::with_capacity(seen.len());
+        joined.resize_with(seen.len(), Seen::default);
+        for (i, g) in seen.into_iter().enumerate() {
+            let k = into.get(i).copied().unwrap_or(i);
+            if let Some(into) = joined.get_mut(k) {
+                if into.count == 0 {
+                    into.first = g.first;
+                }
+                into.first = into.first.min(g.first);
+                if g.last >= into.last {
+                    into.last = g.last;
+                    into.sample = g.sample;
+                }
+                into.count += g.count;
+                for (s, n) in g.statuses {
+                    *into.statuses.entry(s).or_default() += n;
+                }
+            }
+        }
         let mut by_text: Vec<(String, Seen<'_>)> = Vec::new();
-        for (c, g) in drain.clusters().iter().zip(seen) {
+        for (c, g) in drain.clusters().iter().zip(joined).filter(|(_, g)| g.count > 0) {
             let text = c.text();
             match by_text.iter_mut().find(|(t, _)| *t == text) {
                 Some((_, into)) => {

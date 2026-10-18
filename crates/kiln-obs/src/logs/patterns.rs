@@ -21,6 +21,9 @@ use std::collections::HashMap;
 /// A template's token for anything.
 pub const WILDCARD: &str = "<*>";
 
+/// Values at a place that make it a variable's, for [`Params::merge`].
+pub const MERGE_VALUES: usize = 3;
+
 /// Drain's parameters: the tree's depth (the reference's, counting its root and length layers), the
 /// similarity a message needs to join a template, a node's children at the most; and kiln's two ways
 /// with masked messages (the reference's own are both off):
@@ -30,6 +33,12 @@ pub const WILDCARD: &str = "<*>";
 /// - `masked_alike`: a masked variable of the message where the template has a wildcard is alike
 ///   (the reference counts no wildcard as alike, so a message with four variables of eleven tokens
 ///   can be at most 7/11 like any template, however it is built).
+/// - `merge` (off: measured on Loghub, it costs more than it mends, §12.13): after the messages,
+///   templates the tree kept apart are joined where a variable among the first tokens it branched
+///   on sent them down branches of their own (`user ada signed in`, `user sam signed in`):
+///   templates alike but at one of those places, where they hold at least [`MERGE_VALUES`] values
+///   (IPLoM's reading of a position's values, Makanju et al., KDD 2009). Without it, as Drain has
+///   it, a variable among a message's first two tokens makes a pattern of each of its values.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {
     pub depth: usize,
@@ -37,19 +46,20 @@ pub struct Params {
     pub max_children: usize,
     pub masked_variable: bool,
     pub masked_alike: bool,
+    pub merge: bool,
 }
 
 impl Params {
     /// The reference's: Drain as published, its benchmark's settings given.
     pub fn reference(depth: usize, similarity: f64) -> Self {
-        Self { depth, similarity, max_children: 100, masked_variable: false, masked_alike: false }
+        Self { depth, similarity, max_children: 100, masked_variable: false, masked_alike: false, merge: false }
     }
 }
 
 impl Default for Params {
     /// What the Loghub study (§12.13) found best across its 16 systems, masking as above.
     fn default() -> Self {
-        Self { depth: 5, similarity: 0.7, max_children: 100, masked_variable: true, masked_alike: true }
+        Self { depth: 5, similarity: 0.7, max_children: 100, masked_variable: true, masked_alike: true, merge: false }
     }
 }
 
@@ -151,23 +161,73 @@ impl Drain {
         self.best(leaf, seq)
     }
 
+    /// How alike a message (or a template) is to a template: the share of the template's tokens it
+    /// has at their places (a wildcard of the template alike only to a masked variable, and only
+    /// with `masked_alike`), and the template's wildcards.
+    fn alike<S: AsRef<str>>(&self, template: &[Box<str>], seq: &[S]) -> (f64, usize) {
+        let (mut alike, mut wild) = (0usize, 0usize);
+        for (a, b) in template.iter().zip(seq) {
+            if &**a == WILDCARD {
+                wild += 1;
+                if self.p.masked_alike && b.as_ref() == WILDCARD {
+                    alike += 1;
+                }
+            } else if &**a == b.as_ref() {
+                alike += 1;
+            }
+        }
+        (if template.is_empty() { 0.0 } else { alike as f64 / template.len() as f64 }, wild)
+    }
+
+    /// The templates the tree kept apart, joined (`Params::merge`): of each length and each place the
+    /// tree branched on, those alike everywhere else, when they hold at least [`MERGE_VALUES`]
+    /// values there, into the largest (that place a wildcard). What each template became, by its
+    /// place.
+    pub fn merge(&mut self) -> Vec<usize> {
+        let n = self.clusters.len();
+        let mut into: Vec<usize> = (0..n).collect();
+        let branched = self.leaf().saturating_sub(1);
+        for place in 0..branched {
+            // The templates still their own, by length and their tokens but at `place`.
+            let mut sets: HashMap<(usize, Vec<Box<str>>), Vec<usize>> = HashMap::new();
+            for (i, c) in self.clusters.iter().enumerate() {
+                if into.get(i) != Some(&i) || c.template.len() <= place {
+                    continue;
+                }
+                let mut key = c.template.clone();
+                if let Some(t) = key.get_mut(place) {
+                    *t = "".into();
+                }
+                sets.entry((c.template.len(), key)).or_default().push(i);
+            }
+            let mut sets: Vec<Vec<usize>> = sets.into_values().filter(|s| s.len() >= MERGE_VALUES).collect();
+            sets.sort_unstable();
+            for mut set in sets {
+                set.sort_by_key(|&i| (std::cmp::Reverse(self.clusters.get(i).map_or(0, |c| c.size)), i));
+                let Some((&keep, rest)) = set.split_first() else { continue };
+                let size: u64 = rest.iter().filter_map(|&i| self.clusters.get(i)).map(|c| c.size).sum();
+                if let Some(c) = self.clusters.get_mut(keep) {
+                    if let Some(t) = c.template.get_mut(place) {
+                        *t = WILDCARD.into();
+                    }
+                    c.size += size;
+                }
+                for &i in rest {
+                    for x in into.iter_mut().filter(|x| **x == i) {
+                        *x = keep;
+                    }
+                }
+            }
+        }
+        into
+    }
+
     /// `fastMatch`: the most similar template (more wildcards break a tie), if `similarity` alike.
     fn best<S: AsRef<str>>(&self, leaf: &[usize], seq: &[S]) -> Option<usize> {
         let mut best: Option<(usize, f64, usize)> = None;
         for &c in leaf {
             let Some(t) = self.clusters.get(c) else { continue };
-            let (mut alike, mut wild) = (0usize, 0usize);
-            for (a, b) in t.template.iter().zip(seq) {
-                if &**a == WILDCARD {
-                    wild += 1;
-                    if self.p.masked_alike && b.as_ref() == WILDCARD {
-                        alike += 1;
-                    }
-                } else if &**a == b.as_ref() {
-                    alike += 1;
-                }
-            }
-            let sim = if t.template.is_empty() { 0.0 } else { alike as f64 / t.template.len() as f64 };
+            let (sim, wild) = self.alike(&t.template, seq);
             if best.is_none_or(|(_, s, w)| sim > s || (sim == s && wild > w)) {
                 best = Some((c, sim, wild));
             }
@@ -316,13 +376,23 @@ pub fn mask(token: &str) -> Cow<'_, str> {
 /// event ids are its templates' hashes), and the templates.
 pub fn parse<S: AsRef<str>>(lines: impl IntoIterator<Item = Vec<S>>, p: Params) -> (Vec<usize>, Drain) {
     let mut d = Drain::new(p);
-    let ids: Vec<usize> = lines.into_iter().map(|t| d.add(&t)).collect();
+    let mut ids: Vec<usize> = lines.into_iter().map(|t| d.add(&t)).collect();
+    if p.merge {
+        let into = d.merge();
+        for i in &mut ids {
+            *i = into.get(*i).copied().unwrap_or(*i);
+        }
+    }
+    // Numbered over the templates lines are in (those joined into others are none's).
     let mut by_text: HashMap<String, usize> = HashMap::new();
-    let group: Vec<usize> = d.clusters.iter().map(|c| {
-        let n = by_text.len();
-        *by_text.entry(c.text()).or_insert(n)
-    }).collect();
-    (ids.iter().map(|&i| group.get(i).copied().unwrap_or(0)).collect(), d)
+    let mut group: HashMap<usize, usize> = HashMap::new();
+    for &i in &ids {
+        if let (std::collections::hash_map::Entry::Vacant(e), Some(c)) = (group.entry(i), d.clusters.get(i)) {
+            let n = by_text.len();
+            e.insert(*by_text.entry(c.text()).or_insert(n));
+        }
+    }
+    (ids.iter().map(|i| group.get(i).copied().unwrap_or(0)).collect(), d)
 }
 
 /// The share of lines grouped right (Zhu et al., "Tools and Benchmarks for Automated Log Parsing",
@@ -381,6 +451,19 @@ mod tests {
         ] {
             assert_eq!(mask(from), to, "{from}");
         }
+    }
+
+    /// A variable second token sends lines of one template down branches of their own: Drain keeps
+    /// them apart (the default); merged, three values or more at that place are one pattern, two
+    /// (a verb's, say) stay two.
+    #[test]
+    fn templates_the_tree_kept_apart_are_joined_only_when_asked_and_their_place_varies() {
+        let lines = ["user ada signed in", "user sam signed in", "user lin signed in", "job 41 queued", "GET /api/runs 200 in 12 ms", "GET /login 200 in 7 ms"];
+        let tok = |l: &&str| tokens(l).into_iter().map(|t| t.into_owned()).collect::<Vec<_>>();
+        let (apart, _) = parse(lines.iter().map(tok), Params::default());
+        assert_eq!(apart, vec![0, 1, 2, 3, 4, 5]);
+        let (groups, d) = parse(lines.iter().map(tok), Params { merge: true, ..Params::default() });
+        assert_eq!(groups, vec![0, 0, 0, 1, 2, 3], "{:?}", d.clusters().iter().map(Cluster::text).collect::<Vec<_>>());
     }
 
     /// Drain's own example: three messages of two templates; the third joins the first's, which
