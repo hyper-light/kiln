@@ -178,7 +178,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
 | W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance (every `@actions/core` API, `getIDToken` included) on the host and in the `docker` executor (W13-AC02); microVMs and `k8s` left with W13 |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
-| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
+| W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; job-result reuse (R10, AC06); tiers, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
 | W10 | Identity, tokens, OIDC issuer | none | in progress | job tokens with permissions (revoked with the attempt, and on the API), OIDC issuer (RS256, rotation, GitHub claims, getIDToken, workload tokens, publishing, subjects per organization and repository), users, roles, grants, the route table and `/api/openapi.json`, PATs and agent tokens; service and agent subjects left |
 | W11 | Integrations and credential broker | W10 | in progress (CD) | the registry (`ci_integrations`, /api/ci/integrations), credentials in W09's `integration` scope; built: `oci` (any OCI registry), `aws`, `gcp`, `azure` (kiln's identity exchanged per workload), `cloudflare` and `vercel` tokens, Verify for each; the job side: `integrations:` on jobs and steps and `kiln/auth@v1` (each kind's own federation files and variables, ID tokens kept fresh, stored tokens as their tools' variables, masked), `kiln auth --print-env | --exec` in every executor; and secrets brokered `from: integration:…` and cloud secret stores (W09-R08) |
@@ -2359,8 +2359,29 @@ the store to W07 (actions), W12 (registry blobs), W16 (test reports) and W18 (at
       key, and a refused read-only save;
     - `upload-artifact@v4` and `@v7` (zipped and `archive: false`);
     - `download-artifact@v4` and `@v8`: by name, by pattern, raw, and across runs with `run-id`.
+- *Job-result reuse (R10, AC06).* A job with `reuse: true` or `reuse: { paths, env, max-age }`
+  (kiln) gets an input hash before its leg is queued (`kiln_ci::plan::reuse`). It covers:
+  - the leg as planned, with its job and the workflow's `env` and defaults;
+  - its actions' pins and its images' digests;
+  - runs-on and requirements;
+  - the listed variables;
+  - its trust;
+  - the git objects of the listed paths (globs, files or directories) at the commit, or the
+    whole tree when none are listed.
+
+  A leg that succeeded is kept under its hash (`ci_reuse`). A later leg with the same hash,
+  within `max-age`, whose source's artifacts are all still there, takes that result over: its
+  outputs (which the plan and `needs` see as a success), steps, logs and artifacts, and it
+  names its source ("Reused from run #N", linked). Untrusted legs hash differently, so neither
+  side takes the other's. `kiln rerun --no-reuse` (and `no_reuse` on the API) runs every leg.
+  A leg whose inputs can't all be known (an image's digest, the mirror) runs, and says why in
+  the server's log. AC06:
+  - a table of edits changes the hash, one input at a time;
+  - E2E on a local server: a README-only push reused the build, a change under its `paths` ran
+    it, and "run anyway" ran it.
 - *Left.*
-  - R02 (S3), R09 (tiers), R10 (reuse), R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
+  - R02 (S3), R09 (tiers), R11 (BuildKit), R12 and AC08 (speed), R13 (insights).
+  - A diff that only rebases reusing what it didn't touch (W14).
   - R14's cap for called workflows.
   - v1's `artifacts:` as an artifact.
   - AC01 (the toolkit harness: 1,000 files, 2 GiB), AC03, AC06, AC09.

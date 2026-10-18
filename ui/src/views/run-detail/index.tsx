@@ -422,7 +422,10 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
             attempt={attempt}
             legId={job.id}
             status={job.status}
-            reused={!!ciDetail.legs.find((l) => l.id === job.id)?.reused_from}
+            reused={(() => {
+              const l = ciDetail.legs.find((x) => x.id === job.id);
+              return l?.reused_from ? { leg: l.reused_from, run: l.reused_run ?? null, number: l.reused_number ?? null } : null;
+            })()}
             keptUntil={ciDetail.legs.find((l) => l.id === job.id)?.kept_until}
           />
         </Loadable>

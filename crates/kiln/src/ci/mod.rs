@@ -26,6 +26,7 @@ pub mod repo_config;
 pub mod results;
 pub mod rest;
 pub mod reusable;
+pub mod reuse;
 pub mod routing;
 pub mod runs;
 pub mod runs_api;

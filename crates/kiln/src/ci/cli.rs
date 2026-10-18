@@ -561,12 +561,16 @@ pub struct RerunArgs {
     /// Keep a leg that fails this many minutes to look into (terminal, `kiln debug`).
     #[arg(long, value_name = "MINUTES", num_args = 0..=1, default_missing_value = "30")]
     keep_failed: Option<u32>,
+    /// Run every leg, even those whose inputs match an earlier result they could reuse
+    /// (`reuse:`, docs/ci.md W08-R10).
+    #[arg(long)]
+    no_reuse: bool,
 }
 
 pub async fn rerun(args: RerunArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
     let mode = if args.failed { "failed" } else if args.job.is_some() { "job" } else { "all" };
-    let body = json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions, "keep_failed": args.keep_failed });
+    let body = json!({ "mode": mode, "job": args.job, "debug": args.debug, "fresh_actions": args.fresh_actions, "keep_failed": args.keep_failed, "no_reuse": args.no_reuse });
     let v = api.call(Method::Post, &format!("/runs/{}/rerun", enc(&args.run)), Some(body)).await?;
     match v.get("attempt").and_then(Value::as_i64) {
         Some(a) => println!("attempt {a} of run {} started", args.run),
