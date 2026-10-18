@@ -12,6 +12,7 @@ pub mod bits;
 pub mod block;
 pub mod command;
 pub mod crc32c;
+pub mod dist;
 pub mod forecast;
 pub mod gorilla;
 pub mod group;
