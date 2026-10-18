@@ -676,7 +676,8 @@ impl Hub {
                     }
                 }
             }
-            NetEvent::Frame { peer, kind: Kind::Log, data, .. } => {
+            // Bulk frames are job output, but on the conversation feed's lane (messages, in bulk).
+            NetEvent::Frame { peer, kind: Kind::Log, lane, data } if lane != proto::LANE_CONVO => {
                 let chunk: proto::LogChunk = proto::decode(&data)?;
                 if self.owns_job(peer, &chunk.job) {
                     self.logs.append(&chunk.job, chunk.idx, &chunk.data);
