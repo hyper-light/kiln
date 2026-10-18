@@ -767,22 +767,32 @@ impl Claude {
     /// transcript (`goal_status`): met, can't be met, cleared; or still set (it gave up for now).
     fn goal_verdict(&mut self, core: &mut Core, tail: &str) {
         let Some(o) = core.state.objective.clone().filter(|o| o.status == "active") else { return };
-        let last = tail.lines().rev().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find_map(|r| {
-            let a = r.get("attachment").filter(|a| str_of(a, "type") == Some("goal_status"))?;
-            (str_of(a, "condition").map(str::trim) == Some(o.text.as_str())).then(|| a.clone())
-        });
         let flag = |a: &Value, k: &str| a.get(k).and_then(Value::as_bool) == Some(true);
+        // This goal's records, and of them the ones since it was last set (a sentinel, not met).
+        let records: Vec<Value> = tail
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter_map(|r| {
+                let a = r.get("attachment").filter(|a| str_of(a, "type") == Some("goal_status"))?;
+                str_of(a, "condition").is_some_and(|c| c.split_whitespace().eq(o.text.split_whitespace())).then(|| a.clone())
+            })
+            .collect();
+        let set = records.iter().rposition(|a| flag(a, "sentinel") && !flag(a, "met")).map_or(0, |i| i + 1);
+        let since = records.get(set..).unwrap_or(&[]);
         let reason = |a: &Value| str_of(a, "reason").map(str::to_owned);
-        let next = match last {
-            Some(a) if flag(&a, "met") && flag(&a, "sentinel") => Objective::new(&o.text, "cleared", None),
-            Some(a) if flag(&a, "met") => Objective::new(&o.text, "met", reason(&a)),
-            Some(a) if flag(&a, "failed") => Objective::new(&o.text, "unmet", Some(reason(&a).unwrap_or_else(|| "Claude Code found it can't be met.".to_owned()))),
-            Some(a) if self.goal_capped => {
-                let why = reason(&a).map(|r| format!(" The last check: {r}")).unwrap_or_default();
-                Objective::new(&o.text, "unmet", Some(format!("Claude Code stopped after its checks kept finding it unmet; the goal is still set.{why}")))
-            }
-            // Set and not yet decided: the turn was cut short; it carries on with the next.
-            _ => return,
+        // Met, whatever came after (a met goal clears itself): met. Else the last word decides.
+        let next = match since.iter().rev().find(|a| flag(a, "met") && !flag(a, "sentinel")) {
+            Some(a) => Objective::new(&o.text, "met", reason(a)),
+            None => match since.last() {
+                Some(a) if flag(a, "met") && flag(a, "sentinel") => Objective::new(&o.text, "cleared", None),
+                Some(a) if flag(a, "failed") => Objective::new(&o.text, "unmet", Some(reason(a).unwrap_or_else(|| "Claude Code found it can't be met.".to_owned()))),
+                Some(a) if self.goal_capped => {
+                    let why = reason(a).map(|r| format!(" The last check: {r}")).unwrap_or_default();
+                    Objective::new(&o.text, "unmet", Some(format!("Claude Code stopped after its checks kept finding it unmet; the goal is still set.{why}")))
+                }
+                // Set and not yet decided: the turn was cut short; it carries on with the next.
+                _ => return,
+            },
         };
         self.goal_capped = false;
         core.state.objective = Some(next);
@@ -3508,6 +3518,30 @@ mod tests {
         let tail = [rec(json!({"type": "goal_status", "met": false, "sentinel": true, "condition": "tests pass"})), rec(json!({"type": "goal_status", "met": false, "condition": "tests pass", "reason": "Not yet"})), rec(json!({"type": "goal_status", "met": true, "condition": "tests pass", "reason": "They pass", "iterations": 2}))].join("\n");
         c.run_done(&mut core, &job, Some(0), &tail);
         assert_eq!(status(&core), Some(("met".into(), Some("They pass".into()))));
+
+        // Met, then cleared as a met goal clears itself (written however it's spaced): met.
+        set(&mut c, &mut core, "docs  build");
+        let job = end(&mut c, &mut core).unwrap_or_default();
+        let tail = [
+            rec(json!({"type": "goal_status", "met": false, "sentinel": true, "condition": "docs build"})),
+            rec(json!({"type": "goal_status", "met": true, "condition": "docs build", "reason": "Built"})),
+            rec(json!({"type": "goal_status", "met": true, "sentinel": true, "condition": "docs build"})),
+        ]
+        .join("\n");
+        c.run_done(&mut core, &job, Some(0), &tail);
+        assert_eq!(status(&core), Some(("met".into(), Some("Built".into()))));
+
+        // A "met" from before the goal was set again doesn't count.
+        set(&mut c, &mut core, "lint passes");
+        let job = end(&mut c, &mut core).unwrap_or_default();
+        let tail = [
+            rec(json!({"type": "goal_status", "met": true, "condition": "lint passes", "reason": "Earlier"})),
+            rec(json!({"type": "goal_status", "met": false, "sentinel": true, "condition": "lint passes"})),
+            rec(json!({"type": "goal_status", "met": false, "condition": "lint passes", "reason": "Not yet"})),
+        ]
+        .join("\n");
+        c.run_done(&mut core, &job, Some(0), &tail);
+        assert_eq!(status(&core), Some(("active".into(), None)));
 
         // Can't be met.
         set(&mut c, &mut core, "fly");

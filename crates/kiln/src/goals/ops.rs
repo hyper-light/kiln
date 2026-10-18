@@ -67,7 +67,7 @@ pub fn list_ops() -> Vec<Op> {
     vec![
         Op {
             name: "goals.get",
-            summary: "An agent's goal stack: its goals in order (pending, active, met, unmet, skipped), and whether it runs, is paused (and why) or is done.",
+            summary: "An agent's goal stack: its goals in order (pending, active, met, unmet, skipped), and whether it runs, is paused (and why) or is done. The goal under way is sent again whenever the agent stops short of it, until it's met; an agent without goals of its own says it's met by ending its reply with the line GOAL MET.",
             read_only: true,
             destructive: false,
             input: || schema(json!({"agent": {"type": "string", "description": AGENT}}), &["agent"]),
