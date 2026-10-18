@@ -1,0 +1,29 @@
+# kiln's image, built at every push to main for KilnCD to deploy (docs/cd-targets.md §10). Where it
+# goes is set in the UI (Settings → Deployments → Images → kiln): by default this machine's
+# Docker, loaded into the minikube cluster's nodes; or a registry, pushed by commit. The job reads
+# which from KILN_IMAGE_KILN (the repository, or unset for local). Older images are pruned.
+name: image
+on:
+  push: { branches: [main] }
+  manual: true
+concurrency: { group: image, cancel-in-progress: true }
+jobs:
+  image:
+    name: build and publish kiln's image
+    # The machine whose Docker runs the minikube cluster.
+    runs-on: [baremetal, local]
+    timeout-minutes: 60
+    steps:
+      - name: build
+        run: docker build -q --build-arg KILN_COMMIT=$KILN_SHA --label kiln.published=kiln -t kiln:$KILN_SHA .
+      - name: publish
+        run: |
+          if [ -n "${KILN_IMAGE_KILN:-}" ]; then
+            docker tag "kiln:$KILN_SHA" "$KILN_IMAGE_KILN:$KILN_SHA"
+            docker push "$KILN_IMAGE_KILN:$KILN_SHA"
+          else
+            bash deploy/cluster/load-image.sh "kiln:$KILN_SHA"
+          fi
+      - name: prune
+        # The newest 20 of these images stay, here and on the nodes: KilnCD's window to roll back in.
+        run: bash deploy/cluster/prune-images.sh kiln 20

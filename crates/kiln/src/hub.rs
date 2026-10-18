@@ -1364,6 +1364,16 @@ impl Hub {
         self.secrets()
     }
 
+    /// What a job's environment gets from the server: its secrets, and where each image kiln
+    /// publishes lives (`KILN_IMAGE_<NAME>`, docs/cd-targets.md §7.1), set in the UI.
+    fn job_secrets(&self) -> Vec<(String, String)> {
+        let mut s = self.secrets();
+        if let Some(cd) = crate::cd::get() {
+            s.extend(cd.image_env());
+        }
+        s
+    }
+
     fn secrets(&self) -> Vec<(String, String)> {
         self.cfg
             .secrets
@@ -1453,7 +1463,7 @@ impl Hub {
                         run_number: run.number,
                         attempt: job.attempt,
                         spec,
-                        secrets: self.secrets(),
+                        secrets: self.job_secrets(),
                         job_token: crate::api::job_token(&self.admin_token, &job.id),
                         server_url: self.server_url_for(&agent),
                     };

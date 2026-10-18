@@ -235,6 +235,25 @@ pub async fn list(hub: &Hub, scope: &Scope) -> anyhow::Result<Vec<Meta>> {
         .await
 }
 
+/// One secret's value, decrypted, for the server's own use: an integration's credential (W11),
+/// which lives in [`ScopeKind::Integration`] and is never resolved for a leg.
+pub(crate) async fn reveal(hub: &Hub, scope: &Scope, name: &str) -> anyhow::Result<Option<String>> {
+    let (s, name) = (scope.clone(), name.to_ascii_uppercase());
+    let m = master(hub)?;
+    hub.store
+        .call(move |c| {
+            let row: Option<(Vec<u8>, Vec<u8>, String)> = c
+                .query_row("SELECT ciphertext, nonce, key_id FROM ci_secrets WHERE scope_kind = ?1 AND scope_id = ?2 AND name = ?3", params![s.kind.as_str(), s.id, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            let Some((sealed, nonce, key_id)) = row else { return Ok(None) };
+            let keys = all_keys(c, &m)?;
+            let k = keys.get(&key_id).ok_or_else(|| anyhow::anyhow!("secret {name}: its data key is gone"))?;
+            let plain = open(k, &sealed, &nonce, &s.aad(&name))?;
+            Ok(Some(String::from_utf8_lossy(&plain).into_owned()))
+        })
+        .await
+}
+
 /// A resolved secret: its value, and its row (`None` for the config's).
 #[derive(Debug, Clone)]
 pub struct Resolved {

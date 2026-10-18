@@ -913,6 +913,7 @@ html.fills-window body {
   outline-offset: 2px;
 }
 .field input,
+.field select,
 .field textarea {
   min-height: 38px;
   width: 100%;
@@ -923,6 +924,14 @@ html.fills-window body {
   outline: none;
   font-size: 12.5px;
   padding-right: 12px;
+}
+.field select {
+  padding-right: 10px;
+  cursor: pointer;
+}
+.field select option {
+  color: #e3e4e9;
+  background: #131417;
 }
 .field textarea {
   padding-block: 10px;

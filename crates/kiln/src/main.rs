@@ -116,6 +116,18 @@ enum Cmd {
     Oidc(kiln::ci::cli::OidcArgs),
     /// CI actions: the mirrored catalog, prefetching, the action policy.
     Actions(kiln::ci::cli::ActionsArgs),
+    /// The CI engine's runs: a list, or one with its legs.
+    Runs(kiln::ci::cli::RunsArgs),
+    /// A CI run's or leg's logs.
+    Logs(kiln::ci::cli::LogsArgs),
+    /// Start a workflow_dispatch run.
+    Dispatch(kiln::ci::cli::DispatchArgs),
+    /// A new attempt of a CI run: every job, the failed ones, or one job.
+    Rerun(kiln::ci::cli::RerunArgs),
+    /// Cancel a CI run.
+    Cancel(kiln::ci::cli::CancelArgs),
+    /// Where CI legs go, and why they wait.
+    Routing(kiln::ci::cli::RoutingArgs),
     /// kiln's MCP server over stdio (code mode, deployments, skills), for local agents.
     Mcp {
         #[command(flatten)]
@@ -540,6 +552,12 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             kiln::ci::cli::actions(a, &cfg).await
         }
+        Cmd::Runs(a) => kiln::ci::cli::runs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Logs(a) => kiln::ci::cli::logs(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Dispatch(a) => kiln::ci::cli::dispatch(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Rerun(a) => kiln::ci::cli::rerun(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Cancel(a) => kiln::ci::cli::cancel(a, &config::Config::load(&config_path).unwrap_or_default()).await,
+        Cmd::Routing(a) => kiln::ci::cli::routing(a, &config::Config::load(&config_path).unwrap_or_default()).await,
         Cmd::Mcp { server, print_token } => {
             let cfg = config::Config::load(&config_path).unwrap_or_default();
             let t = server.resolve(&cfg).await?;

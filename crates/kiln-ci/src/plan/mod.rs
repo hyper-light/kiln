@@ -14,6 +14,7 @@
 
 pub mod matrix;
 pub mod perms;
+pub mod rerun;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;

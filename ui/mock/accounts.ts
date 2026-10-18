@@ -294,11 +294,21 @@ function stateOf(d: Demo): State {
   };
 }
 
+/** Each demo agent's open pages, and the server's event stream: a rename reaches both, as on the server. */
+const viewers = new Map<string, Set<WebSocket>>();
+let emitEvent: (ev: unknown) => void = () => {};
+export function setDemoEmit(fn: (ev: unknown) => void) {
+  emitEvent = fn;
+}
+
 /** A demo agent's socket: its snapshot, and an answer to what's sent (refused until its harness is signed in). */
 export function handleDemoSession(ws: WebSocket, id: string): boolean {
   const d = demos.get(id);
   if (!d) return false;
   const send = (u: unknown) => ws.send(JSON.stringify(u));
+  const seen = viewers.get(id) ?? new Set<WebSocket>();
+  viewers.set(id, seen.add(ws));
+  ws.on("close", () => seen.delete(ws));
   send({ t: "open", info: d.info });
   send({ t: "meta", meta: d.meta });
   send({ t: "state", state: stateOf(d) });
@@ -359,6 +369,9 @@ export async function handleAccounts(req: http.IncomingMessage, res: http.Server
     if (c.type === "control" && c.id === "rename") {
       const n = typeof c.value === "string" ? c.value.trim() : "";
       d.info.name = n || d.info.kind_name;
+      const state = JSON.stringify({ t: "state", state: { ...stateOf(d), name: d.info.name } });
+      for (const ws of viewers.get(d.info.id) ?? []) if (ws.readyState === ws.OPEN) ws.send(state);
+      emitEvent({ type: "harness", info: d.info });
     }
     json(res, 200, {});
     return true;

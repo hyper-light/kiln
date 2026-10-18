@@ -9,6 +9,7 @@ pub mod dispatch;
 pub mod events;
 pub mod facade;
 pub mod hooks;
+pub mod integrations;
 pub mod load;
 pub mod oidc;
 pub mod preview;

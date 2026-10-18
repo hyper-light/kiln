@@ -205,6 +205,15 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
         (&Method::GET, ["repos"]) => ("cd.repos.list".into(), json!({})),
         (&Method::POST, ["repos"]) => ("cd.repos.add".into(), json_body(body).await?),
         (&Method::DELETE, ["repos"]) => ("cd.repos.remove".into(), json!({"url": q.get("url").cloned().unwrap_or_default()})),
+        (&Method::GET, ["images"]) => ("cd.images.list".into(), json!({})),
+        (&Method::PUT, ["images", name]) => {
+            let mut b = json_body(body).await?;
+            if let Some(m) = b.as_object_mut() {
+                m.insert("name".into(), json!(name));
+            }
+            ("cd.images.set".into(), b)
+        }
+        (&Method::DELETE, ["images", name]) => ("cd.images.set".into(), json!({"name": name, "kind": "local"})),
         _ => return Err((StatusCode::NOT_FOUND, "no such deployments route".into())),
     };
     let out = ops::call(cx, &name, input).await?;

@@ -19,6 +19,7 @@ use kiln_ci::trigger::Event;
 use kiln_ci::wf::Workflow;
 use kiln_ci::wire::{self, AssignmentV2, JobEventV2};
 use parking_lot::Mutex;
+use rusqlite::OptionalExtension as _;
 
 use super::runs;
 use crate::hub::Hub;
@@ -56,7 +57,11 @@ pub enum Msg {
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
     Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+    /// A new attempt of a finished run (W05-R17): its number, or why not.
+    Rerun { run: String, mode: RerunMode, debug: bool, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, reply: async_channel::Sender<Result<u32, String>> },
 }
+
+pub use kiln_ci::plan::rerun::Mode as RerunMode;
 
 /// What a leg asks of routing (W05-R20).
 fn route_of(spec: &LegSpec, workflow: &str, repo: &str, event: &str) -> LegRoute {
@@ -139,6 +144,10 @@ struct RunSt {
     /// Actions waiting for the run's concurrency group to let it start.
     held: Option<Vec<PlanAction>>,
     seq: i64,
+    /// A rerun's legs that keep the last attempt's result, by key: the report and that leg.
+    keep: HashMap<String, (LegReport, String)>,
+    /// A rerun with debug logging (`ACTIONS_STEP_DEBUG`, `ACTIONS_RUNNER_DEBUG`).
+    debug: bool,
 }
 
 /// A leg the scheduler has.
@@ -271,6 +280,11 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
+            Msg::Rerun { run, mode, debug, actions, reply } => {
+                let r = self.rerun(&run, &mode, debug, actions).await.map_err(|e| format!("{e:#}"));
+                let _ = reply.try_send(r);
+                Ok(())
+            }
         };
         if let Err(e) = r {
             tracing::warn!(error = %format!("{e:#}"), "CI dispatcher");
@@ -347,7 +361,7 @@ impl Dispatch {
             }
         };
         let input = RunInput { github: github.clone(), inputs, vars: vars.clone(), changed: s.event.changed.clone().map(Arc::new), trusted };
-        self.save_input(&id, &input, &s.actions, &s.event).await?;
+        self.save_input(&id, &input, &s.actions, &s.event, false, &HashMap::new()).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
         let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files });
         let (plan, actions) = match started {
@@ -360,7 +374,7 @@ impl Dispatch {
         };
         runs::set_run_name(&self.hub, &id, plan.name.clone()).await?;
         let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", s.repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
-        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0 };
+        let st = RunSt { plan, repo: s.repo, event: s.event, path: s.path, created: crate::util::now_unix(), in_progress: false, files, wf: s.workflow, github, vars, trusted, actions: s.actions, keys: HashMap::new(), held: Some(actions), seq: 0, keep: HashMap::new(), debug: false };
         self.workflow_run(&st, "requested", None);
         self.runs.insert(id.clone(), st);
         self.hub.ci.runs.lock().insert(id.clone());
@@ -463,8 +477,9 @@ impl Dispatch {
         Settings { default_runs_on: vec!["k8s".into()], ..Settings::default() }
     }
 
-    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event) -> anyhow::Result<()> {
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event }).to_string();
+    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: bool, keep: &HashMap<String, (LegReport, String)>) -> anyhow::Result<()> {
+        let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep": keep }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -496,7 +511,13 @@ impl Dispatch {
     async fn actions(&mut self, run: &str, actions: Vec<PlanAction>) -> anyhow::Result<()> {
         for a in actions {
             match a {
-                PlanAction::Queue(spec) => self.queue(run, *spec).await?,
+                PlanAction::Queue(spec) => {
+                    // A rerun's leg that isn't run again keeps the last attempt's result.
+                    match self.runs.get_mut(run).and_then(|r| r.keep.remove(&spec.key)) {
+                        Some((report, old)) => Box::pin(self.keep(run, *spec, report, &old)).await?,
+                        None => self.queue(run, *spec).await?,
+                    }
+                }
                 PlanAction::Settle { leg, conclusion, reason } => {
                     let existing = self.runs.get(run).and_then(|r| r.keys.get(&leg.key).cloned());
                     match existing {
@@ -553,6 +574,85 @@ impl Dispatch {
             }
         }
         Ok(())
+    }
+
+    /// A leg of a rerun that keeps the last attempt's result: its copy, and its report to the plan.
+    async fn keep(&mut self, run: &str, spec: LegSpec, report: LegReport, old: &str) -> anyhow::Result<()> {
+        let id = crate::util::new_id();
+        runs::keep_leg(&self.hub, run, old, &id).await?;
+        self.hub.emit_job(&id).await;
+        let Some(r) = self.runs.get_mut(run) else { return Ok(()) };
+        r.keys.insert(spec.key.clone(), id);
+        r.seq += 1;
+        let seq = r.seq;
+        let files = Arc::clone(&r.files);
+        let acts = r.plan.on_leg_finished(&spec.key, report.clone(), &Source { files: &files });
+        runs::log(&self.hub, run, seq, "leg", Some(spec.key.clone()), Some(report_json(&report))).await?;
+        self.actions(run, acts).await
+    }
+
+    /// A new attempt of a finished run (W05-R17): the same run, `github.run_attempt` one more,
+    /// planned again from its saved workflow and input. The jobs `mode` selects run again; the
+    /// others keep the last attempt's legs and results, which the plan takes as they were.
+    async fn rerun(&mut self, run: &str, mode: &RerunMode, debug: bool, fresh: Option<std::collections::BTreeMap<String, wire::ActionRef>>) -> anyhow::Result<u32> {
+        if self.runs.contains_key(run) {
+            anyhow::bail!("the run is still in progress; cancel it or wait for it to finish");
+        }
+        let r = run.to_owned();
+        let saved: Option<(String, String, String)> = self.hub.store.call(move |c| Ok(c.query_row("SELECT p.workflow, p.input, r.repo_id FROM ci_plans p JOIN runs r ON r.id = p.run_id WHERE p.run_id = ?1", [&r], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?))).optional()?)).await?;
+        let Some((model, input, repo_id)) = saved else { anyhow::bail!("no such run of the CI engine") };
+        let wf: Arc<Workflow> = Arc::new(serde_json::from_str(&model)?);
+        let v: serde_json::Value = serde_json::from_str(&input)?;
+        let event: Event = v.get("event").and_then(|e| serde_json::from_value(e.clone()).ok()).ok_or_else(|| anyhow::anyhow!("the run predates saved events; it can't be run again"))?;
+        let repo = self.hub.store.repos().await?.into_iter().find(|x| x.id == repo_id).ok_or_else(|| anyhow::anyhow!("the run's repository is gone"))?;
+        // The last attempt: each leg's last report, and its conclusion.
+        let r = run.to_owned();
+        let (reports, legs, seq): (Vec<(String, String)>, Vec<(String, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
+            let mut q = c.prepare("SELECT leg, report FROM ci_plan_log WHERE run_id = ?1 AND kind = 'leg' AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY seq")?;
+            let reports = q.query_map([&r], |x| Ok((x.get::<_, Option<String>>(0)?.unwrap_or_default(), x.get::<_, Option<String>>(1)?.unwrap_or_default())))?.collect::<Result<Vec<_>, _>>()?;
+            let mut q = c.prepare("SELECT id, key, job_id, conclusion FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
+            let legs = q.query_map([&r], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+            // The log goes on across attempts.
+            let seq: i64 = c.query_row("SELECT COALESCE(MAX(seq), 0) FROM ci_plan_log WHERE run_id = ?1", [&r], |x| x.get(0))?;
+            Ok((reports, legs, seq))
+        }).await?;
+        let failed: BTreeSet<String> = legs.iter().filter(|(_, _, _, c)| matches!(c.as_deref(), Some("failure" | "cancelled" | "timed_out" | "startup_failure"))).filter_map(|(_, _, j, _)| j.clone()).collect();
+        let again = kiln_ci::plan::rerun::jobs(&wf, mode, &failed).map_err(|e| anyhow::anyhow!(e))?;
+        let top = |j: &str| kiln_ci::plan::rerun::top(j).to_owned();
+        let last: HashMap<String, String> = reports.into_iter().collect();
+        let keep: HashMap<String, (LegReport, String)> = legs
+            .iter()
+            .filter(|(_, _, j, _)| j.as_deref().is_some_and(|j| !again.contains(&top(j))))
+            .filter_map(|(id, key, _, _)| last.get(key).map(|rep| (key.clone(), (report_from_json(rep), id.clone()))))
+            .collect();
+        let attempt = runs::start_attempt(&self.hub, run).await?;
+        let mut github = v.get("github").cloned().unwrap_or_default();
+        if let Some(o) = github.as_object_mut() {
+            o.insert("run_attempt".into(), serde_json::Value::String(attempt.to_string()));
+        }
+        let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
+        let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
+        let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
+        self.save_input(run, &input, &actions, &event, debug, &keep).await?;
+        let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
+        let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &files }) {
+            Ok(x) => x,
+            Err(e) => {
+                runs::finish_run(&self.hub, run, Status::Failed, "failure", Some(format!("The run could not start: {e}"))).await?;
+                self.hub.emit_run(run).await;
+                return Ok(attempt);
+            }
+        };
+        let group = plan.concurrency.as_ref().map(|g| (format!("{}\0{}", repo.id, g.group), g.group.clone(), GroupConfig { cancel_in_progress: g.cancel_in_progress, queue_max: g.queue_max, limit: g.limit.map_or(1, |l| l.max(1) as usize), max_pending: 100 }));
+        let path = run_path(&github);
+        let st = RunSt { plan, repo, event, path, created: crate::util::now_unix(), in_progress: false, files, wf, github, vars: input.vars, trusted: input.trusted, actions, keys: HashMap::new(), held: Some(acts), seq, keep, debug };
+        self.workflow_run(&st, "requested", None);
+        self.runs.insert(run.to_owned(), st);
+        self.hub.ci.runs.lock().insert(run.to_owned());
+        self.hub.emit_run(run).await;
+        let cmds = self.sched.handle(Input::RunQueued { run: run.to_owned(), group, supersede: None }, now_ms());
+        self.commands(cmds).await;
+        Ok(attempt)
     }
 
     /// A leg the plan queued: its row, then the scheduler.
@@ -770,7 +870,7 @@ impl Dispatch {
             },
             checkout: if wf.checkout && job.is_none_or(|j| j.kiln.checkout != Some(false)) { "auto".into() } else { "none".into() },
             actions: r.actions.clone(),
-            debug: wire::Debug::default(),
+            debug: wire::Debug { runner_debug: r.debug, step_debug: r.debug, ..wire::Debug::default() },
             limits: wire::Limits::default(),
         }
     }
@@ -926,35 +1026,67 @@ impl Dispatch {
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
         let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &files }).map_err(|e| anyhow::anyhow!(e))?;
         let run_owned = run.to_owned();
-        let log: Vec<(i64, String, Option<String>, Option<String>)> = self.hub.store.call(move |c| {
-            let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 ORDER BY seq")?;
-            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?)
+        let (log, last_seq): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
+            let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY seq")?;
+            let log = st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+            // The log goes on across attempts: an attempt that logged nothing yet continues from
+            // the last attempt's end.
+            let last: i64 = c.query_row("SELECT COALESCE(MAX(seq), 0) FROM ci_plan_log WHERE run_id = ?1", [&run_owned], |r| r.get(0))?;
+            Ok((log, last))
         })
         .await?;
-        let mut seq = 0;
-        for (s, kind, leg, report) in log {
-            seq = s;
+        let seq = last_seq;
+        let mut reported: HashSet<String> = HashSet::new();
+        for (_, kind, leg, report) in log {
             match kind.as_str() {
                 "cancel" => {
                     let _ = plan.on_cancel(&Source { files: &files });
                 }
                 _ => {
                     let rep = report.as_deref().map(report_from_json).unwrap_or_default();
-                    let _ = plan.on_leg_finished(leg.as_deref().unwrap_or_default(), rep, &Source { files: &files });
+                    let key = leg.unwrap_or_default();
+                    let _ = plan.on_leg_finished(&key, rep, &Source { files: &files });
+                    reported.insert(key);
                 }
             }
         }
         // The legs as the store has them.
         let run_owned = run.to_owned();
-        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>)> = self.hub.store.call(move |c| {
-            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL")?;
-            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<Vec<_>, _>>()?)
+        type Row = (String, String, String, Option<String>, u32, Option<String>, Option<String>, Option<String>);
+        let rows: Vec<Row> = self.hub.store.call(move |c| {
+            let mut st = c.prepare("SELECT id, key, status, agent, attempt, leg, conclusion, outputs FROM jobs WHERE run_id = ?1 AND job_id IS NOT NULL AND run_attempt = (SELECT attempt FROM runs WHERE id = ?1)")?;
+            Ok(st.query_map([&run_owned], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<Result<Vec<_>, _>>()?)
         })
         .await?;
+        // Legs that ended before their report reached the log (the server stopped in between):
+        // their result goes to the plan now, so the run goes on.
+        let waiting: HashSet<String> = plan.jobs().iter().flat_map(|j| j.legs.iter()).filter(|l| l.state != "done").map(|l| l.key.clone()).collect();
+        let late: Vec<(String, LegReport)> = rows
+            .iter()
+            .filter(|r| Status::parse(&r.2).is_terminal() && !reported.contains(&r.1) && waiting.contains(&r.1))
+            .map(|r| {
+                let outputs: Vec<(String, String)> = r.7.as_deref().and_then(|o| serde_json::from_str::<std::collections::BTreeMap<String, String>>(o).ok()).map(|m| m.into_iter().collect()).unwrap_or_default();
+                (r.1.clone(), LegReport { conclusion: Some(conclusion_of(r.6.as_deref())), outputs, ..LegReport::default() })
+            })
+            .collect();
+        let legs: Vec<(String, String, String, Option<String>, u32, Option<String>)> = rows.into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.5)).collect();
         let event = v.get("event").and_then(|e| serde_json::from_value::<Event>(e.clone()).ok()).unwrap_or_else(|| Event { name: row.event.clone(), sha: row.sha.clone(), git_ref: input.github.get("ref").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(), trusted: input.trusted, ..Event::default() });
         let actions = v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default();
         let path = run_path(&input.github);
-        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq };
+        let debug = v.get("debug").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        // A rerun's legs still to keep: those not in this attempt yet.
+        let have: HashSet<&str> = legs.iter().map(|l| l.1.as_str()).collect();
+        let keep: HashMap<String, (LegReport, String)> = v
+            .get("keep")
+            .and_then(serde_json::Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter(|(k, _)| !have.contains(k.as_str()))
+                    .filter_map(|(k, x)| Some((k.clone(), (report_from_json(x.get("report")?.as_str()?), x.get("leg")?.as_str()?.to_owned()))))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut st = RunSt { plan, repo: repo.clone(), event, path, created: row.created_at, in_progress: true, files: Arc::clone(&files), wf: Arc::clone(&wf), github: input.github.clone(), vars: input.vars.clone(), trusted: input.trusted, actions, keys: HashMap::new(), held: None, seq, keep, debug };
         let mut queued = Vec::new();
         for (id, key, status, agent, attempt, leg) in legs {
             st.keys.insert(key.clone(), id.clone());
@@ -985,6 +1117,15 @@ impl Dispatch {
         for li in queued {
             let cmds = self.sched.handle(Input::LegQueued(Box::new(li)), now_ms());
             self.commands(cmds).await;
+        }
+        for (key, report) in late {
+            let Some(r) = self.runs.get_mut(run) else { break };
+            r.seq += 1;
+            let seq = r.seq;
+            let files = Arc::clone(&r.files);
+            let acts = r.plan.on_leg_finished(&key, report.clone(), &Source { files: &files });
+            runs::log(&self.hub, run, seq, "leg", Some(key), Some(report_json(&report))).await?;
+            self.actions(run, acts).await?;
         }
         Ok(())
     }
@@ -1044,6 +1185,17 @@ fn placeholder_spec(wf: &Arc<Workflow>, job: &str) -> LegSpec {
         reads: Vec::new(),
         workflow: Arc::clone(wf),
         job_index: index,
+    }
+}
+
+/// A leg's stored conclusion, as the plan has it.
+fn conclusion_of(s: Option<&str>) -> PlanC {
+    match s {
+        Some("success") => PlanC::Success,
+        Some("cancelled") => PlanC::Cancelled,
+        Some("skipped") => PlanC::Skipped,
+        Some("timed_out") => PlanC::TimedOut,
+        _ => PlanC::Failure,
     }
 }
 

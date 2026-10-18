@@ -232,6 +232,11 @@ pub fn ops() -> &'static [Op] {
                 run: add_repo),
             op!("cd.repos.remove", "Remove a repository's credentials.", ro: false, destructive: true,
                 input: || obj_schema(json!({"url": {"type": "string"}}), &["url"]), run: remove_repo),
+            op!("cd.images.list", "Where each image kiln publishes lives: the local Docker that builds it (the default), or a registry repository.", ro: true, destructive: false,
+                input: || obj_schema(json!({}), &[]), run: images_list),
+            op!("cd.images.set", "Set where a published image lives: `local`, or a registry `repository` (with the `integration` that pulls it).", ro: false, destructive: false,
+                input: || obj_schema(json!({"name": {"type": "string"}, "kind": {"type": "string", "enum": ["local", "registry"]}, "repository": {"type": "string"}, "integration": {"type": "string"}}), &["name", "kind"]),
+                run: images_set),
         ]
         .into_iter()
         // Plans share the one table (crates/kiln/src/plans/ops.rs).
@@ -255,6 +260,37 @@ fn str_in<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
 fn app_id(v: &Value) -> Result<String, Fail> {
     let a = str_in(v, "app").ok_or_else(|| bad("`app` is required"))?;
     Ok(if a.contains('/') { a.to_owned() } else { format!("default/{a}") })
+}
+
+/// Agents change what runs only where people let them (docs/cd-targets.md §6): an environment
+/// with `agents: { deploy: true }`, or, for an app outside environments, `[cd] agents_deploy`.
+/// Otherwise an agent plans, and asks a person.
+fn agents_may(cx: &Cx, id: &str, what: &str) -> Result<(), Fail> {
+    if !cx.actor.starts_with("agent:") {
+        return Ok(());
+    }
+    let (env, repo) = cx
+        .cd
+        .apps
+        .read()
+        .get(id)
+        .map(|e| (e.def.environment.clone(), if let Origin::Deploy { repo } = &e.def.origin { Some(repo.clone()) } else { None }))
+        .unwrap_or_default();
+    let allowed = match (&env, &repo) {
+        (Some(env), Some(repo)) => cx.cd.environments.read().get(repo).and_then(|m| m.get(env)).is_some_and(|e| e.agents.deploy),
+        (Some(_), None) => false,
+        (None, _) => cx.hub.cfg.cd.agents_deploy,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        match env {
+            Some(e) => format!("agents may not {what} {id}: environment {e} doesn't let agents deploy. Ask a person to, or have them allow it in .kiln/environments.yaml (agents: {{ deploy: true }})"),
+            None => format!("agents may not {what} {id}: ask a person to, or have them allow agents to deploy ([cd] agents_deploy = true)"),
+        },
+    ))
 }
 
 fn exists(cd: &Cd, id: &str) -> Result<(), Fail> {
@@ -469,6 +505,9 @@ async fn get(cx: Cx, v: Value) -> Out {
         m.insert("commits".into(), json!(entry.commits));
         m.insert("children".into(), json!(entry.children));
         m.insert("revision_info".into(), revision.unwrap_or(Value::Null));
+        // What its inputs deploy now: each artifact pinned (docs/cd-targets.md §1.3).
+        let artifacts = entry.key.and_then(|k| entry.resolved.iter().find(|r| r.key == k)).map(|r| r.artifacts.clone()).unwrap_or_default();
+        m.insert("artifacts".into(), json!(artifacts));
     }
     Ok(out)
 }
@@ -900,6 +939,7 @@ fn ready_to_sync(cd: &Cd, id: &str) -> Result<(), Fail> {
 async fn sync(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
+    agents_may(&cx, &id, "sync")?;
     ready_to_sync(&cx.cd, &id)?;
     let request = sync_request(&v, &cx.actor)?;
     cx.cd.input(Input::Sync { app: id.as_str().into(), request });
@@ -909,13 +949,17 @@ async fn sync(cx: Cx, v: Value) -> Out {
 
 async fn sync_many(cx: Cx, v: Value) -> Out {
     let max = v.get("max").and_then(Value::as_u64).unwrap_or(1000).clamp(1, 100_000) as usize;
-    let ids = selected(&cx.cd, &v, max);
+    let all = selected(&cx.cd, &v, max);
+    let (ids, refused): (Vec<String>, Vec<String>) = all.into_iter().partition(|id| agents_may(&cx, id, "sync").is_ok());
+    if ids.is_empty() && !refused.is_empty() {
+        return Err((StatusCode::FORBIDDEN, format!("agents may not sync these {} apps: their environments don't let agents deploy; ask a person to", refused.len())));
+    }
     let request = sync_request(&v, &cx.actor)?;
     for id in &ids {
         cx.cd.input(Input::Sync { app: id.as_str().into(), request: request.clone() });
     }
     audit(&cx, "cd.sync_many", format!("{} apps", ids.len())).await;
-    Ok(json!({"started": ids.len(), "apps": ids.iter().take(100).collect::<Vec<_>>()}))
+    Ok(json!({"started": ids.len(), "apps": ids.iter().take(100).collect::<Vec<_>>(), "refused": refused.iter().take(100).collect::<Vec<_>>()}))
 }
 
 async fn refresh(cx: Cx, v: Value) -> Out {
@@ -946,6 +990,7 @@ async fn terminate(cx: Cx, v: Value) -> Out {
 
 async fn take_over(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
+    agents_may(&cx, &id, "take over")?;
     let mut def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
     def.labels.insert("kiln.dev/take-over".into(), "true".into());
     // Kept in kiln from now on, so the take-over survives restarts and the parent's re-renders.
@@ -957,6 +1002,7 @@ async fn take_over(cx: Cx, v: Value) -> Out {
 
 async fn rollback(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
+    agents_may(&cx, &id, "roll back")?;
     let def = cx.cd.apps.read().get(&id).map(|e| e.def.clone()).ok_or_else(|| missing(format!("no app {id}")))?;
     if super::is_shadow(&def) {
         return Err(bad(format!("kiln doesn't deploy {id} (it shadows Argo CD's): take it over first")));
@@ -988,7 +1034,7 @@ async fn rollback(cx: Cx, v: Value) -> Out {
     };
     let (kube_version, api_versions) = (cluster.version.read().clone(), cluster.discovery.read().api_versions.clone());
     let (cd, d2, at) = (cx.cd.clone(), def.clone(), commits.clone());
-    let (head, back) = crate::rt::blocking(move || -> anyhow::Result<_> {
+    let (mut head, mut back) = crate::rt::blocking(move || -> anyhow::Result<_> {
         let head = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, None)?;
         let back = cd.inputs_of(&d2, kube_version.as_deref(), &api_versions, Some(&at))?;
         Ok((head, back))
@@ -996,6 +1042,12 @@ async fn rollback(cx: Cx, v: Value) -> Out {
     .await
     .and_then(|r| r)
     .map_err(|e| bad(format!("{e:#}")))?;
+    // The head's artifacts as the source poll resolves them (the pin compares its content), and
+    // the deployment's exactly as it recorded them.
+    let (a, p) = cx.cd.resolve_artifacts(&def, &head.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    head.add_artifacts(a, p);
+    let (a, p) = cx.cd.recorded_artifacts(&def, target.artifacts.clone(), &back.revision).await.map_err(|e| bad(format!("{e:#}")))?;
+    back.add_artifacts(a, p);
     let pin = state::Pin { to: target.id, revision: target.revision.clone(), commits, head: head.content, by: Some(cx.actor.clone()), at_ms: super::now_ms() };
     propose(&cx.cd, Command::Pin { app: id.clone(), pin: Some(Box::new(pin)) }).await?;
     // The held inputs and their sync as one step: nothing syncs the app in between.
@@ -1012,6 +1064,7 @@ async fn rollback(cx: Cx, v: Value) -> Out {
 async fn follow(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     exists(&cx.cd, &id)?;
+    agents_may(&cx, &id, "let go of the rollback of")?;
     if cx.cd.store.read(|d| d.pins.contains_key(&id)) {
         propose(&cx.cd, Command::Pin { app: id.clone(), pin: None }).await?;
         cx.cd.kick();
@@ -1028,6 +1081,10 @@ async fn create(cx: Cx, v: Value) -> Out {
         return Err(bad("an app needs a name and a source"));
     }
     let id = def.id();
+    // A new app in kiln is outside environments: agents need the server's say-so.
+    if cx.actor.starts_with("agent:") && !cx.hub.cfg.cd.agents_deploy {
+        return Err((StatusCode::FORBIDDEN, format!("agents may not create {id}: ask a person to, or have them allow agents to deploy ([cd] agents_deploy = true)")));
+    }
     propose(&cx.cd, Command::PutApp(Box::new(def))).await?;
     audit(&cx, "cd.app.put", id.clone()).await;
     Ok(json!({"app": id}))
@@ -1059,6 +1116,7 @@ async fn import(cx: Cx, v: Value) -> Out {
 
 async fn delete(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
+    agents_may(&cx, &id, "delete")?;
     let entry = cx.cd.apps.read().get(&id).cloned().ok_or_else(|| missing(format!("no app {id}")))?;
     let cascade = str_in(&v, "cascade").map(|c| c != "orphan").unwrap_or(entry.def.cascade);
     if matches!(entry.def.origin, Origin::Api | Origin::Argo { parent: None }) {
@@ -1111,6 +1169,44 @@ async fn remove_cluster(cx: Cx, v: Value) -> Out {
     propose(&cx.cd, Command::DeleteCluster(name.clone())).await?;
     audit(&cx, "cd.cluster.delete", name.clone()).await;
     Ok(json!({"removed": name}))
+}
+
+async fn images_list(cx: Cx, _: Value) -> Out {
+    Ok(images_view(&cx.cd))
+}
+
+/// Every image people set, and the images apps publish with the apps that do (so an image not
+/// set yet, living in the local Docker, still shows).
+fn images_view(cd: &Cd) -> Value {
+    let mut used: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (id, e) in cd.apps.read().iter() {
+        for a in e.def.artifacts.values() {
+            if let Some(p) = &a.published {
+                used.entry(p.clone()).or_default().push(id.clone());
+            }
+        }
+    }
+    json!({ "images": super::images::json(&cd.image_homes()), "used": used })
+}
+
+async fn images_set(cx: Cx, v: Value) -> Out {
+    let name = str_in(&v, "name").ok_or_else(|| bad("`name` is required"))?.to_owned();
+    if cx.actor.starts_with("agent:") {
+        return Err((StatusCode::FORBIDDEN, "agents may not change where images live: ask a person to".into()));
+    }
+    let home = match str_in(&v, "kind") {
+        Some("local") | None => None,
+        Some("registry") => Some(super::images::Home::Registry {
+            repository: str_in(&v, "repository").ok_or_else(|| bad("a registry needs a `repository` (docker.io/acme/kiln)"))?.trim().to_owned(),
+            integration: str_in(&v, "integration").map(str::to_owned),
+        }),
+        Some(other) => return Err(bad(format!("`{other}` is neither local nor registry"))),
+    };
+    cx.cd.set_image_home(&name, home).await.map_err(bad)?;
+    audit(&cx, "cd.images.set", name.clone()).await;
+    // Apps that publish it resolve again now, from where it lives.
+    cx.cd.kick();
+    Ok(images_view(&cx.cd))
 }
 
 async fn repos(cx: Cx, _: Value) -> Out {
