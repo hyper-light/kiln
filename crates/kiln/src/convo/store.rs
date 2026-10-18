@@ -32,10 +32,13 @@ pub const READ_WAIT: Duration = Duration::from_secs(10);
 /// compressed this many at a time, this often.
 const SQUEEZE_BATCH: usize = 2000;
 const SQUEEZE_EVERY: Duration = Duration::from_millis(200);
-/// The records of sessions that ended long enough ago are looked for this often, and let go this
-/// many lines at a time (as often as compressing goes) while the writer has nothing else to do.
-const PRUNE_LOOK: Duration = Duration::from_secs(3600);
+/// This often, while the writer has nothing else to do, it looks after the file: the records of
+/// sessions that ended long enough ago go, this many lines at a time (as often as compressing
+/// goes); then the file is made compact if that and compressing left enough of it free.
+const LOOK_EVERY: Duration = Duration::from_secs(3600);
 const PRUNE_BATCH: usize = 2000;
+/// Free pages that make compacting worth it (and a third of the file).
+const COMPACT_MIN_FREE: u64 = 256 << 20;
 
 /// What the store keeps of one session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -157,6 +160,11 @@ pub trait Engine: Send + 'static {
     /// Let go of up to `limit` record lines of sessions that ended before `before` (unix ms):
     /// how many went (0: none are left). Their events stay.
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize>;
+    /// Make the database's file compact when compressing and letting go left `min_free` bytes of
+    /// it free, and a third of it: the engine to go on with (this one, or one on the compact
+    /// file), and the file's size before and after when it was made compact. An error: the
+    /// engine is gone (the compact file couldn't be opened; the next start finishes it).
+    fn compact(self: Box<Self>, min_free: u64) -> anyhow::Result<(Box<dyn Engine>, Option<(u64, u64)>)>;
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -341,9 +349,10 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     let mut since: Option<Instant> = None;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
-    // The records of sessions that ended longer than `keep_closed` ago: let go while nothing else
-    // waits, looked for once compressing is done and then every `PRUNE_LOOK`.
-    let (mut pruning, mut pruned, mut look_at) = (false, 0usize, Instant::now());
+    // Looking after the file while nothing else waits, once compressing is done and then every
+    // `LOOK_EVERY`: the records of sessions that ended longer than `keep_closed` ago go, then the
+    // file is made compact if enough of it is free.
+    let (mut looking, mut pruned, mut look_at) = (false, 0usize, Instant::now());
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
         if pending.is_empty() {
             return;
@@ -355,13 +364,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         }
     };
     loop {
-        let idle = if squeezing || pruning {
-            SQUEEZE_EVERY
-        } else if keep_closed.is_some() {
-            look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY)
-        } else {
-            Duration::from_secs(3600)
-        };
+        let idle = if squeezing || looking { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY) };
         let wait = since.map_or(idle, |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
         match rx.recv_timeout(wait) {
             Ok(Msg::Rows(rows)) => {
@@ -390,22 +393,33 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             squeezing = false;
                         }
                     }
-                } else if !had
-                    && let Some(keep) = keep_closed
-                    && (pruning || Instant::now() >= look_at)
-                {
-                    let before = crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX));
-                    match engine.prune_some(before, PRUNE_BATCH) {
+                } else if !had && (looking || Instant::now() >= look_at) {
+                    let gone = match keep_closed {
+                        Some(keep) => engine.prune_some(crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX)), PRUNE_BATCH),
+                        None => Ok(0),
+                    };
+                    match gone {
                         Ok(0) => {
                             if pruned > 0 {
-                                tracing::info!(lines = pruned, days = keep.as_secs() / 86_400, "conversation store: the records of sessions that ended long ago were let go");
+                                tracing::info!(lines = pruned, days = keep_closed.map_or(0, |k| k.as_secs() / 86_400), "conversation store: the records of sessions that ended long ago were let go");
                             }
-                            (pruning, pruned, look_at) = (false, 0, Instant::now() + PRUNE_LOOK);
+                            (looking, pruned, look_at) = (false, 0, Instant::now() + LOOK_EVERY);
+                            engine = match engine.compact(COMPACT_MIN_FREE) {
+                                Ok((e, Some((before, after)))) => {
+                                    tracing::info!(before, after, "conversation store: its file was made compact");
+                                    e
+                                }
+                                Ok((e, None)) => e,
+                                Err(e) => {
+                                    tracing::error!(error = %format!("{e:#}"), "conversation store: the compact file couldn't be opened; the store stops until kiln starts again, which finishes it");
+                                    return;
+                                }
+                            };
                         }
-                        Ok(n) => (pruning, pruned) = (true, pruned.saturating_add(n)),
+                        Ok(n) => (looking, pruned) = (true, pruned.saturating_add(n)),
                         Err(e) => {
                             tracing::warn!(error = %format!("{e:#}"), "conversation store: the records of sessions that ended long ago couldn't be let go");
-                            (pruning, pruned, look_at) = (false, 0, Instant::now() + PRUNE_LOOK);
+                            (looking, pruned, look_at) = (false, 0, Instant::now() + LOOK_EVERY);
                         }
                     }
                 }

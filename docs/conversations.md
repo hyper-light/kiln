@@ -228,9 +228,12 @@ keep_closed_days = 30  # days an ended agent's transcript is kept (its events st
   `flush`. The recorder takes a session's locks one at a time (`Session::record_source`). See the
   lesson of c0ffda6 (agents.md).
 - **Disk.** Conversations grow, and so do transcripts: a long-running agent's reaches hundreds of
-  MB. They are kept compressed. A compressed store doesn't shrink its file by itself: the space
-  freed is used again for what comes next (Turso's `VACUUM INTO` makes a compact copy). Ended
-  agents' transcripts go after `keep_closed_days`.
+  MB. They are kept compressed, and ended agents' transcripts go after `keep_closed_days`. What
+  that frees is used again for what comes next, and the file is made compact once it is worth it:
+  hourly, while the store has nothing else to do, when a third of its file and 256 MiB are free.
+  The store writes a compact copy (`VACUUM INTO`), which takes the file's place; reads and writes
+  wait meanwhile. A copy written whole before a crash takes the file's place at the next start;
+  one written in part is removed. The copy needs room beside the file while it is written.
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status

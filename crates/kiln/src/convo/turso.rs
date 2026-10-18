@@ -3,7 +3,7 @@
 //! to its end on that thread (`PlatformIO` does its I/O inline, so `step` waits on nothing).
 
 use std::num::NonZero;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use turso_core::{Connection, ConnectOpts, Database, DatabaseOpts, IO, OpenOptions, PlatformIO, Row as TRow, SqliteDialect, Statement, StepResult, Value};
@@ -26,6 +26,7 @@ pub struct Turso {
     io: Arc<dyn IO>,
     _db: Arc<Database>,
     conn: Arc<Connection>,
+    path: PathBuf,
     /// Who the store is to its peers.
     id: String,
     /// The last number given to a write.
@@ -55,6 +56,42 @@ fn seq(v: u64) -> Value {
     Value::from_i64(i64::try_from(v).unwrap_or(i64::MAX))
 }
 
+/// A file beside the store's: its name with `suffix` added.
+fn beside(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// What a compaction left behind it ([`Engine::compact`]): a compact copy written whole takes the
+/// store's place (the compaction stopped between the copy and the swap); one written in part goes.
+fn finish_compact(path: &Path) -> anyhow::Result<()> {
+    for part in [".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
+        let _ = std::fs::remove_file(beside(path, part));
+    }
+    let whole = beside(path, ".compact");
+    if !whole.exists() {
+        return Ok(());
+    }
+    // The old file's log would be read into the copy: it goes first.
+    for side in ["-wal", "-shm"] {
+        if let Err(e) = std::fs::remove_file(beside(path, side))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(anyhow::Error::from(e).context(format!("remove the old {side} of {}", path.display())));
+        }
+    }
+    std::fs::rename(&whole, path).map_err(|e| anyhow::Error::from(e).context(format!("put the compact copy in place of {}", path.display())))?;
+    // The rename itself on disk (not on Windows, which opens no folder).
+    if let Some(dir) = path.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    tracing::info!(file = %path.display(), "conversation store: the compact copy took the store's place");
+    Ok(())
+}
+
 impl Turso {
     /// The database at `path`, made and migrated as needed.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
@@ -66,11 +103,12 @@ impl Turso {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        finish_compact(path)?;
         let name = path.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", path.display()))?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
         let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(fail)?;
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
-        let mut t = Self { io, _db: db, conn, id: String::new(), rev: 0, squeeze_below: 0 };
+        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0 };
         t.migrate(schema)?;
         if schema < 2 {
             return Ok(t);
@@ -663,6 +701,40 @@ impl Engine for Turso {
         Ok(0)
     }
 
+    fn compact(self: Box<Self>, min_free: u64) -> anyhow::Result<(Box<dyn Engine>, Option<(u64, u64)>)> {
+        let pages = |q: &str| self.one_int(q, &[]).ok().flatten().and_then(|n| u64::try_from(n).ok()).unwrap_or(0);
+        let page = pages("PRAGMA page_size");
+        let (before, free) = (pages("PRAGMA page_count") * page, pages("PRAGMA freelist_count") * page);
+        if free < min_free || free * 3 < before {
+            return Ok((self, None));
+        }
+        // The copy, whole once renamed: from then on it takes the store's place, even after a crash.
+        let path = self.path.clone();
+        let (part, whole) = (beside(&path, ".compact.tmp"), beside(&path, ".compact"));
+        let copied = (|| -> anyhow::Result<()> {
+            let _ = std::fs::remove_file(&part);
+            let name = part.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", part.display()))?;
+            self.conn.execute(format!("VACUUM INTO '{}'", name.replace('\'', "''"))).map_err(fail)?;
+            // Everything is in the copy itself: the log it was written with holds nothing.
+            anyhow::ensure!(std::fs::metadata(beside(&part, "-wal")).map_or(0, |m| m.len()) == 0, "the compact copy's log isn't empty");
+            for side in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(beside(&part, side));
+            }
+            std::fs::File::open(&part)?.sync_all()?;
+            std::fs::rename(&part, &whole)?;
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&part);
+            tracing::warn!(file = %path.display(), error = %format!("{e:#}"), "conversation store: no compact copy could be made; it goes on as it is");
+            return Ok((self, None));
+        }
+        drop(self);
+        let opened = Self::open(&path)?;
+        let after = std::fs::metadata(&path).map_or(0, |m| m.len());
+        Ok((Box::new(opened), Some((before, after))))
+    }
+
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
         let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
         let mut out = Vec::new();
@@ -828,6 +900,69 @@ mod tests {
             assert_eq!(t.marks(s)?.len(), 2, "{s}");
             assert_eq!(t.record(s, "cc-b", 0, 10)?.len(), 5, "{s}");
         }
+        Ok(())
+    }
+
+    /// A line that compresses little: random ids, about `bytes` of them.
+    fn noise(bytes: usize) -> String {
+        let mut s = String::with_capacity(bytes + 32);
+        while s.len() < bytes {
+            s.push_str(&crate::util::new_id());
+        }
+        format!("{{\"text\":\"{s}\"}}")
+    }
+
+    #[test]
+    fn a_store_made_compact_keeps_everything_and_goes_on() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let mut t = Turso::open(&path)?;
+        let line = |s: &str, n: u64, text: String| Row::Record(Box::new(RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: text }));
+        let mut rows = vec![Row::Session { session: "gone".into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 }];
+        rows.extend((0..1_500u64).map(|n| line("gone", n, noise(2_000))));
+        rows.push(Row::Closed { session: "gone".into(), at: 10 });
+        let kept: Vec<(u64, String)> = (0..40u64).map(|n| (n, noise(500))).collect();
+        rows.extend(kept.iter().map(|(n, l)| line("kept", *n, l.clone())));
+        rows.extend(super::super::rows::of("kept", &said("m1", 1, "the clock was read twice"), 5));
+        t.apply(&rows)?;
+        while t.prune_some(1_000, 500)? > 0 {}
+        let (id, rev) = (t.id(), t.rev);
+        // Not worth it below the bar; then made compact, the same store going on.
+        let (t, none) = Box::new(t).compact(u64::MAX)?;
+        assert_eq!(none, None);
+        let (mut t, sizes) = t.compact(0)?;
+        let Some((before, after)) = sizes else { anyhow::bail!("nothing was made compact") };
+        assert!(after * 2 < before, "{before} -> {after}");
+        assert_eq!(t.id(), id);
+        assert_eq!(t.record("kept", "cc", 0, 100)?, kept);
+        assert_eq!(t.kept("kept", 10)?.map(|k| k.events.len()), Some(1));
+        assert_eq!(t.changes(rev, 1 << 20)?.rows.len(), 0, "the numbers went on where they were");
+        t.apply(&[line("kept", 40, "{\"after\":true}".into())])?;
+        assert_eq!(t.record("kept", "cc", 40, 10)?, vec![(40, "{\"after\":true}".to_owned())]);
+        assert!(t.changes(rev, 1 << 20)?.rows.iter().all(|c| c.rev > rev));
+        for left in [".compact", ".compact.tmp", ".compact.tmp-wal", ".compact.tmp-shm"] {
+            assert!(!beside(&path, left).exists(), "{left} left beside the store");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_compaction_stopped_before_the_swap_is_finished_when_the_store_opens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("c.db");
+        let id = {
+            let mut t = Turso::open(&path)?;
+            t.apply(&[Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc".into(), n: 0, end: 1, line: "{\"in\":\"the copy\"}".into() }))])?;
+            t.conn.execute(format!("VACUUM INTO '{}'", beside(&path, ".compact").display())).map_err(fail)?;
+            t.id()
+        };
+        // The old file's log, which mustn't be read into the copy, and a copy written in part.
+        std::fs::write(beside(&path, "-wal"), b"not a log of the copy")?;
+        std::fs::write(beside(&path, ".compact.tmp"), b"half a copy")?;
+        let mut t = Turso::open(&path)?;
+        assert_eq!(t.id(), id);
+        assert_eq!(t.record("s1", "cc", 0, 10)?, vec![(0, "{\"in\":\"the copy\"}".to_owned())]);
+        assert!(!beside(&path, ".compact").exists() && !beside(&path, ".compact.tmp").exists());
         Ok(())
     }
 
