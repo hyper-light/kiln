@@ -786,6 +786,21 @@ impl Updates {
         self.jobs.lock().iter().any(|j| j.id == id && j.reached)
     }
 
+    /// A runner that reports the commit job `id` brings it to, on a build other than the one it
+    /// ran before, has arrived as well. Its machine signed the build again (a Mac's `kiln
+    /// signing`), which changes its bytes and so the build it reports.
+    pub(crate) fn reached_commit(&self, hub: &Hub, id: &str, machine: &str) {
+        let Some(j) = self.jobs.lock().iter().find(|j| j.id == id && !j.reached && j.commit.is_some()).cloned() else { return };
+        let build = crate::fleet::newest_build(hub, machine);
+        let commit = build.as_deref().and_then(|b| crate::fleet::runner_commit(hub, machine, Some(b)));
+        if let (true, Some(build), Some(commit)) = (arrived_by_commit(&j, build.as_deref(), commit.as_deref()), build, commit) {
+            self.update(hub, id, |j| {
+                j.reached = true;
+                push_line(j, format!("{machine} is running {} (build {build}, signed again on the machine)", crate::fleet::short(&commit)));
+            });
+        }
+    }
+
     /// The upgrade is through: the new build reported in and, on a runner that upgrades
     /// blue/green, the old one said it took over.
     pub(crate) fn through(&self, id: &str) -> bool {
@@ -909,6 +924,19 @@ impl Updates {
             });
             self.late(hub, &id);
         }
+        self.late_by_commit(hub, machine);
+    }
+
+    /// The commit `machine`'s runner runs may be known now ([`AgentMsg::Facts`], or a build kiln
+    /// knows the commit of): an upgrade kiln had stopped waiting for that brought it there on a build
+    /// its machine signed again ([`Self::reached_commit`]) is upgraded after all.
+    pub(crate) fn late_by_commit(&self, hub: &Hub, machine: &str) {
+        let ids: Vec<String> =
+            self.jobs.lock().iter().filter(|j| j.kind == "runner" && j.target == machine && j.state == JobState::Failed && !j.reached).map(|j| j.id.clone()).collect();
+        for id in ids {
+            self.reached_commit(hub, &id, machine);
+            self.late(hub, &id);
+        }
     }
 
     /// A job kiln had stopped waiting for whose machine got through after all (the new build
@@ -949,6 +977,13 @@ impl Job {
         push_line(self, format!("upgraded after all: it got there after kiln had stopped waiting ({was})"));
         true
     }
+}
+
+/// Whether a runner whose newest process runs `build`, built from `commit`, is where job `j`
+/// brings it: a build other than the one it ran before, of the job's commit.
+fn arrived_by_commit(j: &Job, build: Option<&str>, commit: Option<&str>) -> bool {
+    let (Some(want), Some(build), Some(commit)) = (j.commit.as_deref(), build, commit) else { return false };
+    !j.reached && j.from_build.as_deref() != Some(build) && commit.eq_ignore_ascii_case(want)
 }
 
 fn push_line(j: &mut Job, line: String) {
@@ -1015,6 +1050,8 @@ pub struct RunnerInfo {
     pub next: Option<String>,
     /// How: "download", "build", "wait", "upgrading" (it is), or "left" (left alone).
     pub how: Option<&'static str>,
+    /// The release run it waits for, and how far that is.
+    pub waits_on: Option<crate::fleet::ReleaseRun>,
     /// Its kiln checkout, as it reports it.
     pub checkout: Option<String>,
     /// "native" or "terminal".
@@ -1269,6 +1306,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 standing: None,
                 next: None,
                 how: None,
+                waits_on: None,
                 checkout: None,
             }
         })
@@ -1291,6 +1329,9 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
         if r.connected
             && let Some((how, next)) = crate::fleet::next(hub, r, t, s).await
         {
+            if how == "wait" {
+                r.waits_on = crate::fleet::waits_on(hub, r, t).await;
+            }
             r.how = Some(how);
             r.next = Some(next);
         }
@@ -1413,6 +1454,7 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
         if !u.running(id) {
             return;
         }
+        u.reached_commit(hub, id, machine);
         if u.through(id) {
             u.finish(hub, id, Ok(String::new()));
             return;
@@ -2223,6 +2265,19 @@ mod tests {
     }
 
     #[test]
+    fn a_given_up_upgrade_that_arrived_on_a_build_signed_again_is_upgraded_after_all() {
+        let mut j = given_up(false);
+        j.commit = Some("94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901".into());
+        // The Mac signed the build again: it reports another build id, of the same commit.
+        assert!(!j.awaits("adacachy", "7c0ffee12345"), "not the build it was handed");
+        assert!(arrived_by_commit(&j, Some("7c0ffee12345"), Some("94F0847A1B2C3D4E5F60718293A4B5C6D7E8F901")));
+        assert!(!arrived_by_commit(&j, Some("1e8fb739442b"), Some("94f0847a1b2c3d4e5f60718293a4b5c6d7e8f901")), "still the build it ran before");
+        j.reached = true;
+        assert!(j.through_late(7));
+        assert_eq!(j.state, JobState::Done);
+    }
+
+    #[test]
     fn a_blue_green_upgrade_needs_its_handover_too() {
         let mut j = given_up(true);
         j.reached = true;
@@ -2515,6 +2570,23 @@ mod tests {
         let mut screen = Screen::default();
         assert_eq!(screen.feed("\x1b[2mhello\x1b[0m\r\nworld\x1b]0;title\x07!\n"), [Shown::Line("hello".into()), Shown::Line("world!".into())]);
         assert_eq!(screen.feed("a\x1b]2;t\x1b\\b\n"), [Shown::Line("ab".into())]);
+    }
+
+    #[test]
+    fn a_runner_signed_again_on_its_machine_has_arrived_once_it_reports_the_jobs_commit() {
+        let to = "31c0bbaf734c4b130b43dcfaec93cc647c1ce536";
+        let mut j = new_job("runner", "mac", "native", Some("89cfa54c0577".into()), Some("b8a054982136".into()));
+        j.commit = Some(to.into());
+        // Still the build it ran before: not yet, whatever commit it says.
+        assert!(!arrived_by_commit(&j, Some("89cfa54c0577"), Some(to)));
+        // Another build (its machine signed the new one again) of the job's commit: arrived.
+        assert!(arrived_by_commit(&j, Some("46a3145906a2"), Some(&to.to_ascii_uppercase())));
+        // Another commit, or none known: not.
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), Some("561a240d637481421c8a402205027de71b100b2e")));
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), None));
+        // A job that doesn't know its commit waits for its build to be reported.
+        j.commit = None;
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), Some(to)));
     }
 
     #[test]

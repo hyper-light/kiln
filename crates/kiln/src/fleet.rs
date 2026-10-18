@@ -312,7 +312,7 @@ async fn commit_time(hub: &Hub, mirror: &str, commit: &str) -> i64 {
 }
 
 /// The build a machine's newest runner process runs.
-fn newest_build(hub: &Hub, machine: &str) -> Option<String> {
+pub(crate) fn newest_build(hub: &Hub, machine: &str) -> Option<String> {
     hub.runner_processes(machine).into_iter().find(|i| i.newest).and_then(|i| i.build)
 }
 
@@ -440,19 +440,76 @@ pub enum Plan {
     Wait(String),
 }
 
-/// A run of the release pipeline building `commit` right now (a job of it running): its number.
-/// With `target`, only one whose job for that platform is the one running.
-async fn release_building(hub: &Hub, commit: &str, target: Option<&str>) -> Option<i64> {
+/// A release run building what a runner waits for, and how far it is: what the runner's row says
+/// and links to.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseRun {
+    /// The run's id (its page) and number.
+    pub run: String,
+    pub number: i64,
+    /// Its job's step under way.
+    pub step: Option<String>,
+    /// When that step (else the job) started, in seconds.
+    pub since: Option<i64>,
+    /// The machine its job runs on.
+    pub on: Option<String>,
+}
+
+impl ReleaseRun {
+    /// "run #232: its build step, on adacachy, 11 min in".
+    fn words(&self, now: i64) -> String {
+        let mut w = format!("run #{}", self.number);
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = &self.step {
+            parts.push(format!("its {s} step"));
+        }
+        if let Some(o) = &self.on {
+            parts.push(format!("on {o}"));
+        }
+        if let Some(t) = self.since {
+            parts.push(format!("{} min in", (now - t).max(0) / 60));
+        }
+        if !parts.is_empty() {
+            w.push_str(": ");
+            w.push_str(&parts.join(", "));
+        }
+        w
+    }
+}
+
+/// A run of the release pipeline building `commit` right now (a job of it running), and where it
+/// is. With `target`, only one whose job for that platform is the one running.
+async fn release_building(hub: &Hub, commit: &str, target: Option<&str>) -> Option<ReleaseRun> {
     let u = &hub.cfg.updates;
     let repo = release_repo(hub).await?;
     let runs = hub.store.runs(Some(repo.id.clone()), 50, None).await.ok()?;
     for run in runs.into_iter().filter(|r| r.pipeline == u.release_pipeline && r.sha.eq_ignore_ascii_case(commit) && !r.status.is_terminal()) {
         let jobs = hub.store.jobs(run.id.clone(), false).await.unwrap_or_default();
-        if jobs.iter().any(|j| j.status == crate::store::Status::Running && target.is_none_or(|t| j.key == platform_job(t))) {
-            return Some(run.number);
+        if let Some(j) = jobs.iter().find(|j| j.status == crate::store::Status::Running && target.is_none_or(|t| j.key == platform_job(t))) {
+            let step = j.steps.iter().find(|s| s.status == crate::store::Status::Running);
+            return Some(ReleaseRun {
+                run: run.id.clone(),
+                number: run.number,
+                step: step.map(|s| s.name.clone()),
+                since: step.and_then(|s| s.started_at).or(j.started_at),
+                on: j.agent.clone(),
+            });
         }
     }
     None
+}
+
+/// The release run `r` waits for to reach `t`, when it waits for one (as [`plan`] decides).
+pub async fn waits_on(hub: &Hub, r: &RunnerInfo, t: &Target) -> Option<ReleaseRun> {
+    let target = r.target.as_deref()?;
+    if binary_for(hub, target, &t.commit).is_some() {
+        return None;
+    }
+    match release_building(hub, &t.commit, Some(target)).await {
+        Some(b) => Some(b),
+        None if can_build(hub, r).is_err() => release_building(hub, &t.commit, None).await,
+        None => None,
+    }
 }
 
 /// The release pipeline's job that builds `target`'s binary, on a machine of that platform
@@ -522,16 +579,17 @@ pub async fn plan(hub: &Hub, r: &RunnerInfo, t: &Target) -> Plan {
     if let Some(b) = binary_for(hub, target, &t.commit) {
         return Plan::Download(b);
     }
+    let now = crate::util::now_unix();
     // The release build's job for its platform is under way: that binary comes soon.
-    if let Some(n) = release_building(hub, &t.commit, Some(target)).await {
-        return Plan::Wait(format!("waits for the release build of {s} (run #{n})"));
+    if let Some(b) = release_building(hub, &t.commit, Some(target)).await {
+        return Plan::Wait(format!("waits for the release build of {s} ({})", b.words(now)));
     }
     // Otherwise a machine that can build itself does so now, rather than wait on a build of every
     // platform at once on another machine, which can take hours.
     match can_build(hub, r) {
         Ok(c) => Plan::Build(c),
         Err(why) => match release_building(hub, &t.commit, None).await {
-            Some(n) => Plan::Wait(format!("waits for the release build of {s} (run #{n})")),
+            Some(b) => Plan::Wait(format!("waits for the release build of {s} ({})", b.words(now))),
             None => Plan::Wait(format!("waits for a build of {s} for {target}: {why}")),
         },
     }
@@ -551,7 +609,7 @@ pub async fn ways(hub: &Hub, r: &RunnerInfo, t: &Target) -> Vec<crate::updates::
             way: Way::Download,
             ok: false,
             why: match release_building(hub, &t.commit, Some(target)).await {
-                Some(n) => format!("no binary of {s} for {target} yet: release run #{n} is building one"),
+                Some(b) => format!("no binary of {s} for {target} yet: release run #{} is building one", b.number),
                 None => format!("no binary of {s} for {target} yet"),
             },
         },
@@ -973,6 +1031,7 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
         if !u.running(id) {
             return;
         }
+        u.reached_commit(hub, id, machine);
         if u.reached(id) {
             u.finish(hub, id, Ok(String::new()));
             return;
@@ -985,6 +1044,14 @@ async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_run_says_how_far_it_is() {
+        let r = ReleaseRun { run: "01a1".into(), number: 232, step: Some("build".into()), since: Some(1_000), on: Some("adacachy".into()) };
+        assert_eq!(r.words(1_000 + 11 * 60 + 5), "run #232: its build step, on adacachy, 11 min in");
+        let bare = ReleaseRun { run: "01a1".into(), number: 7, step: None, since: None, on: None };
+        assert_eq!(bare.words(0), "run #7");
+    }
 
     #[test]
     fn short_and_commits() {

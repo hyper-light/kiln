@@ -645,6 +645,8 @@ export interface RunnerUpdate {
   /** What it does next to reach the newest kiln, as the end of a sentence about it. */
   next?: string | null;
   how?: "download" | "build" | "wait" | "upgrading" | "left" | "off" | null;
+  /** The release run it waits for, and how far that is. */
+  waits_on?: ReleaseWait | null;
   /** Its kiln checkout, as it reports it. */
   checkout?: string | null;
   /** The ways it can be upgraded to the newest kiln now, each with what it does or why it can't
@@ -671,6 +673,15 @@ export interface UpgradeWaits {
   wait_for_jobs_minutes: number;
   /** For a machine to build kiln itself, install included. */
   build_minutes: number;
+}
+
+/** A release run building what a runner waits for: its job's step under way, since when, and where. */
+export interface ReleaseWait {
+  run: string;
+  number: number;
+  step: string | null;
+  since: number | null;
+  on: string | null;
 }
 
 /** The newest kiln: the commit of the release branch every runner is brought to. */
