@@ -32,6 +32,10 @@ pub const READ_WAIT: Duration = Duration::from_secs(10);
 /// compressed this many at a time, this often.
 const SQUEEZE_BATCH: usize = 2000;
 const SQUEEZE_EVERY: Duration = Duration::from_millis(200);
+/// The records of sessions that ended long enough ago are looked for this often, and let go this
+/// many lines at a time (as often as compressing goes) while the writer has nothing else to do.
+const PRUNE_LOOK: Duration = Duration::from_secs(3600);
+const PRUNE_BATCH: usize = 2000;
 
 /// What the store keeps of one session.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -150,6 +154,9 @@ pub trait Engine: Send + 'static {
     /// Compress the next `limit` record lines kept before lines were compressed, if any are left:
     /// whether more are.
     fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool>;
+    /// Let go of up to `limit` record lines of sessions that ended before `before` (unix ms):
+    /// how many went (0: none are left). Their events stay.
+    fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize>;
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -177,13 +184,14 @@ pub struct Store {
 }
 
 impl Store {
-    /// The store, its writer thread started on `engine`.
-    pub fn start(engine: Box<dyn Engine>) -> anyhow::Result<Self> {
+    /// The store, its writer thread started on `engine`. `keep_closed`: how long the records of
+    /// sessions that ended are kept (None: for good).
+    pub fn start(engine: Box<dyn Engine>, keep_closed: Option<Duration>) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<Msg>(QUEUE);
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let w = watchers.clone();
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w))?;
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, keep_closed))?;
         Ok(Self { tx, id, dropped: Arc::default(), watchers })
     }
 
@@ -328,11 +336,14 @@ impl SendWait for mpsc::SyncSender<Msg> {
 
 /// The writer: rows wait at most `COMMIT_MS` (or until `COMMIT_ROWS`) to share a commit; a job
 /// commits what waits first, so it sees everything sent before it.
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, keep_closed: Option<Duration>) {
     let mut pending: Vec<Row> = Vec::new();
     let mut since: Option<Instant> = None;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
     let mut squeezing = true;
+    // The records of sessions that ended longer than `keep_closed` ago: let go while nothing else
+    // waits, looked for once compressing is done and then every `PRUNE_LOOK`.
+    let (mut pruning, mut pruned, mut look_at) = (false, 0usize, Instant::now());
     let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>| {
         if pending.is_empty() {
             return;
@@ -344,7 +355,13 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         }
     };
     loop {
-        let idle = if squeezing { SQUEEZE_EVERY } else { Duration::from_secs(3600) };
+        let idle = if squeezing || pruning {
+            SQUEEZE_EVERY
+        } else if keep_closed.is_some() {
+            look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY)
+        } else {
+            Duration::from_secs(3600)
+        };
         let wait = since.map_or(idle, |t| Duration::from_millis(COMMIT_MS).saturating_sub(t.elapsed()));
         match rx.recv_timeout(wait) {
             Ok(Msg::Rows(rows)) => {
@@ -371,6 +388,24 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                         Err(e) => {
                             tracing::warn!(error = %format!("{e:#}"), "conversation store: older record lines couldn't be compressed");
                             squeezing = false;
+                        }
+                    }
+                } else if !had
+                    && let Some(keep) = keep_closed
+                    && (pruning || Instant::now() >= look_at)
+                {
+                    let before = crate::util::now_ms().saturating_sub(i64::try_from(keep.as_millis()).unwrap_or(i64::MAX));
+                    match engine.prune_some(before, PRUNE_BATCH) {
+                        Ok(0) => {
+                            if pruned > 0 {
+                                tracing::info!(lines = pruned, days = keep.as_secs() / 86_400, "conversation store: the records of sessions that ended long ago were let go");
+                            }
+                            (pruning, pruned, look_at) = (false, 0, Instant::now() + PRUNE_LOOK);
+                        }
+                        Ok(n) => (pruning, pruned) = (true, pruned.saturating_add(n)),
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "conversation store: the records of sessions that ended long ago couldn't be let go");
+                            (pruning, pruned, look_at) = (false, 0, Instant::now() + PRUNE_LOOK);
                         }
                     }
                 }
@@ -402,7 +437,7 @@ pub fn tee(sink: Sink, store: Store, room: usize) -> Sink {
 #[cfg(test)]
 pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
     let dir = tempfile::tempdir()?;
-    let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?))?;
+    let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?), None)?;
     Ok((dir, store))
 }
 
@@ -413,6 +448,25 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    #[test]
+    fn the_writer_lets_go_of_the_records_of_sessions_that_ended_long_ago_while_idle() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Some(Duration::from_secs(60)))?;
+        let now = crate::util::now_ms();
+        let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
+        let line = |s: &str, n: u64| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: "{}".into() }));
+        store.put(vec![session("old"), line("old", 0), line("old", 1), Row::Closed { session: "old".into(), at: now - 3_600_000 }]);
+        store.put(vec![session("new"), line("new", 0), Row::Closed { session: "new".into(), at: now }]);
+        // Asked seldom: each question is the writer's work too, and it lets go only while idle.
+        let until = Instant::now() + Duration::from_secs(15);
+        while !store.marks("old")?.is_empty() {
+            anyhow::ensure!(Instant::now() < until, "the record of a session that ended an hour ago was kept");
+            std::thread::sleep(SQUEEZE_EVERY * 3);
+        }
+        assert_eq!(store.marks("new")?.len(), 1, "a session that ended just now keeps its record");
+        Ok(())
     }
 
     #[test]

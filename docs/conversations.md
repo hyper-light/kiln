@@ -38,6 +38,12 @@ For each agent session (kiln's id):
   kept before that are compressed in the background, a few thousand at a time while the store has
   nothing else to do, under the same numbers, so no feed sends them again. Feed batches travel
   compressed too, to a taker that says it takes them (`zip` in its answer).
+- **An ended agent's transcript goes after `keep_closed_days`** (30 unless set). Its events stay,
+  where search finds them; only the harness's record of it is let go, as nothing reads that once
+  the agent has ended. Each store lets go by its own clock, a few thousand lines at a time while
+  it has nothing else to do, and writes no drop, so no feed carries it: the server's store keeps
+  them as long as `[conversations] keep_closed_days` says, runners and mirrors the 30 days.
+  Claude Code keeps its own transcripts 30 days by default too.
 - **The harness's record** is numbered among each file's non-empty lines, from 0. A move carries
   those lines alone, so a copy of the file on another machine numbers them the same way. After a
   restart, following a file goes on where the store's copy ends. The file is first checked: one
@@ -200,6 +206,7 @@ outlives the server's disk and its own machine both.
 [conversations]
 mirrors = 1          # runners that keep a copy of the server's store; 0: none
 mirror_on = []       # runners to pick first, by name
+keep_closed_days = 30  # days an ended agent's transcript is kept (its events stay); 0: for good
 ```
 
 ## Milestones
@@ -222,8 +229,8 @@ mirror_on = []       # runners to pick first, by name
   lesson of c0ffda6 (agents.md).
 - **Disk.** Conversations grow, and so do transcripts: a long-running agent's reaches hundreds of
   MB. They are kept compressed. A compressed store doesn't shrink its file by itself: the space
-  freed is used again for what comes next (Turso's `VACUUM INTO` makes a compact copy). Pruning
-  ended sessions' transcripts (`keep_closed_days`) is still to come.
+  freed is used again for what comes next (Turso's `VACUUM INTO` makes a compact copy). Ended
+  agents' transcripts go after `keep_closed_days`.
 - **A runner's first feed** sends its whole store, everything it kept before the feed.
 
 ## Status

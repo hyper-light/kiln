@@ -633,6 +633,36 @@ impl Engine for Turso {
         Ok(next > 0)
     }
 
+    fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize> {
+        let mut ended = self.prepare(sql::SESSIONS_ENDED_BEFORE)?;
+        let mut ids: Vec<String> = Vec::new();
+        self.run(&mut ended, &[int(before)], |r| {
+            if let Ok(id) = r.get::<String>(0) {
+                ids.push(id);
+            }
+            Ok(())
+        })?;
+        // The first lines of the first file of the first of them with a record still kept.
+        let (mut first, mut lines, mut gone) = (self.prepare(sql::RECORD_FIRST_SOURCE)?, self.prepare(sql::RECORD_FIRST_LINES)?, self.prepare(sql::RECORDS_PRUNE)?);
+        for id in ids {
+            let mut source = None;
+            self.run(&mut first, &[txt(&id)], |r| {
+                source = r.get::<String>(0).ok();
+                Ok(())
+            })?;
+            let Some(source) = source else { continue };
+            let mut ns: Vec<u64> = Vec::new();
+            self.run(&mut lines, &[txt(&id), txt(&source), int(i64::try_from(limit).unwrap_or(500))], |r| {
+                ns.push(u(r, 0));
+                Ok(())
+            })?;
+            let Some(last) = ns.last().copied() else { continue };
+            self.run(&mut gone, &[txt(&id), txt(&source), seq(last)], |_| Ok(()))?;
+            return Ok(ns.len());
+        }
+        Ok(0)
+    }
+
     fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
         let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
         let mut out = Vec::new();
@@ -767,6 +797,41 @@ mod tests {
     }
 
     #[test]
+    fn the_records_of_sessions_that_ended_long_ago_go_and_their_events_stay() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("c.db"))?;
+        let mut rows = Vec::new();
+        for s in ["old", "recent", "open"] {
+            rows.push(Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: 5 });
+            rows.extend(super::super::rows::of(s, &said("m1", 1, "the clock was read twice"), 5));
+            for source in ["cc-a", "cc-b"] {
+                for n in 0..5u64 {
+                    rows.push(Row::Record(Box::new(RecordRow { session: s.into(), source: source.into(), n, end: (n + 1) * 100, line: format!("{{\"n\":{n}}}") })));
+                }
+            }
+        }
+        rows.push(Row::Closed { session: "old".into(), at: 1_000 });
+        rows.push(Row::Closed { session: "recent".into(), at: 9_000 });
+        t.apply(&rows)?;
+        // Ended before 5,000: "old" alone, its two files, four lines at a time.
+        let mut gone = Vec::new();
+        loop {
+            match t.prune_some(5_000, 4)? {
+                0 => break,
+                n => gone.push(n),
+            }
+        }
+        assert_eq!(gone, vec![4, 1, 4, 1]);
+        assert!(t.marks("old")?.is_empty());
+        assert_eq!(t.kept("old", 10)?.map(|k| k.events.len()), Some(1), "its events stay");
+        for s in ["recent", "open"] {
+            assert_eq!(t.marks(s)?.len(), 2, "{s}");
+            assert_eq!(t.record(s, "cc-b", 0, 10)?.len(), 5, "{s}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn transcript_lines_are_kept_compressed_and_read_back_whole() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let mut t = Turso::open(&dir.path().join("c.db"))?;
@@ -828,7 +893,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("conversations.db");
         {
-            let store = super::super::store::Store::start(Box::new(Turso::open(&path)?))?;
+            let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), None)?;
             store.send("a1", &Update::State { state: Box::new(State { title: "the parser".into(), ..State::default() }) });
             for i in 1..=2_000u64 {
                 store.send("a1", &said(&format!("m{i}"), i, &format!("reply {i} about 100% of_the parser")));
@@ -858,7 +923,7 @@ mod tests {
             assert!(scoped.is_empty());
         }
         // Reopened: everything is still there, and the schema isn't made twice.
-        let store = super::super::store::Store::start(Box::new(Turso::open(&path)?))?;
+        let store = super::super::store::Store::start(Box::new(Turso::open(&path)?), None)?;
         let k = store.kept("a1", 5_000)?.ok_or_else(|| anyhow::anyhow!("nothing kept after reopening"))?;
         assert_eq!(k.events.len(), 2_000);
         assert!(k.events.iter().any(|e| e.id == "m7" && e.text == "reply seven, revised"));

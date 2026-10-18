@@ -220,7 +220,7 @@ impl Registry {
         let (tx, rx) = async_channel::bounded(8192);
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
-        let convo = crate::convo::open(&dir);
+        let convo = crate::convo::open(&dir, conversations.keep_closed());
         // Runners that keep a store send it here; the server keeps their sessions from that.
         let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone(), crate::convo::feed::Brings::TheirMachine)) {
             Some(Ok((i, o))) => (Some(i), Some(o)),
