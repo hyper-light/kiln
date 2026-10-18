@@ -1,9 +1,15 @@
 //! Goal stacks: an agent's goals, one after another, each pursued until it's met before the next
 //! starts, as if you gave it /goal again and again yourself (docs/goals.md). On a harness with
 //! goals of its own the goal goes to them (Claude Code's `/goal <condition>`, Codex's thread goal)
-//! and the harness says how it came out; on the rest it goes as a message and is done when that
-//! turn ends. A goal that isn't met pauses the stack, with why. The server keeps the stacks and
-//! drives them (`run`), so they go on with no console open and across restarts.
+//! and the harness says when it's met; on the rest it goes as a message, and the agent says so
+//! (its reply ends with `GOAL MET`).
+//!
+//! Until the goal under way is met, kiln keeps the agent on it: whenever the agent stops short of
+//! it (it gave up, paused it, stopped with it still set, never took it up, or lost it when it
+//! started again after a runner update or a restart), the goal is sent again, after a pause that
+//! grows while the reminders bring no real work. A goal set in the agent directly (`/goal` in its
+//! composer) joins its stack, so it's kept the same way. The server keeps the stacks and drives
+//! them (`run`), so they go on with no console open and across restarts.
 
 pub mod ops;
 
@@ -23,8 +29,14 @@ use crate::hub::Hub;
 const ITEMS: usize = 100;
 /// Longest goal.
 const TEXT: usize = 2000;
-/// How long an agent may sit idle on a goal its harness hasn't taken up before the stack pauses.
-const UNTAKEN_MS: i64 = 90_000;
+/// How long an agent that stopped short of its goal is left before the goal is sent again, at
+/// first; twice that after each reminder that brought no real work, up to `REMIND_MAX_MS`.
+const REMIND_MS: i64 = 30_000;
+const REMIND_MAX_MS: i64 = 15 * 60_000;
+/// Work on a goal for this long since it was last sent counts as real: reminders start over.
+const WORKED_MS: i64 = 120_000;
+/// How an agent without goals of its own says a goal is met: its reply's last line.
+pub const MET_LINE: &str = "GOAL MET";
 
 /// An agent's goal stack.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -58,9 +70,20 @@ pub struct Item {
     /// When the goal it replaced last changed (a verdict must be newer).
     #[serde(skip)]
     prior_at: i64,
-    /// The agent was seen at work on it (a goal sent as a message is done when that work ends).
+    /// Times it was sent again, in a row, without real work in between.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reminders: i64,
+    /// When it was last sent (unix ms; 0: not yet).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reminded_at: i64,
+    /// When the agent was first seen at work on it since it was last sent (0: not since).
     #[serde(skip)]
-    saw_running: bool,
+    busy_at: i64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// A goal as an edit gives it: an existing one by `id`, or a new one.
@@ -123,7 +146,7 @@ pub async fn get(hub: &Hub, agent: &str) -> R<Stack> {
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
     let head: Option<(String, Option<String>, i64)> =
         c.query_row("SELECT state, reason, updated_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
-    let mut st = c.prepare("SELECT id, text, status, reason, how, started_at, ended_at, prior_at, saw_running FROM goal_items WHERE agent = ?1 ORDER BY pos")?;
+    let mut st = c.prepare("SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at FROM goal_items WHERE agent = ?1 ORDER BY pos")?;
     let items = st
         .query_map(params![agent], |r| {
             Ok(Item {
@@ -135,7 +158,9 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
                 started_at: r.get(5)?,
                 ended_at: r.get(6)?,
                 prior_at: r.get(7)?,
-                saw_running: r.get::<_, i64>(8)? != 0,
+                reminders: r.get(8)?,
+                reminded_at: r.get(9)?,
+                busy_at: r.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -227,6 +252,8 @@ pub async fn control(hub: &Hub, agent: &str, action: Action) -> R<Stack> {
             let now = now_ms();
             match action {
                 Action::Start => {
+                    // The goal under way goes to the agent again at once, from a fresh start.
+                    c.execute("UPDATE goal_items SET reminded_at = 0, reminders = 0, busy_at = 0, started_at = ?2 WHERE agent = ?1 AND status = 'active'", params![agent_s, now])?;
                     let left = c.query_row("SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status IN ('pending', 'active')", params![agent_s], |r| r.get::<_, i64>(0))?;
                     touch(c, &agent_s, Some(if left > 0 { "running" } else { "done" }), None)?;
                 }
@@ -234,10 +261,12 @@ pub async fn control(hub: &Hub, agent: &str, action: Action) -> R<Stack> {
                 Action::Skip => {
                     c.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = 'Skipped by you.' WHERE agent = ?1 AND status = 'active'", params![agent_s, now])?;
                     touch(c, &agent_s, None, None)?;
+                    c.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
                 }
                 Action::Clear => {
                     c.execute("DELETE FROM goal_items WHERE agent = ?1", params![agent_s])?;
                     touch(c, &agent_s, Some("paused"), None)?;
+                    c.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
                 }
             }
             load(c, &agent_s)
@@ -272,12 +301,45 @@ fn how(hub: &Hub, agent: &str) -> &'static str {
 }
 
 fn goal_command(how: &str, text: &str) -> Command {
-    let send = |text: String| Command::Send { id: crate::util::new_id(), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None };
     match how {
         "goal_control" => Command::Control { id: "goal".into(), value: Some(json!({"text": text})) },
         "goal" => send(format!("/goal {text}")),
-        _ => send(format!("Your goal: {text}\n\nWork on it until it's done, then say that it is.")),
+        _ => send(format!("Your goal: {text}\n\nWork on it until it's met. When it is, end your reply with this line: {MET_LINE}")),
     }
+}
+
+/// The goal under way, sent again. A stopped agent starts again for a message (a control waits
+/// for it to run), so to one that stopped the goal goes as words.
+fn reminder_command(how: &str, text: &str, stopped: bool) -> Command {
+    match how {
+        "goal_control" if stopped => send(format!("Your goal isn't met yet: {text}\n\nKeep working on it until it is.")),
+        "goal" | "goal_control" => goal_command(how, text),
+        _ => send(format!("Your goal isn't met yet: {text}\n\nKeep working on it until it is. When it's met, end your reply with this line: {MET_LINE}")),
+    }
+}
+
+fn send(text: String) -> Command {
+    Command::Send { id: crate::util::new_id(), text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None }
+}
+
+/// The same goal: the same words, however they're spaced (a goal is kept as one line).
+fn same(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
+/// The agent's last words end with the line that says its goal is met.
+fn said_met(summary: &str) -> bool {
+    summary
+        .lines()
+        .map(|l| l.trim().trim_matches(|c: char| matches!(c, '*' | '_' | '`' | '#' | '>' | '.' | '!' | ' ')))
+        .rfind(|l| !l.is_empty())
+        .is_some_and(|l| l.eq_ignore_ascii_case(MET_LINE))
+}
+
+/// How long the agent is left before the goal is sent again, after `reminders` in a row.
+fn gap(reminders: i64) -> i64 {
+    let doublings = u32::try_from(reminders.clamp(0, 16)).unwrap_or(16);
+    REMIND_MS.saturating_mul(1_i64 << doublings).min(REMIND_MAX_MS)
 }
 
 /// Clears the stack's goal in the agent's harness, where it has goals of its own: the one under
@@ -285,7 +347,7 @@ fn goal_command(how: &str, text: &str) -> Command {
 /// the agent doesn't go on chasing it.
 async fn clear_in_agent(hub: &Hub, info: &Info, items: &[Item]) {
     let Some(o) = info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet")) else { return };
-    let Some(item) = items.iter().rev().find(|i| i.text == o.text && i.how.is_some()) else { return };
+    let Some(item) = items.iter().rev().find(|i| same(&i.text, &o.text) && i.how.is_some()) else { return };
     let c = match item.how.as_deref() {
         Some("goal_control") => Command::Control { id: "goal".into(), value: Some(json!({"text": "clear"})) },
         Some("goal") => goal_command("goal", "clear"),
@@ -294,12 +356,18 @@ async fn clear_in_agent(hub: &Hub, info: &Info, items: &[Item]) {
     let _ = hub.harness.command(hub, &info.id, c).await;
 }
 
-/// Drives every running stack: sends the next goal to an agent that's free, and follows the one
-/// under way to how it came out.
+/// Drives every running stack: sends the next goal to an agent that's free, follows the one under
+/// way to how it came out, and sends it again when the agent stops short of it. Goals set in an
+/// agent directly join its stack first.
 pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     loop {
         if !hub.shutdown.sleep(Duration::from_millis(1500)).await {
             return Ok(());
+        }
+        for info in hub.harness.list() {
+            if let Err(e) = adopt(&hub, &info).await {
+                tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
+            }
         }
         let running: Vec<String> = hub
             .store
@@ -318,44 +386,102 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     }
 }
 
+/// A goal the agent pursues that its stack doesn't know (set in the agent: `/goal` typed in its
+/// composer, or its harness's own goal set some other way) joins the stack as the goal under way,
+/// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
+/// next. The stack runs.
+async fn adopt(hub: &Hub, info: &Info) -> anyhow::Result<()> {
+    let Some(o) = info.objective.as_ref().filter(|o| o.status == "active") else { return Ok(()) };
+    let Ok(text) = clean(&o.text) else { return Ok(()) };
+    let (agent, how, at) = (info.id.clone(), how(hub, &info.id), o.at);
+    hub.store
+        .call(move |c| {
+            // One you cleared or skipped is being cleared in the agent: it doesn't come back.
+            let dropped: i64 = c.query_row("SELECT dropped_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0)).optional()?.unwrap_or(0);
+            if at <= dropped {
+                return Ok(());
+            }
+            let tx = c.unchecked_transaction()?;
+            let active: Option<(String, String)> =
+                tx.query_row("SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active'", params![agent], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            if active.as_ref().is_some_and(|(_, t)| same(t, &text)) {
+                return Ok(());
+            }
+            let now = now_ms();
+            // Where it goes: after the goals done, before the ones to come.
+            let pos: i64 = tx.query_row("SELECT COALESCE(MAX(pos), -1) + 1 FROM goal_items WHERE agent = ?1 AND status NOT IN ('pending', 'active')", params![agent], |r| r.get(0))?;
+            tx.execute("UPDATE goal_items SET pos = pos + 2 WHERE agent = ?1 AND status IN ('pending', 'active')", params![agent])?;
+            if let Some((id, _)) = &active {
+                tx.execute(
+                    "UPDATE goal_items SET status = 'pending', pos = ?2, how = NULL, started_at = NULL, reminded_at = 0, reminders = 0, busy_at = 0 WHERE id = ?1",
+                    params![id, pos + 1],
+                )?;
+            }
+            // Already on the stack, to come: that one, now; else a new one.
+            let pending: Option<String> = tx.query_row("SELECT id FROM goal_items WHERE agent = ?1 AND status = 'pending' AND text = ?2 ORDER BY pos LIMIT 1", params![agent, text], |r| r.get(0)).optional()?;
+            let id = pending.unwrap_or_else(crate::util::new_id);
+            tx.execute(
+                "INSERT INTO goal_items (id, agent, pos, text, status, how, prior_at, started_at, reminded_at) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?7)
+                 ON CONFLICT(id) DO UPDATE SET status = 'active', pos = ?3, how = ?5, prior_at = ?6, started_at = ?7, reminded_at = ?7, reminders = 0, busy_at = 0",
+                params![id, agent, pos, text, how, at.saturating_sub(1), now],
+            )?;
+            touch(&tx, &agent, Some("running"), None)?;
+            tx.commit()?;
+            tracing::info!(%agent, "a goal set in the agent joins its goal stack");
+            Ok(())
+        })
+        .await
+}
+
 /// What a running stack does next.
+#[derive(Debug)]
 enum Next {
     Wait,
-    /// The goal under way ended: met (go on), or not (pause, with why).
+    /// The goal under way ended: met, or skipped (cleared in the agent). The next one follows.
     End { id: String, status: &'static str, reason: Option<String> },
-    Saw { id: String },
+    /// The agent is at work on the goal under way (since it was last sent).
+    Busy { id: String },
     Start { id: String, text: String },
+    /// Send the goal under way again: the agent stopped short of it. `worked`: it did real work
+    /// on it since it was last sent; `stopped`: its harness isn't running (a message starts it).
+    Remind { id: String, text: String, how: String, worked: bool, stopped: bool },
     Pause(String),
     Done,
 }
 
 fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
     let Some(info) = info else { return Next::Pause("The agent isn't there any more.".into()) };
-    if info.status == Status::Exited {
-        return Next::Pause("The agent stopped. Restart it, then start the stack again.".into());
-    }
-    let free = info.status == Status::Idle && info.approvals.is_empty() && info.queued == 0;
+    let busy = matches!(info.status, Status::Running | Status::Waiting | Status::Starting);
+    // Nothing waiting on you or in its queue; stopped counts (a message starts it again).
+    let free = matches!(info.status, Status::Idle | Status::Exited) && info.approvals.is_empty() && info.queued == 0;
     if let Some(item) = stack.items.iter().find(|i| i.status == "active") {
         let id = item.id.clone();
-        return match item.how.as_deref() {
-            Some("goal" | "goal_control") => match info.objective.as_ref().filter(|o| o.text == item.text && o.at > item.prior_at) {
-                Some(o) => match o.status.as_str() {
-                    "met" => Next::End { id, status: "met", reason: o.reason.clone() },
-                    "unmet" => Next::End { id, status: "unmet", reason: Some(o.reason.clone().unwrap_or_else(|| "It wasn't met.".into())) },
-                    "cleared" => Next::End { id, status: "skipped", reason: Some("The goal was cleared in the agent.".into()) },
-                    "paused" => Next::Pause("The goal was paused in the agent: resume it there, or start the stack again.".into()),
-                    _ => Next::Wait,
-                },
-                // Not taken up yet (the message waits in its queue); or never, after a while idle.
-                None if free && now - item.started_at.unwrap_or(now) > UNTAKEN_MS => Next::Pause("The agent didn't take the goal up.".into()),
-                None => Next::Wait,
-            },
-            // As a message: done when the work it started ends.
-            _ if matches!(info.status, Status::Running | Status::Waiting | Status::Starting) && !item.saw_running => Next::Saw { id },
-            _ if item.saw_running && free => Next::End { id, status: "met", reason: None },
-            _ if free && now - item.started_at.unwrap_or(now) > UNTAKEN_MS => Next::End { id, status: "met", reason: Some("Its turn ended.".into()) },
-            _ => Next::Wait,
-        };
+        if busy {
+            return if item.busy_at == 0 { Next::Busy { id } } else { Next::Wait };
+        }
+        if !free {
+            return Next::Wait;
+        }
+        let how = item.how.clone().unwrap_or_else(|| "message".into());
+        if matches!(how.as_str(), "goal" | "goal_control") {
+            // Its harness's word on this goal since it was last sent: met, or cleared (by you, in
+            // the agent: it goes). Still set, given up, paused, or none at all: it's reminded.
+            if let Some(o) = info.objective.as_ref().filter(|o| same(&o.text, &item.text) && o.at > item.prior_at) {
+                match o.status.as_str() {
+                    "met" => return Next::End { id, status: "met", reason: o.reason.clone() },
+                    "cleared" => return Next::End { id, status: "skipped", reason: Some("The goal was cleared in the agent.".into()) },
+                    _ => {}
+                }
+            }
+        } else if item.busy_at > 0 && said_met(&info.summary) {
+            return Next::End { id, status: "met", reason: None };
+        }
+        let since = item.reminded_at.max(item.started_at.unwrap_or(0));
+        if now.saturating_sub(since) < gap(item.reminders) {
+            return Next::Wait;
+        }
+        let worked = item.busy_at > 0 && info.last_activity.saturating_sub(item.busy_at) >= WORKED_MS;
+        return Next::Remind { id, text: item.text.clone(), how, worked, stopped: info.status == Status::Exited };
     }
     match stack.items.iter().find(|i| i.status == "pending") {
         None => Next::Done,
@@ -370,20 +496,18 @@ async fn step(hub: &Arc<Hub>, agent: &str) -> anyhow::Result<()> {
     let now = now_ms();
     let next = decide(&stack, info.as_ref(), now);
     let a = agent.to_owned();
+    // What its harness last said of the goal it pursues: a verdict on what's sent now must be newer.
+    let prior_at = info.as_ref().and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
     match next {
         Next::Wait => {}
-        Next::Saw { id } => {
-            hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET saw_running = 1 WHERE id = ?1", params![id]).map(|_| ())?)).await?;
+        Next::Busy { id } => {
+            hub.store.call(move |c| Ok(c.execute("UPDATE goal_items SET busy_at = ?2 WHERE id = ?1", params![id, now]).map(|_| ())?)).await?;
         }
         Next::End { id, status, reason } => {
-            let pause = (status == "unmet").then(|| format!("A goal wasn't met: {}", reason.clone().unwrap_or_default()));
             hub.store
                 .call(move |c| {
                     c.execute("UPDATE goal_items SET status = ?2, reason = ?3, ended_at = ?4 WHERE id = ?1", params![id, status, reason, now])?;
-                    match pause {
-                        Some(why) => touch(c, &a, Some("paused"), Some(&why)),
-                        None => touch(c, &a, None, None),
-                    }
+                    touch(c, &a, None, None)
                 })
                 .await?;
         }
@@ -395,25 +519,46 @@ async fn step(hub: &Arc<Hub>, agent: &str) -> anyhow::Result<()> {
         }
         Next::Start { id, text } => {
             let how = how(hub, agent);
-            let prior_at = info.as_ref().and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
-            let sent = hub.harness.command(hub, agent, goal_command(how, &text)).await;
-            let a2 = a.clone();
-            match sent {
+            let stopped = info.as_ref().is_some_and(|i| i.status == Status::Exited);
+            let first = if stopped && how == "goal_control" { send(format!("Your goal: {text}\n\nWork on it until it's met.")) } else { goal_command(how, &text) };
+            match hub.harness.command(hub, agent, first).await {
                 Sent::Ok => {
                     hub.store
                         .call(move |c| {
                             c.execute(
-                                "UPDATE goal_items SET status = 'active', how = ?2, prior_at = ?3, started_at = ?4, saw_running = 0 WHERE id = ?1",
+                                "UPDATE goal_items SET status = 'active', how = ?2, prior_at = ?3, started_at = ?4, reminded_at = ?4, reminders = 0, busy_at = 0 WHERE id = ?1",
                                 params![id, how, prior_at, now],
                             )?;
-                            touch(c, &a2, None, None)
+                            touch(c, &a, None, None)
                         })
                         .await?;
                 }
-                Sent::NoSession => hub.store.call(move |c| touch(c, &a2, Some("paused"), Some("The agent isn't there any more."))).await?,
-                Sent::Unreachable => hub.store.call(move |c| touch(c, &a2, Some("paused"), Some("The agent's machine isn't connected."))).await?,
+                Sent::NoSession => hub.store.call(move |c| touch(c, &a, Some("paused"), Some("The agent isn't there any more."))).await?,
+                // Its machine is away: the goal goes when it's back.
+                Sent::Unreachable => {}
             }
         }
+        Next::Remind { id, text, how, worked, stopped } => match hub.harness.command(hub, agent, reminder_command(&how, &text, stopped)).await {
+            Sent::Ok => {
+                tracing::info!(%agent, worked, stopped, "goal sent again: the agent stopped short of it");
+                hub.store
+                    .call(move |c| {
+                        c.execute(
+                            "UPDATE goal_items SET reminded_at = ?2, reminders = CASE WHEN ?3 THEN 1 ELSE reminders + 1 END, prior_at = ?4, busy_at = 0 WHERE id = ?1",
+                            params![id, now, worked, prior_at],
+                        )?;
+                        touch(c, &a, None, None)
+                    })
+                    .await?;
+            }
+            Sent::NoSession => hub.store.call(move |c| touch(c, &a, Some("paused"), Some("The agent isn't there any more."))).await?,
+            // Its machine is away: tried again after a pause, as a reminder that brought no work.
+            Sent::Unreachable => {
+                hub.store
+                    .call(move |c| Ok(c.execute("UPDATE goal_items SET reminded_at = ?2, reminders = reminders + 1 WHERE id = ?1", params![id, now]).map(|_| ())?))
+                    .await?;
+            }
+        },
     }
     Ok(())
 }
@@ -421,7 +566,8 @@ async fn step(hub: &Arc<Hub>, agent: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::model::Objective;
+    use crate::harness::model::{Objective, ToolKind};
+    use crate::harness::session::ApprovalBrief;
 
     fn info(status: Status, objective: Option<Objective>) -> Info {
         Info { id: "a1".into(), status, objective, ..Info::default() }
@@ -436,46 +582,104 @@ mod tests {
     }
 
     fn obj(status: &str, at: i64) -> Objective {
-        Objective { text: "tests pass".into(), status: status.into(), reason: Some("why".into()), at }
+        Objective { text: "tests  pass".into(), status: status.into(), reason: Some("why".into()), at }
     }
 
+    /// Past the first pause after the goal was sent.
+    const LATER: i64 = 1_000 + REMIND_MS;
+
     #[test]
-    fn goals_start_when_the_agent_is_free_and_end_on_its_harness_verdict() {
+    fn goals_start_when_the_agent_is_free_and_end_when_its_harness_says_met() {
         let pending = stack(vec![item("pending", None)]);
         assert!(matches!(decide(&pending, Some(&info(Status::Idle, None)), 2_000), Next::Start { .. }));
         assert!(matches!(decide(&pending, Some(&info(Status::Running, None)), 2_000), Next::Wait));
+        // A stopped agent starts again for its next goal.
+        assert!(matches!(decide(&pending, Some(&info(Status::Exited, None)), 2_000), Next::Start { .. }));
         let native = stack(vec![item("active", Some("goal"))]);
-        // The verdict of the goal before it doesn't count.
-        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 5)))), 2_000), Next::Wait));
-        assert!(matches!(decide(&native, Some(&info(Status::Running, Some(obj("active", 9)))), 2_000), Next::Wait));
         assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 9)))), 2_000), Next::End { status: "met", .. }));
-        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("unmet", 9)))), 2_000), Next::End { status: "unmet", .. }));
-        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("paused", 9)))), 2_000), Next::Pause(_)));
-        // Never taken up.
-        assert!(matches!(decide(&native, Some(&info(Status::Idle, None)), 1_000 + UNTAKEN_MS + 1), Next::Pause(_)));
+        assert!(matches!(decide(&native, Some(&info(Status::Idle, Some(obj("cleared", 9)))), 2_000), Next::End { status: "skipped", .. }));
+        // The verdict on the goal before it doesn't count.
+        assert!(!matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 5)))), LATER), Next::End { .. }));
         assert!(matches!(decide(&stack(vec![item("met", Some("goal"))]), Some(&info(Status::Idle, None)), 2_000), Next::Done));
         assert!(matches!(decide(&native, None, 2_000), Next::Pause(_)));
-        assert!(matches!(decide(&native, Some(&info(Status::Exited, None)), 2_000), Next::Pause(_)));
     }
 
     #[test]
-    fn a_goal_sent_as_a_message_is_done_when_that_work_ends() {
-        let msg = stack(vec![item("active", Some("message"))]);
-        assert!(matches!(decide(&msg, Some(&info(Status::Idle, None)), 2_000), Next::Wait));
-        assert!(matches!(decide(&msg, Some(&info(Status::Running, None)), 2_000), Next::Saw { .. }));
-        let mut seen = item("active", Some("message"));
-        seen.saw_running = true;
-        assert!(matches!(decide(&stack(vec![seen.clone()]), Some(&info(Status::Running, None)), 2_000), Next::Wait));
-        assert!(matches!(decide(&stack(vec![seen]), Some(&info(Status::Idle, None)), 2_000), Next::End { status: "met", .. }));
+    fn an_agent_that_stops_short_of_its_goal_is_reminded_never_left() {
+        let native = stack(vec![item("active", Some("goal"))]);
+        // Gave up, paused it, stopped with it still set, never took it up, or lost it when it
+        // started again: once the pause since it was sent is over, it's sent again.
+        for o in [Some(obj("unmet", 9)), Some(obj("paused", 9)), Some(obj("active", 9)), None] {
+            assert!(matches!(decide(&native, Some(&info(Status::Idle, o.clone())), 2_000), Next::Wait), "{o:?}");
+            assert!(matches!(decide(&native, Some(&info(Status::Idle, o.clone())), LATER), Next::Remind { stopped: false, .. }), "{o:?}");
+        }
+        // Stopped: sent again all the same (the message starts it).
+        assert!(matches!(decide(&native, Some(&info(Status::Exited, None)), LATER), Next::Remind { stopped: true, .. }));
+        // At work on it: noted once, then left to it.
+        assert!(matches!(decide(&native, Some(&info(Status::Running, None)), LATER), Next::Busy { .. }));
+        let mut working = item("active", Some("goal"));
+        working.busy_at = 2_000;
+        assert!(matches!(decide(&stack(vec![working]), Some(&info(Status::Running, None)), LATER), Next::Wait));
+        // Waiting on you, or with something in its queue: not reminded.
+        let mut asking = info(Status::Idle, None);
+        asking.approvals = vec![ApprovalBrief { id: "p1".into(), tool: ToolKind::Shell, tool_name: "Bash".into(), title: "cargo test".into(), at: 1 }];
+        assert!(matches!(decide(&native, Some(&asking), LATER), Next::Wait));
+        let mut queued = info(Status::Idle, None);
+        queued.queued = 1;
+        assert!(matches!(decide(&native, Some(&queued), LATER), Next::Wait));
     }
 
     #[test]
-    fn goals_are_one_line() {
+    fn reminders_wait_longer_while_they_bring_no_work_and_start_over_after_real_work() {
+        assert_eq!(gap(0), REMIND_MS);
+        assert_eq!(gap(1), 2 * REMIND_MS);
+        assert_eq!(gap(3), 8 * REMIND_MS);
+        assert_eq!(gap(40), REMIND_MAX_MS);
+        let mut thrice = item("active", Some("goal"));
+        thrice.reminders = 3;
+        thrice.reminded_at = 10_000;
+        let s = stack(vec![thrice]);
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS - 1), Next::Wait));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS), Next::Remind { worked: false, .. }));
+        // It worked on it a good while since it was last sent: real work.
+        let mut worked = item("active", Some("goal"));
+        worked.reminded_at = 10_000;
+        worked.busy_at = 11_000;
+        let mut after = info(Status::Idle, None);
+        after.last_activity = 11_000 + WORKED_MS;
+        assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS), Next::Remind { worked: true, .. }));
+    }
+
+    #[test]
+    fn a_goal_sent_as_a_message_is_met_when_the_agent_says_so() {
+        let mut said = item("active", Some("message"));
+        said.busy_at = 1_500;
+        let mut done = info(Status::Idle, None);
+        done.summary = "All 212 tests pass on every platform.\n\n**GOAL MET**".into();
+        assert!(matches!(decide(&stack(vec![said.clone()]), Some(&done), 2_000), Next::End { status: "met", .. }));
+        // Its turn ended without saying so: reminded.
+        let mut not_yet = info(Status::Idle, None);
+        not_yet.summary = "Fixed the parser; the lexer is next.".into();
+        assert!(matches!(decide(&stack(vec![said]), Some(&not_yet), LATER), Next::Remind { .. }));
+        // Words from before it was last sent don't count.
+        assert!(!matches!(decide(&stack(vec![item("active", Some("message"))]), Some(&done), LATER), Next::End { .. }));
+        assert!(said_met("done.\nGoal met."));
+        assert!(!said_met("GOAL MET is what I'll say when it's done"));
+        assert!(!said_met(""));
+    }
+
+    #[test]
+    fn goals_are_one_line_and_go_as_their_harness_takes_them() {
         assert_eq!(clean("  ship\n the   lexer ").ok().as_deref(), Some("ship the lexer"));
         assert!(clean("   ").is_err());
         assert!(clean(&"x".repeat(TEXT + 1)).is_err());
+        assert!(same("tests  pass", "tests pass") && !same("tests pass", "tests passed"));
         assert!(matches!(goal_command("goal", "tests pass"), Command::Send { text, .. } if text == "/goal tests pass"));
         assert!(matches!(goal_command("goal_control", "ship"), Command::Control { id, value: Some(v) } if id == "goal" && v.get("text") == Some(&json!("ship"))));
-        assert!(matches!(goal_command("message", "ship"), Command::Send { text, .. } if text.starts_with("Your goal: ship")));
+        assert!(matches!(goal_command("message", "ship"), Command::Send { text, .. } if text.starts_with("Your goal: ship") && text.ends_with(MET_LINE)));
+        assert!(matches!(reminder_command("goal", "ship", true), Command::Send { text, .. } if text == "/goal ship"));
+        assert!(matches!(reminder_command("goal_control", "ship", false), Command::Control { .. }));
+        assert!(matches!(reminder_command("goal_control", "ship", true), Command::Send { text, .. } if text.contains("isn't met yet: ship")));
+        assert!(matches!(reminder_command("message", "ship", false), Command::Send { text, .. } if text.contains("isn't met yet: ship") && text.ends_with(MET_LINE)));
     }
 }

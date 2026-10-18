@@ -6,9 +6,9 @@ one; how each goal goes depends on what the harness has:
 
 | Harness | A goal goes as | It's met when |
 |---|---|---|
-| Claude Code | `/goal <condition>` (its own: a Stop hook checks the condition each time it would stop, and it keeps working until it's met) | Claude Code's verdict says so (read from its transcript: met, can't be met, or it stopped after its checks kept finding it unmet) |
-| Codex | its thread goal (`thread/goal/set`, as Codex's own `/goal`) | Codex says the goal is complete (`thread/goal/updated`); blocked, usage-limited or out of its token budget is not met |
-| the rest (Gemini CLI, opencode, Goose, Amp …) | a message: "Your goal: …; work on it until it's done" | the turn it started ends |
+| Claude Code | `/goal <condition>` (its own: a Stop hook checks the condition each time it would stop, and it keeps working until it's met) | Claude Code's verdict says met (read from its transcript) |
+| Codex | its thread goal (`thread/goal/set`, as Codex's own `/goal`) | Codex says the goal is complete (`thread/goal/updated`) |
+| the rest (Gemini CLI, opencode, Goose, Amp …) | a message: "Your goal: …; work on it until it's met. When it is, end your reply with this line: GOAL MET" | the agent's reply ends with `GOAL MET` |
 
 A goal is one line: a condition to meet ("the parser tests pass") or an objective.
 
@@ -19,14 +19,37 @@ each with how it came out; a field to add goals (a line each); and:
 
 - **Start** (or **Resume**): goals go to the agent, the next once it's free (idle, nothing waiting
   on you, nothing queued).
-- **Pause**: no more goals go; the one under way carries on in the agent.
+- **Pause**: no more goals go, and the one under way isn't sent again; it carries on in the agent.
 - **Skip this one**: leave the goal under way (its harness's own goal cleared) and go on.
 - **Edit**: the goals not yet started, one text box, a goal a line.
-- **Try it again** (after one that wasn't met) or **Go on to the next**.
+- **Try it again** or **Go on to the next**, after a goal that ended without being met (stacks from
+  before goals were kept to the end).
 - **Clear**: empty the stack; a goal still set in the harness is cleared there too.
 
-A goal that isn't met pauses the stack, and says why (Claude Code's or Codex's own words). The
-stack also pauses when the agent stops, goes away, or doesn't take a goal up.
+### Kept on the goal until it's met
+
+The next goal starts only when the agent says the one under way is met. Until then kiln keeps the
+agent on it: whenever the agent is free (idle or stopped, nothing waiting on you, nothing queued)
+and hasn't said it's met, kiln sends the goal again: its harness's own `/goal` again (re-armed), or
+for the rest the message "Your goal isn't met yet: …". That covers an agent that:
+
+- stopped short: Claude Code's checks kept finding the goal unmet and it gave up for now, or
+  Codex's goal was blocked, paused or out of budget;
+- stopped with the goal still set, or never took it up;
+- lost it: the agent started again (a runner update, a restart, a crash) into a session that no
+  longer has it. The stack is kept by the server, so it knows the goal under way and sends it to
+  the new session;
+- stopped altogether: a message starts it again.
+
+Reminders wait 30 seconds after the agent stops, then twice as long each time one brings no real
+work (up to 15 minutes); once the agent has worked on the goal for two minutes, they start over.
+The goal under way shows how many times it was sent again, and when. While the agent's machine is
+away, the stack waits for it and goes on when it's back. Only you stop it: **Pause**, **Skip
+this one** or **Clear**; the stack pauses by itself only when the agent is gone (closed).
+
+A goal set in the agent itself (`/goal …` in its composer) joins its stack as the goal under way,
+so it's kept the same way, across restarts too; a goal the stack had under way goes back to the
+front of what's next. Clearing it in the agent (`/goal clear`) ends it as skipped.
 
 A plan runs as goals too: **Run it** (or, in the agent's Plan tab, **Run here**) **as Goals**, each
 step one, after the agent's others (a new agent is started for them when you pick one). A step
@@ -41,7 +64,7 @@ restarts.
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?}], updated_at}` |
+| GET | `/api/harness/sessions/:id/goals` | the stack: `{agent, state: "running" \| "paused" \| "done", reason?, items: [{id, text, status: "pending" \| "active" \| "met" \| "unmet" \| "skipped", reason?, how?, started_at?, ended_at?, reminders?, reminded_at?}], updated_at}` (`reminders`: times the goal under way was sent again in a row without real work; `reminded_at`: when it was last sent, unix ms) |
 | POST | `/api/harness/sessions/:id/goals` | `{goals: [text], start?}`: goals after the others |
 | PUT | `/api/harness/sessions/:id/goals` | `{goals: [{id?, text}]}`: the goals not yet started, as they should be (reordered, edited, removed, added) |
 | POST | `/api/harness/sessions/:id/goals/{start,pause,skip,clear}` | as above |
