@@ -13,7 +13,7 @@ use super::calendar::{self, Calendar};
 use super::parse::{Ast, BinOp, CountMode, Fill, Func, MetricQuery, Node, ParseError, Rollup, SpaceAgg, parse};
 use crate::anomaly::{Algorithm, Scorer};
 use crate::batch::Kind;
-use crate::index::Selector;
+use crate::index::{NameMatch, Selector};
 use crate::store::{Scratch, Store, StoreError};
 
 /// The most buckets a series: Prometheus's cap on a range query's resolution (11,000 points a
@@ -1028,8 +1028,116 @@ fn constant(ast: &Ast, id: usize) -> Option<f64> {
     }
 }
 
+/// Whether `q` names a distribution (`crate::dist`): a metric of its own name holds nothing, its
+/// buckets' series (`<name>.dist`) are there.
+fn distribution_of<'q>(store: &Store, q: &'q MetricQuery) -> Option<&'q str> {
+    let NameMatch::Exact(name) = &q.metric else { return None };
+    let mut ids = Vec::new();
+    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
+    (!ids.is_empty()).then_some(name.as_str())
+}
+
+/// A distribution's series on the grid, Datadog's: a percentile (`p99:`) of its values, every
+/// series' buckets of a group merged for each bucket of time (at the coarsest scale among them),
+/// read as `crate::dist::Merged` reads them; `avg` its sums over its counts; `sum`, `count`, `min`
+/// and `max` its own of those, each a bucket's total.
+fn distribution(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+    let NameMatch::Exact(name) = &q.metric else { return Ok(Vec::new()) };
+    let part = |suffix: &str, space: SpaceAgg| MetricQuery { metric: NameMatch::Exact(format!("{name}{suffix}")), space, mode: Some(CountMode::Count), rollup: None, calendar: None, weighted: false, ..q.clone() };
+    let p = match q.space {
+        SpaceAgg::Pct(p) => p,
+        SpaceAgg::Avg => {
+            let sums = metric(store, &part(".sum", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
+            let counts = metric(store, &part(".count", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned)?;
+            return Ok(sums
+                .into_iter()
+                .filter_map(|mut s| {
+                    let c = counts.iter().find(|c| c.tags == s.tags)?;
+                    for (v, n) in s.values.iter_mut().zip(&c.values) {
+                        *v = if *n > 0.0 { *v / *n } else { f64::NAN };
+                    }
+                    Some(s)
+                })
+                .collect());
+        }
+        SpaceAgg::Sum => return metric(store, &part(".sum", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Count => return metric(store, &part(".count", SpaceAgg::Sum), grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Min => return metric(store, &MetricQuery { mode: None, ..part(".min", SpaceAgg::Min) }, grid, spans, max_series, scratch, scanned),
+        SpaceAgg::Max => return metric(store, &MetricQuery { mode: None, ..part(".max", SpaceAgg::Max) }, grid, spans, max_series, scratch, scanned),
+    };
+    let mut ids = Vec::new();
+    store.select(&Selector { metric: NameMatch::Exact(format!("{name}{}", crate::dist::SUFFIX)), clauses: q.filters.clone() }, &mut ids);
+    // In the order of the series' fingerprints, the same on every replica: each group's buckets
+    // summed in one order everywhere.
+    ids.sort_unstable_by_key(|&id| store.fingerprint(id).unwrap_or(0));
+    // Groups by the query's tags, each its buckets' series: (id, scale, bucket).
+    let mut groups: std::collections::BTreeMap<Vec<(String, String)>, Vec<(u32, i32, crate::dist::Bucket)>> = std::collections::BTreeMap::new();
+    for &id in &ids {
+        let Some(s) = store.series(id) else { continue };
+        let Some((scale, b)) = s.tag(crate::dist::BUCKET_TAG).and_then(crate::dist::parse_tag_value) else { continue };
+        let tags: Vec<(String, String)> = q.by.iter().map(|k| (k.clone(), s.tag(k).unwrap_or("N/A").to_owned())).collect();
+        let n = groups.len();
+        let entry = groups.entry(tags);
+        if matches!(entry, std::collections::btree_map::Entry::Vacant(_)) && n >= max_series {
+            return Err(QueryError::TooManySeries(n + 1, max_series));
+        }
+        entry.or_default().push((id, scale, b));
+    }
+    let counted = MetricQuery { mode: Some(CountMode::Count), rollup: Some((Rollup::Sum, None)), calendar: None, weighted: false, fill: None, ..q.clone() };
+    let (from, end) = (spans.start(0), spans.start(grid.n));
+    let (mut ts, mut vs) = (Vec::new(), Vec::new());
+    let mut buckets = vec![f64::NAN; grid.n];
+    let mut out = Vec::with_capacity(groups.len());
+    for (tags, members) in groups {
+        // Each of the group's buckets at its coarsest scale, its counts a bucket of time.
+        let scale = members.iter().map(|m| m.1).min().unwrap_or(crate::dist::SCALE);
+        let mut by_bucket: std::collections::BTreeMap<(u8, i64), (crate::dist::Bucket, Vec<f64>)> = std::collections::BTreeMap::new();
+        for (id, at, b) in members {
+            let Some(s) = store.series(id) else { continue };
+            ts.clear();
+            vs.clear();
+            let lookback = if s.kind() == Kind::Counter { grid.step } else { 0 };
+            store.read_with(id, from.saturating_sub(lookback), end.saturating_sub(1), scratch, &mut ts, &mut vs)?;
+            scanned.0 += 1;
+            scanned.1 += ts.len() as u64;
+            rollup(s.kind(), &counted, spans, &ts, &vs, &mut buckets, None);
+            let coarse = b.coarser(u32::try_from(at - scale).unwrap_or(0));
+            let counts = &mut by_bucket.entry(coarse.order()).or_insert_with(|| (coarse, vec![0.0; grid.n])).1;
+            for (c, v) in counts.iter_mut().zip(&buckets) {
+                if v.is_finite() && *v > 0.0 {
+                    *c += v;
+                }
+            }
+        }
+        // Each bucket of time: the rank's bucket, DDSketch's way (`crate::dist::Merged::quantile`).
+        let q01 = (p / 100.0).clamp(0.0, 1.0);
+        let values: Vec<f64> = (0..grid.n)
+            .map(|i| {
+                let total: f64 = by_bucket.values().map(|(_, c)| c.get(i).copied().unwrap_or(0.0)).sum();
+                if total <= 0.0 {
+                    return f64::NAN;
+                }
+                let rank = q01 * (total - 1.0).max(0.0);
+                let mut seen = 0.0;
+                for (b, c) in by_bucket.values() {
+                    seen += c.get(i).copied().unwrap_or(0.0);
+                    if rank < seen {
+                        return b.value(scale);
+                    }
+                }
+                by_bucket.values().next_back().map_or(f64::NAN, |(b, _)| b.value(scale))
+            })
+            .collect();
+        out.push(Series { tags, values, bounds: None, outlier: None });
+    }
+    Ok(out)
+}
+
 /// A metric query's series on the grid.
 fn metric(store: &Store, q: &MetricQuery, grid: Grid, spans: Spans<'_>, max_series: usize, scratch: &mut Scratch, scanned: &mut (u64, u64)) -> Result<Vec<Series>, QueryError> {
+    if distribution_of(store, q).is_some() {
+        return distribution(store, q, grid, spans, max_series, scratch, scanned);
+    }
     let mut ids = Vec::new();
     store.select(&Selector { metric: q.metric.clone(), clauses: q.filters.clone() }, &mut ids);
     // In the order of the series' fingerprints, the same on every replica (ids are each one's
@@ -2379,6 +2487,80 @@ mod tests {
         for bad in ["sum:pod.uptime{*}.rollup(sum).weighted()", "sum:pod.uptime{*}.weighted().rollup(max, 60)"] {
             assert!(eval(&s, &Request::new(bad, 0, 60_000)).is_err(), "{bad}");
         }
+    }
+
+    /// A distribution's percentiles across hosts: three hosts' values (log-normal, each its own
+    /// level), their buckets written as a distribution's series; `p50`, `p99` of all of them within
+    /// the buckets' relative error of the exact ones, by host too; `avg` the sums over the counts;
+    /// `count` and `max` its own.
+    #[test]
+    fn a_distribution_s_percentiles_merge_across_hosts() {
+        use crate::dist::{BUCKET_TAG, SCALE, bucket_of, tag_value};
+        let mut s = Store::new(Keyed::with_keys(1, 2));
+        let mut b = Builder::new();
+        let mut rng = crate::testkit::Rng::new(3);
+        let mut all: Vec<f64> = Vec::new();
+        let mut by_host: Vec<Vec<f64>> = Vec::new();
+        for (h, level) in [("a", -4.0), ("b", -3.0), ("c", -2.0)] {
+            let mut values = Vec::new();
+            for _ in 0..3000 {
+                let n = (-2.0 * rng.f64().max(1e-300).ln()).sqrt() * (std::f64::consts::TAU * rng.f64()).cos();
+                values.push((n * 0.5 + level).exp());
+            }
+            // The buckets' counts, as an exporter's delta point at t = 30 s.
+            let mut counts: std::collections::BTreeMap<(u8, i64), (crate::dist::Bucket, f64)> = std::collections::BTreeMap::new();
+            for &v in &values {
+                let bk = bucket_of(v, SCALE).unwrap();
+                counts.entry(bk.order()).or_insert((bk, 0.0)).1 += 1.0;
+            }
+            for (bk, n) in counts.values() {
+                let tag = tag_value(SCALE, *bk);
+                let k = SeriesKey::new("lat.dist", [("host", h), (BUCKET_TAG, tag.as_str())], Kind::Count).unwrap();
+                b.define(&k);
+                b.run(k.fp, [(30_000, *n)]);
+            }
+            for (metric, kind, v) in [
+                ("lat.count", Kind::Count, values.len() as f64),
+                ("lat.sum", Kind::Count, values.iter().sum::<f64>()),
+                ("lat.max", Kind::Gauge, values.iter().copied().fold(f64::MIN, f64::max)),
+            ] {
+                let k = SeriesKey::new(metric, [("host", h)], kind).unwrap();
+                b.define(&k);
+                b.run(k.fp, [(30_000, v)]);
+            }
+            all.extend_from_slice(&values);
+            by_host.push(values);
+        }
+        s.apply(&b.finish()).unwrap();
+        let ask = |q: &str| -> Vec<(String, f64)> {
+            let mut r = Request::new(q, 0, 60_000);
+            r.step = Some(60_000);
+            eval(&s, &r).unwrap_or_else(|e| panic!("{q}: {e}")).series.into_iter().map(|x| (x.tags.iter().map(|(k, v)| format!("{k}:{v}")).collect::<Vec<_>>().join(","), x.values[0])).collect()
+        };
+        let exact = |v: &mut Vec<f64>, q: f64| {
+            v.sort_by(f64::total_cmp);
+            v[((v.len() - 1) as f64 * q).floor() as usize]
+        };
+        let bound = ((2f64).powi(-SCALE) * 0.5).exp2() - 1.0;
+        let within = |got: f64, want: f64| ((got - want) / want).abs() <= bound * 1.000_001;
+        for (q, p) in [("p50", 0.5), ("p99", 0.99), ("p99.9", 0.999)] {
+            let got = ask(&format!("{q}:lat{{*}}"));
+            let want = exact(&mut all.clone(), p);
+            assert!(got.len() == 1 && within(got[0].1, want), "{q}: {got:?} for {want}");
+        }
+        let per = ask("p99:lat{*} by {host}");
+        for ((tags, got), values) in per.iter().zip(&by_host) {
+            let want = exact(&mut values.clone(), 0.99);
+            assert!(within(*got, want), "{tags}: {got} for {want}");
+        }
+        // The average is the sums over the counts, exactly; count and max the distribution's own.
+        let avg = ask("avg:lat{*}")[0].1;
+        let mean = all.iter().sum::<f64>() / all.len() as f64;
+        assert!((avg - mean).abs() < 1e-9 * mean, "{avg} {mean}");
+        assert_eq!(ask("count:lat{*}")[0].1, 9000.0);
+        assert_eq!(ask("max:lat{*}")[0].1, all.iter().copied().fold(f64::MIN, f64::max));
+        // A metric of its own name is no distribution: its series are read as they are.
+        assert!(ask("p99:lat.count{*}")[0].1 > 0.0);
     }
 
     #[test]
