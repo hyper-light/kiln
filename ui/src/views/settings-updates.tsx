@@ -11,14 +11,14 @@ import { create } from "zustand";
 import { ChevronDown, RefreshCw, Trash2, Upload } from "lucide-react";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import type { FleetTarget, KilnBinary, ReleaseBuild, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview } from "@/api/types";
+import type { FleetTarget, KilnBinary, ReleaseBuild, ReleaseWait, RunnerInstance, RunnerUpdate, ServerUpdate, UpdateJob, UpdatePolicy, UpdatesOverview } from "@/api/types";
 import { Button } from "@/components/ui/button";
 import { Hold } from "@/components/ui/hold";
 import { Confirm, Facts, Panel, SelectField } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
 import { toast } from "@/components/ui/toast";
 import { fuller, mergeJobs, updatesRes, useRes, useUpdateJobs } from "@/lib/data";
-import { formatBytes, relativeTime, shortSha } from "@/lib/format";
+import { formatBytes, formatDuration, relativeTime, shortSha } from "@/lib/format";
 import { errorMessage, useNow } from "@/lib/hooks";
 import { invalidate } from "@/lib/resource";
 import { cn } from "@/lib/utils";
@@ -537,6 +537,19 @@ function sentence(s: string) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+/** "Waits for the release build of 31c0bba: run #232, its build step, on adacachy, 11m 04s in",
+ * the run a link and its time ticking. */
+function ReleaseWaitWords({ w, newest }: { w: ReleaseWait; newest: FleetTarget | null }) {
+  const nowS = useNow() / 1000;
+  const parts = [w.step ? `its ${w.step} step` : null, w.on ? `on ${w.on}` : null, w.since ? `${formatDuration(nowS - w.since)} in` : null].filter(Boolean);
+  return (
+    <>
+      Waits for the release build{newest ? ` of ${shortSha(newest.commit)}` : ""}: <Link to={`/runs/${w.run}`}>run #{w.number}</Link>
+      {parts.length > 0 ? `, ${parts.join(", ")}` : ""}
+    </>
+  );
+}
+
 function RunnerRow({
   r,
   newest,
@@ -591,7 +604,17 @@ function RunnerRow({
         </span>
         {r.connected && !r.up_to_date && (
           <span className="upd-sub">
-            {r.next ? sentence(r.next) : r.method === "native" ? "upgrades itself" : r.terminal ? "upgraded through a terminal on it" : "terminals are off: upgrade it on the machine"}
+            {r.waits_on ? (
+              <ReleaseWaitWords w={r.waits_on} newest={newest} />
+            ) : r.next ? (
+              sentence(r.next)
+            ) : r.method === "native" ? (
+              "upgrades itself"
+            ) : r.terminal ? (
+              "upgraded through a terminal on it"
+            ) : (
+              "terminals are off: upgrade it on the machine"
+            )}
             {r.from && r.how !== "off" ? ` · ${r.from}` : ""}
           </span>
         )}

@@ -635,6 +635,10 @@ async fn sleep_until_opt(t: Option<Instant>) {
 
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     crate::os::start_reaper();
+    // A Mac set up for kiln signing: launchd's re-sign watcher as this kiln writes it.
+    if cfg!(target_os = "macos") && !o.ephemeral {
+        std::thread::spawn(crate::os::macsign::keep_watching);
+    }
     std::fs::create_dir_all(&o.work_dir).with_context(|| format!("create {}", o.work_dir.display()))?;
     let orphans = crate::exec::reap_orphans(&o.work_dir);
     if orphans > 0 {

@@ -52,6 +52,13 @@ pub fn setup() -> anyhow::Result<Vec<PathBuf>> {
     imp::setup()
 }
 
+/// On a Mac set up for it, launchd's re-sign watcher as this kiln writes it. A runner does this
+/// as it starts, so a Mac set up by an older kiln gets what this one knows (each binary's build
+/// kept beside it). Nothing happens when it is already that, or when the Mac isn't set up.
+pub fn keep_watching() {
+    imp::keep_watching();
+}
+
 /// Sign the kiln binary at `path`, in place by a copy renamed over it (a process running it keeps
 /// the old one), as the build it is. `Ok(false)`: no identity.
 pub fn resign(path: &Path) -> anyhow::Result<bool> {
@@ -146,6 +153,8 @@ mod imp {
     pub fn setup() -> anyhow::Result<Vec<PathBuf>> {
         anyhow::bail!("only a Mac needs kiln's own signature: elsewhere upgrades keep their permissions as they are")
     }
+
+    pub fn keep_watching() {}
 }
 
 #[cfg(target_os = "macos")]
@@ -316,8 +325,19 @@ mod imp {
                 signed.push(b);
             }
         }
-        watch().context("have launchd sign kiln again whenever it's replaced")?;
+        watch(true).context("have launchd sign kiln again whenever it's replaced")?;
         Ok(signed)
+    }
+
+    pub fn keep_watching() {
+        if !keychain().exists() || identity().is_none() {
+            return;
+        }
+        match watch(false) {
+            Ok(true) => tracing::info!("kiln signing: launchd's re-sign watcher is up to date with this kiln now"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "kiln signing: couldn't bring launchd's re-sign watcher up to date"),
+        }
     }
 
     const WATCHER: &str = "io.github.hyper-light.kiln-sign";
@@ -325,8 +345,9 @@ mod imp {
     /// A launchd job that signs the installed kiln and its launchers again whenever they're
     /// replaced, by anything: an upgrade by a kiln from before this signs nothing itself, nor does
     /// a build or install by hand. It uses only macOS's own tools, so it works whatever kiln put
-    /// the binary there; one signed with kiln's identity already is left as it is.
-    fn watch() -> anyhow::Result<()> {
+    /// the binary there; one signed with kiln's identity already is left as it is. Unless `force`,
+    /// nothing is done when the job and its script are already these; whether anything was.
+    fn watch(force: bool) -> anyhow::Result<bool> {
         use std::fmt::Write as _;
         let d = dir();
         let bin_dir = crate::install::bin_path(false).parent().map(Path::to_path_buf).unwrap_or_default();
@@ -346,8 +367,14 @@ for f in "{bin}" "{launchers}"/*; do
   case "$f" in *.new.*|*.signing.*|*.kiln-build) continue ;; esac
   /usr/bin/codesign -dvv "$f" 2>&1 | /usr/bin/grep -q "^Authority={name}" && continue
   tmp="$f.signing.$$"
-  /bin/cp -p "$f" "$tmp" && /usr/bin/codesign --force --sign "$id" --keychain "$kc" --identifier {ident} --timestamp=none "$tmp" && /bin/mv -f "$tmp" "$f" && echo "$(/bin/date) signed $f"
-  /bin/rm -f "$tmp"
+  # The build it was handed out as (the start of its SHA-256 before signing), beside it as signed,
+  # so its runner still reports that build (`kiln signing`'s `<binary>.kiln-build`).
+  was=$(/usr/bin/shasum -a 256 "$f" | /usr/bin/cut -c1-12)
+  /bin/cp -p "$f" "$tmp" && /usr/bin/codesign --force --sign "$id" --keychain "$kc" --identifier {ident} --timestamp=none "$tmp" || {{ /bin/rm -f "$tmp"; continue; }}
+  now=$(/usr/bin/shasum -a 256 "$tmp" | /usr/bin/cut -d" " -f1)
+  printf '{{"build":"%s","sha256":"%s"}}' "$was" "$now" > "$f.kiln-build.$$" && /bin/mv -f "$f.kiln-build.$$" "$f.kiln-build"
+  /bin/mv -f "$tmp" "$f" && echo "$(/bin/date) signed $f (build $was)"
+  /bin/rm -f "$tmp" "$f.kiln-build.$$"
 done
 "#,
             kc = keychain().display(),
@@ -357,7 +384,6 @@ done
             launchers = launchers.display(),
             ident = IDENTIFIER,
         );
-        crate::util::write_secret(&script, body.as_bytes(), 0o700)?;
         let log = d.join("resign.log");
         let mut plist = String::new();
         let _ = write!(
@@ -374,13 +400,17 @@ done
             log.display(),
         );
         let agents = crate::os::home_dir().join("Library/LaunchAgents");
-        std::fs::create_dir_all(&agents)?;
         let path = agents.join(format!("{WATCHER}.plist"));
+        if !force && std::fs::read_to_string(&script).is_ok_and(|s| s == body) && std::fs::read_to_string(&path).is_ok_and(|p| p == plist) {
+            return Ok(false);
+        }
+        crate::util::write_secret(&script, body.as_bytes(), 0o700)?;
+        std::fs::create_dir_all(&agents)?;
         std::fs::write(&path, plist)?;
         let domain = format!("gui/{}", crate::os::uid());
         let _ = crate::install::launchctl(&["bootout", &format!("{domain}/{WATCHER}")]);
         crate::install::launchctl(&["bootstrap", &domain, &path.to_string_lossy()]).map_err(anyhow::Error::msg)?;
-        Ok(())
+        Ok(true)
     }
 }
 

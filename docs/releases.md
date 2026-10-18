@@ -112,7 +112,9 @@ and from then on every binary it installs or downloads, all under one identifier
 (`io.github.hyper-light.kiln`). The runner takes up its signed binary, macOS asks once more
 whether kiln may use the local network, and upgrades keep that permission. `kiln signing` says
 whether a machine is set up. A signed binary keeps the build id it was handed out as
-(`<binary>.kiln-build` beside it), so the server knows it for that build.
+(`<binary>.kiln-build` beside it), so the server knows it for that build; launchd's watcher writes it
+too, and each runner brings the watcher up to date with its own kiln as it starts. An upgrade is
+done once the runner reports the commit it was upgraded to, even on a binary signed again since.
 
 Some runners still upgrade as before: those not under a supervisor (`kiln agent` run by hand), and
 Windows runners. On Unix they upgrade in place: the process re-executes itself, keeping its

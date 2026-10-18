@@ -780,6 +780,21 @@ impl Updates {
         self.jobs.lock().iter().any(|j| j.id == id && j.reached)
     }
 
+    /// A runner that reports the commit job `id` brings it to, on a build other than the one it
+    /// ran before, has arrived as well. Its machine signed the build again (a Mac's `kiln
+    /// signing`), which changes its bytes and so the build it reports.
+    pub(crate) fn reached_commit(&self, hub: &Hub, id: &str, machine: &str) {
+        let Some(j) = self.jobs.lock().iter().find(|j| j.id == id && !j.reached && j.commit.is_some()).cloned() else { return };
+        let build = crate::fleet::newest_build(hub, machine);
+        let commit = build.as_deref().and_then(|b| crate::fleet::runner_commit(hub, machine, Some(b)));
+        if let (true, Some(build), Some(commit)) = (arrived_by_commit(&j, build.as_deref(), commit.as_deref()), build, commit) {
+            self.update(hub, id, |j| {
+                j.reached = true;
+                push_line(j, format!("{machine} is running {} (build {build}, signed again on the machine)", crate::fleet::short(&commit)));
+            });
+        }
+    }
+
     /// The upgrade is through: the new build reported in and, on a runner that upgrades
     /// blue/green, the old one said it took over.
     pub(crate) fn through(&self, id: &str) -> bool {
@@ -896,6 +911,13 @@ impl Updates {
     }
 }
 
+/// Whether a runner whose newest process runs `build`, built from `commit`, is where job `j`
+/// brings it: a build other than the one it ran before, of the job's commit.
+fn arrived_by_commit(j: &Job, build: Option<&str>, commit: Option<&str>) -> bool {
+    let (Some(want), Some(build), Some(commit)) = (j.commit.as_deref(), build, commit) else { return false };
+    !j.reached && j.from_build.as_deref() != Some(build) && commit.eq_ignore_ascii_case(want)
+}
+
 fn push_line(j: &mut Job, line: String) {
     // A progress line gives way to the next line (the terminal draws it again after).
     if std::mem::take(&mut j.progress) {
@@ -959,6 +981,8 @@ pub struct RunnerInfo {
     pub next: Option<String>,
     /// How: "download", "build", "wait", "upgrading" (it is), or "left" (left alone).
     pub how: Option<&'static str>,
+    /// The release run it waits for, and how far that is.
+    pub waits_on: Option<crate::fleet::ReleaseRun>,
     /// Its kiln checkout, as it reports it.
     pub checkout: Option<String>,
     /// "native" or "terminal".
@@ -1083,6 +1107,7 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
                 standing: None,
                 next: None,
                 how: None,
+                waits_on: None,
                 checkout: None,
             }
         })
@@ -1105,6 +1130,9 @@ pub async fn runners(hub: &Arc<Hub>) -> Vec<RunnerInfo> {
         if r.connected
             && let Some((how, next)) = crate::fleet::next(hub, r, t, s).await
         {
+            if how == "wait" {
+                r.waits_on = crate::fleet::waits_on(hub, r, t).await;
+            }
             r.how = Some(how);
             r.next = Some(next);
         }
@@ -1208,6 +1236,7 @@ async fn native(hub: &Arc<Hub>, id: &str, machine: &str, b: &Binary) {
         if !u.running(id) {
             return;
         }
+        u.reached_commit(hub, id, machine);
         if u.through(id) {
             u.finish(hub, id, Ok(String::new()));
             return;
@@ -2221,6 +2250,23 @@ mod tests {
         let mut screen = Screen::default();
         assert_eq!(screen.feed("\x1b[2mhello\x1b[0m\r\nworld\x1b]0;title\x07!\n"), [Shown::Line("hello".into()), Shown::Line("world!".into())]);
         assert_eq!(screen.feed("a\x1b]2;t\x1b\\b\n"), [Shown::Line("ab".into())]);
+    }
+
+    #[test]
+    fn a_runner_signed_again_on_its_machine_has_arrived_once_it_reports_the_jobs_commit() {
+        let to = "31c0bbaf734c4b130b43dcfaec93cc647c1ce536";
+        let mut j = new_job("runner", "mac", "native", Some("89cfa54c0577".into()), Some("b8a054982136".into()));
+        j.commit = Some(to.into());
+        // Still the build it ran before: not yet, whatever commit it says.
+        assert!(!arrived_by_commit(&j, Some("89cfa54c0577"), Some(to)));
+        // Another build (its machine signed the new one again) of the job's commit: arrived.
+        assert!(arrived_by_commit(&j, Some("46a3145906a2"), Some(&to.to_ascii_uppercase())));
+        // Another commit, or none known: not.
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), Some("561a240d637481421c8a402205027de71b100b2e")));
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), None));
+        // A job that doesn't know its commit waits for its build to be reported.
+        j.commit = None;
+        assert!(!arrived_by_commit(&j, Some("46a3145906a2"), Some(to)));
     }
 
     #[test]
