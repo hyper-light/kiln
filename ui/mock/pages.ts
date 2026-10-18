@@ -18,6 +18,7 @@ import type {
   CdPlan,
   CdPlanRepo,
   CdResourceDetail,
+  CdRollout,
   CdSummary,
   CdSync,
   CdTree,
@@ -55,6 +56,7 @@ interface MockApp {
   app: CdApp;
   detail: CdAppDetail;
   history: CdDeployment[];
+  rollouts?: CdRollout[];
 }
 
 const apps = new Map<string, MockApp>();
@@ -144,6 +146,141 @@ const apps = new Map<string, MockApp>();
       apps.set(id, { app, detail, history });
     }
   }
+}
+
+// Two Lambda apps with rollouts: one ramping with an approval waiting, one aborted by a failing check.
+{
+  const at = Date.now();
+  const lambda = (name: string, health: CdHealth, rollouts: CdRollout[], message: string | null) => {
+    const id = `default/${name}`;
+    const revision = hashStr(name).toString(16).padStart(8, "0").repeat(5);
+    const app: CdApp = {
+      app: id,
+      name,
+      project: "default",
+      cluster: "aws-lambda/aws-prod/us-east-1",
+      namespace: "",
+      environment: "production",
+      auto: true,
+      labels: {},
+      origin: { kind: "deploy", repo: "https://github.com/hyper-light/thumbs" },
+      shadow: false,
+      sync: "Synced",
+      health,
+      revision,
+      resources: 3,
+      out_of_sync: 0,
+      shared: 0,
+      missing: 0,
+      unmarked: 0,
+      prune: 0,
+      message,
+      operation: { id: 12, phase: "Succeeded", trigger: "auto", attempt: 1, message: "successfully synced (all tasks run)", by: null, started_ms: at - 300_000, finished_ms: at - 290_000 },
+      pinned: null,
+    };
+    const detail: CdAppDetail = {
+      ...app,
+      definition: { sources: [{ repo: "https://github.com/hyper-light/thumbs", path: ".kiln/deploy.yaml", revision: "main", chart: null, as_ref: null }], sync: { auto: true, prune: true, self_heal: true, allow_empty: false } },
+      commits: [revision],
+      children: [],
+      revision_info: { sha: revision, author: "ada", email: "dev@example.com", at_ms: at - 360_000, subject: "Resize thumbnails in WebP", body: "" },
+    };
+    apps.set(id, { app, detail, history: [], rollouts });
+  };
+  const run = (name: string, against: "preview" | "production", passed: number, failed: number, verdict: CdRollout["checks"][number]["verdict"], why = "", asked = false) => ({
+    name,
+    against,
+    measurements: [...Array(passed).fill("pass"), ...Array(failed).fill("fail")].map((v, i) => ({ at_ms: at - (passed + failed - i) * 20_000, verdict: v, value: { status: v === "pass" ? 200 : 503 }, message: v === "pass" ? "" : "503 from /healthz" })),
+    tally: { passed, failed, inconclusive: 0, errors: 0, streak: passed, errors_in_a_row: 0 },
+    asked: asked ? { id: 9, at_ms: at - 2_000 } : null,
+    next_ms: at + 20_000,
+    verdict,
+    why,
+    timing: { count: 5, every_ms: 20_000, dry_run: false },
+  });
+  const steps: CdRollout["steps"] = [
+    { step: "checks", names: ["smoke"], against: "preview", parallel: true },
+    { step: "weight", weight: 10 },
+    { step: "checks", names: ["errors", "release-ok"], against: "production", parallel: true },
+    { step: "weight", weight: 50 },
+    { step: "pause", ms: 300_000 },
+    { step: "weight", weight: 100 },
+    { step: "watch", names: ["errors"], window_ms: 600_000 },
+  ];
+  lambda(
+    "thumbs-production",
+    "Progressing",
+    [
+      {
+        id: "aws-lambda/aws-prod/us-east-1|lambda.aws.kiln.dev/Alias//thumbs:live",
+        target: "aws-lambda/aws-prod/us-east-1",
+        kind: "Alias",
+        name: "thumbs:live",
+        revision: "9c1e4f2a7b3d",
+        previous_revision: "41d0b7e3c2aa",
+        back_to: 11,
+        blue: "41",
+        green: "42",
+        preview_url: "https://thumbs-live-preview.lambda-url.us-east-1.on.aws/",
+        started_ms: at - 240_000,
+        updated_ms: at - 2_000,
+        status: { state: "running", why: "", held: false, weight: 10, target: 10, step: 3, steps: 7, waiting: "" },
+        steps,
+        step: 2,
+        auto_rollback: true,
+        ready: true,
+        checks: [run("errors", "production", 3, 0, null, "", true), run("release-ok", "production", 0, 0, null, "", true)],
+        watching: [],
+        log: [
+          { event: "read", at_ms: at - 238_000, from: 0, to: 0 },
+          { event: "ready", at_ms: at - 236_000 },
+          { event: "checked", at_ms: at - 200_000, step: 0, background: false, check: { name: "smoke", verdict: "pass" } },
+          { event: "moved", at_ms: at - 190_000, weight: 10 },
+        ],
+        dropped: 0,
+        waiting: ["release-ok"],
+      },
+    ],
+    null,
+  );
+  lambda(
+    "refunds-production",
+    "Degraded",
+    [
+      {
+        id: "aws-lambda/aws-prod/us-east-1|lambda.aws.kiln.dev/Alias//refunds:live",
+        target: "aws-lambda/aws-prod/us-east-1",
+        kind: "Alias",
+        name: "refunds:live",
+        revision: "77ab90de1c43",
+        previous_revision: "5e2f0a9b8c11",
+        back_to: 7,
+        blue: "17",
+        green: "18",
+        preview_url: null,
+        started_ms: at - 900_000,
+        updated_ms: at - 600_000,
+        status: { state: "aborted", why: "check errors failed 2 times (limit 1)", held: false, weight: 0, target: 0, step: 3, steps: 7, waiting: "" },
+        steps,
+        step: 2,
+        auto_rollback: false,
+        ready: true,
+        checks: [],
+        watching: [],
+        log: [
+          { event: "moved", at_ms: at - 700_000, weight: 10 },
+          { event: "measured", at_ms: at - 660_000, check: "errors", n: 2, verdict: "fail", message: "503 from /healthz", decided: "fail" },
+          { event: "aborted", at_ms: at - 660_000, why: "check errors failed 2 times (limit 1)", step: 2 },
+          { event: "moved", at_ms: at - 655_000, weight: 0 },
+          { event: "reverted", at_ms: at - 655_000 },
+          { event: "released", at_ms: at - 600_000, version: "green" },
+        ],
+        dropped: 0,
+        waiting: [],
+      },
+    ],
+    "rollout aborted: check errors failed 2 times (limit 1)",
+  );
 }
 
 function listApps(q: URLSearchParams) {
@@ -796,6 +933,7 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
     if (rest === "") return (void json(res, 200, a.detail), true);
     if (rest === "/tree") return (void json(res, 200, tree(id)), true);
     if (rest === "/history") return (void json(res, 200, { history: a.history }), true);
+    if (rest === "/rollout") return (void json(res, 200, { app: id, rollouts: a.rollouts ?? [] }), true);
     if (rest === "/diff") return (void json(res, 200, { diffs: diffOf(id) }), true);
     if (rest === "/resources") return (void json(res, 200, { resources: [] }), true);
     let rm: RegExpMatchArray | null;

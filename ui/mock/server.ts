@@ -21,7 +21,7 @@ import { AUTHORS, REPOS, commitMessage, hashStr, mockDirList, mulberry32, pick, 
 import { handleAccounts, handleDemoSession, setDemoEmit } from "./accounts.ts";
 import { handlePages } from "./pages.ts";
 import { handlePlaces } from "./places.ts";
-import { handleLongSession, setLongEmit } from "./conversation.ts";
+import { handleLongSession, searchSaid, setLongEmit } from "./conversation.ts";
 import {
   AUTOJOIN,
   DNS_SD_DOMAINS,
@@ -112,8 +112,9 @@ const children: Child[] = [
   { name: "raft", state: "finished", restarts: 0, last_error: null, since_unix: now() - 86_000 },
 ];
 
+let auditSeq = 0;
 function addAudit(actor: string, action: string, detail: string) {
-  audit.unshift({ ts: now(), actor, action, detail });
+  audit.unshift({ id: ++auditSeq, ts: now(), principal: actor, on_behalf_of: null, token: null, scope: null, action, target: null, result: "ok", ip: null, detail, actor });
   if (audit.length > 500) audit.length = 500;
 }
 
@@ -1391,6 +1392,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- agents ----
+    if (p === "/api/conversations/search" && m === "GET") {
+      const q = url.searchParams;
+      return json(res, 200, { hits: searchSaid(q.get("q") ?? "", q.get("agent"), q.has("until") ? Number(q.get("until")) : null, Number(q.get("limit") ?? 100)) });
+    }
     if (p === "/api/agents" && m === "GET") return json(res, 200, [...agents.values()]);
     if (p === "/api/agents/join" && m === "GET") {
       planAutojoin();

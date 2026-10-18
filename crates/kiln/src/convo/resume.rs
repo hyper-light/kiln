@@ -52,7 +52,7 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
             let conv = crate::harness::handoff::codex_of_lines(&files, own).ok_or_else(|| anyhow::anyhow!("the server has no copy of Codex's record of this thread (its machine never sent it)"))?;
             Ok(Carry::Seed { items: crate::harness::handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))) })
         }
-        Protocol::Acp(_) | Protocol::Terminal => anyhow::bail!("{}'s sessions can't go on on another machine yet", kind.name),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => anyhow::bail!("{}'s sessions can't go on on another machine yet", kind.name),
     }
 }
 

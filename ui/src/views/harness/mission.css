@@ -284,6 +284,75 @@
 .ms-fold-btn[aria-expanded="true"] .ms-chev {
   transform: rotate(90deg);
 }
+/* ---------------------------------------------------------------- found in conversations */
+.ms-said {
+  margin-top: 28px;
+}
+.ms-said-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid #2b2d32;
+}
+.ms-said-hit {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 8px;
+  border-bottom: 1px solid #1d1f23;
+  color: inherit;
+}
+a.ms-said-hit:hover {
+  background: #111215;
+}
+.ms-said-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.ms-said-name {
+  overflow: hidden;
+  color: #ededee;
+  font-size: 13.5px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ms-said-meta {
+  flex: none;
+  color: #8f939e;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ms-said-text {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #b4b6bd;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.ms-said-text mark {
+  border-radius: 2px;
+  background: rgb(198 176 142 / 26%);
+  color: inherit;
+}
+.ms-said-gone .ms-said-name {
+  color: #a1a3ab;
+}
+.ms-said-more {
+  margin: 10px 8px 0;
+}
+@media (max-width: 560px) {
+  .ms-said-head {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+}
 /* ---------------------------------------------------------------- found on your machines */
 .ms-found {
   margin-top: 28px;

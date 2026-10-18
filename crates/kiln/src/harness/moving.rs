@@ -78,7 +78,7 @@ pub fn record(protocol: &Protocol, env: &[(String, String)], session: Option<&st
             let conv = super::handoff::read_codex(env, session).ok_or_else(|| format!("Codex's record of thread {session} is not on this machine"))?;
             Ok(Carry::Seed { items: super::handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))) })
         }
-        Protocol::Acp(_) | Protocol::Terminal => Err("this harness's sessions can't move between machines yet".into()),
+        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::Terminal => Err("this harness's sessions can't move between machines yet".into()),
     }
 }
 

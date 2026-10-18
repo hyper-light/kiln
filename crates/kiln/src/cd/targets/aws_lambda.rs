@@ -13,6 +13,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use kiln_cd::obj::{self, ResKey};
 use kiln_cd::providers::aws_lambda::{self as p, CodeSource, GROUP, PUBLISHED};
+use kiln_cd::rollout::State;
+use kiln_cd::state::RolloutRecord;
 use serde_json::{Value, json};
 
 use super::{Cx, applied, until};
@@ -85,7 +87,30 @@ async fn alias(cx: &Cx<'_>, function: &str, name: &str) -> Result<Option<Value>>
         Err(e) => return Err(e),
     };
     let newest = published(cx, function).await?;
-    Ok(p::live_alias(function, &answer, newest.as_deref()))
+    let Some(live) = p::live_alias(function, &answer, newest.as_deref()) else { return Ok(None) };
+    Ok(Some(match cx.rollout(GROUP, "Alias", "", &format!("{function}:{name}")) {
+        Some(r) if presents(&r, &answer, newest.as_deref()) => p::overlay(live, &r.object, &r.rollout.summary()),
+        _ => live,
+    }))
+}
+
+/// Whether an alias reads as its rollout presents it (§5): the rollout moves traffic to the
+/// version the alias is to serve, and steers it, or aborted and holds all of it on blue.
+/// Otherwise the alias reads as it is, so traffic moved by hand reads as drift.
+fn presents(r: &RolloutRecord, answer: &Value, newest: Option<&str>) -> bool {
+    let want = r.object.pointer("/spec/FunctionVersion").and_then(Value::as_str).unwrap_or(PUBLISHED);
+    let want = if want == PUBLISHED { newest } else { Some(want) };
+    if want.is_none() || r.green.as_str() != want {
+        return false;
+    }
+    let all_on_blue = || {
+        answer.get("FunctionVersion") == Some(&r.blue) && answer.pointer("/RoutingConfig/AdditionalVersionWeights").and_then(Value::as_object).is_none_or(|w| w.is_empty())
+    };
+    match r.rollout.state {
+        State::Running | State::Paused { .. } => true,
+        State::Aborted { .. } | State::Superseded { .. } => !r.rollout.reverted || all_on_blue(),
+        State::Succeeded => false,
+    }
 }
 
 async fn url(cx: &Cx<'_>, function: &str, qualifier: &str) -> Result<Option<Value>> {
@@ -360,6 +385,184 @@ async fn apply_url(cx: &Cx<'_>, desired: &Value) -> Result<Value> {
     url(cx, function, qualifier).await?.ok_or_else(|| anyhow::anyhow!("the URL of {function}:{qualifier} is gone"))
 }
 
+// ---------------------------------------------------------------- rollouts (docs/cd-targets.md §5)
+
+/// The alias green's preview is: `<alias>-preview`.
+pub fn preview_alias(alias: &str) -> String {
+    format!("{alias}-preview")
+}
+
+/// Where a rollout of an alias starts.
+pub struct Staged {
+    /// The version the alias serves now; none when there's no alias yet (a first deploy).
+    pub blue: Option<String>,
+    /// The version it is to serve.
+    pub green: String,
+    /// Green runs what blue does, code and configuration: moving traffic changes nothing.
+    pub same: bool,
+}
+
+async fn get_alias(cx: &Cx<'_>, function: &str, alias: &str) -> Result<Option<Value>> {
+    cx.conn.budget().await;
+    match cx.aws()?.rest("lambda", Method::Get, &format!("{}/aliases/{}", function_path(function), encode(alias, false)), &[], None).await {
+        Ok(a) => Ok(Some(a)),
+        Err(e) if AwsError::is_not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A version's configuration, as published.
+async fn version(cx: &Cx<'_>, function: &str, v: &str) -> Result<Option<Value>> {
+    cx.conn.budget().await;
+    match cx.aws()?.rest("lambda", Method::Get, &function_path(function), &[("Qualifier".to_owned(), v.to_owned())], None).await {
+        Ok(a) => Ok(a.get("Configuration").cloned()),
+        Err(e) if AwsError::is_not_found(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// What a rollout of `desired` (an Alias) starts from.
+pub async fn stage(cx: &Cx<'_>, desired: &Value) -> Result<Staged> {
+    let (function, alias) = split(obj::name(desired))?;
+    let want = desired.pointer("/spec/FunctionVersion").and_then(Value::as_str).unwrap_or(PUBLISHED);
+    let green = if want == PUBLISHED {
+        published(cx, function).await?.ok_or_else(|| anyhow::anyhow!("function {function} has no published version yet: apply the function first"))?
+    } else {
+        want.to_owned()
+    };
+    let blue = get_alias(cx, function, alias).await?.and_then(|a| a.get("FunctionVersion").and_then(Value::as_str).map(str::to_owned));
+    let same = match &blue {
+        Some(b) if *b == green => true,
+        Some(b) => match (version(cx, function, b).await?, version(cx, function, &green).await?) {
+            (Some(x), Some(y)) => p::same_version(&x, &y),
+            _ => false,
+        },
+        None => false,
+    };
+    Ok(Staged { blue, green, same })
+}
+
+/// The alias's own function URL, if it has one.
+pub async fn alias_url(cx: &Cx<'_>, function: &str, alias: &str) -> Result<Option<String>> {
+    Ok(url(cx, function, alias).await?.and_then(|u| u.pointer("/status/FunctionUrl").and_then(Value::as_str).map(str::to_owned)))
+}
+
+/// Green's own address while it rolls out: an alias of its own on green, with a function URL
+/// like the alias's when the alias has one. Its URL, if it has one.
+pub async fn preview(cx: &Cx<'_>, function: &str, alias: &str, green: &str) -> Result<Option<String>> {
+    let aws = cx.aws()?;
+    let name = preview_alias(alias);
+    let path = format!("{}/aliases", function_path(function));
+    let body = json!({ "FunctionVersion": green, "RoutingConfig": { "AdditionalVersionWeights": {} }, "Description": format!("kiln: version {green} while it rolls out to {alias}") });
+    match get_alias(cx, function, &name).await? {
+        Some(a) => {
+            let mut b = body.clone();
+            if let (Value::Object(m), Some(r)) = (&mut b, a.get("RevisionId")) {
+                m.insert("RevisionId".into(), r.clone());
+            }
+            cx.conn.budget().await;
+            aws.rest("lambda", Method::Put, &format!("{path}/{}", encode(&name, false)), &[], Some(&b)).await?;
+        }
+        None => {
+            let mut b = body.clone();
+            if let Value::Object(m) = &mut b {
+                m.insert("Name".into(), Value::String(name.clone()));
+            }
+            cx.conn.budget().await;
+            aws.rest("lambda", Method::Post, &path, &[], Some(&b)).await?;
+        }
+    }
+    // A URL like the alias's, if it has one.
+    let Some(main) = url(cx, function, alias).await? else { return Ok(None) };
+    let spec = main.get("spec").cloned().unwrap_or(Value::Null);
+    let cfg: serde_json::Map<String, Value> = ["AuthType", "Cors", "InvokeMode"].iter().filter_map(|k| spec.get(*k).map(|v| ((*k).to_owned(), v.clone()))).collect();
+    let q = [("Qualifier".to_owned(), name.clone())];
+    let upath = format!("{URLS}/{}/url", encode(function, false));
+    let exists = url(cx, function, &name).await?.is_some();
+    cx.conn.budget().await;
+    aws.rest("lambda", if exists { Method::Put } else { Method::Post }, &upath, &q, Some(&Value::Object(cfg.clone()))).await?;
+    if cfg.get("AuthType").and_then(Value::as_str) == Some("NONE") {
+        let statement = json!({ "StatementId": "kiln-function-url-preview", "Action": "lambda:InvokeFunctionUrl", "Principal": "*", "FunctionUrlAuthType": "NONE" });
+        cx.conn.budget().await;
+        match aws.rest("lambda", Method::Post, &format!("{}/policy", function_path(function)), &q, Some(&statement)).await {
+            Ok(_) => {}
+            Err(e) if e.downcast_ref::<AwsError>().is_some_and(|a| a.code == "ResourceConflictException") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(url(cx, function, &name).await?.and_then(|u| u.pointer("/status/FunctionUrl").and_then(Value::as_str).map(str::to_owned)))
+}
+
+/// Green's share of an alias's traffic, as a percentage ([`kiln_cd::rollout::FOREIGN`] when
+/// some goes to a version neither blue nor green), whether green can take traffic, and why not.
+pub async fn observe(cx: &Cx<'_>, function: &str, alias: &str, blue: &str, green: &str) -> Result<(Option<u8>, bool, String)> {
+    let a = get_alias(cx, function, alias).await?.ok_or_else(|| anyhow::anyhow!("alias {function}:{alias} is gone"))?;
+    let primary = a.get("FunctionVersion").and_then(Value::as_str).unwrap_or_default();
+    let weights: Vec<(String, f64)> = a
+        .pointer("/RoutingConfig/AdditionalVersionWeights")
+        .and_then(Value::as_object)
+        .map(|w| w.iter().map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0))).collect())
+        .unwrap_or_default();
+    let others: f64 = weights.iter().map(|(_, w)| w).sum();
+    let share = |v: &str| (if primary == v { 1.0 - others } else { 0.0 }) + weights.iter().filter(|(k, _)| k == v).map(|(_, w)| w).sum::<f64>();
+    let (g, b) = (share(green), share(blue));
+    let weight = if (g + b - 1.0).abs() > 0.005 { kiln_cd::rollout::FOREIGN } else { (g * 100.0).round().clamp(0.0, 100.0) as u8 };
+    let (ready, why) = match version(cx, function, green).await? {
+        None => (false, format!("version {green} is gone")),
+        Some(c) => {
+            let st = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+            match (st("State").as_str(), st("LastUpdateStatus").as_str()) {
+                ("Active" | "Inactive" | "", "Successful" | "") => (true, String::new()),
+                ("Failed", _) => (false, format!("version {green} failed: {} {}", st("StateReasonCode"), st("StateReason"))),
+                (_, "Failed") => (false, format!("version {green}'s update failed: {} {}", st("LastUpdateStatusReasonCode"), st("LastUpdateStatusReason"))),
+                (s, u) => (false, format!("version {green} is {s}{}", if u.is_empty() || u == "Successful" { String::new() } else { format!(", its update {u}") })),
+            }
+        }
+    };
+    Ok((Some(weight), ready, why))
+}
+
+/// Gives green `weight`% of the alias's traffic (0: blue has it all; 100: green has, and blue is
+/// kept to go back to), on the alias as Lambda has it now (its RevisionId), then reads it back.
+pub async fn shift(cx: &Cx<'_>, function: &str, alias: &str, blue: &str, green: &str, weight: u8) -> Result<()> {
+    let a = get_alias(cx, function, alias).await?.ok_or_else(|| anyhow::anyhow!("alias {function}:{alias} is gone"))?;
+    let mut body = match weight {
+        0 => json!({ "FunctionVersion": blue, "RoutingConfig": { "AdditionalVersionWeights": {} } }),
+        100.. => json!({ "FunctionVersion": green, "RoutingConfig": { "AdditionalVersionWeights": {} } }),
+        w => json!({ "FunctionVersion": blue, "RoutingConfig": { "AdditionalVersionWeights": { green: f64::from(w) / 100.0 } } }),
+    };
+    if let (Value::Object(m), Some(r)) = (&mut body, a.get("RevisionId")) {
+        m.insert("RevisionId".into(), r.clone());
+    }
+    cx.conn.budget().await;
+    cx.aws()?
+        .rest("lambda", Method::Put, &format!("{}/aliases/{}", function_path(function), encode(alias, false)), &[], Some(&body))
+        .await
+        .map_err(|e| changed_meanwhile(e, &format!("alias {function}:{alias}")))?;
+    let (got, _, _) = observe(cx, function, alias, blue, green).await?;
+    if got != Some(weight.min(100)) {
+        bail!("alias {function}:{alias} gives version {green} {}% of its traffic, not {weight}%", got.map_or("an unknown share".into(), |g| g.to_string()));
+    }
+    Ok(())
+}
+
+/// Lets go of what a rollout made beside the alias: green's preview alias and its URL. Versions
+/// stay (they cost nothing, and a rollback goes back to one).
+pub async fn release(cx: &Cx<'_>, function: &str, alias: &str) -> Result<()> {
+    let aws = cx.aws()?;
+    let name = preview_alias(alias);
+    let q = [("Qualifier".to_owned(), name.clone())];
+    for (path, query) in [(format!("{URLS}/{}/url", encode(function, false)), &q[..]), (format!("{}/aliases/{}", function_path(function), encode(&name, false)), &[][..])] {
+        cx.conn.budget().await;
+        match aws.rest("lambda", Method::Delete, &path, query, None).await {
+            Ok(_) => {}
+            Err(e) if AwsError::is_not_found(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub async fn delete(cx: &Cx<'_>, key: &ResKey) -> Result<()> {
     let aws = cx.aws()?;
     let name: &str = &key.name;
@@ -408,6 +611,7 @@ mod tests {
     /// URL with its permission; then deleted.
     #[test]
     fn functions_publish_and_aliases_follow() -> anyhow::Result<()> {
+        let _one = fake::LAMBDA.lock();
         crate::rt::block_on(async {
             let fake = Arc::new(Fake::default());
             let base = fake::start(fake.clone()).await?;
