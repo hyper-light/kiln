@@ -29,6 +29,7 @@ pub mod logs;
 pub mod mcp;
 pub mod metrics;
 pub mod net;
+pub mod observe;
 pub mod os;
 pub mod password;
 pub mod pipeline;

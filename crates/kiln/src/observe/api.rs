@@ -1,0 +1,310 @@
+//! The observe API (`docs/observe.md` §7): JSON under `/api/observe/v1/`, what kiln's UI uses and
+//! any client may. Queries are answered by this node's replica, as fresh as it applied, which every
+//! answer states (`applied`); they run on the blocking pool under the store's read lock.
+
+use std::collections::HashMap;
+use std::sync::{OnceLock, PoisonError};
+
+use http::{Method, StatusCode, header};
+use hyper::body::Incoming;
+use kiln_obs::batch::{Kind, SeriesKey};
+use kiln_obs::logs::record::Record;
+use kiln_obs::query::eval::{self, Request as QueryRequest};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use super::Observe;
+use crate::http::server::{self as srv, Request, Response};
+
+pub type Fail = (StatusCode, String);
+
+/// The node's group, once it started.
+static OBSERVE: OnceLock<Observe> = OnceLock::new();
+
+pub fn set_global(o: Observe) {
+    let _ = OBSERVE.set(o);
+}
+
+pub fn get() -> Option<&'static Observe> {
+    OBSERVE.get()
+}
+
+/// A request's body, at the most: a query's text is 8,000 bytes (`kiln_obs::query::lex`), an
+/// ingest's points a few MB.
+const QUERY_BODY: usize = 64 << 10;
+const INGEST_BODY: usize = 16 << 20;
+/// Names and values a listing gives, at the most.
+const LIST: usize = 10_000;
+/// Log records a search gives, at the most.
+const LOGS_MAX: usize = 1_000;
+
+fn fail(code: StatusCode, why: impl std::fmt::Display) -> Fail {
+    (code, why.to_string())
+}
+
+fn observe() -> Result<&'static Observe, Fail> {
+    get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe is starting"))
+}
+
+fn shared() -> Result<kiln_obs::machine::Shared, Fail> {
+    observe()?.store().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "observe's store is not open yet"))
+}
+
+async fn read_json<T: serde::de::DeserializeOwned>(body: Incoming, limit: usize) -> Result<T, Fail> {
+    srv::body_json(body, limit).await.map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{e:#}")))
+}
+
+/// Runs `f` on the store under its read lock, on the blocking pool.
+async fn reading<R: Send + 'static>(f: impl FnOnce(&kiln_obs::store::Store) -> Result<R, Fail> + Send + 'static) -> Result<R, Fail> {
+    let store = shared()?;
+    crate::rt::blocking(move || {
+        let s = store.read().unwrap_or_else(PoisonError::into_inner);
+        f(&s)
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+}
+
+/// The authenticated routes, under `/api/observe/v1/`.
+pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
+    let method = req.method().clone();
+    match (&method, rest) {
+        (&Method::POST, ["query"]) => query(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::GET, ["query"]) => {
+            let body = QueryBody { query: q.get("query").cloned().unwrap_or_default(), from: num(q, "from")?, to: num(q, "to")?, step: q.get("step").map(|s| s.parse()).transpose().map_err(|_| fail(StatusCode::BAD_REQUEST, "step"))?, points: None, max_series: None };
+            query(body).await
+        }
+        (&Method::GET, ["metrics"]) => {
+            let pattern = q.get("match").cloned();
+            let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(LIST).min(LIST);
+            reading(move |s| {
+                let names: Vec<&str> = s.metric_names().into_iter().filter(|n| pattern.as_deref().is_none_or(|p| kiln_obs::index::glob(p, n))).take(limit).collect();
+                Ok(srv::json(StatusCode::OK, &json!({ "metrics": names })))
+            })
+            .await
+        }
+        (&Method::GET, ["tags"]) => {
+            let key = q.get("key").cloned().ok_or_else(|| fail(StatusCode::BAD_REQUEST, "which tag: ?key="))?;
+            let pattern = q.get("match").cloned();
+            let limit = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(LIST).min(LIST);
+            reading(move |s| {
+                let values: Vec<&str> = s.tag_values(&key).into_iter().filter(|v| pattern.as_deref().is_none_or(|p| kiln_obs::index::glob(p, v))).take(limit).collect();
+                Ok(srv::json(StatusCode::OK, &json!({ "key": key, "values": values })))
+            })
+            .await
+        }
+        (&Method::POST, ["logs", "search"]) => search(read_json(req.into_body(), QUERY_BODY).await?).await,
+        (&Method::GET, ["status"]) => Ok(srv::json(StatusCode::OK, &observe()?.view())),
+        (&Method::POST, ["series"]) => ingest_series(read_json(req.into_body(), INGEST_BODY).await?),
+        (&Method::POST, ["logs"]) => ingest_logs(read_json(req.into_body(), INGEST_BODY).await?),
+        _ => Err(fail(StatusCode::NOT_FOUND, "no such observe route")),
+    }
+}
+
+fn num(q: &HashMap<String, String>, k: &str) -> Result<i64, Fail> {
+    q.get(k).ok_or_else(|| fail(StatusCode::BAD_REQUEST, format!("?{k}= (ms since the epoch)")))?.parse().map_err(|_| fail(StatusCode::BAD_REQUEST, k))
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryBody {
+    query: String,
+    /// Milliseconds since the epoch.
+    from: i64,
+    to: i64,
+    #[serde(default)]
+    step: Option<i64>,
+    #[serde(default)]
+    points: Option<usize>,
+    #[serde(default)]
+    max_series: Option<usize>,
+}
+
+async fn query(body: QueryBody) -> Result<Response, Fail> {
+    reading(move |s| {
+        let started = std::time::Instant::now();
+        let mut r = QueryRequest::new(&body.query, body.from, body.to);
+        r.step = body.step;
+        if let Some(p) = body.points {
+            r.points = p.clamp(1, eval::MAX_POINTS);
+        }
+        if let Some(m) = body.max_series {
+            r.max_series = m.clamp(1, eval::DEFAULT_MAX_SERIES);
+        }
+        let a = eval::eval(s, &r).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let series: Vec<Value> = a.series.iter().map(|x| json!({ "tags": x.tags.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(), "values": x.values })).collect();
+        Ok(srv::json(
+            StatusCode::OK,
+            &json!({
+                "grid": { "from": a.grid.from, "step": a.grid.step, "n": a.grid.n },
+                "series": series,
+                "scalar": a.scalar,
+                "scanned": { "series": a.scanned_series, "samples": a.scanned_samples },
+                "applied": s.durable().index,
+                "took_ms": started.elapsed().as_secs_f64() * 1000.0,
+            }),
+        ))
+    })
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchBody {
+    #[serde(default)]
+    query: String,
+    /// Milliseconds since the epoch.
+    from: i64,
+    to: i64,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn search(body: SearchBody) -> Result<Response, Fail> {
+    reading(move |s| {
+        let started = std::time::Instant::now();
+        let parsed = kiln_obs::logs::search::parse(&body.query).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+        let ns = |ms: i64| ms.saturating_mul(1_000_000);
+        let found = s.search_logs(&parsed, ns(body.from), ns(body.to).saturating_add(999_999), body.limit.unwrap_or(100).clamp(1, LOGS_MAX)).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let records: Vec<Value> = found
+            .records
+            .iter()
+            .map(|r| {
+                json!({
+                    "ts_ns": r.ts,
+                    "status": kiln_obs::logs::record::level(r.severity),
+                    "severity": r.severity,
+                    "service": r.service,
+                    "host": r.host,
+                    "source": r.source,
+                    "message": r.message,
+                    "attributes": r.attrs.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect::<serde_json::Map<_, _>>(),
+                    "trace_id": r.trace_id.map(hex),
+                    "span_id": r.span_id.map(hex),
+                })
+            })
+            .collect();
+        Ok(srv::json(
+            StatusCode::OK,
+            &json!({
+                "records": records,
+                "blocks": { "total": found.blocks_total, "pruned": found.blocks_pruned },
+                "rows_scanned": found.rows_scanned,
+                "took_ms": started.elapsed().as_secs_f64() * 1000.0,
+            }),
+        ))
+    })
+    .await
+}
+
+fn hex<const N: usize>(b: [u8; N]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Points as Datadog's series API takes them (v1): a metric, its type, its tags as `key:value`
+/// (or an object), and points of `[seconds since the epoch, value]`.
+#[derive(Debug, Deserialize)]
+struct SeriesBody {
+    series: Vec<SeriesIn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeriesIn {
+    metric: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    tags: Option<Value>,
+    #[serde(default)]
+    host: Option<String>,
+    points: Vec<(f64, f64)>,
+}
+
+fn tags_of(v: Option<&Value>, host: Option<&str>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = match v {
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(|t| t.split_once(':').map_or((t.to_owned(), String::new()), |(k, v)| (k.to_owned(), v.to_owned()))).collect(),
+        Some(Value::Object(o)) => o.iter().map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect(),
+        _ => Vec::new(),
+    };
+    if let Some(h) = host {
+        out.push(("host".into(), h.to_owned()));
+    }
+    out
+}
+
+fn ingest_series(body: SeriesBody) -> Result<Response, Fail> {
+    let o = observe()?;
+    let mut series = Vec::with_capacity(body.series.len());
+    let mut points = 0usize;
+    for s in body.series {
+        let kind = match s.kind.as_deref() {
+            Some("count") => Kind::Count,
+            Some("counter") => Kind::Counter,
+            Some("gauge" | "rate") | None => Kind::Gauge,
+            Some(other) => return Err(fail(StatusCode::BAD_REQUEST, format!("a series of type {other:?}: gauge, count, rate or counter"))),
+        };
+        let tags = tags_of(s.tags.as_ref(), s.host.as_deref());
+        let key = SeriesKey::new(&s.metric, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), kind).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{}: {e}", s.metric)))?;
+        #[allow(clippy::cast_possible_truncation)]
+        let p: Vec<(i64, f64)> = s.points.iter().filter(|(t, v)| t.is_finite() && v.is_finite()).map(|(t, v)| ((t * 1000.0) as i64, *v)).collect();
+        points += p.len();
+        series.push((key, p));
+    }
+    o.write(series);
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "points": points })))
+}
+
+/// Log records: a message, and what Datadog's intake takes beside it.
+#[derive(Debug, Deserialize)]
+struct LogIn {
+    message: String,
+    /// Milliseconds since the epoch; now when none.
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default, alias = "ddsource")]
+    source: Option<String>,
+    #[serde(default)]
+    attributes: Option<serde_json::Map<String, Value>>,
+}
+
+fn ingest_logs(body: Vec<LogIn>) -> Result<Response, Fail> {
+    let o = observe()?;
+    let now = crate::util::now_ms();
+    let n = body.len();
+    let records: Vec<Record> = body
+        .into_iter()
+        .map(|l| Record {
+            ts: l.timestamp.unwrap_or(now).saturating_mul(1_000_000),
+            severity: l.status.as_deref().and_then(kiln_obs::logs::record::severities).map_or(9, |r| *r.start()),
+            service: l.service.unwrap_or_default(),
+            host: l.hostname.unwrap_or_default(),
+            source: l.source.unwrap_or_default(),
+            message: l.message,
+            attrs: l.attributes.unwrap_or_default().into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned))).collect(),
+            trace_id: None,
+            span_id: None,
+        })
+        .collect();
+    o.log(records);
+    Ok(srv::json(StatusCode::ACCEPTED, &json!({ "records": n })))
+}
+
+/// `GET /api/observe/v1/snapshot/{snapshot}/{file}?machine=`: a snapshot's file for the machine
+/// whose member fetches it, with that machine's token.
+pub fn snapshot(snapshot: &str, file: &str, req: &Request) -> Result<Response, Fail> {
+    let o = observe()?;
+    let machine = srv::query(req).get("machine").cloned().unwrap_or_default();
+    let given = srv::header_str(req, &header::AUTHORIZATION).and_then(|h| h.strip_prefix("Bearer ")).unwrap_or("");
+    let want = o.token(&machine).ok_or_else(|| fail(StatusCode::NOT_FOUND, "this node serves no snapshots"))?;
+    if machine.is_empty() || !crate::util::ct_eq(given.as_bytes(), want.as_bytes()) {
+        return Err(fail(StatusCode::UNAUTHORIZED, "bad observe token"));
+    }
+    let path = o.snapshot_file(snapshot, file).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such snapshot file"))?;
+    let body = crate::rt::file_source(path).map_err(|_| fail(StatusCode::NOT_FOUND, "no such snapshot file"))?;
+    Ok(srv::response(StatusCode::OK, "application/octet-stream", srv::channel_body(body)))
+}
+
