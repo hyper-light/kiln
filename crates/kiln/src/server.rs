@@ -159,6 +159,14 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "monitors did not start: no HTTPS client"),
         }
+        match crate::http::client::Client::public() {
+            Ok(http) => {
+                let clouds = crate::observe::cloud::Clouds::open(&cfg.data("observe"), &cfg.data("secrets").join("master.key"), std::sync::Arc::new(http), shutdown.clone());
+                crate::observe::api::set_clouds(clouds.clone());
+                clouds.start();
+            }
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "cloud integrations did not start: no HTTPS client"),
+        }
         match crate::util::load_or_create_token(&cfg.data("observe").join("ingest.token")) {
             Ok(t) => crate::observe::api::set_ingest_token(t),
             Err(e) => tracing::warn!(error = %e, "observe's ingest token could not be made: OTLP takes the admin token alone"),

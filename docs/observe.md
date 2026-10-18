@@ -21,7 +21,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-6 | Logs: LZ4 (§12.6), blocks with summaries and token filters (§12.7), Datadog's search syntax, the store's log head and files, OTLP logs, analytics (count, cardinality, sum, avg, min, max by facets, in time buckets; every facet's counts in one pass), allocating a group, not a row (§12.8); next: live tail, patterns | in progress |
 | O-7 | Monitors (§9): metric, change, log; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; next: anomaly, forecast, composite | in progress |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets, live tail | done |
-| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub done; next: AWS, GCP, Azure | in progress |
+| O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
 | O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
 
 ## 1. Rules
@@ -292,6 +292,7 @@ Under `/api/observe/v1/` (all JSON; the UI uses nothing else). Built:
 | `POST events`, `POST events/search` | an event (Datadog's v1 shape); events searched |
 | `GET/POST monitors`, `GET/PUT/DELETE monitors/{id}`, `POST monitors/{id}/mute`, `…/unmute`, `POST monitors/validate` | monitors (§9), each with its state and its groups'; validate says what a query watches (the metric query or the log search, and its window), so a page draws what is evaluated |
 | `GET integrations`, `PUT/DELETE integrations/{name}`, `POST integrations/{name}/test` | where monitors say things (§10) |
+| `GET clouds`, `PUT/DELETE clouds/{name}`, `POST clouds/{name}/pull`, `POST clouds/{name}/test` | cloud integrations (§10.1), each with its status; a secret left out of a `PUT` (or `"…"`, as shown) is the one kept; `test` pulls a configuration once and writes nothing, saying what it would read |
 | `GET snapshot/{point}/{file}?machine=` | a snapshot's file, for the runner of `machine` with its token |
 
 To come: `GET logs/tail` (websocket).
@@ -332,8 +333,10 @@ time, sent again until answered; §5), from:
 - **The API**: Datadog's v1 series (`POST series`), log intake (`POST logs`) and events (`POST
   events`).
 
-To come: AWS CloudWatch, GCP Cloud Monitoring and Azure Monitor pulled on a schedule (§10);
-Prometheus endpoints scraped.
+- **Clouds**: AWS CloudWatch, Google Cloud Monitoring and Azure Monitor, pulled (§10.1).
+
+To come: Prometheus endpoints scraped; CloudWatch Metric Streams taken (Firehose's HTTP endpoint
+delivery of OTLP).
 
 **Taking what comes, and refusing** (`crate::observe::owner`, `crate::observe::ingest`): a request
 is answered 200 only once its points have room, taken where it is answered (an atomic reservation
@@ -402,9 +405,52 @@ bounded queue, tried again with doubling backoff on errors, 429s (after `Retry-A
 each delivery an event and a count. Integrations are named (`PUT /api/observe/v1/integrations/
 <name>`), their secrets never shown, and testable.
 
-Sources: GitHub's webhooks (§8). To come: AWS CloudWatch (`GetMetricData`, Signature Version 4),
-GCP Cloud Monitoring (`timeSeries.list`, a service account's JWT), Azure Monitor (metrics REST,
-OAuth 2.0 client credentials).
+Sources: GitHub's webhooks (§8), and the clouds (§10.1).
+
+### 10.1 Clouds
+
+`crate::observe::cloud`: each cloud integration is named (`PUT /api/observe/v1/clouds/<name>`),
+pulled by a task of its own on the server every `interval_s` (300 unless said), each pull reading
+back `lookback_s` (three intervals): a point that came late to the cloud, or a write refused while
+observe was busy, is read again, and the store keeps a point once and, of two values at one time,
+the later (§4.5). A pull's points are offered as an exporter's are (§8), in parts of 100,000. Each
+integration writes `max_series` series at the most (20,000), the rest counted and said, not asked
+for (each cloud's API costs by the metric asked).
+
+| | AWS CloudWatch | Google Cloud Monitoring | Azure Monitor |
+| --- | --- | --- | --- |
+| Found | `ListMetrics` by region and namespace, those with points in the last 3 h | `metricDescriptors.list` by project and type prefix | Resource Manager's resources by subscription (and type), each type's `metricDefinitions` |
+| Read | `GetMetricData`, 500 queries a call, paged, JSON 1.0, Signature Version 4 | `timeSeries.list` a type, aligned: gauges by their mean, deltas and counters by each period's increase, distributions by each period's | `metrics`, 20 metrics a call a resource, at the period's grain (else the finest above it) |
+| Named | `aws.<namespace>.<metric>`: `.sum`, `.samplecount` (counts) and the average `sum / samplecount` as the name itself; other statistics `.<stat>` | `gcp.<service>.<path>`; distributions `.count`, `.sum`, `.avg`, `.p50`, `.p95`, `.p99` | `azure.<type>.<metric>`: the primary aggregation as the name; others asked `.<aggregation>` |
+| Tagged | `region`, each dimension by its name in lower case | the metric's and resource's labels, `resource_type`, the metadata's labels | `subscription_id`, `resource_group`, `name`, `region`, the resource's tags |
+| Given | keys (and a session token), a role to assume with its external id | a service account's key (JSON) | an app's tenant, client id and secret |
+| Ambient | the environment, the shared credentials file, a web identity (EKS), the container's (ECS, EKS Pod Identity), the instance's (IMDSv2); the region from the environment or the instance | `GOOGLE_APPLICATION_CREDENTIALS` (a key or a user's), gcloud's file, the metadata server (GCE, GKE, Cloud Run); the project from them | the environment's app, a workload identity (AKS), App Service's managed identity, the VM's |
+
+Names are Datadog's, as far as one rule makes them (a word starts at a capital after a lower-case
+letter: `CPUUtilization` → `cpuutilization`, `NetworkIn` → `network_in`), so a dashboard or a
+monitor written for Datadog's integrations reads these. CloudWatch keeps each period's count, sum,
+minimum and maximum, and its average is the sum over the count: asking `Sum` and `SampleCount`
+(the default) gives the average without a query of its own, and the sums as counts. A
+distribution's quantiles are read from its buckets as Prometheus's `histogram_quantile` reads them
+(linear within a bucket), log-linear within an exponential bucket, whose points are spread so. A
+Google type with no series is quiet, asked again hourly, not each pull: a project's thousands of
+built-in types cost a call each an hour.
+
+Calls throttled or failed on the service's side (429, 5xx, AWS's throttling codes, botocore's
+list) are tried again after `Retry-After`, else 1 s doubling, four tries; a failed pull is tried
+again after a minute, doubling, up to the interval. A region, project, subscription or resource
+that fails is a warning while the others are read; when all fail, the pull fails. The status
+(`GET clouds`) says each integration's state, its error and warnings, its last pull (series,
+points, points left to the next, calls, time); kiln's own series count them (`kiln.cloud.points`,
+`.calls`, `.errors`, `.series`, `.pull.duration`, by `integration` and `cloud`); its first pull, a
+failure and its recovery are events (`service:kiln.cloud @event.type:cloud.pull`).
+
+Secrets (AWS's secret key and session token, Google's key, Azure's client secret) are sealed at
+rest with AES-256-GCM under the server's master key (`<data>/secrets/master.key`, CI's), each bound
+to its integration and field; `clouds.json` is written owner-only (0600) in one step; they are
+never shown (`"…"`). A secret that does not open (the master key changed) leaves its integration
+failing, saying so, until it is given again. Credentials are got again 5 min before they expire;
+a page's `nextLink` elsewhere than Resource Manager is not followed (the token goes nowhere else).
 
 ## 11. UI
 
@@ -767,6 +813,29 @@ again; everything it took is stored (21.4 M, then 27.6 M more). Before, the firs
 full disk failed, the replica stopped and was opened again at once, the log replayed, the cut failed
 again: 83% CPU and a warning every 0.4 s. A replica that stops is now opened again after a second,
 twice as long each time it stops again (to a minute); a merge waits for room for its block.
+
+**Clouds** (`crates/kiln/tests/observe_clouds.rs`): a kiln server pulling from services that
+stand in for AWS (STS, CloudWatch, IMDSv2), Google (OAuth, Cloud Monitoring, the metadata
+server) and Azure (Entra, Resource Manager, the VM's metadata service). Each checks what the real
+one checks: every AWS call's Signature Version 4 recomputed with the key's secret over the method,
+path, signed headers and body, within 5 min of now; Google's assertion verified with the service
+account's public key (its issuer, audience, scope and times); Azure's client secret; every call's
+token. Their figures are functions of the minute, so what is stored is checked minute by minute:
+- with the credentials given (keys and a role assumed with its external id; a service account's
+  key; an app's secret): each cloud's series named and tagged as Datadog names them; CloudWatch's
+  averages from its sums and counts, its lists and results over two pages, a throttled call tried
+  again; Google's gauge, delta and distribution (its count, sum, average and quantiles), its quiet
+  type asked once over several pulls and its string type never; Azure's resources over two pages,
+  a type without metrics asked once, a disabled subscription not read; the role assumed once a
+  process, its keys kept from pull to pull; secrets never shown, never at rest in the clear, the
+  file the owner's alone, and kept across a restart;
+- a cloud that fails (CloudWatch answering 503): four tries, then failing, said once as an event,
+  the next pull a minute away; back, recovered and said; Entra's words for a wrong secret; a change
+  of settings without the secret keeps the kept one; settings that cannot be refused, saying
+  which; a deleted integration pulled no more;
+- the server's own credentials where it runs: an EC2 instance's (its region too), a Compute Engine
+  VM's (its project too), an Azure VM's managed identity.
+2026-10-18: all pass (48 s).
 
 To come: soak.
 

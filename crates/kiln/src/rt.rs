@@ -481,6 +481,50 @@ impl std::fmt::Display for Elapsed {
 
 impl std::error::Error for Elapsed {}
 
+/// `f` of each item, at most `n` at once, all on this task: each future polled under this task's
+/// own waker, which hyper-rt's I/O futures require (futures' `buffered` and `FuturesUnordered`
+/// poll under wakers of their own, and a connect there is refused). The outputs in the items'
+/// order.
+pub async fn each<T, R, Fut: Future<Output = R>>(items: impl IntoIterator<Item = T>, n: usize, f: impl Fn(T) -> Fut) -> Vec<R> {
+    let mut items = items.into_iter().enumerate();
+    let n = n.max(1);
+    let mut running: Vec<(usize, Pin<Box<Fut>>)> = Vec::with_capacity(n);
+    let mut done: Vec<(usize, R)> = Vec::new();
+    std::future::poll_fn(|cx| {
+        loop {
+            while running.len() < n {
+                let Some((i, t)) = items.next() else { break };
+                running.push((i, Box::pin(f(t))));
+            }
+            if running.is_empty() {
+                return Poll::Ready(());
+            }
+            let before = running.len();
+            let mut k = 0;
+            while k < running.len() {
+                let polled = match running.get_mut(k) {
+                    Some((_, fut)) => fut.as_mut().poll(cx),
+                    None => break,
+                };
+                match polled {
+                    Poll::Ready(r) => {
+                        let (i, _) = running.swap_remove(k);
+                        done.push((i, r));
+                    }
+                    Poll::Pending => k += 1,
+                }
+            }
+            // Nothing finished: each future pending has this task's waker.
+            if running.len() == before {
+                return Poll::Pending;
+            }
+        }
+    })
+    .await;
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
 /// `fut`'s output, or `Err(Elapsed)` once `d` has passed (the future is then dropped). When both are
 /// ready the output wins.
 pub async fn timeout<F: Future>(d: Duration, fut: F) -> Result<F::Output, Elapsed> {
@@ -811,6 +855,44 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `each` keeps the items' order, runs no more than `n` at once, runs them at once (four
+    /// 50 ms waits take ~one), and polls them under the task's own waker: a hyper-rt connect inside
+    /// it works, as it would not under futures' `buffered`.
+    #[test]
+    fn each_runs_n_at_once_in_order_under_the_task_s_own_waker() -> anyhow::Result<()> {
+        block_on(async {
+            let running = Arc::new(AtomicUsize::new(0));
+            let most = Arc::new(AtomicUsize::new(0));
+            let t = Instant::now();
+            let out = each(0..12u64, 4, |i| {
+                let (running, most) = (running.clone(), most.clone());
+                async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    // Later items finish first: the order kept is the items', not the finishing.
+                    sleep(Duration::from_millis(50 - (i % 4) * 10)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    i * 10
+                }
+            })
+            .await;
+            assert_eq!(out, (0..12).map(|i| i * 10).collect::<Vec<_>>());
+            assert_eq!(most.load(Ordering::SeqCst), 4);
+            assert!(t.elapsed() < Duration::from_millis(400), "three rounds of 50 ms, not twelve: {:?}", t.elapsed());
+            assert!(each(Vec::<u8>::new(), 3, |x| async move { x }).await.is_empty());
+            // A connect under `each`: refused by the port, not by the runtime.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| anyhow::anyhow!("{e}"))?;
+            let addr = listener.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let http = crate::http::client::Client::public()?;
+            let url = format!("http://{addr}/");
+            let got = each([0u8, 1], 2, |_| async { http.get(&url).timeout(Duration::from_millis(300)).send().await.map(|_| ()).map_err(|e| format!("{e:#}")) }).await;
+            for r in &got {
+                assert!(r.as_ref().err().is_none_or(|e| !e.contains("not on a shard thread")), "{r:?}");
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn timers_spawn_and_cancellation() -> anyhow::Result<()> {

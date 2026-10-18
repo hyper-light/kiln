@@ -3,6 +3,7 @@
 //! observe lane ([`wire`]), the writes a node gathers ([`ingest`]), and the API ([`api`]).
 
 pub mod api;
+pub mod cloud;
 pub mod dashboards;
 pub mod github;
 pub mod host;

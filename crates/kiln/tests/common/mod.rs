@@ -53,6 +53,8 @@ pub struct Fleet {
     pub root: tempfile::TempDir,
     pub http: u16,
     pub admin: String,
+    /// The server's environment besides the fleet's clean one.
+    pub server_env: Vec<(String, String)>,
     pub server: Option<Proc>,
     pub runners: BTreeMap<String, Option<Proc>>,
     /// Each runner's OTLP receiver's port.
@@ -66,6 +68,11 @@ impl Fleet {
 
     /// A fleet whose server's configuration has `extra(root)` too.
     pub fn with(extra: impl Fn(&Path) -> String) -> anyhow::Result<Self> {
+        Self::with_env(extra, &[])
+    }
+
+    /// A fleet whose server's configuration has `extra(root)` too, and whose server has `env`.
+    pub fn with_env(extra: impl Fn(&Path) -> String, env: &[(&str, &str)]) -> anyhow::Result<Self> {
         let root = tempfile::tempdir()?;
         let (http, quic) = (free_port()?, free_port()?);
         let data = root.path().join("server");
@@ -109,7 +116,8 @@ host_seconds = 3600
             extra = extra(root.path())
         );
         std::fs::write(root.path().join("kiln.toml"), cfg)?;
-        let mut f = Self { root, http, admin: String::new(), server: None, runners: BTreeMap::new(), otlp: BTreeMap::new() };
+        let server_env = env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        let mut f = Self { root, http, admin: String::new(), server_env, server: None, runners: BTreeMap::new(), otlp: BTreeMap::new() };
         f.start_server()?;
         f.admin = std::fs::read_to_string(data.join("admin.token"))?.trim().to_owned();
         Ok(f)
@@ -139,7 +147,15 @@ host_seconds = 3600
     pub fn start_server(&mut self) -> anyhow::Result<()> {
         let log = self.root.path().join("server.log");
         let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-        let child = self.command(&self.root.path().join("home-server"), "server")?.arg("--config").arg(self.root.path().join("kiln.toml")).arg("server").stdout(Stdio::from(out.try_clone()?)).stderr(Stdio::from(out)).spawn()?;
+        let child = self
+            .command(&self.root.path().join("home-server"), "server")?
+            .arg("--config")
+            .arg(self.root.path().join("kiln.toml"))
+            .arg("server")
+            .envs(self.server_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdout(Stdio::from(out.try_clone()?))
+            .stderr(Stdio::from(out))
+            .spawn()?;
         self.server = Some(Proc { child, log });
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(60) {

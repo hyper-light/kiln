@@ -51,6 +51,17 @@ fn dashboards() -> Result<&'static std::sync::Arc<super::dashboards::Dashboards>
     DASHBOARDS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "dashboards are kept by the server"))
 }
 
+/// The server's cloud integrations, once it started.
+static CLOUDS: OnceLock<std::sync::Arc<super::cloud::Clouds>> = OnceLock::new();
+
+pub fn set_clouds(c: std::sync::Arc<super::cloud::Clouds>) {
+    let _ = CLOUDS.set(c);
+}
+
+fn clouds() -> Result<&'static std::sync::Arc<super::cloud::Clouds>, Fail> {
+    CLOUDS.get().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "cloud integrations are kept by the server"))
+}
+
 /// The node's view, each digest also in hex (`digest_hex`, `verified_hex`): a u64 is more than
 /// JavaScript's numbers hold exactly, and two digests that differ must not read alike.
 fn status_json(v: &super::View) -> Value {
@@ -278,6 +289,28 @@ pub async fn route(rest: &[&str], q: &HashMap<String, String>, req: Request) -> 
         (&Method::POST, ["integrations", name, "test"]) => {
             monitors()?.test(name).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
             Ok(srv::json(StatusCode::ACCEPTED, &json!({ "sent": true })))
+        }
+        (&Method::GET, ["clouds"]) => Ok(srv::json(StatusCode::OK, &json!({ "clouds": clouds()?.list() }))),
+        (&Method::PUT, ["clouds", name]) => {
+            let name = (*name).to_owned();
+            let c: super::cloud::Cloud = read_json(req.into_body(), QUERY_BODY).await?;
+            clouds()?.put(&name, c).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::DELETE, ["clouds", name]) => match clouds()?.delete(name).map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))? {
+            true => Ok(srv::status(StatusCode::NO_CONTENT)),
+            false => Err(fail(StatusCode::NOT_FOUND, "no such cloud integration")),
+        },
+        (&Method::POST, ["clouds", name, "pull"]) => match clouds()?.pull_now(name) {
+            true => Ok(srv::json(StatusCode::ACCEPTED, &json!({ "pulling": true }))),
+            false => Err(fail(StatusCode::NOT_FOUND, "no such cloud integration")),
+        },
+        (&Method::POST, ["clouds", name, "test"]) => {
+            // A configuration as the form holds it (its secrets `"…"`: the kept ones), pulled once,
+            // nothing written.
+            let name = (*name).to_owned();
+            let c: super::cloud::Cloud = read_json(req.into_body(), QUERY_BODY).await?;
+            Ok(srv::json(StatusCode::OK, &clouds()?.test(&name, c).await))
         }
         (&Method::GET, ["dashboards"]) => {
             // The list without the widgets: what a dashboard is, and how many it holds.
