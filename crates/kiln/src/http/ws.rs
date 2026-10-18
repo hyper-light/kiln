@@ -175,7 +175,7 @@ pub async fn connect(tls: &ClientTls, url: &str, max_message: usize) -> anyhow::
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
     let authority = uri.authority().map_or(host, http::uri::Authority::as_str);
     let path = uri.path_and_query().map_or("/", http::uri::PathAndQuery::as_str);
-    let tcp = super::io::connect(host, port).await?;
+    let tcp = super::io::connect_out(host, port, secure).await?;
     let io = if secure {
         let stream = TlsStream::connect(RtFuturesIo::new(tcp), tls.config()?, super::tls::server_name(host)?)
             .await
