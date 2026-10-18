@@ -4,8 +4,13 @@
 //! UI's requests here (`serve`), streaming both ways. If it exits it starts again; without Bun or
 //! its files, kiln serves the app's shell and the app runs in the browser.
 //!
-//! Where things are: `KILN_UI_DIR` (default `/usr/local/lib/kiln/ui`, which holds `server/main.ts`
-//! and `dist/server`), `KILN_BUN` (default: `bun` on the PATH).
+//! kiln carries its UI server (`carried`, vendor/bun/README.md): Bun and the UI server's files,
+//! unpacked once into the data directory, or `KILN_UI_SERVER_DIR`. A Bun and files of your own
+//! still win: `KILN_BUN` (default: `bun` on the PATH) with `KILN_UI_DIR` (which holds
+//! `server/main.ts` and `dist/server`). A kiln built without one looks for them in
+//! `/usr/local/lib/kiln/ui`, where older images put them.
+
+mod carried;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -104,15 +109,33 @@ async fn forward(req: Request, port: u16) -> anyhow::Result<Response> {
     Ok(http::Response::from_parts(head, body.map_err(std::io::Error::other).boxed()))
 }
 
+/// How to run the UI server: with a Bun and files of your own when they're named, else the one this
+/// kiln carries (unpacked under `base`), else a Bun and files installed where older images put them.
+fn launch(base: &Path) -> Option<carried::Launch> {
+    let own = std::env::var_os("KILN_UI_DIR").is_some() || std::env::var_os("KILN_BUN").is_some();
+    if !own && carried::carried() {
+        match carried::launch(base) {
+            Ok(l) => return Some(l),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "can't unpack the UI server kiln carries"),
+        }
+    }
+    installed()
+}
+
+/// Where the carried UI server is unpacked: `KILN_UI_SERVER_DIR`, else the data directory.
+fn unpack_base(hub: &Hub) -> PathBuf {
+    std::env::var_os("KILN_UI_SERVER_DIR").map_or_else(|| hub.cfg.server.data_dir.clone(), PathBuf::from)
+}
+
 /// The UI server's files and the Bun to run them, when both are there.
-fn files() -> Option<(PathBuf, PathBuf)> {
+fn installed() -> Option<carried::Launch> {
     let dir = std::env::var_os("KILN_UI_DIR").map_or_else(|| PathBuf::from("/usr/local/lib/kiln/ui"), PathBuf::from);
     let main = dir.join("server").join("main.ts");
     if !main.is_file() || !dir.join("dist").join("server").join("server.js").is_file() {
         return None;
     }
     let bun = std::env::var_os("KILN_BUN").map(PathBuf::from).or_else(|| on_path("bun"))?;
-    Some((bun, main))
+    Some(carried::Launch { what: format!("bun at {}", bun.display()), program: bun, args: Vec::new(), main })
 }
 
 fn on_path(name: &str) -> Option<PathBuf> {
@@ -146,9 +169,10 @@ async fn listening(port: u16) -> bool {
     false
 }
 
-fn start(bun: &Path, main: &Path, port: u16, api: &str) -> std::io::Result<Child> {
-    Command::new(bun)
-        .arg(main)
+fn start(l: &carried::Launch, port: u16, api: &str) -> std::io::Result<Child> {
+    Command::new(&l.program)
+        .args(&l.args)
+        .arg(&l.main)
         .env("PORT", port.to_string())
         .env("HOST", "127.0.0.1")
         .env("KILN_API_URL", api)
@@ -160,20 +184,35 @@ fn start(bun: &Path, main: &Path, port: u16, api: &str) -> std::io::Result<Child
 /// Runs the UI server for as long as kiln does, starting it again when it exits (backing off up to
 /// 30 s when it keeps failing).
 pub async fn run(hub: std::sync::Arc<Hub>) -> anyhow::Result<()> {
-    let Some((bun, main)) = files() else {
+    let base = unpack_base(&hub);
+    let Some(mut l) = crate::rt::blocking(move || launch(&base)).await? else {
         tracing::info!("no UI server here (Bun or its files are missing): every page is the app's shell, rendered in the browser");
         hub.shutdown.cancelled().await;
         return Ok(());
     };
+    tracing::info!(what = %l.what, main = %l.main.display(), "UI server");
     let api = api_url(&hub.cfg.server.http_addr);
     let mut backoff = Duration::from_secs(1);
+    let mut moved = false;
     loop {
         let port = free_port()?;
         let started = Instant::now();
-        let mut child = match start(&bun, &main, port, &api) {
+        let mut child = match start(&l, port, &api) {
             Ok(c) => c,
+            // The data directory's filesystem doesn't let programs run (mounted noexec): the
+            // carried UI server goes to the temporary directory instead, once.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && !moved && carried::carried() && std::env::var_os("KILN_UI_SERVER_DIR").is_none() => {
+                moved = true;
+                let tmp = std::env::temp_dir().join("kiln");
+                tracing::warn!(error = %e, program = %l.program.display(), to = %tmp.display(), "the UI server can't run from the data directory (is it mounted noexec?); unpacking it into the temporary directory (KILN_UI_SERVER_DIR sets where)");
+                match crate::rt::blocking(move || carried::launch(&tmp)).await? {
+                    Ok(next) => l = next,
+                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "can't unpack the UI server kiln carries"),
+                }
+                continue;
+            }
             Err(e) => {
-                tracing::warn!(error = %e, bun = %bun.display(), "can't start the UI server");
+                tracing::warn!(error = %e, program = %l.program.display(), "can't start the UI server");
                 hub.shutdown.cancelled().await;
                 return Ok(());
             }
