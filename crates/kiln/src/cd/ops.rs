@@ -232,6 +232,11 @@ pub fn ops() -> &'static [Op] {
                 run: add_repo),
             op!("cd.repos.remove", "Remove a repository's credentials.", ro: false, destructive: true,
                 input: || obj_schema(json!({"url": {"type": "string"}}), &["url"]), run: remove_repo),
+            op!("cd.images.list", "Where each image kiln publishes lives: the local Docker that builds it (the default), or a registry repository.", ro: true, destructive: false,
+                input: || obj_schema(json!({}), &[]), run: images_list),
+            op!("cd.images.set", "Set where a published image lives: `local`, or a registry `repository` (with the `integration` that pulls it).", ro: false, destructive: false,
+                input: || obj_schema(json!({"name": {"type": "string"}, "kind": {"type": "string", "enum": ["local", "registry"]}, "repository": {"type": "string"}, "integration": {"type": "string"}}), &["name", "kind"]),
+                run: images_set),
         ]
         .into_iter()
         // Plans share the one table (crates/kiln/src/plans/ops.rs).
@@ -1164,6 +1169,28 @@ async fn remove_cluster(cx: Cx, v: Value) -> Out {
     propose(&cx.cd, Command::DeleteCluster(name.clone())).await?;
     audit(&cx, "cd.cluster.delete", name.clone()).await;
     Ok(json!({"removed": name}))
+}
+
+async fn images_list(cx: Cx, _: Value) -> Out {
+    Ok(json!({ "images": super::images::json(&cx.cd.image_homes()) }))
+}
+
+async fn images_set(cx: Cx, v: Value) -> Out {
+    let name = str_in(&v, "name").ok_or_else(|| bad("`name` is required"))?.to_owned();
+    if cx.actor.starts_with("agent:") {
+        return Err((StatusCode::FORBIDDEN, "agents may not change where images live: ask a person to".into()));
+    }
+    let home = match str_in(&v, "kind") {
+        Some("local") | None => None,
+        Some("registry") => Some(super::images::Home::Registry {
+            repository: str_in(&v, "repository").ok_or_else(|| bad("a registry needs a `repository` (docker.io/acme/kiln)"))?.trim().to_owned(),
+            integration: str_in(&v, "integration").map(str::to_owned),
+        }),
+        Some(other) => return Err(bad(format!("`{other}` is neither local nor registry"))),
+    };
+    cx.cd.set_image_home(&name, home).await.map_err(bad)?;
+    audit(&cx, "cd.images.set", name.clone()).await;
+    Ok(json!({ "images": super::images::json(&cx.cd.image_homes()) }))
 }
 
 async fn repos(cx: Cx, _: Value) -> Out {

@@ -13,6 +13,7 @@
 pub mod api;
 pub mod cli;
 pub mod guard;
+pub mod images;
 pub mod kube;
 pub mod live;
 pub mod ops;
@@ -612,7 +613,20 @@ impl Cd {
     /// app's inputs wait, and the next poll looks again.
     pub(crate) async fn resolve_artifacts(&self, def: &AppDef, revision: &str) -> Result<(Vec<ArtifactRef>, Vec<PullSecret>)> {
         let mut refs = Vec::new();
-        for (name, spec) in &def.artifacts {
+        for (name, given) in &def.artifacts {
+            // A published image: in a registry, an image like any other; local, ready when its
+            // pipeline's run at this commit succeeded, and run by its tag.
+            let spec = match (&given.published, self.published_spec(given)) {
+                (Some(_), Some(s)) => s,
+                (Some(p), None) => {
+                    let pipeline = given.pipeline.as_deref().unwrap_or("image");
+                    self.published_locally(def, pipeline, revision).await.with_context(|| format!("artifact {name}"))?;
+                    refs.push(ArtifactRef { name: name.clone(), reference: format!("{p}:{revision}"), repository: p.clone(), tag: Some(revision.to_owned()), digest: String::new() });
+                    continue;
+                }
+                (None, _) => given.clone(),
+            };
+            let spec = &spec;
             let text = spec.reference(revision);
             let reference = oci::parse_reference(&text).with_context(|| format!("artifact {name}"))?;
             let registry = self.artifact_registry(spec, &reference).await.with_context(|| format!("artifact {name}"))?;
@@ -642,7 +656,14 @@ impl Cd {
     /// The pull secrets an app's artifacts ask for, with their registries' credentials now.
     async fn pull_secrets_of(&self, def: &AppDef, revision: &str) -> Result<Vec<PullSecret>> {
         let mut out = Vec::new();
-        for (name, spec) in &def.artifacts {
+        for (name, given) in &def.artifacts {
+            // A local published image is on the nodes: nothing to pull with.
+            let spec = match (&given.published, self.published_spec(given)) {
+                (Some(_), Some(s)) => s,
+                (Some(_), None) => continue,
+                (None, _) => given.clone(),
+            };
+            let spec = &spec;
             let Some(ps) = &spec.pull_secret else { continue };
             let reference = oci::parse_reference(&spec.reference(revision)).with_context(|| format!("artifact {name}"))?;
             let registry = self.artifact_registry(spec, &reference).await.with_context(|| format!("artifact {name}"))?;
@@ -683,7 +704,12 @@ impl Cd {
         let refs = def
             .artifacts
             .iter()
-            .map(|(name, spec)| {
+            .map(|(name, given)| {
+                let spec = match (&given.published, self.published_spec(given)) {
+                    (Some(_), Some(s)) => s,
+                    (Some(p), None) => return ArtifactRef { name: name.clone(), reference: format!("{p}:{revision}"), repository: p.clone(), tag: Some(revision.to_owned()), digest: String::new() },
+                    (None, _) => given.clone(),
+                };
                 let text = spec.reference(revision);
                 let (repository, tag) = oci::parse_reference(&text).map(|r| (r.name(), r.tag.clone())).unwrap_or_else(|_| (text.clone(), None));
                 ArtifactRef { name: name.clone(), reference: text, repository, tag, digest: String::new() }

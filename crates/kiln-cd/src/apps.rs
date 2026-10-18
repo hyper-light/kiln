@@ -63,7 +63,16 @@ pub struct AppDef {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ArtifactSpec {
     /// The image: `docker.io/acme/kiln:${{ git.sha }}`, or a name with `tag` below.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image: String,
+    /// Instead of `image`: an image kiln publishes under this name, built by `pipeline` at each
+    /// commit. Where it lives (the local Docker that builds it, loaded into the cluster's nodes,
+    /// or a registry) is a server setting (Settings → Deployments → Images).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<String>,
+    /// The pipeline that builds a published image (default `image`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
     /// Its tag, when `image` carries none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
@@ -1128,6 +1137,8 @@ fn app_from_spec(
                     n.clone(),
                     ArtifactSpec {
                         image: k(&a.image),
+                        published: a.published.as_deref().map(k),
+                        pipeline: a.pipeline.clone(),
                         tag: a.tag.as_deref().map(k),
                         registry: a.registry.as_deref().map(k),
                         pull_secret: a.pull_secret.as_deref().map(k),
