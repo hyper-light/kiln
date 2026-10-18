@@ -321,11 +321,21 @@ export interface SystemInfo {
   config: Record<string, unknown>;
 }
 
+/** A row of the audit log (docs/ci.md W19-R05). `actor` is v1's: the principal, and for whom. */
 export interface AuditEntry {
+  id: number;
   ts: number;
-  actor: string;
+  principal: string;
+  on_behalf_of: string | null;
+  token: string | null;
+  scope: string | null;
   action: string;
+  target: string | null;
+  /** The status a request ended with, or `ok`. */
+  result: string;
+  ip: string | null;
   detail: string;
+  actor: string;
 }
 
 export interface NewRepo {

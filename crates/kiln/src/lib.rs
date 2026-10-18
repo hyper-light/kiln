@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod accounts;
+pub mod audit;
 pub mod agent;
 pub mod aisessions;
 pub mod api;

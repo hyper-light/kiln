@@ -220,10 +220,21 @@ pub fn ops() -> &'static [Op] {
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let op = ops().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
     let (method, rest, q) = (op.route)(&input)?;
-    let mut segs: Vec<&str> = vec!["api", "ci"];
-    segs.extend(rest.iter().map(String::as_str));
-    crate::authz::gate::check(&cx.hub, &cx.caller, &method, &segs, &q).await?;
-    (op.run)(cx, input).await
+    let path = format!("/api/ci/{}", rest.join("/"));
+    let run = async {
+        let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+        crate::authz::gate::check(&cx.hub, &cx.caller, &method, &segs, &q).await?;
+        (op.run)(cx.clone(), input).await
+    };
+    if op.read_only {
+        return run.await;
+    }
+    // A change is audited as its route's would be (W19-R05): one row.
+    crate::audit::request(&cx.hub, crate::audit::Req { caller: &cx.caller, method: &method, path: &path, q: &q, ip: None }, run, |r: &Out| match r {
+        Ok(_) => 200,
+        Err((s, _)) => s.as_u16(),
+    })
+    .await
 }
 
 #[cfg(test)]

@@ -1787,6 +1787,7 @@ impl Hub {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 () = tick.tick().fuse() => {}
             }
+            crate::audit::prune(&self.store, self.cfg.retention.audit_days).await;
             let jobs = self.store.prune(self.cfg.retention.days).await?;
             if !jobs.is_empty() {
                 tracing::info!(jobs = jobs.len(), "pruned old runs");

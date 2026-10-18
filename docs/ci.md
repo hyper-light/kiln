@@ -189,7 +189,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W16 | Test results, flaky, benchmarks | W06, W08 | in progress | ten report formats, `test-results:` to the store, results and annotations, flaky and probably flaky, quarantine with `enforce`, timing for shards, `$KILN_METRICS` and seven converters, bootstrap regressions by fingerprint, `bench-gate`, Tests and Benchmarks panels; the tests page, trends and AC05 left |
 | W17 | Debugging | W06, W13 | in progress | terminals into running and kept legs (host, docker), keep on failure with extend and release, a step rerun in place, `kiln workflow run` here or on a server, agents through MCP (exec, rerun step, keep, release); log search and "compare with the last green run" (W19); microVM and k8s terminals left |
 | W18 | Supply chain, untrusted code | W10, W13 | not started | |
-| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 left |
+| W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
 | W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
@@ -3735,7 +3735,37 @@ rule-based notifications (G-30, G-31).
 - **W19-AC06 Search.** A string printed by one step in 10,000 runs is found in < 500 ms. *Bench.*
 
 **Progress.** In progress: R02 (OpenTelemetry export waits for W11-R09) and R06 (with W11-R06's
-channels). Done: R01, R03, R04, R07, AC01, AC02, AC03 and AC06.
+channels). Done: R01, R03, R04, R05, R07, AC01, AC02, AC03, AC04 and AC06.
+
+- *R05* (`crates/kiln/src/audit.rs`, migration `20261018-2200_w19_audit2.sql`):
+  - **One row per change.** Every request that changes something writes exactly one `audit2`
+    row, refused or not:
+    - who (`principal`, and `on_behalf_of` for a token or agent acting for a user), with which
+      `token`;
+    - the rule's `scope` and the route (`action`), the path (`target`);
+    - the status (`result`) and the address (`ip`).
+
+    So do operations through MCP and code mode (W20), which run handlers directly.
+  - **Handlers' notes.** What a handler records on the way (`Store::audit`) becomes the `detail`
+    of its request's row, not a row of its own. The request runs inside a slot, a task-local
+    that a wrapper sets around each poll, which collects them.
+  - **Rows of their own** come from outside requests:
+    - a leg given secrets (`ci.secrets.use`, by name);
+    - an integration's credentials exchanged for kiln's ID token (`integration.exchange`: AWS,
+      GCP, Azure);
+    - terminal sessions, and the other background actions.
+  - Today's v1 rows moved in.
+  - `GET /api/audit` filters by every field (exact values, comma-separated for any of), `q`
+    anywhere, `since`, `until`, and `before` for paging. Rows are kept `[retention] audit_days`
+    (400).
+  - The System page's audit log filters by window, by facets (who, for whom, action, scope,
+    result, address, token) and by words.
+  - **AC04** (`crates/kiln/tests/audit.rs`): a real server, generated from the route table.
+    Every rule that changes something, called by an agent token acting for a user that may only
+    look, wrote exactly one row with that principal and on-behalf-of, the route, the path and the
+    status. A change let through wrote one row too, its handler's note as the detail.
+  - **Verified end to end:** 356 v1 rows migrated. A variable set through the API wrote one row
+    with every field. The page filtered it in Chromium and WebKit, desktop and phone.
 
 - *R04* (`crates/kiln/src/ci/logsearch.rs`, migration `20261018-2100_w19_log_search.sql`):
   - **The index.** Finished legs' step logs go into `ci_log_index`, SQLite's FTS5 with the
@@ -3906,8 +3936,8 @@ channels). Done: R01, R03, R04, R07, AC01, AC02, AC03 and AC06.
     - pointing that subscriber at a working URL sent the rest there;
     - redelivering a failed delivery sent it there with its own delivery id;
     - `run.failed` and `run.succeeded` arrived with their repository.
-- *Left*: R02's OpenTelemetry export, R05; email (SMTP), the inbox and issue trackers as channels; the other
-  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC04 and AC05.
+- *Left*: R02's OpenTelemetry export; email (SMTP), the inbox and issue trackers as channels; the other
+  events (`leg.flaky`, `deploy.*`, `runner.offline`, …); AC05.
 
 ### W20 Agents: MCP code mode, skills, attachments, experiments
 
@@ -4436,6 +4466,7 @@ errors as `{ error, code, details? }`. Today's routes (`/api/runs`, `/api/jobs/.
 | GET | `/api/ci/notify/deliveries?run=` | `ci.notify.deliveries` | settings.manage | W19 |
 | POST | `/api/ci/hooks/:id` | inbound webhook (HMAC) | open, signed | W03 |
 | GET | `/api/audit?principal=&action=&target=&since=` | `audit.list` | audit.read | W19 |
+| GET | `/api/audit?principal=&on_behalf_of=&token=&scope=&action=&target=&result=&ip=&q=&since=&until=&before=` (built) | `audit.list` | audit.read | W19 |
 | GET/POST · DELETE · POST | `/api/tokens` · `/:id` · `/:id/rotate` | `tokens.*` (shown once; agent tokens rotate) | your own; anyone's with tokens.manage | W10 |
 | GET/POST · DELETE · POST | `/api/users` · `/:id` · `/:id/{link,sign-out}` | `users.*` (a one-time sign-in link) | users.manage | W10 |
 | GET/POST · DELETE | `/api/grants?user=` · `/:id` | `grants.*` (`developer@org:acme`, `!runs.cancel@repo:…`) | users.manage | W10 |

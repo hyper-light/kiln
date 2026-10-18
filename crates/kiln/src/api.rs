@@ -260,14 +260,29 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
     let Some(caller) = caller_of(&hub, req.headers()).await else {
         return Err(err(StatusCode::UNAUTHORIZED, "authentication required"));
     };
+    if method == Method::GET || method == Method::HEAD {
+        return authorized(hub, caller, req).await;
+    }
+    // A change is audited (W19-R05): one row for the request, refused or not, which takes what
+    // its handlers record on the way.
+    let (who, q, ip) = (caller.clone(), srv::query(&req), srv::remote_ip(&req));
+    let h = Arc::clone(&hub);
+    crate::audit::request(&h, crate::audit::Req { caller: &who, method: &method, path: &path, q: &q, ip }, authorized(hub, caller, req), |r: &R| match r {
+        Ok(resp) => resp.status().as_u16(),
+        Err(e) => e.0.as_u16(),
+    })
+    .await
+}
+
+/// The API past authentication: everyone but the owner is held to the route table (W10-R05).
+async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request) -> R {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let seg = segments(&path);
+    let s: Vec<&str> = seg.iter().map(String::as_str).collect();
     let q = srv::query(&req);
-    // Everyone but the owner is held to the route table (W10-R05), and what they change is
-    // audited under their own name.
     if !caller.is_owner() {
         crate::authz::gate::check(&hub, &caller, &method, &s, &q).await.map_err(|(c, m)| err(c, m))?;
-        if method != Method::GET && method != Method::HEAD {
-            hub.store.audit(caller.name.clone(), format!("api.{}", method.as_str().to_ascii_lowercase()), path.clone()).await;
-        }
     }
     let mut req = req;
     req.extensions_mut().insert(caller.clone());
@@ -1276,8 +1291,7 @@ async fn system(hub: &Hub) -> Response {
 }
 
 async fn audit(hub: &Hub, q: &HashMap<String, String>) -> R {
-    let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200);
-    Ok(srv::json(StatusCode::OK, &hub.store.audit_log(limit).await?))
+    Ok(srv::json(StatusCode::OK, &crate::audit::list(&hub.store, q).await?))
 }
 
 fn history(hub: &Hub, q: &HashMap<String, String>) -> Response {
