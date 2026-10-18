@@ -176,7 +176,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W03 | Triggers and events | W02 | in progress | matcher, patterns, skip, cron with DST, payloads; polling, webhooks (deduplicated), schedules, dispatches, workflow_run; native events left |
 | W04 | Planner, matrices, reusable workflows, outputs | W01, W02 | in progress | the plan engine, AC01–AC06 (unit), reusable workflows local and remote, plan preview; fixtures left |
 | W05 | Scheduler, concurrency, routing, retries | W04 (job model) | in progress | core and dispatcher, AC01–AC06, AC08 (127k assignments/s), AC10, reruns as attempts; pools and reservations left |
-| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; toolkit conformance left |
+| W06 | Step runtime on the runner | W01, W02 | in progress | `run:` and `uses:` steps GitHub-exact on the host and in job containers; problem matchers; background steps; debug; kiln's checkout and files; AC01 toolkit conformance on the host (every `@actions/core` API, `getIDToken` included); the same on the other executors (W13-AC02) left |
 | W07 | Actions | W06 | in progress | pins at run start (through reusable workflows), mirror, JS (pre/post), composite, local, `$/`, Docker; policy; catalog; built-ins `kiln/checkout@v1`, `kiln/test-results@v1`, `kiln/notify@v1` and `kiln/auth@v1`; kiln actions' declared secrets, requirements and permissions (R11); `kiln://` and the other built-ins left |
 | W08 | Runtime services: store, caches, artifacts | none (store), W06 (wiring) | in progress | store, blobs, cache (GHES protocol), artifacts v4; actions/cache, upload/download-artifact unmodified; tiers, reuse, BuildKit, speed left |
 | W09 | Secrets and variables | W01 | in progress | encrypted store, scopes, least delivery, declarations (KCI4040/4041), variables, API and CLI, rotation; brokered secrets (integrations, Secrets Manager, Secret Manager, Key Vault), made at leg start, never stored; kiln actions' declared secrets (KCI4040 at start, `with-secrets`, only what's declared inside); environments, the other stores, UI left |
@@ -192,7 +192,7 @@ Statuses: `ready` (can start), `blocked` (waits on what is in brackets), `in pro
 | W19 | Insights, audit, notifications | W05 | in progress | notification rules from trunk and the server (events, `where`, `throttle`, `run.fixed`), Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie and signed webhooks, deliveries recorded, `kiln/notify@v1`; outgoing webhooks (per-scope subscriptions to kiln's events, signed, in order, retried, logged before sending, resumed after a restart, redelivered); insights (hourly and daily rollups that merge, percentiles within 1 %, waits by reason, attempts, flaky legs, cache, runner utilization, fair share, critical path, AC01, AC02) with Prometheus metrics; compare (differences in actions, variables, environment, images, machines and cache; changed files; steps side by side; "since the last green run", AC03); log search (a trigram index built as legs finish, filters, one leg's search, failure excerpts, AC06 under 1 ms in 10,000 runs); audit v2 (one row per change with principal, on-behalf-of, token, scope, route, result and address; handlers' notes as its detail; secret uses and integration exchanges; filters by every field; AC04 from the route table); OpenTelemetry export, the inbox, email and issue-tracker channels left |
 | W20 | Agents: MCP, skills, attachments, experiments | W02, W05 | in progress | one registry for deployments' and CI's operations, checked against the route table; `kiln.ci.*` and tools for runs, legs (exec, rerun step, keep, release), workflows and caches; `kiln-ci-diagnose`; users' tokens over MCP; the rest of the operations, generated routes and CLI, skills, attachments, experiments left |
 | W21 | UI | each backend it shows | in progress | the CI API; the run page (attempts, reruns, critical path, matrix cells, summaries, annotations, artifacts, pins); the leg's notes; the workflow editor with checks, completion and plan preview; Insights (repositories, workflows, runners); comparing runs; log search; the rest left |
-| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green |
+| W22 | Conformance, e2e, performance | grows with the rest | in progress | local e2e harness; AC01: the corpus plans (804 plans), 24 of 33 runnable starter workflows green with every miss explained; AC02: 39 of F-21's 50 green; AC07 (the security suite: token scope on every route, secrets in no log, API, event or database file, YAML bombs, SSRF guards, archive traversal) |
 
 ---
 
@@ -1970,9 +1970,10 @@ executors, W08/W10 runtime URLs and tokens. Gives `JobEvent`s and logs to the se
     JavaScript action on the current `@actions/core`, `@actions/exec` and `@actions/io`, with a
     post step, calls every API (inputs of each kind, outputs, `exportVariable`, `addPath`,
     `setSecret`, state, `debug`, groups, annotations with properties, summaries, `exec`,
-    `getExecOutput`, `mkdirP`, `which`, `isDebug`). `runtime::tests::toolkit_conformance`
+    `getExecOutput`, `mkdirP`, `which`, `isDebug`, `getIDToken`). `runtime::tests::toolkit_conformance`
     checks each effect on the host executor: in the step's log, in a later step, in the post
-    step and in the leg's events.
+    step and in the leg's events. `getIDToken` asks the leg's ID token endpoint for its
+    audience with the request token, and the token is masked from the moment it arrives.
   - R01's workspaces (`crates/kiln/src/runner/workspaces.rs`): a leg's `<work>/w/<8 hex>` is
     removed when the leg ends; until then they were kept forever, 12 GB of them on one runner.
     A failed leg with `keep_on_failure_minutes` (W17-R02) keeps its own until that runs out.
@@ -4571,9 +4572,35 @@ and AC02.
     - `setup-python`: GitHub's `python-versions` manifest has builds for Ubuntu only, and the
       host is not Ubuntu. *Fixed:* `ubuntu-latest` legs now run in kiln's Ubuntu runner image
       (W13-R04), where it installs CPython 3.12.
+- *AC07* (`crates/kiln/tests/security.rs`, against a server of its own):
+  - **Token scope.** Every route of the route table refuses a token that may do nothing. That is an
+    agent's for a user without a grant: 403 for it, and 401 without a token, on 128 routes.
+    Tokens are each caller's own: someone else's is never listed, and is out of reach.
+  - **Secrets.** A run uses a secret in its command, environment, annotations, a title, its
+    summary, its outputs and `$GITHUB_ENV`. The logs show it masked. It is in no API answer (the
+    run, its legs, annotations, summaries and graph), not in the events stream, and in no file
+    under the data directory, the database's write-ahead log included.
+  - **YAML bombs.** A billion laughs is refused, in well under a second, by everything kiln reads
+    from a repository: workflows of both dialects, overlays, actions, `routing.yaml`,
+    `notify.yaml`, `config.yaml`, `pnpm-lock.yaml` and `yarn.lock`.
+  - **SSRF guards.** A request to an address someone gave kiln never reaches this machine, a
+    private network or a link-local address (a cloud's metadata service), unless
+    `[ci] allow_private_targets` names that host, address or network. This covers webhook
+    subscriptions, channels' webhook URLs and OCI registries' Verify. The name is resolved where
+    the request is made and the connection goes to the address checked, so DNS rebinding can't
+    get around it.
+  - **Archive traversal.** The runner unpacks a commit's tarball with nothing outside the
+    workspace (`w22_ac07_tarball_stays_in_the_workspace`):
+    - entries with `..` are skipped;
+    - a link earlier in the archive can't lead a later entry, or the directories made for it,
+      elsewhere;
+    - a link where a file goes is replaced, never written through.
+
+    Actions' tarballs unpack through `tar`'s own checks, and local runs arrive as git packs.
+  - Fork isolation is W18-AC03, and signed URL tampering W08-AC04.
 - *Left.* AC01 for the corpus's repository workflows (they need their projects' sources) and
-  with test tenants (W11-AC03); AC03 to AC09; the rest of F-21; an authenticated way for legs
-  to read github.com's API (W18's egress proxy).
+  with test tenants (W11-AC03); AC03 to AC06, AC08 and AC09; the rest of F-21; an authenticated
+  way for legs to read github.com's API (W18's egress proxy).
 
 ---
 

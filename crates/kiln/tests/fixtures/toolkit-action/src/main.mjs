@@ -39,3 +39,10 @@ core.info(`exec output: ${out.stdout} (exit ${out.exitCode})`);
 await io.mkdirP(`${process.env.RUNNER_TEMP}/f20/a/b`);
 core.info(`which sh: ${(await io.which("sh", true)) !== ""}`);
 core.info(`is debug: ${core.isDebug()}`);
+// getIDToken (W10): a token for an audience, masked once fetched.
+if (process.env.ACTIONS_ID_TOKEN_REQUEST_URL) {
+  const token = await core.getIDToken("kiln-f20");
+  const claims = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+  core.info(`id token: aud=${claims.aud} sub=${claims.sub}`);
+  core.info(`the token itself: ${token}`);
+}
