@@ -16,6 +16,7 @@ pub mod preview;
 pub mod repo_config;
 pub mod rest;
 pub mod reusable;
+pub mod routing;
 pub mod runs;
 pub mod runs_api;
 pub mod schedule;

@@ -491,6 +491,27 @@ enum RoutingCmd {
         #[arg(long = "ref")]
         git_ref: Option<String>,
     },
+    /// Where a leg with these `runs-on` labels would go now, by the rules and the runners.
+    Where {
+        #[arg(required = true)]
+        labels: Vec<String>,
+        #[arg(long)]
+        repo: Option<String>,
+        /// Constraints of its own (`requires:`), e.g. `"memory >= 16Gi"`.
+        #[arg(long = "require")]
+        requires: Vec<String>,
+    },
+    /// The routing rules in the order they apply, with where each comes from; `--set FILE`
+    /// replaces a scope's stored rules with the YAML list in FILE, `--clear` removes them.
+    Rules {
+        /// `server` or `org:<owner>` (a repository's rules are its `.kiln/routing.yaml`).
+        #[arg(long, default_value = "server")]
+        scope: String,
+        #[arg(long)]
+        set: Option<std::path::PathBuf>,
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 fn print_runners(runners: &[Value]) {
@@ -503,7 +524,34 @@ fn print_runners(runners: &[Value]) {
 
 pub async fn routing(args: RoutingArgs, cfg: &Config) -> Result<()> {
     let api = args.conn.api(cfg).await?;
-    let RoutingCmd::Explain { target, repo, git_ref } = args.cmd;
+    let (target, repo, git_ref) = match args.cmd {
+        RoutingCmd::Explain { target, repo, git_ref } => (target, repo, git_ref),
+        RoutingCmd::Where { labels, repo, requires } => {
+            let v = api.call(Method::Post, "/routing/explain", Some(json!({ "labels": labels, "repo": repo.unwrap_or_default(), "requires": requires }))).await?;
+            let strs = |k: &str| v.get(k).and_then(Value::as_array).cloned().unwrap_or_default().iter().filter_map(|x| x.as_str().map(str::to_owned)).collect::<Vec<_>>().join(", ");
+            println!("labels left for runners: [{}]; constraints: [{}]; executors: [{}]; image: {}", strs("labels"), strs("constraints"), strs("executors"), v.get("image").and_then(Value::as_str).unwrap_or("none"));
+            for r in v.get("rules").and_then(Value::as_array).cloned().unwrap_or_default() {
+                println!("  rule from {}: {}", r.get("source").and_then(Value::as_str).unwrap_or_default(), r.get("rule").map(Value::to_string).unwrap_or_default());
+            }
+            print_runners(&v.get("runners").and_then(Value::as_array).cloned().unwrap_or_default());
+            return Ok(());
+        }
+        RoutingCmd::Rules { scope, set, clear } => {
+            if set.is_some() || clear {
+                let rules: Value = match set {
+                    Some(f) => serde_yaml::from_str(&std::fs::read_to_string(&f)?)?,
+                    None => json!([]),
+                };
+                let rules = rules.get("rules").cloned().unwrap_or(rules);
+                api.call(Method::Put, &format!("/routing/rules?scope={}", enc(&scope)), Some(json!({ "rules": rules }))).await?;
+            }
+            let v = api.call(Method::Get, "/routing/rules", None).await?;
+            for r in v.get("rules").and_then(Value::as_array).cloned().unwrap_or_default() {
+                println!("{:>3}  {:<24} {}", r.get("index").and_then(Value::as_u64).unwrap_or_default(), r.get("source").and_then(Value::as_str).unwrap_or_default(), r.get("rule").map(Value::to_string).unwrap_or_default());
+            }
+            return Ok(());
+        }
+    };
     let Some(repo) = repo else {
         let v = api.call(Method::Get, &format!("/legs/{}/routing", enc(&target)), None).await?;
         if let Some(w) = v.get("wait_reason").filter(|w| !w.is_null()) {

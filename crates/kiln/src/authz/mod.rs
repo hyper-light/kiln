@@ -320,6 +320,8 @@ pub static ROUTES: &[Rule] = &[
     any("/api/ci/actions/**", "settings.manage", At::Server),
     any("/api/ci/oidc", "settings.manage", At::Server),
     any("/api/ci/oidc/**", "settings.manage", At::Server),
+    r("POST", "/api/ci/routing/explain", "runs.read", At::Anywhere),
+    any("/api/ci/routing/rules", "routing.manage", At::ScopeQuery),
     r("GET", "/api/ci/integrations/kinds", "runs.read", At::Anywhere),
     any("/api/ci/integrations", "integrations.manage", At::Server),
     any("/api/ci/integrations/**", "integrations.manage", At::Server),

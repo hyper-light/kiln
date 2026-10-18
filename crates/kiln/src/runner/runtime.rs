@@ -518,12 +518,17 @@ impl Leg {
     pub async fn run(self) -> JobResult {
         let job = self.a.job_id.clone();
         let started = Instant::now();
+        let ws = Layout::new(&self.work_dir, &self.a.job_id, &self.a.repo, self.hosted_image()).runner_workspace;
+        super::workspaces::claim(&self.work_dir, &ws).await;
         let r = std::panic::AssertUnwindSafe(self.run_inner()).catch_unwind().await;
         let (status, error) = match r {
             Ok(Ok(s)) => (s, None),
             Ok(Err(e)) => (Status::Failed, Some(format!("{e:#}"))),
             Err(_) => (Status::Failed, Some("the runtime failed unexpectedly".into())),
         };
+        // The workspace goes with the leg, unless a failed leg is kept to look into (W17-R02).
+        let keep = if matches!(status, Status::Failed | Status::TimedOut) { self.a.debug.keep_on_failure_minutes } else { None };
+        super::workspaces::release(&ws, keep).await;
         let _ = started;
         JobResult { job, status, exit_code: None, error, peak_rss: None, cpu_seconds: None }
     }

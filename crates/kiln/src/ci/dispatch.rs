@@ -13,7 +13,7 @@ use std::time::Duration;
 use kiln_ci::plan::{self, Conclusion as PlanC, LegReport, LegSpec, PlanAction, PlanSource, RunInput, RunPlan, Settings};
 use kiln_ci::sched::groups::GroupConfig;
 use kiln_ci::sched::retry::{Failed, FailureClass, RetryPolicy};
-use kiln_ci::sched::routing::{self, LegRoute, RunnerView};
+use kiln_ci::sched::routing::{LegRoute, RunnerView};
 use kiln_ci::sched::{Command, Config, Input, LegIn, Outcome, RunnerIn, Scheduler};
 use kiln_ci::trigger::Event;
 use kiln_ci::wf::Workflow;
@@ -57,6 +57,10 @@ pub enum Msg {
     Explain { leg: String, reply: async_channel::Sender<serde_json::Value> },
     /// The plan `Start` would make, without a run (W04-R29).
     Preview { start: Box<Start>, reply: async_channel::Sender<serde_json::Value> },
+    /// The stored routing rules changed (W05-R21): read them again.
+    RoutingChanged,
+    /// Where a leg routed so would go now, and why each runner can or can't take it.
+    ExplainRoute { route: Box<LegRoute>, reply: async_channel::Sender<serde_json::Value> },
     /// A new attempt of a finished run (W05-R17): its number, or why not.
     Rerun { run: String, mode: RerunMode, debug: bool, actions: Option<std::collections::BTreeMap<String, wire::ActionRef>>, reply: async_channel::Sender<Result<u32, String>> },
 }
@@ -177,6 +181,8 @@ impl PlanSource for Source<'_> {
 struct Dispatch {
     hub: Arc<Hub>,
     sched: Scheduler,
+    /// The routing rules by source (W05-R21); the scheduler holds them in order.
+    routing: super::routing::Sources,
     runs: HashMap<String, RunSt>,
     legs: HashMap<String, LegSt>,
     timers: BTreeSet<i64>,
@@ -218,11 +224,9 @@ pub fn spawn(hub: Arc<Hub>) {
     hub.ci.on.store(true, Ordering::Relaxed);
     super::services::spawn_maintenance(Arc::clone(&hub));
     crate::rt::spawn(async move {
-        let mut rules = vec![routing::native_rule()];
-        if hub.cfg.ci.github_labels {
-            rules.extend(routing::github_label_rules());
-        }
-        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
+        let sources = super::routing::sources(&hub).await;
+        let rules = sources.effective();
+        let mut d = Dispatch { hub: Arc::clone(&hub), sched: Scheduler::new(Config { rules, ..Config::default() }), routing: sources, runs: HashMap::new(), legs: HashMap::new(), timers: BTreeSet::new() };
         if let Err(e) = d.restore().await {
             tracing::warn!(error = %format!("{e:#}"), "the CI engine could not rebuild its runs");
         }
@@ -280,6 +284,23 @@ impl Dispatch {
                 let _ = reply.try_send(v);
                 Ok(())
             }
+            Msg::RoutingChanged => {
+                let fresh = super::routing::sources(&self.hub).await;
+                if fresh != self.routing {
+                    self.routing = fresh;
+                    self.rules_changed().await;
+                }
+                Ok(())
+            }
+            Msg::ExplainRoute { route, reply } => {
+                let (req, runners) = self.sched.explain_route(&route);
+                let constraints: Vec<&String> = req.constraints.iter().map(|(text, _)| text).collect();
+                let labelled = self.routing.labelled();
+                let rules: Vec<serde_json::Value> = req.rules.iter().filter_map(|i| labelled.get(*i)).map(|(source, r)| serde_json::json!({ "source": source, "rule": r })).collect();
+                let v = serde_json::json!({ "labels": req.labels, "group": req.group, "constraints": constraints, "executors": req.executors, "image": req.image, "rules": rules, "runners": runners });
+                let _ = reply.try_send(v);
+                Ok(())
+            }
             Msg::Rerun { run, mode, debug, actions, reply } => {
                 let r = self.rerun(&run, &mode, debug, actions).await.map_err(|e| format!("{e:#}"));
                 let _ = reply.try_send(r);
@@ -289,6 +310,12 @@ impl Dispatch {
         if let Err(e) = r {
             tracing::warn!(error = %format!("{e:#}"), "CI dispatcher");
         }
+    }
+
+    /// Hands the scheduler the rules as they now stand: waiting legs are routed again.
+    async fn rules_changed(&mut self) {
+        let cmds = self.sched.handle(Input::RulesChanged(self.routing.effective()), now_ms());
+        self.commands(cmds).await;
     }
 
     async fn tick(&mut self) {
@@ -323,6 +350,11 @@ impl Dispatch {
 
     /// A workflow that matched an event becomes a run (W04-R01).
     async fn start(&mut self, s: Start) -> anyhow::Result<()> {
+        // The repository's routing rules as its default branch has them now (W05-R21).
+        let fresh = super::routing::repo_rules(&self.hub, &s.repo).await;
+        if self.routing.set_repo(&s.repo.name, fresh) {
+            self.rules_changed().await;
+        }
         let id = crate::util::new_id();
         let trusted = s.event.trusted;
         let model = serde_json::to_string(&*s.workflow).unwrap_or_default();

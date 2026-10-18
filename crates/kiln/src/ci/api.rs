@@ -93,6 +93,17 @@ pub async fn route(hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, r
             let body: serde_json::Value = if method == Method::PUT || method == Method::POST { crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))? } else { serde_json::Value::Null };
             super::actions::route(hub, &method, tail, q, body).await
         }
+        // W05-R21: routing rules, and where a leg would go.
+        (&Method::GET, ["routing", "rules"]) => super::routing::get(hub).await,
+        (&Method::PUT, ["routing", "rules"]) => {
+            let by = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 20).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::routing::put(hub, q, body, &by).await
+        }
+        (&Method::POST, ["routing", "explain"]) => {
+            let body: serde_json::Value = crate::http::server::body_json(req.into_body(), 1 << 16).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+            super::routing::explain(hub, body).await
+        }
         // W09: secrets (names only) and variables.
         (_, ["secrets", ..] | ["variables", ..]) => super::secrets::route(hub, &method, rest, q, req.into_body()).await,
         // W11: integrations, shared by jobs and deployments (docs/cd-targets.md §6, §7.1).

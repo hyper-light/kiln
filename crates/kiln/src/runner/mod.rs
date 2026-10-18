@@ -5,3 +5,4 @@
 pub mod docker;
 pub mod hashfiles;
 pub mod runtime;
+pub mod workspaces;

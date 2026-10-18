@@ -21,6 +21,15 @@ pub struct Ci {
     /// (docs/ci.md W05-R21). Off by default: then such a label must be on a runner, as it must for
     /// GitHub's self-hosted runners.
     pub github_labels: bool,
+    /// `[[ci.routing]]`: the server's routing rules (docs/ci.md W05-R21), applied before any
+    /// organization's, repository's or default rule, so their executor and image win:
+    ///
+    /// ```toml
+    /// [[ci.routing]]
+    /// match = { labels = ["ubuntu-latest"] }
+    /// executor = ["host"]
+    /// ```
+    pub routing: Vec<kiln_ci::sched::routing::Rule>,
     pub cache: Cache,
     pub artifacts: Artifacts,
     pub oidc: Oidc,
