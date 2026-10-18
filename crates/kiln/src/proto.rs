@@ -184,6 +184,9 @@ pub const CAP_SHARDS: u32 = 1 << 14;
 pub const CAP_FACTS: u32 = 1 << 15;
 /// The runner opens terminals into legs ([`ServerMsg::JobTerminalOpen`], docs/ci.md W17).
 pub const CAP_JOB_TTY: u32 = 1 << 16;
+/// The runner's Docker or Podman runs rootless, so untrusted legs may use it (docs/ci.md W18-R07).
+/// Clear of `CAP_REACH`, `CAP_REPOS` and `CAP_CONVO`.
+pub const CAP_DOCKER_ROOTLESS: u32 = 1 << 20;
 /// The runner takes reach links ([`ServerMsg::Reach`], `crate::reach`).
 pub const CAP_REACH: u32 = 1 << 17;
 /// [`AgentMsg::Build`] capability: the runner keeps its agent sessions' conversations in a store
@@ -538,6 +541,7 @@ mod tests {
         assert_eq!(decode::<AgentMsg>(&b)?, convo);
         let all = [CAP_UPGRADE, CAP_TAKEOVER, CAP_DIRS, CAP_TAKEOVER_STOP, CAP_SYNC, CAP_FRONT_DOOR, CAP_REPOS, CAP_OUTPOST, CAP_CI2, CAP_ACTIONS, CAP_DOCKER, CAP_FIRECRACKER, CAP_SHARDS, CAP_FACTS, CAP_JOB_TTY, CAP_REACH];
         assert!(CAP_CONVO.is_power_of_two() && all.iter().all(|c| c & CAP_CONVO == 0), "CAP_CONVO is a bit of its own");
+        assert!(CAP_DOCKER_ROOTLESS.is_power_of_two() && all.iter().chain([&CAP_CONVO]).all(|c| c & CAP_DOCKER_ROOTLESS == 0), "CAP_DOCKER_ROOTLESS is a bit of its own");
         // Observe's and updates' bits, taken elsewhere; a lane of its own, within the eight a peer has.
         const { assert!(CAP_CONVO & (128 | 256 | 512) == 0) };
         const { assert!(LANE_CONVO > LANE_REACH && LANE_CONVO != 5 && LANE_CONVO < 8) };

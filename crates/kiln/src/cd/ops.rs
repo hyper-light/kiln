@@ -1268,7 +1268,8 @@ async fn delete(cx: Cx, v: Value) -> Out {
     let id = app_id(&v)?;
     agents_may(&cx, &id, "delete")?;
     let entry = cx.cd.apps.read().get(&id).cloned().ok_or_else(|| missing(format!("no app {id}")))?;
-    let cascade = str_in(&v, "cascade").map(|c| c != "orphan").unwrap_or(entry.def.cascade);
+    // A shadowed app's objects are Argo CD's: kiln only stops comparing them.
+    let cascade = !super::is_shadow(&entry.def) && str_in(&v, "cascade").map(|c| c != "orphan").unwrap_or(entry.def.cascade);
     if matches!(entry.def.origin, Origin::Api | Origin::Argo { parent: None }) {
         propose(&cx.cd, Command::DeleteApp(id.clone())).await?;
     }

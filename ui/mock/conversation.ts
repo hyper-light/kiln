@@ -190,13 +190,26 @@ const pause = (): State["pause"] =>
         checkpoint: { git_ref: "refs/kiln/checkpoints/demo-long/1792300000000", commit: "4f1c2a9e07b3d5c6a8e9f0b1c2d3e4f5a6b7c8d9", at: LIVE_AT + 8_000 },
       }
     : undefined;
+// MOCK_NEAR=1: close to the 5-hour limit, with a weekly one and a model's own (as a Max plan shows them).
+const NEAR = process.env.MOCK_NEAR === "1";
 const limits = (): State["limits"] =>
   PAUSED
     ? [
         { id: "five_hour", label: "Session", used_percent: 100, resets_at: PAUSED_UNTIL, window: "5h", status: "rejected" },
         { id: "seven_day", label: "Weekly", used_percent: 62, resets_at: PAUSED_UNTIL + 3 * 86_400_000, window: "7d" },
       ]
-    : [{ id: "seven_day", label: "Weekly", used_percent: 62, resets_at: LIVE_AT + 3 * 86_400_000, window: "7d" }];
+    : NEAR
+      ? [
+          { id: "five_hour", label: "Session", used_percent: 99, resets_at: Date.now() + 82 * 60_000, window: "5h", status: "warning" },
+          { id: "seven_day", label: "Weekly", used_percent: 80, resets_at: Date.now() + 5 * 86_400_000 + 13 * 3_600_000, window: "7d", status: "warning" },
+          { id: "seven_day_fable", label: "Weekly · Fable", used_percent: 0, resets_at: Date.now() + 5 * 86_400_000 + 13 * 3_600_000, window: "7d" },
+        ]
+      : [{ id: "seven_day", label: "Weekly", used_percent: 62, resets_at: LIVE_AT + 3 * 86_400_000, window: "7d" }];
+// MOCK_OFFLINE_MS: its machine is away that long from the start, then back.
+let offlineUntil = Date.now() + Number(process.env.MOCK_OFFLINE_MS ?? 0);
+const offline = () => Date.now() < offlineUntil;
+let pauseAt: number | undefined;
+let moveOn = false;
 
 const info: AgentInfo = {
   id: ID,
@@ -250,7 +263,9 @@ let doing = "Thinking";
 let turnStarted = Date.now() - Number(process.env.MOCK_TURN_AGE_MS ?? 134_000);
 let lastTurn: State["last_turn"];
 const state = (): State => ({
-  status: running ? "running" : "idle",
+  status: offline() ? "disconnected" : running ? "running" : "idle",
+  pause_at: pauseAt,
+  move_on_limit: moveOn || undefined,
   doing: running ? doing : undefined,
   turn_started: running ? turnStarted : undefined,
   last_turn: running ? undefined : lastTurn,
@@ -376,6 +391,18 @@ export function searchSaid(q: string, agent: string | null, until: number | null
 const late = Number(process.env.MOCK_LATE_SESSION ?? 0);
 const knownAt = Date.now() + late;
 if (late > 0) setTimeout(() => emit({ type: "harness", info: longInfo() }), late);
+// Its machine back: viewers hear it, as the server tells them.
+if (offline())
+  setTimeout(() => {
+    broadcast({ t: "state", state: state() });
+    emit({ type: "harness", info: longInfo() });
+  }, offlineUntil - Date.now() + 50);
+/** Send its machine away again for `ms` (the browser checks drive it, `POST /mock/away`). */
+export function sendAway(ms: number) {
+  offlineUntil = Date.now() + ms;
+  broadcast({ t: "state", state: state() });
+  setTimeout(() => broadcast({ t: "state", state: state() }), ms + 50);
+}
 
 export function handleLongSession(ws: WebSocket, id: string): boolean {
   if (id !== ID) return false;
@@ -406,13 +433,20 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
   };
   go(0);
   ws.on("message", (raw) => {
-    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string };
+    let c: { type?: string; text?: string; id?: string; mode?: string; model?: string; effort?: string; percent?: number | null; on?: boolean };
     try {
       c = JSON.parse(raw.toString()) as typeof c;
     } catch {
       return;
     }
-    if (c.type === "set_mode" && c.mode) info.mode = c.mode;
+    // Its machine is away: the server can't hand it anything (it says so; the message is lost).
+    if (offline() && c.type === "send") {
+      send(ws, { t: "error", error: "its machine is away" });
+      return;
+    }
+    if (c.type === "pause_at") pauseAt = c.percent ?? undefined;
+    else if (c.type === "move_on_limit") moveOn = Boolean(c.on);
+    else if (c.type === "set_mode" && c.mode) info.mode = c.mode;
     else if (c.type === "set_model" && c.model) info.model = c.model;
     else if (c.type === "set_effort" && c.effort) effort = c.effort;
     else if (c.type === "force_stop") {

@@ -19,7 +19,7 @@ import { commandNames, Marked } from "./marks";
 import { SendWith } from "./run-settings";
 import { MicButton } from "./voice";
 import { modelLabel } from "./derive";
-import { useDrafts, useSendMode } from "./state";
+import { useDrafts, useHeld, useSendMode, type Held } from "./state";
 
 const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] = [
   { id: "queue", label: "Queue", hint: "Sent when it finishes what it's doing" },
@@ -29,8 +29,17 @@ const MODES: { id: SendMode; label: string; hint: string; feature?: string }[] =
 
 const fine = () => typeof window !== "undefined" && window.matchMedia?.("(pointer: fine)").matches;
 
-/** One queued message: its words (tap to read them whole), and what can be done with it. */
-function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: string; text: string; index: number; count: number; store: SessionStore; canNow: boolean; canSteer: boolean }) {
+/** What can be done with a waiting message, where it waits (kiln's queue, or this browser). */
+interface RowActs {
+  onEdit: (text: string) => void;
+  onRemove: () => void;
+  onMove?: (index: number) => void;
+  onSteer?: () => void;
+  onNow?: () => void;
+}
+
+/** One waiting message: its words (tap to read them whole), and what can be done with it. */
+function QueueRow({ text, index, count, onEdit, onRemove, onMove, onSteer, onNow }: { text: string; index: number; count: number } & RowActs) {
   const [editing, setEditing] = React.useState(false);
   const [whole, setWhole] = React.useState(false);
   const [draft, setDraft] = React.useState(text);
@@ -52,7 +61,7 @@ function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: str
           onChange={(e) => setDraft(e.target.value)}
           onBlur={() => {
             setEditing(false);
-            if (draft.trim() && draft !== text) store.send({ type: "queue_edit", id, text: draft });
+            if (draft.trim() && draft !== text) onEdit(draft);
           }}
           onKeyDown={(e) => {
             if (e.key === "Escape") {
@@ -73,32 +82,36 @@ function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: str
             <Pencil size={13} />
           </button>
         </Tip>
-        {canSteer && (
+        {onSteer && (
           <Tip content="Steer it into the running turn now, without interrupting">
-            <button type="button" className="hx-icon" aria-label="Steer now" onClick={() => store.send({ type: "queue_steer", id })}>
+            <button type="button" className="hx-icon" aria-label="Steer now" onClick={onSteer}>
               <Navigation size={13} />
             </button>
           </Tip>
         )}
-        {canNow && (
+        {onNow && (
           <Tip content="Stop the current turn and send this now">
-            <button type="button" className="hx-icon" aria-label="Send now" onClick={() => store.send({ type: "queue_send_now", id })}>
+            <button type="button" className="hx-icon" aria-label="Send now" onClick={onNow}>
               <Zap size={13} />
             </button>
           </Tip>
         )}
-        <Tip content="Move up">
-          <button type="button" className="hx-icon" aria-label="Move up" disabled={index === 0} onClick={() => store.send({ type: "queue_move", id, index: index - 1 })}>
-            <ArrowUp size={13} />
-          </button>
-        </Tip>
-        <Tip content="Move down">
-          <button type="button" className="hx-icon" aria-label="Move down" disabled={index === count - 1} onClick={() => store.send({ type: "queue_move", id, index: index + 1 })}>
-            <ArrowDown size={13} />
-          </button>
-        </Tip>
+        {onMove && (
+          <>
+            <Tip content="Move up">
+              <button type="button" className="hx-icon" aria-label="Move up" disabled={index === 0} onClick={() => onMove(index - 1)}>
+                <ArrowUp size={13} />
+              </button>
+            </Tip>
+            <Tip content="Move down">
+              <button type="button" className="hx-icon" aria-label="Move down" disabled={index === count - 1} onClick={() => onMove(index + 1)}>
+                <ArrowDown size={13} />
+              </button>
+            </Tip>
+          </>
+        )}
         <Tip content="Remove">
-          <button type="button" className="hx-icon qd-remove" aria-label="Remove" onClick={() => store.send({ type: "queue_remove", id })}>
+          <button type="button" className="hx-icon qd-remove" aria-label="Remove" onClick={onRemove}>
             <X size={13} />
           </button>
         </Tip>
@@ -107,8 +120,11 @@ function QueueRow({ id, text, index, count, store, canNow, canSteer }: { id: str
   );
 }
 
-/** What's queued: one line until opened; it folds again a few seconds after you leave it. */
-function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text: string }[]; store: SessionStore; canNow: boolean; canSteer: boolean }) {
+/**
+ * What waits: one line until opened; it folds again a few seconds after you leave it. `label`:
+ * where it waits ("Queued", "Kept here"); `hint`: when it goes; `acts`: what each one can do.
+ */
+function Queued({ queue, label, hint, acts }: { queue: { id: string; text: string }[]; label: string; hint: string; acts: (id: string) => RowActs }) {
   const [open, setOpen] = React.useState(false);
   const timer = React.useRef(0);
   const root = React.useRef<HTMLDivElement>(null);
@@ -149,15 +165,17 @@ function Queued({ queue, store, canNow, canSteer }: { queue: { id: string; text:
       onKeyDown={() => open && fold()}
     >
       <button type="button" className="qd-line" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <span className="qd-label">Queued · {queue.length}</span>
+        <span className="qd-label">
+          {label} · {queue.length}
+        </span>
         {!open && <span className="qd-first">{first}</span>}
-        {open && <span className="qd-hint">sent in order when it finishes</span>}
+        {open && <span className="qd-hint">{hint}</span>}
         <ChevronDown size={12} className="qd-chev" aria-hidden="true" />
       </button>
       {open && (
         <ol ref={folding} className="qd-list">
           {queue.map((q, i) => (
-            <QueueRow key={q.id} id={q.id} text={q.text} index={i} count={queue.length} store={store} canNow={canNow} canSteer={canSteer} />
+            <QueueRow key={q.id} text={q.text} index={i} count={queue.length} {...acts(q.id)} />
           ))}
         </ol>
       )}
@@ -217,7 +235,23 @@ const StopTurn = React.memo(function StopTurn({ store }: { store: SessionStore }
   );
 });
 
+/**
+ * What was kept here for `agent` goes, in order, if it can take it now (connected, its machine
+ * there). Those that went are dropped at once, after: a send that fails stops the rest.
+ */
+function sendHeld(store: SessionStore, agent: string) {
+  const s = store.get();
+  if (s.conn !== "open" || s.state?.status === "disconnected") return;
+  const went: string[] = [];
+  for (const m of useHeld.getState().held[agent] ?? []) {
+    if (!store.send({ type: "send", id: m.id, text: m.text, mode: "queue", attachments: m.attachments, overrides: m.overrides })) break;
+    went.push(m.id);
+  }
+  if (went.length) useHeld.getState().drop(agent, ...went);
+}
+
 const NO_QUEUE: QueueItem[] = [];
+const NO_HELD: Held[] = [];
 const NO_FEATURES: string[] = [];
 const NO_COMMANDS: SlashCommand[] = [];
 
@@ -245,8 +279,16 @@ export function Composer({
   const setText = React.useCallback((t: string | ((was: string) => string)) => setDraft(agent, typeof t === "function" ? t(useDrafts.getState().drafts[agent] ?? "") : t), [agent, setDraft]);
   const chosen = useSendMode((s) => s.mode);
   const setMode = useSendMode((s) => s.setMode);
+  // The connection's down: what needs the server (the mic, commands' replies) waits for it.
   const disabled = useSession(store, (s) => s.conn !== "open");
   const status = useSession(store, (s) => s.state?.status);
+  // The agent can't take a message now (its machine away, or the connection down): what you
+  // send is kept here, and goes once it can. Typing never stops.
+  const reachable = !disabled && status !== "disconnected";
+  // The machine it runs on, by name (none for one on the kiln server itself).
+  const machine = useSession(store, (s) => (s.info?.target?.startsWith("agent:") ? s.info.target.slice(6) : ""));
+  const paused = useSession(store, (s) => (s.state?.pause ? (s.state.pause.auto ? "auto" : "manual") : null));
+  const held = useHeld((s) => s.held[agent] ?? NO_HELD);
   const queue = useSession(store, (s) => s.state?.queue ?? NO_QUEUE);
   const approvals = useSession(store, (s) => s.state?.approvals.length ?? 0);
   const model = useSession(store, (s) => s.state?.model ?? "");
@@ -273,7 +315,25 @@ export function Composer({
   const pressTimer = React.useRef(0);
   const longPressed = React.useRef(false);
   const shellLine = Boolean(onTerminal) && text.trimStart().startsWith("!");
-  const sendLabel = shellLine ? "Run" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
+  const sendLabel = shellLine ? "Run" : !reachable || paused ? "Queue" : running ? (mode === "queue" ? "Queue" : mode === "steer" ? "Steer" : "Send now") : "Send";
+  const away = machine ? `${machine} is back` : "it's back";
+
+  // What was kept here goes, in order, once the agent can take it: whenever the session or what's
+  // kept changes, while the composer shows.
+  const sendsHeld = React.useCallback(
+    (el: HTMLDivElement | null) => {
+      if (!el) return;
+      const go = () => sendHeld(store, agent);
+      go();
+      const offSession = store.subscribe(go);
+      const offHeld = useHeld.subscribe(go);
+      return () => {
+        offSession();
+        offHeld();
+      };
+    },
+    [store, agent],
+  );
 
   // Grow with the text (measured as each change is shown) up to the stylesheet's most lines, ten,
   // or four on a phone; past that it scrolls inside, so a long message never pushes the
@@ -423,21 +483,15 @@ export function Composer({
   };
 
   const sendText = (body: string) => {
-    if ((!body && files.length === 0) || disabled || pending > 0) return;
-    const ok = store.send({
-      type: "send",
-      id: clientId(),
-      text: body,
-      mode: running ? mode : "queue",
-      attachments: files.length ? attachments.payload() : undefined,
-      overrides: override.model || override.effort ? override : undefined,
-    });
-    if (ok) {
-      write("");
-      clear();
-      setOverride({});
-      setWithOpen(false);
-    }
+    if ((!body && files.length === 0) || pending > 0) return;
+    const m = { id: clientId(), text: body, attachments: files.length ? attachments.payload() : undefined, overrides: override.model || override.effort ? override : undefined };
+    // It can't take it now (or what was kept here hasn't all gone yet): kept here, sent once it
+    // can, in order — never lost, never blocked.
+    if (held.length > 0 || !(reachable && store.send({ type: "send", ...m, mode: running ? mode : "queue" }))) useHeld.getState().hold(agent, { ...m, at: Date.now() });
+    write("");
+    clear();
+    setOverride({});
+    setWithOpen(false);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -494,8 +548,29 @@ export function Composer({
   };
 
   return (
-    <div className="hx-composer cp">
-      {queue.length > 0 && <Queued queue={queue} store={store} canNow={features.includes("send_now")} canSteer={features.includes("queue_steer")} />}
+    <div ref={sendsHeld} className="hx-composer cp">
+      {held.length > 0 && (
+        <Queued
+          queue={held}
+          label="Kept here"
+          hint={reachable ? "sending…" : `sent in order once ${away}`}
+          acts={(id) => ({ onEdit: (t) => useHeld.getState().edit(agent, id, t), onRemove: () => useHeld.getState().drop(agent, id) })}
+        />
+      )}
+      {queue.length > 0 && (
+        <Queued
+          queue={queue}
+          label="Queued"
+          hint={paused === "auto" ? "sent in order once the limit resets" : paused ? "sent in order once you resume it" : "sent in order when it finishes"}
+          acts={(id) => ({
+            onEdit: (text) => store.send({ type: "queue_edit", id, text }),
+            onRemove: () => store.send({ type: "queue_remove", id }),
+            onMove: (index) => store.send({ type: "queue_move", id, index }),
+            onSteer: features.includes("queue_steer") && !paused ? () => store.send({ type: "queue_steer", id }) : undefined,
+            onNow: features.includes("send_now") && !paused ? () => store.send({ type: "queue_send_now", id }) : undefined,
+          })}
+        />
+      )}
 
       {reply && <ReplyPanel reply={reply} onClose={() => setReply(null)} />}
       {palItems.length > 0 && <CommandList items={palItems} index={palIndex} onPick={pick} onHover={setPalIndex} />}
@@ -545,7 +620,7 @@ export function Composer({
           <SendWith className="cp-with" models={meta?.models ?? []} model={model} modelLabel={modelLabel} efforts={meta?.efforts ?? []} effort={effort} value={override} onChange={setOverride} />
         )}
         <div className="cp-field">
-          <div ref={mirror} className="hx-compose-input cp-mirror" aria-hidden="true" data-off={disabled || undefined}>
+          <div ref={mirror} className="hx-compose-input cp-mirror" aria-hidden="true">
             <Marked text={text} names={names} />
           </div>
           <textarea
@@ -553,11 +628,12 @@ export function Composer({
             className="hx-compose-input cp-input"
             rows={1}
             value={text}
-            disabled={disabled}
             placeholder={
-              disabled
-                ? "Not connected"
-                : toMain
+              !reachable
+                ? `${disabled ? "Not connected" : `${machine || "Its machine"} is offline`}: what you send waits here and goes once ${away}`
+                : paused
+                  ? `Queue a message: it goes once ${paused === "auto" ? "the limit resets" : "you resume it"}`
+                  : toMain
                   ? "Message the main agent"
                   : running
                     ? mode === "steer"
@@ -632,10 +708,10 @@ export function Composer({
             }}
             onPointerUp={() => window.clearTimeout(pressTimer.current)}
             onPointerLeave={() => window.clearTimeout(pressTimer.current)}
-            disabled={(!text.trim() && files.length === 0) || disabled || pending > 0}
+            disabled={(!text.trim() && files.length === 0) || pending > 0}
             aria-label={sendLabel}
           >
-            {running && mode === "queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}
+            {sendLabel === "Queue" ? <CornerDownLeft size={15} /> : <ArrowUp size={15} />}
             <span className="cp-label">{sendLabel}</span>
           </button>
         </div>

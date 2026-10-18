@@ -452,7 +452,7 @@ impl Core {
         self.touch_state();
     }
 
-    pub fn events(&self) -> impl Iterator<Item = &Event> {
+    pub fn events(&self) -> impl DoubleEndedIterator<Item = &Event> {
         self.events.iter()
     }
 

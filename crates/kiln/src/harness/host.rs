@@ -52,6 +52,8 @@ pub struct Saved {
     pause_at: Option<u8>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     manual_resume: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    move_on_limit: bool,
     /// A turn of its was under way, and hadn't ended, when this runner last saved it: a restart
     /// (an upgrade, the system stopping the runner, a crash) cut it short, and started again it
     /// is told to go on with it.
@@ -87,6 +89,7 @@ fn record(s: &Session) -> Saved {
         pause: st.pause.clone(),
         pause_at: st.pause_at,
         manual_resume: st.manual_resume,
+        move_on_limit: st.move_on_limit,
         cut: s.turn_open.load(Ordering::Relaxed),
         harness: ran.0,
         ran: ran.1,
@@ -556,7 +559,7 @@ impl Host {
         }
         let trees = super::survivors::trees(&alive);
         let session = self.open_seeded(Some(s.id), s.spec, seed, None)?;
-        let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume;
+        let paused = s.pause.is_some() || s.pause_at.is_some() || s.manual_resume || s.move_on_limit;
         if !trees.is_empty() {
             session.ran.lock().1.clone_from(&alive);
             *session.left.lock() = trees.iter().map(|(root, _)| root.clone()).collect();
@@ -571,6 +574,7 @@ impl Host {
             core.state.pause = s.pause.map(|p| super::model::Pause { checking: None, ..p });
             core.state.pause_at = s.pause_at;
             core.state.manual_resume = s.manual_resume;
+            core.state.move_on_limit = s.move_on_limit;
             // The turn the restart cut short goes on first, in kiln's words, with what it started
             // that still runs.
             if cut {
@@ -816,6 +820,8 @@ pub fn refusal(id: &str, spec_json: &str, error: &str) -> Vec<super::core::Updat
         pause: None,
         last_turn: None,
         keep_off: false,
+        move_on_limit: false,
+        pause_at: None,
     };
     let state = super::model::State { status: Status::Exited, exit: Some(exit), reach: spec.reach.clone(), ..Default::default() };
     vec![super::core::Update::Open { info: Box::new(info) }, super::core::Update::State { state: Box::new(state) }]

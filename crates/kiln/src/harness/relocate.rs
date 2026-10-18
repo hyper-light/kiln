@@ -22,7 +22,7 @@ use crate::sync::tasks::{Ask, Kind as TaskKind, Source, Target};
 const COPY_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// `cwd` is `root` or inside it.
-fn within(cwd: &str, root: &str) -> Option<String> {
+pub(super) fn within(cwd: &str, root: &str) -> Option<String> {
     let root = root.trim_end_matches('/');
     if cwd == root {
         return Some(String::new());

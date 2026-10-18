@@ -117,7 +117,6 @@ export function AgentHeader({
 }) {
   const navigate = useNavigate();
   const features = meta?.features ?? [];
-  const sessionControls = (meta?.controls ?? []).filter((c) => (c.scope ?? "session") === "session").length;
   const running = status === "running" || status === "waiting";
   const activity = state?.activity ?? info?.activity;
   const cost = state?.usage?.cost_usd ?? info?.cost_usd ?? 0;
@@ -125,7 +124,8 @@ export function AgentHeader({
   const approvals = state?.approvals ?? [];
   const left = state?.left_behind ?? info?.left_behind ?? 0;
   const openShell = info?.shell ? () => navigate(`/terminal?session=${encodeURIComponent(info.shell ?? "")}`) : null;
-  const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), ...(sessionControls > 0 ? [{ label: "Settings…", onSelect: onSettings }] : [])];
+  // Settings always: kiln's own (usage limits) are there whatever the harness offers.
+  const extra = [...(openShell ? [{ label: "Open its shell", onSelect: openShell }] : []), { label: "Settings…", onSelect: onSettings }];
   // Codex takes a new permission mode, model or effort from its next turn.
   const nextTurn = info?.kind === "codex" ? { mode: true, model: true, effort: true } : undefined;
   // How it runs, as one line; with the other harnesses' models on its machine where it can go on in them.
@@ -258,6 +258,8 @@ export function AgentHeader({
           plan={plan}
           stopAt={state?.pause_at ?? null}
           onStopAt={(percent) => send({ type: "pause_at", percent })}
+          moveOn={state?.move_on_limit ?? false}
+          onMoveOn={(on) => send({ type: "move_on_limit", on })}
           onMore={() => {
             setUsage(false);
             onUsage();

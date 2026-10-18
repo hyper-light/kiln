@@ -85,6 +85,20 @@ pub struct AssignmentV2 {
     pub integrations: Vec<Integration>,
     pub debug: Debug,
     pub limits: Limits,
+    /// W18-R08: where the leg's containers may connect, through the runner's egress proxy;
+    /// `None` when they connect freely.
+    #[serde(default)]
+    pub network: Option<Network>,
+}
+
+/// A leg's egress (W18-R08): the hosts it may reach (`*.example.com`, `host:port`) besides kiln's
+/// own server, which it always reaches.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Network {
+    pub allow: Vec<String>,
+    /// The leg is untrusted: if its executor can't enforce the policy it must not run.
+    pub untrusted: bool,
 }
 
 /// An integration a leg authenticates to (W11-R03): what the runner needs to give its steps the

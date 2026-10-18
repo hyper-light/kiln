@@ -207,6 +207,12 @@ pub struct Info {
     /// Kiln doesn't keep it going when it stops part-way (`goals::keep`; set on the server).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_off: bool,
+    /// At a usage limit it goes on on another machine with room (as `State::move_on_limit`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub move_on_limit: bool,
+    /// Where it pauses as its limits fill (as `State::pause_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_at: Option<u8>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -260,6 +266,8 @@ impl Info {
         self.reach.clone_from(&s.reach);
         self.pause.clone_from(&s.pause);
         self.last_turn.clone_from(&s.last_turn);
+        self.move_on_limit = s.move_on_limit;
+        self.pause_at = s.pause_at;
     }
 
     /// The parts lists care about changed (activity timestamps aside).
@@ -712,6 +720,8 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, core: Core, sink: Sink, on
         pause: None,
         last_turn: None,
         keep_off: false,
+        move_on_limit: false,
+        pause_at: None,
     };
     let (ctl, ctl_rx) = async_channel::unbounded();
     let s = Arc::new(Session {
@@ -1670,6 +1680,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                 let line: Vec<u8> = buf.drain(..=nl).collect();
                                 adapter.line(&mut core, &String::from_utf8_lossy(&line));
                             }
+                            // At its stop point in the middle of a turn: it stops at its next step.
+                            if super::pause::stop_mid_turn(&mut core) {
+                                adapter.command(&mut core, Command::Interrupt);
+                            }
                             if buf.len() > 32 << 20 {
                                 tracing::warn!(session = %s.id, "dropping an oversized line from the harness");
                                 buf.clear();
@@ -1758,6 +1772,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             // reached the limit.
                             Command::Resume => {
                                 let mut core = s.core.lock();
+                                // Going on regardless: the stop point leaves the windows past it be.
+                                super::pause::waive_stop_point(&mut core);
                                 if let Some(p) = super::pause::release(&mut core, "Resumed by you.") {
                                     adapter.go_on(&mut core, p);
                                 }
@@ -1777,6 +1793,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                             Command::PauseAt { percent } => {
                                 let mut core = s.core.lock();
                                 core.state.pause_at = percent.filter(|p| (1..=100).contains(p));
+                                core.touch_state();
+                                drop(core);
+                                on_change();
+                            }
+                            Command::MoveOnLimit { on } => {
+                                let mut core = s.core.lock();
+                                core.state.move_on_limit = on;
                                 core.touch_state();
                                 drop(core);
                                 on_change();
@@ -1908,7 +1931,12 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                     // Polls the harness only answers when asked: every few seconds, however busy.
                     if Instant::now() >= next_tick {
                         next_tick = Instant::now() + TICK;
-                        adapter.tick(&mut s.core.lock());
+                        let mut core = s.core.lock();
+                        adapter.tick(&mut core);
+                        // A step that ended without a word after it (limits that grew meanwhile).
+                        if super::pause::stop_mid_turn(&mut core) {
+                            adapter.command(&mut core, Command::Interrupt);
+                        }
                     }
                     jobs = flush(&s, &sink, Some(&p.stdin)).await;
                     let listed = {
@@ -2166,6 +2194,8 @@ mod tests {
             pause: None,
             last_turn: None,
             keep_off: false,
+            move_on_limit: false,
+            pause_at: None,
         };
         let before = i.clone();
         let mut st = State { status: Status::Running, mode: "plan".into(), ..State::default() };

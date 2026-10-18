@@ -53,16 +53,24 @@ impl PtyIo {
         let pid = child.process_id();
         crate::rt::spawn(async move {
             let code = match pid {
-                Some(pid) => wait_pid_exit(pid, || child.try_wait())
-                    .await
-                    .ok()
-                    .and_then(|st| i32::try_from(st.exit_code()).ok()),
+                Some(pid) => wait_pid_exit(pid, || child.try_wait()).await.ok().and_then(|st| exit_code(pid, &st)),
                 None => None,
             };
             crate::rt::sleep(Duration::from_millis(50)).await;
             let _ = out.send(PtyOut::Exit(code)).await;
         });
     }
+}
+
+/// The code a program exited with; None when a signal ended it, as for an adopted session.
+/// portable-pty calls that code 1, which reads as the program failing by itself (a build killed
+/// from outside looked like a failed build).
+fn exit_code(pid: u32, st: &portable_pty::ExitStatus) -> Option<i32> {
+    if let Some(signal) = st.signal() {
+        tracing::info!(pid, signal, "a terminal's program was ended by a signal");
+        return None;
+    }
+    i32::try_from(st.exit_code()).ok()
 }
 
 /// PTY → `out` (until EOF/EIO: the shell exited or the master closed, or `stop`: the session went

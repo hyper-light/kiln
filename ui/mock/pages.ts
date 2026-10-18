@@ -95,7 +95,8 @@ const apps = new Map<string, MockApp>();
         environment: cluster.startsWith("prod") ? "production" : "staging",
         auto: r() < 0.7,
         labels: { team: project },
-        origin: { kind: "deploy", repo: "https://github.com/hyper-light/deploy" },
+        // Every third one is kept in kiln (its sync policy is kiln's to change); the rest come from a deploy file.
+        origin: n % 3 === 0 ? { kind: "api" } : { kind: "deploy", repo: "https://github.com/hyper-light/deploy" },
         shadow: r() < 0.08,
         sync,
         health,
@@ -112,9 +113,13 @@ const apps = new Map<string, MockApp>();
         operation: op,
         pinned: null,
       };
+      // Only an app that syncs by itself is synced by auto-sync or self-heal.
+      if (op && !app.auto) op.trigger = "manual";
       const detail: CdAppDetail = {
         ...app,
         definition: {
+          name,
+          project,
           sources: [{ repo: "https://github.com/hyper-light/deploy", path: `apps/${project}/${name}`, revision: "main", chart: null, as_ref: null }],
           sync: { auto: app.auto, prune: true, self_heal: app.auto, allow_empty: false },
         },
@@ -370,7 +375,12 @@ function tree(id: string): CdTree | null {
     nodes.push(n);
     return n;
   };
-  const dep = managed("Deployment", a.name, "apps", { health: a.health === "Missing" ? "Missing" : a.health, ready: "3/3", info: [{ name: "Ready", value: "3/3" }] });
+  const dep = managed("Deployment", a.name, "apps", {
+    health: a.health === "Missing" ? "Missing" : a.health,
+    message: a.health === "Degraded" ? `Deployment "${a.name}" exceeded its progress deadline` : null,
+    ready: "3/3",
+    info: [{ name: "Ready", value: "3/3" }],
+  });
   const off = a.sync === "OutOfSync";
   managed("Service", a.name, "", off ? { sync: "OutOfSync", tracked_by: `default/${a.name}-argo`, shared_with: [`default/${a.name}-argo`], marks_only: true, why: `app default/${a.name}-argo's tracking is on it: a sync takes it over` } : {});
   managed("ConfigMap", `${a.name}-config`, "", { health: null, info: [{ name: "Keys", value: "4" }], ...(off ? { sync: "OutOfSync" as const, marks_only: true, why: ".metadata.labels.kiln.dev/app is missing live" } : {}) });
@@ -917,6 +927,16 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
               : x.app.localeCompare(y.app),
       );
     return (void json(res, 200, { apps: list, next: null }), true);
+  }
+  // An app kept in kiln, put again (its sync policy changed): what it says now.
+  if (p === "/api/cd/apps" && m === "POST") {
+    const def = await ctx.body<{ name?: string; project?: string; sync?: { auto: boolean; prune: boolean; self_heal: boolean; allow_empty: boolean } }>(req);
+    const a = apps.get(`${def.project}/${def.name}`);
+    if (!a || !def.sync) return (void json(res, 400, { error: "no such app, or no sync policy" }), true);
+    if (a.detail.definition) a.detail.definition.sync = def.sync;
+    a.detail.auto = def.sync.auto;
+    a.app.auto = def.sync.auto;
+    return (void json(res, 200, { app: a.detail.app }), true);
   }
   if (p === "/api/cd/plans/repos") return (void json(res, 200, { repos: PLAN_REPOS }), true);
   if (p === "/api/cd/plans" && m === "POST") {

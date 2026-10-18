@@ -61,6 +61,24 @@ pub struct Opts {
     /// installed. Its terminals, AI sessions and agents work; it takes no jobs, keeps no front
     /// door or repo copies, and is never upgraded by the server.
     pub outpost: bool,
+    /// What its administrator declares of it (docs/ci.md W13-R02).
+    pub declared: crate::runner::probe::Declared,
+}
+
+/// Probes this runner's facts and sends them (docs/ci.md W13-R01), one probe at a time.
+fn probe_facts(uplink: &Uplink, work_dir: &std::path::Path, declared: &crate::runner::probe::Declared, probing: &Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    if probing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (up, dir, declared, busy) = (uplink.clone(), work_dir.to_path_buf(), declared.clone(), Arc::clone(probing));
+    crate::rt::spawn(async move {
+        let facts = crate::runner::probe::gather(&dir, &declared).await;
+        if let Ok(json) = serde_json::to_string(&facts) {
+            up.msg(AgentMsg::Facts { json }).await;
+        }
+        busy.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Why an outpost turns a job down (an older server may still hand it one).
@@ -743,6 +761,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
     });
     let uplink = Uplink(up_tx);
+    // Its facts, probed again every 10 minutes (docs/ci.md W13-R01); once on each connection.
+    let probing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if !o.ephemeral && !o.outpost {
+        let (up, dir, declared, busy, stop) = (uplink.clone(), o.work_dir.clone(), o.declared.clone(), Arc::clone(&probing), shutdown.clone());
+        crate::rt::spawn(async move {
+            while stop.sleep(Duration::from_secs(600)).await {
+                probe_facts(&up, &dir, &declared, &busy);
+            }
+        });
+    }
     let (done_tx, done_rx) = async_channel::unbounded::<JobResult>();
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
@@ -1436,6 +1464,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     && let Ok(b) = proto::encode(&crate::updates::runner_facts())
                 {
                     net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
+                    // The rest, probed: they take a moment (docs/ci.md W13-R01).
+                    probe_facts(&uplink, &o.work_dir, &o.declared, &probing);
                 }
                 // Whether this machine takes upgrades (an older server skips it).
                 if !o.ephemeral && !o.outpost {
@@ -2025,11 +2055,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let _ = done.send(result).await;
                         });
                     }
-                    ServerMsg::ProbeFacts => {
-                        if let Ok(b) = proto::encode(&crate::updates::runner_facts()) {
-                            net.send(SERVER_PEER, LANE_CONTROL, Kind::Control, b).await;
-                        }
-                    }
+                    ServerMsg::ProbeFacts => probe_facts(&uplink, &o.work_dir, &o.declared, &probing),
                     // A terminal into a running or kept leg (docs/ci.md W17-R01), or a command run
                     // there (W17-R05): its workspace and environment, or its container; the leg's
                     // secrets masked in what it shows.

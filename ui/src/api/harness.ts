@@ -308,7 +308,7 @@ export interface State {
   switching?: { kind: string; model: string };
   /** Nothing more goes to the harness until this ends: its account reached a usage limit. Queued messages, goals and plan steps wait. */
   pause?: Pause;
-  /** It stops between turns once a limit is this full (percent); absent: only when one is reached. */
+  /** It pauses once a limit is this full (percent): between turns, or at the next step of one under way; absent: only when one is reached. */
   pause_at?: number;
   /** How its last turn ended (what kiln's keep-going reads). */
   last_turn?: TurnEnd;
@@ -316,6 +316,8 @@ export interface State {
   kept?: number;
   /** A pause ends only when a person resumes it. */
   manual_resume?: boolean;
+  /** At a limit it goes on on another machine whose harness is signed in to an account with room. */
+  move_on_limit?: boolean;
 }
 
 /** Why a session waits for a usage limit, and until when (`State.pause`). */
@@ -573,6 +575,10 @@ export interface AgentInfo {
   pause?: Pause;
   /** Kiln doesn't keep it going when it stops part-way (the "keep_going" control). */
   keep_off?: boolean;
+  /** At a limit it goes on on another machine with room (as `State.move_on_limit`). */
+  move_on_limit?: boolean;
+  /** Where it pauses as its limits fill (as `State.pause_at`). */
+  pause_at?: number;
   cost_usd: number;
   activity?: string;
   last_activity: number;
@@ -682,8 +688,10 @@ export type Command =
   | { type: "resume" }
   /** Whether a pause ends by itself once its limit resets. */
   | { type: "auto_resume"; on: boolean }
-  /** Stop between turns once a limit is this full (null: only when one is reached). */
-  | { type: "pause_at"; percent: number | null };
+  /** Pause once a limit is this full (null: only when one is reached). */
+  | { type: "pause_at"; percent: number | null }
+  /** Whether at a limit it goes on on another machine with room. */
+  | { type: "move_on_limit"; on: boolean };
 
 export type Update =
   | { t: "open"; info: AgentInfo }
