@@ -1156,6 +1156,8 @@ export interface OutpostInvite {
   /** When the invite stops working (unix seconds). */
   expires_at: number;
   commands: Record<InstallOs, string>;
+  /** The same lines without the invite: the outpost asks to join, and is approved on Add machines (servers from before don't say). */
+  ask?: Record<InstallOs, string>;
 }
 
 export interface JoinInfo {

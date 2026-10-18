@@ -173,11 +173,16 @@ app, per project or globally, as Argo CD's `ignoreDifferences` and `resource.cus
 
 kiln has built-in rules for Deployments, StatefulSets, DaemonSets, ReplicaSets, Pods, Jobs,
 Services, Ingresses, PersistentVolumeClaims, HorizontalPodAutoscalers and APIServices, matching
-Argo CD's. Other kinds use, in order: a rule from settings; the Lua script Argo CD's resource
-customizations library has for it (the library ships inside kiln, 290+ kinds); a generic rule for
-objects with `status.conditions` (`Ready` / `Available`); otherwise `Healthy` once it exists. An
-app's health is the worst of its resources', in Argo CD's order from worst: Unknown, Degraded,
-Missing, Progressing, Suspended, Healthy.
+Argo CD's. Before them, in Argo CD's order, come Lua scripts: a setting's for the kind (Argo CD's
+`resource.customizations.health.<group>_<kind>`, `*` allowed in the key), then the script Argo
+CD's resource customizations library has for it, then the library's wildcard scripts
+(`*.crossplane.io/*`). The library ships inside kiln (294 scripts: cert-manager, Argo Rollouts,
+Prometheus Operator, Crossplane, Istio, Strimzi, KEDA and more), and runs as Argo CD runs it, in
+Lua with Argo CD's libraries, the object as `obj`, and a second per script; kiln's tests run Argo
+CD's own expectations for every script (1,387 objects, status and message alike). A kind with no
+rule has no health and doesn't count toward its app's, as in Argo CD. An app's health is the
+worst of its resources', in Argo CD's order from worst: Unknown, Degraded, Missing, Progressing,
+Suspended, Healthy.
 
 ## Syncing
 

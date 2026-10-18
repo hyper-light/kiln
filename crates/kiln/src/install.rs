@@ -707,29 +707,43 @@ pub fn relaunch_runner(state_dir: &Path, instance: Option<&str>) -> anyhow::Resu
     anyhow::bail!("launchd would not run the reload: {}", tried.join("; "))
 }
 
-/// Runner supervisors of this user for `state_dir` that launchd did not start (`job` is the one
-/// it did): one an install whose load failed started from a terminal, say. Two runners of one
-/// machine would share its state directory, so an install stops them first.
+/// Runners of this user for `state_dir` that launchd is not running (`job` is the one it is): a
+/// supervisor an install whose load failed started from a terminal, say, or a runner its
+/// supervisor left behind when launchd stopped the job (an orphan, its parent gone). Two runners of
+/// one machine would share its state directory, so an install stops them first.
 fn stray_runners(state_dir: &Path, job: &[u32]) -> Vec<u32> {
-    let Ok(out) = Command::new("ps").args(["-x", "-o", "pid=", "-o", "command="]).stdin(Stdio::null()).stderr(Stdio::null()).output() else {
+    let Ok(out) = Command::new("ps").args(["-x", "-o", "pid=", "-o", "ppid=", "-o", "command="]).stdin(Stdio::null()).stderr(Stdio::null()).output() else {
         return Vec::new();
     };
     strays_in(&String::from_utf8_lossy(&out.stdout), state_dir, job, std::process::id())
 }
 
-/// [`stray_runners`] in `ps -o pid=,command=` output.
+/// [`stray_runners`] in `ps -o pid=,ppid=,command=` output.
 fn strays_in(ps: &str, state_dir: &Path, job: &[u32], me: u32) -> Vec<u32> {
     let ours = state_dir.canonicalize().unwrap_or_else(|_| state_dir.to_path_buf());
+    let same = |args: &[String]| {
+        let theirs = crate::upgrade::arg_value(args, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);
+        theirs.canonicalize().unwrap_or(theirs) == ours
+    };
     ps.lines()
         .filter_map(|l| {
             let mut words = l.split_whitespace();
             let pid: u32 = words.next()?.parse().ok()?;
+            let ppid: u32 = words.next()?.parse().ok()?;
             let words: Vec<String> = words.map(str::to_owned).collect();
-            let sep = words.iter().position(|w| w == "--")?;
-            let (before, after) = (words.get(..sep)?, words.get(sep + 1..)?);
-            let theirs = crate::upgrade::arg_value(after, "--state-dir").map_or_else(|| crate::config::default_data_dir().join("agent"), PathBuf::from);
-            let same = theirs.canonicalize().unwrap_or(theirs) == ours;
-            (before.iter().any(|w| w == "supervise") && after.first().is_some_and(|w| w == "agent") && same && pid != me && !job.contains(&pid)).then_some(pid)
+            if pid == me || job.contains(&pid) {
+                return None;
+            }
+            // `<kiln> supervise [--exe <kiln>] -- agent …`
+            if let Some(sep) = words.iter().position(|w| w == "--") {
+                let (before, after) = (words.get(..sep)?, words.get(sep + 1..)?);
+                if before.iter().any(|w| w == "supervise") && after.first().is_some_and(|w| w == "agent") && same(after) {
+                    return Some(pid);
+                }
+            }
+            // `<kiln> [--config=…] agent …` whose supervisor is gone.
+            let sub = words.iter().skip(1).find(|w| !w.starts_with('-'));
+            (ppid == 1 && sub.is_some_and(|w| w == "agent") && words.iter().all(|w| w != "supervise") && same(&words)).then_some(pid)
         })
         .collect()
 }
@@ -1007,16 +1021,20 @@ mod tests {
     #[test]
     fn runners_launchd_did_not_start_are_found() {
         let state = Path::new("/nonexistent/kiln-state");
-        let ps = "  101 /Users/me/.local/bin/kiln supervise -- agent --server http://h:7070 --state-dir /nonexistent/kiln-state\n  \
-                   102 /Users/me/.local/bin/kiln agent --server http://h:7070 --state-dir /nonexistent/kiln-state\n  \
-                   103 /Users/me/.local/share/kiln/launcher/kiln-agent supervise --exe /Users/me/.local/bin/kiln -- agent --state-dir /nonexistent/kiln-state\n  \
-                   104 /usr/local/bin/kiln supervise -- server\n  \
-                   105 /Users/me/.local/bin/kiln supervise -- agent --state-dir /elsewhere\n  \
-                   106 /Users/me/.local/bin/kiln supervise -- agent --state-dir /nonexistent/kiln-state\n";
-        // 101 and 106: supervisors of this state directory; 103 too, unless launchd runs it;
-        // never the runner under one (102), a server (104), another machine's runner (105), or this process.
-        assert_eq!(strays_in(ps, state, &[], 0), [101, 103, 106]);
-        assert_eq!(strays_in(ps, state, &[103], 106), [101]);
+        let ps = "  101     1 /Users/me/.local/bin/kiln supervise -- agent --server http://h:7070 --state-dir /nonexistent/kiln-state\n  \
+                   102   101 /Users/me/.local/bin/kiln agent --server http://h:7070 --state-dir /nonexistent/kiln-state\n  \
+                   103     1 /Users/me/.local/share/kiln/launcher/kiln-agent supervise --exe /Users/me/.local/bin/kiln -- agent --state-dir /nonexistent/kiln-state\n  \
+                   104     1 /usr/local/bin/kiln supervise -- server\n  \
+                   105     1 /Users/me/.local/bin/kiln supervise -- agent --state-dir /elsewhere\n  \
+                   106     1 /Users/me/.local/bin/kiln supervise -- agent --state-dir /nonexistent/kiln-state\n  \
+                   107     1 /Users/me/.local/bin/kiln --config=/c.toml agent --server http://h:7070 --state-dir /nonexistent/kiln-state\n  \
+                   108   900 /Users/me/.local/bin/kiln reach mcp\n  \
+                   109     1 /Users/me/.local/bin/kiln agent --state-dir /elsewhere\n";
+        // 101 and 106: supervisors of this state directory; 103 too, unless launchd runs it; 107: a
+        // runner its supervisor left behind. Never the runner under a supervisor (102), a server
+        // (104), another machine's runner (105, 109), something else of kiln's (108), or this process.
+        assert_eq!(strays_in(ps, state, &[], 0), [101, 103, 106, 107]);
+        assert_eq!(strays_in(ps, state, &[103], 106), [101, 107]);
     }
 
     /// launchd for real (macOS, by hand): a one-shot job reloads another and stops a process
