@@ -157,6 +157,9 @@ pub struct Registry {
     pub local: Arc<Host>,
     /// The server's conversation store (docs/conversations.md), when it's on.
     pub convo: Option<crate::convo::store::Store>,
+    /// What runners' feeds send into it (`crate::convo::feed`), and what to answer them.
+    pub feed: Option<crate::convo::feed::Intake>,
+    feed_out: Option<async_channel::Receiver<crate::convo::feed::Out>>,
     local_rx: async_channel::Receiver<(String, Update)>,
     /// Where `kiln spawn` in the server's own terminals reaches `local`.
     local_sock: Mutex<Option<String>>,
@@ -173,6 +176,9 @@ pub struct Registry {
     /// Sessions kiln doesn't keep going when they stop part-way (`goals::keep`; the "keep_going"
     /// control), kept in `keep-off.json` so it holds across restarts.
     keep_off: Mutex<std::collections::HashSet<String>>,
+    /// Each session's latest epoch (`State::epoch`) seen, those that went on on another machine at
+    /// least once, kept in `epochs.json`: a machine that announces an older copy lets go of it.
+    epochs: Mutex<HashMap<String, u64>>,
 }
 
 /// The name a session's machine reports as its own: none when it's empty or its harness's name.
@@ -207,6 +213,15 @@ impl Registry {
         // Every session's conversation, on every machine, kept on disk as it comes in
         // (docs/conversations.md): the server's own sessions' too, as they pass through `ingest`.
         let convo = crate::convo::open(&dir);
+        // Runners that keep a store send it here; the server keeps their sessions from that.
+        let (feed, feed_out) = match convo.as_ref().map(|st| crate::convo::feed::Intake::start(st.clone())) {
+            Some(Ok((i, o))) => (Some(i), Some(o)),
+            Some(Err(e)) => {
+                tracing::warn!(error = %format!("{e:#}"), "runners' conversation stores won't reach the server's");
+                (None, None)
+            }
+            None => (None, None),
+        };
         let local = Host::new(tx, Some(dir.join("local.json")), Limits::default());
         Self {
             mirrors: Mutex::new(HashMap::new()),
@@ -214,11 +229,14 @@ impl Registry {
             kinds: Mutex::new(HashMap::new()),
             local,
             convo,
+            feed,
+            feed_out,
             local_rx: rx,
             local_sock: Mutex::new(None),
             local_shells: Mutex::new(HashMap::new()),
             names: Mutex::new(std::fs::read(dir.join("names.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             keep_off: Mutex::new(std::fs::read(dir.join("keep-off.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
+            epochs: Mutex::new(std::fs::read(dir.join("epochs.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             dir,
             scanner: Arc::new(Mutex::new(None)),
         }
@@ -313,13 +331,89 @@ impl Registry {
     }
 
     /// The server's own sessions' updates, into the mirrors (supervised; restartable).
+    /// Sessions of machines that are away, as the server's store has them (the server started
+    /// again since they went away): listed as away, so they can be moved on, until their machine
+    /// says what it has.
+    pub fn restore_away(&self, hub: &Hub, away: Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>) {
+        let mut infos = Vec::new();
+        {
+            let mut g = self.mirrors.lock();
+            for (u, events) in away {
+                let Ok(mut info) = serde_json::from_str::<Info>(&u.info) else { continue };
+                // The machine whose feed brought it, else the one its updates came from.
+                let Some(machine) = u.machine.clone().or_else(|| info.target.strip_prefix("agent:").map(str::to_owned)) else { continue };
+                info.target = format!("agent:{machine}");
+                if g.contains_key(&u.id) || hub.agents.lock().get(&machine).is_some_and(|a| a.connected) {
+                    continue;
+                }
+                info.status = Status::Disconnected;
+                let mut m = Mirror::new(info.clone(), Location::Machine(machine));
+                m.meta = u.meta.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
+                m.state = u.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or(Value::Null);
+                if let Some(o) = m.state.as_object_mut() {
+                    o.insert("status".into(), json!("disconnected"));
+                }
+                for e in events {
+                    if let Ok(v) = serde_json::from_str::<Value>(&e.body) {
+                        m.upsert(v);
+                    }
+                }
+                g.insert(u.id, m);
+                infos.push(info);
+            }
+        }
+        if !infos.is_empty() {
+            tracing::info!(sessions = infos.len(), "agent sessions on machines that are away, from the conversation store");
+        }
+        for info in infos {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
+    }
+
     pub async fn run_local(hub: Arc<Hub>) -> anyhow::Result<()> {
         static RESTORED: std::sync::Once = std::sync::Once::new();
+        // Sessions of machines that are away: listed from the store (the last month's).
+        if let Some(st) = hub.harness.convo.clone() {
+            const AWAY_DAYS: i64 = 30;
+            const AWAY_EVENTS: usize = 200;
+            let since = crate::util::now_ms() - AWAY_DAYS * 24 * 3600 * 1000;
+            let read = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
+                let mut out = Vec::new();
+                for u in st.unended(since)? {
+                    let events = st.events(&u.id, None, AWAY_EVENTS)?;
+                    out.push((u, events));
+                }
+                Ok(out)
+            })
+            .await;
+            match read {
+                Ok(Ok(away)) => hub.harness.restore_away(&hub, away),
+                Ok(Err(e)) | Err(e) => tracing::warn!(error = %format!("{e:#}"), "sessions of machines that are away couldn't be read from the conversation store"),
+            }
+        }
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.lock().insert("local".to_owned(), offered);
         RESTORED.call_once(|| {
             hub.harness.local.restore_from(hub.harness.convo.as_ref());
+            // The server's own sessions' harness records, followed into its store.
+            if let Some(st) = &hub.harness.convo {
+                let local = hub.harness.local.clone();
+                if let Err(e) = crate::convo::record::Recorder::start(st.clone(), move || local.record_sources()) {
+                    tracing::warn!(error = %format!("{e:#}"), "the harnesses' records won't be kept in the conversation store");
+                }
+            }
+            // What the server answers runners' feeds, on the feed's lane.
+            if let Some(out) = hub.harness.feed_out.clone() {
+                let h = hub.clone();
+                crate::rt::spawn(async move {
+                    while let Ok(o) = out.recv().await {
+                        if let Ok(b) = crate::proto::encode(&crate::proto::ServerMsg::Convo { json: o.json, data: Vec::new() }) {
+                            h.net.send(o.peer, crate::proto::LANE_CONVO, crate::net::Kind::Log, b).await;
+                        }
+                    }
+                });
+            }
             match super::socket::serve(&hub.harness.local, super::socket::path("server", &hub.harness.dir)) {
                 Ok(p) => *hub.harness.local_sock.lock() = Some(p.to_string_lossy().into_owned()),
                 Err(e) => tracing::info!(error = %format!("{e:#}"), "`kiln spawn` will not be available in the server's own terminals"),
@@ -391,6 +485,40 @@ impl Registry {
 
     /// Apply one update from a machine and pass it on to the session's viewers.
     pub fn ingest(&self, hub: &Hub, from: &Location, id: &str, u: Update) {
+        self.ingest_from(hub, from, id, u, false);
+    }
+
+    /// Machine `machine` is where session `id` runs (or the server doesn't know the session yet):
+    /// what it says of it counts.
+    pub fn runs_on(&self, id: &str, machine: &str) -> bool {
+        self.mirrors.lock().get(id).is_none_or(|m| matches!(&m.location, Location::Machine(at) if at == machine))
+    }
+
+    /// A copy of session `id` at `epoch` is from before it went on elsewhere: its machine lets go
+    /// of it.
+    pub fn stale(&self, id: &str, epoch: u64) -> bool {
+        self.epochs.lock().get(id).is_some_and(|e| *e > epoch)
+    }
+
+    /// Session `id` is at `epoch` now (epochs only rise), kept when it changes.
+    fn raise_epoch(&self, id: &str, epoch: u64) {
+        let snapshot = {
+            let mut g = self.epochs.lock();
+            let e = g.entry(id.to_owned()).or_insert(0);
+            if *e >= epoch {
+                return;
+            }
+            *e = epoch;
+            g.clone()
+        };
+        if let Err(e) = self.keep_json("epochs.json", &snapshot) {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't keep the agents' epochs");
+        }
+    }
+
+    /// An update of session `id` from `from`. `shipped`: its machine keeps it in a store it sends
+    /// the server's (`crate::convo::feed`), which keeps it from that, not from here.
+    pub fn ingest_from(&self, hub: &Hub, from: &Location, id: &str, u: Update, shipped: bool) {
         let mut changed: Option<Info> = None;
         let mut gone = false;
         let mut save_names = false;
@@ -413,7 +541,18 @@ impl Registry {
             }
             other => other,
         };
-        if let Some(store) = &self.convo {
+        match &u {
+            Update::Open { info } if info.epoch > 0 => self.raise_epoch(id, info.epoch),
+            Update::Open { .. } => {}
+            // Only the machine a session runs on speaks for it: a copy left behind where it went
+            // on from says nothing more of it.
+            _ => {
+                if self.mirrors.lock().get(id).is_some_and(|m| m.location != *from) {
+                    return;
+                }
+            }
+        }
+        if let Some(store) = self.convo.as_ref().filter(|_| !shipped) {
             store.send(id, &u);
         }
         {
@@ -442,7 +581,7 @@ impl Registry {
             match &u {
                 Update::Open { .. } | Update::Reply { .. } => {}
                 Update::Closed => gone = true,
-                Update::Reset => {
+                Update::Reset { .. } => {
                     m.events.clear();
                     m.index.clear();
                 }
@@ -701,6 +840,7 @@ impl Registry {
                         objective: None,
                         summary: String::new(),
                         doing: None,
+                        epoch: 0,
                         todos_done: 0,
                         todos_total: 0,
                         files_changed: 0,
@@ -847,6 +987,68 @@ impl Registry {
     }
 
     /// Stop a session for good.
+    /// Session `id` goes on on machine `to` (in folder `cwd`, else the one it worked in), from the
+    /// server's conversation store, because its own machine is gone (`docs/conversations.md`,
+    /// "Resuming on another machine"). From here on the copy on the machine it was on doesn't
+    /// count: that machine lets go of it if it comes back. Ok once the package is on its way.
+    pub async fn resume_on(&self, hub: &Hub, id: &str, to: &str, cwd: Option<String>) -> Result<(), String> {
+        let store = self.convo.clone().ok_or_else(|| "this server keeps no conversations (KILN_CONVERSATIONS is off)".to_owned())?;
+        let (from, epoch) = {
+            let g = self.mirrors.lock();
+            let m = g.get(id).ok_or_else(|| "no such agent session".to_owned())?;
+            (m.location.clone(), m.state.get("epoch").and_then(Value::as_u64).unwrap_or(0))
+        };
+        let from_name = match &from {
+            Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
+            Location::Machine(m) => m.clone(),
+        };
+        if hub.agents.lock().get(&from_name).is_some_and(|a| a.connected) {
+            return Err(format!("{from_name} is online: move the session from there instead"));
+        }
+        if !hub.agents.lock().get(to).is_some_and(|a| a.connected) {
+            return Err(format!("{to} isn't connected"));
+        }
+        if hub.runner_caps(to) & crate::proto::CAP_CONVO == 0 {
+            return Err(format!("{to} runs a kiln too old to take a session from the server; upgrade it first"));
+        }
+        let (st, i, f, t) = (store.clone(), id.to_owned(), from_name.clone(), to.to_owned());
+        let pkg = crate::rt::blocking(move || crate::convo::resume::package(&st, &i, &f, &t, cwd.as_deref()))
+            .await
+            .map_err(|e| format!("{e:#}"))?
+            .map_err(|e| format!("{e:#}"))?;
+        let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        // Its copy where it was doesn't count from now on: not here, not in the store (rows that
+        // machine still sends are left out).
+        let next = epoch.max(pkg.state.epoch) + 1;
+        self.raise_epoch(id, next);
+        store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes: None, epoch: Some(next), open: false, at: crate::util::now_ms() }]);
+        let info = {
+            let mut g = self.mirrors.lock();
+            g.get_mut(id).map(|m| {
+                m.location = Location::Machine(to.to_owned());
+                m.info.target = m.location.target();
+                m.info.status = Status::Starting;
+                m.info.clone()
+            })
+        };
+        if let Some(info) = info {
+            hub.emit(&json!({"type": "harness", "info": info}));
+        }
+        tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
+        // In pieces, on the conversation lane.
+        const PIECE: usize = 3 << 20;
+        let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
+        let mut offset = 0u64;
+        for (n, piece) in pieces.iter().enumerate() {
+            let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
+            if !hub.send_to_agent(to, crate::proto::LANE_CONVO, &msg).await {
+                return Err(format!("{to} went away while the session was on its way"));
+            }
+            offset += piece.len() as u64;
+        }
+        Ok(())
+    }
+
     pub async fn close(&self, hub: &Hub, id: &str) -> bool {
         let loc = self.location(id);
         let ok = match &loc {
@@ -855,9 +1057,13 @@ impl Registry {
             Some(Location::Machine(machine)) => hub.send_to_agent(machine, LANE_TERM, &ServerMsg::HarnessClose { session: id.to_owned() }).await,
         };
         // A machine that is gone cannot confirm: forget it here; it is dropped there on reconnect.
+        // Ended in the store too, or it would be listed as away again after a restart.
         if loc.is_some() && (!ok || matches!(loc, Some(Location::Local))) {
             if let Some(m) = self.mirrors.lock().remove(id) {
                 m.out.send(Arc::from(json!({"t": "closed"}).to_string()));
+            }
+            if let Some(store) = &self.convo {
+                store.put(vec![crate::convo::rows::Row::Closed { session: id.to_owned(), at: crate::util::now_ms() }]);
             }
             hub.emit(&json!({"type": "harness_closed", "id": id}));
         }

@@ -353,7 +353,10 @@ function JobPanel({ job, ciDetail, attempt, onJobPatch }: { job: Job; ciDetail: 
   const planned = useSuspenseResource(`job/${job.id}`, (s) => api.job(job.id, s)).data;
   const spec = job.spec ?? planned.spec;
   const [specOpen, setSpecOpen] = React.useState(false);
-  const [open, setOpen] = React.useState<Set<number>>(() => defaultOpen(job));
+  // `?step=` (a log search's hit) opens that step too.
+  const [search] = useSearchParams();
+  const asked = search.get("step");
+  const [open, setOpen] = React.useState<Set<number>>(() => (asked !== null && Number.isInteger(Number(asked)) ? new Set([...defaultOpen(job), Number(asked)]) : defaultOpen(job)));
 
   // A step that starts running opens (the job is followed as it goes).
   const running = job.steps.find((s) => s.status === "running")?.idx ?? null;

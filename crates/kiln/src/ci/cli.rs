@@ -30,13 +30,17 @@ enum SecretsCmd {
         #[arg(long, default_value = "server")]
         scope: String,
     },
-    /// Set a secret from a file, or from stdin (one trailing newline is dropped).
+    /// Set a secret from a file, or from stdin (one trailing newline is dropped); or say where
+    /// its value comes from at leg start, never stored (`--from integration:aws-prod`,
+    /// `aws-sm:<arn>`, `gcp-sm:projects/…/secrets/…`, `azure-kv:<vault>/<secret>`).
     Set {
         name: String,
         #[arg(long, default_value = "server")]
         scope: String,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from")]
         from_file: Option<std::path::PathBuf>,
+        #[arg(long)]
+        from: Option<String>,
     },
     Delete {
         name: String,
@@ -729,7 +733,11 @@ pub async fn secrets(args: SecretsArgs, cfg: &Config) -> Result<()> {
                 println!("{name:<32} {size:>6} B  updated {}  used {}", when(s.get("updated_at").and_then(Value::as_i64)), when(s.get("last_used_at").and_then(Value::as_i64)));
             }
         }
-        SecretsCmd::Set { name, scope, from_file } => {
+        SecretsCmd::Set { name, scope, from: Some(from), .. } => {
+            api.call(Method::Put, &format!("/secrets/{}?scope={}", enc(&name), enc(&scope)), Some(json!({ "from": from }))).await?;
+            println!("set {} in {scope}, from {from}", name.to_ascii_uppercase());
+        }
+        SecretsCmd::Set { name, scope, from_file, from: None } => {
             let value = match from_file {
                 Some(p) => std::fs::read_to_string(&p)?,
                 None => {

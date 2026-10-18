@@ -160,6 +160,7 @@ pub async fn token(hub: &Hub, i: &Integration, w: &kiln_ci::oidc::Workload<'_>) 
         None => federated,
     };
     minted().lock().insert(key, t.clone());
+    crate::audit::exchange(hub, i, w, &provider).await;
     Ok(t)
 }
 

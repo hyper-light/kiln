@@ -51,6 +51,12 @@ pub const BUILTINS: &[Builtin] = &[
         outputs: &[("failed", "How many tests failed."), ("passed", "How many passed.")],
     },
     Builtin {
+        name: "auth",
+        description: "Authenticate the steps after this one to an integration (W11-R03): AWS, Google Cloud and Azure through their own federation files and variables, with the leg's ID token (refreshed as the leg runs); other kinds' stored tokens as the variables their tools read.",
+        inputs: &[Input { name: "integration", description: "The integration, by name.", default: None, required: true }],
+        outputs: &[("kind", "The integration's kind."), ("env", "The variables set, comma-separated.")],
+    },
+    Builtin {
         name: "notify",
         description: "Send a message through the repository's channels: Slack, Discord, Teams, Telegram, PagerDuty, Opsgenie or a webhook (W19).",
         inputs: &[

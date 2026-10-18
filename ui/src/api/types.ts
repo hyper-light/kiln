@@ -321,11 +321,21 @@ export interface SystemInfo {
   config: Record<string, unknown>;
 }
 
+/** A row of the audit log (docs/ci.md W19-R05). `actor` is v1's: the principal, and for whom. */
 export interface AuditEntry {
+  id: number;
   ts: number;
-  actor: string;
+  principal: string;
+  on_behalf_of: string | null;
+  token: string | null;
+  scope: string | null;
   action: string;
+  target: string | null;
+  /** The status a request ended with, or `ok`. */
+  result: string;
+  ip: string | null;
   detail: string;
+  actor: string;
 }
 
 export interface NewRepo {
@@ -1234,6 +1244,8 @@ export interface OutpostInvite {
   /** When the invite stops working (unix seconds). */
   expires_at: number;
   commands: Record<InstallOs, string>;
+  /** The same lines without the invite: the outpost asks to join, and is approved on Add machines (servers from before don't say). */
+  ask?: Record<InstallOs, string>;
 }
 
 export interface JoinInfo {

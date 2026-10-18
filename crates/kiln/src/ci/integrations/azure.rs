@@ -134,6 +134,7 @@ pub async fn token(hub: &Hub, i: &Integration, w: &kiln_ci::oidc::Workload<'_>, 
     let assertion = crate::ci::oidc::mint(hub, &claims).await?;
     let t = exchange(&tenant, &client_id, scope, &assertion).await.with_context(|| format!("signing in as {client_id} in {tenant}"))?;
     minted().lock().insert(key, t.clone());
+    crate::audit::exchange(hub, i, w, &format!("{client_id} in {tenant}")).await;
     Ok(t)
 }
 

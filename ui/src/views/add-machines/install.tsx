@@ -173,6 +173,12 @@ function OutpostLine({ os, invite, error, onRenew }: { os: InstallOs; invite: Ou
             The invite in it works once.
             <Expiry at={invite.expires_at} onRenew={onRenew} />
           </p>
+          {invite.ask && (
+            <>
+              <p className="am-note">Or without the invite: the outpost asks to join and shows a code; approve it on this page when the codes match.</p>
+              <CodeLine command={invite.ask[os]} prompt={os === "windows" ? "PS>" : "$"} copyName="Copy the outpost command without an invite" />
+            </>
+          )}
         </>
       ) : (
         <p className="am-note">Making an invite…</p>

@@ -126,6 +126,10 @@ pub fn ops() -> &'static [Op] {
                     super::events::workflow_dispatch(&cx.hub, &r, &git_ref, &text(&v, "workflow")?, &inputs, &by(&cx)).await.map_err(|e| (e.status, e.message))?;
                     Ok(json!({ "dispatched": true, "ref": git_ref }))
                 }),
+            op!("ci.runs.compare", "What changed between two runs of a workflow, or since its last green run (`other`: a run's id or `last-green`, the default): the actions, variables, environment, images, machines and cache that differ, the files changed between the commits, and each leg's steps side by side.", ro: true, destructive: false,
+                input: || schema(json!({"run": {"type": "string", "description": RUN}, "other": {"type": "string", "description": "The run to compare with, or `last-green`."}}), &["run"]),
+                route: |v| Ok((Method::GET, path(&["runs", &text(v, "run")?, "compare", v.get("other").and_then(Value::as_str).unwrap_or("last-green")]), HashMap::new())),
+                run: |cx: Cx, v: Value| async move { answer(super::compare::runs(&cx.hub, &text(&v, "run")?, v.get("other").and_then(Value::as_str).unwrap_or("last-green")).await).await }),
             op!("ci.runs.cancel", "Cancel a run: its queued legs settle, its running ones are stopped.", ro: false, destructive: true,
                 input: || schema(json!({"run": {"type": "string", "description": RUN}}), &["run"]),
                 route: |v| Ok((Method::POST, path(&["runs", &text(v, "run")?, "cancel"]), HashMap::new())),
@@ -153,6 +157,18 @@ pub fn ops() -> &'static [Op] {
                 input: || schema(json!({"leg": {"type": "string", "description": LEG}, "step": {"type": "integer", "description": "The step's index (`idx` in ci.legs.get)."}, "from": {"type": "integer"}}), &["leg", "step"]),
                 route: |v| Ok((Method::GET, path(&["legs", &text(v, "leg")?, "logs"]), query(v, &["step", "from"]))),
                 run: |cx: Cx, v: Value| async move { answer(super::runs_api::logs(&cx.hub, &text(&v, "leg")?, &query(&v, &["step", "from"])).await).await }),
+            op!("ci.legs.search", "Search one leg's logs (a running one's too) for a string: `{ hits: [{ step, step_name, line, text, at }] }`.", ro: true, destructive: false,
+                input: || schema(json!({"leg": {"type": "string", "description": LEG}, "q": {"type": "string", "description": "What to find, case-insensitive."}}), &["leg", "q"]),
+                route: |v| Ok((Method::GET, path(&["legs", &text(v, "leg")?, "logs", "search"]), query(v, &["q"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::logsearch::leg(&cx.hub, &text(&v, "leg")?, "search", &query(&v, &["q"])).await).await }),
+            op!("ci.legs.failure_excerpt", "What to read first when a leg failed: its failed step's log from just before the first line that reads like an error (else the step's last lines).", ro: true, destructive: false,
+                input: || schema(json!({"leg": {"type": "string", "description": LEG}, "lines": {"type": "integer", "description": "How many lines (40 by default)."}}), &["leg"]),
+                route: |v| Ok((Method::GET, path(&["legs", &text(v, "leg")?, "logs", "failure"]), query(v, &["lines"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::logsearch::leg(&cx.hub, &text(&v, "leg")?, "failure", &query(&v, &["lines"])).await).await }),
+            op!("ci.logs.search", "Search step logs across runs for a string of three characters or more, newest first: when an error started, how often it comes. Filter by repository, workflow, branch, conclusion and days back.", ro: true, destructive: false,
+                input: || schema(json!({"q": {"type": "string", "description": "What to find, case-insensitive."}, "repo": {"type": "string", "description": REPO}, "workflow": {"type": "string", "description": "The workflow's path."}, "branch": {"type": "string"}, "conclusion": {"type": "string", "description": "The run's: success, failure, cancelled…"}, "days": {"type": "integer"}, "limit": {"type": "integer"}}), &["q"]),
+                route: |v| Ok((Method::GET, path(&["logs", "search"]), query(v, &["q", "repo", "workflow", "branch", "conclusion", "days", "limit"]))),
+                run: |cx: Cx, v: Value| async move { answer(super::logsearch::route(&cx.hub, &query(&v, &["q", "repo", "workflow", "branch", "conclusion", "days", "limit"])).await).await }),
             op!("ci.legs.routing", "Why a leg waits, and how each runner measures up against what it needs.", ro: true, destructive: false,
                 input: || schema(json!({"leg": {"type": "string", "description": LEG}}), &["leg"]),
                 route: |v| Ok((Method::GET, path(&["legs", &text(v, "leg")?, "routing"]), HashMap::new())),
@@ -204,10 +220,21 @@ pub fn ops() -> &'static [Op] {
 pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let op = ops().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
     let (method, rest, q) = (op.route)(&input)?;
-    let mut segs: Vec<&str> = vec!["api", "ci"];
-    segs.extend(rest.iter().map(String::as_str));
-    crate::authz::gate::check(&cx.hub, &cx.caller, &method, &segs, &q).await?;
-    (op.run)(cx, input).await
+    let path = format!("/api/ci/{}", rest.join("/"));
+    let run = async {
+        let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+        crate::authz::gate::check(&cx.hub, &cx.caller, &method, &segs, &q).await?;
+        (op.run)(cx.clone(), input).await
+    };
+    if op.read_only {
+        return run.await;
+    }
+    // A change is audited as its route's would be (W19-R05): one row.
+    crate::audit::request(&cx.hub, crate::audit::Req { caller: &cx.caller, method: &method, path: &path, q: &q, ip: None }, run, |r: &Out| match r {
+        Ok(_) => 200,
+        Err((s, _)) => s.as_u16(),
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -217,7 +244,7 @@ mod tests {
     /// Every operation is a route of the table, with a capability of its own (W20-R01).
     #[test]
     fn w20_r01_each_operation_is_a_route() {
-        let probe = json!({"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml"});
+        let probe = json!({"run": "r1", "leg": "l1", "repo": "acme/app", "path": ".github/workflows/ci.yml", "step": 0, "command": "true", "state": "approved", "minutes": 5, "content": "x", "workflow": "ci.yml", "q": "error"});
         for op in ops() {
             let route = (op.route)(&probe);
             assert!(route.is_ok(), "{}", op.name);

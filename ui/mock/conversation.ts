@@ -194,7 +194,7 @@ const limits = (): State["limits"] =>
         { id: "five_hour", label: "Session", used_percent: 100, resets_at: PAUSED_UNTIL, window: "5h", status: "rejected" },
         { id: "seven_day", label: "Weekly", used_percent: 62, resets_at: PAUSED_UNTIL + 3 * 86_400_000, window: "7d" },
       ]
-    : undefined;
+    : [{ id: "seven_day", label: "Weekly", used_percent: 62, resets_at: LIVE_AT + 3 * 86_400_000, window: "7d" }];
 
 const info: AgentInfo = {
   id: ID,
@@ -232,18 +232,20 @@ const meta: Meta = {
   efforts: ["low", "medium", "high", "max"].map((id) => ({ id, label: id.charAt(0).toUpperCase() + id.slice(1) })),
   commands: [{ name: "compact", description: "Summarize the conversation to free context", group: "Context", args: "optional", route: { kind: "prompt" } }],
   agents: [],
-  features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel"],
+  features: ["interrupt", "set_mode", "set_model", "set_effort", "steer", "send_now", "queue_cancel", "attachments"],
 };
 
 let activity = "Running cargo test";
 let effort = "high";
-// A long think under way, as the harness reports it (`doing`, since `turn_started`); an interrupt
-// doesn't take (so a stop can be forced), and a forced stop ends the turn.
+// A long turn under way, as the harness reports it (`doing`, since `turn_started`): it thinks, then
+// takes a step, and thinks again. An interrupt doesn't take (so a stop can be forced), a forced stop
+// ends the turn, and a message sent to it when it's done starts the next.
 let running = !PAUSED;
-const turnStarted = Date.now() - Number(process.env.MOCK_TURN_AGE_MS ?? 134_000);
+let doing = "Thinking";
+let turnStarted = Date.now() - Number(process.env.MOCK_TURN_AGE_MS ?? 134_000);
 const state = (): State => ({
   status: running ? "running" : "idle",
-  doing: running ? "Thinking" : undefined,
+  doing: running ? doing : undefined,
   turn_started: running ? turnStarted : undefined,
   cwd: info.cwd,
   model: info.model,
@@ -262,6 +264,7 @@ const state = (): State => ({
   tasks: [],
   todos: [],
   usage: { cost_usd: 4.21, input_tokens: 812_000, output_tokens: 64_000, cache_read_tokens: 5_100_000, turns: TURNS + 1 },
+  plan: "Max",
   dropped: 0,
   pause: pause(),
   limits: limits(),
@@ -313,6 +316,7 @@ function tick() {
     live = add({ id: `L-a-live-${step}`, at: at + 200, kind: "assistant", text: "", streaming: true }) as Extract<HEvent, { kind: "assistant" }>;
     broadcast({ t: "events", events: [done, e, { ...live }] });
     activity = step % 2 ? "Reading files" : "Running cargo test";
+    doing = step % 2 ? "Thinking" : activity;
     broadcast({ t: "state", state: state() });
   }
   timer = setTimeout(tick, 140);
@@ -369,6 +373,12 @@ export function handleLongSession(ws: WebSocket, id: string): boolean {
     else if (c.type === "force_stop") running = false;
     else if (c.type === "send" && c.text) {
       const e = add({ id: `L-sent-${seq}`, at: Date.now(), kind: "user", text: c.text, client_id: c.id });
+      if (!running) {
+        running = true;
+        doing = "Thinking";
+        turnStarted = Date.now();
+        broadcast({ t: "state", state: state() });
+      }
       // Steered and sent-now messages show where they went in; a queued one would wait (not modeled).
       broadcast({ t: "events", events: [e] });
       return;

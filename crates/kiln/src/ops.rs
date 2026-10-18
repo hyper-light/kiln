@@ -58,7 +58,19 @@ pub async fn call(cx: Cx, name: &str, input: Value) -> Out {
     let op = crate::cd::ops::ops().iter().find(|o| o.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, format!("no operation {name}")))?;
     // Deployments' routes: reading needs runs.read, the rest environments.deploy.
     let method = if op.read_only { Method::GET } else { Method::POST };
-    crate::authz::gate::check(&cx.hub, &cx.caller, &method, &["api", "cd", "ops", name], &Default::default()).await?;
-    let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deployments aren't on here, or are starting ([cd] enabled)".to_owned()))?;
-    crate::cd::ops::call(crate::cd::ops::Cx { hub: cx.hub, cd, actor: cx.caller.name }, name, input).await
+    let run = async {
+        crate::authz::gate::check(&cx.hub, &cx.caller, &method, &["api", "cd", "ops", name], &Default::default()).await?;
+        let cd = crate::cd::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deployments aren't on here, or are starting ([cd] enabled)".to_owned()))?;
+        crate::cd::ops::call(crate::cd::ops::Cx { hub: Arc::clone(&cx.hub), cd, actor: cx.caller.name.clone() }, name, input).await
+    };
+    if op.read_only {
+        return run.await;
+    }
+    // A change is audited as its route's would be (docs/ci.md W19-R05): one row.
+    let path = format!("/api/cd/ops/{name}");
+    crate::audit::request(&cx.hub, crate::audit::Req { caller: &cx.caller, method: &method, path: &path, q: &Default::default(), ip: None }, run, |r: &Out| match r {
+        Ok(_) => 200,
+        Err((s, _)) => s.as_u16(),
+    })
+    .await
 }
