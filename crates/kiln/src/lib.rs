@@ -10,6 +10,7 @@ pub mod authz;
 pub mod autodetect;
 pub mod bluegreen;
 pub mod cd;
+pub mod deploy;
 pub mod ci;
 pub mod http;
 pub mod kubeapi;

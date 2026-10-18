@@ -1,0 +1,148 @@
+//! `/api/deploy` (docs/deploy-api.md §12.1): environments, apps, registrations and releases over
+//! HTTP, for the UI, `kiln` and scripts. Errors are `{error}` with the status that says what went
+//! wrong; every change is audited with its caller.
+//!
+//! | Route | |
+//! | --- | --- |
+//! | `GET`, `POST /environments`; `GET`, `PUT`, `DELETE /environments/{env}` | environments |
+//! | `GET`, `POST /apps`; `GET`, `PUT`, `DELETE /apps/{app}` | apps |
+//! | `POST`, `GET`, `DELETE /apps/{app}/environments/{env}` | register, show, deregister (`?keep=true`) |
+//! | `POST /apps/{app}/environments/{env}/pause`, `…/resume` | the provider's automation |
+//! | `GET /apps/{app}/environments/{env}/candidates` | releases a rollback can go to |
+//! | `GET`, `POST /releases`; `GET /releases/{id}` | releases (filters: `app`, `environment`, `state`, `limit`) |
+//! | `POST /releases/{id}/cancel`, `/releases/{id}/rollback` | |
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use http::{Method, StatusCode};
+use hyper::body::Incoming;
+use serde_json::{Value, json};
+
+use super::flow::{self, Ask, Fail, RollbackAsk};
+use super::model::{App, Environment, State};
+use super::{Deploy, kilncd, store};
+use crate::http::server::{self as srv, Request, Response};
+use crate::hub::Hub;
+
+const LIMIT: usize = 4 << 20;
+
+fn bad(msg: impl Into<String>) -> Fail {
+    (StatusCode::BAD_REQUEST, msg.into())
+}
+
+fn internal(e: anyhow::Error) -> Fail {
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+async fn body<T: serde::de::DeserializeOwned>(body: Incoming) -> Result<T, Fail> {
+    let bytes = srv::body_bytes(body, LIMIT).await.map_err(|e| bad(format!("{e:#}")))?;
+    let bytes = if bytes.is_empty() { &b"{}"[..] } else { &bytes[..] };
+    serde_json::from_slice(bytes).map_err(|e| bad(format!("the body doesn't read: {e}")))
+}
+
+fn ok(v: &impl serde::Serialize) -> Result<Response, Fail> {
+    Ok(srv::json(StatusCode::OK, v))
+}
+
+fn created(v: &impl serde::Serialize) -> Result<Response, Fail> {
+    Ok(srv::json(StatusCode::CREATED, v))
+}
+
+fn release_id(s: &str) -> Result<i64, Fail> {
+    s.parse().map_err(|_| bad(format!("{s:?} isn't a release number")))
+}
+
+/// Routes `/api/deploy/<rest>`.
+pub async fn route(_hub: &Arc<Hub>, rest: &[&str], q: &HashMap<String, String>, req: Request) -> Result<Response, Fail> {
+    let d = super::get().ok_or_else(|| (StatusCode::SERVICE_UNAVAILABLE, "deploying by API isn't running here (it runs with [cd] enabled)".to_owned()))?;
+    let actor = req.extensions().get::<crate::authz::Caller>().map_or_else(|| "admin".to_owned(), |c| c.name.clone());
+    let method = req.method().clone();
+    let store = &d.hub.store;
+    match (&method, rest) {
+        (&Method::GET, ["environments"]) => ok(&json!({ "environments": store::environments(store).await.map_err(internal)? })),
+        (&Method::POST, ["environments"]) => created(&flow::put_environment(&d, &actor, body::<Environment>(req.into_body()).await?).await?),
+        (&Method::GET, ["environments", name]) => ok(&store::environment(store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no environment {name}")))?),
+        (&Method::PUT, ["environments", name]) => {
+            let e: Environment = body(req.into_body()).await?;
+            if e.name != *name {
+                return Err(bad(format!("the body is environment {}, the path {name}", e.name)));
+            }
+            ok(&flow::put_environment(&d, &actor, e).await?)
+        }
+        (&Method::DELETE, ["environments", name]) => {
+            flow::delete_environment(&d, &actor, name).await?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+
+        (&Method::GET, ["apps"]) => ok(&json!({ "apps": store::apps(store).await.map_err(internal)? })),
+        (&Method::POST, ["apps"]) => created(&flow::put_app(&d, &actor, body::<App>(req.into_body()).await?).await?),
+        (&Method::GET, ["apps", name]) => app_view(&d, name).await,
+        (&Method::PUT, ["apps", name]) => {
+            let a: App = body(req.into_body()).await?;
+            if a.name != *name {
+                return Err(bad(format!("the body is app {}, the path {name}", a.name)));
+            }
+            ok(&flow::put_app(&d, &actor, a).await?)
+        }
+        (&Method::DELETE, ["apps", name]) => {
+            flow::delete_app(&d, &actor, name).await?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+
+        (&Method::POST, ["apps", app, "environments", env]) => created(&flow::register(&d, &actor, app, env).await?),
+        (&Method::GET, ["apps", app, "environments", env]) => registration_view(&d, app, env).await,
+        (&Method::DELETE, ["apps", app, "environments", env]) => {
+            flow::deregister(&d, &actor, app, env, q.get("keep").is_some_and(|v| v == "true" || v == "1")).await?;
+            Ok(srv::status(StatusCode::NO_CONTENT))
+        }
+        (&Method::POST, ["apps", app, "environments", env, "pause"]) => ok(&flow::pause(&d, &actor, app, env, true).await?),
+        (&Method::POST, ["apps", app, "environments", env, "resume"]) => ok(&flow::pause(&d, &actor, app, env, false).await?),
+        (&Method::GET, ["apps", app, "environments", env, "candidates"]) => ok(&json!({ "candidates": flow::candidates(&d, app, env).await? })),
+
+        (&Method::GET, ["releases"]) => {
+            let state = match q.get("state") {
+                Some(s) => Some(State::parse(s).ok_or_else(|| bad(format!("{s:?} isn't a release state")))?),
+                None => None,
+            };
+            let query = store::ReleaseQuery { app: q.get("app").cloned(), environment: q.get("environment").cloned(), state, limit: q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(50) };
+            ok(&json!({ "releases": store::releases(store, query).await.map_err(internal)? }))
+        }
+        (&Method::POST, ["releases"]) => created(&flow::release(&d, &actor, body::<Ask>(req.into_body()).await?).await?),
+        (&Method::GET, ["releases", id]) => ok(&store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?),
+        (&Method::POST, ["releases", id, "cancel"]) => ok(&flow::cancel(&d, &actor, release_id(id)?).await?),
+        (&Method::POST, ["releases", id, "rollback"]) => {
+            let of = store::release(store, release_id(id)?).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no release {id}")))?;
+            let to: RollbackAsk = body(req.into_body()).await?;
+            created(&flow::release(&d, &actor, Ask { app: of.app, environment: of.environment, rollback: Some(to), ..Ask::default() }).await?)
+        }
+        _ => Err((StatusCode::NOT_FOUND, "not found".into())),
+    }
+}
+
+/// An app, with each environment it's registered in and what runs there.
+async fn app_view(d: &Deploy, name: &str) -> Result<Response, Fail> {
+    let a = store::app(&d.hub.store, name).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {name}")))?;
+    let regs = store::registrations(&d.hub.store, Some(name), None).await.map_err(internal)?;
+    let mut envs = Vec::new();
+    for reg in regs {
+        let running = match reg.running {
+            Some(id) => store::release(&d.hub.store, id).await.map_err(internal)?,
+            None => None,
+        };
+        envs.push(json!({ "registration": reg, "running": running }));
+    }
+    ok(&json!({ "app": a, "environments": envs }))
+}
+
+/// A registration: what runs, what's in flight, the latest releases, and what KilnCD says now.
+async fn registration_view(d: &Deploy, app: &str, env: &str) -> Result<Response, Fail> {
+    let a = store::app(&d.hub.store, app).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("no app {app}")))?;
+    let reg = store::registration(&d.hub.store, app, env).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, format!("{app} isn't registered in {env}")))?;
+    let recent = store::releases(&d.hub.store, store::ReleaseQuery { app: Some(app.into()), environment: Some(env.into()), state: None, limit: 20 }).await.map_err(internal)?;
+    let in_flight = recent.iter().find(|r| r.state.in_flight()).cloned();
+    let running = recent.iter().find(|r| Some(r.id) == reg.running).cloned();
+    let id = kilncd::app_id(&a, env);
+    let provider = crate::cd::get().and_then(|cd| cd.statuses.read().get(&id).map(crate::cd::summary_json)).unwrap_or(Value::Null);
+    ok(&json!({ "registration": reg, "running": running, "in_flight": in_flight, "releases": recent, "provider": { "kind": "kilncd", "app": id, "status": provider } }))
+}
