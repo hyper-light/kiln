@@ -34,8 +34,6 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
     }
   };
   const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean }[] = [
-    { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
-    { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
     {
       label: "Rename…",
       onSelect: () => {
@@ -43,6 +41,8 @@ export function useAgentActions(a: Pick<AgentInfo, "id" | "name" | "status" | "k
         setAct("rename");
       },
     },
+    { label: "Stop the current turn", onSelect: () => void command({ type: "interrupt" }, "interrupt it"), hidden: a.status !== "running" && a.status !== "waiting" },
+    { label: "Restart", onSelect: () => void command({ type: "restart" }, "restart it"), hidden: live },
     { label: "Duplicate…", onSelect: () => setAct("duplicate") },
     { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
     { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : void end()), danger: true },
