@@ -96,6 +96,7 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
   if (active) {
     return (
       <div className="flex flex-col items-start gap-3 md:items-end">
+        <RunApproval detail={detail} />
         <DeployReview detail={detail} />
         <Button variant="danger" disabled={busy} aria-expanded={confirm} onClick={() => setConfirm(!confirm)}>
           <Square /> Cancel
@@ -140,6 +141,46 @@ export function CiRunActions({ detail, jobs }: { detail: CiRunDetail; jobs: stri
         <RotateCcw /> Rerun
       </Button>
     </div>
+  );
+}
+
+/** An outside contributor's run, waiting for a maintainer before any job starts: approved or
+ * rejected in place, in one step (W18-R06). */
+function RunApproval({ detail }: { detail: CiRunDetail }) {
+  const { run } = detail;
+  const [busy, setBusy] = React.useState(false);
+  if (run.approval !== "required") return null;
+  const decide = async (state: "approved" | "rejected") => {
+    setBusy(true);
+    try {
+      await ci.approve(run.id, [], state, "");
+      toast({ title: state === "approved" ? "Approved: the run starts" : "Rejected: the run is cancelled", tone: "info" });
+      invalidate(`run/${run.id}`);
+      invalidate(`ci-run/${run.id}`);
+    } catch (e) {
+      toast.error("Approval failed", errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Confirm
+      label="Approve the run"
+      className="w-full md:w-96"
+      actions={
+        <>
+          <Button size="xs" variant="primary" disabled={busy} onClick={() => decide("approved")}>
+            Approve and run
+          </Button>
+          <Button size="xs" variant="ghost" disabled={busy} onClick={() => decide("rejected")}>
+            Reject
+          </Button>
+        </>
+      }
+    >
+      <p className="font-medium text-[#e4e5e7]">{`Waiting for a maintainer: ${run.actor} is an outside contributor`}</p>
+      <p className="text-[12.5px] text-[#b0b4be]">Approved, it runs untrusted: no secrets, a read-only token, its network contained.</p>
+    </Confirm>
   );
 }
 

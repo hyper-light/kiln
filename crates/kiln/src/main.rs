@@ -135,6 +135,9 @@ enum Cmd {
     Auth(kiln::runner::auth::AuthArgs),
     /// The packages a tree's lockfiles pin, as an SBOM (SPDX 2.3 or CycloneDX 1.6).
     Sbom(kiln::ci::sbom::SbomArgs),
+    /// The egress relay in a leg's container (docs/ci.md W18-R08); the runner starts it.
+    #[command(hide = true)]
+    EgressRelay,
     /// The CI engine's runs: a list, or one with its legs.
     Runs(kiln::ci::cli::RunsArgs),
     /// A CI run's or leg's logs.
@@ -432,6 +435,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 // Commands from other runners are a terminal's worth of access: not without one.
                 reach: (!a.ephemeral).then_some(!a.no_reach && !a.no_terminal),
                 outpost: false,
+                // `[agent.facts]` and `[agent.probes]` of its config file (docs/ci.md W13-R02).
+                declared: kiln::runner::probe::Declared::from_file(&config_path),
             };
             let result = run_agent(opts, shutdown).await;
             if let Some(ann) = announcer {
@@ -473,6 +478,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 // It runs no other machine's commands (reach), and for now sends none.
                 reach: None,
                 outpost: true,
+                declared: kiln::runner::probe::Declared::default(),
             };
             run_agent(opts, shutdown).await
         }
@@ -661,6 +667,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Metrics(a) => kiln::ci::cli::metrics(a),
         Cmd::Auth(a) => kiln::runner::auth::cli(a).await,
         Cmd::Sbom(a) => kiln::ci::sbom::cli(a).await,
+        Cmd::EgressRelay => kiln::runner::egress::relay_main(),
         Cmd::Workflow(a) => {
             // A signal stops the runs; the server and runner this process runs for them stop after.
             let stop = Shutdown::new();

@@ -15,6 +15,7 @@
 //! - [`compare`]: what differs between two runs or legs (W19).
 //! - [`sbom`]: SBOMs from lockfiles, SPDX and CycloneDX (W18).
 //! - [`attest`]: provenance statements, DSSE envelopes and Sigstore bundles (W18).
+//! - [`trust`]: which untrusted runs wait for approval, and where legs may connect (W18).
 //! - [`runner`]: what the runner decides: workflow commands, environment files, masking (W06).
 //! - [`store`]: chunking and GitHub's cache rules for the runtime store (W08).
 //! - [`secrets`]: secret scopes, and which secrets a leg reads (W09).
@@ -39,5 +40,6 @@ pub mod secrets;
 pub mod stats;
 pub mod store;
 pub mod trigger;
+pub mod trust;
 pub mod wf;
 pub mod wire;

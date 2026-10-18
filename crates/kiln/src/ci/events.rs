@@ -172,6 +172,18 @@ async fn synthesize(hub: &Hub, repo: &Repo, t: &Trigger) -> Event {
             let base_sha = gitops::run_git(hub, &["-C", &mirror, "rev-parse", &default_branch], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
             let pr = PullRequest { number, state: "open".into(), head: Side { branch: format!("pr/{number}"), sha: t.sha.clone(), repo: ctx_repo.clone() }, base: Side { branch: default_branch.clone(), sha: base_sha, repo: ctx_repo.clone() }, ..PullRequest::default() };
             e.payload = context::pull_request(&e, &ctx_repo, &pr);
+            // Polling can't see where the head lives: one on none of the repository's branches
+            // came from a fork, and is untrusted (W03-R08, W18-R05). Its author counts as a
+            // contributor once the default branch has a commit of theirs, as GitHub counts.
+            e.trusted = gitops::run_git(hub, &["-C", &mirror, "for-each-ref", "--count=1", "--contains", &t.sha, "--format=%(refname)", "refs/heads/"], LS_REMOTE_TIMEOUT).await.is_ok_and(|o| !o.trim_ascii().is_empty());
+            if !e.trusted {
+                let email = gitops::run_git(hub, &["-C", &mirror, "log", "-1", "--format=%ae", &t.sha], LS_REMOTE_TIMEOUT).await.map(|o| String::from_utf8_lossy(&o).trim().to_owned()).unwrap_or_default();
+                let merged = !email.is_empty()
+                    && gitops::run_git(hub, &["-C", &mirror, "log", "-1", "--format=%H", "--fixed-strings", &format!("--author=<{email}>"), &format!("refs/heads/{default_branch}")], LS_REMOTE_TIMEOUT).await.is_ok_and(|o| !o.trim_ascii().is_empty());
+                if let Some(p) = e.payload.get_mut("pull_request").and_then(serde_json::Value::as_object_mut) {
+                    p.insert("author_association".into(), serde_json::json!(if merged { "CONTRIBUTOR" } else { "FIRST_TIME_CONTRIBUTOR" }));
+                }
+            }
         }
         "manual" => {
             e.name = "workflow_dispatch".into();

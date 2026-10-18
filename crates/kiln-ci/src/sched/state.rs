@@ -542,8 +542,8 @@ impl Scheduler {
         l.reason = None;
         l.last_runner = Some(runner.to_owned());
         let (attempt, request, exclusive, repo, fair) = (l.attempt, l.input.request, l.input.exclusive, l.input.repo.clone(), l.key.map_or(0, |k| k.1));
-        let executors = l.req.executors.clone();
-        let (image, docker) = (l.req.image.clone(), l.req.docker.clone());
+        let req = l.req.clone();
+        let (image, docker) = (req.image.clone(), req.docker.clone());
         self.vtime = self.vtime.max(fair as f64 / 1000.0);
         *self.in_progress.entry(repo).or_default() += 1;
         let mut executor = None;
@@ -551,7 +551,7 @@ impl Scheduler {
             r.running.push(id.to_owned());
             add(&mut r.used, &request);
             r.exclusive = exclusive;
-            executor = executors.iter().find(|e| super::routing::has_executor(&r.input.view.facts, e)).cloned();
+            executor = req.executors.iter().find(|e| super::routing::usable(&req, &r.input.view.facts, e)).cloned();
         }
         out.push(Command::Assign { leg: id.to_owned(), runner: runner.to_owned(), attempt, executor, image, docker });
     }
