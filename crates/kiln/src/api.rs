@@ -413,7 +413,8 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "harness", "sessions", id, "move"]) => {
             let body: serde_json::Value = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             let to = body.get("to").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
-            match crate::harness::relocate::start(&hub, id, &to).await {
+            let now = body.get("now").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            match crate::harness::relocate::start(&hub, id, &to, now).await {
                 Ok(v) => Ok(srv::json(StatusCode::ACCEPTED, &v)),
                 Err(e) => Err(err(StatusCode::CONFLICT, e)),
             }

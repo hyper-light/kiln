@@ -269,6 +269,8 @@ pub struct Seed {
     /// Where it came from: the runner and its folder there.
     pub from: String,
     pub from_cwd: String,
+    /// Its turn was interrupted to move: it picks the turn up here.
+    pub picks_up: bool,
     /// Said with the move (its folder isn't here, so it works in home).
     pub note: Option<String>,
 }
@@ -474,6 +476,12 @@ pub fn start_seeded(id: String, spec: Spec, sink: Sink, on_change: Arc<dyn Fn() 
         core.harness = Some(kind.name.to_owned());
         let folder = if core.state.cwd == sd.from_cwd { String::new() } else { format!(" (it works in {} here; it was in {})", core.state.cwd, sd.from_cwd) };
         let mut text = format!("Moved here from {}{folder} — the conversation, its timeline and queue came along", sd.from);
+        // Interrupted to move: the turn goes on here, first thing.
+        if sd.picks_up {
+            text.push_str(", and the turn it was in the middle of goes on here");
+            let ask = format!("This conversation just moved here from {}, which interrupted your last turn. Pick up where you left off.", sd.from);
+            core.state.queue.insert(0, super::model::QueueItem { id: crate::util::new_id(), text: ask, at: Core::now(), attachments: Vec::new(), overrides: None });
+        }
         if let Some(n) = &sd.note {
             text.push_str(". ");
             text.push_str(n);
@@ -1157,17 +1165,27 @@ struct Move {
     to: String,
     cwd: String,
     note: Option<String>,
+    /// The turn under way was interrupted to move now: it is picked up over there.
+    picks_up: bool,
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>) -> Move {
+/// `now`: the turn under way isn't waited for (the caller interrupts it).
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool) -> Move {
     let mut core = s.core.lock();
     core.hold = true;
     let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
-    let text = if busy { format!("Moving to {to} when this turn ends") } else { format!("Moving to {to}…") };
+    let picks_up = now && busy;
+    let text = if picks_up {
+        format!("Moving to {to} now: this turn stops here and goes on there")
+    } else if busy {
+        format!("Moving to {to} when this turn ends")
+    } else {
+        format!("Moving to {to}…")
+    };
     core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
     core.touch_state();
-    Move { to, cwd, note }
+    Move { to, cwd, note, picks_up }
 }
 
 /// How a move is getting on before it starts (its repository being copied there).
@@ -1201,7 +1219,8 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move) -> Result<(
     }
     let env = spec.env.clone();
     let carry = crate::rt::blocking(move || super::moving::record(&kind.protocol, &env, session.as_deref(), &note)).await.map_err(|e| format!("{e:#}"))??;
-    let pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    let mut pkg = super::moving::pack(&s.id, spec, &mv.cwd, &me, &from_cwd, carry, events, state);
+    pkg.picks_up = mv.picks_up;
     let bytes = serde_json::to_vec(&pkg).map_err(|e| format!("{e}"))?;
     moving_note(s, &format!("Moving to {}: handing over the conversation ({} KB)", mv.to, bytes.len() / 1024));
     reach.adopt(&mv.to, &bytes).await
@@ -1413,7 +1432,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                                     switching = Some(sw);
                                 }
                             }
-                            Command::MoveTo { to, cwd, note } => moving = Some(move_wanted(&s, to, cwd, note)),
+                            Command::MoveTo { to, cwd, note, now } => {
+                                let mv = move_wanted(&s, to, cwd, note, now);
+                                // Not waiting for the turn: it stops here, and goes on there.
+                                if mv.picks_up {
+                                    adapter.command(&mut s.core.lock(), Command::Interrupt);
+                                }
+                                moving = Some(mv);
+                            }
                             Command::Moving { text } => moving_note(&s, &text),
                             c => {
                                 // A model of its own harness: no switch after all.
@@ -1595,8 +1621,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: async_channel::Rece
                         }
                     }
                     // Another runner: it goes there, now.
-                    Command::MoveTo { to, cwd, note } => {
-                        moving = Some(move_wanted(&s, to, cwd, note));
+                    Command::MoveTo { to, cwd, note, now } => {
+                        moving = Some(move_wanted(&s, to, cwd, note, now));
                         break;
                     }
                     Command::Moving { text } => moving_note(&s, &text),

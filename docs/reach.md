@@ -186,6 +186,9 @@ and is answered over there.
    machine, it works in its home folder.
 2. **The turn** (`harness/session.rs`, on the runner it is on). A move waits for the turn under way
    to end; kiln's queue holds what is sent meanwhile. Then the harness ends, its record complete.
+   **Move now** doesn't wait: once the other runner is ready (its copy of the repository made), the
+   turn is interrupted, and the other runner picks it up first thing — the conversation, the
+   interrupted reply included, and a message saying it moved (`move {"now": true}`).
 3. **The hand-over** (`harness/moving.rs`). The runner packs the session — the harness's own record
    (Claude Code's transcript as it is; Codex's conversation as a new thread's history, as a switch of
    harness carries it), kiln's timeline and state with its queue, its settings with the folder it goes
@@ -200,7 +203,8 @@ Measured on one machine with two runners, each with a home of its own: an idle a
 one in a git repository in 6.9 s the first time (5.3 s of it copying the repository over, uncommitted
 work and all) and in about a second after that, either way, its copies being in step. One moved
 mid-turn moves as the turn ends, and a message sent meanwhile is answered on the new runner with the
-whole conversation in its context. An agent that comes back to a runner it was on replaces the record
+whole conversation in its context; moved now instead, it is on the new runner in 1.6 s, and the turn
+goes on there 5 s later (Claude Code starting). An agent that comes back to a runner it was on replaces the record
 it left there; one resumed there meanwhile, with turns of its own, is never written over, and the
 agent stays where it is.
 

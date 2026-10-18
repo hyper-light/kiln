@@ -1156,6 +1156,9 @@ pub enum Command {
         /// What came along of the folder, said in the timeline ("its repository, kept in step").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+        /// Not waiting for the turn under way: it is interrupted, and picked up over there.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        now: bool,
     },
     /// How a move is getting on before it starts (its repository being copied over): shown.
     Moving {
