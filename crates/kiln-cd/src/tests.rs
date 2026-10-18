@@ -591,6 +591,28 @@ fn objects_argo_cd_deployed_are_found_by_its_tracking_name() {
     assert_eq!(s.map(|s| (s.sync, s.resources, s.out_of_sync)), Some((Sync::Synced, 1, 0)), "{s:?}");
 }
 
+/// A shadow compares what Argo CD deployed: removing it, even "with its objects", deletes none.
+#[test]
+fn removing_a_shadow_deletes_nothing_it_compared() {
+    let (mut h, git) = harness(fast());
+    let cm = json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cfg", "namespace": "web",
+        "annotations": {"argocd.argoproj.io/tracking-id": "web:/ConfigMap:web/cfg"}}, "data": {"v": "1"}});
+    if let Some(c) = h.clusters.get_mut("dev") {
+        let _ = c.apply(0, cm, "argocd-controller", false);
+    }
+    let mut a = AppConfig::new("default/web", "dev", "web");
+    a.tracking = crate::model::Tracking::ArgoAnnotation;
+    a.tracking_name = Some("web".into());
+    a.read_only = true;
+    h.input(Input::UpsertApp(a));
+    deploy(&mut h, &git, "default/web", "r1", vec![config_map("cfg", "1", json!({}))]);
+    h.run_for(5_000);
+    assert_eq!(status(&h, "default/web").map(|s| s.sync), Some(Sync::Synced), "its tracking names it: the object is its own");
+    h.input(Input::RemoveApp { id: "default/web".into(), cascade: Some(crate::model::Propagation::Foreground) });
+    h.run_for(10_000);
+    assert!(present(&h, "cfg"), "a shadow never writes, also as it goes");
+}
+
 #[test]
 fn crds_deployed_by_argo_cd_carry_no_tracking_and_still_compare_synced() {
     let (mut h, git) = harness(fast());
