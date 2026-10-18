@@ -65,6 +65,8 @@ pub async fn route(hub: &Arc<Hub>, body: hyper::body::Incoming) -> Result<Respon
     let declared = w.on.iter().find(|t| t.event == "workflow_dispatch").map(|t| t.inputs.clone());
     let (event, inputs) = events::preview_event(hub, &repo, &event_name, &full_ref, &sha, payload.as_ref(), &given, declared.as_deref(), &path).await.map_err(refused)?;
     let matched = kiln_ci::trigger::matches(&w, &event);
+    // What the action policies refuse among its own `uses:` (a run checks the nested ones too).
+    let policy = super::actions::refusals(&super::actions::policies(hub, &repo).await, super::actions::uses_of(&w));
     let (tx, rx) = async_channel::bounded(1);
     let start = Start { repo, event, path, workflow: Arc::new(w), message: String::new(), author: String::new(), actions: Default::default(), inputs };
     hub.ci.send(Msg::Preview { start: Box::new(start), reply: tx });
@@ -73,7 +75,7 @@ pub async fn route(hub: &Arc<Hub>, body: hyper::body::Incoming) -> Result<Respon
         _ => return Err((StatusCode::SERVICE_UNAVAILABLE, "The CI dispatcher didn't answer.".into())),
     };
     let why = matched.as_ref().err().map(ToString::to_string);
-    Ok(srv::json(StatusCode::OK, &merge(base, json!({ "event": event_name, "runs": matched.is_ok(), "why": why, "plan": plan }))))
+    Ok(srv::json(StatusCode::OK, &merge(base, json!({ "event": event_name, "runs": matched.is_ok() && policy.is_empty(), "why": why, "policy": policy, "plan": plan }))))
 }
 
 fn merge(mut a: Value, b: Value) -> Value {

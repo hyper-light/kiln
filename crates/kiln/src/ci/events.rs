@@ -48,17 +48,24 @@ pub async fn start(hub: &Hub, repo: &Repo, event: &Event, l: &load::Loaded, mess
         tracing::debug!(workflow = %l.path, %why, "workflow not run");
         return Ok(false);
     }
-    match super::actions::resolve(hub, w).await {
-        Ok(actions) => hub.ci.send(Msg::Start(Box::new(Start {
-            repo: repo.clone(),
-            event: event.clone(),
-            path: l.path.clone(),
-            workflow: Arc::new(w.clone()),
-            message: message.to_owned(),
-            author: author.to_owned(),
-            actions,
-            inputs,
-        }))),
+    match super::actions::resolve(hub, repo, &event.sha, w).await {
+        Ok(actions) => {
+            // Every resolution is audited (W07-R04): who, which ref, which commit.
+            if !actions.is_empty() {
+                let list: Vec<String> = actions.iter().map(|(u, a)| format!("{u} → {}", a.sha)).collect();
+                hub.store.audit(event.actor.clone(), "ci.actions.resolve".into(), format!("{} {} at {}: {}", repo.name, l.path, event.sha, list.join(", "))).await;
+            }
+            hub.ci.send(Msg::Start(Box::new(Start {
+                repo: repo.clone(),
+                event: event.clone(),
+                path: l.path.clone(),
+                workflow: Arc::new(w.clone()),
+                message: message.to_owned(),
+                author: author.to_owned(),
+                actions,
+                inputs,
+            })));
+        }
         Err(e) => fail_run(hub, repo, event, l, message, author, e).await?,
     }
     Ok(true)

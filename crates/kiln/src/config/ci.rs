@@ -20,6 +20,29 @@ pub struct Ci {
     pub cache: Cache,
     pub artifacts: Artifacts,
     pub oidc: Oidc,
+    pub actions: Actions,
+}
+
+/// `[ci.actions]`: which remote actions runs may use, and what to mirror ahead (docs/ci.md
+/// W07-R04). Repositories can narrow this further (`/api/ci/actions/policy?repo=`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Actions {
+    /// `owner/repo[/path][@ref]` globs a run may use; any when empty.
+    pub allow: Vec<String>,
+    /// Globs a run may not use, whatever `allow` says.
+    pub deny: Vec<String>,
+    /// Refuse tags and branches: every remote action pinned by its full commit SHA (`KCI4021`).
+    pub require_sha_pins: bool,
+    /// Actions to mirror by `kiln actions sync` (`owner/repo@ref`), for servers that will run
+    /// without reaching GitHub.
+    pub prefetch: Vec<String>,
+}
+
+impl Actions {
+    pub fn policy(&self) -> kiln_ci::policy::Policy {
+        kiln_ci::policy::Policy { allow: self.allow.clone(), deny: self.deny.clone(), require_sha_pins: self.require_sha_pins }
+    }
 }
 
 /// `[ci.cache]`: GitHub's cache service (docs/ci.md W08-R06).
