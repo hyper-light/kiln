@@ -611,6 +611,7 @@ mod tests {
     /// URL with its permission; then deleted.
     #[test]
     fn functions_publish_and_aliases_follow() -> anyhow::Result<()> {
+        let _one = fake::LAMBDA.lock();
         crate::rt::block_on(async {
             let fake = Arc::new(Fake::default());
             let base = fake::start(fake.clone()).await?;

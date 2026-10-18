@@ -192,8 +192,8 @@ async fn driver(host: Arc<dyn Host>, target: String, key: String, tx: Sender<Msg
             Ok(Err(_)) => (None, Event::Tick),
             Err(_) if Instant::now() >= next_read => {
                 let r = &rec.rollout;
-                let busy = r.state == State::Running || r.moving.is_some() || !r.ready;
-                next_read = Instant::now() + if busy { hot } else { rest };
+                let running = r.state == State::Running || r.moving.is_some() || !r.ready;
+                next_read = Instant::now() + if running { hot } else { rest };
                 match host.call(&rec, Op::Observe).await {
                     Ok(Answer::Observed { weight, ready, why }) => (None, Event::Observed { weight, ready, why }),
                     Ok(_) => (None, Event::Tick),
@@ -391,8 +391,14 @@ pub async fn start(cx: &Cx<'_>, desired: &Value, s: &Start) -> Result<(Value, bo
     let kept = cx.records.rollout(&target, &key);
     // The rollout kept moves traffic to this very version.
     if let Some(r) = kept.as_ref().filter(|r| r.green.as_str() == Some(staged.green.as_str())) {
+        let same_plan = stamped(&r.object).ok().flatten().is_some_and(|(was, with)| was == spec && with == checks);
         match &r.rollout.state {
-            State::Running | State::Paused { .. } => return Ok((read(cx, desired).await?, true)),
+            State::Running | State::Paused { .. } if same_plan => return Ok((read(cx, desired).await?, true)),
+            // Its steps or checks changed: it starts again from the first step with them (Argo
+            // Rollouts does so when a canary's steps change).
+            State::Running | State::Paused { .. } => {
+                tracing::info!(app = %s.app, object = %obj::name(desired), "deployments: a rollout's steps or checks changed; it starts again from the first");
+            }
             // Aborted: the traffic stays on blue until a person retries or git moves on.
             State::Aborted { .. } => {
                 if r.rollout.reverted {
@@ -784,6 +790,7 @@ mod tests {
     /// promotes.
     #[test]
     fn a_lambda_alias_rolls_out_blue_green() -> anyhow::Result<()> {
+        let _one = fake::LAMBDA.lock();
         crate::rt::block_on(async {
             let fake = Arc::new(Fake::default());
             let base = fake::start(fake.clone()).await?;
@@ -866,6 +873,19 @@ mod tests {
             assert_eq!((r.blue.as_str(), r.green.as_str()), (Some("3"), Some("5")), "the newer rollout starts from the same blue");
             assert_eq!(alias(&fake, "live-preview").map(|a| a.0), Some("5".into()));
             until("version 5 to wait for a person", || kept(&host).is_some_and(|r| matches!(r.rollout.state, State::Paused { .. }))).await?;
+
+            // Synced again as it is, it carries on; with its steps changed, it starts again from
+            // the first, as Argo Rollouts does.
+            let started = kept(&host).map(|r| r.started_ms);
+            deploy(&host, "s3://bucket/thumbs/v5.zip", manual, checks).await?;
+            assert_eq!(kept(&host).map(|r| r.started_ms), started, "the same rollout carries on");
+            let changed = "blue-green: { before: smoke, promote: manual, after: errors, window: 60ms, keep: 50ms }";
+            deploy(&host, "s3://bucket/thumbs/v5.zip", changed, checks).await?;
+            let r = kept(&host).ok_or_else(|| anyhow!("no rollout kept"))?;
+            assert_ne!(Some(r.started_ms), started, "new steps start it again");
+            assert!(r.rollout.plan.steps.iter().any(|s| matches!(s, Step::Watch { window_ms: 60, .. })), "with the new steps");
+            assert_eq!((r.blue.as_str(), r.green.as_str()), (Some("3"), Some("5")));
+            until("version 5 to wait for a person again", || kept(&host).is_some_and(|r| matches!(r.rollout.state, State::Paused { .. }))).await?;
             assert!(tell(host.clone(), &host.conn.target.name(), &alias_key(), (None, Event::Promote { full: false })));
             until("version 5 to succeed", || kept(&host).is_some_and(|r| r.rollout.state == State::Succeeded && r.rollout.done())).await?;
             assert_eq!(alias(&fake, "live"), Some(("5".into(), json!({}))));

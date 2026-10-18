@@ -50,6 +50,10 @@ pub struct Fake {
     pub state: Mutex<State>,
 }
 
+/// Tests on a fake Lambda run one at a time: the endpoints they point at theirs are the
+/// process's.
+pub static LAMBDA: Mutex<()> = Mutex::new(());
+
 fn err(status: u16, code: &str, message: &str) -> Response {
     let r = srv::json(http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::BAD_REQUEST), &json!({ "message": message, "__type": code }));
     srv::with_header(r, http::header::HeaderName::from_static("x-amzn-errortype"), code)

@@ -556,7 +556,9 @@ checks:
   (green is deployed again first if it was already let go).
 
 A newer revision supersedes a running rollout. Traffic goes back to blue, the green in between
-goes at once, and the newer revision starts from the first step. An app's first deploy has no
+goes at once, and the newer revision starts from the first step. Changing a running rollout's
+steps or checks in git starts it again from the first step too, traffic back on blue first: kiln
+compiles a rollout's plan when it starts. An app's first deploy has no
 blue, so it goes straight to all the traffic with no steps or checks, and so does going back to
 one of the last `rollback-window` revisions.
 
@@ -615,6 +617,7 @@ Read from Argo Rollouts' controller: `analysis/analysis.go` (how a metric is ass
 | AnalysisRuns are objects: a controller restart loses no measurement, and a stale result can't land on a newer run | every request carries an id: late answers are ignored, and a restart asks again with the same ids |
 | `progressDeadlineSeconds` (600) | `progress-deadline` (10m) |
 | a new revision mid-rollout starts again from step 0; stable stays stable | the same |
+| a canary whose steps change (`currentStepHash`) starts again from step 0; blue/green settings apply as they change | any change to a rollout's steps or checks starts it again from the first step, for every strategy |
 | no steps or analysis on a first deploy, or going back within `rollbackWindow` | the same, `rollback-window` |
 | `scaleDownDelaySeconds` and `abortScaleDownDelaySeconds` (30s) | 30s after a canary; `keep` (30m) after a blue/green; `keep-failed` (30s) |
 
