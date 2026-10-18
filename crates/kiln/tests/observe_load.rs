@@ -15,6 +15,10 @@
 //! `KOBS_LOAD_RATE=<requests a second a sender>` paces the runner's senders when its server is away;
 //! `KOBS_PROFILE=<folder>` runs each node under samply (`SAMPLY`: its path), its profile saved
 //! there as `server.json.gz` and `r1.json.gz`.
+//!
+//! The soak (`a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing`):
+//! `KOBS_SOAK_SECS` (300; hours for a soak worth the name), `KOBS_SOAK_RATE` (points a second,
+//! 200,000), `KOBS_SOAK_LOGS` (log records a second, 2,000).
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
@@ -167,6 +171,8 @@ struct Sent {
     requests: u64,
     errors: Vec<String>,
     latencies_us: Vec<u64>,
+    /// A paced sender's schedule started over, behind by more than a second.
+    late: u64,
 }
 
 thread_local! {
@@ -212,49 +218,69 @@ fn spent(before: &std::collections::BTreeMap<String, f64>, after: &std::collecti
     d.iter().map(|(k, v)| format!("{k} {v:.1}")).collect::<Vec<_>>().join(", ")
 }
 
-/// A process's resident anonymous memory by where it lies (`/proc/<pid>/smaps`): the main heap,
-/// the C library's thread arenas (each a 64 MiB reservation, `[anon]` mappings of exactly that
-/// size or less after trimming, aligned to it), and the rest (mmapped allocations, stacks).
-fn anon_by_mapping(pid: u32) -> String {
+/// A process's resident anonymous memory by where it lies (`/proc/<pid>/smaps`), bytes: the main
+/// heap; the C library's thread arenas' heaps (each a reservation of 64 MiB at the most, aligned
+/// to it), each one's; and the rest (mmapped allocations, stacks).
+#[derive(Debug, Default)]
+struct Anon {
+    heap: u64,
+    arenas: Vec<u64>,
+    other: u64,
+}
+
+fn anon_of(pid: u32) -> Anon {
     let smaps = std::fs::read_to_string(format!("/proc/{pid}/smaps")).unwrap_or_default();
-    let (mut heap, mut arenas, mut other, mut n_arenas) = (0u64, 0u64, 0u64, 0usize);
-    let mut each: Vec<u64> = Vec::new();
+    let mut out = Anon::default();
+    // The mapping being read: its start, length, and whether it is the heap; None for a file's.
     let mut current: Option<(u64, u64, bool)> = None;
-    let mut flush = |c: Option<(u64, u64, bool)>, rss: u64| {
-        if let Some((start, len, is_heap)) = c {
-            if is_heap {
-                heap += rss;
-            } else if len <= 64 << 20 && start % (64 << 20) == 0 {
-                arenas += rss;
-                n_arenas += usize::from(rss > 0);
-                each.push(rss);
-            } else {
-                other += rss;
-            }
-        }
+    let mut add = |out: &mut Anon, c: Option<(u64, u64, bool)>, bytes: u64| match c {
+        Some((_, _, true)) => out.heap += bytes,
+        Some((start, len, false)) if len <= 64 << 20 && start % (64 << 20) == 0 => out.arenas.push(bytes),
+        Some(_) => out.other += bytes,
+        None => {}
     };
-    let mut rss = 0u64;
+    let mut bytes = 0u64;
     for line in smaps.lines() {
         let mut parts = line.split_whitespace();
         let first = parts.next().unwrap_or("");
-        if let Some((a, b)) = first.split_once('-')
-            && let (Ok(a), Ok(b)) = (u64::from_str_radix(a, 16), u64::from_str_radix(b, 16))
-        {
-            flush(current.take(), rss);
-            rss = 0;
+        let range = first.split_once('-').and_then(|(a, b)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(b, 16).ok()?)));
+        if let Some((a, b)) = range {
+            add(&mut out, current.take(), bytes);
+            bytes = 0;
             let rest: Vec<&str> = parts.collect();
+            // An address range's line: perms, offset, device, inode, then a name if any.
             let name = rest.get(4).copied().unwrap_or("");
-            // Anonymous: no file; the heap by name.
-            current = if name.is_empty() || name == "[heap]" { Some((a, b - a, name == "[heap]")) } else { None };
+            current = if name.is_empty() || name == "[heap]" { Some((a, b.saturating_sub(a), name == "[heap]")) } else { None };
         } else if first == "Anonymous:" {
-            rss = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024;
+            bytes = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024;
         }
     }
-    flush(current.take(), rss);
+    add(&mut out, current.take(), bytes);
+    out
+}
+
+fn anon_by_mapping(pid: u32) -> String {
+    let a = anon_of(pid);
     let mib = |b: u64| b as f64 / 1048576.0;
-    each.sort_unstable_by(|a, b| b.cmp(a));
+    let mut each = a.arenas.clone();
+    each.sort_unstable_by(|x, y| y.cmp(x));
+    let n = each.iter().filter(|&&b| b > 0).count();
     let top: Vec<String> = each.iter().take(4).map(|&b| format!("{:.0}", mib(b))).collect();
-    format!("heap {:.0} MiB, {} arenas {:.0} MiB (the largest {} MiB), other {:.0} MiB", mib(heap), n_arenas, mib(arenas), top.join(", "), mib(other))
+    format!("heap {:.0} MiB, {n} arena heaps {:.0} MiB (the largest {} MiB), other {:.0} MiB", mib(a.heap), mib(each.iter().sum()), top.join(", "), mib(a.other))
+}
+
+/// The breakdown counts each resident anonymous byte once: its parts add up to what the process
+/// says it holds anonymously, give or take what changed between the two reads.
+#[test]
+fn a_process_s_memory_by_where_it_lies_adds_up_to_what_it_holds() {
+    let held: Vec<u8> = vec![1; 32 << 20];
+    let a = anon_of(std::process::id());
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let anon_kib: u64 = status.lines().find(|l| l.starts_with("RssAnon:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let total = a.heap + a.arenas.iter().sum::<u64>() + a.other;
+    let anon = anon_kib * 1024;
+    assert!(total <= anon + (8 << 20) && total + (8 << 20) >= anon, "{a:?}: {total} of {anon}");
+    assert!(held.iter().all(|&b| b == 1));
 }
 
 fn pct(sorted: &[u64], q: f64) -> u64 {
@@ -685,5 +711,242 @@ fn a_full_disk_is_refused_in_time_never_spun_on_and_nothing_it_took_is_lost() ->
     let stored: f64 = at(&a, &["series"]).as_array().into_iter().flatten().flat_map(|s| at(s, &["values"]).as_array().cloned().unwrap_or_default()).filter_map(|v| v.as_f64()).sum();
     anyhow::ensure!(stored.round() as u64 == taken + more, "{} taken, {stored} stored", taken + more);
     eprintln!("\na full disk: {taken} points taken, then refused; idle while full ({:.2} CPU s in 5 s); {more} more once 30 MiB were freed; all {} stored", c1 - c0, taken + more);
+    Ok(())
+}
+
+/// A sample of a soak: when, each process's resident and anonymous memory, the server's store
+/// (head and index bytes, blocks, its log's bytes), and what had been taken by then.
+struct Sampled {
+    at_s: f64,
+    server: (f64, f64),
+    runner: (f64, f64),
+    head_mib: f64,
+    index_mib: f64,
+    blocks: u64,
+    log_mib: f64,
+    taken: u64,
+}
+
+/// docs/observe.md §13, the soak: a steady load held for long, at a rate a busy fleet sends, half to
+/// the server and half to the runner's receiver, log records beside it, a dashboard reading every
+/// 2 s and a monitor evaluating every 10 s. What it proves: every point and record taken is stored
+/// once and the replicas agree at the end; the store cuts and the log compacts all through; and
+/// each process's memory holds a level, its run's last third no higher than its second by more than
+/// a tenth (a leak climbs; a high-water mark, a buffer grown once, does not).
+#[test]
+#[ignore = "starts real processes and loads them for minutes"]
+fn a_steady_load_held_for_long_keeps_its_memory_level_and_loses_nothing() -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicU64;
+    let secs = env("KOBS_SOAK_SECS", 300);
+    let rate = env("KOBS_SOAK_RATE", 200_000);
+    let log_rate = env("KOBS_SOAK_LOGS", 2_000);
+    let (senders, series) = (4u64, 1000u64);
+    // A cut comes once the log holds half a cadence (`kiln_obs::group::due`): about a minute of
+    // this load's points, so a soak shorter than two would judge none.
+    anyhow::ensure!(secs >= 120, "a soak of 120 s at the least (KOBS_SOAK_SECS): a cut comes about once a minute at 200,000 points a second");
+    let mut f = Fleet::new()?;
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(90), "r1 a learner, caught up", |s| caught_up(s, &["r1"]))?;
+    let ingest = std::fs::read_to_string(f.root.path().join("server").join("observe").join("ingest.token"))?.trim().to_owned();
+    let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    let server_pid = f.server.as_ref().map_or(0, |p| p.child.id());
+    let runner_pid = f.runners.get("r1").and_then(Option::as_ref).map_or(0, |p| p.child.id());
+    // A monitor of the soak's own points, evaluated every 10 s, that never alerts.
+    f.call(
+        "POST",
+        "/api/observe/v1/monitors",
+        Some(&json!({ "name": "soak", "query": "avg(last_1m):avg:load.v{*} by {host} > 1000000", "message": "never", "options": { "every": 10, "thresholds": { "critical": 1_000_000 } } })),
+    )?;
+    let rss = |pid: u32| -> (f64, f64) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let kib = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0;
+        (kib("VmRSS:"), kib("RssAnon:"))
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let taken = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
+    let t0_ms = common::now_ms();
+    // Each sender: its `series` points (one each) a request, paced to its share of the rate, their
+    // time the request's own (now, a millisecond on from its last at the least).
+    let interval = Duration::from_secs_f64(series as f64 * senders as f64 / rate.max(1) as f64);
+    let mut threads = Vec::new();
+    for sender in 0..senders {
+        let (stop, ingest, taken) = (stop.clone(), ingest.clone(), taken.clone());
+        let (port, auth) = if sender % 2 == 0 { (f.http, format!("Authorization: Bearer {ingest}\r\n")) } else { (r1, String::new()) };
+        threads.push(std::thread::spawn(move || -> Sent {
+            let mut sent = Sent::default();
+            let mut conn = Conn::new(port);
+            let headers = format!("{auth}Content-Type: application/x-protobuf\r\nContent-Encoding: gzip\r\n");
+            let mut next = Instant::now();
+            let mut last_ms = 0i64;
+            let mut late = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now < next {
+                    std::thread::sleep(next - now);
+                } else if now - next > Duration::from_secs(1) {
+                    // Behind by more than a second (the machine busy): the schedule starts over
+                    // rather than bursting to catch up.
+                    late += 1;
+                    next = now;
+                }
+                next += interval;
+                let ms = common::now_ms().max(last_ms + 1);
+                let body = gzip(&request(sender, series, ms as u64 * 1_000_000)).unwrap_or_default();
+                let t = Instant::now();
+                let answer = conn.send("/v1/metrics", &headers, &body);
+                sent.latencies_us.push(t.elapsed().as_micros() as u64);
+                sent.requests += 1;
+                match answer {
+                    Ok(a) if a.code == 200 => {
+                        sent.taken += series;
+                        taken.fetch_add(series, Ordering::Relaxed);
+                        sent.last_ms = Some(ms);
+                        last_ms = ms;
+                    }
+                    Ok(a) if a.code == 503 => {
+                        sent.refused += series;
+                        std::thread::sleep(Duration::from_millis(a.retry_after.map_or(100, |s| s * 1000).min(2_000)));
+                    }
+                    Ok(a) => sent.errors.push(format!("{}: {}", a.code, String::from_utf8_lossy(&a.body))),
+                    Err(e) => sent.errors.push(e.to_string()),
+                }
+                if sent.errors.len() > 20 {
+                    break;
+                }
+            }
+            sent.late = late;
+            sent
+        }));
+    }
+    // Log records: a tenth of a second's worth every tenth of a second, through the API.
+    let logs = {
+        let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
+        std::thread::spawn(move || -> (u64, Vec<String>) {
+            let (mut posted, mut errors) = (0u64, Vec::new());
+            let mut conn = Conn::new(port);
+            let batch = (log_rate / 10).max(1);
+            let mut next = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now < next {
+                    std::thread::sleep(next - now);
+                }
+                next += Duration::from_millis(100);
+                let records: Vec<serde_json::Value> = (0..batch).map(|i| json!({ "message": format!("soak line {} of {posted}", i), "service": "soak", "hostname": "soak", "status": if i % 10 == 0 { "error" } else { "info" }, "attributes": { "i": i } })).collect();
+                let body = serde_json::to_vec(&records).unwrap_or_default();
+                match conn.send("/api/observe/v1/logs", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &body) {
+                    Ok(a) if a.code == 202 => posted += batch,
+                    // Behind: sent again a moment later, as a client would.
+                    Ok(a) if a.code == 503 => std::thread::sleep(Duration::from_millis(100)),
+                    Ok(a) => errors.push(format!("logs: {}", a.code)),
+                    Err(e) => errors.push(format!("logs: {e}")),
+                }
+                if errors.len() > 20 {
+                    break;
+                }
+            }
+            (posted, errors)
+        })
+    };
+    // A dashboard: one series and every host, over the last 15 minutes, every 2 s.
+    let reader = {
+        let (stop, port, admin) = (stop.clone(), f.http, f.admin.clone());
+        std::thread::spawn(move || -> (Vec<u64>, Vec<String>) {
+            let (mut took, mut errors) = (Vec::new(), Vec::new());
+            let mut conn = Conn::new(port);
+            while !stop.load(Ordering::Relaxed) {
+                let now = common::now_ms();
+                for q in ["avg:load.v{host:load-0,s:7}", "sum:load.v{*} by {host}"] {
+                    let body = serde_json::to_vec(&json!({ "query": q, "from": now - 900_000, "to": now })).unwrap_or_default();
+                    let t = Instant::now();
+                    match conn.send("/api/observe/v1/query", &format!("Authorization: Bearer {admin}\r\nContent-Type: application/json\r\n"), &body) {
+                        Ok(a) if a.code == 200 => took.push(t.elapsed().as_micros() as u64),
+                        Ok(a) => errors.push(format!("{q}: {}", a.code)),
+                        Err(e) => errors.push(format!("{q}: {e}")),
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            (took, errors)
+        })
+    };
+    // A sample every 10 s.
+    let mut samples: Vec<Sampled> = Vec::new();
+    let mib = |s: &serde_json::Value, k: &str| at(s, &[k]).as_u64().unwrap_or(0) as f64 / 1048576.0;
+    eprintln!("\nobserve, a soak: {rate} points a second for {secs} s ({senders} senders of {series} points a request, half to the runner), {log_rate} log records a second");
+    eprintln!("  {:>6} {:>16} {:>16} {:>8} {:>8} {:>7} {:>8} {:>12}", "s", "server MiB", "runner MiB", "head", "index", "blocks", "log MiB", "taken");
+    while started.elapsed() < Duration::from_secs(secs) {
+        std::thread::sleep(Duration::from_secs(10).min(Duration::from_secs(secs).saturating_sub(started.elapsed())).max(Duration::from_millis(100)));
+        let st = f.status()?;
+        let x = Sampled { at_s: started.elapsed().as_secs_f64(), server: rss(server_pid), runner: rss(runner_pid), head_mib: mib(&st, "heap_samples"), index_mib: mib(&st, "heap_index"), blocks: at(&st, &["blocks"]).as_u64().unwrap_or(0), log_mib: mib(&st, "log_bytes"), taken: taken.load(Ordering::Relaxed) };
+        eprintln!(
+            "  {:>6.0} {:>9.0} ({:>4.0}) {:>9.0} ({:>4.0}) {:>8.1} {:>8.1} {:>7} {:>8.1} {:>12}",
+            x.at_s, x.server.0, x.server.1, x.runner.0, x.runner.1, x.head_mib, x.index_mib, x.blocks, x.log_mib, x.taken
+        );
+        samples.push(x);
+    }
+    stop.store(true, Ordering::Relaxed);
+    let ran = started.elapsed();
+    let mut all = Sent::default();
+    let mut newest = 0i64;
+    for t in threads {
+        let s = t.join().map_err(|_| anyhow::anyhow!("a sender panicked"))?;
+        newest = newest.max(s.last_ms.unwrap_or(0));
+        all.taken += s.taken;
+        all.refused += s.refused;
+        all.requests += s.requests;
+        all.errors.extend(s.errors);
+        all.latencies_us.extend(s.latencies_us);
+        all.late += s.late;
+    }
+    let (posted, log_errors) = logs.join().map_err(|_| anyhow::anyhow!("the log sender panicked"))?;
+    let (mut read, read_errors) = reader.join().map_err(|_| anyhow::anyhow!("the reader panicked"))?;
+    anyhow::ensure!(all.errors.is_empty() && log_errors.is_empty() && read_errors.is_empty(), "errors: {:?} {:?} {:?}\n{}", all.errors.iter().take(5).collect::<Vec<_>>(), log_errors.iter().take(5).collect::<Vec<_>>(), read_errors.iter().take(5).collect::<Vec<_>>(), f.logs());
+    // Every point and record taken, stored once.
+    let settled = Instant::now();
+    let mut have = 0;
+    while settled.elapsed() < Duration::from_secs(180) {
+        have = stored(&f, t0_ms - 60_000, newest + 1_000)?;
+        if have >= all.taken {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    anyhow::ensure!(have == all.taken, "{} points taken, {have} stored\n{}", all.taken, f.logs());
+    let mut kept = 0.0;
+    while settled.elapsed() < Duration::from_secs(240) {
+        let found = f.call("POST", "/api/observe/v1/logs/aggregate", Some(&json!({ "query": "service:soak", "from": t0_ms - 60_000, "to": common::now_ms() + 60_000 })))?;
+        kept = at(&found, &["groups"]).as_array().and_then(|g| g.first()).and_then(|g| at(g, &["value"]).as_f64()).unwrap_or(0.0);
+        if kept >= posted as f64 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    anyhow::ensure!(kept == posted as f64, "{posted} log records taken, {kept} stored");
+    let st = f.status()?;
+    let dropped = at(&st, &["dropped"]).as_u64().unwrap_or(0) + at(&st, &["machines"]).as_array().into_iter().flatten().map(|m| at(m, &["status", "dropped"]).as_u64().unwrap_or(0)).sum::<u64>();
+    anyhow::ensure!(dropped == 0, "{dropped} dropped for room after being taken");
+    let (index, digest) = f.verify(2)?;
+    all.latencies_us.sort_unstable();
+    read.sort_unstable();
+    let ms = |us: u64| us as f64 / 1000.0;
+    eprintln!("  taken      {} points ({:.0} a second), {} refused (503, sent again), the senders {} times a second behind; {posted} log records", all.taken, all.taken as f64 / ran.as_secs_f64(), all.refused, all.late);
+    eprintln!("  a request  p50 {:.2} ms, p99 {:.2} ms; a dashboard query p50 {:.2} ms, p99 {:.2} ms", ms(pct(&all.latencies_us, 0.5)), ms(pct(&all.latencies_us, 0.99)), ms(pct(&read, 0.5)), ms(pct(&read, 0.99)));
+    eprintln!("  where      the server's {} (of {:.0} MiB anonymous); the runner's {} (of {:.0})", anon_by_mapping(server_pid), rss(server_pid).1, anon_by_mapping(runner_pid), rss(runner_pid).1);
+    eprintln!("  replicas   agree at index {index}: {digest:016x}");
+    // The store cut and its log compacted all through.
+    let blocks_made = samples.windows(2).filter(|w| matches!(w, [a, b] if b.blocks != a.blocks)).count();
+    anyhow::ensure!(blocks_made > 0, "no cut in {secs} s");
+    // Memory holds a level: each third's highest, the last no more than a tenth over the second
+    // (and 16 MiB: a buffer's doubling, a merge's block).
+    let third = samples.len() / 3;
+    anyhow::ensure!(third >= 2, "too short a soak to judge memory: {} samples", samples.len());
+    let peak = |range: &[Sampled], which: fn(&Sampled) -> f64| range.iter().map(which).fold(0.0f64, f64::max);
+    for (name, which) in [("server", (|x: &Sampled| x.server.0) as fn(&Sampled) -> f64), ("runner", |x: &Sampled| x.runner.0)] {
+        let (second, last) = (peak(samples.get(third..2 * third).unwrap_or(&[]), which), peak(samples.get(2 * third..).unwrap_or(&[]), which));
+        eprintln!("  memory     the {name}'s highest: {second:.0} MiB in the second third, {last:.0} in the last");
+        anyhow::ensure!(last <= second * 1.1 + 16.0, "the {name}'s memory climbs: {second:.0} MiB, then {last:.0}\n{}", f.logs());
+    }
     Ok(())
 }

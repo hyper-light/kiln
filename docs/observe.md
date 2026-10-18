@@ -22,7 +22,7 @@ is what it is. A change in behaviour updates it in the same commit.
 | O-7 | Monitors (§9): metric, change, log, anomaly; thresholds with recovery, warnings, NO DATA, renotify, mute, evaluation delay; Datadog's templates and mentions; anomaly detection (§9.1): Datadog's three algorithms, seasons learned, deviations calibrated per series, scored on NAB 52.6 (§12.12), `anomalies()` in queries with its band drawn; composites (Datadog's algebra and group matching, its table a test); forecasts (`forecast()` and forecast monitors; chosen and scored on M4, §12.15); outliers (`outliers()` and outlier monitors; DBSCAN's constant from a simulation, §9.1) | done |
 | O-8 | The UI (§11): Observe's overview, dashboards (kiln's own and yours, template variables, edited in place), the metrics explorer, the logs explorer and event stream, monitors (composites among them) and integrations; checked by scenarios in Chromium and WebKit (§13); next: distribution and heatmap widgets | done |
 | O-9 | Integrations (§10): Slack, Discord, Teams, PagerDuty, signed webhooks, GitHub; AWS CloudWatch, Google Cloud Monitoring and Azure Monitor pulled with given or ambient credentials (§10.1), checked live against services that verify as the clouds do (§13); next: CloudWatch Metric Streams, Prometheus scrapes, the clouds' logs | in progress |
-| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). Next: soak; sampling profiles (samply needs `perf_event_paranoid` ≤ 1 here) | continuous |
+| O-10 | Load, soak and fault scenarios end to end; allocation and fault passes. Done: the flood and the server-away scenarios (§13), OTLP decoding and the sample path (§12.10), blocks and merges (§4.5); measured in §12.11. Full disks and clock skew done (§13). The soak (§13: memory holds its level). Sampling profiles (perf): decoding a third faster (§12.1, §12.5), OTLP a fifth (§12.10), requests' buffers handed back. Next: hours-long soaks; a rollup tier for long ranges | continuous |
 
 ## 1. Rules
 
@@ -1392,7 +1392,24 @@ token. Their figures are functions of the minute, so what is stored is checked m
   VM's (its project too), an Azure VM's managed identity.
 2026-10-18: all pass (48 s).
 
-To come: soak.
+**A soak** (`observe_load.rs`, `KOBS_SOAK_SECS`, 300 unless said; hours for a soak worth the
+name): a server and a runner, 200,000 points a second held steady (4 senders paced, OTLP protobuf,
+gzip, half to the runner's receiver), 2,000 log records a second through the API, a dashboard's two
+queries every 2 s and a monitor every 10 s. Every point and record taken is stored once, the
+replicas agree, the store cuts (about once a minute) and merges and its log compacts throughout, and
+each process's memory holds a level: its highest in the run's last third within a tenth of its
+second's. 2026-10-18, 300 s: 60,008,000 points and 600,200 records, all stored; the server 82–95
+MiB resident (72–80 anonymous), the runner 61–69 (50–56), the head 1–9 MiB between cuts, 1–3 blocks;
+the server's highest 94 MiB in the second third and 95 in the last; a request p50 0.24 ms, p99 2.8
+ms; a dashboard query p50 7.9 ms, p99 349 ms (every host's 15 minutes, read raw: some 60 M points;
+a rollup tier, as Datadog keeps, is what would make it fast).
+
+What floods leave (§12.11) is a high-water mark, not a leak: after one, the server held some 300 MiB
+more than before, most of it in the C library's per-thread arenas (32 of them, from
+`/proc/<pid>/smaps`), while its store held under 15 MiB; `GLIBC_TUNABLES=glibc.malloc.arena_max=2`
+held it to 90 MiB more, a fixed `mmap_threshold` to 164. kiln cannot set either from inside without
+`unsafe` (and a variable it set would reach the jobs it runs): an operator who runs floods on a small
+machine can.
 
 ## 14. References
 
