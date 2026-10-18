@@ -445,7 +445,7 @@ pub async fn answer(o: &Observe, signal: Signal, req: crate::http::server::Reque
         Ok(b) => b,
         Err(_) => return srv::text(StatusCode::PAYLOAD_TOO_LARGE, "an OTLP request is taken up to 20 MiB"),
     };
-    let (o, now_ns) = (o.clone(), i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)).unwrap_or(i64::MAX));
+    let (o, now_ns) = (o.clone(), super::clock_ms().saturating_mul(1_000_000));
     let taken = crate::rt::blocking(move || take(&o, signal, &content_type, gzip, &body, now_ns)).await;
     match taken {
         Ok(Answer::Ok { json: true, .. }) => srv::response(StatusCode::OK, "application/json", srv::full("{}")),

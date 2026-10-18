@@ -115,7 +115,18 @@ pub struct Counts {
     pub expired: u64,
     /// Log records.
     pub logs: u64,
+    /// Samples more than [`AHEAD_MS`] past their write's time, and log records more than
+    /// [`LOGS_AHEAD_MS`]: dropped (a sender's clock, or its data, is wrong).
+    pub ahead: u64,
+    pub logs_ahead: u64,
 }
+
+/// How far past its write's time a sample may be: ten minutes, as far as Datadog's intake takes a
+/// metric's point ahead. The write's time is its leader's clock (the leader stamps every write it
+/// proposes), so every replica judges alike.
+pub const AHEAD_MS: i64 = 10 * 60_000;
+/// How far ahead a log record may be: two hours, Datadog's for log events.
+pub const LOGS_AHEAD_MS: i64 = 2 * 3_600_000;
 
 impl std::ops::AddAssign for Counts {
     fn add_assign(&mut self, o: Self) {
@@ -126,6 +137,8 @@ impl std::ops::AddAssign for Counts {
         self.duplicates += o.duplicates;
         self.expired += o.expired;
         self.logs += o.logs;
+        self.ahead += o.ahead;
+        self.logs_ahead += o.logs_ahead;
     }
 }
 
@@ -612,7 +625,7 @@ impl Store {
         if self.sessions.get(&sender).is_some_and(|s| seq <= s.seq) {
             return Written::Duplicate;
         }
-        let applied = self.apply(batch);
+        let applied = self.apply_within(batch, at.saturating_add(AHEAD_MS), at.saturating_add(LOGS_AHEAD_MS).saturating_mul(1_000_000));
         self.sessions.insert(sender, Session { seq, at, index });
         if self.sessions.len() > MAX_SESSIONS
             && let Some(oldest) = self.sessions.iter().min_by_key(|(_, s)| s.index).map(|(&k, _)| k)
@@ -647,12 +660,18 @@ impl Store {
         self.keep_series(&keep).unwrap_or(0)
     }
 
-    /// Applies a write batch, item by item.
+    /// Applies a write batch, item by item, every sample's time taken.
     pub fn apply(&mut self, batch: &[u8]) -> Result<Applied, ApplyError> {
+        self.apply_within(batch, i64::MAX, i64::MAX)
+    }
+
+    /// Applies a write batch, its samples no later than `horizon` (ms) and its log records no
+    /// later than `logs_horizon` (ns): later ones are counted and dropped.
+    pub fn apply_within(&mut self, batch: &[u8], horizon: i64, logs_horizon: i64) -> Result<Applied, ApplyError> {
         let mut done = Applied::default();
         self.pending.clear();
         self.pending_at.clear();
-        let result = self.apply_items(batch, &mut done);
+        let result = self.apply_items(batch, &mut done, horizon, logs_horizon);
         self.pending.clear();
         self.pending_at.clear();
         self.totals += done.counts;
@@ -663,7 +682,7 @@ impl Store {
         self.pending_at.find(fp, |&i| self.pending.get(i as usize).is_some_and(|p| p.fp == fp)).and_then(|&i| self.pending.get(i as usize)).copied()
     }
 
-    fn apply_items(&mut self, batch: &[u8], done: &mut Applied) -> Result<(), ApplyError> {
+    fn apply_items(&mut self, batch: &[u8], done: &mut Applied, horizon: i64, logs_horizon: i64) -> Result<(), ApplyError> {
         let mut r = Reader::new(batch)?;
         while let Some(item) = r.next_item()? {
             match item {
@@ -689,7 +708,11 @@ impl Store {
                     if raw.len() != raw_len {
                         return Err(ApplyError::LogRows);
                     }
-                    self.logs.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
+                    let (raw, rows, ahead) = within_logs(raw, rows, logs_horizon).map_err(|_| ApplyError::LogRows)?;
+                    done.counts.logs_ahead += ahead;
+                    if rows > 0 {
+                        self.logs.append(raw, rows).map_err(|e| ApplyError::Logs(e.to_string()))?;
+                    }
                     done.counts.logs += u64::from(rows);
                 }
                 Item::Run { fp, samples } => {
@@ -713,6 +736,7 @@ impl Store {
                         match d.next_sample()? {
                             None => break None,
                             Some((t, _)) if t < cutoff => done.counts.expired += 1,
+                            Some((t, _)) if t > horizon => done.counts.ahead += 1,
                             Some(s) => break Some(s),
                         }
                     };
@@ -747,6 +771,8 @@ impl Store {
                     while let Some((t, v)) = next {
                         if t < cutoff {
                             done.counts.expired += 1;
+                        } else if t > horizon {
+                            done.counts.ahead += 1;
                         } else {
                             match series.append(t, v)? {
                                 Appended::InOrder => {}
@@ -1351,6 +1377,37 @@ impl Heap {
     pub fn total(&self) -> usize {
         self.symbols + self.index + self.samples
     }
+}
+
+
+/// A batch's log rows without those later than `horizon` (ns): the rows as they are when none is
+/// (as nearly always), else written again without them; how many went.
+fn within_logs(raw: Vec<u8>, rows: u32, horizon: i64) -> Result<(Vec<u8>, u32, u64), crate::logs::record::RowError> {
+    use crate::logs::record::{Rows, put_row_ref};
+    let mut it = Rows::new(&raw, rows as usize);
+    let mut any = false;
+    while let Some(r) = it.next_row()? {
+        if r.ts > horizon {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return Ok((raw, rows, 0));
+    }
+    let mut kept = Vec::with_capacity(raw.len());
+    let (mut n, mut ahead, mut prev) = (0u32, 0u64, 0i64);
+    let mut it = Rows::new(&raw, rows as usize);
+    while let Some(r) = it.next_row()? {
+        if r.ts > horizon {
+            ahead += 1;
+            continue;
+        }
+        put_row_ref(&mut kept, &r, prev);
+        prev = r.ts;
+        n += 1;
+    }
+    Ok((kept, n, ahead))
 }
 
 #[cfg(test)]

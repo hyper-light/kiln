@@ -61,6 +61,20 @@ pub fn write(sender: u64, seq: u64, at: i64, batch: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A write's time, read and set in place (`None`: not a write): a runner's sends say its clock
+/// when sent, and the leader stamps what it proposes with its own.
+pub fn write_at(entry: &mut [u8], set: Option<i64>) -> Option<i64> {
+    if entry.first() != Some(&WRITE) {
+        return None;
+    }
+    let at = entry.get_mut(17..25)?;
+    let was = i64::from_le_bytes(<[u8; 8]>::try_from(&*at).ok()?);
+    if let Some(t) = set {
+        at.copy_from_slice(&t.to_le_bytes());
+    }
+    Some(was)
+}
+
 pub fn retain(metrics: i64, logs: i64, at: i64) -> Vec<u8> {
     let mut out = Vec::with_capacity(25);
     out.push(RETAIN);

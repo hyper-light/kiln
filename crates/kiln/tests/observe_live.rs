@@ -465,3 +465,65 @@ fn github_s_webhooks_and_posted_events_are_events_and_counts() -> anyhow::Result
     anyhow::ensure!(by.get("github") == Some(&2.0) && by.get("web") == Some(&1.0), "events counted by service: {by:?}");
     Ok(())
 }
+
+/// A runner whose clock is an hour ahead of the server's: the server measures it from the
+/// runner's writes, says so (an event, and the machine's status), and drops the runner's own
+/// figures an hour ahead (counted, not stored), while points the runner takes with true times are
+/// stored. Started again with a true clock, it is said to agree again.
+#[test]
+#[ignore = "starts real processes"]
+fn a_runner_whose_clock_is_an_hour_ahead_is_said_so_and_its_figures_from_the_future_are_not_kept() -> anyhow::Result<()> {
+    let mut f = Fleet::new()?;
+    f.start_runner_with("r1", &[("KILN_OBSERVE_CLOCK_SKEW_MS", "3600000"), ("KILN_OBSERVE_HOST_SECONDS", "2")])?;
+    let skewed = f.until(Duration::from_secs(120), "r1's clock measured an hour ahead, its figures dropped as ahead", |s| {
+        at(s, &["machines"]).as_array().into_iter().flatten().any(|m| {
+            at(m, &["machine"]) == "r1"
+                && at(m, &["clock_skew_ms"]).as_i64().is_some_and(|k| (3_590_000..=3_610_000).contains(&k))
+                && at(m, &["status", "ahead"]).as_u64().unwrap_or(0) > 0
+        })
+    })?;
+    let _ = skewed;
+    // Said once, as an event.
+    let now = crate_now();
+    let said = f.call("POST", "/api/observe/v1/events/search", Some(&json!({ "query": "@event.type:observe.clock_skew", "from": now - 600_000, "to": now + 60_000, "limit": 10 })))?;
+    let messages: Vec<String> = at(&said, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str().map(str::to_owned)).collect();
+    anyhow::ensure!(messages.len() == 1 && messages.first().is_some_and(|m| m.contains("r1's clock is 1 h 0 min ahead")), "{messages:?}");
+    // Points with true times, taken by the skewed runner, are stored.
+    let r1 = *f.otlp.get("r1").ok_or_else(|| anyhow::anyhow!("r1's receiver"))?;
+    let mut req = kiln_obs::otlp::pb::Writer::default();
+    req.message(1, |rm| {
+        rm.message(2, |sm| {
+            sm.message(2, |m| {
+                m.str(1, "e2e.true.time");
+                m.message(5, |g| {
+                    g.message(1, |dp| {
+                        dp.fixed64(3, (now as u64) * 1_000_000);
+                        dp.double(4, 7.0);
+                    });
+                });
+            });
+        });
+    });
+    let (code, _) = raw(r1, "POST", "/v1/metrics", "Content-Type: application/x-protobuf\r\n", &req.buf)?;
+    anyhow::ensure!(code == 200, "{code}");
+    let start = Instant::now();
+    loop {
+        let q = f.query("sum:e2e.true.time{*}", now - 60_000, now + 60_000)?;
+        if q.values().any(|v| v.contains(&Some(7.0))) {
+            break;
+        }
+        anyhow::ensure!(start.elapsed() < Duration::from_secs(30), "a point with a true time never stored: {q:?}\n{}", f.logs());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Its clock set right (started again without the skew): it agrees again, and is said to.
+    f.kill_runner("r1");
+    f.start_runner("r1")?;
+    f.until(Duration::from_secs(120), "r1's clock agreeing again", |s| {
+        at(s, &["machines"]).as_array().into_iter().flatten().any(|m| at(m, &["machine"]) == "r1" && at(m, &["clock_skew_ms"]).as_i64().is_some_and(|k| k.abs() < 5_000))
+    })?;
+    let now = crate_now();
+    let said = f.call("POST", "/api/observe/v1/events/search", Some(&json!({ "query": "@event.type:observe.clock_skew", "from": now - 600_000, "to": now + 60_000, "limit": 10 })))?;
+    let messages: Vec<String> = at(&said, &["records"]).as_array().into_iter().flatten().filter_map(|r| at(r, &["message"]).as_str().map(str::to_owned)).collect();
+    anyhow::ensure!(messages.iter().any(|m| m.contains("r1's clock agrees with the server's again")), "{messages:?}");
+    Ok(())
+}

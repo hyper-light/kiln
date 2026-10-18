@@ -148,6 +148,35 @@ fn a_write_sent_twice_is_applied_once() {
     assert_eq!(s.apply_entry(5, &[crate::command::RETAIN, 1]), Ok(Answer::Malformed(CommandError::Short)));
 }
 
+/// A write's samples more than ten minutes past its time, and its log records more than two hours
+/// past it, are counted and dropped, judged by the write's own time (its leader's clock): every
+/// replica alike. A series whose only sample was ahead is not defined.
+#[test]
+fn samples_and_records_too_far_ahead_of_their_write_are_counted_and_dropped() {
+    let mut s = Store::new(Keyed::with_keys(1, 2));
+    let at = 1_760_000_000_000i64;
+    let (k, lone) = (gauge("m", "a"), gauge("m", "ahead"));
+    let mut b = Builder::new();
+    b.define(&k);
+    b.run(k.fp, [(at - 60_000, 1.0), (at + 9 * 60_000, 2.0), (at + 11 * 60_000, 3.0)]);
+    b.define(&lone);
+    b.run(lone.fp, [(at + 3_600_000, 4.0)]);
+    let ns = |ms: i64| ms * 1_000_000;
+    b.logs(&[
+        Record { ts: ns(at), message: "now".into(), ..Record::default() },
+        Record { ts: ns(at + 3 * 3_600_000), message: "three hours ahead".into(), ..Record::default() },
+        Record { ts: ns(at + 60_000), message: "a minute ahead".into(), ..Record::default() },
+    ]);
+    let Ok(Answer::Write { outcome: Written::Applied(a), .. }) = s.apply_entry(1, &b.finish_write(5, 1, at)) else { panic!("not applied") };
+    assert_eq!((a.counts.samples, a.counts.ahead, a.counts.logs, a.counts.logs_ahead), (2, 2, 2, 1));
+    let series = read_all(&s, &Selector::metric("m"));
+    assert_eq!(series.len(), 1, "the series whose only sample was ahead is not defined: {series:?}");
+    assert_eq!(series[0].1, vec![(at - 60_000, 1f64.to_bits()), (at + 9 * 60_000, 2f64.to_bits())]);
+    let all = crate::logs::search::parse("*").unwrap();
+    let kept: Vec<String> = s.search_logs(&all, i64::MIN, i64::MAX, 10).unwrap().records.into_iter().map(|r| r.message).collect();
+    assert_eq!(kept, vec!["a minute ahead".to_owned(), "now".to_owned()]);
+}
+
 #[test]
 fn a_bound_on_series_refuses_new_series_past_it() {
     let mut s = Store::new(Keyed::with_keys(1, 2));

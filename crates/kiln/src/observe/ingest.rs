@@ -103,6 +103,8 @@ pub struct Batcher {
     known: HashMap<u64, Instant>,
     pub dropped: u64,
     pub written: u64,
+    /// Samples and records the group dropped as too far ahead of their write's time.
+    pub ahead: u64,
     /// Points and log bytes that have left what waits (cut into a write, or dropped), less those
     /// that came back to wait again: what admission's bound is released by.
     left_points: u64,
@@ -137,6 +139,7 @@ impl Batcher {
             known: HashMap::new(),
             dropped: 0,
             written: 0,
+            ahead: 0,
             left_points: 0,
             left_log_bytes: 0,
         }
@@ -439,8 +442,9 @@ impl Batcher {
             }
             self.left_points = self.left_points.saturating_sub(back);
         }
-        // Refused and past the bound: those points go, counted.
+        // Refused and past the bound: those points go, counted; so do those too far ahead.
         self.dropped += (outcome.refused.len() + outcome.over_limit.len()) as u64;
+        self.ahead += outcome.ahead;
         // Its buffers for the next write (its entry went to whoever sent it).
         out.entry = Vec::new();
         settle(&mut out.points);

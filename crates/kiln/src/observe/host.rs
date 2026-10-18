@@ -359,7 +359,7 @@ impl Collector {
     pub fn look(&mut self) -> Vec<(SeriesKey, Vec<(i64, f64)>)> {
         let now = Instant::now();
         let secs = self.prev.at.map(|t| now.duration_since(t).as_secs_f64()).filter(|&s| s > 0.0);
-        let mut p = Points { ts: crate::util::now_ms(), out: Vec::new() };
+        let mut p = Points { ts: super::clock_ms(), out: Vec::new() };
         let host = self.host.clone();
         let place = std::mem::take(&mut self.place);
         let base: Vec<(&str, &str)> = std::iter::once(("host", host.as_str())).chain(place.iter().map(|(k, v)| (k.as_str(), v.as_str()))).collect();

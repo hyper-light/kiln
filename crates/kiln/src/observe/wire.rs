@@ -80,13 +80,17 @@ pub struct Outcome {
     /// Definitions refused (a fingerprint not its key's), and series past the group's bound.
     pub refused: Vec<u64>,
     pub over_limit: Vec<u64>,
+    /// Samples and log records too far ahead of the write's time, dropped
+    /// (`kiln_obs::store::AHEAD_MS`).
+    #[serde(default)]
+    pub ahead: u64,
 }
 
 impl Outcome {
     pub fn of(w: &kiln_obs::store::Written) -> Self {
         use kiln_obs::store::Written;
         match w {
-            Written::Applied(a) => Self { applied: true, unknown: a.unknown.clone(), refused: a.refused.clone(), over_limit: a.over_limit.clone(), ..Self::default() },
+            Written::Applied(a) => Self { applied: true, unknown: a.unknown.clone(), refused: a.refused.clone(), over_limit: a.over_limit.clone(), ahead: a.counts.ahead + a.counts.logs_ahead, ..Self::default() },
             Written::Duplicate => Self { applied: true, duplicate: true, ..Self::default() },
             Written::Failed(e) => Self { failed: Some(e.to_string()), ..Self::default() },
         }
@@ -110,6 +114,9 @@ pub struct Status {
     /// Writes of this machine's waiting to be sent, and points dropped for room.
     pub queued: u64,
     pub dropped: u64,
+    /// Samples and records of its writes too far ahead of their time (its clock, or its senders'),
+    /// dropped by the group.
+    pub ahead: u64,
     /// The replica's digest (`kiln_obs::store::Store::digest`) as of `applied`: of its series.
     pub digest: u64,
     /// The full digest last asked for ([`Msg::Verify`]), and the index it is of.

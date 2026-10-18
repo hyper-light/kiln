@@ -152,6 +152,11 @@ host_seconds = 3600
     }
 
     pub fn start_runner(&mut self, name: &str) -> anyhow::Result<()> {
+        self.start_runner_with(name, &[])
+    }
+
+    /// A runner with `env` besides the fleet's (after it: the same name wins).
+    pub fn start_runner_with(&mut self, name: &str, env: &[(&str, &str)]) -> anyhow::Result<()> {
         let join = std::fs::read_to_string(self.root.path().join("server").join("join.token"))?.trim().to_owned();
         let dir = self.root.path().join(name);
         let log = self.root.path().join(format!("{name}.log"));
@@ -170,6 +175,7 @@ host_seconds = 3600
             .arg(dir.join("state"))
             .arg("--work-dir")
             .arg(dir.join("work"))
+            .envs(env.iter().copied())
             .stdout(Stdio::from(out.try_clone()?))
             .stderr(Stdio::from(out))
             .spawn()?;

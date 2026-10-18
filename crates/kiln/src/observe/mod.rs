@@ -27,3 +27,11 @@ pub(crate) fn fresh_id(prefix: &str, taken: impl Fn(&str) -> bool) -> String {
         }
     }
 }
+
+/// The time observe gives what it writes and judges (ms since the epoch): this machine's clock.
+/// `KILN_OBSERVE_CLOCK_SKEW_MS` moves it, for a test of a machine whose clock is off (changing the
+/// real one takes root): what observe of that machine sees is what a skewed machine's would be.
+pub fn clock_ms() -> i64 {
+    static SKEW: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    crate::util::now_ms().saturating_add(*SKEW.get_or_init(|| std::env::var("KILN_OBSERVE_CLOCK_SKEW_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)))
+}

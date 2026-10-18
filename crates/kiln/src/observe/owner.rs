@@ -48,6 +48,19 @@ const STATUS_EVERY: Duration = Duration::from_secs(10);
 const MAINTAIN_EVERY: Duration = Duration::from_secs(60);
 /// How often the view the API shows is made again, at the most.
 const VIEW_EVERY: Duration = Duration::from_millis(500);
+/// A span of ms as people say it, to the nearest second under two minutes, else minute: `90 s`,
+/// `45 min`, `1 h 0 min`.
+fn span(ms: u64) -> String {
+    if ms < 119_500 {
+        return format!("{} s", (ms + 500) / 1000);
+    }
+    let min = (ms + 30_000) / 60_000;
+    if min < 60 { format!("{min} min") } else { format!("{} h {} min", min / 60, min % 60) }
+}
+
+/// A machine's clock this far from the server's is said (an event): the Datadog Agent's NTP check
+/// warns past a minute.
+const SKEW_SAID: Duration = Duration::from_secs(60);
 /// How often the bytes observe holds on disk are counted (a walk of its folder: a stat a file).
 const SIZED_EVERY: Duration = Duration::from_secs(30);
 /// Writes of other nodes' senders whose answers the server routes, at the most: one out a sender.
@@ -103,10 +116,12 @@ pub struct View {
     pub heap_index: u64,
     pub heap_samples: u64,
     pub cutoff_ms: i64,
-    /// This node's writes: points waiting, points dropped, writes applied.
+    /// This node's writes: points waiting, points dropped, writes applied; samples and records
+    /// the group dropped as too far ahead of their time.
     pub waiting: u64,
     pub dropped: u64,
     pub written: u64,
+    pub ahead: u64,
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
     /// The server's view of each machine's replica.
@@ -125,6 +140,8 @@ pub struct MachineView {
     pub member: u64,
     pub up: bool,
     pub status: Option<Status>,
+    /// How far its clock is ahead of the server's (negative: behind), ms, from its last write.
+    pub clock_skew_ms: Option<i64>,
 }
 
 enum Input {
@@ -450,6 +467,9 @@ struct Owner {
     up: HashSet<String>,
     statuses: HashMap<String, Status>,
     writers: HashMap<u64, String>,
+    /// Each machine's clock against the server's, from its writes' times; and whether it was past
+    /// [`SKEW_SAID`] when last said.
+    skews: HashMap<String, (i64, bool)>,
     changing: Option<(u64, Instant)>,
     retained: Option<Instant>,
     limited: bool,
@@ -501,6 +521,7 @@ impl Owner {
             up: HashSet::new(),
             statuses: HashMap::new(),
             writers: HashMap::new(),
+            skews: HashMap::new(),
             changing: None,
             retained: None,
             limited: false,
@@ -754,6 +775,8 @@ impl Owner {
                 }
                 self.writers.insert(sender, machine.to_owned());
                 let _ = seq;
+                let mut entry = entry;
+                self.stamp(machine, &mut entry);
                 if let Some(rep) = &mut self.rep {
                     let _ = rep.r.propose(Vec::new(), entry);
                 }
@@ -762,6 +785,27 @@ impl Owner {
                 self.statuses.insert(machine.to_owned(), s);
             }
             Msg::Written { .. } | Msg::Member { .. } | Msg::Release | Msg::Verify => {}
+        }
+    }
+
+    /// A runner's write stamped with the server's clock (its leader's: what every replica judges
+    /// its samples' times against, `kiln_obs::store::AHEAD_MS`), the runner's own time read first:
+    /// how far its clock is from the server's, said as an event once it passes [`SKEW_SAID`], and
+    /// again once it is back.
+    fn stamp(&mut self, machine: &str, entry: &mut [u8]) {
+        let now = super::clock_ms();
+        let Some(theirs) = kiln_obs::command::write_at(entry, Some(now)) else { return };
+        let skew = theirs.saturating_sub(now);
+        let past = skew.unsigned_abs() > SKEW_SAID.as_millis() as u64;
+        let was = self.skews.insert(machine.to_owned(), (skew, past)).is_some_and(|(_, p)| p);
+        if past != was {
+            let (message, severity) = if past {
+                (format!("{machine}'s clock is {} {} the server's: its own figures' times are off by as much, and samples more than ten minutes ahead are dropped", span(skew.unsigned_abs()), if skew > 0 { "ahead of" } else { "behind" }), 13)
+            } else {
+                (format!("{machine}'s clock agrees with the server's again"), 9)
+            };
+            let attrs = vec![("event.type".to_owned(), "observe.clock_skew".to_owned()), ("machine".to_owned(), machine.to_owned()), ("skew_ms".to_owned(), skew.to_string())];
+            self.batcher.logs(vec![Record { ts: now.saturating_mul(1_000_000), severity, service: "kiln.observe".into(), host: machine.to_owned(), source: "kiln.event".into(), message, attrs, trace_id: None, span_id: None }], Instant::now());
         }
     }
 
@@ -800,7 +844,7 @@ impl Owner {
             self.limited = true;
         }
         if self.retained.is_none_or(|t| t.elapsed() >= RETAIN_EVERY) {
-            let now = crate::util::now_ms();
+            let now = super::clock_ms();
             let back = |d: Duration| now.saturating_sub(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
             if rep.r.propose(Vec::new(), kiln_obs::command::retain(back(self.retention.0), back(self.retention.1), now)).is_ok() {
                 self.retained = Some(Instant::now());
@@ -890,7 +934,10 @@ impl Owner {
 
     /// This node's writes: proposed here (the server) or sent to the server (a runner).
     fn writes(&mut self) {
-        let Some((seq, entry)) = self.batcher.poll(Instant::now(), crate::util::now_ms()) else { return };
+        let Some((seq, mut entry)) = self.batcher.poll(Instant::now(), super::clock_ms()) else { return };
+        // Its time is when it is sent, each time it is (a write may wait for a connection): what the
+        // server measures this machine's clock by.
+        kiln_obs::command::write_at(&mut entry, Some(super::clock_ms()));
         if self.is_server() {
             if let Some(rep) = &mut self.rep {
                 let _ = rep.r.propose(Vec::new(), entry);
@@ -1024,6 +1071,7 @@ impl Owner {
         let (waiting, _) = self.batcher.backlog();
         s.queued = waiting;
         s.dropped = self.batcher.dropped + self.admission.refused.load(Ordering::Relaxed);
+        s.ahead = self.batcher.ahead;
         s.fetching = self.fetching.as_ref().map(|f| f.progress);
         s.verified = self.verified;
         if let Some(rep) = &self.rep {
@@ -1041,7 +1089,7 @@ impl Owner {
 
     fn make_view(&self) -> View {
         let (waiting, _) = self.batcher.backlog();
-        let mut v = View { role: if self.is_server() { "server" } else { "runner" }, waiting, dropped: self.batcher.dropped + self.admission.refused.load(Ordering::Relaxed), written: self.batcher.written, error: self.error.clone(), ..View::default() };
+        let mut v = View { role: if self.is_server() { "server" } else { "runner" }, waiting, dropped: self.batcher.dropped + self.admission.refused.load(Ordering::Relaxed), written: self.batcher.written, ahead: self.batcher.ahead, error: self.error.clone(), ..View::default() };
         if let Some(rep) = &self.rep {
             let store = rep.r.machine().read();
             v.member = rep.r.id();
@@ -1063,7 +1111,7 @@ impl Owner {
         v.disk_bytes = self.dir_bytes;
         v.verified = self.verified;
         if self.is_server() {
-            v.machines = self.members.machines.iter().map(|(machine, &member)| MachineView { machine: machine.clone(), member, up: self.up.contains(machine), status: self.statuses.get(machine).cloned() }).collect();
+            v.machines = self.members.machines.iter().map(|(machine, &member)| MachineView { machine: machine.clone(), member, up: self.up.contains(machine), status: self.statuses.get(machine).cloned(), clock_skew_ms: self.skews.get(machine).map(|s| s.0) }).collect();
         }
         v
     }
@@ -1267,6 +1315,15 @@ fn dir_bytes(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spans_read_as_people_say_them() {
+        assert_eq!(span(0), "0 s");
+        assert_eq!(span(89_600), "90 s");
+        assert_eq!(span(3_599_500), "1 h 0 min");
+        assert_eq!(span(2_700_000), "45 min");
+        assert_eq!(span(7_329_000), "2 h 2 min");
+    }
 
     /// Eight threads take room as fast as they can while one frees it at its own pace: what is
     /// inside never passes the bound, read where it can be read exactly (the freeing thread is the
