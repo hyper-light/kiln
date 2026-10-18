@@ -778,9 +778,16 @@ mod tests {
         use std::os::unix::process::CommandExt as _;
         let mut child = std::process::Command::new(&exe).args(["-c", "sleep 30 & wait"]).process_group(0).spawn()?;
         let pid = child.id();
-        std::thread::sleep(Duration::from_millis(300));
+        // Until its sleep has started (a loaded machine may take a while).
+        let until = |want: bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while busy_under(pid) != want && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            busy_under(pid) == want
+        };
+        assert!(until(true), "its sleep runs under it");
         assert!(!runs_old_binary(pid, &exe), "it runs the binary on disk");
-        assert!(busy_under(pid), "its sleep runs under it");
         // A new binary installed where it was (a new file, renamed into place): the child runs the old one.
         let next = dir.path().join("prog.next");
         std::fs::copy("/bin/sh", &next)?;
@@ -789,7 +796,7 @@ mod tests {
         // It and its sleep, as a group.
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(i32::try_from(pid)?), nix::sys::signal::Signal::SIGKILL);
         let _ = child.wait();
-        assert!(!busy_under(pid), "nothing runs under a process that is gone");
+        assert!(until(false), "nothing runs under a process that is gone");
         Ok(())
     }
 
