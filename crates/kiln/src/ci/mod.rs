@@ -13,6 +13,7 @@ pub mod integrations;
 pub mod load;
 pub mod oidc;
 pub mod preview;
+pub mod repo_config;
 pub mod rest;
 pub mod reusable;
 pub mod runs;

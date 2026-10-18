@@ -76,9 +76,13 @@ fn steps_uses(steps: &[Step], out: &mut Vec<String>) {
     }
 }
 
-/// The policies a run of `repo` answers to: the server's, then the repository's.
+/// The policies a run of `repo` answers to: the server's, then the repository's (its
+/// `.kiln/config.yaml` on the default branch, and one set through the API).
 pub async fn policies(hub: &Hub, repo: &Repo) -> Vec<Policy> {
     let mut out = vec![hub.cfg.ci.actions.policy()];
+    if let Some(p) = super::repo_config::load(hub, repo).await.actions {
+        out.push(p);
+    }
     let id = repo.id.clone();
     let own: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT policy FROM ci_action_policies WHERE repo_id = ?1", [&id], |r| r.get(0)).optional()?)).await.unwrap_or_default();
     if let Some(p) = own.and_then(|t| serde_json::from_str::<Policy>(&t).ok()) {
@@ -336,8 +340,11 @@ pub async fn route(hub: &Hub, method: &http::Method, rest: &[&str], q: &std::col
             let id = repo.id.clone();
             match *method {
                 http::Method::GET => {
-                    let own = policies(hub, &repo).await.into_iter().nth(1);
-                    Ok(srv::json(StatusCode::OK, &json!({ "server": server, "repository": own })))
+                    let file = super::repo_config::load(hub, &repo).await.actions;
+                    let rid = repo.id.clone();
+                    let set: Option<String> = hub.store.call(move |c| Ok(c.query_row("SELECT policy FROM ci_action_policies WHERE repo_id = ?1", [&rid], |r| r.get(0)).optional()?)).await.map_err(fail)?;
+                    let own = set.and_then(|t| serde_json::from_str::<Policy>(&t).ok());
+                    Ok(srv::json(StatusCode::OK, &json!({ "server": server, "repository": own, "config_yaml": file })))
                 }
                 http::Method::PUT => {
                     let p: Policy = serde_json::from_value(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("not a policy ({{allow, deny, require_sha_pins}}): {e}")))?;

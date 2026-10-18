@@ -362,9 +362,10 @@ impl Dispatch {
             }
         };
         let input = RunInput { github: github.clone(), inputs, vars: vars.clone(), changed: s.event.changed.clone().map(Arc::new), trusted };
-        self.save_input(&id, &input, &s.actions, &s.event, false, &HashMap::new()).await?;
+        let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
+        self.save_input(&id, &input, &s.actions, &s.event, false, &HashMap::new(), perms).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
-        let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files });
+        let started = RunPlan::start(Arc::clone(&s.workflow), input, self.settings_with(&serde_json::json!({ "default_permissions": perms })), &Source { files: &files });
         let (plan, actions) = match started {
             Ok(x) => x,
             Err(e) => {
@@ -453,7 +454,8 @@ impl Dispatch {
         let vars = super::secrets::vars_for(&self.hub, &s.repo, &s.path, None).await.map(serde_json::Value::Object).unwrap_or_else(|_| serde_json::json!({}));
         let input = RunInput { github, inputs, vars, changed: s.event.changed.clone().map(Arc::new), trusted: s.event.trusted };
         let files = Arc::new(super::reusable::files(&self.hub, &s.repo, &s.event.sha, &s.workflow).await);
-        let p = match RunPlan::preview(Arc::clone(&s.workflow), input, self.settings(), &Source { files: &files }) {
+        let perms = if super::repo_config::load(&self.hub, &s.repo).await.default_permissions() == plan::perms::Default::Write { "write" } else { "read" };
+        let p = match RunPlan::preview(Arc::clone(&s.workflow), input, self.settings_with(&serde_json::json!({ "default_permissions": perms })), &Source { files: &files }) {
             Ok(p) => p,
             Err(e) => return serde_json::json!({ "error": e }),
         };
@@ -478,9 +480,17 @@ impl Dispatch {
         Settings { default_runs_on: vec!["k8s".into()], ..Settings::default() }
     }
 
-    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: bool, keep: &HashMap<String, (LegReport, String)>) -> anyhow::Result<()> {
+    /// A run's settings: the repository's default token permissions (W10-R04), as it started or
+    /// as its saved input says, so a replay or rerun plans exactly as the run did.
+    fn settings_with(&self, saved: &serde_json::Value) -> Settings {
+        let default_permissions = if saved.get("default_permissions").and_then(serde_json::Value::as_str) == Some("write") { plan::perms::Default::Write } else { plan::perms::Default::Read };
+        Settings { default_permissions, ..self.settings() }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn save_input(&self, run: &str, input: &RunInput, actions: &std::collections::BTreeMap<String, wire::ActionRef>, event: &Event, debug: bool, keep: &HashMap<String, (LegReport, String)>, default_permissions: &str) -> anyhow::Result<()> {
         let keep: serde_json::Map<String, serde_json::Value> = keep.iter().map(|(k, (rep, leg))| (k.clone(), serde_json::json!({ "report": report_json(rep), "leg": leg }))).collect();
-        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep": keep }).to_string();
+        let json = serde_json::json!({ "github": input.github, "inputs": input.inputs, "vars": input.vars, "changed": input.changed.as_deref(), "trusted": input.trusted, "actions": actions, "event": event, "debug": debug, "keep": keep, "default_permissions": default_permissions }).to_string();
         let run = run.to_owned();
         self.hub.store.call(move |c| Ok(c.execute("UPDATE ci_plans SET input = ?2 WHERE run_id = ?1", rusqlite::params![run, json]).map(|_| ())?)).await
     }
@@ -634,9 +644,10 @@ impl Dispatch {
         let changed: Option<Vec<String>> = v.get("changed").and_then(|c| serde_json::from_value(c.clone()).ok());
         let input = RunInput { github: github.clone(), inputs: v.get("inputs").cloned().unwrap_or_default(), vars: v.get("vars").cloned().unwrap_or_default(), changed: changed.map(Arc::new), trusted: v.get("trusted").and_then(serde_json::Value::as_bool).unwrap_or(false) };
         let actions = fresh.unwrap_or_else(|| v.get("actions").and_then(|a| serde_json::from_value(a.clone()).ok()).unwrap_or_default());
-        self.save_input(run, &input, &actions, &event, debug, &keep).await?;
+        let perms = v.get("default_permissions").and_then(serde_json::Value::as_str).unwrap_or("read").to_owned();
+        self.save_input(run, &input, &actions, &event, debug, &keep, &perms).await?;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &event.sha, &wf).await);
-        let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &files }) {
+        let (plan, acts) = match RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files }) {
             Ok(x) => x,
             Err(e) => {
                 runs::finish_run(&self.hub, run, Status::Failed, "failure", Some(format!("The run could not start: {e}"))).await?;
@@ -1048,7 +1059,7 @@ impl Dispatch {
         let row = self.hub.store.run(run.to_owned()).await?.ok_or_else(|| anyhow::anyhow!("no run"))?;
         let repo = self.hub.store.repos().await?.into_iter().find(|r| r.id == row.repo_id).ok_or_else(|| anyhow::anyhow!("no repository"))?;
         let files = Arc::new(super::reusable::files(&self.hub, &repo, &row.sha, &wf).await);
-        let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings(), &Source { files: &files }).map_err(|e| anyhow::anyhow!(e))?;
+        let (mut plan, _) = RunPlan::start(Arc::clone(&wf), input.clone(), self.settings_with(&v), &Source { files: &files }).map_err(|e| anyhow::anyhow!(e))?;
         let run_owned = run.to_owned();
         let (log, last_seq): (Vec<(i64, String, Option<String>, Option<String>)>, i64) = self.hub.store.call(move |c| {
             let mut st = c.prepare("SELECT seq, kind, leg, report FROM ci_plan_log WHERE run_id = ?1 AND attempt = (SELECT attempt FROM runs WHERE id = ?1) ORDER BY seq")?;
