@@ -21,6 +21,13 @@ import "./goals.css";
 
 const WORD: Record<GoalItem["status"], string> = { met: "met", active: "under way", pending: "waiting", unmet: "not met", skipped: "skipped" };
 
+/** When the goal under way last went to the agent: sent, or sent again (how many times in a row). */
+function sentWords(g: GoalItem): string {
+  if (!g.reminded_at) return "";
+  const when = relativeTime(g.reminded_at / 1000);
+  return g.reminders ? ` · sent again ${g.reminders}×, last ${when}` : ` · sent ${when}`;
+}
+
 /** Each agent's last goal stack: a read that fails keeps showing it (with none yet, the panel says why). */
 const lastStack = new Map<string, GoalStack>();
 
@@ -191,23 +198,27 @@ function GoalPanel({
                   </button>
                 </li>
               ) : null}
-              {shown.map((g) => (
-                <li key={g.id} className="gs-link" data-status={g.status}>
-                  <span className="gs-node" aria-hidden="true">
-                    {g.status === "met" ? "✓" : g.status === "unmet" ? "✕" : g.status === "skipped" ? "–" : items.indexOf(g) + 1}
-                  </span>
-                  <span className="gs-text">
-                    {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
-                    {g.text.split(" — ")[0]}
-                    {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
-                    <span className="gs-word">
-                      {WORD[g.status]}
-                      {g.status === "active" && g.reminders ? ` · sent again ${g.reminders}×${g.reminded_at ? `, last ${relativeTime(g.reminded_at / 1000)}` : ""}` : ""}
-                      {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
+              {shown.map((g) => {
+                // The goal under way while you've paused the stack: paused, not under way.
+                const held = g.status === "active" && stack?.state === "paused";
+                return (
+                  <li key={g.id} className="gs-link" data-status={held ? "paused" : g.status}>
+                    <span className="gs-node" aria-hidden="true">
+                      {g.status === "met" ? "✓" : g.status === "unmet" ? "✕" : g.status === "skipped" ? "–" : items.indexOf(g) + 1}
                     </span>
-                  </span>
-                </li>
-              ))}
+                    <span className="gs-text">
+                      {/* A plan's step as a goal reads "title — description — Done when: …": its title first, the rest under it. */}
+                      {g.text.split(" — ")[0]}
+                      {g.text.includes(" — ") && <span className="gs-detail">{g.text.split(" — ").slice(1).join(" — ")}</span>}
+                      <span className="gs-word">
+                        {held ? "paused" : WORD[g.status]}
+                        {g.status === "active" && !held ? sentWords(g) : ""}
+                        {g.reason && g.status !== "pending" ? ` · ${g.reason}` : ""}
+                      </span>
+                    </span>
+                  </li>
+                );
+              })}
             </ol>
           )}
           <form

@@ -127,6 +127,15 @@
   border-color: #8a5a55;
   color: #e3a7a0;
 }
+/* The goal under way while you've paused the stack: held, in the paused chip's amber. */
+.gs-link[data-status="paused"] .gs-node {
+  border-color: #e3c9a0;
+  border-style: dashed;
+  color: #e3c9a0;
+}
+.gs-link[data-status="paused"] .gs-word {
+  color: #e3c9a0;
+}
 .gs-link[data-status="active"] {
   color: #ededee;
 }

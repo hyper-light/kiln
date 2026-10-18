@@ -17,9 +17,12 @@ A goal is one line: a condition to meet ("the parser tests pass") or an objectiv
 An agent's **Plan** tab has its **Goal stack** (`/goals` opens it), in a panel of its own below its plans: what's met, under way and next,
 each with how it came out; a field to add goals (a line each); and:
 
-- **Start** (or **Resume**): goals go to the agent, the next once it's free (idle, nothing waiting
-  on you, nothing queued).
-- **Pause**: no more goals go, and the one under way isn't sent again; it carries on in the agent.
+- **Start**: goals go to the agent, the next once it's free (idle, nothing waiting on you, nothing
+  queued).
+- **Pause**: the agent isn't held to the goal under way any more: its harness's own goal is
+  cleared there (so Claude Code's or Codex's goal stops driving it), nothing is sent again, and no
+  next goal starts. The goal keeps its place, shown as paused.
+- **Resume**: the goal under way goes to the agent again at once, and the stack carries on.
 - **Skip this one**: leave the goal under way (its harness's own goal cleared) and go on.
 - **Edit**: the goals not yet started, one text box, a goal a line.
 - **Try it again** or **Go on to the next**, after a goal that ended without being met (stacks from

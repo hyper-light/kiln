@@ -37,6 +37,10 @@ const REMIND_MAX_MS: i64 = 15 * 60_000;
 const WORKED_MS: i64 = 120_000;
 /// How an agent without goals of its own says a goal is met: its reply's last line.
 pub const MET_LINE: &str = "GOAL MET";
+/// A clear in the agent this soon after kiln cleared its goal (pausing the stack) is kiln's own.
+const OWN_CLEAR_MS: i64 = 60_000;
+/// Why a stack you paused is paused.
+const PAUSED_BY_YOU: &str = "Paused by you: the agent isn't held to its goal (its own goal is cleared) until you resume.";
 
 /// An agent's goal stack.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -48,6 +52,9 @@ pub struct Stack {
     pub reason: Option<String>,
     pub items: Vec<Item>,
     pub updated_at: i64,
+    /// When kiln last cleared the goal in the agent itself (pause, skip, clear).
+    #[serde(skip)]
+    dropped_at: i64,
 }
 
 /// One goal.
@@ -144,8 +151,9 @@ pub async fn get(hub: &Hub, agent: &str) -> R<Stack> {
 }
 
 fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
-    let head: Option<(String, Option<String>, i64)> =
-        c.query_row("SELECT state, reason, updated_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+    let head: Option<(String, Option<String>, i64, i64)> = c
+        .query_row("SELECT state, reason, updated_at, dropped_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .optional()?;
     let mut st = c.prepare("SELECT id, text, status, reason, how, started_at, ended_at, prior_at, reminders, reminded_at, busy_at FROM goal_items WHERE agent = ?1 ORDER BY pos")?;
     let items = st
         .query_map(params![agent], |r| {
@@ -164,8 +172,8 @@ fn load(c: &rusqlite::Connection, agent: &str) -> anyhow::Result<Stack> {
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let (state, reason, updated_at) = head.unwrap_or_else(|| ("paused".into(), None, 0));
-    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at })
+    let (state, reason, updated_at, dropped_at) = head.unwrap_or_else(|| ("paused".into(), None, 0, 0));
+    Ok(Stack { agent: agent.to_owned(), state, reason, items, updated_at, dropped_at })
 }
 
 fn touch(c: &rusqlite::Connection, agent: &str, state: Option<&str>, reason: Option<&str>) -> anyhow::Result<()> {
@@ -240,11 +248,14 @@ pub async fn add(hub: &Hub, agent: &str, texts: Vec<String>, start: bool) -> R<S
 pub async fn control(hub: &Hub, agent: &str, action: Action) -> R<Stack> {
     let info = known(hub, agent)?;
     let stack = get(hub, agent).await?;
-    // Leaving a goal under way (or one still set that wasn't met): its harness's own goal goes too.
+    // Leaving a goal under way (or one still set that wasn't met), or pausing it: its harness's own
+    // goal goes too, so nothing holds the agent to it.
     let active = stack.items.iter().any(|i| i.status == "active");
-    if action == Action::Clear || (action == Action::Skip && active) {
+    if action == Action::Clear || (matches!(action, Action::Skip | Action::Pause) && active) {
         clear_in_agent(hub, &info, &stack.items).await;
     }
+    // What the agent last said of its goal: a verdict from before you resume doesn't count.
+    let said_at = info.objective.as_ref().map_or(0, |o| o.at);
     let agent_s = agent.to_owned();
     Ok(hub
         .store
@@ -252,12 +263,19 @@ pub async fn control(hub: &Hub, agent: &str, action: Action) -> R<Stack> {
             let now = now_ms();
             match action {
                 Action::Start => {
-                    // The goal under way goes to the agent again at once, from a fresh start.
-                    c.execute("UPDATE goal_items SET reminded_at = 0, reminders = 0, busy_at = 0, started_at = ?2 WHERE agent = ?1 AND status = 'active'", params![agent_s, now])?;
+                    // The goal under way goes to the agent again at once (its last send forgotten:
+                    // the pause since it started is long over), reminders starting over.
+                    c.execute(
+                        "UPDATE goal_items SET reminded_at = 0, reminders = 0, busy_at = 0, prior_at = MAX(prior_at, ?2) WHERE agent = ?1 AND status = 'active'",
+                        params![agent_s, said_at],
+                    )?;
                     let left = c.query_row("SELECT COUNT(*) FROM goal_items WHERE agent = ?1 AND status IN ('pending', 'active')", params![agent_s], |r| r.get::<_, i64>(0))?;
                     touch(c, &agent_s, Some(if left > 0 { "running" } else { "done" }), None)?;
                 }
-                Action::Pause => touch(c, &agent_s, Some("paused"), Some("Paused by you."))?,
+                Action::Pause => {
+                    touch(c, &agent_s, Some("paused"), Some(PAUSED_BY_YOU))?;
+                    c.execute("UPDATE goal_stacks SET dropped_at = ?2 WHERE agent = ?1", params![agent_s, now])?;
+                }
                 Action::Skip => {
                     c.execute("UPDATE goal_items SET status = 'skipped', ended_at = ?2, reason = 'Skipped by you.' WHERE agent = ?1 AND status = 'active'", params![agent_s, now])?;
                     touch(c, &agent_s, None, None)?;
@@ -386,12 +404,13 @@ pub async fn run(hub: Arc<Hub>) -> anyhow::Result<()> {
     }
 }
 
-/// A goal the agent pursues that its stack doesn't know (set in the agent: `/goal` typed in its
-/// composer, or its harness's own goal set some other way) joins the stack as the goal under way,
+/// A goal set in the agent that its stack doesn't know (`/goal` typed in its composer, or its
+/// harness's own goal set some other way), pursued or given up on for now but still set, joins the
+/// stack as the goal under way,
 /// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
 /// next. The stack runs.
 async fn adopt(hub: &Hub, info: &Info) -> anyhow::Result<()> {
-    let Some(o) = info.objective.as_ref().filter(|o| o.status == "active") else { return Ok(()) };
+    let Some(o) = info.objective.as_ref().filter(|o| matches!(o.status.as_str(), "active" | "unmet")) else { return Ok(()) };
     let Ok(text) = clean(&o.text) else { return Ok(()) };
     let (agent, how, at) = (info.id.clone(), how(hub, &info.id), o.at);
     hub.store
@@ -445,12 +464,13 @@ enum Next {
     /// Send the goal under way again: the agent stopped short of it. `worked`: it did real work
     /// on it since it was last sent; `stopped`: its harness isn't running (a message starts it).
     Remind { id: String, text: String, how: String, worked: bool, stopped: bool },
-    Pause(String),
     Done,
 }
 
 fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
-    let Some(info) = info else { return Next::Pause("The agent isn't there any more.".into()) };
+    // An agent kiln doesn't know right now is waited for: its runner is reconnecting, or the
+    // server has just started. (A closed agent's stack goes when it's closed.)
+    let Some(info) = info else { return Next::Wait };
     let busy = matches!(info.status, Status::Running | Status::Waiting | Status::Starting);
     // Nothing waiting on you or in its queue; stopped counts (a message starts it again).
     let free = matches!(info.status, Status::Idle | Status::Exited) && info.approvals.is_empty() && info.queued == 0;
@@ -467,9 +487,11 @@ fn decide(stack: &Stack, info: Option<&Info>, now: i64) -> Next {
             // Its harness's word on this goal since it was last sent: met, or cleared (by you, in
             // the agent: it goes). Still set, given up, paused, or none at all: it's reminded.
             if let Some(o) = info.objective.as_ref().filter(|o| same(&o.text, &item.text) && o.at > item.prior_at) {
+                // Cleared by kiln itself when you paused the stack isn't cleared by you.
+                let own = stack.dropped_at > 0 && o.at >= stack.dropped_at && o.at - stack.dropped_at <= OWN_CLEAR_MS;
                 match o.status.as_str() {
                     "met" => return Next::End { id, status: "met", reason: o.reason.clone() },
-                    "cleared" => return Next::End { id, status: "skipped", reason: Some("The goal was cleared in the agent.".into()) },
+                    "cleared" if !own => return Next::End { id, status: "skipped", reason: Some("The goal was cleared in the agent.".into()) },
                     _ => {}
                 }
             }
@@ -511,9 +533,6 @@ async fn step(hub: &Arc<Hub>, agent: &str) -> anyhow::Result<()> {
                 })
                 .await?;
         }
-        Next::Pause(why) => {
-            hub.store.call(move |c| touch(c, &a, Some("paused"), Some(&why))).await?;
-        }
         Next::Done => {
             hub.store.call(move |c| touch(c, &a, Some("done"), None)).await?;
         }
@@ -533,9 +552,8 @@ async fn step(hub: &Arc<Hub>, agent: &str) -> anyhow::Result<()> {
                         })
                         .await?;
                 }
-                Sent::NoSession => hub.store.call(move |c| touch(c, &a, Some("paused"), Some("The agent isn't there any more."))).await?,
-                // Its machine is away: the goal goes when it's back.
-                Sent::Unreachable => {}
+                // Not known right now, or its machine is away: the goal goes when it's back.
+                Sent::NoSession | Sent::Unreachable => {}
             }
         }
         Next::Remind { id, text, how, worked, stopped } => match hub.harness.command(hub, agent, reminder_command(&how, &text, stopped)).await {
@@ -551,9 +569,9 @@ async fn step(hub: &Arc<Hub>, agent: &str) -> anyhow::Result<()> {
                     })
                     .await?;
             }
-            Sent::NoSession => hub.store.call(move |c| touch(c, &a, Some("paused"), Some("The agent isn't there any more."))).await?,
-            // Its machine is away: tried again after a pause, as a reminder that brought no work.
-            Sent::Unreachable => {
+            // Not known right now, or its machine is away: tried again after a pause, as a reminder
+            // that brought no work.
+            Sent::NoSession | Sent::Unreachable => {
                 hub.store
                     .call(move |c| Ok(c.execute("UPDATE goal_items SET reminded_at = ?2, reminders = reminders + 1 WHERE id = ?1", params![id, now]).map(|_| ())?))
                     .await?;
@@ -601,7 +619,8 @@ mod tests {
         // The verdict on the goal before it doesn't count.
         assert!(!matches!(decide(&native, Some(&info(Status::Idle, Some(obj("met", 5)))), LATER), Next::End { .. }));
         assert!(matches!(decide(&stack(vec![item("met", Some("goal"))]), Some(&info(Status::Idle, None)), 2_000), Next::Done));
-        assert!(matches!(decide(&native, None, 2_000), Next::Pause(_)));
+        // Not known right now (its runner reconnecting, the server just started): waited for.
+        assert!(matches!(decide(&native, None, LATER), Next::Wait));
     }
 
     #[test]
@@ -627,6 +646,16 @@ mod tests {
         let mut queued = info(Status::Idle, None);
         queued.queued = 1;
         assert!(matches!(decide(&native, Some(&queued), LATER), Next::Wait));
+    }
+
+    #[test]
+    fn the_clear_a_pause_sends_is_kiln_s_own_and_not_the_end_of_the_goal() {
+        let mut paused_then_resumed = stack(vec![item("active", Some("goal"))]);
+        paused_then_resumed.dropped_at = 7;
+        // Its harness says the goal was cleared, just after kiln cleared it to pause: sent again.
+        assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 9)))), LATER), Next::Remind { .. }));
+        // Cleared in the agent long after: by you, so the goal ends.
+        assert!(matches!(decide(&paused_then_resumed, Some(&info(Status::Idle, Some(obj("cleared", 7 + OWN_CLEAR_MS + 1)))), LATER), Next::End { status: "skipped", .. }));
     }
 
     #[test]

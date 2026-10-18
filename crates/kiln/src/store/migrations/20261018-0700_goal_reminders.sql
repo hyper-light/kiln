@@ -8,7 +8,9 @@ ALTER TABLE goal_items ADD COLUMN busy_at INTEGER NOT NULL DEFAULT 0;
 -- being cleared there, and doesn't join the stack again.
 ALTER TABLE goal_stacks ADD COLUMN dropped_at INTEGER NOT NULL DEFAULT 0;
 
--- Stacks the old rules paused by themselves (not you) run again under the new ones, which keep
+-- Stacks the old rules paused by themselves (not you; "isn't there any more" included: that was
+-- often only the server starting before the agent's runner was back) run again under the new
+-- ones, which keep
 -- the agent on its goal: a goal that wasn't met is under way again, and the goal under way is sent
 -- again (it has no reminder yet).
 UPDATE goal_items SET status = 'active', reason = NULL, ended_at = NULL
@@ -20,6 +22,7 @@ UPDATE goal_stacks SET state = 'running', reason = NULL
  WHERE state = 'paused'
    AND (reason LIKE 'A goal wasn''t met:%' OR reason IN (
         'The agent didn''t take the goal up.',
+        'The agent isn''t there any more.',
         'The agent stopped. Restart it, then start the stack again.',
         'The agent''s machine isn''t connected.',
         'The goal was paused in the agent: resume it there, or start the stack again.'))
