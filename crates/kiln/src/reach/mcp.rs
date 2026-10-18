@@ -23,18 +23,62 @@ const OUTPUT_MAX: usize = 30_000;
 /// A foreground run returns after this long by default (it then keeps running in the background).
 const WAIT_DEFAULT_S: u64 = 600;
 
-fn instructions(prefer: Option<&str>) -> String {
-    let mut s = "kiln reach runs commands on the other machines of this kiln (its runners), end-to-end encrypted. Use it when \
-work needs another platform or more power than this machine: build and test for Linux x86-64 from a Mac (`run` with \
-on: \"linux/amd64\"), use the machine with the GPU (on: \"+gpu\"), or run on a machine by name. The repository you are in \
-is synced to that machine first (only what changed; git sees the same state there), and the command runs in the matching \
-folder, so edit here and build or test there. `runners` lists the machines, best first. Long commands can run in the \
-background (background: true), then `output` and `stop`."
+fn instructions(prefer: Option<&str>, machines: &str) -> String {
+    let mut s = "kiln reach runs commands on the other machines of this kiln (its runners), end-to-end encrypted. When a step \
+has to happen on another machine (the person's Mac, a server, the box with the GPU), run it there yourself with `run`: \
+don't hand the person a command to type. When a step needs a person at that machine (a password, a system dialog to \
+allow, something physical), start it yourself and tell them exactly what will appear and what to do. Use it too when work \
+needs another platform or more power than this machine: build and test for Linux x86-64 from a Mac (`run` with \
+on: \"linux/amd64\"), use the machine with the GPU (on: \"+gpu\"). The repository you are in is synced to that machine \
+first (only what changed; git sees the same state there), and the command runs in the matching folder, so edit here and \
+build or test there; for a command that isn't about this repository, pass sync: false (it runs in that machine's home \
+folder). `runners` lists the machines, best first. Long commands can run in the background (background: true), then \
+`output` and `stop`."
         .to_owned();
+    if !machines.is_empty() {
+        s.push_str(&format!(" This kiln's machines: {machines}."));
+    }
     if let Some(p) = prefer {
         s.push_str(&format!(" This session's person prefers commands to run on {p}: `run` goes there unless you say otherwise."));
     }
     s
+}
+
+/// This kiln's machines, as the instructions name them ("adacachy (linux/x86_64, this machine),
+/// …"): asked of the runner's reach socket, briefly (empty when it doesn't answer in time).
+fn machines(sock: &std::path::Path) -> String {
+    let sock = sock.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ask = || -> anyhow::Result<Value> {
+            let mut c = Client::connect(&sock)?;
+            c.send(&Req::Runners { want: None })?;
+            match c.event()? {
+                Some(Ev::Runners(j)) => Ok(serde_json::from_str(&j)?),
+                other => anyhow::bail!("unexpected answer {other:?}"),
+            }
+        };
+        let _ = tx.send(ask());
+    });
+    let Ok(Ok(v)) = rx.recv_timeout(std::time::Duration::from_secs(2)) else { return String::new() };
+    describe(&v)
+}
+
+fn describe(v: &Value) -> String {
+    let me = v.get("me").and_then(Value::as_str).unwrap_or("");
+    let entries = v.get("runners").and_then(Value::as_array).into_iter().flatten().chain(v.get("passed").and_then(Value::as_array).into_iter().flatten());
+    let mut out: Vec<String> = Vec::new();
+    for e in entries {
+        let r = e.get("runner").unwrap_or(e);
+        let Some(name) = r.get("name").and_then(Value::as_str) else { continue };
+        if out.iter().any(|o| o.starts_with(&format!("{name} ("))) {
+            continue;
+        }
+        let platform = format!("{}/{}", r.get("os").and_then(Value::as_str).unwrap_or("?"), r.get("arch").and_then(Value::as_str).unwrap_or("?"));
+        let here = if name == me { ", this machine" } else { "" };
+        out.push(format!("{name} ({platform}{here})"));
+    }
+    out.join(", ")
 }
 
 fn tools() -> Value {
@@ -318,6 +362,7 @@ pub fn serve() -> anyhow::Result<()> {
     let sock = super::local::find_socket()?;
     let prefer = std::env::var("KILN_REACH_ON").ok().filter(|s| !s.trim().is_empty());
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let machines = machines(&sock);
     let server = Arc::new(Server { sock, prefer, cwd, runs: Arc::default(), next: Mutex::new(0) });
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let say = |out: &Arc<Mutex<std::io::Stdout>>, v: &Value| {
@@ -352,7 +397,7 @@ pub fn serve() -> anyhow::Result<()> {
                             "protocolVersion": version,
                             "capabilities": {"tools": {"listChanged": false}},
                             "serverInfo": {"name": "kiln-reach", "title": "kiln reach", "version": env!("CARGO_PKG_VERSION")},
-                            "instructions": instructions(server.prefer.as_deref()),
+                            "instructions": instructions(server.prefer.as_deref(), &machines),
                         }),
                     ),
                 );
@@ -429,7 +474,12 @@ mod tests {
         assert!(x.iter().any(|a| a == "mcp_servers.kiln_reach.command=\"/opt/kiln\""));
         assert!(x.iter().any(|a| a == "mcp_servers.kiln_reach.env={KILN_REACH_SOCK=\"/run/x.sock\"}"));
         assert!(tools().as_array().is_some_and(|t| t.len() == 4));
-        assert!(instructions(Some("adacachy")).contains("prefers commands to run on adacachy"));
+        assert!(instructions(Some("adacachy"), "").contains("prefers commands to run on adacachy"));
+        let i = instructions(None, "");
+        assert!(i.contains("run it there yourself") && i.contains("don't hand the person a command to type"));
+        let v = json!({"me": "adacachy", "runners": [{"runner": {"name": "adacachy", "os": "linux", "arch": "x86_64"}}, {"runner": {"name": "mac", "os": "macos", "arch": "aarch64"}}], "passed": [{"runner": {"name": "box", "os": "windows", "arch": "x86_64"}}]});
+        assert_eq!(describe(&v), "adacachy (linux/x86_64, this machine), mac (macos/aarch64), box (windows/x86_64)");
+        assert!(instructions(None, &describe(&v)).contains("This kiln's machines: adacachy (linux/x86_64, this machine), mac (macos/aarch64)"));
         Ok(())
     }
 }

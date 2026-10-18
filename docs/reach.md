@@ -154,7 +154,11 @@ one on the machine. One connection is one request (`local::Req`) answered by a s
 
 kiln gives every agent it starts on a runner the `kiln-reach` MCP server (`kiln reach mcp`):
 Claude Code through `--mcp-config`, Codex through `-c mcp_servers.kiln_reach.*`. Its instructions
-tell the model when reach helps; its tools:
+name the kiln's machines (asked of the runner when the server starts) and tell the model when reach
+helps. When a step has to happen on another machine, such as the person's Mac, the agent runs it
+there itself rather than handing the person a command to type. When the step needs a person at that
+machine (a password, a system dialog to allow), the agent starts it and says what will appear. Reach
+also serves builds and tests that need another platform or more power. Its tools:
 
 | tool | does |
 | --- | --- |
